@@ -46,6 +46,7 @@ async fn creates_flavors_and_executes_through_runtime_daemon() {
                 memory_limit_mb: Some(512),
                 pids_limit: Some(128),
                 disk_size_mb: None,
+                allow_docker: false,
                 network_mode: Some("none".into()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(60),

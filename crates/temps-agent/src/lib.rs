@@ -8,6 +8,7 @@
 //! and external services.
 
 pub mod auth;
+mod build_admission;
 pub mod build_handler;
 mod exec_timeout;
 pub mod handlers;
@@ -89,6 +90,18 @@ pub struct NodeHealthReport {
     /// heartbeated), so it can validate an image before transferring it.
     #[serde(default)]
     pub platform: String,
+    /// Build slots free right now; `0` means a new build would queue. The
+    /// control plane reads it to prefer a builder that is not busy; absent
+    /// from an agent that predates it, which is read as "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_slots_available: Option<u32>,
+    /// Cap used for this slot report. The control plane can assess an updated
+    /// database cap before sending the next build's settings to the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_concurrency_limit: Option<u32>,
+    /// This agent accepts database-backed per-node builder limits.
+    #[serde(default)]
+    pub build_limits_supported: bool,
 }
 
 /// How this node verifies the control plane's TLS certificate.

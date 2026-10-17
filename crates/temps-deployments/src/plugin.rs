@@ -248,6 +248,28 @@ impl TempsPlugin for DeploymentsPlugin {
                 }
             }
 
+            let ci_dispatch = crate::services::ci_dispatch::CiDispatchService::new(
+                db.clone(),
+                encryption_service.clone(),
+                config_service.data_dir(),
+            )
+            .map_err(|error| PluginError::InitializationFailed(error.to_string()))?;
+            let ci_dispatch = Arc::new(ci_dispatch);
+            context.register_service(ci_dispatch.clone());
+            if let Err(error) = ci_dispatch.reconcile().await {
+                tracing::warn!(%error, "CI cancellation reconciliation pending; leases remain fenced by deployment state and will be retried");
+            }
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Err(error) = ci_dispatch.reconcile().await {
+                        tracing::warn!(%error, "CI cancellation reconciliation failed; will retry");
+                    }
+                }
+            });
+
             // Resolve the CAS asset store backend once and share it across every
             // write-side consumer in this plugin (the cleanup service below, and
             // the workflow execution service further down). `TEMPS_STATIC_STORAGE_BACKEND`
@@ -571,6 +593,55 @@ impl TempsPlugin for DeploymentsPlugin {
                 unreachable!("register_services runs exactly once per plugin instance");
             }
 
+            // Compose configuration checks outside a deployment: the
+            // "Run compose check" action, the settings preview (via the
+            // `ComposeConfigurationChecker` trait, so temps-git runs the
+            // deploy job's own validation without depending on this crate),
+            // the host Compose CLI status and post-upgrade revalidation.
+            let compose_check_service = Arc::new(
+                crate::services::compose_check_service::ComposeCheckService::new(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    context.require_service::<temps_core::EncryptionService>(),
+                    context.require_service::<temps_git::GitProviderManager>(),
+                    Arc::new(temps_deployer::compose::ComposeExecutor::new_with_handle(
+                        context.require_service::<temps_core::DockerHandle>(),
+                        config_service.data_dir(),
+                    )),
+                ),
+            );
+            context.register_service(compose_check_service.clone());
+            let compose_checker: Arc<
+                dyn temps_presets::compose_check::ComposeConfigurationChecker,
+            > = compose_check_service.clone();
+            context.register_service(compose_checker);
+            // Probe once at startup: an outdated Compose CLI is reported as a
+            // platform warning before the first deployment hits it.
+            tokio::spawn({
+                let service = compose_check_service.clone();
+                async move {
+                    service.probe_host().await;
+                }
+            });
+            // Re-check Compose projects whose stored check predates this
+            // binary's validation rules, after boot has settled. Sequential
+            // and one-shot; see `revalidate_outdated_projects`.
+            tokio::spawn({
+                let service = compose_check_service;
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                    match service.revalidate_outdated_projects().await {
+                        Ok(0) => tracing::debug!("Compose revalidation found no failing projects"),
+                        Ok(flagged) => tracing::warn!(
+                            flagged,
+                            "Compose revalidation flagged project(s) that would fail their next deployment; see each project's Git settings"
+                        ),
+                        Err(error) => {
+                            tracing::error!("Compose revalidation after upgrade failed: {error}")
+                        }
+                    }
+                }
+            });
+
             // Get the db connection for RemoteDeploymentService
             let db_for_remote = context.require_service::<sea_orm::DatabaseConnection>();
 
@@ -663,6 +734,32 @@ impl TempsPlugin for DeploymentsPlugin {
                     "No audit logger is registered; a deployment that receives the host \
                      Docker socket (ADR 045) will be logged but not recorded in the audit \
                      trail"
+                ),
+            }
+
+            // Rescans (daily, manual) know only a deployment id. Tell the scan
+            // service how to find the build node that holds a worker-built
+            // image, which this process may not have a copy of. Needs the node
+            // scheduler, so it is wired once that exists.
+            match (
+                context.get_service::<temps_vulnerability_scanner::VulnerabilityScanService>(),
+                context.get_service::<WorkflowExecutionService>(),
+            ) {
+                (Some(scan_service), Some(workflow_execution_service)) => {
+                    match workflow_execution_service.build_node_scanner_resolver() {
+                        Some(resolver) => {
+                            scan_service.set_deployment_scanner_resolver(resolver);
+                            tracing::debug!("Build-node scanner wired into vulnerability scans");
+                        }
+                        None => tracing::warn!(
+                            "Build nodes are not reachable from this process yet; rescans of \
+                             worker-built images will be scanned on this host"
+                        ),
+                    }
+                }
+                _ => tracing::debug!(
+                    "Vulnerability scan service is not registered; rescans are not routed to \
+                     build nodes"
                 ),
             }
 
@@ -980,16 +1077,39 @@ impl TempsPlugin for DeploymentsPlugin {
         let traefik_discovery_routes =
             handlers::traefik_discovery::configure_routes().with_state(traefik_discovery_state);
 
+        let compose_check_routes =
+            handlers::compose_check::configure_routes()
+                .with_state(Arc::new(handlers::compose_check::ComposeCheckAppState {
+                compose_check_service: context
+                    .require_service::<crate::services::compose_check_service::ComposeCheckService>(
+                ),
+                project_access_checker: context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            }));
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
+            .merge(handlers::ci_dispatch::admin_routes())
             .with_state(app_state)
             .merge(deployment_token_routes)
-            .merge(traefik_discovery_routes);
+            .merge(traefik_discovery_routes)
+            .merge(compose_check_routes);
 
         Some(PluginRoutes::new(routes))
+    }
+
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let state = Arc::new(handlers::ci_dispatch::CiRunnerState {
+            dispatch: context.require_service::<crate::services::ci_dispatch::CiDispatchService>(),
+            log_service: context.require_service::<temps_logs::LogService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+        });
+        Some(PluginRoutes::new(
+            handlers::ci_dispatch::runner_routes().with_state(state),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -1005,6 +1125,8 @@ impl TempsPlugin for DeploymentsPlugin {
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
         let traefik_discovery_schema =
             <handlers::traefik_discovery::TraefikDiscoveryApiDoc as UtoimaOpenApi>::openapi();
+        let compose_check_schema =
+            <handlers::compose_check::ComposeCheckApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -1013,8 +1135,10 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
+                compose_check_schema,
             ],
         ))
     }
@@ -1045,6 +1169,114 @@ mod tests {
 
         // The actual job processor functionality is tested separately
         // This test just verifies the plugin structure is correct
+    }
+
+    struct RunnerAudit;
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RunnerAudit {
+        async fn create_audit_log(
+            &self,
+            _: &dyn temps_core::AuditOperation,
+        ) -> Result<(), anyhow::Error> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn ci_runner_routes_are_public_while_settings_stay_admin() {
+        use temps_core::plugin::ServiceRegistrationContext;
+        use tower::ServiceExt;
+        let context = ServiceRegistrationContext::new();
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let dispatch = Arc::new(
+            crate::services::ci_dispatch::CiDispatchService::new(
+                db,
+                Arc::new(temps_core::EncryptionService::new_from_password(
+                    "synthetic-route-test",
+                )),
+                root.path().into(),
+            )
+            .unwrap(),
+        );
+        context.register_service(dispatch);
+        context.register_service(Arc::new(temps_logs::LogService::new(
+            root.path().join("logs"),
+        )));
+        context.register_service::<dyn temps_core::AuditLogger>(Arc::new(RunnerAudit));
+        let plugin = DeploymentsPlugin::new();
+        let public = plugin
+            .configure_public_routes(&context.create_plugin_context())
+            .unwrap()
+            .router;
+        let id = uuid::Uuid::new_v4();
+        // No console session or API key: runner endpoints execute their own
+        // authentication/extractors, including all six routes, on the public surface.
+        for (method, suffix, body, expected) in [
+            (
+                "POST",
+                "claim",
+                "{}",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            ("GET", "context", "", axum::http::StatusCode::UNAUTHORIZED),
+            ("GET", "lease", "", axum::http::StatusCode::UNAUTHORIZED),
+            (
+                "POST",
+                "result",
+                "{}",
+                axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "POST",
+                "failure",
+                r#"{"message":"stopped"}"#,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                "logs",
+                r#"{"lines":[]}"#,
+                axum::http::StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            let response = public
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(format!("/internal/ci-builds/{id}/{suffix}"))
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{suffix}");
+        }
+        for (method, path) in [
+            ("GET", "/settings/ci-builder"),
+            ("PUT", "/settings/ci-builder"),
+            ("POST", "/settings/ci-builder/provision"),
+        ] {
+            let response = public
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
     }
 
     // Guards against the deployment-token router/schema being dropped from the

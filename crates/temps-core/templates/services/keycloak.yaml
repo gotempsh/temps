@@ -6,7 +6,7 @@
 slug: keycloak
 name: Keycloak
 version: 1.0.0
-kind: service
+kind: app
 description: Production-ready identity and access management backed by a Temps-managed PostgreSQL database.
 git:
   url: https://github.com/keycloak/keycloak.git

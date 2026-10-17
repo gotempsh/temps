@@ -54,7 +54,6 @@ export function PluginInstallPage() {
   usePageTitle(plugin ? `Install ${plugin.title}` : 'Install plugin')
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
       { label: 'Plugins', href: '/settings/plugins' },
       { label: 'Review & install' },
     ])

@@ -16,7 +16,6 @@ import {
   KeyRound,
   LockKeyhole,
   Monitor,
-  Puzzle,
   RadioTower,
   Server,
   Settings2,
@@ -108,20 +107,14 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         url: '/settings/request-timeouts',
         icon: Clock,
       },
-      // Worker Nodes deliberately is NOT here: it is a main-navigation page
-      // under "Build & deliver" (see components/dashboard/Sidebar.tsx). It
-      // keeps the /settings/nodes URL, and the sidebar excludes that route
-      // from the settings swap so the page renders with the normal shell.
+      // Worker Nodes and Plugins deliberately are NOT here: they are
+      // main-navigation pages (see components/dashboard/primary-navigation.ts).
+      // They keep their /settings/... URLs, and the sidebar excludes those
+      // routes from the settings swap so the pages render with the normal shell.
       {
         title: 'Traefik Discovery',
         url: '/settings/traefik-discovery',
         icon: Waypoints,
-      },
-      {
-        title: 'Plugins',
-        url: '/settings/plugins',
-        icon: Puzzle,
-        featureKey: 'plugin-system',
       },
       { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
     ],

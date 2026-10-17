@@ -50,6 +50,7 @@ export function TelemetrySourceBadge({ source }: { source: TelemetrySource }) {
         <Tooltip>
           <TooltipTrigger asChild>
             <Badge
+              role="img"
               variant="destructive"
               className="gap-1 font-normal"
               aria-label="Cloud unavailable"
@@ -74,6 +75,7 @@ export function TelemetrySourceBadge({ source }: { source: TelemetrySource }) {
         <Tooltip>
           <TooltipTrigger asChild>
             <Badge
+              role="img"
               variant="outline"
               className="gap-1 font-normal"
               aria-label={region ? `Temps Cloud · ${region}` : 'Temps Cloud'}
@@ -96,6 +98,7 @@ export function TelemetrySourceBadge({ source }: { source: TelemetrySource }) {
       <Tooltip>
         <TooltipTrigger asChild>
           <Badge
+            role="img"
             variant="secondary"
             className="gap-1 font-normal"
             aria-label="This instance"

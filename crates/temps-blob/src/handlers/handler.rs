@@ -20,12 +20,17 @@ use temps_auth::{permission_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
 use temps_providers::externalsvc::{ExternalService, ServiceType};
+use temps_providers::managed_names::{
+    enable_failure_problem, get_managed_service, ManagedContainerNameSettings, ManagedServiceKind,
+    UpdateManagedContainerName,
+};
 use temps_providers::{CreateExternalServiceRequest, UpdateExternalServiceRequest};
 use tracing::{error, info};
 use utoipa::OpenApi;
 
 use super::audit::{
-    AuditContext, BlobServiceDisabledAudit, BlobServiceEnabledAudit, BlobServiceUpdatedAudit,
+    AuditContext, BlobServiceDisabledAudit, BlobServiceEnabledAudit,
+    BlobServiceSettingsUpdatedAudit, BlobServiceUpdatedAudit,
 };
 
 use super::types::*;
@@ -89,6 +94,8 @@ async fn authorize_project_access(
         blob_enable,
         blob_update,
         blob_disable,
+        blob_get_settings,
+        blob_update_settings,
     ),
     components(
         schemas(
@@ -104,6 +111,8 @@ async fn authorize_project_access(
             UpdateBlobRequest,
             UpdateBlobResponse,
             DisableBlobResponse,
+            ManagedContainerNameSettings,
+            UpdateManagedContainerName,
         )
     ),
     tags(
@@ -128,6 +137,20 @@ pub fn configure_routes() -> Router<Arc<BlobAppState>> {
         .route("/blob/enable", post(blob_enable))
         .route("/blob/update", patch(blob_update))
         .route("/blob/disable", delete(blob_disable))
+        .route(
+            "/blob/settings",
+            get(blob_get_settings).patch(blob_update_settings),
+        )
+}
+
+/// The name of this instance's Blob service: the one that already exists, else
+/// the saved or per-instance default (see `temps_providers::managed_names`).
+async fn blob_service_name(state: &BlobAppState) -> Result<String, Problem> {
+    Ok(state
+        .managed_names
+        .resolve(ManagedServiceKind::Blob)
+        .await?
+        .service_name)
 }
 
 /// Upload a blob
@@ -474,11 +497,29 @@ pub async fn blob_status(
     // Status check requires SystemRead permission
     permission_guard!(auth, SystemRead);
 
+    // This is the endpoint the console uses to onboard the feature, so an
+    // unreadable container-name setting degrades to "not enabled" instead of
+    // failing the whole status check.
+    let service_name = match state.managed_names.resolve(ManagedServiceKind::Blob).await {
+        Ok(resolved) => resolved.service_name,
+        Err(error) => {
+            tracing::warn!("Blob status could not resolve its service name: {}", error);
+            return Ok(Json(BlobStatusResponse {
+                enabled: false,
+                healthy: false,
+                version: None,
+                docker_image: None,
+            }));
+        }
+    };
+
     // Check if the service exists in the database via ExternalServiceManager
-    let service_result = state
-        .external_service_manager
-        .get_service_by_name("temps-blob")
-        .await;
+    let service_result = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &service_name,
+    )
+    .await;
 
     match service_result {
         Ok(service) => {
@@ -538,6 +579,7 @@ pub async fn blob_status(
     responses(
         (status = 200, description = "Blob service enabled", body = EnableBlobResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 409, description = "The Blob container name is already taken on this Docker host by something that is not this instance's Blob service. Set a unique blob.container_name via PATCH /blob/settings", body = ProblemDetails),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -558,12 +600,30 @@ pub async fn blob_enable(
         request.root_password.is_some()
     );
 
+    // A container-name change must not land between resolving the name below
+    // and creating the service under it.
+    let _naming = state.managed_names.lock_naming().await;
+
+    // What this instance calls its Blob service. The plugin built its engine
+    // at startup; point it at the name resolved now (the operator may have
+    // chosen another container name since) before anything creates or starts
+    // a container.
+    let resolved_name = state
+        .managed_names
+        .resolve(ManagedServiceKind::Blob)
+        .await?;
+    state
+        .rustfs_service
+        .set_instance_name(resolved_name.service_name.clone());
+
     // Check if the service already exists (might be stopped)
-    let existing_service = state
-        .external_service_manager
-        .get_service_by_name("temps-blob")
-        .await
-        .ok();
+    let existing_service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &resolved_name.service_name,
+    )
+    .await
+    .ok();
 
     let service_info = if let Some(existing) = existing_service {
         // Service exists - need to initialize the plugin's RustfsService and start the container
@@ -643,7 +703,7 @@ pub async fn blob_enable(
         // Create service request for ExternalServiceManager
         // Using Blob service type which uses RustfsService (high-performance S3-compatible storage)
         let create_request = CreateExternalServiceRequest {
-            name: "temps-blob".to_string(),
+            name: resolved_name.service_name.clone(),
             service_type: ServiceType::Blob,
             version,
             parameters,
@@ -659,10 +719,11 @@ pub async fn blob_enable(
             .create_service(create_request)
             .await
             .map_err(|e| {
-                error!("Failed to create Blob service: {}", e);
-                temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Failed to Enable Blob Service")
-                    .with_detail(format!("Could not create S3/Blob service: {}", e))
+                error!(
+                    "Failed to create Blob service '{}': {}",
+                    resolved_name.service_name, e
+                );
+                enable_failure_problem(ManagedServiceKind::Blob, &e)
             })?;
 
         // `create_service` builds its own service instance to start the
@@ -706,7 +767,7 @@ pub async fn blob_enable(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-blob".to_string(),
+        service_name: service_info.name.clone(),
         docker_image: docker_image.clone(),
         version: version.clone(),
     };
@@ -753,15 +814,17 @@ pub async fn blob_update(
     info!("Updating Blob service with config: {:?}", request);
 
     // Get existing service
-    let service = state
-        .external_service_manager
-        .get_service_by_name("temps-blob")
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Blob Service Not Found")
-                .with_detail("Blob service is not enabled. Enable it first before updating.")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &blob_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Blob Service Not Found")
+            .with_detail("Blob service is not enabled. Enable it first before updating.")
+    })?;
 
     // Get current details for audit log
     let current_details = state
@@ -829,7 +892,7 @@ pub async fn blob_update(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-blob".to_string(),
+        service_name: service.name.clone(),
         old_docker_image,
         new_docker_image: new_docker_image.clone(),
         old_version,
@@ -880,15 +943,17 @@ pub async fn blob_disable(
     info!("Disabling Blob service");
 
     // Get the service record
-    let service = state
-        .external_service_manager
-        .get_service_by_name("temps-blob")
-        .await
-        .map_err(|_| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Blob Service Not Found")
-                .with_detail("Blob service is not enabled")
-        })?;
+    let service = get_managed_service(
+        &state.external_service_manager,
+        ManagedServiceKind::Blob,
+        &blob_service_name(&state).await?,
+    )
+    .await
+    .map_err(|_| {
+        temps_core::problemdetails::new(StatusCode::NOT_FOUND)
+            .with_title("Blob Service Not Found")
+            .with_detail("Blob service is not enabled")
+    })?;
 
     // Stop the service through external_service_manager (stops container + updates DB status)
     state
@@ -909,7 +974,7 @@ pub async fn blob_disable(
             ip_address: Some(metadata.ip_address.clone()),
             user_agent: metadata.user_agent.clone(),
         },
-        service_name: "temps-blob".to_string(),
+        service_name: service.name.clone(),
     };
 
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
@@ -920,6 +985,102 @@ pub async fn blob_disable(
         success: true,
         message: "Blob service disabled successfully".to_string(),
     }))
+}
+
+/// Get the Blob container-name setting
+///
+/// Returns the Docker container the Blob service runs in on this instance, the
+/// default an empty setting resolves to, and whether the name can still be
+/// changed (it cannot once the service exists).
+#[utoipa::path(
+    tag = "Blob Management",
+    get,
+    path = "/blob/settings",
+    responses(
+        (status = 200, description = "Blob container-name settings", body = ManagedContainerNameSettings),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn blob_get_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<BlobAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemRead);
+
+    let resolved = state
+        .managed_names
+        .resolve(ManagedServiceKind::Blob)
+        .await?;
+    Ok(Json(ManagedContainerNameSettings::from(&resolved)))
+}
+
+/// Set the Blob container name
+///
+/// Several Temps instances sharing one Docker daemon each need their own Blob
+/// container. The default is already unique per instance; set a name here to
+/// choose it yourself. Must start with `rustfs-`; an empty value restores the
+/// default. Refused with 409 while the Blob service exists: renaming its
+/// container would orphan the data, so delete the service first.
+#[utoipa::path(
+    tag = "Blob Management",
+    patch,
+    path = "/blob/settings",
+    request_body = UpdateManagedContainerName,
+    responses(
+        (status = 200, description = "Container name saved", body = ManagedContainerNameSettings),
+        (status = 400, description = "The container name is not one Docker and Temps accept", body = temps_core::ProblemDetails),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "The Blob service already exists, so its container cannot be renamed", body = temps_core::ProblemDetails),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn blob_update_settings(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<BlobAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<UpdateManagedContainerName>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    // The engine is pointed at the saved name while the naming lock is still
+    // held, so an enable running at the same moment never sees a name that
+    // differs from the engine's.
+    let change = state
+        .managed_names
+        .set_container_name(ManagedServiceKind::Blob, &request.container_name, |saved| {
+            state
+                .rustfs_service
+                .set_instance_name(saved.service_name.clone());
+        })
+        .await?;
+    let (previous, saved) = (change.previous, change.saved);
+
+    info!(
+        user_id = auth.user_id(),
+        previous = %previous.container_name,
+        container = %saved.container_name,
+        "Blob container name setting saved"
+    );
+
+    let audit = BlobServiceSettingsUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_container_name: previous.container_name,
+        new_container_name: saved.container_name.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(ManagedContainerNameSettings::from(&saved)))
 }
 
 #[cfg(test)]

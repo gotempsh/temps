@@ -35,6 +35,37 @@ pub struct KvServiceUpdatedAudit {
     pub new_version: Option<String>,
 }
 
+/// Audit event for changing the KV container-name setting
+#[derive(Debug, Clone, Serialize)]
+pub struct KvServiceSettingsUpdatedAudit {
+    pub context: AuditContext,
+    pub previous_container_name: String,
+    pub new_container_name: String,
+}
+
+impl AuditOperation for KvServiceSettingsUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "KV_SERVICE_SETTINGS_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
 impl AuditOperation for KvServiceEnabledAudit {
     fn operation_type(&self) -> String {
         "KV_SERVICE_ENABLED".to_string()

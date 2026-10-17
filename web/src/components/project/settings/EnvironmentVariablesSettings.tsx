@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { InheritedVariablesPanel } from '@/components/project-groups/InheritedVariablesPanel'
 import {
   EnvironmentVariableResponse,
   EnvironmentInfo,
@@ -30,7 +31,7 @@ import {
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import { Button } from '@/components/ui/button'
 import { EnvironmentVariableValue } from './EnvironmentVariableValue'
-import { RecordLink, useUrlState } from '@temps-sdk/ds'
+import { RecordLink, useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -39,20 +40,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
+import { IDLE_LIST_POLL_MS, refetchOnFocusWhenStale } from '@/lib/live-refetch'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, Eye, EyeOff, KeyRound, Plus, Upload } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -169,6 +161,21 @@ interface EnvironmentVariableRowProps {
   environmentChoicesAvailable: boolean
 }
 
+/** What deleting a variable affects, naming the environments it is active on. */
+function deleteConsequences(environments: { name: string }[]): string {
+  const where =
+    environments.length > 0
+      ? `It is active on ${environments.map((env) => env.name).join(', ')}. `
+      : ''
+  return `${where}Running deployments keep the old value until they are redeployed.`
+}
+
+/** The first few keys of a bulk selection, so the user can verify it. */
+function summarizeKeys(keys: string[], shown = 3): string {
+  if (keys.length <= shown) return keys.join(', ')
+  return `${keys.slice(0, shown).join(', ')} and ${keys.length - shown} more`
+}
+
 function EnvironmentVariableRow({
   variable,
   project,
@@ -204,10 +211,14 @@ function EnvironmentVariableRow({
   useEffect(() => {
     const guard = createCredentialRevealGuard()
     revealGuard.current = guard
-    // Drop plaintext whenever this row changes project, identity, or version.
+    // Drop revealed plaintext whenever this row changes project, identity, or
+    // version. The edit draft is deliberately left alone: the list polls, so
+    // `updated_at` can change while the editor is open, and clearing the draft
+    // there would leave `valueLoaded` true with an empty box that Save sends
+    // as an explicit empty value. The editor clears its own draft when it
+    // closes or saves.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRevealedValue(undefined)
-    setEditValue('')
     return () => guard.invalidate()
   }, [revealScope])
 
@@ -312,13 +323,18 @@ function EnvironmentVariableRow({
     },
   })
 
-  const handleDelete = async () => {
-    await deleteMutation.mutateAsync({
-      path: {
-        project_id: project.id,
-        var_id: variable.id,
+  const [isDeleteOpen, setIsDeleteOpen] = useState(false)
+
+  const handleDelete = () => {
+    deleteMutation.mutate(
+      {
+        path: {
+          project_id: project.id,
+          var_id: variable.id,
+        },
       },
-    })
+      { onSettled: () => setIsDeleteOpen(false) }
+    )
   }
 
   const [isEditModalOpen, setIsEditModalOpen] = useState(false)
@@ -337,12 +353,24 @@ function EnvironmentVariableRow({
   // accidentally expose it as a regular value.
   const [convertToSecret, setConvertToSecret] = useState(false)
 
-  // Update selected environments and preview flag when variable changes (after refetch)
+  // Keep the editor's environment and preview choices in step with the stored
+  // variable, but never while the editor is open: the list polls, so a refetch
+  // (even one returning the same values in a fresh array) would otherwise wipe
+  // what the user just picked and Save would send the reset choices. Closing
+  // the editor re-syncs, which also discards an abandoned draft. Keyed on the
+  // ids rather than the array identity for the same reason.
+  const storedEnvironmentIds = variable.environments
+    .map((env) => env.id)
+    .join(',')
+  const storedIncludeInPreview = variable.include_in_preview ?? false
   useEffect(() => {
+    if (isEditModalOpen) return
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    setSelectedEditEnvironments(variable.environments.map((env) => env.id))
-    setEditIncludeInPreview(variable.include_in_preview ?? false)
-  }, [variable.environments, variable.include_in_preview])
+    setSelectedEditEnvironments(
+      storedEnvironmentIds ? storedEnvironmentIds.split(',').map(Number) : []
+    )
+    setEditIncludeInPreview(storedIncludeInPreview)
+  }, [storedEnvironmentIds, storedIncludeInPreview, isEditModalOpen])
 
   const openEditDialog = async () => {
     setIsEditModalOpen(true)
@@ -514,58 +542,24 @@ function EnvironmentVariableRow({
             >
               Edit
             </Button>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  variant="ghost"
-                  className="text-muted-foreground hover:text-destructive"
-                  size="sm"
-                  disabled={
-                    deleteMutation.isPending || updateMutation.isPending
-                  }
-                >
-                  Delete
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>
-                    Delete environment variable
-                  </AlertDialogTitle>
-                  <AlertDialogDescription className="space-y-3">
-                    <p>
-                      Are you sure you want to delete{' '}
-                      <span className="font-medium">{variable.key}</span>? This
-                      action cannot be undone.
-                    </p>
-                    {variable.environments &&
-                      variable.environments.length > 0 && (
-                        <div className="space-y-2">
-                          <p className="text-sm font-medium text-foreground">
-                            This variable is active on:
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            {variable.environments.map((env) => (
-                              <span
-                                key={env.name}
-                                className="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium bg-secondary text-secondary-foreground"
-                              >
-                                {env.name}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      )}
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction onClick={handleDelete}>
-                    Delete
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
+            <Button
+              variant="ghost"
+              className="text-muted-foreground hover:text-destructive"
+              size="sm"
+              disabled={deleteMutation.isPending || updateMutation.isPending}
+              onClick={() => setIsDeleteOpen(true)}
+            >
+              Delete
+            </Button>
+            <ConfirmDeleteDialog
+              open={isDeleteOpen}
+              onOpenChange={setIsDeleteOpen}
+              resourceType="environment variable"
+              resourceName={variable.key}
+              consequences={deleteConsequences(variable.environments)}
+              isPending={deleteMutation.isPending}
+              onConfirm={handleDelete}
+            />
           </div>
         </TableCell>
       </TableRow>
@@ -971,7 +965,7 @@ function AddEnvironmentVariableDialog({
         <DialogHeader>
           <DialogTitle>Add Environment Variable</DialogTitle>
           <DialogDescription>
-            Add a new environment variable to your project.
+            Add a new environment variable to your service.
           </DialogDescription>
         </DialogHeader>
         <form
@@ -1305,8 +1299,13 @@ export function EnvironmentVariablesSettings({
     new Set()
   )
   const [isBulkDeleteDialogOpen, setIsBulkDeleteDialogOpen] = useState(false)
-  const { get, patch } = useUrlState<'environment' | 'q'>()
-  const search = get('q') ?? ''
+  const urlState = useUrlState<'environment' | 'q'>()
+  const { get, patch } = urlState
+  // The box keeps what was typed locally; `search` is the committed URL value
+  // the list is filtered by.
+  const [searchText, setSearchText, search] = useUrlSearchText('q', {
+    urlState,
+  })
   const environmentFilter = get('environment')
   const [revealAllScope, setRevealAllScope] = useState<string | null>(null)
   const [showComparison, setShowComparison] = useState(false)
@@ -1397,6 +1396,10 @@ export function EnvironmentVariablesSettings({
         project_id: project.id,
       },
     }),
+    // Variables are also written through the API and CLI; keep the list in
+    // step with them while it is on screen (paused when the tab is hidden).
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    refetchInterval: IDLE_LIST_POLL_MS,
   })
 
   const {
@@ -1408,6 +1411,8 @@ export function EnvironmentVariablesSettings({
     queryKey: ['resolved-env-vars', project.id, selectedEnvId],
     queryFn: () => getResolvedEnvVars(project.id, selectedEnvId ?? undefined),
     staleTime: 15_000,
+    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    refetchInterval: IDLE_LIST_POLL_MS,
     enabled: Boolean(projectEnvironments) && !environmentsFailed,
   })
 
@@ -1723,6 +1728,11 @@ export function EnvironmentVariablesSettings({
     }
   }
 
+  const selectedRows = (envVariables ?? []).filter((v) =>
+    visibleSelectedIds.has(v.id)
+  )
+  const selectedKeys = selectedRows.map((v) => v.key)
+
   const handleBulkDelete = async () => {
     let successCount = 0
     let errorCount = 0
@@ -1768,7 +1778,9 @@ export function EnvironmentVariablesSettings({
     return <EnvironmentVariablesLoadingState />
   }
 
-  if (variablesFailed)
+  // A failed background refresh keeps the rows already loaded: replacing the
+  // table with this error view would unmount an open editor and its draft.
+  if (variablesFailed && envVariables === undefined)
     return (
       <div role="alert" className="space-y-3">
         <p>Could not load environment variables for {project.name}.</p>
@@ -1817,7 +1829,6 @@ export function EnvironmentVariablesSettings({
                 onClick={() => setFiltersOpen((open) => !open)}
                 aria-expanded={filtersOpen}
                 aria-controls="variable-filters"
-                aria-label="Filters"
               >
                 <ChevronDown
                   className={cn(
@@ -1850,6 +1861,9 @@ export function EnvironmentVariablesSettings({
               </Button>
             </div>
           )}
+        </div>
+        <div className="mb-5">
+          <InheritedVariablesPanel project={project} />
         </div>
         {(hasVariables ||
           orderedEnvironments.length > 0 ||
@@ -1894,8 +1908,8 @@ export function EnvironmentVariablesSettings({
                 <Input
                   aria-label="Filter environment variables by name"
                   placeholder="Filter by variable name…"
-                  value={search}
-                  onChange={(event) => patch({ q: event.target.value })}
+                  value={searchText}
+                  onChange={(event) => setSearchText(event.target.value)}
                   className="w-full sm:w-72"
                 />
               </div>
@@ -1946,7 +1960,7 @@ export function EnvironmentVariablesSettings({
                 No environment variables
               </EmptyPlaceholder.Title>
               <EmptyPlaceholder.Description>
-                Add environment variables to configure your project across
+                Add environment variables to configure your service across
                 different environments.
               </EmptyPlaceholder.Description>
               <div className="flex gap-2">
@@ -2237,14 +2251,17 @@ export function EnvironmentVariablesSettings({
                             </span>
                           </div>
                           {keys.length === 0 ? (
-                            <p className="mt-2 text-xs text-emerald-600 dark:text-emerald-400">
+                            <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">
                               No keys missing relative to{' '}
                               {environment.id === comparisonFirst.id
                                 ? comparisonSecond.name
                                 : comparisonFirst.name}
                             </p>
                           ) : (
-                            <ul className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono">
+                            <ul
+                              tabIndex={0}
+                              className="mt-2 max-h-32 space-y-1 overflow-y-auto text-xs font-mono"
+                            >
                               {keys.map((key) => (
                                 <li key={key} className="break-all">
                                   {key}
@@ -2287,61 +2304,33 @@ export function EnvironmentVariablesSettings({
         }
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={isBulkDeleteDialogOpen}
         onOpenChange={setIsBulkDeleteDialogOpen}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete Multiple Variables</AlertDialogTitle>
-            <AlertDialogDescription className="space-y-3">
-              <p>
-                Are you sure you want to delete {selectedCount} environment
-                variable{selectedCount !== 1 ? 's' : ''}? This action cannot be
-                undone.
-              </p>
-              {selectedCount > 0 && (
-                <div className="space-y-2">
-                  <p className="text-sm font-medium text-foreground">
-                    Variables to be deleted:
-                  </p>
-                  <div className="max-h-[200px] overflow-auto border rounded-md p-3 space-y-1">
-                    {(envVariables ?? [])
-                      .filter((v) => visibleSelectedIds.has(v.id))
-                      .map((v) => (
-                        <div
-                          key={v.id}
-                          className="text-sm font-mono flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between"
-                        >
-                          <span className="break-all">{v.key}</span>
-                          <div className="flex flex-wrap gap-1">
-                            {v.environments.map((env) => (
-                              <span
-                                key={env.name}
-                                className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-secondary text-secondary-foreground"
-                              >
-                                {env.name}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
-                      ))}
-                  </div>
-                </div>
-              )}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleBulkDelete}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete {selectedCount} Variable{selectedCount !== 1 ? 's' : ''}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="environment variables"
+        resourceName={summarizeKeys(selectedKeys)}
+        consequences={
+          <>
+            <p>
+              Removed from every environment they apply to. Running deployments
+              keep the old values until they are redeployed.
+            </p>
+            <ul className="mt-2 space-y-1">
+              {selectedRows.map((variable) => (
+                <li key={variable.id}>
+                  <span className="font-mono text-foreground">
+                    {variable.key}
+                  </span>
+                  {' · '}
+                  {variable.environments.map((env) => env.name).join(', ') ||
+                    'no environments'}
+                </li>
+              ))}
+            </ul>
+          </>
+        }
+        onConfirm={() => void handleBulkDelete()}
+      />
     </div>
   )
 }

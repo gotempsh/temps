@@ -250,7 +250,12 @@ function DisclosureSection({ status }: { status: TelemetryStatusResponse }) {
 
 function LoadingState() {
   return (
-    <div className="space-y-10" aria-busy="true" aria-label="Loading telemetry">
+    <div
+      role="status"
+      className="space-y-10"
+      aria-busy="true"
+      aria-label="Loading telemetry"
+    >
       {[0, 1].map((key) => (
         <div
           key={key}

@@ -21,7 +21,8 @@ use temps_core::{
 };
 use temps_database::DbConnection;
 use temps_deployer::compose::{
-    ComposeDeployRequest, ComposeExecutor, ComposeOutputSink, EnvFileSource,
+    ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,
+    EnvFileSource, ResolvedComposeConfiguration,
 };
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
 use temps_logs::{LogLevel, LogService};
@@ -95,6 +96,57 @@ fn health_check_path_for_public_route(
         .filter(|path| is_safe_health_check_path(path))
         .unwrap_or("/")
         .to_string())
+}
+
+/// The detected health check path as stored in the service snapshot, which
+/// is persisted on the project and returned to anyone who can read it.
+/// Variables are substituted before detection, so a healthcheck such as
+/// `curl localhost/ready/${TOKEN}` would otherwise persist the secret.
+/// Only a path the public route could use is kept (no query, fragment,
+/// userinfo or scheme), and only when it is written literally in the Compose
+/// `sources`: any other path was produced by substitution, and its values may
+/// come from the project, the repository `.env` or an include's env files, so
+/// none can be ruled out. The route then falls back to `/`, as it does for
+/// any unsafe path.
+/// The service list saved on the project for the settings page, from the
+/// resolved model so it shows what deploys. Readers of the project need not
+/// be allowed to reveal environment values, so nothing substituted reaches
+/// it: images pass through `redact`, and a health path is kept only when it
+/// is written literally (see [`snapshot_health_check_path`]). Detection runs
+/// on the resolved image first, so a masked image is still recognised.
+/// Best-effort: a parse failure yields an empty list rather than failing the
+/// deployment, since this only feeds a UI convenience.
+fn compose_service_snapshots(
+    resolved_content: &str,
+    override_content: Option<&str>,
+    health_path_sources: &[&str],
+    redact: impl Fn(&str) -> String,
+) -> Vec<temps_entities::preset::ComposeServiceSnapshot> {
+    temps_presets::list_compose_services_with_override(resolved_content, override_content)
+        .map(|services| {
+            services
+                .into_iter()
+                .map(|s| temps_entities::preset::ComposeServiceSnapshot {
+                    name: s.name,
+                    image: s.image.as_deref().map(&redact),
+                    looks_like_database: s.looks_like_database,
+                    detected_service_type: s.detected_service_type,
+                    ports: s.ports,
+                    health_check_path: snapshot_health_check_path(
+                        s.health_check_path,
+                        health_path_sources,
+                    ),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn snapshot_health_check_path(path: Option<String>, sources: &[&str]) -> Option<String> {
+    let path = path?;
+    (is_safe_health_check_path(&path)
+        && sources.iter().any(|source| source.contains(path.as_str())))
+    .then_some(path)
 }
 
 fn is_safe_health_check_path(path: &str) -> bool {
@@ -683,6 +735,121 @@ impl DeployComposeJob {
         Err(WorkflowError::WorkflowCancelled)
     }
 
+    /// Keep the project's stored Compose check current, so the settings page
+    /// stops (or starts) flagging it. Best-effort: the deployment outcome
+    /// never depends on this write.
+    async fn record_compose_check(
+        &self,
+        passed: bool,
+        error_class: Option<temps_presets::compose_check::ComposeCheckErrorClass>,
+        error: Option<String>,
+    ) {
+        if let Err(error) = crate::services::compose_check_service::store_validation_report(
+            self.db.as_ref(),
+            self.project_id,
+            passed,
+            error_class,
+            error,
+        )
+        .await
+        {
+            tracing::warn!(
+                project_id = self.project_id,
+                deployment_id = self.deployment_id,
+                "Failed to record the Compose configuration check: {error}"
+            );
+        }
+    }
+
+    /// Write a configuration-check failure to the deployment log: the error
+    /// class, and for a `docker compose config` failure the exact command,
+    /// its exit code and the sanitized Compose output.
+    async fn log_compose_check_failure(&self, error: &ComposeError) {
+        tracing::error!(
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            deployment_id = self.deployment_id,
+            error_class = %error.class(),
+            error = %error,
+            "Compose configuration check failed"
+        );
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        let _ = self
+            .log_service
+            .log_error(
+                log_id,
+                &format!(
+                    "Compose configuration check failed ({}): {error}",
+                    error.class()
+                ),
+            )
+            .await;
+        if let ComposeError::ConfigResolutionFailed { diagnostics, .. } = error {
+            let _ = self
+                .log_service
+                .log_error(
+                    log_id,
+                    &format!(
+                        "Command: {}\nExit code: {}\nCompose output (sanitized):\n{}",
+                        diagnostics.argv.join(" "),
+                        diagnostics
+                            .exit_code
+                            .map(|code| code.to_string())
+                            .unwrap_or_else(|| "none (terminated by signal)".to_string()),
+                        if diagnostics.stderr.is_empty() {
+                            "<empty>"
+                        } else {
+                            diagnostics.stderr.as_str()
+                        }
+                    ),
+                )
+                .await;
+        }
+    }
+
+    /// Say what the configuration check did, so a stack that boots with an
+    /// unexpected value can be traced back to a variable that was not set.
+    async fn log_compose_resolution(&self, resolution: &ResolvedComposeConfiguration) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        if let Some(command) = &resolution.command {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    &format!(
+                        "Resolved Compose configuration ({}) with: {}",
+                        resolution.resolution_reasons.join(", "),
+                        command.argv.join(" ")
+                    ),
+                )
+                .await;
+        }
+        if !resolution.unset_variables.is_empty() {
+            let names: Vec<&str> = resolution
+                .unset_variables
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let _ = self
+                .log_service
+                .log_warning(
+                    log_id,
+                    &format!(
+                        "Compose variable(s) {} are not set in this environment or the repository .env and have no default; they were replaced with empty strings, as Docker Compose does.",
+                        names.join(", ")
+                    ),
+                )
+                .await;
+        }
+        for note in &resolution.notes {
+            let _ = self.log_service.log_info(log_id, note).await;
+        }
+    }
+
     async fn execute_locked(
         &self,
         mut context: WorkflowContext,
@@ -836,49 +1003,83 @@ impl DeployComposeJob {
             }
         };
 
-        let (compose_content, compose_override) = self
-            .compose_executor
-            .resolve_security_configuration(
-                &project_name,
-                repo_path.as_deref(),
-                compose_file_name,
-                &compose_content,
-                self.compose_override.as_deref(),
-                &self.environment_vars,
-            )
-            .await
-            .map_err(|error| {
-                WorkflowError::JobExecutionFailed(format!(
-                    "Failed to resolve Compose policy for project {}: {error}",
-                    self.project_id
-                ))
-            })?;
+        if !self.excluded_services.is_empty() {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Excluding service(s) from deployment: {}",
+                            self.excluded_services.join(", ")
+                        ),
+                    )
+                    .await;
+            }
+        }
 
-        // Full service list from the raw compose file, *before* exclusion
-        // stripping — so excluded services still show up as re-includable
-        // options in the settings-page checklist. Best-effort: a parse
-        // failure degrades to an empty snapshot rather than failing the
-        // deploy, since this only feeds a UI convenience, not the deploy
-        // itself.
-        let compose_services: Vec<temps_entities::preset::ComposeServiceSnapshot> =
-            temps_presets::list_compose_services_with_override(
-                &compose_content,
-                compose_override.as_deref(),
-            )
-            .map(|services| {
-                services
-                    .into_iter()
-                    .map(|s| temps_entities::preset::ComposeServiceSnapshot {
-                        name: s.name,
-                        image: s.image,
-                        looks_like_database: s.looks_like_database,
-                        detected_service_type: s.detected_service_type,
-                        ports: s.ports,
-                        health_check_path: s.health_check_path,
-                    })
-                    .collect()
+        // Every configuration check, before Docker or database mutations and
+        // before the running stack is touched: variables are resolved first,
+        // then the security policy judges the values that will deploy.
+        // Rejecting after teardown would cause downtime on the running
+        // deployment for what is purely a configuration problem. "Run compose
+        // check" and the settings preview run this same function.
+        let checked = match self
+            .compose_executor
+            .check_configuration(&ComposeCheckInput {
+                project_name: &project_name,
+                project_dir: repo_path.as_deref(),
+                compose_file: compose_file_name,
+                content: &compose_content,
+                override_content: self.compose_override.as_deref(),
+                excluded_services: &self.excluded_services,
+                environment: &self.environment_vars,
+                repository_env: None,
+                filesystem_checks: repo_path.is_some(),
+                allow_cli: true,
+                defer_unknown_required: false,
             })
-            .unwrap_or_default();
+            .await
+        {
+            Ok(checked) => {
+                self.record_compose_check(true, None, None).await;
+                checked
+            }
+            Err(error) => {
+                self.log_compose_check_failure(&error).await;
+                self.record_compose_check(false, Some(error.class()), Some(error.to_string()))
+                    .await;
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Compose configuration check failed for project {} ({}): {error}",
+                    self.project_id,
+                    error.class()
+                )));
+            }
+        };
+        self.log_compose_resolution(&checked.resolution).await;
+
+        // Full service list, *before* exclusion stripping — so excluded
+        // services still show up as re-includable options in the
+        // settings-page checklist.
+        // The files as written, before substitution (including those pulled
+        // in by include/extends): a health path found there literally
+        // carries no variable value.
+        let health_path_sources: Vec<&str> = std::iter::once(compose_content.as_str())
+            .chain(self.compose_override.as_deref())
+            .chain(
+                checked
+                    .resolution
+                    .referenced_sources
+                    .iter()
+                    .map(String::as_str),
+            )
+            .collect();
+        let compose_services = compose_service_snapshots(
+            &checked.resolved_content,
+            checked.override_content.as_deref(),
+            &health_path_sources,
+            |text| checked.resolution.substituted_values.redact(text),
+        );
         // Resolve and validate before Docker or database mutations. Explicit
         // route configuration is authoritative; unsafe auto-detected paths
         // fall back to the secret-free deployment root.
@@ -908,6 +1109,7 @@ impl DeployComposeJob {
                 temps_entities::preset::ComposeServiceFamily::S3 => ("S3 / RustFS", "s3"),
             };
             if let Some(ref log_id) = self.log_id {
+                // Already masked; see `compose_service_snapshots`.
                 let image_suffix = service
                     .image
                     .as_deref()
@@ -929,41 +1131,15 @@ impl DeployComposeJob {
             }
         }
 
-        // Strip any user-excluded services (and references to them in other
-        // services' `depends_on`) before anything downstream — env-file
-        // planning, security preflight, and the actual `docker compose up` —
-        // ever sees them. Compose's own `-f` override merging can only
-        // add/replace fields on a service, never unset one, so this has to
-        // rewrite the base document rather than layer another override file.
-        let compose_content = if self.excluded_services.is_empty() {
-            compose_content
-        } else {
-            if let Some(ref log_id) = self.log_id {
-                let _ = self
-                    .log_service
-                    .log_info(
-                        log_id,
-                        &format!(
-                            "Excluding service(s) from deployment: {}",
-                            self.excluded_services.join(", ")
-                        ),
-                    )
-                    .await;
-            }
-            match self
-                .compose_executor
-                .strip_excluded_services(&compose_content, &self.excluded_services)
-            {
-                Ok(stripped) => stripped,
-                Err(e) => {
-                    let error_msg = format!("Failed to apply excluded services: {}", e);
-                    if let Some(ref log_id) = self.log_id {
-                        let _ = self.log_service.log_error(log_id, &error_msg).await;
-                    }
-                    return Err(WorkflowError::JobExecutionFailed(error_msg));
-                }
-            }
-        };
+        // Excluded services (and references to them in other services'
+        // `depends_on`) were removed by the check above, before env-file
+        // planning and the actual `docker compose up` see the model.
+        let compose_content = checked.content;
+        let compose_override = checked.override_content;
+        // Paths in the resolved model may embed substituted values
+        // (`env_file: ${TOKEN}.env`); the job log is readable without
+        // permission to see them.
+        let substituted_values = checked.resolution.substituted_values;
 
         // Read .env from repo if it exists
         let env_content = if let Some(selected_repo_dir) = repo_path.as_deref() {
@@ -998,17 +1174,17 @@ impl DeployComposeJob {
             let message = match plan.source {
                 EnvFileSource::Repository(_) => format!(
                     "Compose references env file '{}' — copied from the repository",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment if self.environment_vars.is_empty() => format!(
                     "Compose references env file '{}', which is not in the repository — created it empty. \
                      If the stack needs values, set them in the environment's variables and redeploy.",
-                    plan.path
+                    substituted_values.redact(&plan.path)
                 ),
                 EnvFileSource::ProjectEnvironment => format!(
                     "Compose references env file '{}', which is not in the repository — created it from \
                      this environment's {} variable(s)",
-                    plan.path,
+                    substituted_values.redact(&plan.path),
                     self.environment_vars.len()
                 ),
             };
@@ -1094,37 +1270,6 @@ impl DeployComposeJob {
                         )
                         .await;
                 }
-            }
-        }
-
-        // Validate the compose security policy BEFORE tearing down the existing
-        // stack. Rejecting after teardown would cause downtime on the running
-        // deployment for what is purely a configuration problem.
-        if let Err(error) = self
-            .compose_executor
-            .preflight_validate(&compose_content, compose_override.as_deref())
-        {
-            let error_msg = format!("Compose security policy rejected deployment: {error}");
-            tracing::error!(error = %error_msg, "Docker Compose preflight validation failed");
-            if let Some(ref log_id) = self.log_id {
-                let _ = self.log_service.log_error(log_id, &error_msg).await;
-            }
-            return Err(WorkflowError::JobExecutionFailed(error_msg));
-        }
-        if let Some(selected_repo_dir) = repo_path.as_deref() {
-            if let Err(e) = self.compose_executor.preflight_validate_filesystem(
-                selected_repo_dir,
-                compose_file_name,
-                &compose_content,
-                compose_override.as_deref(),
-            ) {
-                let error_msg =
-                    format!("Compose filesystem security policy rejected deployment: {e}");
-                tracing::error!(error = %error_msg, "Docker Compose filesystem preflight failed");
-                if let Some(ref log_id) = self.log_id {
-                    let _ = self.log_service.log_error(log_id, &error_msg).await;
-                }
-                return Err(WorkflowError::JobExecutionFailed(error_msg));
             }
         }
 
@@ -2344,6 +2489,84 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_health_paths_never_carry_substituted_secrets() {
+        // TOKEN may come from the repository .env or an include's env file,
+        // which the project's variables never see; the path is dropped
+        // because it is not written in any source.
+        let source = "healthcheck: {test: [CMD, curl, 'http://localhost/ready/${TOKEN}']}";
+        assert_eq!(
+            snapshot_health_check_path(Some("/ready/private-token".to_string()), &[source]),
+            None
+        );
+        // A query is never persisted, whatever it contains or wherever it
+        // is written.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/ready?token=x".to_string()),
+                &["test: curl localhost/ready?token=x"]
+            ),
+            None
+        );
+        // A path partly built from a variable is not in the sources either.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/v2/health".to_string()),
+                &["test: curl localhost/${API_VERSION}/health"]
+            ),
+            None
+        );
+        assert_eq!(snapshot_health_check_path(None, &[source]), None);
+    }
+
+    #[test]
+    fn literal_health_paths_are_kept_from_any_source() {
+        let source = "services:\n  web:\n    healthcheck:\n      test: [CMD, curl, -f, 'http://localhost:8080/api/health']\n";
+        assert_eq!(
+            snapshot_health_check_path(Some("/api/health".to_string()), &[source]),
+            Some("/api/health".to_string())
+        );
+        // The override and referenced files are sources too.
+        assert_eq!(
+            snapshot_health_check_path(
+                Some("/health".to_string()),
+                &[
+                    "services: {}",
+                    "services: {web: {healthcheck: {test: 'curl localhost/health'}}}"
+                ]
+            ),
+            Some("/health".to_string())
+        );
+    }
+
+    #[test]
+    fn service_snapshots_mask_substituted_images() {
+        let resolved = "services:\n  web:\n    image: registry.example.com/private-token/web:1\n  db:\n    image: postgres:16-private-tag\n";
+        let redact = |text: &str| {
+            text.replace("private-token", "***")
+                .replace("private-tag", "***")
+        };
+        let services = compose_service_snapshots(resolved, None, &[resolved], redact);
+        let image = |name: &str| {
+            services
+                .iter()
+                .find(|service| service.name == name)
+                .and_then(|service| service.image.clone())
+        };
+        assert_eq!(
+            image("web").as_deref(),
+            Some("registry.example.com/***/web:1")
+        );
+        assert_eq!(image("db").as_deref(), Some("postgres:16-***"));
+        // Detection saw the resolved image.
+        let db = services.iter().find(|service| service.name == "db");
+        assert_eq!(
+            db.and_then(|service| service.detected_service_type),
+            Some(temps_entities::preset::ComposeServiceFamily::Postgres)
+        );
+        assert!(compose_service_snapshots("not: [valid", None, &[], redact).is_empty());
+    }
+
+    #[test]
     fn compose_health_path_never_persists_query_secrets() {
         let detected = vec![temps_entities::preset::ComposeServiceSnapshot {
             name: "web".to_string(),
@@ -2563,17 +2786,17 @@ services:
         // `ComposeExecutor::write_compose_files` performs this same rewrite
         // before layering an override that defines `ports`, preventing Compose
         // from retaining both the base and override port mappings.
-        let mut prepared: serde_yaml::Value = serde_yaml::from_str(&stripped).unwrap();
+        let mut prepared: yaml_serde::Value = yaml_serde::from_str(&stripped).unwrap();
         prepared["services"]["web"]
             .as_mapping_mut()
             .expect("web service should be a mapping")
             .remove("ports");
-        let prepared = serde_yaml::to_string(&prepared).unwrap();
+        let prepared = yaml_serde::to_string(&prepared).unwrap();
 
         let preview =
             temps_presets::render_effective_compose_preview(base, Some(override_yaml), &excluded)
                 .expect("preview should render");
-        let preview_value: serde_yaml::Value = serde_yaml::from_str(&preview.yaml).unwrap();
+        let preview_value: yaml_serde::Value = yaml_serde::from_str(&preview.yaml).unwrap();
 
         let temp = tempfile::tempdir().unwrap();
         let base_path = temp.path().join("compose.yml");

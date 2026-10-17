@@ -113,6 +113,12 @@ abort "public release can precede required daemon images" unless
 %w[daemon-images build-and-push-sandbox-images build-and-push-preview-gateway].each do |name|
   abort "#{name} publishes before tests" unless Array(release.dig("jobs", name, "needs")).include?("require-tests")
 end
+database_call = release.dig("jobs", "database-images")
+abort "a release can publish without its managed-database images being pullable" unless
+  database_call && database_call["uses"] == "./.github/workflows/database-images.yml" &&
+  database_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
+  database_call.dig("with", "ensure") == true && !database_call.key?("if") &&
+  !database_call.key?("continue-on-error") && publish.fetch("needs").include?("database-images")
 daemon_call = release.dig("jobs", "daemon-images")
 abort "daemon staging must follow ref validation without moving channel tags" unless
   daemon_call["needs"].sort == %w[validate-release-ref require-tests].sort &&
@@ -280,6 +286,7 @@ read_contents = {"contents" => "read"}
 publish_packages = {"contents" => "read", "packages" => "write"}
 expected_release_permissions = {
   "daemon-images" => publish_packages.merge("id-token" => "write"),
+  "database-images" => publish_packages.merge("id-token" => "write"),
   "validate-release-ref" => read_contents,
   "require-tests" => {"actions" => "read", "contents" => "read"},
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},

@@ -1667,10 +1667,7 @@ impl DataSource for PostgresSource {
             }
 
             // Depth >= 2: Not supported
-            _ => Err(DataError::InvalidQuery(format!(
-                "PostgreSQL hierarchy only supports 2 levels (database/schema). Path depth: {}",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("PostgreSQL", path, 2)),
         }
     }
 

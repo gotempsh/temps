@@ -156,6 +156,11 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=30s
 KillSignal=SIGTERM
+# Stop only the agent, not the sandbox VMs it started: Firecracker and
+# microsandbox VMMs are its child processes, and the default
+# KillMode=control-group would take every running sandbox down with each
+# `systemctl restart`. The restarted agent finds them again by name.
+KillMode=process
 UMask=0077
 
 [Install]
@@ -415,6 +420,23 @@ mod tests {
         assert!(unit.contains("Environment=\"TEMPS_DATA_DIR=/root/.temps\""));
         assert!(unit.contains("ExecStart=\"/usr/local/bin/temps\" agent"));
         assert!(unit.contains("Requires=docker.service"));
+    }
+
+    /// A restart of the agent must not kill the sandbox VMs it started.
+    #[test]
+    fn the_unit_stops_only_the_agent_so_sandbox_vms_survive_a_restart() {
+        let unit =
+            render_unit(Path::new("/usr/local/bin/temps"), Path::new("/root/.temps")).unwrap();
+        let service = unit
+            .split("[Service]")
+            .nth(1)
+            .and_then(|rest| rest.split("[Install]").next())
+            .unwrap();
+        let kill_modes: Vec<&str> = service
+            .lines()
+            .filter(|line| line.starts_with("KillMode="))
+            .collect();
+        assert_eq!(kill_modes, ["KillMode=process"], "{unit}");
     }
 
     #[test]

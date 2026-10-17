@@ -16,9 +16,15 @@ pub struct Model {
     pub scope: String,
     /// JSON array of allowed model IDs, NULL means all models allowed
     pub allowed_models: Option<serde_json::Value>,
-    /// Max requests per minute for this scope, NULL means unlimited
+    /// Max requests per minute per project for deployment-token callers.
+    /// On `project:{id}` it applies to that project; on `instance` it is the
+    /// default for every project without its own value. NULL inherits (project
+    /// -> instance -> built-in default); 0 means unlimited.
     pub max_requests_per_minute: Option<i64>,
-    /// Max spending per month in microcents, NULL means unlimited
+    /// Max operator-funded spend per UTC month in microcents, per project, for
+    /// deployment-token callers. Same scope/inheritance rules as
+    /// `max_requests_per_minute`; NULL inherits (no built-in cap) and 0 means
+    /// unlimited.
     pub max_cost_per_month_microcents: Option<i64>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

@@ -22,6 +22,7 @@ const provider: ProviderCatalogDto = {
   credential_saved: false,
   credential_verification_status: 'not_saved',
   supports_max_turns: true,
+  login_supported: false,
   host_authenticated: false,
   model_source: 'bootstrap',
   workspace_ready: false,

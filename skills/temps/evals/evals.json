@@ -7,7 +7,7 @@
       "expected_output": "Inspects the app and target context, runs the capability detector, offers missing observability once without blocking deployment, uses pinned @temps-sdk/cli with --target-context, and verifies deployment health.",
       "files": [],
       "expectations": [
-        "Uses bunx or npx with @temps-sdk/cli@0.1.37 rather than a global temps command",
+        "Uses bunx or npx with @temps-sdk/cli@0.1.38 rather than a global temps command",
         "Names an explicit target context for state-changing commands",
         "Checks analytics, error tracking, and tracing before the final deploy step",
         "Treats observability as an opt-in offer rather than a deployment requirement",
@@ -34,7 +34,7 @@
       "files": [],
       "expectations": [
         "Uses only the relevant errors command-group reference",
-        "Uses @temps-sdk/cli@0.1.37 with the staging target context",
+        "Uses @temps-sdk/cli@0.1.38 with the staging target context",
         "Performs no state-changing operation",
         "Does not offer instrumentation during a read-only error query"
       ]
@@ -72,10 +72,23 @@
       "files": [],
       "expectations": [
         "Routes to ci-automation and deploy-application",
-        "Pins @temps-sdk/cli@0.1.37 and verifies the reviewed package integrity",
+        "Pins @temps-sdk/cli@0.1.38 and verifies the reviewed package integrity",
         "Uses CI secrets rather than repository plaintext or local ~/.temps files",
         "Uses an explicit production target context and preflight whoami",
         "Waits for deployment health and fails on a bounded timeout"
+      ]
+    },
+    {
+      "id": 7,
+      "prompt": "This repo has apps/web and apps/api. Put both on Temps as one project so the web app can call /api.",
+      "expected_output": "Creates a project (group), connects the repository, dry-runs then runs the monorepo import, adds a /api path route from web to api, and verifies membership and routes.",
+      "files": [],
+      "expectations": [
+        "Routes to projects-and-monorepos and the project-groups reference",
+        "Explains that the console's Project is `project-groups` in the CLI and each app is a service",
+        "Runs `project-groups import --dry-run` before importing",
+        "Uses a path route instead of CORS or a custom proxy for /api",
+        "Follows up with `instantiations show <id> --wait` or `retry` instead of re-running the import"
       ]
     }
   ]

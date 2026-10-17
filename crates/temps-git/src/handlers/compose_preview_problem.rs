@@ -10,6 +10,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use temps_core::problemdetails::ProblemDetails;
 use temps_entities::compose_security::ComposeSecurityCheck;
+use temps_presets::compose_check::{ComposeCheckErrorClass, ComposeCheckReport};
 use temps_presets::ComposeParseError;
 use utoipa::ToSchema;
 
@@ -21,6 +22,27 @@ pub struct ComposePreviewProblemResponse {
     /// The individual project security check an administrator may review.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_check: Option<ComposeSecurityCheck>,
+    /// The class a deployment of the same configuration would fail with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<ComposeCheckErrorClass>,
+    /// The deploy-time Compose check that rejected the configuration, when
+    /// it ran: the `docker compose config` command, its sanitized output and
+    /// the referenced variable names. Variable values are never included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compose_check: Option<ComposeCheckReport>,
+}
+
+/// The deploy-time class of a preview rendering error, so a preview that
+/// fails for the same reason as a deployment reports the same class.
+pub fn preview_error_class(error: &ComposeParseError) -> ComposeCheckErrorClass {
+    match error {
+        ComposeParseError::InvalidYaml { .. } | ComposeParseError::MissingServices => {
+            ComposeCheckErrorClass::InvalidYaml
+        }
+        ComposeParseError::InvalidOverride { .. } => ComposeCheckErrorClass::InvalidOverride,
+        ComposeParseError::PolicyViolation { .. } => ComposeCheckErrorClass::PolicyViolation,
+        ComposeParseError::Serialization { .. } => ComposeCheckErrorClass::Internal,
+    }
 }
 
 impl ComposePreviewProblemResponse {
@@ -30,18 +52,45 @@ impl ComposePreviewProblemResponse {
             _ => None,
         };
         Self {
-            problem: ProblemDetails {
-                type_url: Some("about:blank".to_string()),
-                title: title.to_string(),
-                status: Some(StatusCode::BAD_REQUEST.as_u16()),
-                detail: Some(format!(
-                    "Compose preview for '{path}' could not be rendered: {error}"
-                )),
-                instance: Some(uri.to_string()),
-                extensions: BTreeMap::new(),
-            },
+            problem: preview_problem(
+                title,
+                format!("Compose preview for '{path}' could not be rendered: {error}"),
+                uri,
+            ),
             policy_check,
+            error_class: Some(preview_error_class(error)),
+            compose_check: None,
         }
+    }
+
+    /// The deploy-time Compose check rejected the configuration. The detail
+    /// is the message the deployment would fail with.
+    pub fn from_check(path: &str, uri: &Uri, report: ComposeCheckReport) -> Self {
+        let error = report
+            .error
+            .clone()
+            .unwrap_or_else(|| "the Compose configuration check failed".to_string());
+        Self {
+            problem: preview_problem(
+                "Compose Check Failed",
+                format!("Compose configuration '{path}' would fail to deploy: {error}"),
+                uri,
+            ),
+            policy_check: None,
+            error_class: report.error_class,
+            compose_check: Some(report),
+        }
+    }
+}
+
+fn preview_problem(title: &str, detail: String, uri: &Uri) -> ProblemDetails {
+    ProblemDetails {
+        type_url: Some("about:blank".to_string()),
+        title: title.to_string(),
+        status: Some(StatusCode::BAD_REQUEST.as_u16()),
+        detail: Some(detail),
+        instance: Some(uri.to_string()),
+        extensions: BTreeMap::new(),
     }
 }
 
@@ -97,6 +146,8 @@ mod tests {
         let problem: serde_json::Value =
             serde_json::from_slice(&body).expect("problem body should be valid JSON");
         assert_eq!(problem["policy_check"], "extends");
+        assert_eq!(problem["error_class"], "policy_violation");
+        assert!(problem.get("compose_check").is_none());
         assert_eq!(problem["type"], "about:blank");
         assert_eq!(problem["title"], "Compose Preview Failed");
         assert_eq!(problem["status"], 400);
@@ -123,8 +174,71 @@ mod tests {
         let problem: serde_json::Value =
             serde_json::from_slice(&body).expect("problem body should be valid JSON");
         assert!(problem.get("policy_check").is_none());
+        assert_eq!(problem["error_class"], "invalid_yaml");
         assert_eq!(problem["status"], 400);
         assert_eq!(problem["instance"], "/compose-preview");
+    }
+
+    #[tokio::test]
+    async fn failed_check_reports_the_deploy_error_and_its_class() {
+        let mut report = ComposeCheckReport::failure(
+            ComposeCheckErrorClass::PolicyViolation,
+            "Compose security policy rejected privileged for service 'web': privileged containers are not allowed",
+        );
+        report.referenced_variables = vec!["APP_PORT".to_string()];
+        let response = ComposePreviewProblemResponse::from_check(
+            "compose.yaml",
+            &Uri::from_static("/compose-preview"),
+            report,
+        )
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), 8192)
+            .await
+            .expect("problem body should be readable");
+        let problem: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem body should be valid JSON");
+        assert_eq!(problem["title"], "Compose Check Failed");
+        assert_eq!(problem["error_class"], "policy_violation");
+        assert_eq!(problem["compose_check"]["passed"], false);
+        assert_eq!(
+            problem["compose_check"]["referenced_variables"],
+            serde_json::json!(["APP_PORT"])
+        );
+        assert!(problem["detail"].as_str().is_some_and(|detail| {
+            detail.contains("compose.yaml") && detail.contains("privileged")
+        }));
+    }
+
+    #[test]
+    fn every_preview_error_maps_to_a_deploy_class() {
+        let cases = [
+            (
+                ComposeParseError::InvalidYaml {
+                    reason: "bad".to_string(),
+                },
+                ComposeCheckErrorClass::InvalidYaml,
+            ),
+            (
+                ComposeParseError::MissingServices,
+                ComposeCheckErrorClass::InvalidYaml,
+            ),
+            (
+                ComposeParseError::InvalidOverride {
+                    reason: "bad".to_string(),
+                },
+                ComposeCheckErrorClass::InvalidOverride,
+            ),
+            (
+                ComposeParseError::Serialization {
+                    reason: "bad".to_string(),
+                },
+                ComposeCheckErrorClass::Internal,
+            ),
+        ];
+        for (error, class) in cases {
+            assert_eq!(preview_error_class(&error), class, "{error}");
+        }
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 import { hasCompletedDeployment } from '@/lib/first-deploy'
+import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 export interface ActivationSignals {
   /** Dedicated active admin key has authenticated an external AI harness */
@@ -46,6 +47,17 @@ export interface ActivationSignals {
   dnsProviderConnected: boolean
   /** More than just the initial admin — i.e. a teammate was invited */
   teamInvited: boolean
+  /**
+   * Signals this role is not allowed to read (platform settings, DNS
+   * providers and the user list need `settings:read`). Their value above is
+   * `false` only because nothing was read: they must not be shown as "not
+   * done", nor counted in `completedCount`/`totalCount`.
+   */
+  unreadable: {
+    externalUrl: boolean
+    dnsProviders: boolean
+    team: boolean
+  }
   /** True once all signals are loaded (used to avoid flash of incomplete state) */
   isLoaded: boolean
   /** Number of completed items out of total */
@@ -54,6 +66,12 @@ export interface ActivationSignals {
 }
 
 const TOTAL = 11
+
+const NOTHING_UNREADABLE = {
+  externalUrl: false,
+  dnsProviders: false,
+  team: false,
+}
 
 export function useActivationSignals(): ActivationSignals {
   // Platform settings, DNS providers and the user list are readable by
@@ -121,6 +139,10 @@ export function useActivationSignals(): ActivationSignals {
   const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
     ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
     retry: false,
+    // Shares its cache entry with the AI-harness setup banner, and each
+    // observer's `meta` replaces the other's: both must opt out. Roles without
+    // API-key access are refused here, which is not a failure of the page.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
   })
 
   // TEMP: pretend nothing is set up yet, for building the first-run
@@ -140,6 +162,7 @@ export function useActivationSignals(): ActivationSignals {
       backupsConfigured: false,
       dnsProviderConnected: false,
       teamInvited: false,
+      unreadable: NOTHING_UNREADABLE,
       isLoaded: true,
       completedCount: 0,
       totalCount: TOTAL,
@@ -189,18 +212,23 @@ export function useActivationSignals(): ActivationSignals {
   // active user.
   const teamInvited = (usersData?.length ?? 0) > 1
 
+  const unreadable = isAdmin
+    ? NOTHING_UNREADABLE
+    : { externalUrl: true, dnsProviders: true, team: true }
+  const unreadableCount = Object.values(unreadable).filter(Boolean).length
+
   const completed = [
     aiHarnessConfigured,
     gitConnected,
     wildcardDomainReady,
     hasProject,
     firstDeploySucceeded,
-    externalUrlSet,
+    externalUrlSet && !unreadable.externalUrl,
     notificationsConfigured,
     hasDatabase,
     backupsConfigured,
-    dnsProviderConnected,
-    teamInvited,
+    dnsProviderConnected && !unreadable.dnsProviders,
+    teamInvited && !unreadable.team,
   ].filter(Boolean).length
 
   return {
@@ -216,8 +244,9 @@ export function useActivationSignals(): ActivationSignals {
     backupsConfigured,
     dnsProviderConnected,
     teamInvited,
+    unreadable,
     isLoaded,
     completedCount: completed,
-    totalCount: TOTAL,
+    totalCount: TOTAL - unreadableCount,
   }
 }

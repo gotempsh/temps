@@ -41,6 +41,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Label } from '@/components/ui/label'
 import { AiHarnessLogo } from '@/components/ui/ai-harness-logo'
 import {
@@ -438,11 +439,16 @@ export function ApplicationWorkspaceSettingsPanel({
                     value={sandboxShellCommand(workspace.sandbox_public_id)}
                   />
                 </div>
-                <HighlightedCode
-                  className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
-                  code={sandboxShellCommand(workspace.sandbox_public_id)}
-                  language="bash"
-                />
+                <ScrollRegion
+                  className="mt-2 rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                  regionLabel="Interactive shell command, scrollable"
+                >
+                  <HighlightedCode
+                    className="block w-max whitespace-nowrap"
+                    code={sandboxShellCommand(workspace.sandbox_public_id)}
+                    language="bash"
+                  />
+                </ScrollRegion>
                 <p className="mt-1.5 text-[10px] leading-4 text-muted-foreground">
                   Run from an authenticated Temps CLI. Detach with Ctrl-P,
                   Ctrl-Q and reattach with the same command.
@@ -471,21 +477,31 @@ export function ApplicationWorkspaceSettingsPanel({
                           value={upgrade.command}
                         />
                       </div>
-                      <HighlightedCode
-                        className="mt-2 block overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
-                        code={upgrade.command}
-                        language="bash"
-                      />
+                      <ScrollRegion
+                        className="mt-2 rounded bg-background px-2 py-1.5 text-[10px] text-muted-foreground"
+                        regionLabel={`${upgrade.name} upgrade command, scrollable`}
+                      >
+                        <HighlightedCode
+                          className="block w-max whitespace-nowrap"
+                          code={upgrade.command}
+                          language="bash"
+                        />
+                      </ScrollRegion>
                       <details className="mt-2 text-[10px] text-muted-foreground">
                         <summary className="cursor-pointer select-none">
                           Run as a one-shot CLI command
                         </summary>
                         <div className="mt-1.5 flex items-start gap-1.5 rounded bg-background p-2">
-                          <HighlightedCode
-                            className="min-w-0 flex-1 overflow-x-auto whitespace-nowrap"
-                            code={upgrade.cliCommand}
-                            language="bash"
-                          />
+                          <ScrollRegion
+                            className="min-w-0 flex-1"
+                            regionLabel={`${upgrade.name} Temps CLI command, scrollable`}
+                          >
+                            <HighlightedCode
+                              className="block w-max whitespace-nowrap"
+                              code={upgrade.cliCommand}
+                              language="bash"
+                            />
+                          </ScrollRegion>
                           <CopyButton
                             className="size-6 shrink-0 rounded"
                             label={`Copy ${upgrade.name} Temps CLI command`}
@@ -675,10 +691,14 @@ function ActionButton({
 
 function Field({ children, label }: { children: ReactNode; label: string }) {
   return (
-    <div className="space-y-1.5">
-      <Label>{label}</Label>
+    // A wrapping <label> names the control it contains, whatever that is
+    // (select or input), without needing an id on every call site.
+    <label className="block space-y-1.5">
+      <Label asChild>
+        <span className="block">{label}</span>
+      </Label>
       {children}
-    </div>
+    </label>
   )
 }
 

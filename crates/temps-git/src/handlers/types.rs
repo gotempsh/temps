@@ -27,6 +27,14 @@ pub struct GitAppState {
     /// provider or connection) — challenges with MFA step-up when the acting
     /// user has one enrolled. See [`temps_core::SensitiveActionAuthorizer`].
     pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    /// The deploy job's Compose resolution and policy validation, registered
+    /// by the deployments plugin. The settings preview runs it so a preview
+    /// fails with the same error class a deployment would. `None` only when
+    /// the deployments plugin is not loaded; the preview then falls back to
+    /// its static checks.
+    pub compose_checker: Option<Arc<dyn temps_presets::compose_check::ComposeConfigurationChecker>>,
+    /// Restricts project-scoped previews to members of that project.
+    pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -51,6 +59,10 @@ pub fn create_git_app_state(
         connection_health_service,
         telemetry,
         sensitive_action_authorizer,
+        // Both are resolved in `route_state`, after every plugin registered
+        // its services.
+        compose_checker: None,
+        project_access_checker: None,
     })
 }
 

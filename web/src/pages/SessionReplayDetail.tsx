@@ -89,13 +89,37 @@ function isMetaEventData(data: unknown): data is MetaEventData {
 
 // Event type mapping
 const EVENT_TYPE_INFO = {
-  0: { name: 'DOMContentLoaded', icon: FileText, color: 'text-blue-500' },
-  1: { name: 'Load', icon: Loader2, color: 'text-green-500' },
-  2: { name: 'Full Snapshot', icon: Camera, color: 'text-purple-500' },
-  3: { name: 'Incremental', icon: MousePointer, color: 'text-yellow-500' },
-  4: { name: 'Meta', icon: Eye, color: 'text-cyan-500' },
-  5: { name: 'Custom', icon: Sparkles, color: 'text-pink-500' },
-  6: { name: 'Plugin', icon: Puzzle, color: 'text-indigo-500' },
+  0: {
+    name: 'DOMContentLoaded',
+    icon: FileText,
+    color: 'text-blue-600 dark:text-blue-500',
+  },
+  1: {
+    name: 'Load',
+    icon: Loader2,
+    color: 'text-green-700 dark:text-green-500',
+  },
+  2: {
+    name: 'Full Snapshot',
+    icon: Camera,
+    color: 'text-purple-600 dark:text-purple-500',
+  },
+  3: {
+    name: 'Incremental',
+    icon: MousePointer,
+    color: 'text-yellow-700 dark:text-yellow-500',
+  },
+  4: { name: 'Meta', icon: Eye, color: 'text-cyan-700 dark:text-cyan-500' },
+  5: {
+    name: 'Custom',
+    icon: Sparkles,
+    color: 'text-pink-700 dark:text-pink-500',
+  },
+  6: {
+    name: 'Plugin',
+    icon: Puzzle,
+    color: 'text-indigo-600 dark:text-indigo-500',
+  },
 }
 
 // Incremental snapshot types
@@ -186,7 +210,7 @@ const getEventIcon = (event: SessionEventDto) => {
 const getEventColor = (event: SessionEventDto) => {
   const eventInfo =
     EVENT_TYPE_INFO[event.event_type as keyof typeof EVENT_TYPE_INFO]
-  return eventInfo?.color || 'text-gray-500'
+  return eventInfo?.color || 'text-gray-600 dark:text-gray-400'
 }
 
 export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
@@ -516,7 +540,10 @@ export function SessionReplayDetail({ project }: { project: ProjectResponse }) {
 
                         {isSelected && firstEventData && (
                           <div className="ml-[60px] mt-3 rounded-md bg-muted/30 p-2">
-                            <pre className="overflow-x-auto text-xs">
+                            <pre
+                              tabIndex={0}
+                              className="overflow-x-auto text-xs"
+                            >
                               <HighlightedCode
                                 code={formatEventData(firstEventData)}
                                 language="json"

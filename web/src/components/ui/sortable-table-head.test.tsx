@@ -50,4 +50,13 @@ describe('SortableTableHead', () => {
     expect(html).toContain('aria-sort="descending"')
     expect(html).toContain('aria-label="Sort by Duration, ascending"')
   })
+
+  test('the button fills the header cell so the whole header is the target', () => {
+    const html = render(false)
+
+    // Padding lives on the button, not the cell: clicking anywhere in the
+    // header (not just on its label) must reach the button.
+    expect(html).toMatch(/<th class="[^"]*\bp-0\b/)
+    expect(html).toMatch(/<button[^>]*class="[^"]*\bw-full\b/)
+  })
 })

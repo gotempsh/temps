@@ -4,6 +4,7 @@
 pub mod handlers;
 pub mod plugin;
 pub mod services;
+pub mod template_creation;
 pub mod utils;
 
 #[allow(ambiguous_glob_reexports)]

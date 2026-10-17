@@ -43,7 +43,8 @@ use crate::commands::upgrade::{
     check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_to_file,
     extract_binary_from_tarball_file, fetch_expected_checksum, fetch_latest_release_in_channel,
     fetch_specific_release, finalize_staged_binary, is_newer_version, is_older_version,
-    platform_target, seal_staged_binary, verify_computed_checksum, GitHubRelease, UpgradeChannel,
+    platform_target, seal_staged_binary, stage_vm_agent_from_tarball, verify_computed_checksum,
+    GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -77,7 +78,7 @@ pub struct BinarySelfUpdater {
     binary_path: PathBuf,
     /// Directory holding the update journal.
     data_dir: PathBuf,
-    /// `temps serve --disable-self-update`. A hard, API-proof off switch: unlike
+    /// `temps serve --disable-self-update` or `TEMPS_DISABLE_SELF_UPDATE`. A hard, API-proof off switch: unlike
     /// the settings toggle, nothing reachable over HTTP can clear it.
     disabled_by_flag: bool,
     supervisor: SupervisorKind,
@@ -90,7 +91,9 @@ pub struct BinarySelfUpdater {
     /// Database URL passed explicitly to the migrate child process so it works
     /// even when the parent was started with `--database-url` (not the env var).
     database_url: String,
-    /// `temps serve --pre-migration-backup`, forwarded to the migrate child.
+    /// `temps serve --pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP`,
+    /// forwarded to the migrate child as the flag (so it does not depend on the
+    /// child inheriting the environment).
     pre_migration_backup: bool,
 }
 
@@ -272,7 +275,7 @@ impl BinarySelfUpdater {
 
     /// First blocker that applies, or `None` when an update can run.
     ///
-    /// Order is deliberate: an explicit operator decision (`--disable-self-update`,
+    /// Order is deliberate: an explicit operator decision (`--disable-self-update`/`TEMPS_DISABLE_SELF_UPDATE`,
     /// then the settings toggle) is reported before any environmental problem,
     /// because "you turned this off" is the honest answer even on a host that
     /// also happens to be unsupervised.
@@ -280,8 +283,9 @@ impl BinarySelfUpdater {
         if self.disabled_by_flag {
             return Some((
                 SelfUpdateBlocker::DisabledByFlag,
-                "The server was started with --disable-self-update. Restart it without that flag \
-                 to allow updates from the console; this cannot be re-enabled from the UI."
+                "The server was started with --disable-self-update (or TEMPS_DISABLE_SELF_UPDATE). \
+                 Restart it without that flag and variable to allow updates from the console; \
+                 this cannot be re-enabled from the UI."
                     .to_string(),
             ));
         }
@@ -959,11 +963,50 @@ impl UpdateJob {
         let staged_path = seal_staged_binary(staged_file)?;
         preflight_staged_binary(staged_path.as_ref())?;
 
+        // The Firecracker guest agent ships in the same tarball and has to
+        // match the host's wire protocol, so refresh it alongside the binary.
+        // Strictly best-effort: staging happens before the swap so a failure
+        // is known up front, and neither it nor the install below can turn a
+        // verified host update into a failed one.
+        let staged_agent = match stage_vm_agent_from_tarball(
+            download_file.as_file_mut(),
+            &download_path,
+            &self.binary_path,
+        ) {
+            Ok(staged) => staged,
+            Err(e) => {
+                warn!(
+                    to = %to_version,
+                    binary = %self.binary_path.display(),
+                    error = %e,
+                    "Could not stage the Firecracker guest agent from the release; the existing one was left untouched"
+                );
+                None
+            }
+        };
+
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots
         // but misbehaves can be reverted with a single `mv`, without network.
         let backup_path = backup_current_binary(&self.binary_path)?;
         finalize_staged_binary(&self.binary_path, staged_path)?;
+
+        if let Some(staged_agent) = staged_agent {
+            let agent_path = staged_agent.dest().to_path_buf();
+            match staged_agent.install() {
+                Ok(path) => info!(
+                    to = %to_version,
+                    agent = %path.display(),
+                    "Updated the Firecracker guest agent beside the binary; re-run `temps firecracker setup` to give new sandboxes the updated agent"
+                ),
+                Err(e) => warn!(
+                    to = %to_version,
+                    agent = %agent_path.display(),
+                    error = %e,
+                    "Host binary updated but the Firecracker guest agent could not be replaced; it is still the previous version"
+                ),
+            }
+        }
 
         Ok((to_version, backup_path))
     }

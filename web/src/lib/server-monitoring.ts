@@ -327,6 +327,46 @@ export function isMetricsUnavailable(err: unknown): boolean {
   return msg.includes('not enabled') || msg.includes('unavailable')
 }
 
+/**
+ * The current disk share: the snapshot's figure when present, otherwise the
+ * latest used-bytes sample over the total. `null` when neither exists, so a
+ * missing reading stays distinguishable from a genuine 0 % (`usagePercent`
+ * clamps a missing pair to 0 for the progress bar, which is not a reading).
+ */
+export function currentDiskPercent(
+  snapshotPercent: number | null,
+  lastUsedBytes: number | null,
+  totalBytes: number | null
+): number | null {
+  if (snapshotPercent != null) return snapshotPercent
+  if (lastUsedBytes == null || totalBytes == null || !(totalBytes > 0)) {
+    return null
+  }
+  return usagePercent(lastUsedBytes, totalBytes)
+}
+
+/**
+ * Whether the metrics store answered but has not received a single node
+ * sample yet: every usage series is empty and the latest snapshot carries no
+ * figure. This is the first minutes after metric collection is switched on,
+ * which the charts alone render as five unrelated "no samples" captions.
+ * A request that is still pending or failed is not "no samples".
+ */
+export function hasNoNodeSamples(state: {
+  /** Each series' points once it has answered; `undefined` while pending or failed. */
+  series: (readonly unknown[] | undefined)[]
+  /** Latest snapshot's usage figures; `null` when none is present. */
+  current: (number | null)[]
+}): boolean {
+  return (
+    state.series.length > 0 &&
+    state.series.every(
+      (points) => points !== undefined && points.length === 0
+    ) &&
+    state.current.every((value) => value === null)
+  )
+}
+
 /** Slices of the Docker disk-usage breakdown, in fixed order. */
 export const DOCKER_USAGE_SLICES = [
   { key: 'images', label: 'Images' },

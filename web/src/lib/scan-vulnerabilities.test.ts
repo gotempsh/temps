@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { expect, test } from 'bun:test'
-import { scanVulnerabilities } from './scan-vulnerabilities'
+import { describe, expect, test } from 'bun:test'
+import {
+  findScanVulnerability,
+  findVulnerabilityInPages,
+  scanVulnerabilities,
+  VulnerabilitySearchIncompleteError,
+} from './scan-vulnerabilities'
 const row = {
   id: 1,
   scan_id: 1,
@@ -33,4 +38,233 @@ test('rejects malformed payloads rather than reporting zero vulnerabilities', ()
       'invalid vulnerability list'
     )
   }
+})
+
+test('findScanVulnerability treats unknown or malformed ids as not found', () => {
+  expect(findScanVulnerability([row], '1')?.id).toBe(1)
+  for (const id of [undefined, '', 'abc', '1.5', '-1', '0x1', '2']) {
+    expect(findScanVulnerability([row], id)).toBeUndefined()
+  }
+})
+
+describe('findVulnerabilityInPages', () => {
+  const makeRow = (id: number) => ({
+    ...row,
+    id,
+    vulnerability_id: `CVE-${id}`,
+  })
+  // A scan with 250 findings served 100 at a time, like the server does.
+  const all = Array.from({ length: 250 }, (_, i) => makeRow(i + 1))
+  const pagesRequested: number[] = []
+  const fetchPage = async (page: number) => {
+    pagesRequested.push(page)
+    return {
+      data: all.slice((page - 1) * 100, page * 100),
+      total: all.length,
+      page,
+      page_size: 100,
+    }
+  }
+
+  test('finds a finding that is not on the first page', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '230', fetchPage })
+    expect(found?.id).toBe(230)
+    expect(pagesRequested).toEqual([1, 2, 3])
+  })
+
+  test('stops at the first page when the finding is there', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '7', fetchPage })
+    expect(found?.id).toBe(7)
+    expect(pagesRequested).toEqual([1])
+  })
+
+  test('reports an absent id only after the last page', async () => {
+    pagesRequested.length = 0
+    const found = await findVulnerabilityInPages({ vulnId: '9999', fetchPage })
+    expect(found).toBeUndefined()
+    expect(pagesRequested).toEqual([1, 2, 3])
+  })
+
+  test('does not fetch for a malformed id', async () => {
+    pagesRequested.length = 0
+    for (const id of [undefined, '', 'abc', '1.5', '-1']) {
+      expect(await findVulnerabilityInPages({ vulnId: id, fetchPage })).toBe(
+        undefined
+      )
+    }
+    expect(pagesRequested).toEqual([])
+  })
+
+  test('an empty scan ends on the first page', async () => {
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '1',
+      fetchPage: async (page) => {
+        calls.push(page)
+        return { data: [], total: 0, page, page_size: 100 }
+      },
+    })
+    expect(found).toBeUndefined()
+    expect(calls).toEqual([1])
+  })
+
+  test('a failing page is an error, not "not found"', async () => {
+    const failing = async (page: number) => {
+      if (page === 2) throw new Error('boom')
+      return { data: all.slice(0, 100), total: 250, page, page_size: 100 }
+    }
+    await expect(
+      findVulnerabilityInPages({ vulnId: '150', fetchPage: failing })
+    ).rejects.toThrow('boom')
+  })
+
+  test('a server that returns shorter pages than asked for does not end the walk', async () => {
+    // Asked for 100 per page, served 40: only `total` says there is more.
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '200',
+      fetchPage: async (page) => {
+        calls.push(page)
+        return {
+          data: all.slice((page - 1) * 40, page * 40),
+          total: all.length,
+          page,
+          page_size: 40,
+        }
+      },
+    })
+    expect(found?.id).toBe(200)
+    expect(calls).toEqual([1, 2, 3, 4, 5])
+  })
+
+  test('without a total, a page shorter than requested ends the walk', async () => {
+    const calls: number[] = []
+    const found = await findVulnerabilityInPages({
+      vulnId: '999',
+      pageSize: 100,
+      fetchPage: async (page) => {
+        calls.push(page)
+        return { data: all.slice((page - 1) * 100, page * 100) }
+      },
+    })
+    expect(found).toBeUndefined()
+    expect(calls).toEqual([1, 2, 3])
+  })
+
+  test('giving up at the page limit is an incomplete search, not "not found"', async () => {
+    const big = async (page: number) => ({
+      data: Array.from({ length: 100 }, (_, i) => makeRow(page * 1000 + i)),
+      total: 1_000_000,
+      page,
+      page_size: 100,
+    })
+    const search = findVulnerabilityInPages({
+      vulnId: '5',
+      fetchPage: big,
+      maxPages: 3,
+    })
+    await expect(search).rejects.toBeInstanceOf(
+      VulnerabilitySearchIncompleteError
+    )
+    await expect(search).rejects.toMatchObject({
+      reason: 'too-large',
+      // Searching again would read the same pages and fail the same way.
+      retryable: false,
+      pagesSearched: 3,
+    })
+    await expect(search).rejects.toThrow('first 300 findings')
+    await expect(search).rejects.toThrow('which has 1000000')
+    // The message must not send the user to the scan's list: it shows only
+    // the first page of findings, which cannot contain this one.
+    await expect(search).rejects.not.toThrow(/scan's list/)
+  })
+
+  test('a finding served on no page is an unstable-order search, not "not found"', async () => {
+    // 250 findings, but the server dealt a tied row to neither side of the
+    // page-2/page-3 boundary: id 200 is skipped and id 199 is served twice.
+    const pages = [
+      all.slice(0, 100),
+      all.slice(100, 199),
+      [all[198], ...all.slice(200, 250)],
+    ]
+    const search = findVulnerabilityInPages({
+      vulnId: '200',
+      fetchPage: async (page) => ({
+        data: pages[page - 1] ?? [],
+        total: 250,
+        page,
+        page_size: 100,
+      }),
+    })
+    await expect(search).rejects.toBeInstanceOf(
+      VulnerabilitySearchIncompleteError
+    )
+    await expect(search).rejects.toMatchObject({
+      reason: 'unstable-order',
+      retryable: true,
+    })
+  })
+
+  test('fewer distinct findings than the total is unstable even without a repeat', async () => {
+    const search = findVulnerabilityInPages({
+      vulnId: '9999',
+      fetchPage: async (page) => ({
+        // The server says 150 but only ever serves 100 distinct rows.
+        data: page === 1 ? all.slice(0, 100) : [],
+        total: 150,
+        page,
+        page_size: 100,
+      }),
+    })
+    await expect(search).rejects.toMatchObject({ reason: 'unstable-order' })
+  })
+
+  test('a consistent walk with no repeats still resolves undefined for an absent id', async () => {
+    const found = await findVulnerabilityInPages({
+      vulnId: '9999',
+      fetchPage: async (page) => ({
+        data: all.slice((page - 1) * 100, page * 100),
+        total: 250,
+        page,
+        page_size: 100,
+      }),
+    })
+    expect(found).toBeUndefined()
+  })
+
+  test('a repeat does not hide a finding that is on a later page', async () => {
+    const pages = [
+      all.slice(0, 100),
+      [all[99], ...all.slice(100, 199)],
+      all.slice(199),
+    ]
+    const found = await findVulnerabilityInPages({
+      vulnId: '230',
+      fetchPage: async (page) => ({
+        data: pages[page - 1] ?? [],
+        total: 250,
+      }),
+    })
+    expect(found?.id).toBe(230)
+  })
+
+  test('stops before requesting another page once cancelled', async () => {
+    const controller = new AbortController()
+    const calls: number[] = []
+    const search = findVulnerabilityInPages({
+      vulnId: '9999',
+      signal: controller.signal,
+      fetchPage: async (page, signal) => {
+        calls.push(page)
+        // The user leaves the page while the second request is in flight.
+        if (page === 2) controller.abort()
+        expect(signal).toBe(controller.signal)
+        return { data: all.slice((page - 1) * 100, page * 100), total: 250 }
+      },
+    })
+    await expect(search).rejects.toThrow()
+    expect(calls).toEqual([1, 2])
+  })
 })

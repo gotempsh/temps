@@ -80,6 +80,41 @@ pub enum StatusPageError {
     PublishWithoutMonitors { status_page_id: i32 },
     #[error("failed to generate a status page slug for project {project_id}: {reason}")]
     SlugGeneration { project_id: i32, reason: String },
+    #[error("'{hostname}' is not a valid status page hostname: {reason}")]
+    InvalidHostname { hostname: String, reason: String },
+    #[error("'{hostname}' is already in use on this Temps instance")]
+    HostnameInUse { hostname: String },
+    #[error("'{hostname}' changed while its certificate order started (page unpublished or hostname removed); try again")]
+    HostnameBindingChanged { hostname: String },
+    #[error("publish status page {status_page_id} before verifying '{hostname}'; certificates are only issued for published pages")]
+    DomainRequiresPublishedPage {
+        status_page_id: i32,
+        hostname: String,
+    },
+    #[error("a certificate operation for '{hostname}' is already in progress; try again when it finishes")]
+    CertificateOperationInProgress { hostname: String },
+    #[error("'{hostname}' on status page {status_page_id} has no certificate to renew; verify it instead")]
+    DomainNotRenewable {
+        status_page_id: i32,
+        hostname: String,
+    },
+    #[error("too many custom domain operations for project {project_id}; try again in {retry_after_secs}s")]
+    DomainOperationsThrottled {
+        project_id: i32,
+        retry_after_secs: u64,
+    },
+    #[error("could not check whether '{hostname}' is already in use: {reason}")]
+    HostnameUnverifiable { hostname: String, reason: String },
+    #[error("status page {status_page_id} already has the maximum of {limit} custom domains")]
+    StatusPageDomainLimitReached { status_page_id: i32, limit: u64 },
+    #[error("custom domain {domain_id} not found on status page {status_page_id}")]
+    StatusPageDomainNotFound { status_page_id: i32, domain_id: i32 },
+    #[error("ownership of '{hostname}' could not be verified yet: {reason}")]
+    DomainVerificationFailed { hostname: String, reason: String },
+    #[error("failed to start certificate issuance for '{hostname}': {reason}")]
+    CertificateOrder { hostname: String, reason: String },
+    #[error("an account email address is required to request a certificate for '{hostname}'")]
+    AcmeEmailRequired { hostname: String },
     #[error("failed to build the public snapshot of status page {status_page_id}: {source}")]
     SnapshotBuild {
         status_page_id: i32,

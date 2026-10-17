@@ -8,6 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OtelMetricAlertRuleResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
@@ -15,16 +16,6 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -177,42 +168,24 @@ export default function MetricAlerts({ project }: MetricAlertsProps) {
         </div>
       )}
 
-      <AlertDialog
-        open={!!pendingDelete}
+      <ConfirmDeleteDialog
+        open={pendingDelete !== null}
         onOpenChange={(open) => {
           if (!open) setPendingDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete alert rule?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently deletes
-              {pendingDelete ? ` “${pendingDelete.name}”` : ' this alert rule'}.
-              This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              disabled={deleteMutation.isPending}
-              onClick={(e) => {
-                e.preventDefault()
-                if (pendingDelete) {
-                  deleteMutation.mutate({
-                    path: { id: pendingDelete.id },
-                    query: { project_id: project.id },
-                  })
-                }
-              }}
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="alert rule"
+        resourceName={pendingDelete?.name ?? ''}
+        consequences={`${project.name} stops being monitored for this rule and no longer receives its alerts.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (pendingDelete) {
+            deleteMutation.mutate({
+              path: { id: pendingDelete.id },
+              query: { project_id: project.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }
@@ -282,7 +255,7 @@ function AlertRow({
           </DropdownMenuItem>
           <DropdownMenuItem
             onClick={onDelete}
-            className="text-rose-500 focus:text-rose-500"
+            className="text-rose-700 dark:text-rose-500 focus:text-rose-500"
           >
             <Trash2 className="size-4" />
             Delete

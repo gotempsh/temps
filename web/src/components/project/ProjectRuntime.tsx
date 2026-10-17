@@ -14,7 +14,8 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Button } from '@/components/ui/button'
 import { FileText, Radio, Rocket, ScrollText } from 'lucide-react'
-import { useNavigate, useParams, useSearchParams } from 'react-router'
+import { useNavigate, useParams } from 'react-router'
+import { useUrlState } from '@temps-sdk/ds'
 
 interface ProjectRuntimeProps {
   project: ProjectResponse
@@ -23,18 +24,15 @@ interface ProjectRuntimeProps {
 export function ProjectRuntime({ project }: ProjectRuntimeProps) {
   const navigate = useNavigate()
   const { slug } = useParams()
-  const [searchParams, setSearchParams] = useSearchParams()
+  // The tab shares its URL writes with the log search (`q`) and deployment
+  // filter inside the viewers, so switching tabs right after typing keeps both.
+  const { get, patch } = useUrlState<'tab'>()
 
   // Sync tab with ?tab= search param (defaults to "live")
-  const activeTab = searchParams.get('tab') === 'history' ? 'history' : 'live'
+  const activeTab = get('tab') === 'history' ? 'history' : 'live'
 
   const handleTabChange = (value: string) => {
-    if (value === 'live') {
-      searchParams.delete('tab')
-    } else {
-      searchParams.set('tab', value)
-    }
-    setSearchParams(searchParams, { replace: true })
+    patch({ tab: value === 'live' ? undefined : value })
   }
 
   // Check if project has any deployments

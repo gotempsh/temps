@@ -40,7 +40,7 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{patch, post},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use temps_auth::{
@@ -59,8 +59,8 @@ use super::audit::{
 use super::rate_limiter::AnalyticsIngestRateLimiter;
 use super::service::AnalyticsIngestKeyService;
 use super::types::{
-    AnalyticsIngestKey, AnalyticsIngestKeyError, CreateAnalyticsIngestKeyRequest,
-    UpdateAnalyticsIngestKeyRequest,
+    AnalyticsIngestEndpoint, AnalyticsIngestKey, AnalyticsIngestKeyError,
+    CreateAnalyticsIngestKeyRequest, UpdateAnalyticsIngestKeyRequest,
 };
 
 /// State for the ingest-key admin routes.
@@ -76,6 +76,10 @@ pub struct AnalyticsIngestKeysAppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// ADR-028 team-based project access checker (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Source of the external URL for [`get_analytics_ingest_key_endpoint`].
+    /// `None` when the binary has no settings service; the endpoint then
+    /// reports no external URL rather than failing.
+    pub config_service: Option<Arc<temps_config::ConfigService>>,
 }
 
 #[derive(OpenApi)]
@@ -83,11 +87,13 @@ pub struct AnalyticsIngestKeysAppState {
     paths(
         create_analytics_ingest_key,
         list_analytics_ingest_keys,
+        get_analytics_ingest_key_endpoint,
         update_analytics_ingest_key,
         rotate_analytics_ingest_key,
         revoke_analytics_ingest_key,
     ),
     components(schemas(
+        AnalyticsIngestEndpoint,
         AnalyticsIngestKey,
         CreateAnalyticsIngestKeyRequest,
         UpdateAnalyticsIngestKeyRequest,
@@ -103,6 +109,10 @@ pub fn configure_ingest_key_routes() -> Router<Arc<AnalyticsIngestKeysAppState>>
         .route(
             "/projects/{project_id}/analytics/ingest-keys",
             post(create_analytics_ingest_key).get(list_analytics_ingest_keys),
+        )
+        .route(
+            "/projects/{project_id}/analytics/ingest-endpoint",
+            get(get_analytics_ingest_key_endpoint),
         )
         .route(
             "/projects/{project_id}/analytics/ingest-keys/{key_id}",
@@ -167,6 +177,16 @@ impl From<AnalyticsIngestKeyError> for Problem {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
+            }
+            // The reason is a settings-store error; it stays in the server log
+            // because this route answers roles that cannot read settings.
+            AnalyticsIngestKeyError::ExternalUrlUnavailable { project_id, .. } => {
+                error!("{error}");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("External URL Unavailable")
+                    .with_detail(format!(
+                        "The external URL for analytics ingest in project {project_id} could not be read"
+                    ))
             }
             AnalyticsIngestKeyError::Database(ref e) => {
                 error!("Analytics ingest key database error: {e}");
@@ -298,6 +318,58 @@ async fn list_analytics_ingest_keys(
     let keys = state.ingest_key_service.list(project_id).await?;
 
     Ok((StatusCode::OK, Json(keys)))
+}
+
+/// The public address an app Temps does not deploy should send analytics to.
+///
+/// This is the `basePath` of the install snippet. It is its own endpoint
+/// because `GET /settings` needs `settings:read`, which a project member does
+/// not hold; this one needs only `AnalyticsRead` on the project, exactly like
+/// listing the keys the same snippet embeds, and exposes nothing but the one
+/// address. `external_url: null` means none is stored.
+#[utoipa::path(
+    tag = "Analytics Ingest Keys",
+    get,
+    path = "/projects/{project_id}/analytics/ingest-endpoint",
+    operation_id = "get_analytics_ingest_key_endpoint",
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 200, description = "The configured external URL, or null when none is stored", body = AnalyticsIngestEndpoint),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_analytics_ingest_key_endpoint(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AnalyticsIngestKeysAppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, AnalyticsRead);
+    deny_deployment_token!(auth);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let external_url = match &state.config_service {
+        Some(config) => config
+            .get_external_url()
+            .await
+            .map_err(|e| AnalyticsIngestKeyError::ExternalUrlUnavailable {
+                project_id,
+                reason: e.to_string(),
+            })?
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty()),
+        None => None,
+    };
+
+    Ok((
+        StatusCode::OK,
+        Json(AnalyticsIngestEndpoint { external_url }),
+    ))
 }
 
 /// Update an ingest key's label, origin allowlist, or rate limit.
@@ -555,6 +627,7 @@ mod tests {
             rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
             audit_service: audit.clone(),
             project_access_checker: None,
+            config_service: None,
         });
         (state, audit)
     }
@@ -693,6 +766,199 @@ mod tests {
         .err()
         .expect("a role without AnalyticsRead must not list ingest keys");
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    // ── Ingest endpoint (the install snippet's `basePath`) ───────────────
+    //
+    // The snippet is shown to every role that can read the project's
+    // analytics, but `GET /settings` is admin-only, so the address has to come
+    // from here and must not need `settings:read`.
+
+    fn settings_row_with_external_url(
+        external_url: Option<&str>,
+    ) -> temps_entities::settings::Model {
+        let settings = temps_core::AppSettings {
+            external_url: external_url.map(str::to_string),
+            ..temps_core::AppSettings::default()
+        };
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn state_with_external_url(external_url: Option<&str>) -> Arc<AnalyticsIngestKeysAppState> {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row_with_external_url(external_url)]])
+                .into_connection(),
+        );
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("test ServerConfig should build"),
+        );
+        Arc::new(AnalyticsIngestKeysAppState {
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            project_access_checker: None,
+            config_service: Some(Arc::new(temps_config::ConfigService::new(
+                server_config,
+                db,
+            ))),
+        })
+    }
+
+    #[tokio::test]
+    async fn endpoint_returns_the_external_url_to_a_plain_user() {
+        // `Role::User` is the role the issue was reported with. It must be able
+        // to read the address even though it cannot read the settings.
+        assert!(Role::User.has_permission(&Permission::AnalyticsRead));
+        assert!(!Role::User.has_permission(&Permission::SettingsRead));
+
+        let response = get_analytics_ingest_key_endpoint(
+            user_auth(Role::User),
+            State(state_with_external_url(Some("https://temps.example.test"))),
+            Path(1),
+        )
+        .await
+        .expect("a user with AnalyticsRead may read the ingest endpoint")
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "external_url": "https://temps.example.test" })
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_strips_a_trailing_slash_so_the_snippet_does_not_double_it() {
+        let response = get_analytics_ingest_key_endpoint(
+            user_auth(Role::User),
+            State(state_with_external_url(Some("https://temps.example.test/"))),
+            Path(1),
+        )
+        .await
+        .expect("read should succeed")
+        .into_response();
+
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "external_url": "https://temps.example.test" })
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_reports_null_when_no_external_url_is_stored() {
+        let response = get_analytics_ingest_key_endpoint(
+            user_auth(Role::User),
+            State(state_with_external_url(None)),
+            Path(1),
+        )
+        .await
+        .expect("read should succeed")
+        .into_response();
+
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "external_url": null })
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_reports_null_without_a_settings_service() {
+        let response =
+            get_analytics_ingest_key_endpoint(user_auth(Role::User), State(empty_state()), Path(1))
+                .await
+                .expect("read should succeed")
+                .into_response();
+
+        assert_eq!(
+            body_json(response).await,
+            serde_json::json!({ "external_url": null })
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_answers_500_without_leaking_the_settings_error_when_the_read_fails() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "settings store unreachable at 10.0.0.9".to_string(),
+                )])
+                .into_connection(),
+        );
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgres://test:test@localhost/test".to_string(),
+                None,
+                None,
+            )
+            .expect("test ServerConfig should build"),
+        );
+        let state = Arc::new(AnalyticsIngestKeysAppState {
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            audit_service: Arc::new(RecordingAuditLogger::default()),
+            project_access_checker: None,
+            config_service: Some(Arc::new(temps_config::ConfigService::new(
+                server_config,
+                db,
+            ))),
+        });
+
+        let err = get_analytics_ingest_key_endpoint(user_auth(Role::User), State(state), Path(7))
+            .await
+            .err()
+            .expect("a failed settings read must not be reported as 'no external URL'");
+
+        assert_eq!(err.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let rendered = serde_json::to_string(&err.body).expect("problem body should serialize");
+        assert!(
+            rendered.contains("project 7"),
+            "the detail should name the project: {rendered}"
+        );
+        assert!(
+            !rendered.contains("10.0.0.9") && !rendered.contains("unreachable"),
+            "the settings error must stay in the server log: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_a_role_without_analytics_read() {
+        assert!(!Role::MetricsIngest.has_permission(&Permission::AnalyticsRead));
+
+        let err = get_analytics_ingest_key_endpoint(
+            user_auth(Role::MetricsIngest),
+            State(state_with_external_url(Some("https://temps.example.test"))),
+            Path(1),
+        )
+        .await
+        .err()
+        .expect("a role without AnalyticsRead must not read the ingest endpoint");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn endpoint_rejects_a_deployment_token() {
+        let err = get_analytics_ingest_key_endpoint(
+            deployment_token_auth(),
+            State(state_with_external_url(Some("https://temps.example.test"))),
+            Path(1),
+        )
+        .await
+        .err()
+        .expect("a deployment token must not read the ingest endpoint");
+        assert_deployment_token_denied(err);
     }
 
     // ── Deployment tokens are denied outright ────────────────────────────
@@ -1092,6 +1358,13 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (
+                AnalyticsIngestKeyError::ExternalUrlUnavailable {
+                    project_id: 2,
+                    reason: "settings store unreachable".into(),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
                 AnalyticsIngestKeyError::Database(sea_orm::DbErr::Custom("boom".into())),
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
@@ -1152,9 +1425,9 @@ mod tests {
             }
         }
 
-        assert_eq!(operation_ids.len(), 5, "expected five operations");
+        assert_eq!(operation_ids.len(), 6, "expected six operations");
         let unique: std::collections::HashSet<_> = operation_ids.iter().collect();
-        assert_eq!(unique.len(), 5, "operationIds must be unique");
+        assert_eq!(unique.len(), 6, "operationIds must be unique");
     }
 
     /// The `public_key` field must never be described as a secret, and must

@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  ServiceGroupControl,
+  useServiceGroup,
+} from '@/components/project-groups/ServiceGroupControl'
+import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
 import { useEffect, useRef } from 'react'
 import {
@@ -9,10 +14,10 @@ import {
 } from '@/lib/docker-socket'
 import type { ProjectDeploymentStatus } from '@/lib/project-deployment-status'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
+import { ExternalBadge } from '@/components/dashboard/ProjectCard'
 import { Badge, badgeVariants } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
 import { useProjectFailureState } from '@/hooks/useProjectFailureState'
 import { useProjectsMonitorHealth } from '@/hooks/useProjectsMonitorHealth'
@@ -123,11 +128,18 @@ export function ProjectDetailHeader({
   // field as "unknown", so the badge stays hidden rather than claiming the
   // grant is absent.
   const dockerSocket = describeDockerSocket(project.docker_socket)
-  const screenshotLocation = lastDeployment?.screenshot_location
+  const group = useServiceGroup(project.id).data?.group
+  // An app hosted elsewhere is never deployed by Temps: no deploy button and
+  // no "Not deployed", which would read as something to fix. `hosting` is the
+  // explicit flag; `source_type: 'external'` marks a monitoring-only project.
+  const isExternal =
+    project.hosting === 'external' || project.source_type === 'external'
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
   const { status: deploymentStatus, environmentsQuery } =
-    useProjectFailureState(project.id, lastDeployment)
+    useProjectFailureState(project.id, lastDeployment, {
+      enabled: !isExternal,
+    })
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -164,27 +176,21 @@ export function ProjectDetailHeader({
   return (
     <header className="flex h-12 sm:h-16 shrink-0 items-center gap-2 border-b px-3 sm:px-4">
       <div className="flex flex-1 items-center justify-between gap-4 min-w-0">
-        <div className="flex items-center gap-4">
-          {screenshotLocation ? (
-            <div className="size-8 shrink-0 overflow-hidden rounded-md border bg-muted/30">
-              <ReloadableImage
-                src={`/api/files${
-                  screenshotLocation.startsWith('/')
-                    ? screenshotLocation
-                    : '/' + screenshotLocation
-                }`}
-                alt={`${project.slug} preview`}
-                className="h-full w-full object-cover object-top"
-              />
-            </div>
-          ) : (
-            <ProjectAvatar name={project.name} className="size-8" />
-          )}
+        <div className="flex min-w-0 items-center gap-4">
+          <ServiceIcon service={project} size="md" className="shrink-0" />
           <div className="flex items-center gap-2 min-w-0">
             <h1 className="text-base sm:text-lg font-semibold truncate">
-              {project.slug}
+              {group ? (
+                <ProjectServiceSwitcher project={project} group={group}>
+                  {project.slug}
+                </ProjectServiceSwitcher>
+              ) : (
+                project.slug
+              )}
             </h1>
-            {isProblemStatus(deploymentStatus) ? (
+            {isExternal ? (
+              <ExternalBadge />
+            ) : isProblemStatus(deploymentStatus) ? (
               // Failed / Degraded link to the overview banner that explains
               // the problem and offers the fix. Unlike the routine states it
               // stays visible on phones, where it shrinks to its icon so the
@@ -227,6 +233,7 @@ export function ProjectDetailHeader({
               // an operator needs. It degrades to an icon plus a short label
               // instead of disappearing.
               <Badge
+                role="img"
                 variant="outline"
                 className="inline-flex shrink-0 gap-1"
                 title={dockerSocket.detail}
@@ -250,9 +257,10 @@ export function ProjectDetailHeader({
                 className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
               />
             </Link>
+            <ServiceGroupControl project={project} />
           </div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex shrink-0 items-center gap-2">
           {activeVisitorsCount !== undefined && (
             <button
               type="button"
@@ -301,10 +309,12 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
-          <Button size="sm" onClick={onDeploy}>
-            <Rocket className="size-4" />
-            <span className="hidden sm:inline">Deploy</span>
-          </Button>
+          {!isExternal && (
+            <Button size="sm" onClick={onDeploy}>
+              <Rocket className="size-4" />
+              <span className="max-sm:sr-only">Deploy</span>
+            </Button>
+          )}
         </div>
       </div>
     </header>

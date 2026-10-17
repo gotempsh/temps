@@ -275,7 +275,7 @@ export function UserDetail() {
                   {target.user.mfa_enabled && (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
                     >
                       <Shield className="h-3 w-3" />
                       MFA
@@ -284,7 +284,7 @@ export function UserDetail() {
                   {target.user.email_verified ? (
                     <Badge
                       variant="secondary"
-                      className="gap-1 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                      className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
                     >
                       <MailCheck className="h-3 w-3" />
                       Verified

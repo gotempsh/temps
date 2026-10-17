@@ -118,7 +118,7 @@ test('custom windows and legacy one-day links retain their meaning', () => {
 describe('facetProjectLabels', () => {
   test('names projects the server resolved and marks the rest unknown', () => {
     expect(facetProjectLabels([1, 2], { '1': 'storefront' })).toEqual({
-      labels: { '1': 'storefront', '2': 'Unknown project #2' },
+      labels: { '1': 'storefront', '2': 'Unknown service #2' },
       existing: [1],
     })
   })

@@ -112,7 +112,17 @@ impl DeployStaticJob {
     /// Write log message to job-specific log file and context
     async fn log(&self, context: &WorkflowContext, message: String) -> Result<(), WorkflowError> {
         let level = Self::detect_log_level(&message);
+        self.log_at(context, level, message).await
+    }
 
+    /// Write a log message at an explicit level, bypassing content sniffing
+    /// (a skipped path named `error.map` must not turn a warning into an error).
+    async fn log_at(
+        &self,
+        context: &WorkflowContext,
+        level: LogLevel,
+        message: String,
+    ) -> Result<(), WorkflowError> {
         if let (Some(ref log_id), Some(ref log_service)) = (&self.log_id, &self.log_service) {
             log_service
                 .append_structured_log(log_id, level, message.clone())
@@ -282,6 +292,11 @@ impl WorkflowTask for DeployStaticJob {
             }
         };
 
+        if let Some(summary) = result.skipped_summary() {
+            self.log_at(&context, LogLevel::Warning, format!("⚠️ {summary}"))
+                .await?;
+        }
+
         self.log(&context, format!("📍 Deployed to: {}", result.storage_path))
             .await?;
 
@@ -433,6 +448,7 @@ mod tests {
                 tags: vec![],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -696,16 +712,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_sensitive_static_deploy_cleans_temporary_extraction() {
+    async fn static_deploy_skips_sensitive_files_and_cleans_temporary_extraction() {
         let temp_dir = TempDir::new().unwrap();
         let base_dir = temp_dir.path().join("static");
         let built_files_dir = temp_dir.path().join("built_files");
         std_fs::create_dir_all(&built_files_dir).unwrap();
         std_fs::write(built_files_dir.join("index.html"), b"ordinary").unwrap();
         std_fs::write(built_files_dir.join("app.js.map"), b"private source map").unwrap();
+        std_fs::write(built_files_dir.join(".nojekyll"), b"").unwrap();
 
         let extracted_destination = Arc::new(std::sync::Mutex::new(None));
-        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir));
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.clone()));
         let image_builder = Arc::new(MockImageBuilder {
             extract_dir: built_files_dir,
             extracted_destination: Some(extracted_destination.clone()),
@@ -713,8 +730,8 @@ mod tests {
         let job = DeployStaticJob::new(
             "deploy_static".to_string(),
             "build_image".to_string(),
-            "/app/dist".to_string(),
-            "my-project".to_string(),
+            "/app/build".to_string(),
+            "docs-site".to_string(),
             "production".to_string(),
             "deploy-sensitive".to_string(),
             deployer,
@@ -725,9 +742,21 @@ mod tests {
             .set_output("build_image", "image_tag", "myapp:latest")
             .unwrap();
 
-        let result = job.execute(context).await;
+        let result = job
+            .execute(context)
+            .await
+            .expect("non-publishable files must be skipped, not fail the deployment");
 
-        assert!(result.is_err(), "source maps must not be published");
+        let static_dir: String = result
+            .context
+            .get_output("deploy_static", "static_dir_location")
+            .unwrap()
+            .unwrap();
+        let deployed = base_dir.join(static_dir);
+        assert!(deployed.join("index.html").is_file());
+        assert!(!deployed.join("app.js.map").exists());
+        assert!(!deployed.join(".nojekyll").exists());
+
         let extraction_path = extracted_destination
             .lock()
             .unwrap()
@@ -735,7 +764,7 @@ mod tests {
             .expect("mock extraction destination was recorded");
         assert!(
             !extraction_path.exists(),
-            "failed deployment leaked temporary extraction directory {}",
+            "deployment leaked temporary extraction directory {}",
             extraction_path.display()
         );
     }

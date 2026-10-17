@@ -14,6 +14,7 @@ import { MemoryRouter } from 'react-router'
 import {
   finishedOperationsPageOptions,
   runningOperationsPageOptions,
+  waitingOperationsPageOptions,
 } from './operations-queries'
 import {
   getOperationsTrayState,
@@ -62,13 +63,15 @@ function stubFeed(operations: readonly OperationEntry[]) {
     const page = Number(url.searchParams.get('page') ?? '1')
     const pageSize = Number(url.searchParams.get('page_size') ?? '20')
     const isRunning = (op: OperationEntry) =>
-      ['queued', 'running', 'waiting'].includes(op.status)
+      ['queued', 'running'].includes(op.status)
     const matching = operations.filter((op) =>
       status === 'running'
         ? isRunning(op)
         : status === 'finished'
-          ? !isRunning(op)
-          : true
+          ? ['succeeded', 'failed', 'cancelled'].includes(op.status)
+          : status === 'waiting'
+            ? op.status === 'waiting'
+            : true
     )
     const body: OperationsListResponse = {
       operations: matching.slice((page - 1) * pageSize, page * pageSize),
@@ -150,6 +153,23 @@ describe('operations tray queries', () => {
             pageSize: 20,
             onPageChange: noop,
           }}
+          waiting={{
+            operations: [],
+            nav: {
+              page: 1,
+              hasNewer: false,
+              hasOlder: false,
+              first: 0,
+              last: 0,
+              total: 0,
+            },
+            isPending: false,
+            isError: false,
+            onRetry: noop,
+            isPaging: false,
+            pageSize: 20,
+            onPageChange: noop,
+          }}
           recent={{
             operations: feed.recent,
             nav: feed.recentNav,
@@ -221,15 +241,24 @@ describe('operations tray queries', () => {
     expect(runningOperationsPageOptions(2).gcTime).toBe(0)
   })
 
-  test('closing the tray returns both sections to their first page', () => {
+  test('closing the tray returns all sections to their first page', () => {
     setOperationsTrayOpen(true)
     setOperationsTrayPage('recent', 4)
     setOperationsTrayPage('running', 2)
-    expect(getOperationsTrayState().pages).toEqual({ running: 2, recent: 4 })
+    setOperationsTrayPage('waiting', 3)
+    expect(getOperationsTrayState().pages).toEqual({
+      running: 2,
+      waiting: 3,
+      recent: 4,
+    })
 
     setOperationsTrayOpen(false)
 
-    expect(getOperationsTrayState().pages).toEqual({ running: 1, recent: 1 })
+    expect(getOperationsTrayState().pages).toEqual({
+      running: 1,
+      waiting: 1,
+      recent: 1,
+    })
   })
 
   test('running work beyond one page of 100 is reachable on the next page', async () => {
@@ -268,4 +297,44 @@ describe('operations tray queries', () => {
       hasOlder: false,
     })
   })
+})
+
+test('old review work has its own paged feed independent of newer history', async () => {
+  const reviews = Array.from({ length: 25 }, (_, i) =>
+    entry({
+      id: `autofix:${i + 1}`,
+      kind: 'autofix',
+      status: 'waiting',
+      created_at: '2026-07-15T10:00:00Z',
+      finished_at: null,
+    })
+  )
+  const { client, requests } = stubFeed([...finishedOps(25), ...reviews])
+  const queryClient = new QueryClient()
+  const running = await queryClient.fetchQuery(
+    runningOperationsPageOptions(1, { client })
+  )
+  const waiting = await queryClient.fetchQuery(
+    waitingOperationsPageOptions(1, { client })
+  )
+  const finished = await queryClient.fetchQuery(
+    finishedOperationsPageOptions(1, { client })
+  )
+  const feed = operationsTrayFeed({
+    runningPage: running,
+    waitingPage: waiting,
+    finishedPage: finished,
+  })
+  expect(feed.runningCount).toBe(0)
+  expect(feed.running).toHaveLength(0)
+  expect(feed.waiting).toHaveLength(20)
+  expect(feed.recent).toHaveLength(20)
+  expect(feed.waitingNav.hasOlder).toBe(true)
+  expect(requests[1]?.searchParams.get('status')).toBe('waiting')
+  const older = await queryClient.fetchQuery(
+    waitingOperationsPageOptions(2, { client })
+  )
+  expect(older.operations).toHaveLength(5)
+  expect(waitingOperationsPageOptions(2).gcTime).toBe(0)
+  queryClient.clear()
 })

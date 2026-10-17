@@ -350,6 +350,21 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         Ok(recovered.map(|h| Self::stamp(h, node_id)))
     }
 
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        self.local.release_orphaned_resources(container_name).await
+    }
+
+    async fn release_orphaned_resources_on(
+        &self,
+        node_id: Option<i32>,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        self.for_node(node_id)
+            .await?
+            .release_orphaned_resources(container_name)
+            .await
+    }
+
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         self.local.supports_backend(backend)
     }
@@ -875,6 +890,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1076,6 +1092,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,

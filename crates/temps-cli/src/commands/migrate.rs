@@ -65,8 +65,14 @@ pub struct MigrateCommand {
     /// Before applying the migrations, dump the database to
     /// `<data dir>/backups/pre-migration/` so you can roll back to the
     /// previous release; nothing is applied if that dump fails. Off by
-    /// default.
-    #[arg(long, conflicts_with = "skip_pre_migration_backup")]
+    /// default. Also settable with `TEMPS_PRE_MIGRATION_BACKUP=true`, the same
+    /// variable `temps serve` reads.
+    #[arg(
+        long,
+        env = "TEMPS_PRE_MIGRATION_BACKUP",
+        value_parser = crate::commands::parse_bool_setting,
+        conflicts_with = "skip_pre_migration_backup"
+    )]
     pub pre_migration_backup: bool,
 
     /// No-op, kept so existing scripts keep working: the pre-migration
@@ -988,6 +994,60 @@ mod tests {
             assert_eq!(migrate.pre_migration_backup, backup.is_some());
             assert_eq!(migrate.data_dir.as_deref(), backup);
         }
+    }
+
+    /// Parses `MigrateCommand` with the backup env variable's *name* swapped
+    /// for one unique to `case`, so a test never reads or writes the real
+    /// `TEMPS_PRE_MIGRATION_BACKUP` and cannot race with parallel tests.
+    fn parse_with_backup_env(
+        case: &str,
+        value: &str,
+        extra: &[&str],
+    ) -> Result<super::MigrateCommand, clap::Error> {
+        use clap::{Args, FromArgMatches};
+        let name = format!("TEMPS_TEST_MIGRATE_{case}_BACKUP").to_uppercase();
+        std::env::set_var(&name, value);
+        // clap wants a 'static name; leaking a test-only string is harmless.
+        let leaked: &'static str = Box::leak(name.clone().into_boxed_str());
+        let command = super::MigrateCommand::augment_args(clap::Command::new("temps"))
+            .mut_arg("pre_migration_backup", move |a| a.env(leaked));
+        let mut argv = vec!["temps", "--database-url", "postgres://localhost/temps"];
+        argv.extend_from_slice(extra);
+        let result = command
+            .try_get_matches_from(argv)
+            .and_then(|matches| super::MigrateCommand::from_arg_matches(&matches));
+        std::env::remove_var(name);
+        result
+    }
+
+    #[test]
+    fn the_pre_migration_backup_env_var_matches_serve() {
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let env = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "pre_migration_backup")
+            .and_then(|arg| arg.get_env())
+            .map(|name| name.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("TEMPS_PRE_MIGRATION_BACKUP"));
+    }
+
+    #[test]
+    fn the_pre_migration_backup_reads_its_env_var() {
+        for (value, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
+            let migrate = parse_with_backup_env("values", value, &[]).expect("env value parses");
+            assert_eq!(migrate.pre_migration_backup, expected, "value {value:?}");
+        }
+        let error = match parse_with_backup_env("invalid", "disabled", &[]) {
+            Ok(_) => panic!("an unrecognised value must not silently become true"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("'disabled' is not a boolean"), "{error}");
+        assert!(
+            parse_with_backup_env("flag", "false", &["--pre-migration-backup"])
+                .expect("flag next to a false env value")
+                .pre_migration_backup
+        );
     }
 
     #[test]

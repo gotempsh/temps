@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { extractProblemDetails } from '@/utils/errorHandling'
+import { httpStatusOf } from './http-error-status'
 
 /**
  * Why a read failed, in the three ways a console page must tell apart.
@@ -14,9 +15,15 @@ import { extractProblemDetails } from '@/utils/errorHandling'
  */
 export type ReadFailureKind = 'not-found' | 'forbidden' | 'failed'
 
-/** Only a numeric HTTP 404 establishes that a record is missing. */
+/**
+ * Only a numeric HTTP 404 establishes that a record is missing. The status
+ * may sit on a problem document or on an `Error` a fetcher built from one
+ * (`errorWithStatus`), which has no `title` to be recognised as a problem.
+ */
 export function isVerifiedNotFound(error: unknown): boolean {
-  return extractProblemDetails(error)?.status === 404
+  return (
+    extractProblemDetails(error)?.status === 404 || httpStatusOf(error) === 404
+  )
 }
 
 export function isForbiddenRead(error: unknown): boolean {
@@ -38,6 +45,20 @@ export function readFailureKind(error: unknown): ReadFailureKind {
 export function readFailureExplanation(error: unknown): string {
   if (isForbiddenRead(error)) {
     return 'You do not have permission to read this resource. Sign in with an authorized account or ask an administrator for access.'
+  }
+  // A 4xx that is neither "missing" nor "refused" (a 413 from a proxy, say)
+  // is an answer: Temps, or whatever sits in front of it, was reached and
+  // declined the request. "Could not contact Temps" would be wrong.
+  const status = httpStatusOf(error)
+  // A timeout or a rate limit is a passing condition: the retry policy treats
+  // it as retryable, so telling the user a retry cannot help would be wrong.
+  if (status === 408 || status === 429) {
+    return `Temps or a proxy in front of it answered HTTP ${status} (${
+      status === 429 ? 'too many requests' : 'request timeout'
+    }). This is usually temporary: wait a moment, then retry.`
+  }
+  if (status !== undefined && status >= 400 && status < 500) {
+    return `The request was rejected with HTTP ${status} by Temps or a proxy in front of it. Retrying the same request will not help.`
   }
   return 'Could not contact Temps or the server could not complete the request. Retry to check its current state.'
 }

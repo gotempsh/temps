@@ -119,7 +119,7 @@ export function BaseDomainStep({
               <p className="font-medium">This domain will be used to create:</p>
               <ul className="space-y-1 ml-4">
                 <li>
-                  • Wildcard domain for all projects: *.{value || 'example.com'}
+                  • Wildcard domain for all services: *.{value || 'example.com'}
                 </li>
                 <li>
                   • Preview deployments: *.preview.{value || 'example.com'}

@@ -6,6 +6,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { refreshAiProviderModelsMutation } from '@/api/client/@tanstack/react-query.gen'
 import { aiProviderCatalogQueryOptions } from '@/lib/ai-provider-catalog-query'
 import { mergeProviderModelRefresh } from '@/pages/agent-sandbox/provider-model-catalog'
+import { HarnessUpdateBar } from './HarnessUpdateBar'
 import { problemDetail } from '@/lib/api-problem'
 import type { ProviderCatalogResponse } from '@/api/client'
 import type { ProviderCatalogDto } from '@/api/client'
@@ -99,6 +100,17 @@ export function WorkspaceHarnessSetup({
   const thinking = model?.tool_thinking_options ?? model?.thinking_options ?? []
   return (
     <div className="space-y-5">
+      {/* The update acts on the persistent AI workspace that model discovery
+          runs in. It is offered where that workspace is configured, not next
+          to an application's first task, whose turns run in a separate
+          workspace this action does not reach. */}
+      {mode === 'connection' && (
+        <HarnessUpdateBar
+          providerId={provider.id}
+          providerName={provider.name}
+          enabled={provider.workspace_ready}
+        />
+      )}
       {/* A saved connection renders as a one-line summary with Replace, so
           there is no separate "use saved connection" step to click through. */}
       {mode === 'connection' && (

@@ -42,6 +42,7 @@ import {
   projectDeploysImage,
 } from '@/lib/project-deploy-action'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   AlertTriangle,
   CheckCircle2,
@@ -106,9 +107,14 @@ function CommitDetailsCard({
         </div>
       </div>
       <div className="space-y-2.5 px-3 py-3">
-        <p className="max-h-24 overflow-y-auto whitespace-pre-wrap text-sm leading-relaxed">
-          {commit.message}
-        </p>
+        <ScrollRegion
+          className="max-h-24"
+          regionLabel="Commit message, scrollable"
+        >
+          <p className="whitespace-pre-wrap text-sm leading-relaxed">
+            {commit.message}
+          </p>
+        </ScrollRegion>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span className="font-medium text-foreground">{commit.author}</span>
           <span aria-hidden="true">·</span>
@@ -600,7 +606,7 @@ export function RedeploymentModal({
       <DialogContent className="sm:max-w-[640px]">
         <DialogHeader>
           <DialogTitle>
-            {mode === 'redeploy' ? 'Redeploy' : 'Deploy Project'}
+            {mode === 'redeploy' ? 'Redeploy' : 'Deploy Service'}
           </DialogTitle>
         </DialogHeader>
 

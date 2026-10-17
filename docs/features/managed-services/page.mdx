@@ -358,19 +358,92 @@ Provision S3-compatible object storage for files, backups, and assets:
 
     | Option | Description | Default |
     |--------|-------------|---------|
-    | `server` | S3 server: `rustfs` or `minio` | `rustfs` |
-    | `docker_image` | Image for the selected server | RustFS image |
+    | `backend` | Storage engine: `rustfs` or `garage` (read-only after creation) | `rustfs` |
+    | `buckets` | Buckets created for every environment that links the service | none (one bucket per environment) |
+    | `docker_image` | Image for the selected engine | Engine's pinned image |
     | `access_key` / `secret_key` | Credentials | Generated |
     | `region` | Region reported to clients | see `services types info s3` |
     | `port` | Host port | Auto-assigned |
   </Col>
 </Row>
 
-<Note>
-RustFS is the default backend. Garage is modeled as an external provider
-backend, and MinIO is available for compatibility with existing
-S3-compatible workflows.
-</Note>
+### Storage backends, buckets and credentials
+
+Choose the engine when you create the service. It cannot be changed afterwards;
+to switch, create a second service and [migrate](#migrate-between-backends).
+
+| | RustFS (default) | Garage |
+|---|---|---|
+| Best for | General S3 workloads, the largest feature surface, a web console | Small footprint, simple operation, single-node self-hosting |
+| Image | `rustfs/rustfs` (pinned) | `dxflrs/garage` (pinned) |
+| Console | Yes | No (S3 API only) |
+| Credentials | Per-environment access key with a bucket-scoped policy | Per-environment access key granted read/write on its buckets only |
+
+```bash
+# RustFS is the default
+temps services create --type s3 --name media
+
+# Garage, with two buckets for every environment
+temps services create --type s3 --name media --backend garage \
+  --bucket uploads --bucket exports
+```
+
+Existing services created before `backend` existed keep running as RustFS, and
+legacy MinIO services keep working; new MinIO services are not accepted.
+
+Each environment that links the service gets **its own access key**, scoped to
+that environment's buckets. A key can read and write its own buckets and nothing
+else, including the same logical bucket of another environment. Bucket names
+are `<project>-<environment>-<name>`. If you declare no buckets, the
+environment gets the single bucket `<project>-<environment>`.
+
+| Variable | Value |
+|---|---|
+| `S3_BUCKET` | First declared bucket |
+| `S3_BUCKET_<NAME>` | One per bucket, `NAME` upper-snake-cased (`exports` → `S3_BUCKET_EXPORTS`) |
+| `S3_ENDPOINT`, `AWS_ENDPOINT_URL` | Service endpoint on the Docker network |
+| `S3_ACCESS_KEY`, `AWS_ACCESS_KEY_ID` | The environment's access key |
+| `S3_SECRET_KEY`, `AWS_SECRET_ACCESS_KEY` | The environment's secret key |
+| `AWS_REGION` | Region reported by the service |
+
+Unlinking a project revokes its environments' keys. Buckets and their objects
+are kept; deleting data is always a separate action. If a key cannot be revoked
+(for example the storage container is down, or a worker node is offline), the
+unlink fails and the link is kept, so a credential is never left active behind
+a link you believed was removed. Revoking keys on a worker node needs a worker
+agent that is up to date. A key is left in place while another project still
+links the same bucket scope.
+
+Two projects cannot link one service with the same project and environment
+scope, or with scopes that resolve to the same physical bucket name; the second
+link is refused with a message naming the project that holds the scope.
+
+### Migrate between backends {{ anchor: true, id: 'migrate-between-backends' }}
+
+To move from RustFS to Garage (or back), create the target service, then copy
+the data across. The source is only read, so you can re-run the copy to pick up
+late writes before pointing applications at the new service.
+
+```bash
+curl -X POST "$TEMPS_URL/api/external-services/$TARGET_ID/migrate-s3" \
+  -H "Authorization: Bearer $TEMPS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"source_service_id\": $SOURCE_ID}"
+```
+
+Both services must run on the control-plane host, and Garage services cannot
+be created on a worker node yet. Zero-byte objects are copied with direct
+requests, because the bulk-copy client uploads them in a way Garage rejects.
+
+Garage is available for S3 storage only; Blob services cannot use it.
+
+Backups of a managed S3 service are plain object copies. Restoring one into a
+new service creates a service on the same engine as the source.
+
+Declared bucket names are 3-32 characters of lower-case letters, digits and
+hyphens, duplicates are dropped, and a service declares at most 16. A Garage
+service's own key cannot create buckets, so it cannot be registered directly as
+a backup destination; use a RustFS service or an external S3 bucket for that.
 
 ### Connecting to S3
 

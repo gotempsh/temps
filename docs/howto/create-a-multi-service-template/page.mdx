@@ -1,0 +1,163 @@
+export const metadata = {
+  title: 'Create a Multi-Service Template',
+  description:
+    'Describe an app made of several services (its databases, shared variables and path routes) in one template YAML, validate it, load it into Temps and create it in one step.',
+  alternates: {
+    canonical: '/docs/create-a-multi-service-template',
+  },
+}
+
+export const sections = [
+  { title: 'What a template creates', id: 'what-a-template-creates' },
+  { title: 'Write the template', id: 'write-the-template' },
+  { title: 'Rules the server enforces', id: 'rules-the-server-enforces' },
+  { title: 'Validate it', id: 'validate-it' },
+  { title: 'Load it into Temps', id: 'load-it-into-temps' },
+  { title: 'Create the app from it', id: 'create-the-app-from-it' },
+]
+
+# Create a Multi-Service Template
+
+Many apps are more than one service: a backend, a frontend, a database, some generated secrets and a route from `/api` to the backend. A multi-service template describes all of it, so anyone on your Temps server can create the whole app in one step. {{ className: 'lead' }}
+
+---
+
+## What a template creates {{ anchor: true, id: 'what-a-template-creates' }}
+
+Creating a template with several services:
+
+1. creates a new [Project](/docs/projects) (or uses one you pick),
+2. creates or links each managed database the template lists,
+3. adds the template's shared variables to the project, generating secrets where the template says so,
+4. creates every service in the project, with its own directory, preset, port and resources,
+5. adds the path routes between them, then deploys.
+
+It runs on the server one step at a time and resumes from the step that failed, so a retry never creates duplicates.
+
+---
+
+## Write the template {{ anchor: true, id: 'write-the-template' }}
+
+A template file is a catalog: a `version` and a list of `templates`. This one describes a shop with a Dockerfile backend, a Vite frontend, a PostgreSQL database and `/api` routed to the backend:
+
+```yaml {{ title: 'shop.yaml' }}
+version: "3"
+templates:
+  - slug: shop
+    name: Shop
+    version: 1.0.0
+    kind: app                  # app: pinned upstream code; starter: code the user takes over
+    description: Storefront with an API and a PostgreSQL database.
+    git:                       # shared by services that do not set their own
+      url: https://github.com/example/shop.git
+      ref: v1.4.0              # a tag or commit: what every install builds
+    databases:
+      - postgres
+    shared_env_vars:           # become the project's shared variables
+      - name: SESSION_SECRET
+        secret: true
+        default_generator: random_secret
+      - name: LOG_LEVEL
+        default: info
+    services:
+      - name: backend
+        directory: backend
+        preset: dockerfile
+        exposed_port: 8080
+        health_check_path: /api/health
+        resources:
+          memory_limit: 1024
+        database_bindings:
+          postgres:
+            DATABASE_URL: POSTGRES_URL
+        env_vars:              # this service only
+          - name: SMTP_HOST
+      - name: frontend
+        directory: frontend
+        preset: vite
+    routes:
+      - source: frontend       # whose domains receive the requests
+        prefix: /api
+        target: backend        # who answers them
+        strip_prefix: false
+```
+
+Each entry under `services` becomes one service. Its fields:
+
+<Properties>
+  <Property name="name">
+    Unique within the template: lowercase letters, digits and hyphens, starting with a letter, at most 63 characters. It names the created service (with a suffix if the name is taken).
+  </Property>
+  <Property name="directory, git, image">
+    Where the service comes from: a `directory` of the template's repository, its own `git` (`url` and `ref`), or a prebuilt `image`.
+  </Property>
+  <Property name="preset, preset_config, command">
+    How it is built and started. `preset` is a build preset such as `dockerfile`, `vite`, `nextjs` or `nixpacks-node`.
+  </Property>
+  <Property name="exposed_port, health_check_path, resources">
+    The port it listens on, the path Temps checks after it starts, and its CPU and memory requests and limits.
+  </Property>
+  <Property name="env_vars, databases, database_bindings">
+    Variables of this service only; the template databases it uses; and which of its variables are filled from a database (for example `DATABASE_URL` from the database's `POSTGRES_URL`).
+  </Property>
+</Properties>
+
+`kind: service` from older templates still loads and is treated as `app`.
+
+---
+
+## Rules the server enforces {{ anchor: true, id: 'rules-the-server-enforces' }}
+
+- **Source-built services pin a git ref.** In a template with several services, a service built from source must build a fixed `ref`, from its own `git` or the template's. An empty `ref` is rejected. When `ref` is left out it means `main`, which moves: prefer a tag or a commit.
+- **Image services pin a digest.** A service that runs `image` uses the `dockerfile` preset, an image reference with an `@sha256:` digest and an `exposed_port`.
+- **Every database is used.** Each entry in `databases` must be linked to at least one service, through its `databases` or `database_bindings`.
+- **Secrets have no literal defaults.** A secret shared variable uses a generator (`random_secret` or `random_hex_32`) or a value supplied when the template is created.
+- **Names do not collide.** A variable cannot be both shared and a service's own.
+- **Routes connect template services.** `source` and `target` name two different services, and `prefix` is a path such as `/api` (not `/`, and not a reserved platform path such as `/_temps` or `/.well-known`).
+
+---
+
+## Validate it {{ anchor: true, id: 'validate-it' }}
+
+Check the file offline before loading it. The CLI applies the same rules as the server and lists every problem:
+
+```bash
+bunx @temps-sdk/cli templates validate ./shop.yaml
+```
+
+---
+
+## Load it into Temps {{ anchor: true, id: 'load-it-into-temps' }}
+
+Start the server with the file (you can pass `--templates` several times, or set `TEMPS_ADDITIONAL_TEMPLATES`):
+
+```bash
+temps serve --templates /etc/temps/shop.yaml
+```
+
+The templates are added to the built-in catalog. A template in the file that fails validation, for example with a preset this release does not support, is skipped with a warning in the server log naming the template and the reason, and the rest still load. A missing or unreadable file stops the server with an error.
+
+---
+
+## Create the app from it {{ anchor: true, id: 'create-the-app-from-it' }}
+
+In the console, open **Projects** > **New service** > **Template** and pick the template. It shows the services it will create, the project they go into and the values you need to provide.
+
+With the CLI:
+
+```bash
+# Into a new project named "Shop" (the default for several services)
+bunx @temps-sdk/cli templates create shop --project "Shop"
+
+# Into an existing project, linking an existing database and passing a value
+bunx @temps-sdk/cli templates create shop --into acme-shop \
+  --database postgres=12 \
+  --env backend:SMTP_HOST=smtp.example.com
+```
+
+The CLI prints the creation's id and follows it until it finishes. If it stops, or a step fails, continue it instead of starting again:
+
+```bash
+bunx @temps-sdk/cli instantiations show 42 --wait
+bunx @temps-sdk/cli instantiations retry 42
+```

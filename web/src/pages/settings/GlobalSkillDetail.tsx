@@ -2,19 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { HighlightedCode } from '@/components/ui/code-block'
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -94,7 +85,10 @@ export function GlobalSkillDetail() {
       queryClient.invalidateQueries({ queryKey: listGlobalSkillsQueryKey() })
       navigate('/skills')
     },
-    onError: () => toast.error('Failed to delete skill'),
+    onError: () => {
+      setConfirmDelete(false)
+      toast.error('Failed to delete skill')
+    },
   })
 
   if (isLoading) {
@@ -271,7 +265,10 @@ export function GlobalSkillDetail() {
               </form>
             ) : (
               <div className="rounded-md border bg-muted/50 p-3">
-                <pre className="text-xs whitespace-pre-wrap font-mono overflow-x-auto">
+                <pre
+                  tabIndex={0}
+                  className="text-xs whitespace-pre-wrap font-mono overflow-x-auto"
+                >
                   <HighlightedCode code={skill.content} language="markdown" />
                 </pre>
               </div>
@@ -299,7 +296,7 @@ export function GlobalSkillDetail() {
               <Badge variant="outline" className="text-xs">
                 {skill.project_id === null
                   ? 'Global'
-                  : `Project ${skill.project_id}`}
+                  : `Service ${skill.project_id}`}
               </Badge>
             </div>
             <div>
@@ -324,26 +321,15 @@ export function GlobalSkillDetail() {
         </Card>
       </div>
 
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete global skill?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this skill. All projects that
-              reference it will lose access.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => deleteMutation.mutate({ path: { slug: slug! } })}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        resourceType="global skill"
+        resourceName={skill?.name ?? slug ?? ''}
+        consequences="All services that reference it will lose access."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate({ path: { slug: slug! } })}
+      />
     </div>
   )
 }

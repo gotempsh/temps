@@ -1363,6 +1363,7 @@ pub(crate) mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: slug.to_string(),
             slug: slug.to_string(),
@@ -1400,6 +1401,7 @@ pub(crate) mod tests {
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             source_type: temps_entities::source_type::SourceType::Git,

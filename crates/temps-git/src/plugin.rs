@@ -283,6 +283,11 @@ fn route_state(context: &PluginContext) -> Arc<crate::handlers::types::GitAppSta
     Arc::new(crate::handlers::types::GitAppState {
         sensitive_action_authorizer: context
             .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+        // Registered by the deployments plugin, which depends on this crate;
+        // resolved here for the same ordering reason as the authorizer.
+        compose_checker: context
+            .get_service::<dyn temps_presets::compose_check::ComposeConfigurationChecker>(),
+        project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
         ..(*git_app_state).clone()
     })
 }

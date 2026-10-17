@@ -218,10 +218,7 @@ impl DataSource for MariaDbSource {
                     })
                     .collect())
             }
-            _ => Err(DataError::InvalidQuery(format!(
-                "MariaDB hierarchy only supports root/database levels. Path depth: {}",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("MariaDB", path, 1)),
         }
     }
 

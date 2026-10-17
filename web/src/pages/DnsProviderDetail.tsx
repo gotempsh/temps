@@ -18,18 +18,9 @@ import {
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -93,7 +84,6 @@ import {
   Cloud,
   Edit,
   Globe,
-  Loader2,
   Plus,
   RefreshCw,
   TestTube2,
@@ -1397,74 +1387,33 @@ export default function DnsProviderDetail() {
       </Dialog>
 
       {/* Delete Provider Dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={isDeleteDialogOpen}
         onOpenChange={setIsDeleteDialogOpen}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete DNS Provider</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone and will remove all managed zones
-              associated with this provider.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProviderMut.isPending}
-              onClick={() => deleteProviderMut.mutate()}
-            >
-              {deleteProviderMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="DNS provider"
+        resourceName={provider.name}
+        confirmLabel="Delete Provider"
+        consequences="All managed zones associated with this provider are removed, and DNS records for them will no longer be automatically managed."
+        isPending={deleteProviderMut.isPending}
+        onConfirm={() => deleteProviderMut.mutate()}
+      />
 
       {/* Remove managed zone dialog */}
-      <AlertDialog
-        open={!!domainToRemove}
-        onOpenChange={(open) => !open && setDomainToRemove(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove managed zone</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to remove &quot;{domainToRemove?.domain}
-              &quot; from this provider? DNS records will no longer be
-              automatically managed.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={removeDomainMut.isPending}
-              onClick={() =>
-                domainToRemove && removeDomainMut.mutate(domainToRemove.domain)
-              }
-            >
-              {removeDomainMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Removing...
-                </>
-              ) : (
-                'Remove zone'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={domainToRemove !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToRemove(null)
+        }}
+        resourceType="managed zone"
+        resourceName={domainToRemove?.domain ?? ''}
+        verb="Remove"
+        confirmLabel="Remove zone"
+        consequences={`It is removed from ${provider.name}; DNS records for it will no longer be automatically managed.`}
+        isPending={removeDomainMut.isPending}
+        onConfirm={() => {
+          if (domainToRemove) removeDomainMut.mutate(domainToRemove.domain)
+        }}
+      />
     </>
   )
 }

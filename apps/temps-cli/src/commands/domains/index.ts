@@ -599,7 +599,7 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
     return
   }
 
-  const order = await withSpinner('Fetching ACME order...', async () => {
+  const lookup = await withSpinner('Fetching ACME order...', async () => {
     const { data, error } = await getDomainOrder({
       client,
       path: { domain_id: domainId },
@@ -608,8 +608,15 @@ async function showOrder(options: OrderShowOptions): Promise<void> {
     return data
   })
 
+  // `order` is null when the domain has none (e.g. its certificate is active);
+  // the API explains why in `reason`.
+  const order = lookup?.order
   if (!order) {
-    warning('No order found for this domain')
+    if (options.json) {
+      json({ order: null, reason: lookup?.reason ?? null })
+      return
+    }
+    warning(lookup?.reason ?? 'No order found for this domain')
     return
   }
 

@@ -241,3 +241,37 @@ export function isOidcFormValid(form: CreateOidcProviderRequest): boolean {
     form.client_secret.trim().length > 0
   )
 }
+
+export type OidcRequiredField =
+  'name' | 'issuer_url' | 'client_id' | 'client_secret'
+
+export type OidcFieldErrors = Partial<Record<OidcRequiredField, string>>
+
+/** Required fields in the order they appear on the form. */
+export const OIDC_REQUIRED_FIELDS: ReadonlyArray<{
+  field: OidcRequiredField
+  label: string
+  inputId: string
+}> = [
+  { field: 'name', label: 'Name', inputId: 'oidc-name' },
+  { field: 'issuer_url', label: 'Issuer URL', inputId: 'oidc-issuer' },
+  { field: 'client_id', label: 'Client ID', inputId: 'oidc-client-id' },
+  {
+    field: 'client_secret',
+    label: 'Client secret',
+    inputId: 'oidc-client-secret',
+  },
+]
+
+/** One message per empty required field, so none is reported only after another is fixed. */
+export function oidcFormFieldErrors(
+  form: CreateOidcProviderRequest
+): OidcFieldErrors {
+  const errors: OidcFieldErrors = {}
+  for (const { field, label } of OIDC_REQUIRED_FIELDS) {
+    if (form[field].trim().length === 0) {
+      errors[field] = `${label} is required`
+    }
+  }
+  return errors
+}

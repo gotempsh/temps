@@ -25,6 +25,7 @@ import {
   Database,
   HardDrive,
   Cpu,
+  Plus,
 } from 'lucide-react'
 import { toast } from 'sonner'
 
@@ -35,7 +36,10 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
+import { EmptyState } from '@/components/ui/empty-state'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -46,22 +50,13 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
-import {
   extendTimeoutMutation,
   getApplicationWorkspaceOptions,
   getGlobalAiWorkspaceOptions,
   listApplicationsOptions,
   getWorkspaceActivityOptions,
   listSandboxesOptions,
+  listSandboxesQueryKey,
   pauseSandboxMutation,
   restartSandboxMutation,
   resumeSandboxMutation,
@@ -86,6 +81,7 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
+import { CreateSandboxSheet } from '@/components/sandboxes/CreateSandboxSheet'
 import { SandboxNodeBadge } from '@/components/sandboxes/SandboxNode'
 
 function statusVariant(
@@ -182,6 +178,7 @@ export default function Sandboxes({
   const [page, setPage] = useState(1)
   const [filter, setFilter] = useState<StatusFilter>('active')
   const [stopTarget, setStopTarget] = useState<SandboxView | null>(null)
+  const [createOpen, setCreateOpen] = useState(false)
   const queryClient = useQueryClient()
 
   const listQuery = listSandboxesOptions({
@@ -287,7 +284,7 @@ export default function Sandboxes({
   }, [items, now, filter])
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
 
   const deleteMutation = useMutation({
     ...stopSandboxMutation(),
@@ -305,7 +302,7 @@ export default function Sandboxes({
         title={workspacesOnly ? 'Workspaces' : 'Sandboxes'}
         description={
           workspacesOnly
-            ? 'Persistent projects and working context, with compute when you need it.'
+            ? 'Persistent services and working context, with compute when you need it.'
             : 'Standalone compute environments managed through the CLI, API, or SDK.'
         }
         actions={
@@ -344,6 +341,12 @@ export default function Sandboxes({
                 })}
               </div>
             )}
+            {!workspacesOnly && (
+              <Button size="sm" onClick={() => setCreateOpen(true)}>
+                <Plus className="mr-1.5 h-4 w-4" />
+                <span className="max-sm:sr-only">New sandbox</span>
+              </Button>
+            )}
             <Button
               variant="outline"
               size="sm"
@@ -353,7 +356,7 @@ export default function Sandboxes({
               <RefreshCw
                 className={`mr-1.5 h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
               />
-              <span className="hidden sm:inline">Refresh</span>
+              <span className="max-sm:sr-only">Refresh</span>
             </Button>
           </div>
         }
@@ -443,15 +446,30 @@ export default function Sandboxes({
               </CardContent>
             </Card>
           ) : items.length === 0 ? (
-            // Empty state — there's no "Create Sandbox" button in the UI yet, so
-            // surface the three real ways to create one (CLI / REST / SDK) right
-            // here instead of making the user hunt for docs.
-            <CreateSandboxDocs variant="full" />
+            // Empty state: the primary action first, then the three other ways
+            // to create one (CLI / REST / SDK) so nobody has to hunt for docs.
+            <div className="space-y-4">
+              <Card>
+                <CardContent className="space-y-3 py-10 text-center">
+                  <Box className="mx-auto h-8 w-8 text-muted-foreground" />
+                  <p className="text-sm font-medium">No sandboxes yet</p>
+                  <p className="mx-auto max-w-md text-xs text-muted-foreground">
+                    A sandbox is an isolated environment you can run commands
+                    in, open a terminal on, edit files in and share a preview
+                    of. Create one here or from the CLI, API or SDK.
+                  </p>
+                  <Button size="sm" onClick={() => setCreateOpen(true)}>
+                    <Plus className="mr-1.5 h-4 w-4" />
+                    New sandbox
+                  </Button>
+                </CardContent>
+              </Card>
+              <CreateSandboxDocs variant="full" />
+            </div>
           ) : (
             <div className="space-y-3">
-              {/* Collapsible docs banner. Creation still only happens from outside
-              the UI, so keep the instructions one click away even when the
-              user already has sandboxes. */}
+              {/* Collapsible docs banner: the CLI, API and SDK equivalents of
+              "New sandbox", one click away even when sandboxes already exist. */}
               <CreateSandboxDocs variant="compact" />
               {visible.length === 0 ? (
                 <Card>
@@ -514,39 +532,27 @@ export default function Sandboxes({
             </div>
           )}
 
-          <AlertDialog
+          <ConfirmDeleteDialog
             open={stopTarget !== null}
             onOpenChange={(open) => {
               if (!open) setStopTarget(null)
             }}
-          >
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  This tears down the container for{' '}
-                  <span className="font-mono">{stopTarget?.id}</span>. The row
-                  is kept for audit but cannot be restarted. This cannot be
-                  undone.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={() => {
-                    if (stopTarget)
-                      deleteMutation.mutate({ path: { id: stopTarget.id } })
-                  }}
-                  disabled={deleteMutation.isPending}
-                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                >
-                  {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+            resourceType="sandbox"
+            resourceName={stopTarget?.name || stopTarget?.id || ''}
+            consequences={`This tears down the container for ${stopTarget?.id ?? ''}. The row is kept for audit but cannot be restarted.`}
+            isPending={deleteMutation.isPending}
+            onConfirm={() => {
+              if (stopTarget)
+                deleteMutation.mutate({ path: { id: stopTarget.id } })
+            }}
+          />
         </>
       )}
+      <CreateSandboxSheet
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        available={platformFeatures.data?.sandboxes ?? true}
+      />
     </PageContainer>
   )
 }
@@ -598,7 +604,7 @@ export function ManagedApplicationWorkspaces({
             <p className="text-sm text-muted-foreground">
               {computeOnly
                 ? 'Compute attached to a workspace. Manage its lifecycle from the owning workspace.'
-                : 'Projects and persistent context, with optional compute and AI threads.'}
+                : 'Services and persistent context, with optional compute and AI threads.'}
             </p>
           </div>
           {entries.length > 0 && (
@@ -610,7 +616,11 @@ export function ManagedApplicationWorkspaces({
       )}
 
       {loading && entries.length === 0 ? (
-        <div className="space-y-3" aria-label="Loading application workspaces">
+        <div
+          role="status"
+          className="space-y-3"
+          aria-label="Loading application workspaces"
+        >
           {Array.from({ length: 2 }).map((_, index) => (
             <Card key={index}>
               <CardContent className="space-y-3 py-4">
@@ -651,11 +661,7 @@ export function ManagedApplicationWorkspaces({
       )}
 
       {!loading && !error && visibleEntries.length === 0 && !visibleGlobal && (
-        <p className="text-sm text-muted-foreground">
-          {computeOnly
-            ? 'No workspace-owned compute is attached.'
-            : 'No workspaces are available yet.'}
-        </p>
+        <WorkspacesEmptyState computeOnly={computeOnly} />
       )}
 
       {error && (
@@ -665,6 +671,39 @@ export function ManagedApplicationWorkspaces({
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * Nothing to list. A workspace belongs to an application, so the way to get
+ * one is to create a project; that action is offered to administrators only,
+ * everyone else gets the same explanation and a link to the project list.
+ */
+function WorkspacesEmptyState({ computeOnly }: { computeOnly: boolean }) {
+  const canCreateProject = useIsInstanceAdmin()
+  if (computeOnly) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No workspace-owned compute is attached.
+      </p>
+    )
+  }
+  return (
+    <div className="rounded-lg border bg-card text-card-foreground">
+      <EmptyState
+        size="compact"
+        icon={FolderOpen}
+        title="No workspaces yet"
+        description="Each project gets a workspace that keeps its services and working context, with compute when you need it. Create a project to start one."
+        action={
+          <Button asChild variant={canCreateProject ? 'default' : 'outline'}>
+            <Link to={canCreateProject ? '/projects/new' : '/projects'}>
+              {canCreateProject ? 'Create project' : 'Open projects'}
+            </Link>
+          </Button>
+        }
+      />
+    </div>
   )
 }
 
@@ -854,7 +893,7 @@ function SandboxRow({
   const [customPort, setCustomPort] = useState('')
 
   const invalidate = () =>
-    queryClient.invalidateQueries({ queryKey: ['sandboxes'] })
+    queryClient.invalidateQueries({ queryKey: listSandboxesQueryKey() })
 
   const pauseMutation = useMutation({
     ...pauseSandboxMutation(),

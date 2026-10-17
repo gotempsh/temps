@@ -371,7 +371,10 @@ function CertificateDetailSheet({
               {row.attempt.error_chain && (
                 <DetailField label="Error chain">
                   <div className="relative">
-                    <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 pr-10 font-mono text-xs">
+                    <pre
+                      tabIndex={0}
+                      className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md bg-muted p-3 pr-10 font-mono text-xs"
+                    >
                       {row.attempt.error_chain}
                     </pre>
                     <div className="absolute right-2 top-2">

@@ -7,7 +7,7 @@ import { MemoryRouter } from 'react-router'
 import type { GlobalLogFacetsResponse } from '@/api/client/types.gen'
 import { LogExplorer } from './LogExplorer'
 
-test('standalone database logs do not appear as Project 0 or application logs', () => {
+test('standalone database logs do not appear as Service 0 or application logs', () => {
   const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
   Object.defineProperty(globalThis, 'window', {
     configurable: true,
@@ -31,8 +31,8 @@ test('standalone database logs do not appear as Project 0 or application logs', 
         <LogExplorer lines={[]} facets={facets} onFilter={() => {}} />
       </MemoryRouter>
     )
-    expect(html).not.toContain('Project 0')
-    expect(html).toContain('Project 7')
+    expect(html).not.toContain('Service 0')
+    expect(html).toContain('Service 7')
     expect(html).toMatch(/Applications<\/span><span[^>]*>20/)
     expect(html).toMatch(/Databases<\/span><span[^>]*>100/)
   } finally {
@@ -217,15 +217,15 @@ test('facet projects with no line on the loaded page are named from projectLabel
             project_names: { '1': 'web-app', '2': 'api' },
             external_service_names: {},
           }}
-          projectLabels={{ '2': 'worker-app', '42': 'Unknown project #42' }}
+          projectLabels={{ '2': 'worker-app', '42': 'Unknown service #42' }}
           onFilter={() => {}}
         />
       </MemoryRouter>
     )
     expect(html).toContain('web-app')
     expect(html).toContain('worker-app')
-    expect(html).toContain('Unknown project #42')
-    expect(html).not.toContain('Project 2<')
+    expect(html).toContain('Unknown service #42')
+    expect(html).not.toContain('Service 2<')
   } finally {
     if (previousWindow)
       Object.defineProperty(globalThis, 'window', previousWindow)

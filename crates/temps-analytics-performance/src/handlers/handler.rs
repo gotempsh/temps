@@ -959,6 +959,7 @@ mod tests {
             source_type: temps_entities::source_type::SourceType::Git,
             project_type: temps_entities::types::ProjectType::Server,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             template_slug: None,
             service_template: None,
             gitlab_webhook_id: None,
@@ -976,6 +977,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
         }
     }

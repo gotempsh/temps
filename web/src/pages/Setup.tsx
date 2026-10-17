@@ -90,7 +90,7 @@ function buildRecommendations(
     })
   }
 
-  if (!s.externalUrlSet) {
+  if (!s.externalUrlSet && !s.unreadable.externalUrl) {
     recs.push({
       key: 'external-url',
       icon: Globe,
@@ -102,7 +102,11 @@ function buildRecommendations(
     })
   }
 
-  if (s.wildcardDomainReady && !s.dnsProviderConnected) {
+  if (
+    s.wildcardDomainReady &&
+    !s.dnsProviderConnected &&
+    !s.unreadable.dnsProviders
+  ) {
     recs.push({
       key: 'dns-auto',
       icon: ShieldCheck,
@@ -307,7 +311,7 @@ export function Setup() {
                           className={cn(
                             'flex size-8 shrink-0 items-center justify-center rounded-lg',
                             rec.tone === 'warning'
-                              ? 'bg-amber-500/10 text-amber-500'
+                              ? 'bg-amber-500/10 text-amber-700 dark:text-amber-500'
                               : 'bg-primary/10 text-primary'
                           )}
                         >

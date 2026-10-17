@@ -61,37 +61,37 @@ const settingsGroups: SettingsGroup[] = [
       },
       {
         title: 'Domains',
-        description: 'Attach and manage project domains.',
+        description: 'Attach and manage service domains.',
         url: 'settings/domains',
         icon: Globe,
       },
     ],
   },
   {
-    label: 'Project',
+    label: 'Service',
     description: 'Defaults and access that apply across every environment.',
     items: [
       {
         title: 'General',
-        description: 'Project identity and default deployment behavior.',
+        description: 'Service identity and default deployment behavior.',
         url: 'settings/general',
         icon: Settings2,
       },
       {
         title: 'Secrets',
-        description: 'Store encrypted project credentials.',
+        description: 'Store encrypted service credentials.',
         url: 'settings/secrets',
         icon: KeyRound,
       },
       {
         title: 'Security',
-        description: 'Headers and project security controls.',
+        description: 'Headers and service security controls.',
         url: 'settings/security',
         icon: Shield,
       },
       {
         title: 'Access',
-        description: 'Control who can view and change this project.',
+        description: 'Control who can view and change this service.',
         url: 'settings/access',
         icon: Users,
       },
@@ -104,7 +104,7 @@ const settingsGroups: SettingsGroup[] = [
       {
         title: 'Telemetry storage',
         description:
-          'Where this project’s spans are stored, and what leaves this instance.',
+          'Where this service’s spans are stored, and what leaves this instance.',
         url: 'settings/telemetry',
         icon: HardDrive,
       },
@@ -142,7 +142,7 @@ const settingsGroups: SettingsGroup[] = [
   },
   {
     label: 'Automation',
-    description: 'Scheduled work and programmable project extensions.',
+    description: 'Scheduled work and programmable service extensions.',
     items: [
       {
         title: 'Cron jobs',
@@ -152,25 +152,25 @@ const settingsGroups: SettingsGroup[] = [
       },
       {
         title: 'Webhooks',
-        description: 'Notify external systems about project events.',
+        description: 'Notify external systems about service events.',
         url: 'settings/webhooks',
         icon: Webhook,
       },
       {
         title: 'AI workflows',
-        description: 'Automate project work with agents.',
+        description: 'Automate service work with agents.',
         url: 'agents',
         icon: Bot,
       },
       {
         title: 'Skills',
-        description: 'Give project agents reusable capabilities.',
+        description: 'Give service agents reusable capabilities.',
         url: 'settings/skills',
         icon: Wand2,
       },
       {
         title: 'MCP servers',
-        description: 'Connect project agents to external tools.',
+        description: 'Connect service agents to external tools.',
         url: 'settings/mcp-servers',
         icon: Server,
       },
@@ -195,7 +195,7 @@ export function ProjectSettingsOverview({
           Configure {project.name}
         </h2>
         <p className="mt-2 text-sm leading-6 text-muted-foreground">
-          Project-wide defaults and environment-specific runtime controls,
+          Service-wide defaults and environment-specific runtime controls,
           organized by the scope they affect.
         </p>
       </div>

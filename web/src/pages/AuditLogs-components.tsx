@@ -155,7 +155,7 @@ export function AuditLogs() {
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Audit Logs"
-        description="Activity across the platform — authentication, project changes, skills, MCP servers, and more."
+        description="Activity across the platform — authentication, service changes, skills, MCP servers, and more."
       />
 
       <div
@@ -164,6 +164,7 @@ export function AuditLogs() {
         aria-label="Audit log filters"
       >
         <SearchableSelect
+          label="Operation type"
           value={operation}
           onValueChange={(operation) => patch({ operation, page: null })}
           options={operationOptions}
@@ -174,6 +175,7 @@ export function AuditLogs() {
           className="w-full sm:w-56"
         />
         <SearchableSelect
+          label="User"
           value={selectedUserId}
           onValueChange={(user) => patch({ user, page: null })}
           options={userOptions}

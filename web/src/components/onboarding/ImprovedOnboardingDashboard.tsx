@@ -64,7 +64,7 @@ const STEP_LABELS = {
   'external-url': 'External URL',
   'screenshot-setup': 'Screenshots',
   'git-provider': 'Git Provider',
-  project: 'Project',
+  project: 'Service',
   complete: 'Complete',
 }
 
@@ -426,7 +426,7 @@ export function ImprovedOnboardingDashboard() {
               <CheckCircle2 className="h-16 w-16 text-green-600 mx-auto" />
               <h2 className="text-2xl font-bold">Setup Complete!</h2>
               <p className="text-muted-foreground">
-                You&apos;re all set to start deploying projects with Temps
+                You&apos;re all set to start deploying services with Temps
               </p>
               <div className="flex gap-3 justify-center pt-4">
                 <Button onClick={() => navigate('/projects')}>

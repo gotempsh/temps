@@ -863,10 +863,7 @@ impl DataSource for RedisSource {
             }
 
             // Depth >= 1: Not supported (Redis is flat - databases contain keys directly)
-            _ => Err(DataError::InvalidQuery(format!(
-                "Redis hierarchy only supports 1 level (database). Path depth: {}. Use list_entities to list keys.",
-                path.depth()
-            ))),
+            _ => Err(DataError::container_path_too_deep("Redis", path, 1)),
         }
     }
 

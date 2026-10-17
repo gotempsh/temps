@@ -30,6 +30,69 @@ pub struct StatInfo {
     pub size: u64,
 }
 
+/// Entries per page when the caller does not ask for a size.
+pub const DEFAULT_LIST_PAGE_SIZE: usize = 20;
+/// Most entries one page returns. A directory with more is read one page at a
+/// time: a page is held in memory on the control plane and rendered by a
+/// browser, so no request can make either side hold the whole directory.
+pub const MAX_LIST_PAGE_SIZE: usize = 100;
+/// Most names the listing script reads from one directory. The sandbox shell
+/// holds the names it is paging over, so a directory of millions of entries
+/// could exhaust a small sandbox's memory; past this many the listing is
+/// marked `truncated` and covers the first `MAX_LIST_SCAN` names the
+/// filesystem returns.
+pub const MAX_LIST_SCAN: usize = 10_000;
+
+/// Clamp a requested page and page size to what the endpoint serves. No page
+/// past [`MAX_LIST_SCAN`] can hold an entry (a page is at least one entry), so
+/// the page number is capped there and the skip count stays bounded.
+pub fn list_page_bounds(page: Option<usize>, page_size: Option<usize>) -> (usize, usize) {
+    (
+        page.unwrap_or(1).clamp(1, MAX_LIST_SCAN),
+        page_size
+            .unwrap_or(DEFAULT_LIST_PAGE_SIZE)
+            .clamp(1, MAX_LIST_PAGE_SIZE),
+    )
+}
+
+/// What a directory entry is, without following a symlink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirEntryKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+/// One name in a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirEntry {
+    pub name: String,
+    pub kind: DirEntryKind,
+}
+
+/// Output of `list_dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirListing {
+    pub path: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    /// One page: directories first, then everything else, each group in byte
+    /// order of the name. At most `page_size` entries.
+    pub entries: Vec<DirEntry>,
+    /// 1-based page these entries are.
+    pub page: usize,
+    pub page_size: usize,
+    /// Entries in the whole directory, not just this page. At most
+    /// [`MAX_LIST_SCAN`]: see `truncated`.
+    pub total: usize,
+    /// The directory has more than [`MAX_LIST_SCAN`] entries, so `total` and
+    /// the pages cover only the first `MAX_LIST_SCAN` names it returned.
+    pub truncated: bool,
+    /// Entries exist after this page.
+    pub has_more: bool,
+}
+
 /// One entry in a batched filesystem write.
 #[derive(Debug, Clone)]
 pub struct BatchWriteEntry {
@@ -42,7 +105,7 @@ pub struct BatchWriteEntry {
 /// Map a provider error from a filesystem operation. Errors that already
 /// carry a precise meaning keep it — a rejected request (400, e.g. a file
 /// over a worker node's read limit), a feature a worker node can't serve
-/// (422), an unreachable node (503), a missing container (404) — and
+/// (422), an unreachable node (503), a VM that is not running (409) — and
 /// everything else is a failed file operation naming the path.
 fn file_op_err(
     public_id: &str,
@@ -56,7 +119,8 @@ fn file_op_err(
         | AgentError::SandboxUnsupportedOnNode { .. }
         | AgentError::SandboxNodeUnavailable { .. }
         | AgentError::SandboxProviderUnavailable { .. }
-        | AgentError::SandboxNotFound { .. } => crate::error::from_agent_error(public_id, err),
+        | AgentError::SandboxNotFound { .. }
+        | AgentError::SandboxNotRunning { .. } => crate::error::from_agent_error(public_id, err),
         other => SandboxError::FileOp {
             sandbox_id: public_id.to_string(),
             op: op.to_string(),
@@ -76,12 +140,10 @@ impl SandboxService {
     ) -> Result<Vec<u8>, SandboxError> {
         validate_absolute(path, "read")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         let bytes = self
             .registry()
             .provider()
@@ -104,12 +166,10 @@ impl SandboxService {
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "write")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         self.registry()
             .provider()
             .write_file(&handle, path, contents, mode)
@@ -128,12 +188,10 @@ impl SandboxService {
     ) -> Result<StatInfo, SandboxError> {
         validate_absolute(path, "stat")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
 
         // `test -e && stat -c '%F %s' <path>` → prints "regular file 42"
         // / "directory 4096" / ... on success, exits non-zero on missing.
@@ -199,6 +257,60 @@ impl SandboxService {
         Ok(info)
     }
 
+    /// List the entries of a directory inside the sandbox.
+    ///
+    /// Like `stat`, a missing path is not an error (`exists: false`), and a
+    /// path that is not a directory reports `is_dir: false` with no entries.
+    /// Symlinks are reported as such and never followed, so a link cannot make
+    /// the listing wander outside the directory that was asked for.
+    pub async fn fs_list(
+        &self,
+        public_id: &str,
+        user_id: i32,
+        path: &str,
+        page: Option<usize>,
+        page_size: Option<usize>,
+    ) -> Result<DirListing, SandboxError> {
+        validate_absolute(path, "list")?;
+        let (page, page_size) = list_page_bounds(page, page_size);
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
+        self.touch(internal_id, row.timeout_secs).await;
+
+        let cmd = vec![
+            "sh".into(),
+            "-c".into(),
+            list_script(path, (page - 1).saturating_mul(page_size), page_size),
+        ];
+        let result = self
+            .registry()
+            .provider()
+            .exec(&handle, cmd, HashMap::new(), None)
+            .await
+            .map_err(|e| file_op_err(public_id, "list", path.to_string(), e))?;
+
+        if result.exit_code != 0 {
+            return Err(SandboxError::FileOp {
+                sandbox_id: public_id.to_string(),
+                op: "list".into(),
+                path: path.to_string(),
+                reason: format!("list exited {}: {}", result.exit_code, result.stdout.trim()),
+            });
+        }
+        // A directory the sandbox user cannot read must not look empty: the
+        // console would tell the user it has no files.
+        parse_list_output(path, &result.stdout, page, page_size).ok_or_else(|| {
+            SandboxError::Validation {
+                message: format!(
+                    "Directory '{path}' in sandbox {public_id} cannot be listed: the sandbox \
+                 user lacks read and search permission on it"
+                ),
+            }
+        })
+    }
+
     /// Write multiple files in one call. Mirrors `@vercel/sandbox`'s
     /// `writeFiles()`, which is the hot path for seeding project
     /// scaffolding (e.g. a generated Next.js app). Semantics:
@@ -227,12 +339,10 @@ impl SandboxService {
             return Ok(0);
         }
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
 
         let mut written = 0usize;
         for entry in files {
@@ -257,12 +367,10 @@ impl SandboxService {
     ) -> Result<(), SandboxError> {
         validate_absolute(path, "mkdir")?;
         let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        // Only a sandbox that is really running counts as activity: a dead
+        // VM must not have its idle deadline pushed out by every attempt.
         self.touch(internal_id, row.timeout_secs).await;
-        let handle = self
-            .registry()
-            .get(internal_id, public_id)
-            .await
-            .map_err(|e| Self::provider_err(public_id, e))?;
         let cmd = vec!["mkdir".into(), "-p".into(), path.to_string()];
         let result = self
             .registry()
@@ -318,6 +426,188 @@ fn validate_absolute(path: &str, op: &str) -> Result<(), SandboxError> {
     Ok(())
 }
 
+/// Shell script that prints `missing`, `notdir`, `denied`, or `ok` followed by
+/// one `<k> <name>` line per entry (`k` is `f`, `d`, `l` or `o`).
+///
+/// `denied` covers a directory the sandbox user cannot both read and search,
+/// and a path hidden behind an ancestor it cannot search: without read
+/// permission the listing below sees nothing, and `[ -e ]` is false for
+/// anything under a locked parent, so either would be reported as empty or
+/// missing.
+///
+/// A `total <n>` line follows `ok`: the number of entries the page numbers are
+/// computed from, so the console can show "page 3 of 12". A directory with more
+/// than [`MAX_LIST_SCAN`] entries is cut there and a `truncated 1` line says so.
+///
+/// Only one page leaves the sandbox: the first `skip` entries are counted and
+/// dropped, and the scan stops after `want` (one more than the page, so the
+/// caller can tell "exactly a page" from "more than a page"). Directories are
+/// emitted first, in a second pass the rest, so the order is the same for
+/// every page of the same directory. At most `MAX_LIST_SCAN + 1` names are
+/// read (`find | head`, so the pipe closes on the rest) and then sorted as one
+/// list under `LC_ALL=C`, so the order is bytewise and not "dotfiles first,
+/// then the rest"; where `sort` is missing the filesystem order is used, which
+/// is still the same on every page. A `sort` that fails is an error, not an
+/// empty directory.
+///
+/// Written for busybox `sh`: no `find -printf`, no arrays. Names are read as
+/// lines, relative to the directory, so none of them is ever re-parsed as part
+/// of a command line (word splitting is limited to newlines and globbing is
+/// off while the sorted list is walked). A name containing a newline would
+/// break the line framing and is skipped.
+fn list_script(path: &str, skip: usize, page_size: usize) -> String {
+    format!(
+        "LC_ALL=C; export LC_ALL\n\
+         d={p}\n\
+         if [ ! -e \"$d\" ]; then\n\
+           a=$d\n\
+           while [ \"$a\" != / ]; do\n\
+             a=${{a%/*}}\n\
+             if [ -z \"$a\" ]; then a=/; fi\n\
+             if [ -d \"$a\" ] && [ ! -x \"$a\" ]; then echo denied; exit 0; fi\n\
+           done\n\
+           echo missing; exit 0\n\
+         fi\n\
+         if [ ! -d \"$d\" ]; then echo notdir; exit 0; fi\n\
+         if [ ! -r \"$d\" ] || [ ! -x \"$d\" ]; then echo denied; exit 0; fi\n\
+         cd -- \"$d\" 2>/dev/null || {{ echo denied; exit 0; }}\n\
+         for u in find head; do\n\
+           if ! command -v \"$u\" >/dev/null 2>&1; then echo \"list failed: $u is not available\"; exit 3; fi\n\
+         done\n\
+         if command -v sort >/dev/null 2>&1; then s=sort; else s=cat; fi\n\
+         L=$({{ find . -mindepth 1 -maxdepth 1 ! -name '*\n*' 2>/dev/null; echo \"status:$?\"; }} | head -n {scan_plus_one} | $s) || {{ echo 'list failed: sorting the names failed'; exit 3; }}\n\
+         IFS='\n'\n\
+         set -f\n\
+         t=0\n\
+         st=\n\
+         for f in $L; do\n\
+           case \"$f\" in\n\
+             status:*) st=${{f#status:}};;\n\
+             *) t=$((t+1));;\n\
+           esac\n\
+         done\n\
+         cut=0\n\
+         if [ \"$t\" -gt {scan} ]; then\n\
+           cut=1\n\
+           t={scan}\n\
+         elif [ \"$st\" != 0 ]; then\n\
+           echo \"list failed: reading the directory failed (status ${{st:-missing}})\"; exit 3\n\
+         fi\n\
+         echo ok\n\
+         if [ \"$cut\" = 1 ]; then echo 'truncated 1'; fi\n\
+         echo \"total $t\"\n\
+         seen=0\n\
+         n=0\n\
+         for pass in d o; do\n\
+           for f in $L; do\n\
+             case \"$f\" in status:*) continue;; esac\n\
+             if [ -L \"$f\" ]; then k=l; elif [ -d \"$f\" ]; then k=d; elif [ -f \"$f\" ]; then k=f; else k=o; fi\n\
+             if [ \"$pass\" = d ]; then\n\
+               if [ \"$k\" != d ]; then continue; fi\n\
+             elif [ \"$k\" = d ]; then continue; fi\n\
+             seen=$((seen+1))\n\
+             if [ \"$seen\" -gt {scan} ]; then break 2; fi\n\
+             if [ \"$seen\" -le {skip} ]; then continue; fi\n\
+             printf '%s %s\\n' \"$k\" \"${{f#./}}\"\n\
+             n=$((n+1))\n\
+             if [ \"$n\" -gt {page_size} ]; then break 2; fi\n\
+           done\n\
+         done\n",
+        p = shell_quote(path),
+        skip = skip,
+        page_size = page_size,
+        scan = MAX_LIST_SCAN,
+        scan_plus_one = MAX_LIST_SCAN + 1,
+    )
+}
+
+/// Turn the output of [`list_script`] into a [`DirListing`], or `None` when
+/// the directory exists but the sandbox user may not read it.
+///
+/// Lines are split on `\n` alone: `str::lines` also strips a trailing `\r`,
+/// which is a legal last byte of a file name and would rename the entry. The
+/// script already ordered the entries, so they are kept as received.
+fn parse_list_output(
+    path: &str,
+    stdout: &str,
+    page: usize,
+    page_size: usize,
+) -> Option<DirListing> {
+    let mut lines = stdout.split('\n');
+    let status = lines.next().map(str::trim).unwrap_or("");
+    let listing = |exists: bool, is_dir: bool| DirListing {
+        path: path.to_string(),
+        exists,
+        is_dir,
+        entries: Vec::new(),
+        page,
+        page_size,
+        total: 0,
+        truncated: false,
+        has_more: false,
+    };
+    match status {
+        "missing" => return Some(listing(false, false)),
+        "denied" => return None,
+        "notdir" => return Some(listing(true, false)),
+        _ => {}
+    }
+
+    let mut total = None;
+    let mut truncated = false;
+    let mut entries: Vec<DirEntry> = lines
+        .filter_map(|line| {
+            let (kind, name) = line.split_once(' ')?;
+            if kind == "total" {
+                total = name.trim().parse::<usize>().ok();
+                return None;
+            }
+            if kind == "truncated" {
+                truncated = true;
+                return None;
+            }
+            if name.is_empty() {
+                return None;
+            }
+            let kind = match kind {
+                "f" => DirEntryKind::File,
+                "d" => DirEntryKind::Directory,
+                "l" => DirEntryKind::Symlink,
+                "o" => DirEntryKind::Other,
+                _ => return None,
+            };
+            Some(DirEntry {
+                name: name.to_string(),
+                kind,
+            })
+        })
+        .collect();
+
+    let has_more = entries.len() > page_size;
+    entries.truncate(page_size);
+    // A script that did not report a total (or one that is inconsistent with
+    // the page it returned) still yields a count that is never smaller than
+    // what has been seen, so the page controls cannot point past the end. An
+    // empty page proves nothing about the entries before it (the directory may
+    // simply be shorter than the page asked for), so it contributes no floor.
+    let seen = if entries.is_empty() {
+        0
+    } else {
+        page.saturating_sub(1)
+            .saturating_mul(page_size)
+            .saturating_add(entries.len())
+            .saturating_add(usize::from(has_more))
+    };
+    let total = total.map_or(seen, |reported| reported.max(seen));
+    Some(DirListing {
+        entries,
+        total,
+        truncated,
+        has_more,
+        ..listing(true, true)
+    })
+}
+
 /// POSIX single-quote escape — see `exec::shell_escape`. Duplicated here
 /// so `fs.rs` doesn't depend on exec internals.
 fn shell_quote(s: &str) -> String {
@@ -371,7 +661,24 @@ mod tests {
                 sandbox: "temps-sandbox-1".into(),
             },
         );
-        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert!(matches!(err, SandboxError::VmNotRunning { .. }), "{err:?}");
+
+        let err = file_op_err(
+            "sbx_1",
+            "read",
+            "/a",
+            AgentError::SandboxNotRunning {
+                run_id: 0,
+                sandbox_id: "sbx_1".into(),
+                container: "temps-sandbox-1".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::VmNotRunning { backend: Some(b), .. } if b == "firecracker"),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -447,5 +754,328 @@ mod tests {
             size: 0,
         };
         assert!(!s.exists);
+    }
+
+    #[test]
+    fn list_script_quotes_the_path_and_reads_one_page() {
+        let script = list_script("/work space/it's", 40, 20);
+        assert!(script.contains("d='/work space/it'\\''s'\n"), "{script}");
+        assert!(
+            script.contains("-le 40"),
+            "skips the earlier pages: {script}"
+        );
+        assert!(
+            script.contains("-gt 20"),
+            "stops after a page and one: {script}"
+        );
+        assert!(script.contains("LC_ALL=C"), "{script}");
+    }
+
+    /// Runs the real script under each POSIX shell present (`sh`, and `dash`,
+    /// which behaves like the busybox `ash` sandboxes ship) against a directory with names
+    /// that sort on both sides of a dot, so the documented order is checked,
+    /// not just the text of the script.
+    #[cfg(unix)]
+    #[test]
+    fn list_script_orders_names_bytewise_and_pages_consistently() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for name in [
+            " space", "-dash", ".env", ".git", "..hidden", "b.txt", "A.txt",
+        ] {
+            std::fs::write(dir.path().join(name), "").expect("file");
+        }
+        std::fs::create_dir(dir.path().join("src")).expect("dir");
+        std::fs::create_dir(dir.path().join(".cache")).expect("dir");
+        let path = dir.path().to_str().expect("utf-8 path").to_string();
+        for shell in ["/bin/sh", "/bin/dash"] {
+            if !std::path::Path::new(shell).exists() {
+                continue;
+            }
+            check_listing_under(shell, &path);
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_listing_under(shell: &str, path: &str) {
+        let run = |skip: usize, page_size: usize| -> DirListing {
+            let output = std::process::Command::new(shell)
+                .arg("-c")
+                .arg(list_script(path, skip, page_size))
+                .output()
+                .expect("runs sh");
+            let stdout = String::from_utf8(output.stdout).expect("utf-8");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let page = skip / page_size + 1;
+            parse_list_output(path, &stdout, page, page_size).expect("a listing")
+        };
+
+        let all = run(0, 100);
+        let names: Vec<_> = all.entries.iter().map(|e| e.name.as_str()).collect();
+        // Directories first, then files, each group in plain byte order: a
+        // space and `-` sort before `.`, which sorts before letters.
+        assert_eq!(
+            names,
+            [".cache", "src", " space", "-dash", "..hidden", ".env", ".git", "A.txt", "b.txt"]
+        );
+        assert_eq!(all.total, 9);
+        assert!(!all.has_more);
+
+        let mut paged = Vec::new();
+        for page_index in 0..3 {
+            let page = run(page_index * 4, 4);
+            assert_eq!(page.total, 9);
+            assert_eq!(page.has_more, page_index < 2, "page {page_index}");
+            paged.extend(page.entries.into_iter().map(|e| e.name));
+        }
+        assert_eq!(paged, names, "pages concatenate to the whole listing");
+    }
+
+    #[test]
+    fn page_bounds_default_and_clamp() {
+        assert_eq!(list_page_bounds(None, None), (1, DEFAULT_LIST_PAGE_SIZE));
+        assert_eq!(list_page_bounds(Some(0), Some(0)), (1, 1));
+        assert_eq!(
+            list_page_bounds(Some(3), Some(100_000)),
+            (3, MAX_LIST_PAGE_SIZE)
+        );
+        assert_eq!(
+            list_page_bounds(Some(usize::MAX), Some(100)),
+            (MAX_LIST_SCAN, 100),
+            "a page past the scan cap cannot hold an entry; the skip count stays bounded"
+        );
+    }
+
+    #[test]
+    fn an_empty_page_past_the_end_does_not_inflate_the_total() {
+        let listing = parse_list_output("/small", "ok\ntotal 3\n", 51, 20).expect("a listing");
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.total, 3, "the directory's own count, not 50 pages");
+
+        let huge = parse_list_output("/small", "ok\n", usize::MAX, usize::MAX).expect("a listing");
+        assert_eq!(huge.total, 0, "no overflow, no invented entries");
+    }
+
+    #[test]
+    fn parse_list_reports_a_truncated_directory() {
+        let listing = parse_list_output("/huge", "ok\ntruncated 1\ntotal 10000\nf a\n", 1, 20)
+            .expect("a listing");
+        assert!(listing.truncated);
+        assert_eq!(listing.total, MAX_LIST_SCAN);
+
+        let whole = parse_list_output("/small", "ok\ntotal 1\nf a\n", 1, 20).expect("a listing");
+        assert!(!whole.truncated);
+    }
+
+    #[cfg(unix)]
+    fn run_script_with_path(script: &str, path_prefix: Option<&std::path::Path>) -> (bool, String) {
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        if let Some(prefix) = path_prefix {
+            path = format!("{}:{path}", prefix.display());
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("PATH", path)
+            .output()
+            .expect("runs sh");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        )
+    }
+
+    /// A `sort` that dies must not turn into "this directory is empty".
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_sort_is_an_error_not_an_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("kept.txt"), "").expect("file");
+        let bin = tempfile::tempdir().expect("bin dir");
+        let fake = bin.path().join("sort");
+        std::fs::write(&fake, "#!/bin/sh\ncat >/dev/null\nexit 1\n").expect("fake sort");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let script = list_script(dir.path().to_str().expect("utf-8"), 0, 20);
+        let (ok, stdout) = run_script_with_path(&script, Some(bin.path()));
+
+        assert!(!ok, "the script must fail: {stdout}");
+        assert!(stdout.contains("list failed"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "ok"), "{stdout}");
+    }
+
+    /// `find` (or any command before `sort`) failing must not be hidden by a
+    /// `sort` that then succeeds on the empty input.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_find_is_an_error_not_an_empty_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("temp dir");
+        std::fs::write(dir.path().join("kept.txt"), "").expect("file");
+        let bin = tempfile::tempdir().expect("bin dir");
+        let fake = bin.path().join("find");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").expect("fake find");
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+        let script = list_script(dir.path().to_str().expect("utf-8"), 0, 20);
+        let (ok, stdout) = run_script_with_path(&script, Some(bin.path()));
+
+        assert!(!ok, "the script must fail: {stdout}");
+        assert!(stdout.contains("list failed"), "{stdout}");
+        assert!(!stdout.lines().any(|line| line == "ok"), "{stdout}");
+    }
+
+    /// Past `MAX_LIST_SCAN` names the script stops reading and says so, and a
+    /// name containing a newline is left out instead of splitting in two.
+    #[cfg(unix)]
+    #[test]
+    fn a_huge_directory_is_cut_at_the_scan_cap_and_marked_truncated() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        for i in 0..MAX_LIST_SCAN + 5 {
+            std::fs::write(dir.path().join(format!("f{i:05}")), "").expect("file");
+        }
+        std::fs::write(dir.path().join("two\nlines"), "").expect("newline name");
+        let path = dir.path().to_str().expect("utf-8").to_string();
+
+        let script = list_script(&path, 0, MAX_LIST_PAGE_SIZE);
+        let (ok, stdout) = run_script_with_path(&script, None);
+        assert!(ok, "{stdout}");
+        let listing = parse_list_output(&path, &stdout, 1, MAX_LIST_PAGE_SIZE).expect("a listing");
+
+        assert!(listing.truncated);
+        assert_eq!(listing.total, MAX_LIST_SCAN);
+        assert_eq!(listing.entries.len(), MAX_LIST_PAGE_SIZE);
+        assert!(listing.has_more);
+        assert!(
+            listing.entries.iter().all(|e| !e.name.contains('\n')),
+            "a newline name never reaches the listing"
+        );
+    }
+
+    #[test]
+    fn parse_list_reports_missing_and_not_a_directory() {
+        let missing = parse_list_output("/nope", "missing\n", 1, 20).expect("a listing");
+        assert!(!missing.exists && !missing.is_dir && missing.entries.is_empty());
+
+        let file = parse_list_output("/etc/hosts", "notdir\n", 1, 20).expect("a listing");
+        assert!(file.exists && !file.is_dir && file.entries.is_empty());
+    }
+
+    #[test]
+    fn parse_list_does_not_turn_a_denied_directory_into_an_empty_one() {
+        assert!(parse_list_output("/root", "denied\n", 1, 20).is_none());
+    }
+
+    #[test]
+    fn list_script_refuses_a_directory_it_cannot_read_and_search() {
+        let script = list_script("/root", 0, 20);
+        assert!(
+            script.contains("[ ! -r \"$d\" ] || [ ! -x \"$d\" ]"),
+            "{script}"
+        );
+    }
+
+    /// `[ -e ]` is false for anything under a parent the user cannot search,
+    /// which would read as "does not exist". The script walks the ancestors
+    /// before concluding that.
+    #[test]
+    fn list_script_tells_a_locked_parent_from_a_missing_path() {
+        let script = list_script("/srv/private/data", 0, 20);
+        let missing = script.find("echo missing").expect("reports missing");
+        let walk = script
+            .find("[ -d \"$a\" ] && [ ! -x \"$a\" ]")
+            .expect("checks ancestors");
+        assert!(walk < missing, "ancestors are checked first: {script}");
+    }
+
+    #[test]
+    fn parse_list_keeps_a_trailing_carriage_return_in_a_name() {
+        let listing =
+            parse_list_output("/work", "ok\nf config\nf config\r\n", 1, 20).expect("a listing");
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["config", "config\r"]);
+    }
+
+    #[test]
+    fn parse_list_keeps_the_order_the_script_produced() {
+        let listing = parse_list_output(
+            "/work",
+            "ok\nd .git\nd src\nf  leading space\nl current\no fifo\nf zebra.txt\n",
+            1,
+            20,
+        )
+        .expect("a listing");
+        let names: Vec<_> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                ".git",
+                "src",
+                " leading space",
+                "current",
+                "fifo",
+                "zebra.txt"
+            ]
+        );
+        assert_eq!(listing.entries[3].kind, DirEntryKind::Symlink);
+        assert!(!listing.has_more);
+        assert_eq!(listing.total, 6, "no total line: what was seen");
+        assert!(listing.exists && listing.is_dir);
+    }
+
+    #[test]
+    fn parse_list_ignores_malformed_lines() {
+        let listing =
+            parse_list_output("/work", "ok\nx unknown-kind\nnospace\nf \nf real\n", 1, 20)
+                .expect("a listing");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "real");
+    }
+
+    #[test]
+    fn parse_list_flags_more_entries_after_the_page() {
+        let mut out = String::from("ok\n");
+        for i in 0..=3 {
+            out.push_str(&format!("f file-{i}\n"));
+        }
+        let listing = parse_list_output("/big", &out, 2, 3).expect("a listing");
+        assert!(listing.has_more);
+        assert_eq!(listing.entries.len(), 3);
+        assert_eq!((listing.page, listing.page_size), (2, 3));
+
+        let exact = parse_list_output("/big", "ok\nf a\nf b\nf c\n", 1, 3).expect("a listing");
+        assert!(!exact.has_more, "exactly a page is not followed by more");
+    }
+
+    #[test]
+    fn parse_list_reports_the_total_of_the_whole_directory() {
+        let listing = parse_list_output("/big", "ok\ntotal 250\nf a\nf b\nf c\nf d\n", 2, 3)
+            .expect("a listing");
+        assert_eq!(listing.total, 250);
+        assert_eq!(listing.entries.len(), 3);
+
+        let empty = parse_list_output("/empty", "ok\ntotal 0\n", 1, 20).expect("a listing");
+        assert_eq!(empty.total, 0);
+        assert!(empty.entries.is_empty() && !empty.has_more);
+    }
+
+    #[test]
+    fn parse_list_never_reports_a_total_below_what_it_has_seen() {
+        // A directory that changed between the count and the page.
+        let listing =
+            parse_list_output("/busy", "ok\ntotal 1\nf a\nf b\nf c\n", 1, 20).expect("a listing");
+        assert_eq!(listing.total, 3);
+    }
+
+    #[test]
+    fn list_script_counts_the_whole_directory_before_paging() {
+        let script = list_script("/work", 0, 20);
+        let counted = script.find("echo \"total $t\"").expect("prints a total");
+        let paged = script.find("seen=0").expect("pages afterwards");
+        assert!(counted < paged, "{script}");
     }
 }

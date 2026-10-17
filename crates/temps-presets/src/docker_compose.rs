@@ -145,8 +145,8 @@ pub struct EffectiveComposePreview {
 /// mutates or re-serializes the input, unlike `strip_excluded_services` in
 /// `temps-deployer`, which needs a full rewrite at deploy time.
 pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, ComposeParseError> {
-    let mut root: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|e| ComposeParseError::InvalidYaml {
+    let mut root: yaml_serde::Value =
+        yaml_serde::from_str(yaml).map_err(|e| ComposeParseError::InvalidYaml {
             reason: e.to_string(),
         })?;
     root.apply_merge()
@@ -156,7 +156,7 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
 
     let services = root
         .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(yaml_serde::Value::as_mapping)
         .ok_or(ComposeParseError::MissingServices)?;
 
     let mut previews = Vec::with_capacity(services.len());
@@ -166,7 +166,7 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
 
         let image = service
             .and_then(|s| s.get("image"))
-            .and_then(serde_yaml::Value::as_str)
+            .and_then(yaml_serde::Value::as_str)
             .map(str::to_string);
 
         let depends_on = service
@@ -212,7 +212,7 @@ pub fn list_compose_services(yaml: &str) -> Result<Vec<ComposeServicePreview>, C
 /// Extract one unambiguous HTTP path from a Compose healthcheck that probes a
 /// loopback address. We intentionally ignore remote hosts, non-HTTP commands,
 /// and checks with multiple different paths.
-fn http_healthcheck_path(healthcheck: &serde_yaml::Value) -> Option<String> {
+fn http_healthcheck_path(healthcheck: &yaml_serde::Value) -> Option<String> {
     let mut paths = std::collections::BTreeSet::new();
     visit_healthcheck_strings(healthcheck, &mut |text| {
         for scheme in ["http://", "https://"] {
@@ -255,24 +255,24 @@ fn http_healthcheck_path(healthcheck: &serde_yaml::Value) -> Option<String> {
         .flatten()
 }
 
-fn visit_healthcheck_strings(value: &serde_yaml::Value, visitor: &mut impl FnMut(&str)) {
+fn visit_healthcheck_strings(value: &yaml_serde::Value, visitor: &mut impl FnMut(&str)) {
     match value {
-        serde_yaml::Value::String(text) => visitor(text),
-        serde_yaml::Value::Sequence(values) => {
+        yaml_serde::Value::String(text) => visitor(text),
+        yaml_serde::Value::Sequence(values) => {
             for value in values {
                 visit_healthcheck_strings(value, visitor);
             }
         }
-        serde_yaml::Value::Mapping(values) => {
+        yaml_serde::Value::Mapping(values) => {
             for (key, value) in values {
                 visit_healthcheck_strings(key, visitor);
                 visit_healthcheck_strings(value, visitor);
             }
         }
-        serde_yaml::Value::Tagged(tagged) => {
+        yaml_serde::Value::Tagged(tagged) => {
             visit_healthcheck_strings(&tagged.value, visitor);
         }
-        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) | serde_yaml::Value::Number(_) => {}
+        yaml_serde::Value::Null | yaml_serde::Value::Bool(_) | yaml_serde::Value::Number(_) => {}
     }
 }
 
@@ -355,7 +355,7 @@ pub fn render_effective_compose_preview_with_policy(
     validate_preview_composition(&base, policy)?;
     if base
         .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(yaml_serde::Value::as_mapping)
         .is_none()
         && !(base.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include))
     {
@@ -368,6 +368,7 @@ pub fn render_effective_compose_preview_with_policy(
         validate_preview_composition(&override_document, policy)?;
         validate_preview_override(&base, &override_document, policy)?;
         normalize_sensitive_maps(&mut override_document);
+        super::compose_check::deduplicate_override_lists(&base, &mut override_document);
         merge_compose_value(&mut base, override_document, &[]);
     }
     validate_preview_build_images(&base, policy)?;
@@ -378,7 +379,7 @@ pub fn render_effective_compose_preview_with_policy(
     disabled_services.dedup();
     let redacted_values = redact_sensitive_values(&mut base);
     normalize_empty_named_resources(&mut base);
-    let yaml = serde_yaml::to_string(&base).map_err(|error| ComposeParseError::Serialization {
+    let yaml = yaml_serde::to_string(&base).map_err(|error| ComposeParseError::Serialization {
         reason: error.to_string(),
     })?;
 
@@ -391,7 +392,7 @@ pub fn render_effective_compose_preview_with_policy(
 }
 
 fn validate_preview_composition(
-    compose: &serde_yaml::Value,
+    compose: &yaml_serde::Value,
     policy: &ComposeSecurityPolicy,
 ) -> Result<(), ComposeParseError> {
     if policy.enforced(ComposeSecurityCheck::Include) && compose.get("include").is_some() {
@@ -421,13 +422,13 @@ fn validate_preview_composition(
 }
 
 fn validate_preview_build_images(
-    compose: &serde_yaml::Value,
+    compose: &yaml_serde::Value,
     policy: &ComposeSecurityPolicy,
 ) -> Result<(), ComposeParseError> {
     if !policy.enforced(ComposeSecurityCheck::BuildImage) {
         return Ok(());
     }
-    let Some(services) = compose.get("services").and_then(serde_yaml::Value::as_mapping) else {
+    let Some(services) = compose.get("services").and_then(yaml_serde::Value::as_mapping) else {
         return Ok(());
     };
     for (name, service) in services {
@@ -448,20 +449,20 @@ fn validate_preview_build_images(
 /// as null. Compose treats that as a default named-resource declaration, but
 /// serializing it back as `name: null` is misleading in an effective manifest.
 /// Use the explicit `{}` form for every top-level named resource instead.
-fn normalize_empty_named_resources(root: &mut serde_yaml::Value) {
+fn normalize_empty_named_resources(root: &mut yaml_serde::Value) {
     let Some(root) = root.as_mapping_mut() else {
         return;
     };
     for section_name in ["volumes", "networks", "configs", "secrets"] {
         let Some(section) = root
             .get_mut(section_name)
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
         else {
             continue;
         };
         for definition in section.values_mut() {
             if definition.is_null() {
-                *definition = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+                *definition = yaml_serde::Value::Mapping(yaml_serde::Mapping::new());
             }
         }
     }
@@ -470,9 +471,9 @@ fn normalize_empty_named_resources(root: &mut serde_yaml::Value) {
 fn parse_compose_document(
     yaml: &str,
     source: &str,
-) -> Result<serde_yaml::Value, ComposeParseError> {
-    let mut root: serde_yaml::Value =
-        serde_yaml::from_str(yaml).map_err(|error| ComposeParseError::InvalidYaml {
+) -> Result<yaml_serde::Value, ComposeParseError> {
+    let mut root: yaml_serde::Value =
+        yaml_serde::from_str(yaml).map_err(|error| ComposeParseError::InvalidYaml {
             reason: format!("{source}: {error}"),
         })?;
     root.apply_merge()
@@ -482,23 +483,23 @@ fn parse_compose_document(
     Ok(root)
 }
 
-fn service_names(root: &serde_yaml::Value) -> Vec<String> {
+fn service_names(root: &yaml_serde::Value) -> Vec<String> {
     let mut names: Vec<_> = root
         .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(yaml_serde::Value::as_mapping)
         .into_iter()
         .flat_map(|services| services.keys())
-        .filter_map(serde_yaml::Value::as_str)
+        .filter_map(yaml_serde::Value::as_str)
         .map(str::to_string)
         .collect();
     names.sort();
     names
 }
 
-fn strip_excluded_services_value(root: &mut serde_yaml::Value, excluded: &[String]) {
+fn strip_excluded_services_value(root: &mut yaml_serde::Value, excluded: &[String]) {
     let Some(services) = root
         .get_mut("services")
-        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(yaml_serde::Value::as_mapping_mut)
     else {
         return;
     };
@@ -580,8 +581,8 @@ const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
 ];
 
 fn validate_preview_override(
-    base: &serde_yaml::Value,
-    override_document: &serde_yaml::Value,
+    base: &yaml_serde::Value,
+    override_document: &yaml_serde::Value,
     policy: &ComposeSecurityPolicy,
 ) -> Result<(), ComposeParseError> {
     let Some(root) = override_document.as_mapping() else {
@@ -603,7 +604,7 @@ fn validate_preview_override(
     }
     let Some(override_services) = override_document
         .get("services")
-        .and_then(serde_yaml::Value::as_mapping)
+        .and_then(yaml_serde::Value::as_mapping)
     else {
         if root.get("include").is_some() && !policy.enforced(ComposeSecurityCheck::Include) {
             return Ok(());
@@ -620,7 +621,7 @@ fn validate_preview_override(
     let enabled: BTreeSet<_> = service_names(base).into_iter().collect();
     for name in override_services
         .keys()
-        .filter_map(serde_yaml::Value::as_str)
+        .filter_map(yaml_serde::Value::as_str)
     {
         if policy.enforced(ComposeSecurityCheck::InlineServices) && !enabled.contains(name) {
             return Err(ComposeParseError::PolicyViolation {
@@ -630,14 +631,14 @@ fn validate_preview_override(
         }
 
         let Some(service) = override_services
-            .get(serde_yaml::Value::String(name.to_string()))
-            .and_then(serde_yaml::Value::as_mapping)
+            .get(yaml_serde::Value::String(name.to_string()))
+            .and_then(yaml_serde::Value::as_mapping)
         else {
             return Err(ComposeParseError::InvalidOverride {
                 reason: format!("service '{name}' override must be a mapping"),
             });
         };
-        for key in service.keys().filter_map(serde_yaml::Value::as_str) {
+        for key in service.keys().filter_map(yaml_serde::Value::as_str) {
             if NEVER_ALLOWED_SERVICE_KEYS.contains(&key) {
                 if let Some(check) = ComposeSecurityCheck::for_restricted_service_field(key) {
                     if policy.enforced(check) {
@@ -661,10 +662,10 @@ fn validate_preview_override(
     Ok(())
 }
 
-fn normalize_sensitive_maps(root: &mut serde_yaml::Value) {
+fn normalize_sensitive_maps(root: &mut yaml_serde::Value) {
     let Some(services) = root
         .get_mut("services")
-        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(yaml_serde::Value::as_mapping_mut)
     else {
         return;
     };
@@ -677,7 +678,7 @@ fn normalize_sensitive_maps(root: &mut serde_yaml::Value) {
         }
         if let Some(args) = service
             .get_mut("build")
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
             .and_then(|build| build.get_mut("args"))
         {
             normalize_key_value_sequence(args);
@@ -685,34 +686,34 @@ fn normalize_sensitive_maps(root: &mut serde_yaml::Value) {
     }
 }
 
-fn normalize_key_value_sequence(value: &mut serde_yaml::Value) {
+fn normalize_key_value_sequence(value: &mut yaml_serde::Value) {
     let Some(sequence) = value.as_sequence() else {
         return;
     };
-    let mut mapping = serde_yaml::Mapping::new();
+    let mut mapping = yaml_serde::Mapping::new();
     for entry in sequence {
         let Some(entry) = entry.as_str() else {
             continue;
         };
         let (key, value) = entry
             .split_once('=')
-            .map_or((entry, serde_yaml::Value::Null), |(key, value)| {
-                (key, serde_yaml::Value::String(value.to_string()))
+            .map_or((entry, yaml_serde::Value::Null), |(key, value)| {
+                (key, yaml_serde::Value::String(value.to_string()))
             });
         if !key.trim().is_empty() {
-            mapping.insert(serde_yaml::Value::String(key.trim().to_string()), value);
+            mapping.insert(yaml_serde::Value::String(key.trim().to_string()), value);
         }
     }
-    *value = serde_yaml::Value::Mapping(mapping);
+    *value = yaml_serde::Value::Mapping(mapping);
 }
 
 fn merge_compose_value(
-    base: &mut serde_yaml::Value,
-    override_value: serde_yaml::Value,
+    base: &mut yaml_serde::Value,
+    override_value: yaml_serde::Value,
     path: &[String],
 ) {
     match (base, override_value) {
-        (serde_yaml::Value::Mapping(base), serde_yaml::Value::Mapping(override_mapping)) => {
+        (yaml_serde::Value::Mapping(base), yaml_serde::Value::Mapping(override_mapping)) => {
             for (key, value) in override_mapping {
                 let key_name = key.as_str().unwrap_or_default().to_string();
                 let mut child_path = path.to_vec();
@@ -725,13 +726,19 @@ fn merge_compose_value(
             }
         }
         (
-            base @ serde_yaml::Value::Sequence(_),
-            serde_yaml::Value::Sequence(mut override_items),
+            base @ yaml_serde::Value::Sequence(_),
+            yaml_serde::Value::Sequence(mut override_items),
         ) => {
             if compose_sequence_replaces(path) {
-                *base = serde_yaml::Value::Sequence(override_items);
-            } else if let serde_yaml::Value::Sequence(base_items) = base {
-                base_items.append(&mut override_items);
+                *base = yaml_serde::Value::Sequence(override_items);
+            } else if let yaml_serde::Value::Sequence(base_items) = base {
+                // Compose appends these lists; identical items are merged
+                // once, matching the deploy-time de-duplication.
+                for item in override_items.drain(..) {
+                    if !base_items.contains(&item) {
+                        base_items.push(item);
+                    }
+                }
             }
         }
         (base, override_value) => *base = override_value,
@@ -748,10 +755,10 @@ fn compose_sequence_replaces(path: &[String]) -> bool {
         || (field == "test" && path.iter().any(|part| part == "healthcheck"))
 }
 
-fn redact_sensitive_values(root: &mut serde_yaml::Value) -> usize {
+fn redact_sensitive_values(root: &mut yaml_serde::Value) -> usize {
     let Some(services) = root
         .get_mut("services")
-        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(yaml_serde::Value::as_mapping_mut)
     else {
         return 0;
     };
@@ -762,21 +769,21 @@ fn redact_sensitive_values(root: &mut serde_yaml::Value) -> usize {
         };
         if let Some(environment) = service
             .get_mut("environment")
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
         {
             for value in environment.values_mut() {
-                *value = serde_yaml::Value::String("<redacted>".to_string());
+                *value = yaml_serde::Value::String("<redacted>".to_string());
                 count += 1;
             }
         }
         if let Some(args) = service
             .get_mut("build")
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
             .and_then(|build| build.get_mut("args"))
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
         {
             for value in args.values_mut() {
-                *value = serde_yaml::Value::String("<redacted>".to_string());
+                *value = yaml_serde::Value::String("<redacted>".to_string());
                 count += 1;
             }
         }
@@ -791,7 +798,7 @@ fn redact_sensitive_values(root: &mut serde_yaml::Value) -> usize {
         }
         if let Some(test) = service
             .get_mut("healthcheck")
-            .and_then(serde_yaml::Value::as_mapping_mut)
+            .and_then(yaml_serde::Value::as_mapping_mut)
             .and_then(|healthcheck| healthcheck.get_mut("test"))
         {
             count += redact_value(test);
@@ -811,7 +818,7 @@ fn redact_sensitive_values(root: &mut serde_yaml::Value) -> usize {
     // application configuration and credentials, so never expose it.
     if let Some(configs) = root
         .get_mut("configs")
-        .and_then(serde_yaml::Value::as_mapping_mut)
+        .and_then(yaml_serde::Value::as_mapping_mut)
     {
         for config in configs.values_mut() {
             if let Some(content) = config
@@ -825,33 +832,33 @@ fn redact_sensitive_values(root: &mut serde_yaml::Value) -> usize {
     count
 }
 
-fn redact_value(value: &mut serde_yaml::Value) -> usize {
+fn redact_value(value: &mut yaml_serde::Value) -> usize {
     if value.as_str() == Some("<redacted>") || value.is_null() {
         return 0;
     }
-    *value = serde_yaml::Value::String("<redacted>".to_string());
+    *value = yaml_serde::Value::String("<redacted>".to_string());
     1
 }
 
-fn redact_label_values(labels: &mut serde_yaml::Value) -> usize {
+fn redact_label_values(labels: &mut yaml_serde::Value) -> usize {
     match labels {
-        serde_yaml::Value::Mapping(mapping) => mapping.values_mut().map(redact_value).sum(),
-        serde_yaml::Value::Sequence(items) => items.iter_mut().map(redact_value).sum(),
+        yaml_serde::Value::Mapping(mapping) => mapping.values_mut().map(redact_value).sum(),
+        yaml_serde::Value::Sequence(items) => items.iter_mut().map(redact_value).sum(),
         _ => redact_value(labels),
     }
 }
 
-fn redact_secret_named_scalars(value: &mut serde_yaml::Value) -> usize {
+fn redact_secret_named_scalars(value: &mut yaml_serde::Value) -> usize {
     match value {
-        serde_yaml::Value::Mapping(mapping) => redact_secret_named_mapping(mapping),
-        serde_yaml::Value::Sequence(items) => {
+        yaml_serde::Value::Mapping(mapping) => redact_secret_named_mapping(mapping),
+        yaml_serde::Value::Sequence(items) => {
             items.iter_mut().map(redact_secret_named_scalars).sum()
         }
         _ => 0,
     }
 }
 
-fn redact_secret_named_mapping(mapping: &mut serde_yaml::Mapping) -> usize {
+fn redact_secret_named_mapping(mapping: &mut yaml_serde::Mapping) -> usize {
     let mut count = 0;
     for (key, value) in mapping {
         let key = key.as_str().unwrap_or_default();
@@ -888,7 +895,7 @@ fn is_secret_key_name(key: &str) -> bool {
 }
 
 fn compose_port_mappings(
-    value: &serde_yaml::Value,
+    value: &yaml_serde::Value,
 ) -> Vec<temps_entities::preset::ComposePortMapping> {
     let Some(entries) = value.as_sequence() else {
         return Vec::new();
@@ -901,7 +908,7 @@ fn compose_port_mappings(
 }
 
 fn compose_port_mapping(
-    value: &serde_yaml::Value,
+    value: &yaml_serde::Value,
 ) -> Option<temps_entities::preset::ComposePortMapping> {
     use temps_entities::preset::ComposePortMapping;
 
@@ -934,7 +941,7 @@ fn compose_port_mapping(
     let published = mapping.get("published").and_then(yaml_u16);
     let protocol = mapping
         .get("protocol")
-        .and_then(serde_yaml::Value::as_str)
+        .and_then(yaml_serde::Value::as_str)
         .unwrap_or("tcp")
         .to_string();
     Some(ComposePortMapping {
@@ -944,7 +951,7 @@ fn compose_port_mapping(
     })
 }
 
-fn yaml_u16(value: &serde_yaml::Value) -> Option<u16> {
+fn yaml_u16(value: &yaml_serde::Value) -> Option<u16> {
     value
         .as_u64()
         .and_then(|port| u16::try_from(port).ok())
@@ -958,12 +965,12 @@ fn yaml_u16(value: &serde_yaml::Value) -> Option<u16> {
 ///
 /// A sorted set makes the API deterministic and prevents duplicate rows when
 /// malformed/hand-written sequence input repeats a key.
-fn environment_variable_names(value: &serde_yaml::Value) -> Vec<String> {
+fn environment_variable_names(value: &yaml_serde::Value) -> Vec<String> {
     let mut names = BTreeSet::new();
     if let Some(map) = value.as_mapping() {
         names.extend(
             map.keys()
-                .filter_map(serde_yaml::Value::as_str)
+                .filter_map(yaml_serde::Value::as_str)
                 .map(str::trim)
                 .filter(|key| !key.is_empty())
                 .map(str::to_string),
@@ -972,7 +979,7 @@ fn environment_variable_names(value: &serde_yaml::Value) -> Vec<String> {
         names.extend(
             sequence
                 .iter()
-                .filter_map(serde_yaml::Value::as_str)
+                .filter_map(yaml_serde::Value::as_str)
                 .filter_map(|entry| {
                     let key = entry.split_once('=').map_or(entry, |(key, _)| key).trim();
                     (!key.is_empty()).then(|| key.to_string())
@@ -985,18 +992,18 @@ fn environment_variable_names(value: &serde_yaml::Value) -> Vec<String> {
 /// Reads service names out of a `depends_on:` value, which per the Compose
 /// spec is either a plain list of service names or a map of service name to
 /// `{ condition: ... }`.
-fn depends_on_names(value: &serde_yaml::Value) -> Vec<String> {
+fn depends_on_names(value: &yaml_serde::Value) -> Vec<String> {
     if let Some(seq) = value.as_sequence() {
         return seq
             .iter()
-            .filter_map(serde_yaml::Value::as_str)
+            .filter_map(yaml_serde::Value::as_str)
             .map(str::to_string)
             .collect();
     }
     if let Some(map) = value.as_mapping() {
         return map
             .keys()
-            .filter_map(serde_yaml::Value::as_str)
+            .filter_map(yaml_serde::Value::as_str)
             .map(str::to_string)
             .collect();
     }
@@ -1160,13 +1167,13 @@ services:
 
     #[test]
     fn ignores_remote_and_ambiguous_http_healthchecks() {
-        let remote = serde_yaml::from_str::<serde_yaml::Value>(
+        let remote = yaml_serde::from_str::<yaml_serde::Value>(
             "test: ['CMD', 'curl', '-f', 'https://example.com/health']",
         )
         .expect("valid healthcheck");
         assert_eq!(http_healthcheck_path(&remote), None);
 
-        let ambiguous = serde_yaml::from_str::<serde_yaml::Value>(
+        let ambiguous = yaml_serde::from_str::<yaml_serde::Value>(
             "test: ['CMD-SHELL', 'curl http://localhost:3000/ready || curl http://localhost:3000/live']",
         )
         .expect("valid healthcheck");
@@ -1329,7 +1336,7 @@ services:
         assert!(preview.yaml.contains("15455:80"));
         assert!(!preview.yaml.contains("3000:3000"));
 
-        let rendered: serde_yaml::Value = serde_yaml::from_str(&preview.yaml).unwrap();
+        let rendered: yaml_serde::Value = yaml_serde::from_str(&preview.yaml).unwrap();
         let depends_on = rendered["services"]["web"]["depends_on"]
             .as_sequence()
             .unwrap();

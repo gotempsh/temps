@@ -15,7 +15,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { Wand2 } from 'lucide-react'
 import { useState } from 'react'
-import { Navigate, useParams } from 'react-router'
+import { useParams } from 'react-router'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 
 interface AutofixRedirectProps {
   project: ProjectResponse
@@ -46,12 +47,12 @@ export function AutofixRedirect({ project }: AutofixRedirectProps) {
   })
 
   if (groupId <= 0) {
-    return <Navigate to="../errors" replace />
+    return <RedirectWithQuery to="../errors" />
   }
 
   const targetRunId = latestRun?.id ?? newRunId
   if (targetRunId) {
-    return <Navigate to={`../agents/${targetRunId}`} replace />
+    return <RedirectWithQuery to={`../agents/${targetRunId}`} />
   }
 
   if (isLoading) {

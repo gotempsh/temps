@@ -184,7 +184,7 @@ function SourceView({
           className="bg-background/80 backdrop-blur-sm"
         />
       </div>
-      <div className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
+      <div tabIndex={0} className="border rounded-lg bg-muted/30 p-4 max-h-[600px] overflow-auto">
         <pre className="text-xs font-mono whitespace-pre-wrap break-all">
           <HighlightedCode
             code={type === 'html' ? content : content}
@@ -377,7 +377,7 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                         href={link.original_url}
                         target="_blank"
                         rel="noopener noreferrer"
-                        className="text-blue-500 hover:underline truncate min-w-0 flex-1"
+                        className="text-blue-600 dark:text-blue-500 hover:underline truncate min-w-0 flex-1"
                         title={link.original_url}
                       >
                         {link.original_url}
@@ -590,7 +590,7 @@ export function EmailDetail() {
         <span className="inline-flex flex-wrap items-center gap-1.5">
           <code className="font-mono text-xs">{email.id}</code>
           <CopyAction value={email.id} label="Copy email ID" />
-          {email.project_id != null && <span>· project #{email.project_id}</span>}
+          {email.project_id != null && <span>· service #{email.project_id}</span>}
           {email.domain_id != null && <span>· domain #{email.domain_id}</span>}
         </span>
       }

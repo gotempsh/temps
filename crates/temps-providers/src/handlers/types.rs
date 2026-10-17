@@ -7,7 +7,7 @@ use crate::{ExternalServiceManager, QueryService};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct SensitiveValueResponse {
@@ -733,6 +733,23 @@ pub struct UpgradeExternalServiceRequest {
     /// This will trigger pg_upgrade for PostgreSQL or equivalent upgrade procedures for other services
     #[schema(example = "gotempsh/postgres-walg:18-bookworm")]
     pub docker_image: String,
+}
+
+/// Query for `GET /external-services/types/{service_type}/parameters`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct ServiceTypeParametersQuery {
+    /// Managed S3 storage engine to describe (`rustfs` or `garage`). Defaults
+    /// to `rustfs`; ignored for service types without backends.
+    #[param(example = "garage")]
+    pub backend: Option<String>,
+}
+
+/// Copy every bucket of another managed S3 service into this one.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MigrateS3ServiceRequest {
+    /// Managed S3 service to copy from (RustFS or Garage). It is only read.
+    #[schema(example = 12)]
+    pub source_service_id: i32,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

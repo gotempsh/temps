@@ -38,7 +38,7 @@ import {
   serviceProjectId,
   serviceProjectLink,
 } from '@/lib/service-project-link'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { keepPreviousData, useMutation, useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
   CheckCircle2,
@@ -387,8 +387,12 @@ export function CreateService() {
       path: {
         service_type: serviceType || '',
       },
+      // The parameters depend on the storage engine picked in the preset.
+      query: preset.backend ? { backend: preset.backend } : undefined,
     }),
     enabled: !!serviceType,
+    // Keep the form on screen while the other engine's schema loads.
+    placeholderData: keepPreviousData,
   })
 
   const creationDefaults = useMemo(
@@ -610,7 +614,7 @@ export function CreateService() {
             <Link2 className="size-4" />
             <AlertTitle>
               Create and link to{' '}
-              {projectQuery.data?.name ?? `project ${projectId}`}
+              {projectQuery.data?.name ?? `service ${projectId}`}
             </AlertTitle>
             <AlertDescription>
               {createAndLinkDescription(serviceType ?? '')}
@@ -782,7 +786,7 @@ export function CreateService() {
               ? `Create ${serviceName.trim()}`
               : 'Create database'
           }
-          submitDisabled={!serviceName.trim()}
+          submitDisabled={!serviceName.trim() || !!preset.error}
           isSubmitting={createServiceMut.isPending}
           serviceType={serviceType}
           managedByTemps

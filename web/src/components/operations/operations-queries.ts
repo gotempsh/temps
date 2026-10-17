@@ -2,20 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Query options for the header operations tray. Active work and finished
- * history are separate queries against `GET /operations` so the in-flight
- * rows and the badge count always come from the same response, however much
+ * Query options for the header operations tray. Active work, human review
+ * and finished history are separate queries against `GET /operations`. The
+ * active rows and badge count come from the same response, however much
  * newer finished work exists.
  *
- * Both sections use page navigation, not infinite scrolling: each section
+ * All sections use page navigation, not infinite scrolling: each section
  * observes exactly one page (keyed by page number) and Newer/Older replaces
  * it. Memory bound: per section the tray holds at most three pages -- the
  * first page (cached for the badge), the page on screen, and the page being
  * left while its successor loads (`keepPreviousData`). That is at most
- * 3 x 100 running + 3 x 20 finished = 360 rows however long the user
- * browses, and 120 rows while the tray is closed. Pages other than the first
+ * 3 x 100 running + 3 x 20 waiting + 3 x 20 finished = 420 rows however long
+ * the user browses, and 140 rows while the tray is closed. Other pages
  * are dropped from the cache as soon as nothing observes them (`gcTime: 0`),
- * and closing the tray returns both sections to page 1, so nothing loaded
+ * and closing the tray returns all sections to page 1, so nothing loaded
  * while browsing outlives the open tray.
  */
 import { listOperationsOptions } from '@/api/client/@tanstack/react-query.gen'
@@ -24,6 +24,7 @@ import type { ListOperationsData } from '@/api/client/types.gen'
 import {
   FINISHED_OPERATIONS_QUERY,
   RUNNING_OPERATIONS_QUERY,
+  WAITING_OPERATIONS_QUERY,
 } from '@/lib/operations'
 import { keepPreviousData } from '@tanstack/react-query'
 
@@ -66,6 +67,21 @@ export function finishedOperationsPageOptions(
     ...listOperationsOptions({
       ...overrides,
       query: { ...FINISHED_OPERATIONS_QUERY, page },
+    }),
+    placeholderData: keepPreviousData,
+    ...browsedPageCache(page),
+  }
+}
+
+/** One page of work awaiting review (`status=waiting`), 20 per page. */
+export function waitingOperationsPageOptions(
+  page: number,
+  overrides: OperationsQueryOverrides = {}
+) {
+  return {
+    ...listOperationsOptions({
+      ...overrides,
+      query: { ...WAITING_OPERATIONS_QUERY, page },
     }),
     placeholderData: keepPreviousData,
     ...browsedPageCache(page),

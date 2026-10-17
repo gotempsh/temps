@@ -70,6 +70,22 @@ jobs:
       channel: ${{ (inputs.dry_run == true || contains(github.ref_name, '-')) && 'beta' || 'stable' }}
       dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
 
+  database-images:
+    # Managed-database images (Postgres, Redis, MongoDB, ...) the binary
+    # references by tag. Publishes only tags missing from GHCR -- a release
+    # must not move a tag under running databases -- then fails unless every
+    # required tag is anonymously pullable. Freshness is owned by the weekly
+    # schedule in database-images.yml, not by the release cadence.
+    needs: [validate-release-ref, require-tests]
+    uses: ./.github/workflows/database-images.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    with:
+      ensure: true
+      dry_run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true }}
+
   validate-release-ref:
     name: Validate Release Ref
     runs-on: ubuntu-latest
@@ -227,13 +243,15 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-          targets: x86_64-unknown-linux-gnu
+          # The musl target is for the Firecracker guest agent (temps-vm-agent),
+          # which must be fully static; the temps binary itself stays on gnu.
+          targets: x86_64-unknown-linux-gnu,x86_64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -267,9 +285,45 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # Guest-side agent for Firecracker sandboxes. It runs as PID 1 inside the
+      # microVM, so it has to be a fully static binary that works on any guest
+      # image. `temps firecracker setup` installs it from next to the `temps`
+      # executable, so it ships in the same tarball and always matches the
+      # host's wire protocol.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-vm-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-pty-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-amd64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -304,13 +358,14 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler
+          sudo apt-get install -y cmake pkg-config libssl-dev protobuf-compiler musl-tools
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-          targets: aarch64-unknown-linux-gnu
+          # See build-linux-amd64: the musl target is for the static guest agent.
+          targets: aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
 
       - name: Cache dependencies
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -347,9 +402,41 @@ jobs:
       - name: Rename binary
         run: cp target/release/temps temps
 
+      # See build-linux-amd64: the static guest agent ships next to `temps`.
+      - name: Build Firecracker guest agent (static musl)
+        run: cargo build --release -p temps-vm-agent --bin temps-vm-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package Firecracker guest agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-vm-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-vm-agent temps-vm-agent
+          file temps-vm-agent
+          file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
+
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-pty-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-arm64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum
@@ -604,9 +691,10 @@ jobs:
 
   create-release:
     name: Create Release
-    # All image sets, embedded manifests and binaries must succeed before
-    # publication, and the commit must have passed rust-tests.yml.
-    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images]
+    # All image sets (including the managed-database images), embedded
+    # manifests and binaries must succeed before publication, and the commit
+    # must have passed rust-tests.yml.
+    needs: [require-tests, build-linux-amd64, build-linux-arm64, build-darwin-amd64, build-darwin-arm64, runtime-image-manifest, promote-runtime-images, database-images]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -863,6 +951,10 @@ jobs:
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
 
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
+
           # Verify
           temps --version
           ```
@@ -877,6 +969,10 @@ jobs:
 
           # Move to PATH
           sudo mv temps /usr/local/bin/temps
+
+          # Firecracker sandboxes only: `temps firecracker setup` looks for the
+          # guest agent next to the temps binary
+          sudo mv temps-vm-agent /usr/local/bin/temps-vm-agent
 
           # Verify
           temps --version
