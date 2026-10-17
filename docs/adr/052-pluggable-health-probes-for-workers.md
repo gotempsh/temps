@@ -245,6 +245,12 @@ bound rather than showing a stale `healthy`.
 
 ## Rollout
 
+The distributed runtime monitoring and uptime follow-up is specified in
+[ADR-053](./053-distributed-runtime-health-and-worker-uptime.md) (proposed).
+It covers Docker-free control planes, worker authorization, runtime exec
+containment and availability coverage. Phase 1 records deployment-time health
+only; it does not enable recurring probes or worker uptime percentages.
+
 1. **Phase 1**: `process` and `exec` at deploy time; `health_state` recorded;
    portless container state; route and monitoring paths skip portless
    containers; settings UI and failure message.

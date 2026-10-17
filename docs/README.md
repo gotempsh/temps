@@ -16,3 +16,8 @@ The documentation uses MDX (Markdown + JSX) and is pulled into the
 
 - [Background workers and deployment health probes](deploy/docker-containers/page.mdx#background-workers)
 - [Docker Compose security exceptions](features/compose-security-policies.md)
+
+## Architecture proposals
+
+- [Distributed runtime health and worker uptime](adr/053-distributed-runtime-health-and-worker-uptime.md)
+  (proposed; includes control planes without local workloads or Docker)
