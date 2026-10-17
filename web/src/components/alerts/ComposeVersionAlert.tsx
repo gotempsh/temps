@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getComposeStatusOptions } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeUpgradeHelp } from '@/components/deployments/ComposeUpgradeHelp'
 import { Button } from '@/components/ui/button'
 import {
   COMPOSE_STATUS_REFRESH_MS,
@@ -16,7 +17,7 @@ import { useState } from 'react'
  * Platform warning when the host's Docker Compose CLI is missing or too old
  * for the `docker compose config` options Compose deployments need. The
  * server probes it once at startup; the banner states the installed version,
- * what is missing and the minimum version to install.
+ * what is missing and offers installation-specific upgrade instructions.
  */
 export function ComposeVersionAlert() {
   // The server probes asynchronously after startup: poll until it reports a
@@ -42,6 +43,12 @@ export function ComposeVersionAlert() {
         <span className="font-medium">Docker Compose needs an upgrade</span>
         <span className="hidden sm:inline"> — {warning}</span>
       </p>
+      <ComposeUpgradeHelp
+        version={data?.version}
+        minimumVersion={data?.minimum_version}
+        variant="ghost"
+        className="h-7 shrink-0 px-2 text-xs"
+      />
       <Button
         size="sm"
         variant="ghost"

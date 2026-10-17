@@ -11,6 +11,7 @@ import {
 } from '@/lib/compose-check'
 import { cn } from '@/lib/utils'
 import { CheckCircle2, XCircle } from 'lucide-react'
+import { ComposeUpgradeHelp } from './ComposeUpgradeHelp'
 
 interface ComposeCheckReportViewProps {
   report: ComposeCheckReport
@@ -58,6 +59,11 @@ export function ComposeCheckReportView({
           {hint && !report.passed && (
             <p className="text-muted-foreground">{hint}</p>
           )}
+          {!report.passed &&
+            (report.error_class === 'unsupported_compose_version' ||
+              report.error_class === 'compose_unavailable') && (
+              <ComposeUpgradeHelp />
+            )}
         </div>
       </div>
 

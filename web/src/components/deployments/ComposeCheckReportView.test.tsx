@@ -39,6 +39,7 @@ describe('ComposeCheckReportView', () => {
     )
     expect(html).toContain('Docker Compose too old')
     expect(html).toContain('v2.35.0')
+    expect(html).toContain('Update Docker Compose')
     expect(html).toContain(
       'docker compose -p temps-7-3 -f compose.yaml config --no-env-resolution'
     )
@@ -66,6 +67,25 @@ describe('ComposeCheckReportView', () => {
     )
     expect(html).toContain('passes the deploy-time checks')
     expect(html).not.toContain('v2.35.0')
+    expect(html).not.toContain('Update Docker Compose')
     expect(html).not.toContain('exit code')
+  })
+
+  test('a missing CLI offers the same installation guide', () => {
+    const html = renderToStaticMarkup(
+      <ComposeCheckReportView
+        report={{ ...failed, error_class: 'compose_unavailable' }}
+      />
+    )
+    expect(html).toContain('Update Docker Compose')
+  })
+
+  test('other Compose errors do not suggest upgrading the CLI', () => {
+    const html = renderToStaticMarkup(
+      <ComposeCheckReportView
+        report={{ ...failed, error_class: 'interpolation' }}
+      />
+    )
+    expect(html).not.toContain('Update Docker Compose')
   })
 })
