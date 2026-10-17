@@ -1045,7 +1045,10 @@ impl ContainerDeployer for RemoteNodeDeployer {
     ) -> Result<crate::ExecResult, DeployerError> {
         let result = tokio::time::timeout(
             timeout,
-            self.exec_command(container_id, command, Some(timeout.as_secs().max(1))),
+            self.agent_post::<_, RemoteExecResult>(
+                &format!("/agent/containers/{container_id}/health-exec"),
+                &serde_json::json!({ "command": command, "timeout_seconds": timeout.as_secs().max(1) }),
+            ),
         )
         .await
         .map_err(|_| DeployerError::ExecTimeout {
@@ -3659,7 +3662,7 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
         let request = server.await.unwrap();
-        assert!(request.contains("/agent/containers/worker-container/exec"));
+        assert!(request.contains("/agent/containers/worker-container/health-exec"));
         assert!(request.contains("redis-cli"));
         assert!(request.contains("timeout_seconds"));
     }

@@ -493,6 +493,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_probe_socket_write_requires_recent_verification_for_enrolled_admin() {
+        let action = SensitiveAction::ChangeDockerSocketHealth { project_id: 3 };
+        let authorizer =
+            authorizer_with_sessions(vec![session(Some(Utc::now() - Duration::seconds(1)))]);
+        assert_eq!(
+            authorizer
+                .authorize(&action, &browser_principal(true))
+                .await
+                .unwrap(),
+            SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false
+            }
+        );
+        let authorizer =
+            authorizer_with_sessions(vec![session(Some(Utc::now() + Duration::minutes(1)))]);
+        assert_eq!(
+            authorizer
+                .authorize(&action, &browser_principal(true))
+                .await
+                .unwrap(),
+            SensitiveActionDecision::Allow
+        );
+    }
+
+    #[tokio::test]
     async fn expired_elevation_requires_verification() {
         let authorizer =
             authorizer_with_sessions(vec![session(Some(Utc::now() - Duration::seconds(1)))]);

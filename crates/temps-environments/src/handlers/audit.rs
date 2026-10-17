@@ -48,6 +48,8 @@ pub struct EnvironmentSettingsUpdatedFields {
     pub branch: Option<String>,
     pub replicas: Option<i32>,
     pub security_updated: bool,
+    /// Record that health changed without copying command arguments into audit data.
+    pub health_updated: bool,
     /// Per-environment attack-mode override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit project),
     /// `Some(Some(b))` = overridden.

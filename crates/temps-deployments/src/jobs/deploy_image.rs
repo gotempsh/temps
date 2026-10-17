@@ -1167,6 +1167,7 @@ async fn wait_for_non_http_probe(
     health: &temps_core::repo_config::HealthCheckConfig,
     address: Option<&str>,
     budget: Duration,
+    job_log: Option<(&DeployImageJob, &WorkflowContext)>,
 ) -> Result<(), WorkflowError> {
     health.validate().map_err(|reason| {
         WorkflowError::JobValidationFailed(format!(
@@ -1244,8 +1245,8 @@ async fn wait_for_non_http_probe(
                     let timeout = Duration::from_secs(health.timeout)
                         .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
                     // ExecTimeout fails immediately: Docker cannot kill only an exec;
-                    // the runtime stops/restarts the candidate to contain the command.
-                    let result = tokio::time::timeout_at(
+                    // the runtime stops the candidate to contain the command.
+                    let execution = tokio::time::timeout_at(
                         deadline,
                         deployer.exec_in_container(container_id, health.command.clone(), timeout),
                     )
@@ -1254,12 +1255,38 @@ async fn wait_for_non_http_probe(
                         WorkflowError::JobExecutionFailed(format!(
                             "Container {container_id} exec probe exceeded startup timeout"
                         ))
-                    })?
-                    .map_err(|error| {
-                        WorkflowError::JobExecutionFailed(format!(
-                            "Container {container_id} exec probe failed: {error}"
-                        ))
                     })?;
+                    let result = match execution {
+                        Ok(result) => result,
+                        Err(error) => {
+                            if let Some((job, context)) = job_log {
+                                let _ = tokio::time::timeout_at(deadline, job.log(context,
+                                    format!("Exec probe runtime error for container {container_id}: {error}"))).await;
+                            }
+                            // Runtime errors can contain command diagnostics too. Keep
+                            // those in the authorized log, never in a persisted reason.
+                            let reason = if matches!(
+                                error,
+                                temps_deployer::DeployerError::ExecTimeout { .. }
+                            ) {
+                                "timeout; candidate requires stop-only cleanup"
+                            } else {
+                                "runtime could not complete the command; inspect authorized job logs"
+                            };
+                            return Err(WorkflowError::JobExecutionFailed(format!(
+                                "Container {container_id} exec probe failed: {reason}"
+                            )));
+                        }
+                    };
+                    if let Some((job, context)) = job_log {
+                        // Captured output may contain credentials. Only authorized job logs
+                        // receive it; persisted health details contain an exit code only.
+                        tokio::time::timeout_at(deadline, job.log(
+                            context,
+                            format!("Exec probe exited {}: {}", result.exit_code, result.output),
+                        )).await.map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe logging exceeded startup timeout")))?
+                            .map_err(|_| WorkflowError::JobExecutionFailed(format!("Container {container_id} exec probe log could not be written")))?;
+                    }
                     if result.exit_code == 0 {
                         let after = tokio::time::timeout_at(
                             deadline,
@@ -1287,9 +1314,12 @@ async fn wait_for_non_http_probe(
                     }
                     // Exit 126/127 means the configured executable cannot be run.
                     if matches!(result.exit_code, 126 | 127) {
-                        return Err(WorkflowError::JobValidationFailed(format!("Container {container_id} health.command could not execute (exit {}): {}", result.exit_code, result.output)));
+                        return Err(WorkflowError::JobValidationFailed(format!(
+                            "Container {container_id} health.command could not execute (exit {})",
+                            result.exit_code
+                        )));
                     }
-                    last_failure = format!("exec exited {}: {}", result.exit_code, result.output);
+                    last_failure = format!("exec exited {}", result.exit_code);
                 }
                 "tcp" => {
                     let address = address.ok_or_else(|| {
@@ -4086,6 +4116,7 @@ impl DeployImageJob {
                 &health,
                 address.as_deref(),
                 remaining,
+                Some((self, context)),
             )
             .await
             {
@@ -8938,6 +8969,7 @@ mod health_probe_tests {
         states: Mutex<VecDeque<ContainerInfo>>,
         exits: Mutex<VecDeque<i64>>,
         exec_timeout: bool,
+        exec_error: bool,
     }
 
     impl ProbeDeployer {
@@ -8950,6 +8982,7 @@ mod health_probe_tests {
                 }])),
                 exits: Mutex::new(VecDeque::from([0])),
                 exec_timeout: false,
+                exec_error: false,
             }
         }
     }
@@ -8974,6 +9007,12 @@ mod health_probe_tests {
                 return Err(DeployerError::ExecTimeout {
                     container_id: id.into(),
                     timeout_secs: timeout.as_secs(),
+                });
+            }
+            if self.exec_error {
+                return Err(DeployerError::ExecFailed {
+                    container_id: id.into(),
+                    reason: "probe output".into(),
                 });
             }
             let mut exits = self.exits.lock().unwrap();
@@ -9061,7 +9100,8 @@ mod health_probe_tests {
             "worker",
             &probe("process"),
             None,
-            Duration::from_secs(2)
+            Duration::from_secs(2),
+            None,
         )
         .await
         .is_ok());
@@ -9071,7 +9111,8 @@ mod health_probe_tests {
             "worker",
             &probe("process"),
             None,
-            Duration::from_millis(20)
+            Duration::from_millis(20),
+            None,
         )
         .await
         .is_err());
@@ -9089,6 +9130,7 @@ mod health_probe_tests {
                 &probe(kind),
                 Some("127.0.0.1:1"),
                 Duration::from_secs(2),
+                None,
             )
             .await;
             assert!(result.is_err(), "{kind}");
@@ -9105,7 +9147,8 @@ mod health_probe_tests {
                 "worker",
                 &probe(kind),
                 Some("127.0.0.1:1"),
-                Duration::from_secs(2)
+                Duration::from_secs(2),
+                None,
             )
             .await
             .is_err());
@@ -9119,7 +9162,8 @@ mod health_probe_tests {
             "worker",
             &probe("process"),
             None,
-            Duration::from_secs(3)
+            Duration::from_secs(3),
+            None,
         )
         .await
         .is_err());
@@ -9137,7 +9181,8 @@ mod health_probe_tests {
             "worker",
             &probe("process"),
             None,
-            Duration::from_secs(4)
+            Duration::from_secs(4),
+            None,
         )
         .await
         .is_ok());
@@ -9153,7 +9198,8 @@ mod health_probe_tests {
             "worker",
             &probe("exec"),
             None,
-            Duration::from_secs(3)
+            Duration::from_secs(3),
+            None,
         )
         .await
         .is_ok());
@@ -9164,6 +9210,7 @@ mod health_probe_tests {
             &probe("exec"),
             None,
             Duration::from_secs(3),
+            None,
         )
         .await
         .unwrap_err();
@@ -9174,10 +9221,106 @@ mod health_probe_tests {
             "worker",
             &probe("exec"),
             None,
-            Duration::from_millis(20)
+            Duration::from_millis(20),
+            None,
         )
         .await
         .is_err());
+    }
+
+    struct ProbeLog(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl temps_core::LogWriter for ProbeLog {
+        async fn write_log(&self, message: String) -> Result<(), WorkflowError> {
+            self.0.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_is_only_written_to_authorized_job_log() {
+        let deployer = Arc::new(ProbeDeployer::running());
+        *deployer.exits.lock().unwrap() = VecDeque::from([127]);
+        let job = DeployImageJobBuilder::new(
+            "worker",
+            temps_core::docker_socket_grant::DeployCaller::Platform,
+        )
+        .job_id("deploy".into())
+        .build_job_id("build".into())
+        .target(DeploymentTarget::Docker {
+            registry_url: "local".into(),
+            network: None,
+        })
+        .service_name("worker".into())
+        .build(deployer.clone())
+        .unwrap();
+        let log = Arc::new(ProbeLog(Mutex::new(Vec::new())));
+        let context = WorkflowContext::new("worker".into(), 1, 1, 1, log.clone());
+        let error = wait_for_non_http_probe(
+            deployer.as_ref(),
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            Some((&job, &context)),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!error.contains("probe output"));
+        assert!(log
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("probe output")));
+    }
+
+    #[tokio::test]
+    async fn health_probe_exec_output_never_enters_failure_details() {
+        for exit in [1, 126, 127] {
+            let deployer = ProbeDeployer::running();
+            *deployer.exits.lock().unwrap() = VecDeque::from([exit]);
+            let error = wait_for_non_http_probe(
+                &deployer,
+                "worker",
+                &probe("exec"),
+                None,
+                Duration::from_millis(20),
+                None,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&exit.to_string()), "{error}");
+            assert!(
+                !error.contains("probe output"),
+                "exec output must only appear in authorized job logs"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_runtime_diagnostics_are_not_persisted() {
+        let mut deployer = ProbeDeployer::running();
+        deployer.exec_error = true;
+        let error = wait_for_non_http_probe(
+            &deployer,
+            "worker",
+            &probe("exec"),
+            None,
+            Duration::from_secs(2),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("exec probe failed"));
+        assert!(!error.contains("probe output"));
     }
 
     #[tokio::test]
@@ -9189,7 +9332,8 @@ mod health_probe_tests {
             "worker",
             &probe("exec"),
             None,
-            Duration::from_secs(2)
+            Duration::from_secs(2),
+            None,
         )
         .await
         .unwrap_err()
@@ -9204,7 +9348,8 @@ mod health_probe_tests {
             "worker",
             &probe("exec"),
             None,
-            Duration::from_secs(2)
+            Duration::from_secs(2),
+            None,
         )
         .await
         .is_err());
@@ -9213,7 +9358,8 @@ mod health_probe_tests {
             "worker",
             &probe("typo"),
             None,
-            Duration::from_secs(2)
+            Duration::from_secs(2),
+            None,
         )
         .await
         .is_err());
@@ -9224,7 +9370,8 @@ mod health_probe_tests {
             "worker",
             &malformed,
             None,
-            Duration::from_secs(2)
+            Duration::from_secs(2),
+            None,
         )
         .await
         .is_err());
@@ -9240,7 +9387,8 @@ mod health_probe_tests {
             "tcp-service",
             &probe("tcp"),
             Some(&address),
-            Duration::from_secs(1)
+            Duration::from_secs(1),
+            None,
         )
         .await
         .is_ok());
@@ -9250,7 +9398,8 @@ mod health_probe_tests {
             "tcp-service",
             &probe("tcp"),
             Some(&address),
-            Duration::from_millis(20)
+            Duration::from_millis(20),
+            None,
         )
         .await
         .is_err());
@@ -9259,7 +9408,8 @@ mod health_probe_tests {
             "tcp-service",
             &probe("tcp"),
             None,
-            Duration::from_secs(1)
+            Duration::from_secs(1),
+            None,
         )
         .await
         .is_err());
