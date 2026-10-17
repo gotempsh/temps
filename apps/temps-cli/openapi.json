@@ -116352,7 +116352,6 @@
             "description": "Internal server error"
           }
         },
-        "summary": "Update environment settings",
         "tags": [
           "Projects"
         ]

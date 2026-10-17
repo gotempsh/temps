@@ -8756,14 +8756,25 @@ mod health_probe_exec_tests {
             .await?;
         assert_eq!(result.output.len(), crate::MAX_EXEC_OUTPUT_BYTES);
         assert!(result.truncated);
-        assert!(runtime
+        // Docker may report an exec launch failure through the API or as
+        // exit 126/127. An API failure can stop the candidate for cleanup,
+        // so keep it separate from the subsequent timeout assertion.
+        let missing_command_container = GenericImage::new("alpine", "3.21")
+            .with_cmd(["sleep", "300"])
+            .start()
+            .await?;
+        match runtime
             .exec_in_container(
-                container.id(),
+                missing_command_container.id(),
                 vec!["missing-health-command".into()],
-                timeout
+                timeout,
             )
             .await
-            .is_err());
+        {
+            Ok(result) => assert!(matches!(result.exit_code, 126 | 127)),
+            Err(DeployerError::ExecFailed { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
         let result = runtime
             .exec_in_container(
                 container.id(),

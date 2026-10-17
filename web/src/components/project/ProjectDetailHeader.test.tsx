@@ -19,10 +19,16 @@ function renderHeader(
     activeVisitors,
     containers,
     hosting = 'hosted',
+    preset = 'dockerfile',
   }: {
     activeVisitors?: number
-    containers?: { status: string }[]
+    containers?: {
+      status: string
+      container_port?: number | null
+      health_state?: string
+    }[]
     hosting?: ProjectResponse['hosting']
+    preset?: string
   } = {}
 ) {
   const client = new QueryClient({
@@ -58,12 +64,15 @@ function renderHeader(
               slug: 'temps-cloud-api',
               name: 'Temps',
               hosting,
+              project_type: 'server',
+              preset,
             } as ProjectResponse
           }
           lastDeployment={
             { id: 3513, status, is_current: false } as DeploymentResponse
           }
           onDeploy={() => {}}
+          lastDeploymentUrl="https://app.example.com"
           activeVisitorsCount={
             activeVisitors === undefined
               ? undefined
@@ -146,4 +155,43 @@ test('a service hosted elsewhere shows External and no deploy button', () => {
   expect(html).toContain('External')
   expect(html).not.toContain('Not deployed')
   expect(html).not.toContain('>Deploy<')
+})
+
+for (const health_state of ['healthy', 'unhealthy', 'unknown']) {
+  test(`a confirmed worker shows ${health_state} at deploy instead of HTTP controls`, () => {
+    const html = renderHeader('completed', 3500, {
+      activeVisitors: 0,
+      containers: [{ status: 'running', container_port: null, health_state }],
+    })
+    expect(html).toContain('Background worker')
+    expect(html).toContain(`${health_state} at deploy`)
+    expect(html).not.toContain('Visit deployed site')
+    expect(html).not.toContain('Open Live visitors')
+    expect(html).not.toContain('href="/projects/temps-cloud-api/monitors"')
+  })
+}
+
+for (const container_port of [8080, undefined]) {
+  test(`HTTP controls remain available for a web or unclassified container (${container_port})`, () => {
+    const html = renderHeader('completed', 3500, {
+      activeVisitors: 0,
+      containers: [
+        { status: 'running', container_port, health_state: 'healthy' },
+      ],
+    })
+    expect(html).not.toContain('Background worker')
+    expect(html).toContain('Visit deployed site')
+    expect(html).toContain('Open Live visitors')
+  })
+}
+
+test('Compose header presentation is unchanged for an internal service without a port', () => {
+  const html = renderHeader('completed', 3500, {
+    preset: 'docker-compose',
+    containers: [
+      { status: 'running', container_port: null, health_state: 'healthy' },
+    ],
+  })
+  expect(html).not.toContain('Background worker')
+  expect(html).toContain('Visit deployed site')
 })

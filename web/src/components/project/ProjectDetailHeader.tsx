@@ -7,6 +7,8 @@ import {
 } from '@/components/project-groups/ServiceGroupControl'
 import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import type { DeploymentResponse, ProjectResponse } from '@/api/client'
+import { portlessWorkerHealth } from '@/components/containers/container-workload'
+import { Status } from '@temps-sdk/ds'
 import { useEffect, useRef } from 'react'
 import {
   describeDockerSocket,
@@ -136,10 +138,37 @@ export function ProjectDetailHeader({
     project.hosting === 'external' || project.source_type === 'external'
   // Latest build and currently deployed version can be different, including
   // during builds, after failures, and following a rollback.
-  const { status: deploymentStatus, environmentsQuery } =
-    useProjectFailureState(project.id, lastDeployment, {
-      enabled: !isExternal,
-    })
+  const {
+    status: deploymentStatus,
+    environmentsQuery,
+    containersQuery,
+    healthEnvironment,
+  } = useProjectFailureState(project.id, lastDeployment, {
+    enabled: !isExternal,
+  })
+  const supportsWorker =
+    !isExternal &&
+    project.project_type === 'server' &&
+    project.preset !== 'docker-compose'
+  const currentDeploymentId = healthEnvironment?.current_deployment_id
+  const refetchContainers = containersQuery.refetch
+  useEffect(() => {
+    if (
+      supportsWorker &&
+      currentDeploymentId != null &&
+      !healthEnvironment?.sleeping
+    )
+      void refetchContainers()
+  }, [
+    currentDeploymentId,
+    refetchContainers,
+    supportsWorker,
+    healthEnvironment?.sleeping,
+  ])
+  const workerHealth = supportsWorker
+    ? portlessWorkerHealth(containersQuery.data?.containers)
+    : null
+  const isWorker = workerHealth !== null
   // When a build finishes, its environment pointer is already set; refetch at
   // once so "Deploying" turns into "Deployed" instead of briefly reading
   // "Not deployed" until the next poll.
@@ -246,22 +275,41 @@ export function ProjectDetailHeader({
                 <span className="hidden sm:inline">{dockerSocket.label}</span>
               </Badge>
             )}
-            <Link
-              to={`/projects/${project.slug}/monitors`}
-              title={`${healthIndicator.label}: ${healthIndicator.detail}`}
-              aria-label={`${healthIndicator.label}: ${healthIndicator.detail}`}
-              className="inline-flex size-6 shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
+            {isWorker ? (
               <span
-                aria-hidden="true"
-                className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
-              />
-            </Link>
+                className="inline-flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground"
+                title="Deploy-time health; runtime probing is not enabled"
+              >
+                <span className="max-sm:sr-only">Background worker</span>
+                <Status
+                  tone={
+                    workerHealth === 'healthy'
+                      ? 'ok'
+                      : workerHealth === 'unhealthy'
+                        ? 'error'
+                        : 'idle'
+                  }
+                  label={`${workerHealth} at deploy`}
+                />
+              </span>
+            ) : (
+              <Link
+                to={`/projects/${project.slug}/monitors`}
+                title={`${healthIndicator.label}: ${healthIndicator.detail}`}
+                aria-label={`${healthIndicator.label}: ${healthIndicator.detail}`}
+                className="inline-flex size-6 shrink-0 items-center justify-center rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              >
+                <span
+                  aria-hidden="true"
+                  className={`inline-block size-2 rounded-full ${healthToneStyles[healthIndicator.tone]}`}
+                />
+              </Link>
+            )}
             <ServiceGroupControl project={project} />
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {activeVisitorsCount !== undefined && (
+          {activeVisitorsCount !== undefined && !isWorker && (
             <button
               type="button"
               onClick={handleVisitorsClick}
@@ -296,7 +344,7 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
-          {lastDeploymentUrl && !isLoadingLastDeployment && (
+          {lastDeploymentUrl && !isLoadingLastDeployment && !isWorker && (
             <Button variant="outline" size="icon" className="size-9" asChild>
               <a
                 href={lastDeploymentUrl}

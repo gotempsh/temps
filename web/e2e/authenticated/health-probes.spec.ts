@@ -15,6 +15,7 @@ import {
   getDeployment,
   getEnvironment,
   getEnvironments,
+  getLastDeployment,
   getProject,
   listContainerHistory,
   listContainers,
@@ -190,6 +191,33 @@ test.describe('live deployment health probes', () => {
         })
         expect(data.current_deployment_id).toBe(id)
       }
+      const assertRejectedReuse = async (
+        operation: () => Promise<{ response?: Response; error?: unknown }>,
+        environmentId: number
+      ) => {
+        const { data: before } = await getLastDeployment({
+          ...api,
+          path: { id: project.id },
+        })
+        // Reuse workflows run synchronously: a failed gate returns an error
+        // response while preserving its new failed deployment row.
+        const response = await operation()
+        expect(response.response?.status).toBe(500)
+        expect(response.error).toMatchObject({
+          detail: expect.stringContaining('health.command'),
+        })
+        const { data: after } = await getLastDeployment({
+          ...api,
+          path: { id: project.id },
+        })
+        const failed = after.deployment
+        if (!failed)
+          throw new Error('Rejected reuse did not retain a deployment row')
+        deployments.push(failed.id)
+        expect(failed.id).toBeGreaterThan(before.deployment?.id ?? 0)
+        expect(failed.environment_id).toBe(environmentId)
+        expect(failed.status).toBe('failed')
+      }
       const webBody = async () => {
         const response = await page.request.get(proxyURL, {
           headers: { Host: new URL(env.main_url).host },
@@ -200,12 +228,13 @@ test.describe('live deployment health probes', () => {
 
       await test.step('probe settings survive saving after invalid hidden fields', async () => {
         await page.goto(
-          `/projects/${project.slug}/settings/delivery#deployment`
+          `/projects/${project.slug}/settings/delivery?section=deployment`
         )
         const probe = page.getByRole('combobox', {
           name: 'Health probe',
           exact: true,
         })
+        await expect(probe).toBeVisible()
         const choose = async (option: string) => {
           await probe.click()
           await page.getByRole('option', { name: option, exact: true }).click()
@@ -232,17 +261,21 @@ test.describe('live deployment health probes', () => {
         }
         await save()
         await expect(
-          page.getByText('Deployment configuration updated successfully', {
-            exact: true,
-          })
+          page
+            .getByText('Deployment configuration updated successfully', {
+              exact: true,
+            })
+            .last()
         ).toBeVisible()
         await page.getByLabel('HTTP health path', { exact: true }).fill('')
         await choose('Process (background worker)')
         await save()
         await expect(
-          page.getByText('Deployment configuration updated successfully', {
-            exact: true,
-          })
+          page
+            .getByText('Deployment configuration updated successfully', {
+              exact: true,
+            })
+            .last()
         ).toBeVisible()
         await page.reload()
         await expect(probe).toHaveText('Process (background worker)')
@@ -354,8 +387,22 @@ test.describe('live deployment health probes', () => {
           `/projects/${project.slug}/environments?environment=${env.id}`
         )
         await expect(
-          page.getByText('Background worker', { exact: true }).first()
+          page.getByRole('button', {
+            name: /Background worker healthy at deploy/,
+          })
         ).toBeVisible()
+        await expect(
+          page.getByRole('link', {
+            name: 'Visit deployed site in a new window',
+            exact: true,
+          })
+        ).toHaveCount(0)
+        await expect(page.getByRole('link', { name: /^Uptime / })).toHaveCount(
+          0
+        )
+        await expect(
+          page.getByRole('button', { name: /active visitors right now/ })
+        ).toHaveCount(0)
       })
 
       await test.step('exec succeeds, while a failed exec keeps output out of persisted details', async () => {
@@ -409,23 +456,14 @@ test.describe('live deployment health probes', () => {
           ...api,
           path: { ...path, env_id: env.id },
         })
-        const { data: rollback } = await rollbackToDeployment({
-          ...api,
-          path: { ...path, deployment_id: webDeployment },
-        })
-        deployments.push(rollback.id)
-        await expect
-          .poll(
-            async () => {
-              const { data } = await getDeployment({
-                ...api,
-                path: { ...path, deployment_id: rollback.id },
-              })
-              return data.status
-            },
-            { timeout: 120_000, intervals: [1000] }
-          )
-          .toBe('failed')
+        await assertRejectedReuse(
+          () =>
+            rollbackToDeployment({
+              client,
+              path: { ...path, deployment_id: webDeployment },
+            }),
+          env.id
+        )
         if (!before.current_deployment_id)
           throw new Error('Missing current worker deployment')
         await currentIs(before.current_deployment_id)
@@ -436,24 +474,15 @@ test.describe('live deployment health probes', () => {
           path,
           body: { name: 'staging', branch: 'staging' },
         })
-        const { data: promoted } = await promoteDeployment({
-          ...api,
-          path: { ...path, deployment_id: webDeployment },
-          body: { target_environment_id: staging.id },
-        })
-        deployments.push(promoted.id)
-        await expect
-          .poll(
-            async () => {
-              const { data } = await getDeployment({
-                ...api,
-                path: { ...path, deployment_id: promoted.id },
-              })
-              return data.status
-            },
-            { timeout: 120_000, intervals: [1000] }
-          )
-          .toBe('failed')
+        await assertRejectedReuse(
+          () =>
+            promoteDeployment({
+              client,
+              path: { ...path, deployment_id: webDeployment },
+              body: { target_environment_id: staging.id },
+            }),
+          staging.id
+        )
         const { data } = await getEnvironment({
           ...api,
           path: { ...path, env_id: staging.id },
