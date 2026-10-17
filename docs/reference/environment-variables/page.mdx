@@ -11,6 +11,7 @@ export const sections = [
   { title: "Server Configuration", id: "server" },
   { title: "Database Configuration", id: "database" },
   { title: "Anonymous Telemetry", id: "telemetry" },
+  { title: "OpenTelemetry Trace Export", id: "otel-export" },
   { title: "Application Environment Variables", id: "application" },
   { title: "CLI Configuration", id: "cli" },
   { title: "SDK Configuration", id: "sdk" },
@@ -208,6 +209,31 @@ Temps sends anonymous product-usage events (event names, counts and coarse label
 ```bash
 # Never send anonymous telemetry from this host, whatever the console says
 export TEMPS_TELEMETRY=0
+```
+
+---
+
+## OpenTelemetry Trace Export {{ anchor: true, id: 'otel-export' }}
+
+`temps serve` can export its **own** traces over OTLP. It is **off by default** and is only turned on by `TEMPS_OTEL_EXPORT` or `--otel-export`; the standard `OTEL_*` variables below configure the destination but never enable it on their own. Precedence is CLI flag, then environment, then `<data-dir>/otel-export.yaml`, then default. Full guide with Jaeger and collector examples: [Export Temps server traces](/docs/export-server-traces).
+
+| Variable | CLI Flag | Default | Description |
+| --- | --- | --- | --- |
+| `TEMPS_OTEL_EXPORT` | `--otel-export[=BOOL]` | `false` | Enable trace export. Bootstrap-time: the tracer is created before the database connection exists, so this is not a console setting. Restart to change. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `--otel-endpoint` | `http://localhost:4318` (`:4317` for gRPC) | Collector base URL; `/v1/traces` is appended for `http/protobuf`. |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | — | — | Full traces URL, used exactly as written. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` / `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | `--otel-protocol` | `http/protobuf` | `grpc` or `http/protobuf`. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / `OTEL_EXPORTER_OTLP_TRACES_HEADERS` | — (credentials) | — | `key=value,key=value`, values percent-decoded. Never logged. |
+| `OTEL_SERVICE_NAME` | `--otel-service-name` | `temps` | `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES` | — | — | Extra resource attributes, `key=value,key=value`. |
+| `OTEL_TRACES_SAMPLER` / `OTEL_TRACES_SAMPLER_ARG` | `--otel-sample-ratio` | `parentbased_always_on` | Standard sampler names; the flag sets `parentbased_traceidratio`. |
+| `OTEL_EXPORTER_OTLP_TIMEOUT` / `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` | — | `10000` | Per-export timeout in milliseconds. |
+| `OTEL_SDK_DISABLED` / `OTEL_TRACES_EXPORTER=none` | — | — | Force export off, overriding the config file. |
+
+```bash
+export TEMPS_OTEL_EXPORT=true
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 ```
 
 ---

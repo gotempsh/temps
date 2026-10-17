@@ -154,6 +154,11 @@ impl ProxyShutdownSignal for CtrlCShutdownSignal {
             let cleanup_handler = CtrlCShutdownSignal::new(cleanup_timeout, db, data_dir);
             cleanup_handler.cleanup_resources().await;
 
+            // The proxy exits right after this future resolves, so queued
+            // OpenTelemetry spans must be flushed here. No-op when export is
+            // disabled.
+            crate::otel_export::shutdown().await;
+
             info!("Graceful shutdown completed");
         })
     }

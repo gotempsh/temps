@@ -6,6 +6,7 @@ pub mod disk_status;
 pub mod enrollment_tokens;
 mod handler;
 mod installation_secrets;
+pub mod otel_export;
 pub mod plugin;
 mod retention;
 mod service;

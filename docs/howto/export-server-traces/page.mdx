@@ -1,0 +1,212 @@
+export const metadata = {
+  title: 'Export Temps Server Traces (OpenTelemetry)',
+  description:
+    'Send the Temps server’s own OpenTelemetry traces to Jaeger, Tempo, Honeycomb, Grafana, any OTLP collector, or another Temps instance. Disabled by default.',
+  alternates: {
+    canonical: '/docs/export-server-traces',
+  },
+}
+
+export const sections = [
+  { title: 'What is exported', id: 'what-is-exported' },
+  { title: 'Turn it on', id: 'turn-it-on' },
+  { title: 'Example: Jaeger', id: 'jaeger' },
+  { title: 'Example: a generic OTLP collector', id: 'collector' },
+  { title: 'Configuration reference', id: 'reference' },
+  { title: 'Sampling', id: 'sampling' },
+  { title: 'Failure behaviour and limits', id: 'failure' },
+  { title: 'Security', id: 'security' },
+  { title: 'Verify it is working', id: 'verify' },
+]
+
+# Export Temps Server Traces (OpenTelemetry)
+
+`temps serve` can export **its own** traces (the spans the server creates while handling console and API requests) to any OTLP-compatible backend: Jaeger, Grafana Tempo, Honeycomb, an OpenTelemetry Collector, or another Temps instance's OTel ingest. This is separate from the traces your *deployed applications* send to Temps. {{ className: 'lead' }}
+
+It is **off by default**. When off, nothing is built: no exporter thread, no network connection, no request middleware.
+
+---
+
+## What is exported {{ anchor: true, id: 'what-is-exported' }}
+
+- **One server span per console/API request**, named `METHOD /route/template` (for example `GET /api/projects/{id}`), with the HTTP method, the route template and the response status code. A `5xx` response marks the span as an error. An incoming W3C `traceparent` header is honoured, so a request that is part of a larger trace continues it.
+- **Any other `tracing` span** the server creates at or above the configured log level (`--log-level` / `RUST_LOG`). Exported spans follow the same filter as log output.
+- Resource attributes on every span: `service.name` (default `temps`), `service.version`, `service.instance.id` (a random id per process start), `host.name` and `process.pid`.
+
+What is deliberately **not** exported:
+
+- Log lines (`tracing` events). They are free-form text and can contain identifiers and error strings, and this feature sends data to a backend you configure.
+- The concrete URL path, query string, request or response headers and bodies. Only the route *template* is recorded.
+- The proxy hot path (traffic to your deployed applications). Only the console/API listeners are instrumented.
+
+<Note>
+  The server currently defines few spans of its own beyond the HTTP request span, so traces are shallow: a root span per request. Deployment, database and background-job spans appear as the code base gains `tracing` instrumentation; no exporter change is needed for them to show up.
+</Note>
+
+---
+
+## Turn it on {{ anchor: true, id: 'turn-it-on' }}
+
+Export is enabled by an explicit Temps setting. Setting `OTEL_EXPORTER_OTLP_ENDPOINT` alone does **not** turn it on, so a variable inherited from a shell or container image cannot start sending data by accident.
+
+```bash
+# flag
+temps serve --otel-export --otel-endpoint http://collector.internal:4318
+
+# or environment (the destination uses the standard OTEL_* variables)
+export TEMPS_OTEL_EXPORT=true
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://collector.internal:4318
+temps serve
+```
+
+`--otel-export=false` switches it off even if the environment or config file enables it.
+
+---
+
+## Example: Jaeger {{ anchor: true, id: 'jaeger' }}
+
+Jaeger v2 accepts OTLP natively on ports 4317 (gRPC) and 4318 (HTTP).
+
+```bash
+docker run --rm --name jaeger \
+  -p 16686:16686 -p 4317:4317 -p 4318:4318 \
+  jaegertracing/jaeger:latest
+```
+
+Then start Temps pointing at it over gRPC:
+
+```bash
+export TEMPS_OTEL_EXPORT=true
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+temps serve
+```
+
+Open `http://localhost:16686`, pick the `temps` service and click **Find Traces**.
+
+Over HTTP instead, drop the protocol line and use port 4318. `/v1/traces` is appended for you:
+
+```bash
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
+
+---
+
+## Example: a generic OTLP collector {{ anchor: true, id: 'collector' }}
+
+For a hosted backend or a collector that needs credentials, pass headers through the environment (never a flag; see [Security](#security)):
+
+```bash
+export TEMPS_OTEL_EXPORT=true
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://otlp.example.com
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20<token>"
+export OTEL_SERVICE_NAME=temps-prod-eu
+export OTEL_RESOURCE_ATTRIBUTES="deployment.environment=production,team=platform"
+temps serve --otel-sample-ratio 0.25
+```
+
+Header values are percent-decoded (`%20` is a space). Use `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` when the backend gives you a full per-signal URL: it is used exactly as written, with no `/v1/traces` appended.
+
+A matching OpenTelemetry Collector receiver:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+```
+
+To send to another Temps instance's [OTel ingest](/docs/ai-tracing), use OTLP/HTTP with an API key and the project that should own the traces:
+
+```bash
+export TEMPS_OTEL_EXPORT=true
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://other-temps.example.com/api/otel/v1/traces
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer%20tk_<api-key>,x-temps-project-id=2"
+```
+
+---
+
+## Configuration reference {{ anchor: true, id: 'reference' }}
+
+Each setting takes the first valid value from: **CLI flag, then environment variable, then config file, then default.** A value that cannot be parsed is logged as a warning and the next layer is used; it never stops the server.
+
+| Setting | CLI flag | Environment | Config file key | Default |
+| --- | --- | --- | --- | --- |
+| Enable export | `--otel-export[=BOOL]` | `TEMPS_OTEL_EXPORT`; `OTEL_SDK_DISABLED=true` and `OTEL_TRACES_EXPORTER=none` force it off | `enabled` | off |
+| Collector base URL | `--otel-endpoint` | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` (used verbatim), `OTEL_EXPORTER_OTLP_ENDPOINT` | `endpoint` | `http://localhost:4318` (`:4317` for gRPC) |
+| Protocol | `--otel-protocol` | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`, `OTEL_EXPORTER_OTLP_PROTOCOL` | `protocol` | `http/protobuf` |
+| Headers | none (credentials) | `OTEL_EXPORTER_OTLP_TRACES_HEADERS`, `OTEL_EXPORTER_OTLP_HEADERS` | none (credentials) | none |
+| Service name | `--otel-service-name` | `OTEL_SERVICE_NAME`, then `service.name` in `OTEL_RESOURCE_ATTRIBUTES` | `service_name` | `temps` |
+| Resource attributes | none | `OTEL_RESOURCE_ATTRIBUTES` (`k=v,k=v`) | `resource_attributes` (map) | none |
+| Sampling | `--otel-sample-ratio` | `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | `sample_ratio` | `parentbased_always_on` |
+| Export timeout | none | `OTEL_EXPORTER_OTLP_TRACES_TIMEOUT`, `OTEL_EXPORTER_OTLP_TIMEOUT` (ms) | `export_timeout_secs` | 10 s |
+
+Supported protocols are `grpc` and `http/protobuf`. `http/json` is not supported. Only `temps serve` exports traces; other subcommands ignore all of these settings.
+
+The optional config file is `<data-dir>/otel-export.yaml` (the data directory is `--data-dir`, `TEMPS_DATA_DIR`, or `~/.temps`). Unknown keys are rejected with a warning, which is how a stray `headers:` entry gets caught:
+
+```yaml
+# <data-dir>/otel-export.yaml
+enabled: true
+endpoint: http://collector.internal:4318
+protocol: http/protobuf
+service_name: temps-prod-eu
+sample_ratio: 0.25
+export_timeout_secs: 10
+resource_attributes:
+  deployment.environment: production
+```
+
+<Note>
+  Tracing is installed before the database connection exists, so these settings are read at startup from the command line, environment and data directory rather than from the console settings page. Restart `temps serve` to change them.
+</Note>
+
+---
+
+## Sampling {{ anchor: true, id: 'sampling' }}
+
+- `--otel-sample-ratio 0.1` keeps about 10% of traces (`parentbased_traceidratio`). A request whose caller already sampled the trace is always kept, so traces are never cut in half.
+- `OTEL_TRACES_SAMPLER` accepts `always_on`, `always_off`, `traceidratio`, `parentbased_always_on` (default), `parentbased_always_off` and `parentbased_traceidratio`, with the ratio in `OTEL_TRACES_SAMPLER_ARG`.
+- The flag wins over the environment, which wins over the config file.
+
+<Note>
+  Parent-based samplers honour the caller's `traceparent`. A client on the internet can therefore ask for its own request to be exported. The queue below caps the cost; if you do not want callers influencing sampling, use `OTEL_TRACES_SAMPLER=traceidratio`, which ignores the incoming sampled flag.
+</Note>
+
+---
+
+## Failure behaviour and limits {{ anchor: true, id: 'failure' }}
+
+Telemetry must never hurt the server, so:
+
+- **Bad configuration** (an invalid URL, an unsupported protocol, a malformed header) is logged at `warn` at startup. An unusable endpoint leaves export disabled; the server starts normally.
+- **An unreachable or rejecting collector** does not block requests or crash anything. The failed batch is dropped and a warning is logged on the first failure and then at most every five minutes, with a note when the collector recovers.
+- **Bounded memory.** Spans queue in memory up to **2,048 spans**, flush every **5 s** or **512 spans**, and each export is limited by the export timeout (10 s by default). When the queue is full, new spans are **dropped**, not buffered. Worst case memory is the queue plus one in-flight batch.
+- **Shutdown.** On a graceful stop (Ctrl-C / SIGINT) queued spans are flushed, waiting at most 5 s. A hard kill (`SIGKILL`) loses up to five seconds of spans.
+- **Cost when on.** One background thread for the batch exporter, plus one single-worker runtime when using gRPC. A span is created per console/API request, including high-volume public ingest routes; use a sample ratio on busy instances.
+
+---
+
+## Security {{ anchor: true, id: 'security' }}
+
+- **Headers are credentials.** They are accepted only from `OTEL_EXPORTER_OTLP_HEADERS`; there is no flag (flag values appear in `ps`) and no config-file key (the file is not encrypted). Header values are never logged: the startup line prints `authorization=***`.
+- **Endpoints are redacted in logs.** Embedded `user:password@` and query strings are stripped (`https://***@host/path?***`).
+- **Spans carry no request content.** Only method, route template and status code are recorded, plus the resource attributes listed above. `host.name` is the machine hostname; override it with `OTEL_RESOURCE_ATTRIBUTES=host.name=...` if that is sensitive in your backend.
+- Prefer `https://` endpoints (and `http/protobuf` or gRPC over TLS) for anything that leaves your network.
+
+---
+
+## Verify it is working {{ anchor: true, id: 'verify' }}
+
+On startup, Temps logs one line with the effective configuration (secrets masked):
+
+```text
+INFO OpenTelemetry trace export enabled: protocol=grpc endpoint=http://localhost:4317/ headers=[authorization=***] service.name=temps sampler=parentbased_always_on timeout=10s resource_attributes=deployment.environment (queue=2048 spans, batch=512, flush every 5s)
+```
+
+Then make a few console requests and look for the `temps` service in your backend (within about five seconds). If nothing arrives, look for a `OTLP trace export failed` warning, which names the endpoint and the reason. A common mistake is pointing `http/protobuf` at port 4317 (gRPC) or the reverse: set `OTEL_EXPORTER_OTLP_PROTOCOL` to match the port.

@@ -379,6 +379,11 @@ pub struct ServeCommand {
     /// exactly what the running process provides.
     #[arg(long, value_enum, default_value_t = ServeProfile::Full, env = "TEMPS_SERVE_PROFILE")]
     pub profile: ServeProfile,
+
+    /// Export this server's own traces over OpenTelemetry (OTLP). Disabled
+    /// unless `--otel-export` is given; see docs/howto/export-server-traces.
+    #[command(flatten)]
+    pub otel: crate::otel_export::OtelArgs,
 }
 
 /// Name the flag whose address the public-only listener would collide with,

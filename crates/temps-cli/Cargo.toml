@@ -103,6 +103,13 @@ argon2 = "0.6"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+# Blocking HTTPS client handed to the OTLP/HTTP exporter. Must be the same
+# reqwest major opentelemetry-http uses (0.13), not the workspace 0.12.
+reqwest-otlp = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 anyhow = { workspace = true }
 yaml_serde = { workspace = true }
 dirs = { version = "7.0" }
@@ -154,6 +161,8 @@ tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
+# In-memory span exporter for the OpenTelemetry layer tests.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
 # endpoint table still matches the handlers this crate assembles into the API.
 temps-plugin-sdk = { path = "../temps-plugin-sdk" }

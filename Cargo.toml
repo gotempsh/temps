@@ -156,6 +156,15 @@ log = "0.4"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "std", "fmt", "registry"] }
 
+# OpenTelemetry export of the server's own spans (`temps serve --otel-export`).
+# opentelemetry_sdk must stay >= 0.32.1 (GHSA-w9wp-h8wv-79jx, see item 2b
+# below); the four crates move in lockstep, tracing-opentelemetry 0.34 pairs
+# with opentelemetry 0.33.
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots"] }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
+
 # ============================================================================
 # Date/Time & UUID
 # ============================================================================

@@ -4761,6 +4761,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .merge(mcp_root_router)
         .nest("/api", public_router)
         .layer(axum::middleware::from_fn(track_server_errors));
+    // Request spans for OpenTelemetry export; a no-op unless `--otel-export`.
+    let public_app = crate::otel_export::layer_requests(public_app);
 
     // Platform-console listener: when an embedding binary overrode the root
     // bundle AND configured an address, serve the ORIGINAL console (same
@@ -4776,6 +4778,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .nest("/api", admin_router)
         .fallback(serve_static_file)
         .layer(axum::middleware::from_fn(track_server_errors));
+    let admin_app = crate::otel_export::layer_requests(admin_app);
 
     // Defense-in-depth: the Pingora proxy is now the primary enforcer (it
     // 404s gated requests before they ever reach this listener). The axum

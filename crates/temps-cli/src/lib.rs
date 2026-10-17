@@ -10,6 +10,7 @@
 
 pub mod commands;
 mod docker_context;
+pub mod otel_export;
 
 use clap::{Parser, Subcommand};
 use commands::{
@@ -114,6 +115,18 @@ pub fn install_tracing(log_level: &str, log_format: &str) {
 /// (e.g. `vibetemps_api={level}`). `extra` is comma-separated directives,
 /// empty for none.
 pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
+    install_tracing_with_otel(log_level, log_format, extra, None);
+}
+
+/// [`install_tracing_extra`] plus an optional OpenTelemetry layer from
+/// [`otel_export::prepare`]. With `None` the subscriber stack is exactly the
+/// one installed before trace export existed.
+pub fn install_tracing_with_otel(
+    log_level: &str,
+    log_format: &str,
+    extra: &str,
+    otel_layer: Option<otel_export::OtelLayer>,
+) {
     let filter = if std::env::var("RUST_LOG").is_ok() {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .expect("Invalid RUST_LOG environment variable")
@@ -226,7 +239,12 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
             .boxed(),
     };
 
+    // The OpenTelemetry layer goes directly on the registry so its type does
+    // not depend on what is stacked above it. The global `filter` below still
+    // gates which spans exist at all, so exported spans follow --log-level /
+    // RUST_LOG.
     let subscriber = tracing_subscriber::registry()
+        .with(otel_layer)
         .with(filter)
         .with(fmt_layer)
         .with(ErrorMetricsLayer);
@@ -541,7 +559,16 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv(&positional_secrets(&cli));
-    install_tracing(&cli.log_level, &cli.log_format);
+    // Only `temps serve` exports its own traces; every other command passes
+    // `None` and pays nothing.
+    let mut otel = match &cli.command {
+        Commands::Serve(serve) => {
+            otel_export::prepare(Some(&serve.otel), serve.data_dir.as_deref())
+        }
+        _ => otel_export::prepare(None, None),
+    };
+    install_tracing_with_otel(&cli.log_level, &cli.log_format, "", otel.layer.take());
+    otel.report();
     match docker_context {
         Ok(adopted) => tracing::info!(
             "Using Docker context '{}' ({}) because DOCKER_HOST is not set",
@@ -550,7 +577,11 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
         ),
         Err(skip) => tracing::debug!("Not adopting a Docker context: {:?}", skip),
     }
-    dispatch(cli, extra_plugins)
+    let result = dispatch(cli, extra_plugins);
+    // Flush queued spans on the paths that return (e.g. `--role=console`).
+    // The proxy path exits from its own shutdown handler, which flushes too.
+    otel_export::shutdown_blocking();
+    result
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
