@@ -27,6 +27,13 @@ connectivity to workers are sufficient. It must also start with zero
 deployments anywhere in the cluster and discover later deployments without
 a process restart.
 
+Single-host installations are equally first-class. The control plane and
+workload execution role can share a machine and a process, or run as separate
+`temps serve` and `temps agent` processes on the same machine. A physical node
+is not the same thing as a process or a control-plane/agent role. Requiring a
+separate host, self-enrollment or a loopback management connection would be an
+unnecessary regression for the combined single-host install.
+
 There are two existing seams to preserve and improve:
 
 - `ContainerRuntimeResolver` in
@@ -51,37 +58,78 @@ work.
 
 ### 1. Separate coordination from execution
 
-The control plane owns probe configuration, authorization, scheduling,
-accepted observations, availability history and alerts. The workload node
-owns execution against its local container runtime. No application port or
-Docker API is exposed to the control plane for worker health checks.
+The control-plane role owns probe configuration, authorization, placement,
+configuration reconciliation, accepted observations, availability history and
+alerts. The workload execution role owns recurring scheduling and execution
+against its local container runtime. The control plane distributes an approved
+revision and execution lease; it does not dispatch every periodic check.
+No application port or Docker API is exposed over the network for worker
+health checks.
 
 ```mermaid
 flowchart LR
-    UI[Console and status APIs] --> CP[Control plane: policy, scheduler, history]
+    UI[Console and status APIs] --> CP[Control plane: policy, reconciliation, history]
     CP <--> DB[(Database: placement, leases, observations)]
-    CP -->|Authenticated management channel| A[Worker A agent]
-    CP -->|Authenticated management channel| B[Worker B agent]
-    A -->|Local inspect or bounded probe| W1[Assigned container]
-    B -->|Local inspect or bounded probe| W2[Assigned container]
+    CP -->|Approved configuration| A[Worker A probe engine]
+    CP -->|Approved configuration| B[Worker B probe engine]
+    A -->|Authenticated observations| CP
+    B -->|Authenticated observations| CP
+    A -->|Schedule and probe locally| W1[Assigned container]
+    B -->|Schedule and probe locally| W2[Assigned container]
 ```
 
 Monitoring services start from database and node-management dependencies,
 independently of local runtime construction, placement eligibility, build
-services and public proxy listeners. An empty cluster is an idle scheduler,
+services and public proxy listeners. An empty cluster is idle reconciliation,
 not a startup error. Stopping local workload placement must not disable
 monitoring remote workers.
 
-Replace the required local deployer dependency with a placement-aware probe
-executor interface. Its local adapter is registered only when local execution
-is available; its remote adapter uses registered worker identities and
-endpoints. A legacy local placement on a Docker-free control plane produces
+Extract a shared bounded probe engine with typed assignment, policy and result
+interfaces and no database dependency. `temps agent` hosts it for worker
+placements; combined `temps serve` embeds it for local placements when a local
+runtime is available. Keep database-backed reconciliation and aggregation
+separate from this engine. A legacy local placement on a Docker-free control
+plane produces
 `unknown / runtime_unavailable` with an operator-facing explanation. A remote
-resolution failure never selects the local adapter.
+resolution failure never selects the embedded local engine.
 
 In split topology, the console/control-plane process owns coordination;
-proxy-only processes do not start additional schedulers. A combined
-single-node install uses the same contracts through the local adapter.
+proxy-only processes do not start additional probe engines. The same probe
+implementation, safety limits and result validation apply in all topologies:
+
+| Topology                                                | Probe engine owner                              | Control-plane connection                                                               |
+| ------------------------------------------------------- | ----------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Combined single-host `temps serve` with local workloads | Embedded workload engine                        | Typed in-process calls; no self-enrollment, separate agent process or HTTP round trip  |
+| Separate `temps serve` and `temps agent` on one host    | The process assigned to that workload placement | Authenticated management protocol for the agent; being on loopback grants no exemption |
+| Docker-free control plane with remote workers           | Each workload's assigned worker agent           | Authenticated management protocol; no local engine required                            |
+
+Execution ownership is explicit per placement, not inferred from shared IPs
+or physical co-location. A container is never monitored by both the embedded
+engine and a co-located agent. Use one canonical runtime/container assignment
+and exclusive ownership, plus a host-owned interprocess lock when multiple
+processes can access the same daemon. If ownership cannot be established,
+refuse the duplicate engine admission and report unknown. Migrating a local
+placement to an agent must reconcile outstanding probes before handover.
+
+Co-location does not widen application privileges. The combined process may
+already have host Docker access for deployments, but its probe engine uses
+the same restricted assignment checks and runtime operations as the remote
+engine. No additional Docker socket is mounted into workloads, no host shell
+is exposed, and a container with an unrelated local ID cannot be selected.
+
+### Kubernetes comparison
+
+Kubernetes' kubelet performs periodic probes on its node; its control plane
+owns desired Pod configuration and receives status. Startup, readiness and
+liveness are distinct policies; readiness failure changes service eligibility,
+while liveness can restart a container. Temps adopts node-owned recurring
+checks and centrally authorized configuration, without adopting automatic
+restart/remediation in this phase. See the official
+[probe model](https://kubernetes.io/docs/concepts/workloads/pods/probes/) and
+[node authorization model](https://kubernetes.io/docs/reference/access-authn-authz/node/).
+These describe Kubernetes; the authorization, cleanup and coverage requirements
+in this ADR are explicit Temps design decisions, not guarantees inherited
+from that comparison.
 
 ### 2. Persist the authorized effective probe
 
@@ -109,12 +157,14 @@ evidence during migration. Add runtime current-state/history storage with a
 probe revision and observation source; an old readiness success must never
 seed a runtime uptime interval.
 
-### 3. Use a restricted authenticated agent operation
+### 3. Reconcile restricted assignments and report bounded observations
 
-Periodic checks use a versioned runtime-health operation, distinct from both
-interactive exec and deployment `health-exec`. The operation accepts a typed
-probe request; it does not accept an arbitrary Docker action, host path,
-execution user, environment override, privileged mode or target URL.
+Remote monitoring uses a versioned runtime-health assignment and reporting
+protocol, distinct from both interactive exec and deployment `health-exec`.
+Configuration reconciliation installs an authorized probe revision for a
+specific placement; the node's engine then schedules it locally. The protocol
+does not accept an arbitrary Docker action, host path, execution user,
+environment override, privileged mode or target URL.
 
 Required transport is authenticated TLS with verified cluster CA, peer
 identity and node-scoped credentials, following the multi-node hardening
@@ -123,27 +173,37 @@ checks. Legacy plaintext agents or agents without the required capability
 report monitoring unavailable with an upgrade action. Never silently fall
 back to generic exec or an insecure transport.
 
-Each request binds these fields into its authenticated envelope:
+The embedded single-host engine receives the same typed, service-authorized
+assignment and result envelopes in-process. This transport does not require
+TLS or an agent token, but it retains all project, container, revision,
+ownership, expiry and output checks. A separate co-located agent is a remote
+principal and must pass normal transport authentication.
+
+Each assignment binds these fields into its authenticated envelope:
 
 - Cluster and target node identity; project, environment and deployment IDs.
 - Placement generation, replica ID and immutable runtime container ID.
 - Authorized probe revision and configuration digest.
-- Unique attempt ID, scheduler fencing epoch, admission expiry and bounded
-  execution budget.
+- Execution-owner identity, fencing epoch, authorization expiry, interval and
+  bounded execution/cleanup budgets.
 
-The agent verifies its identity, the control-plane caller's runtime-health
+The engine verifies its identity, the control-plane caller's runtime-health
 permission, expiry, known assignment and probe revision before accessing
 Docker. A container name or caller-supplied label is insufficient proof of
-ownership. Maintain an agent-owned assignment record from authenticated
+ownership. Maintain an engine-owned assignment record from authenticated
 deployment operations and verify it against the resolved immutable ID.
 Do not expose the endpoint until this binding is implemented. Reject wrong
 nodes, unrelated/retained containers and unknown revisions before execution.
 
-Retries reuse an attempt ID. The agent deduplicates admitted attempts and
-serializes lifecycle/probe operations per container. Admission expiry and
-replay state must survive agent restart; if the previous outcome cannot be
-established, return unknown rather than executing the attempt again. This
-provides bounded replay protection, not an exactly-once execution promise.
+Each locally scheduled attempt has a unique ID and a monotonically increasing
+sequence within the assignment epoch. Reports include these identifiers, the
+assigned revision, outcome and bounded duration. Delivery retries reuse report
+identities; they do not rerun the command. The engine deduplicates assignment
+updates and serializes lifecycle/probe operations per container. Authorization
+expiry, sequence high-water marks and unresolved execution ownership survive
+process restart; ambiguous recovery reports unknown and does not execute a
+replacement probe. This is bounded replay protection, not an exactly-once
+execution promise.
 
 ### 4. Treat probe configuration as code execution authority
 
@@ -220,31 +280,57 @@ Do not overlap commands, accumulate orphan tasks, or kill the workload to
 recover monitoring capacity. Resource reservations survive until cleanup is
 confirmed or the isolated execution boundary is proven gone.
 
-### 6. Fence scheduling and accept results conditionally
+### 6. Fence reconciliation, local scheduling and result acceptance
 
 Use database-backed expiring ownership and a monotonically increasing
-scheduler epoch, supporting a single coordinator today and multiple control
-plane processes later. Database time controls lease validity; agents enforce
-short admission expiry with a defined clock-skew budget and monotonic local
-execution deadlines. Excessive clock uncertainty rejects admission.
+configuration-owner epoch, supporting one coordinator today and multiple
+control-plane processes later. Database time controls coordinator lease
+validity. Reconcile assignment changes and lease renewal in bounded batches,
+not a database job and control-plane RPC for each probe tick. Agents reject
+obsolete configuration epochs and keep a single local due-work scheduler with
+bounded execution concurrency.
 
-Claim indexed due work in bounded batches. Keep at most one active runtime
-probe per replica, including across control-plane failover. A replacement
-scheduler reconciles an outstanding attempt with the worker rather than
-assuming the old HTTP request was cancelled. Agents reject obsolete epochs
-and do not admit a replacement while the earlier probe owns the container.
+Approved assignments have a finite renewable execution authorization lease,
+proposed default 120 seconds. An engine may continue already approved checks
+during a brief control-plane outage only until that lease expires. Establish
+expiry with a defined clock-skew budget and a monotonic local deadline;
+excessive clock uncertainty rejects admission. Renewal never extends an
+expired or revoked authorization based only on cached settings. On expiry,
+stop admitting probes, safely contain any outstanding probe within its
+existing deadline and leave the application running. The control plane's
+observation freshness is independent of this execution lease.
 
-The control plane accepts a result only while its attempt, ownership epoch,
+An acknowledged revocation prevents further admission immediately. An
+unreachable node cannot receive immediate revocation; the execution lease
+bounds that residual authority and the UI must say when acknowledgement is
+pending. Grant-sensitive assignments may use a shorter lease. This limitation
+also applies to a separately running co-located agent whose management
+connection has failed.
+
+Keep at most one active runtime probe per replica across restarts, engine
+handover and control-plane failover. A replacement coordinator reconciles
+the existing assignment and unresolved execution with its owner; it does not
+start a second scheduler or assume a lost management connection cancelled
+work. A higher epoch fences new admissions without releasing an unresolved
+older execution slot. Ownership cannot transfer until the previous engine is
+confirmed quiescent, or its authority has expired and its execution boundary
+is proven terminated.
+
+The control plane accepts a report only while its ownership epoch,
 node, placement generation, container identity and probe revision still match
-the current assignment. Accept and update state transactionally and
-idempotently. A late result from an old container cannot mark a replacement
-healthy. Nodes cannot submit observations for another node or write directly
-to shared monitoring tables.
+the current assignment, its sequence is new and its authorization was valid.
+Accept and update state transactionally and idempotently. A late result from
+an old container cannot mark a replacement healthy. Nodes cannot submit
+observations for another node or write directly to shared monitoring tables.
 
-Use control-plane dispatch/receipt times and bounded measured duration to
-establish observation coverage. Agent wall-clock timestamps are diagnostic,
-not an authority for retroactive uptime. Reject replayed, future, oversized
-or malformed results. Do not backfill disconnected periods with later success.
+Report fresh current state in bounded batches or through authenticated
+collection, with an authenticated reporting session and short receipt deadline.
+Use control-plane receipt times and bounded report age/duration to establish
+conservative observation coverage. A queued success from before a disconnect
+cannot refresh current state after reconnect. Require a new bounded-age sample
+in the new reporting session; agent wall-clock timestamps are diagnostic, not
+authority for retroactive uptime. Reject replayed, future, oversized or
+malformed reports. Do not backfill disconnected periods with later success.
 
 ### 7. Represent uncertainty and uptime honestly
 
@@ -326,35 +412,48 @@ monitors are not deleted simply because the project also has a worker.
 
 ## Resource budget and saturation
 
-This is control-plane work. No probe execution, database access or locks are
-added to the proxy request path.
+This is background management work: policy/history on the control plane and
+probe scheduling/execution on each workload node. No probe execution, database
+access or locks are added to the proxy request path. On a combined host both
+roles share its CPU/memory budget rather than receiving independent allowances.
 
 Proposed initial defaults are a 30-second runtime interval, 5-second attempt
-budget, 4 concurrent probes per node and 16 per coordinator. Enforce global,
-node and project fairness as well as per-container exclusion. Validate policy
-against hard implementation limits; operators cannot configure unbounded
-work through record settings.
+budget and 4 concurrent probes per workload node, shared by all embedded and
+separate engine processes on that node. Enforce node and project fairness as
+well as per-container exclusion. The control plane bounds configuration/report
+processing to 16 concurrent operations; these are not 16 remote probe ticks.
+Validate policy against hard implementation limits; operators cannot configure
+unbounded work through record settings.
 
-Use indexed due/expiry queries of at most 100 records, bounded response
-envelopes of at most 64 KiB per attempt, and batches of at most 100 current-state
-or history updates flushed within one second. Keep caches bounded and evict
-inactive placements; do not spawn a task or timer for every container or scan
-the entire deployment table every tick. Reuse existing reconciliation
-infrastructure, with change notifications plus indexed catch-up after restart.
+Use indexed reconciliation/expiry queries of at most 100 records and local
+due-work structures bounded by assigned placements. Reports contain at most
+100 observations and 64 KiB per envelope, with a one-second maximum flush age
+while connected. Batch current-state/history writes to the same record bound.
+Keep caches bounded and evict inactive placements; do not spawn a task or
+timer for every container or scan the entire deployment table every tick.
+Reuse existing reconciliation infrastructure, with change notifications plus
+indexed catch-up after restart. A disconnected engine retains only bounded
+current state and uncertainty markers; it never builds an unbounded report
+spool or replays offline samples as fresh coverage.
 
 At 1,000 replicas on 20 workers, a 30-second interval schedules about 33 checks
-per second. With 100 ms mean completion this requires about four concurrent
-checks. A 5-second failure storm exceeds the default capacity: defer due work
-fairly, suppress overlapping retries and expire freshness to unknown. Do not
-grow an in-memory backlog or block deployment/lifecycle operations.
+per second cluster-wide. With 100 ms mean completion this requires about four
+concurrent checks across those nodes, not four control-plane execution slots.
+At 50 replicas per node, a 5-second failure storm requires about nine concurrent
+checks per node and exceeds its four-slot budget: defer due work fairly,
+suppress overlapping retries and expire freshness to unknown. On a single
+host the same four-slot limit applies to all local workloads. Do not grow an
+in-memory backlog or block deployment/lifecycle operations.
 
 Record bounded current state and transitions, and compact availability into
 per-minute buckets containing healthy, unhealthy, unknown and eligible
 durations. Batch persistence and configure retention; avoid retaining one raw
 row for every successful observation indefinitely. Account for replica-policy
 changes when aggregating environment buckets. Target under 16 MiB additional
-scheduler working memory at the reference load, including in-flight buffers;
-measure this and database write volume before rollout on 3 vCPU / 4 GiB hosts.
+control-plane working memory at the reference load, including in-flight
+buffers, plus a measured bounded per-node engine footprint. Measure the total
+combined-host footprint and database write volume before rollout on
+3 vCPU / 4 GiB hosts.
 
 ## Trust limits
 
@@ -380,8 +479,15 @@ heartbeats and remediation need their own design and authorization review.
   destroy application availability. Rejected for runtime checks.
 - **Let agents choose arbitrary commands and push health:** expands trust and
   makes configuration provenance, replay and failover ambiguous. Agents may
-  execute only authenticated assigned revisions; heartbeat ingestion is
-  deferred.
+  report health only for authenticated assigned revisions. Agent-owned
+  scheduling/reporting is selected; agent-selected commands and arbitrary
+  application heartbeat ingestion are not.
+- **Dispatch every runtime probe from the control plane:** centralizes timer
+  load and makes local monitoring dependent on a management round trip.
+  Rejected in favor of one bounded engine on the workload node.
+- **Require a separate agent process for single-host installs:** adds
+  enrollment and network dependencies without improving an in-process trust
+  boundary. Use the same engine embedded in combined `temps serve` instead.
 - **Enable runtime exec with only a client timeout:** abandons commands and
   permits resource exhaustion. Rejected until safe containment is demonstrated.
 
@@ -389,9 +495,12 @@ heartbeats and remediation need their own design and authorization review.
 
 1. Correct the portless uptime presentation and expose safe effective probe
    metadata without claiming runtime coverage. Preserve historical HTTP data.
-2. Decouple monitoring startup from local deployments/Docker and add versioned
-   remote capabilities, assignment validation, fenced scheduling and separate
-   runtime storage. Ship process/HTTP/TCP monitoring and coverage reporting.
+2. Extract the shared node-local probe engine, embed it for combined
+   single-host workloads and host it in agents for assigned worker workloads.
+   Decouple control-plane monitoring startup from local deployments/Docker.
+   Add versioned capabilities, assignment validation, fenced reconciliation,
+   execution leases and separate runtime storage. Ship process/HTTP/TCP
+   monitoring and coverage reporting.
 3. Enable sustained-failure and monitoring-loss alerts after transition and
    deduplication tests pass. Keep automatic remediation out of scope.
 4. Enable runtime exec only after the non-destructive execution mechanism has
@@ -406,6 +515,12 @@ Required tests next to the implementing code include:
 - Real multi-node E2E uses a Docker-free application control-plane process and
   at least two worker agents. Workers run application containers; the control
   plane receives no Docker socket. Exercise separate replicas and node loss.
+- Combined single-host E2E probes local workloads without a separate agent,
+  self-enrollment or loopback HTTP. Separate co-located control-plane/agent
+  processes exercise authenticated reporting and the same probe semantics.
+- A co-located embedded engine and agent sharing Docker cannot execute a
+  duplicate probe or exceed the host budget. Test ownership handover, process
+  restart and ambiguous cleanup without selecting a different local container.
 - Missing/expired/revoked credentials, wrong CA/node identity, plaintext and
   old-capability agents fail closed without execution or insecure fallback.
 - Wrong project/container/node, changed assignment, retained candidates,
@@ -413,9 +528,13 @@ Required tests next to the implementing code include:
   results are rejected; replay protection survives agent restart.
 - Concurrent coordinators, lease expiry, clock skew, reconnect and restart
   cannot overlap an unresolved probe or let stale owners update current state.
+  Authorized local checks continue only within the bounded execution lease;
+  expiry stops admission without stopping the application. Delayed/offline
+  reports cannot restore fresh health or retroactively fill coverage gaps.
 - Unauthorized exec configuration and override removal, including granted
   projects and reuse paths, fail before persistence or execution. Revoking a
-  grant/config authorization prevents subsequent checks.
+  grant/config authorization prevents subsequent checks once acknowledged;
+  disconnected execution cannot continue beyond its existing lease.
 - HTTP redirect/target escape and cross-tenant address attempts are rejected;
   process stability restarts after observation gaps or runtime identity changes.
 - Runtime exec timeout, cancellation, descendants, agent crash and cleanup
