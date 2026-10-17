@@ -582,7 +582,7 @@ impl NativeApiService {
             credentials
                 .require_capability(&request.model, "the Responses API", |c| c.responses_api)?;
         } else {
-            Self::require_openai(&credentials, "/ai/v1/responses", &request.model)?;
+            Self::require_openai(&credentials, "/api/ai/v1/responses", &request.model)?;
         }
         if credentials.credential_type == CredentialType::System {
             reject_stateful_request(request)?;
@@ -670,7 +670,7 @@ impl NativeApiService {
             .gateway_service
             .resolve_credentials(&summary.model, byok)
             .await?;
-        Self::require_openai(&credentials, "/ai/v1/files", &summary.model)?;
+        Self::require_openai(&credentials, "/api/ai/v1/files", &summary.model)?;
         let base_url = self.base_url(&credentials)?;
 
         let file = tokio::fs::File::open(spooled.file.path())
@@ -1083,6 +1083,10 @@ impl NativeApiService {
             tags: vec!["batch".to_string()],
             request_id: Some(batch.id.clone()),
             trace_id: None,
+            // Objects are owned by a user or, for deployment tokens, a
+            // project; the creating token itself is not recorded.
+            project_id: owner.project_id,
+            token_id: None,
         };
         // Latency is not meaningful for a job that ran for hours; 0 keeps it
         // out of latency percentiles.
@@ -1772,6 +1776,8 @@ mod tests {
             tags: vec!["batch".into()],
             request_id: Some("batch_test".into()),
             trace_id: None,
+            project_id: None,
+            token_id: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

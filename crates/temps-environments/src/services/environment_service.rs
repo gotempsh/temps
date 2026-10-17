@@ -1486,12 +1486,36 @@ impl EnvironmentService {
 
         let new_domain = environment_domains::ActiveModel {
             environment_id: Set(environment.id),
-            domain: Set(normalized),
+            domain: Set(normalized.clone()),
             created_at: Set(chrono::Utc::now()),
             ..Default::default()
         };
 
-        Ok(new_domain.insert(self.db.as_ref()).await?)
+        // A hostname attached to a status page (#1412) is reserved for it;
+        // checked and claimed under the shared hostname lock.
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &normalized).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &normalized)
+                .await?
+            {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is attached to a status page; remove it there first"
+                )));
+            }
+            Ok(new_domain.insert(&txn).await?)
+        }
+        .await;
+        match inserted {
+            Ok(domain) => {
+                txn.commit().await?;
+                Ok(domain)
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                Err(e)
+            }
+        }
     }
 
     pub async fn delete_environment_domain(
@@ -2525,6 +2549,7 @@ mod tests {
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
             "source_type": source_type, "project_type": temps_entities::types::ProjectType::Server,
+            "hosting": "hosted",
             "cross_project_trace_sharing": true,
             "cloud_telemetry_fidelity": "metered", "cloud_telemetry_attribute_allowlist": [],
             "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"

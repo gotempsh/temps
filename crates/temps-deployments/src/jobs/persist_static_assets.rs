@@ -1161,6 +1161,7 @@ mod tests {
                 tags: vec![],
                 created: None,
                 working_dir: Some("/app".to_string()),
+                config: None,
             })
         }
         async fn save_image(

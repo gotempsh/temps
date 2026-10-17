@@ -7,7 +7,8 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { QueryKey } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { listRoutesOptions } from '@/api/client/@tanstack/react-query.gen'
-import type { RouteResponse } from '@/api/client/types.gen'
+import type { RouteResponse, UserResponse } from '@/api/client/types.gen'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { Routes as RoutesPage } from './Routes'
 
@@ -39,13 +40,35 @@ function fail(client: QueryClient, queryKey: QueryKey, error: unknown) {
     .setState({ status: 'error', error: error as Error, fetchStatus: 'idle' })
 }
 
-function render(client: QueryClient) {
+/** Only instance admins are offered "Add Route". */
+function signedIn(role: string): UserResponse {
+  return {
+    id: 1,
+    name: 'Operator',
+    username: 'operator',
+    avatar_url: '',
+    mfa_enabled: false,
+    role,
+  }
+}
+
+function render(client: QueryClient, role = 'admin') {
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={['/settings/load-balancer']}>
-        <BreadcrumbProvider>
-          <RoutesPage />
-        </BreadcrumbProvider>
+        <AuthContext.Provider
+          value={{
+            user: signedIn(role),
+            isLoading: false,
+            error: null,
+            logout: async () => {},
+            refetch: () => {},
+          }}
+        >
+          <BreadcrumbProvider>
+            <RoutesPage />
+          </BreadcrumbProvider>
+        </AuthContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -96,6 +119,17 @@ test('verified empty route list keeps the Add Route CTA', () => {
   expect(addRouteLinks(html)).toBe(2)
   expect(html).not.toContain('unavailable')
   expect(html).not.toContain('access denied')
+  client.clear()
+})
+
+test('verified empty route list offers no Add Route to a non-administrator', () => {
+  const client = createClient()
+  client.setQueryData(listKey, [] as RouteResponse[])
+  const html = render(client, 'reader')
+  expect(html).toContain('No routes configured')
+  expect(addRouteLinks(html)).toBe(0)
+  expect(html).not.toContain('/settings/load-balancer/add')
+  expect(html).toContain('Only administrators can add, edit or remove routes')
   client.clear()
 })
 

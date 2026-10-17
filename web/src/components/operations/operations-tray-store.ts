@@ -16,7 +16,7 @@
  *   "View in operations" action.
  *
  * It also holds the page each tray section is showing. Closing the tray
- * returns both to page 1 so browsed history is released rather than kept
+ * returns all to page 1 so browsed history is released rather than kept
  * (and polled) behind a closed popover.
  */
 import { invalidateOperations } from '@/lib/operations'
@@ -33,7 +33,7 @@ export interface LocalOperation {
 }
 
 /** A separately paged section of the tray. */
-export type OperationsTraySection = 'running' | 'recent'
+export type OperationsTraySection = 'running' | 'waiting' | 'recent'
 
 interface TrayState {
   open: boolean
@@ -42,7 +42,7 @@ interface TrayState {
   pages: Readonly<Record<OperationsTraySection, number>>
 }
 
-const FIRST_PAGES: TrayState['pages'] = { running: 1, recent: 1 }
+const FIRST_PAGES: TrayState['pages'] = { running: 1, waiting: 1, recent: 1 }
 
 let state: TrayState = { open: false, local: [], pages: FIRST_PAGES }
 const listeners = new Set<() => void>()
@@ -65,11 +65,12 @@ export function getOperationsTrayState(): TrayState {
 }
 
 export function setOperationsTrayOpen(open: boolean) {
-  // Closing returns both sections to their first page.
+  // Closing returns all sections to their first page.
   const pages = open ? state.pages : FIRST_PAGES
   const unchanged =
     state.open === open &&
     state.pages.running === pages.running &&
+    state.pages.waiting === pages.waiting &&
     state.pages.recent === pages.recent
   if (unchanged) return
   setState({ ...state, open, pages })

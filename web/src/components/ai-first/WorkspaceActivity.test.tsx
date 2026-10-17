@@ -58,7 +58,7 @@ describe('workspace activity', () => {
       />
     )
     expect(html).toContain('lucide-folder')
-    expect(html).toContain('aria-label="2 projects"')
+    expect(html).toContain('aria-label="2 services"')
     expect(html.match(/<p\b/g)).toHaveLength(1)
     expect(html.replace(/<[^>]*>/g, '').trim()).toBe('211')
     expect(html).not.toContain('flex-wrap')
@@ -66,11 +66,11 @@ describe('workspace activity', () => {
   test('retains the project count when activity is unavailable or archived', () => {
     expect(
       renderToStaticMarkup(<WorkspaceActivity projectCount={1} error />)
-    ).toContain('aria-label="1 project"')
+    ).toContain('aria-label="1 service"')
     const archived = renderToStaticMarkup(
       <WorkspaceActivity projectCount={0} showThreads={false} />
     )
-    expect(archived).toContain('aria-label="0 projects"')
+    expect(archived).toContain('aria-label="0 services"')
     expect(archived).not.toContain('Activity unavailable')
   })
   test('shows each harness logo and count alongside persistent terminal states', () => {

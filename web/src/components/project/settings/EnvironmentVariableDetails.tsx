@@ -3,6 +3,7 @@
 import type { EnvironmentVariableResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { CredentialDetails } from './CredentialDetails'
+import { EnvironmentVariableRevealValue } from './EnvironmentVariableRevealValue'
 
 export function EnvironmentVariableDetails({
   projectId,
@@ -28,12 +29,13 @@ export function EnvironmentVariableDetails({
         <>
           <div>
             <dt className="text-muted-foreground">Value</dt>
-            <dd className="mt-1 font-mono">••••••••••••</dd>
-            <dd className="text-xs text-muted-foreground">
-              {variable.is_secret
-                ? 'Secret · write-only'
-                : 'Hidden in this view'}
-            </dd>
+            <EnvironmentVariableRevealValue
+              projectId={projectId}
+              variableId={variable.id}
+              name={variable.key}
+              isSecret={variable.is_secret ?? false}
+              version={String(variable.updated_at)}
+            />
           </div>
           <div>
             <dt className="text-muted-foreground">Environments</dt>

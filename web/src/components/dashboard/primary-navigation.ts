@@ -86,7 +86,16 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
         icon: Sparkles,
         featureKey: 'ai-chat',
       },
-      { title: 'Projects', url: '/projects', icon: Folder },
+      {
+        title: 'Projects',
+        url: '/projects',
+        icon: Folder,
+        // A project (group) overview lives at /p/:slug.
+        activeWhen: (path: string) =>
+          path === '/projects' ||
+          path.startsWith('/projects/') ||
+          path.startsWith('/p/'),
+      },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       {

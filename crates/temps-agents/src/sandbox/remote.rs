@@ -361,6 +361,14 @@ pub struct RemoteRecoverRequest {
     pub container_name: String,
 }
 
+/// `POST /agent/sandboxes/release-orphaned`: release the isolated network and
+/// egress proxy a sandbox whose container no longer exists left on the node.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteReleaseOrphanedRequest {
+    /// Sandbox label, without the `temps-sandbox-` prefix.
+    pub container_name: String,
+}
+
 /// `POST /agent/sandboxes/status` takes an empty JSON object.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemoteStatusRequest {}
@@ -1142,6 +1150,7 @@ impl RemoteSandboxProvider {
 #[async_trait]
 impl SandboxProvider for RemoteSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(SandboxBackend::Docker)?;
         let label = config
             .container_name_override
             .clone()
@@ -1476,6 +1485,23 @@ impl SandboxProvider for RemoteSandboxProvider {
         Ok(handle.map(|h| self.stamp(h)))
     }
 
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        let body = RemoteReleaseOrphanedRequest {
+            container_name: container_name.to_string(),
+        };
+        let _: RemoteOkResponse = self
+            .call(
+                "/agent/sandboxes/release-orphaned",
+                &body,
+                LIFECYCLE_TIMEOUT,
+                None,
+                "release orphaned resources",
+                SMALL_RESPONSE_CAP,
+            )
+            .await?;
+        Ok(())
+    }
+
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         backend == SandboxBackend::Docker
     }
@@ -1784,6 +1810,36 @@ mod tests {
         serve(app).await
     }
 
+    #[tokio::test]
+    async fn releasing_orphaned_resources_asks_the_worker_by_bare_label() {
+        let (url, seen) = fake_agent(200, Some(serde_json::json!({ "ok": true }))).await;
+        provider_at(&url)
+            .release_orphaned_resources("abc")
+            .await
+            .expect("worker acknowledged the release");
+        assert_eq!(
+            seen.lock().await.clone(),
+            Some(serde_json::json!({ "container_name": "abc" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_orphaned_resources_surfaces_a_worker_failure() {
+        let (url, _seen) = fake_agent(
+            503,
+            Some(serde_json::json!({ "error": "the Docker daemon on this node is down" })),
+        )
+        .await;
+        let error = provider_at(&url)
+            .release_orphaned_resources("abc")
+            .await
+            .expect_err("a worker that cannot release must not report success");
+        assert!(
+            matches!(error, AgentError::SandboxProviderUnavailable { .. }),
+            "{error:?}"
+        );
+    }
+
     fn provider_at(url: &str) -> RemoteSandboxProvider {
         RemoteSandboxProvider::new(
             2,
@@ -1812,6 +1868,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: Default::default(),
             idle_timeout: Duration::from_secs(60),

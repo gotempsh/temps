@@ -233,6 +233,16 @@ pub enum DeploymentError {
         source_deployment_id: i32,
     },
 
+    /// The project's app runs outside Temps (`hosting: external`), so Temps
+    /// does not create deployments for it. `reason` is the operator-facing
+    /// explanation, which already names the project and how to change it.
+    #[error("Project {project_id} ('{project_name}') is hosted externally: {reason}")]
+    ProjectHostedExternally {
+        project_id: i32,
+        project_name: String,
+        reason: String,
+    },
+
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
@@ -248,6 +258,18 @@ impl From<sea_orm::DbErr> for DeploymentError {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+/// Whether a project's hosting allows Temps to deploy it.
+fn hosting_deploy_check(project: &projects::Model) -> Result<(), DeploymentError> {
+    match project.hosting.deploy_refusal(&project.name) {
+        Some(reason) => Err(DeploymentError::ProjectHostedExternally {
+            project_id: project.id,
+            project_name: project.name.clone(),
+            reason,
+        }),
+        None => Ok(()),
     }
 }
 
@@ -1819,20 +1841,38 @@ impl DeploymentService {
         Ok(deployment)
     }
 
+    /// Most recent deployment of a project, or `None` when the project exists
+    /// but has never been deployed (a normal state, not an error).
+    ///
+    /// A project that does not exist (or was soft-deleted) is a
+    /// [`DeploymentError::NotFound`] naming the project, so callers can tell
+    /// "nothing deployed yet" apart from "wrong project id".
     pub async fn get_last_deployment(
         &self,
         project_id: i32,
-    ) -> Result<Deployment, DeploymentError> {
-        let deployment_with_pipeline = deployments::Entity::find()
+    ) -> Result<Option<Deployment>, DeploymentError> {
+        // Check the project first: a soft-deleted project keeps its deployment
+        // rows, and must read as "not found" rather than returning them.
+        let project_exists = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .is_some();
+        if !project_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "project {} not found",
+                project_id
+            )));
+        }
+
+        let Some(deployment) = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
-                DeploymentError::NotFound(format!("project {} not found", project_id))
-            })?;
-
-        let deployment = deployment_with_pipeline;
+        else {
+            return Ok(None);
+        };
 
         // Check if this deployment is current for any environment
         let is_current = environments::Entity::find()
@@ -1850,9 +1890,10 @@ impl DeploymentService {
             .get(&deployment.environment_id)
             .cloned();
 
-        Ok(self
-            .map_db_deployment_to_deployment(deployment, is_current, environment)
-            .await)
+        Ok(Some(
+            self.map_db_deployment_to_deployment(deployment, is_current, environment)
+                .await,
+        ))
     }
 
     pub async fn get_deployment(
@@ -2656,6 +2697,32 @@ impl DeploymentService {
         Ok(())
     }
 
+    /// Refuse to create a deployment for a project whose app runs outside
+    /// Temps (`hosting: external`).
+    ///
+    /// A project that no longer exists is let through: the operation that
+    /// follows reports the missing project with its own context.
+    pub async fn ensure_project_hosted_locally(
+        &self,
+        project_id: i32,
+    ) -> Result<(), DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, project_id, "Could not load project before deploying");
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Could not load project {project_id} to check where it is hosted: {error}"
+                    ),
+                }
+            })?;
+        match project {
+            Some(project) => hosting_deploy_check(&project),
+            None => Ok(()),
+        }
+    }
+
     /// Where the image reused by a rollback or promotion lives (and so how a
     /// remote worker obtains it), and which image the reuse is bound to.
     ///
@@ -2735,11 +2802,12 @@ impl DeploymentService {
     /// `image_name`, for a rollback/promotion that must reach those workers.
     ///
     /// Used for a mixed-architecture worker build always -- the control
-    /// plane never holds its other architectures -- and for any worker
-    /// build when this control plane runs no workloads, since it then has
-    /// no copy of the image to stream from. A full-profile control plane
-    /// keeps streaming a single-architecture image from its own copy, as
-    /// before.
+    /// plane never holds its other architectures -- for any worker build
+    /// when this control plane runs no workloads, since it then has no copy
+    /// of the image to stream from, and for a build whose node reported the
+    /// image's configuration, which was therefore not copied back. A
+    /// full-profile control plane keeps streaming a single-architecture
+    /// image from its own copy when the build reported none, as before.
     async fn reused_worker_build(
         &self,
         project_id: i32,
@@ -2773,10 +2841,13 @@ impl DeploymentService {
             .node_scheduler
             .get()
             .is_some_and(|scheduler| !scheduler.local_workloads_enabled());
-        Ok(
-            (worker_build.is_per_architecture() || control_plane_has_no_copy)
-                .then_some(worker_build),
-        )
+        // A build whose node reported the image's configuration was not
+        // copied back to the control plane, so its worker is the source.
+        let control_plane_was_not_given_a_copy = worker_build.image_config.is_some();
+        Ok((worker_build.is_per_architecture()
+            || control_plane_has_no_copy
+            || control_plane_was_not_given_a_copy)
+            .then_some(worker_build))
     }
 
     async fn configure_reuse_deploy_builder(
@@ -6532,6 +6603,7 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -6839,6 +6911,62 @@ mod tests {
                 .expect("read the sibling deployment"),
             "persisting one deployment's mount must not affect a sibling deployment's row"
         );
+    }
+
+    /// The hosting check used by rollback and promotion: it lives in the
+    /// service so the handlers never read the project row themselves.
+    #[tokio::test]
+    async fn externally_hosted_projects_are_refused_before_a_deployment_is_created() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker unavailable; skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to prepare test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        let service = create_deployment_service_for_test(db.clone());
+
+        assert!(
+            service
+                .ensure_project_hosted_locally(project.id)
+                .await
+                .is_ok(),
+            "a hosted project may be deployed"
+        );
+        // A missing project is left for the operation itself to report.
+        assert!(service
+            .ensure_project_hosted_locally(project.id + 10_000)
+            .await
+            .is_ok());
+
+        let mut external: projects::ActiveModel = project.clone().into();
+        external.hosting = Set(temps_entities::types::Hosting::External);
+        external
+            .update(db.as_ref())
+            .await
+            .expect("mark the project external");
+
+        match service.ensure_project_hosted_locally(project.id).await {
+            Err(DeploymentError::ProjectHostedExternally {
+                project_id,
+                project_name,
+                reason,
+            }) => {
+                assert_eq!(project_id, project.id);
+                assert_eq!(project_name, project.name);
+                assert!(reason.contains(&project.name), "{reason}");
+            }
+            other => panic!("expected ProjectHostedExternally, got {other:?}"),
+        }
     }
 
     struct NoopLogWriter;
@@ -7936,6 +8064,7 @@ mod tests {
             labels: Set(serde_json::json!({})),
             capacity: Set(serde_json::json!({})),
             dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
             public_ingress_enabled: Set(false),
             public_ingress_unsupported_reasons: Set(serde_json::json!([])),
             created_at: Set(Utc::now()),
@@ -9498,6 +9627,69 @@ mod tests {
             .unwrap();
         assert_eq!(updated_deployment2.state, "stopped");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_last_deployment_distinguishes_empty_project_from_missing_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping get_last_deployment integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let service = create_deployment_service_for_test(db.clone());
+
+        // Project with a deployment -> Some(latest).
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let last = service
+            .get_last_deployment(project.id)
+            .await?
+            .expect("project with a deployment must return it");
+        assert_eq!(last.id, deployment.id);
+
+        // Project that exists but was never deployed -> Ok(None).
+        let empty_project = projects::ActiveModel {
+            name: Set("Never Deployed".to_string()),
+            slug: Set("never-deployed".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo-empty".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        assert!(service
+            .get_last_deployment(empty_project.id)
+            .await?
+            .is_none());
+
+        // A soft-deleted project keeps its deployment rows but reads as not found.
+        let mut deleted: projects::ActiveModel = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await?
+            .expect("project exists")
+            .into();
+        deleted.is_deleted = Set(true);
+        deleted.update(db.as_ref()).await?;
+        let result = service.get_last_deployment(project.id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {} not found", project.id)
+        ));
+
+        // Unknown project -> NotFound naming the project.
+        let missing_id = empty_project.id + 10_000;
+        let result = service.get_last_deployment(missing_id).await;
+        assert!(matches!(
+            result,
+            Err(DeploymentError::NotFound(message))
+                if message == format!("project {missing_id} not found")
+        ));
         Ok(())
     }
 
@@ -11783,6 +11975,45 @@ mod tests {
             .expect("the worker is the only source of the image");
         assert_eq!(reused.builder_node_id, Some(5));
         assert!(!reused.is_per_architecture());
+        Ok(())
+    }
+
+    /// A node that reported the image's configuration was not asked to send
+    /// the image back, so even a full-profile control plane has no copy: the
+    /// reuse must name the worker and carry the reported ports.
+    #[tokio::test]
+    async fn rollback_of_a_build_that_was_not_copied_back_uses_the_worker_and_its_ports(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:arm",
+                "builder_node_id": 5,
+                "image_tags_by_platform": { "linux/arm64": "app-1:latest" },
+                "image_config": { "exposed_ports": [8080], "working_dir": "/app" }
+            }),
+        )
+        .await?;
+        let full = create_deployment_service_for_test(db.clone());
+        full.set_node_scheduler(Arc::new(crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))));
+
+        let reused = full
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("the worker is the only holder of an image that was not copied back");
+
+        assert_eq!(reused.builder_node_id, Some(5));
+        assert_eq!(
+            reused.image_config.map(|config| config.exposed_ports),
+            Some(vec![8080])
+        );
         Ok(())
     }
 }

@@ -44,8 +44,8 @@ pub(super) fn from_text(text: &str) -> Found {
     if !looks_like_kubeconfig(text) {
         return Found::default();
     }
-    // serde_yaml bounds recursion depth and alias expansion.
-    let config: Kubeconfig = match serde_yaml::from_str(text) {
+    // yaml_serde bounds recursion depth and alias expansion.
+    let config: Kubeconfig = match yaml_serde::from_str(text) {
         Ok(config) => config,
         Err(_) => {
             return Found::problem(

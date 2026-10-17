@@ -36,16 +36,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { Alert, AlertDescription } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ArrowLeft, Trash2, TestTube, Loader2 } from 'lucide-react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -330,9 +321,9 @@ export function EditNotificationProvider() {
     }
   }
 
-  const handleDelete = async () => {
+  const handleDelete = () => {
     if (!provider) return
-    await deleteMutation.mutateAsync({ path: { id: provider.id } })
+    deleteMutation.mutate({ path: { id: provider.id } })
   }
 
   if (isLoading) {
@@ -429,26 +420,16 @@ export function EditNotificationProvider() {
         </CardContent>
       </Card>
 
-      <AlertDialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete the &quot;{provider.name}&quot;
-              notification provider. This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={handleDelete}
-              className="bg-destructive text-destructive-foreground"
-            >
-              Delete Provider
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        resourceType={`${provider.provider_type} notification provider`}
+        resourceName={provider.name}
+        confirmLabel="Delete Provider"
+        consequences="Notification preferences that deliver through it will stop sending."
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDelete}
+      />
     </div>
   )
 }

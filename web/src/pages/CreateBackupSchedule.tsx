@@ -64,6 +64,29 @@ interface NewScheduleForm {
   max_runtime_hours: number | ''
 }
 
+type ScheduleFieldErrors = {
+  name?: string
+  cron?: string
+  services?: string
+  maxRuntime?: string
+}
+
+// Ids focus moves to for each invalid field.
+const FIELD_ERROR_IDS = {
+  name: 'name',
+  cron: 'custom-cron',
+  services: 'schedule-services',
+  maxRuntime: 'max-runtime',
+} as const
+
+// Fields in the order they appear on the page.
+const FIELD_ORDER: ReadonlyArray<keyof ScheduleFieldErrors> = [
+  'name',
+  'cron',
+  'services',
+  'maxRuntime',
+]
+
 export function CreateBackupSchedule() {
   const { id } = useParams<{ id: string }>()
   const sourceId = id ? parseInt(id, 10) : undefined
@@ -90,6 +113,9 @@ export function CreateBackupSchedule() {
     scheduleOptions[1].value
   )
   const [customCron, setCustomCron] = useState('')
+  const [fieldErrors, setFieldErrors] = useState<ScheduleFieldErrors>({})
+  const clearFieldError = (field: keyof ScheduleFieldErrors) =>
+    setFieldErrors((current) => ({ ...current, [field]: undefined }))
   // 'all' (default) means the schedule backs up every database — including
   // ones created after this schedule. 'specific' means it only backs up the
   // services explicitly picked below. Default chosen to match what most
@@ -141,17 +167,22 @@ export function CreateBackupSchedule() {
   }
 
   function handleSubmit() {
+    // Report every problem at once, each next to its own field.
+    const errors: ScheduleFieldErrors = {}
     if (!form.name?.trim()) {
-      toast.error('Schedule name is required')
-      return
+      errors.name = 'Schedule name is required'
     }
 
     const schedule_expression =
       selectedPreset === 'custom' ? customCron : selectedPreset
 
-    if (!schedule_expression) {
-      toast.error('Please select a schedule or enter a custom cron expression')
-      return
+    // The custom expression input only renders for scheduled backups.
+    if (
+      form.backup_type === 'scheduled' &&
+      selectedPreset === 'custom' &&
+      !schedule_expression.trim()
+    ) {
+      errors.cron = 'Enter a custom cron expression'
     }
 
     let max_runtime_secs: number | undefined
@@ -161,21 +192,27 @@ export function CreateBackupSchedule() {
       !Number.isNaN(form.max_runtime_hours)
     ) {
       if (Number(form.max_runtime_hours) <= 0) {
-        toast.error('Max runtime must be a positive number of hours')
-        return
+        errors.maxRuntime = 'Max runtime must be a positive number of hours'
+      } else {
+        max_runtime_secs = Math.round(Number(form.max_runtime_hours) * 3600)
       }
-      max_runtime_secs = Math.round(Number(form.max_runtime_hours) * 3600)
     }
 
     if (backupMode === 'specific' && selectedServiceIds.length === 0) {
-      toast.error(
+      errors.services =
         'Select at least one database, or switch back to "All databases."'
-      )
+    }
+
+    setFieldErrors(errors)
+    const firstInvalid = FIELD_ORDER.find((field) => errors[field])
+    if (firstInvalid) {
+      document.getElementById(FIELD_ERROR_IDS[firstInvalid])?.focus()
       return
     }
+
     createMutation.mutate({
       body: {
-        name: form.name,
+        name: form.name ?? '',
         description: form.description,
         backup_type: form.backup_type ?? 'scheduled',
         schedule_expression,
@@ -226,8 +263,21 @@ export function CreateBackupSchedule() {
                 id="name"
                 placeholder="Daily Backup"
                 value={form.name ?? ''}
-                onChange={(e) => setForm({ ...form, name: e.target.value })}
+                aria-invalid={fieldErrors.name ? true : undefined}
+                aria-describedby={fieldErrors.name ? 'name-error' : undefined}
+                onChange={(e) => {
+                  clearFieldError('name')
+                  setForm({ ...form, name: e.target.value })
+                }}
               />
+              {fieldErrors.name && (
+                <p
+                  id="name-error"
+                  className="text-sm font-medium text-destructive"
+                >
+                  {fieldErrors.name}
+                </p>
+              )}
             </div>
 
             <div className="grid gap-2">
@@ -304,9 +354,24 @@ export function CreateBackupSchedule() {
                     id="custom-cron"
                     placeholder="0 0 * * *"
                     value={customCron}
-                    onChange={(e) => setCustomCron(e.target.value)}
+                    aria-invalid={fieldErrors.cron ? true : undefined}
+                    aria-describedby={
+                      fieldErrors.cron ? 'custom-cron-error' : undefined
+                    }
+                    onChange={(e) => {
+                      clearFieldError('cron')
+                      setCustomCron(e.target.value)
+                    }}
                     className="mt-1"
                   />
+                  {fieldErrors.cron && (
+                    <p
+                      id="custom-cron-error"
+                      className="mt-1 text-sm font-medium text-destructive"
+                    >
+                      {fieldErrors.cron}
+                    </p>
+                  )}
                   <p className="text-xs text-muted-foreground mt-1">
                     Format: second minute hour day month weekday. Use names such
                     as SUN for weekdays.
@@ -344,7 +409,10 @@ export function CreateBackupSchedule() {
             <Label>Backup targets</Label>
             <RadioGroup
               value={backupMode}
-              onValueChange={(v) => setBackupMode(v as 'all' | 'specific')}
+              onValueChange={(v) => {
+                if (v === 'all') clearFieldError('services')
+                setBackupMode(v as 'all' | 'specific')
+              }}
               className="gap-4"
             >
               <div className="flex items-start space-x-3 space-y-0">
@@ -379,13 +447,34 @@ export function CreateBackupSchedule() {
               </div>
             </RadioGroup>
             {backupMode === 'specific' && (
-              <div className="mt-2 rounded-md border p-2">
+              <div
+                id="schedule-services"
+                role="group"
+                aria-label="Databases to back up"
+                aria-invalid={fieldErrors.services ? true : undefined}
+                aria-describedby={
+                  fieldErrors.services ? 'schedule-services-error' : undefined
+                }
+                tabIndex={-1}
+                className="mt-2 rounded-md border p-2 aria-invalid:border-destructive"
+              >
                 <ScheduleServicesSelector
                   value={selectedServiceIds}
-                  onChange={setSelectedServiceIds}
+                  onChange={(next) => {
+                    clearFieldError('services')
+                    setSelectedServiceIds(next)
+                  }}
                   disabled={createMutation.isPending}
                 />
               </div>
+            )}
+            {backupMode === 'specific' && fieldErrors.services && (
+              <p
+                id="schedule-services-error"
+                className="text-sm font-medium text-destructive"
+              >
+                {fieldErrors.services}
+              </p>
             )}
             <div className="mt-3 flex items-start justify-between gap-3 rounded-md border p-3">
               <div className="grid gap-1 leading-tight">
@@ -419,7 +508,12 @@ export function CreateBackupSchedule() {
               step={1}
               placeholder="auto"
               value={form.max_runtime_hours ?? ''}
+              aria-invalid={fieldErrors.maxRuntime ? true : undefined}
+              aria-describedby={
+                fieldErrors.maxRuntime ? 'max-runtime-error' : undefined
+              }
               onChange={(e) => {
+                clearFieldError('maxRuntime')
                 const raw = e.target.value
                 setForm({
                   ...form,
@@ -427,6 +521,14 @@ export function CreateBackupSchedule() {
                 })
               }}
             />
+            {fieldErrors.maxRuntime && (
+              <p
+                id="max-runtime-error"
+                className="text-sm font-medium text-destructive"
+              >
+                {fieldErrors.maxRuntime}
+              </p>
+            )}
             <p className="text-xs text-muted-foreground">
               Wall-clock ceiling for one backup attempt. Leave empty to use the
               engine default (24h for Postgres, 4h for Redis/MongoDB, 12h for S3

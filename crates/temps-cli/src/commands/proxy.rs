@@ -200,8 +200,9 @@ pub struct ProxyCommand {
 /// standalone proxy has no plugin registry — the mechanism every other
 /// process uses to install a gate — but it *does* have the same database,
 /// so there is no structural reason it must under-enforce. A binary that
-/// knows how to build a gate passes one here; `execute` passes none and
-/// gets [`temps_core::OpenIpGate`].
+/// knows how to build a gate (e.g. one with its own policy templates) passes
+/// one here; `execute` passes none and gets the built-in per-project /
+/// per-environment allow/deny list gate.
 ///
 /// The runtime handle is part of the contract rather than an implementation
 /// detail: pingora owns the process runtime once the proxy starts, so a gate
@@ -318,7 +319,14 @@ impl ProxyCommand {
                 debug!("proxy: enforcing project IP rules via a caller-supplied gate");
                 gate
             }
-            None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+            // OSS default: the built-in per-project / per-environment allow
+            // and deny lists, hydrated before traffic is accepted.
+            None => {
+                temps_proxy::ip_access::ProjectIpAccessGate::start_blocking(db.clone(), rt.handle())
+                    .map_err(|error| {
+                        anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+                    })? as Arc<dyn temps_core::ProjectIpGate>
+            }
         };
         let request_policy_gate = match request_policy_gate_builder {
             Some(build) => build(db.clone(), rt.handle())?,
@@ -725,8 +733,9 @@ impl ProxyCommand {
             // proxy_logs_days`, refreshed in the background on `rt`.
             settings_retention,
             // Supplied by the caller when the embedding binary knows how to
-            // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
-            // which is what the plain `temps proxy` entrypoint passes.
+            // build one; the built-in per-project / per-environment allow and
+            // deny list gate otherwise, which is what the plain `temps proxy`
+            // entrypoint gets.
             project_ip_gate,
             request_policy_gate,
         ) {

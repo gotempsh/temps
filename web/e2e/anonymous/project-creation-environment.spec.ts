@@ -89,7 +89,9 @@ test('renders backend-managed and selected-database variables without a false em
   })
 
   await page.goto('/projects/new?source=manual')
-  await expect(page.getByRole('heading', { name: 'New Project' })).toBeVisible()
+  await expect(
+    page.getByRole('heading', { name: 'New service', exact: true })
+  ).toBeVisible()
   try {
     await expect(page.getByLabel('Loading databases')).toBeVisible()
     await expect(page.getByText('No databases configured yet')).toHaveCount(0)

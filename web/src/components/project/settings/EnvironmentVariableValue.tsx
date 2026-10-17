@@ -68,6 +68,7 @@ export function EnvironmentVariableValue({
           </DialogDescription>
         </DialogHeader>
         <pre
+          role="region"
           ref={valueRef}
           tabIndex={0}
           aria-label="Full value"

@@ -96,6 +96,21 @@ interface DeployOptions {
   yes?: boolean
 }
 
+/**
+ * Whether the server can deploy this git-sourced project from its
+ * repository: through a provider connection, or, for a public repository,
+ * by cloning its URL anonymously (no connection needed).
+ */
+export function deploysFromGit(project: {
+  git_provider_connection_id?: number | null
+  is_public_repo?: boolean | null
+  git_url?: string | null
+}): boolean {
+  return (
+    !!project.git_provider_connection_id || (!!project.is_public_repo && !!project.git_url)
+  )
+}
+
 export async function deploy(options: DeployOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -158,7 +173,7 @@ export async function deploy(options: DeployOptions): Promise<void> {
   // Check source type — delegate to appropriate deploy method
   const sourceType = project.source_type
   const isGitBased = sourceType === 'git'
-  const hasGitConnection = isGitBased && !!project.git_provider_connection_id
+  const hasGitConnection = isGitBased && deploysFromGit(project)
 
   if (sourceType === 'static_files') {
     info(`Project uses static files deployment`)
@@ -314,7 +329,13 @@ export async function deploy(options: DeployOptions): Promise<void> {
 
   // Select commit — resolve from flag, interactive picker, or skip (deploy HEAD)
   let commit = options.commit
-  if (!commit && !options.yes && project.repo_owner && project.repo_name) {
+  if (
+    !commit &&
+    !options.yes &&
+    project.git_provider_connection_id &&
+    project.repo_owner &&
+    project.repo_name
+  ) {
     // Try to fetch recent commits so the user can pick one
     const repositoryId = await getRepositoryId(
       project.repo_owner,

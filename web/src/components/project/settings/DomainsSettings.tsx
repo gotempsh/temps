@@ -10,16 +10,7 @@ import {
   deleteCustomDomainMutation,
   listCustomDomainsForProjectOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -44,7 +35,7 @@ import { KbdBadge } from '@/components/ui/kbd-badge'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
 import { AddDomainDialog } from './AddDomainDialog'
 import { EditDomainDialog } from './EditDomainDialog'
@@ -59,7 +50,8 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
   const [editingDomain, setEditingDomain] = useState<
     CustomDomainResponse | undefined
   >()
-  const [domainToDelete, setDomainToDelete] = useState<number | null>(null)
+  const [domainToDelete, setDomainToDelete] =
+    useState<CustomDomainResponse | null>(null)
   const [deliveryOpen, setDeliveryOpen] = useState(false)
   // Bumped per opening so the always-mounted dialog starts from a fresh form
   // and preview for each target, without conditional mounting.
@@ -127,10 +119,6 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       },
     })
   }
-  const deleteDialogOpen = useMemo(
-    () => domainToDelete !== null,
-    [domainToDelete]
-  )
   return (
     <div className="space-y-6">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -144,7 +132,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       </div>
 
       <p className="text-sm text-muted-foreground mb-6">
-        Configure domains for your project. Each domain can be assigned to a
+        Configure domains for your service. Each domain can be assigned to a
         specific environment and optionally set up with redirects.
       </p>
 
@@ -213,7 +201,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     className="text-destructive"
-                    onClick={() => setDomainToDelete(domain.id)}
+                    onClick={() => setDomainToDelete(domain)}
                   >
                     Delete
                   </DropdownMenuItem>
@@ -287,31 +275,19 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         onSuccess={handleEditSuccess}
       />
 
-      <AlertDialog
-        open={deleteDialogOpen}
-        onOpenChange={(open) => !open && setDomainToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              domain from your project.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (domainToDelete) handleDelete(domainToDelete)
-                setDomainToDelete(null)
-              }}
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={domainToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="custom domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences={`Requests to this domain stop reaching ${project.slug}, and any delivery bindings and redirects configured on it are removed.`}
+        onConfirm={() => {
+          if (domainToDelete) handleDelete(domainToDelete.id)
+          setDomainToDelete(null)
+        }}
+      />
     </div>
   )
 }

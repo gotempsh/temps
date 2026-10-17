@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Component, Path};
 
 use crate::BuildResult;
@@ -41,11 +42,43 @@ pub const MAX_BUILD_ARG_VALUE_BYTES: usize = 32 * 1024;
 /// for the rest of the spec (and JSON escaping) under [`MAX_BUILD_SPEC_BYTES`].
 pub const MAX_BUILD_ARGS_BYTES: usize = 128 * 1024;
 
+/// Operator settings persisted on each node. These are control-plane operations,
+/// independent of the proxy request path. Existing agents keep their fixed limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct BuildLimits {
+    pub concurrency: u16,
+    pub queue_wait_seconds: u32,
+    pub build_timeout_seconds: u32,
+}
+
+impl Default for BuildLimits {
+    fn default() -> Self {
+        Self {
+            concurrency: 1,
+            queue_wait_seconds: 300,
+            build_timeout_seconds: 1800,
+        }
+    }
+}
+
+impl BuildLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=32).contains(&self.concurrency)
+            || !(1..=1800).contains(&self.queue_wait_seconds)
+            || !(1..=14400).contains(&self.build_timeout_seconds)
+        {
+            return Err("Builder limits require concurrency 1–32, queue wait 1–1800 seconds and build timeout 1–14400 seconds".into());
+        }
+        Ok(())
+    }
+}
+
 /// Paths are relative to the root of the tar archive.
 ///
 /// Deliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,
 /// and a stray `{:?}` must not be able to put them in a log.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BuildSpec {
     pub version: u16,
     pub image_name: String,
@@ -432,6 +465,113 @@ pub enum BuildFailureKind {
     Worker,
 }
 
+pub fn safe_extract_context(
+    archive: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive)
+        .map_err(|error| format!("Cannot open uploaded build context: {error}"))?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("Cannot read build context archive: {error}"))?;
+    let mut total_size = 0_u64;
+    let mut count = 0_usize;
+    for entry in entries {
+        count += 1;
+        if count > MAX_BUILD_CONTEXT_ENTRIES {
+            return Err(format!(
+                "Build context exceeds the {MAX_BUILD_CONTEXT_ENTRIES}-entry limit"
+            ));
+        }
+        let mut entry = entry.map_err(|error| format!("Invalid build context entry: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("Invalid build context path: {error}"))?
+            .into_owned();
+        validate_archive_path(&path)?;
+        if path.components().any(|part| part.as_os_str() == ".git") {
+            return Err("Build context must not contain a .git directory".to_string());
+        }
+        let output = destination.join(&path);
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            std::fs::create_dir_all(&output).map_err(|error| {
+                format!(
+                    "Cannot create build context directory '{}': {error}",
+                    path.display()
+                )
+            })?;
+        } else if kind.is_file() {
+            let size = entry
+                .header()
+                .size()
+                .map_err(|error| format!("Invalid build context entry size: {error}"))?;
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| "Build context size overflowed".to_string())?;
+            if total_size > MAX_BUILD_CONTEXT_BYTES {
+                return Err(format!(
+                    "Extracted build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"
+                ));
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Cannot create build context parent '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            }
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .map_err(|error| {
+                    format!(
+                        "Cannot create build context file '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            std::io::copy(&mut entry, &mut target).map_err(|error| {
+                format!(
+                    "Cannot extract build context file '{}': {error}",
+                    path.display()
+                )
+            })?;
+            target.flush().map_err(|error| {
+                format!(
+                    "Cannot flush build context file '{}': {error}",
+                    path.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry
+                    .header()
+                    .mode()
+                    .map_err(|error| format!("Invalid mode for '{}': {error}", path.display()))?;
+                // Preserve executable source scripts, but never setuid/setgid.
+                target
+                    .set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+                    .map_err(|error| {
+                        format!(
+                            "Cannot set source permissions for '{}': {error}",
+                            path.display()
+                        )
+                    })?;
+            }
+        } else {
+            return Err(format!(
+                "Build context entry '{}' is not a regular file or directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -690,5 +830,45 @@ mod tests {
             serde_json::from_slice::<BuildEvent>(&encoded).expect("deserialize event"),
             BuildEvent::Failure(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod build_limit_tests {
+    use super::BuildLimits;
+    #[test]
+    fn builder_limits_reject_zero_and_values_beyond_resource_bounds() {
+        assert!(BuildLimits::default().validate().is_ok());
+        for concurrency in [0, 33, u16::MAX] {
+            assert!(BuildLimits {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for queue_wait_seconds in [0, 1801, u32::MAX] {
+            assert!(BuildLimits {
+                queue_wait_seconds,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for build_timeout_seconds in [0, 14401, u32::MAX] {
+            assert!(BuildLimits {
+                build_timeout_seconds,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(BuildLimits {
+            concurrency: 32,
+            queue_wait_seconds: 1800,
+            build_timeout_seconds: 14400
+        }
+        .validate()
+        .is_ok());
     }
 }

@@ -16,8 +16,8 @@
 //! The four sources are merged with a single `UNION ALL` statement so the
 //! result can be ordered and paginated in the database (`created_at DESC`,
 //! then the stable entry id). Rows are restricted to a recency window
-//! ([`OPERATIONS_RECENCY_WINDOW_DAYS`]) plus anything still active, which keeps
-//! the union small no matter how much history the instance has.
+//! ([`OPERATIONS_RECENCY_WINDOW_DAYS`]) plus active work and pending reviews,
+//! which bounds terminal history regardless of how long the instance has run.
 //!
 //! Every user-controlled value (window start, project ids, hidden project ids,
 //! kind, limit, offset) is a bound parameter. The only text interpolated into
@@ -33,8 +33,8 @@ use tracing::error;
 use utoipa::ToSchema;
 
 /// Finished operations older than this are left out of the feed. Anything
-/// still active is always included, however old, so a stuck operation can't
-/// silently drop out of view.
+/// still active or awaiting review is always included, however old, so work
+/// cannot silently drop out of view.
 pub const OPERATIONS_RECENCY_WINDOW_DAYS: i64 = 7;
 
 /// Default page size for `GET /operations`.
@@ -131,10 +131,13 @@ impl OperationStatus {
 
     /// Whether the operation is still in flight (counts toward `running_count`).
     pub const fn is_active(self) -> bool {
-        matches!(
-            self,
-            OperationStatus::Queued | OperationStatus::Running | OperationStatus::Waiting
-        )
+        matches!(self, OperationStatus::Queued | OperationStatus::Running)
+    }
+
+    /// Whether the operation has reached a terminal outcome. Waiting for review
+    /// is neither active computation nor finished work.
+    pub const fn is_finished(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 
     fn parse(value: &str) -> Option<Self> {
@@ -158,8 +161,10 @@ const ALL_STATUSES: [OperationStatus; 6] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperationStatusFilter {
-    /// Queued, running and waiting operations.
+    /// Queued and running operations.
     Running,
+    /// Operations paused for human review.
+    Waiting,
     /// Succeeded, failed and cancelled operations.
     Finished,
     /// Everything in the window.
@@ -274,11 +279,11 @@ impl StateMap {
         sql
     }
 
-    /// `'pending', 'running', ...` — the raw states that are still active.
-    fn active_states_sql(&self) -> String {
+    /// Raw states retained regardless of age: active work and human review.
+    fn unfinished_states_sql(&self) -> String {
         self.entries
             .iter()
-            .filter(|(_, status)| status.is_active())
+            .filter(|(_, status)| !status.is_finished())
             .map(|(state, _)| format!("'{state}'"))
             .collect::<Vec<_>>()
             .join(", ")
@@ -572,14 +577,19 @@ pub(crate) fn build_operations_query(
 
     let status_filter = match query.status {
         OperationStatusFilter::All => "TRUE".to_string(),
-        OperationStatusFilter::Running => format!("status IN ({})", statuses_sql(true)),
-        OperationStatusFilter::Finished => format!("status IN ({})", statuses_sql(false)),
+        OperationStatusFilter::Running => {
+            format!("status IN ({})", statuses_sql(OperationStatus::is_active))
+        }
+        OperationStatusFilter::Waiting => "status = 'waiting'".to_string(),
+        OperationStatusFilter::Finished => {
+            format!("status IN ({})", statuses_sql(OperationStatus::is_finished))
+        }
     };
 
     let count_sql = format!(
         "{cte} SELECT COUNT(*) FILTER (WHERE {status_filter}) AS total, \
          COUNT(*) FILTER (WHERE status IN ({})) AS running_count FROM ops",
-        statuses_sql(true)
+        statuses_sql(OperationStatus::is_active)
     );
     let count_values = params.values.clone();
 
@@ -615,10 +625,10 @@ fn included_sources(
     .collect()
 }
 
-fn statuses_sql(active: bool) -> String {
+fn statuses_sql(predicate: fn(OperationStatus) -> bool) -> String {
     ALL_STATUSES
         .iter()
-        .filter(|status| status.is_active() == active)
+        .filter(|status| predicate(**status))
         .map(|status| format!("'{}'", status.as_str()))
         .collect::<Vec<_>>()
         .join(", ")
@@ -762,7 +772,7 @@ fn deployments_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
         format!("CASE WHEN ({status}) IN ('failed', 'cancelled') THEN d.cancelled_reason END");
     let base = vec![format!(
         "(d.created_at >= {window} OR d.state IN ({}))",
-        DEPLOYMENT_STATES.active_states_sql()
+        DEPLOYMENT_STATES.unfinished_states_sql()
     )];
     format!(
         "SELECT 'deployment:' || d.id::text AS op_id, {DEPLOYMENT_KIND_SQL} AS kind, \
@@ -800,7 +810,7 @@ fn restore_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
     let status = RESTORE_STATES.case_sql("r.status");
     let base = vec![format!(
         "(r.created_at >= {window} OR r.status IN ({}))",
-        RESTORE_STATES.active_states_sql()
+        RESTORE_STATES.unfinished_states_sql()
     )];
     format!(
         "SELECT 'restore:' || r.id::text AS op_id, 'restore' AS kind, {status} AS status, \
@@ -840,7 +850,7 @@ fn backups_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
     let status = BACKUP_STATES.case_sql("b.state");
     let base = vec![format!(
         "(b.started_at >= {window} OR b.state IN ({}))",
-        BACKUP_STATES.active_states_sql()
+        BACKUP_STATES.unfinished_states_sql()
     )];
     format!(
         "SELECT 'backup:' || b.id::text AS op_id, 'backup' AS kind, {status} AS status, \
@@ -879,7 +889,7 @@ fn autofix_branch(window: &str, filters: &ProjectFilters<'_>) -> String {
         "ar.trigger_type = 'autofixer'".to_string(),
         format!(
             "(ar.created_at >= {window} OR ar.status IN ({}))",
-            AUTOFIX_STATES.active_states_sql()
+            AUTOFIX_STATES.unfinished_states_sql()
         ),
     ];
     format!(
@@ -1313,6 +1323,26 @@ mod tests {
     }
 
     #[test]
+    fn review_is_neither_active_nor_finished() {
+        for raw in ["analyzed", "fix_ready"] {
+            let status = map_autofix_status(raw);
+            assert_eq!(status, OperationStatus::Waiting);
+            assert!(!status.is_active(), "{raw} must not count as running");
+            assert!(!status.is_finished(), "{raw} still needs human action");
+        }
+        assert!(OperationStatus::Queued.is_active());
+        assert!(OperationStatus::Running.is_active());
+        for status in [
+            OperationStatus::Succeeded,
+            OperationStatus::Failed,
+            OperationStatus::Cancelled,
+        ] {
+            assert!(status.is_finished());
+            assert!(!status.is_active());
+        }
+    }
+
+    #[test]
     fn unknown_states_fall_back_to_a_terminal_status() {
         // A terminal fallback keeps an unrecognised state from inflating the
         // running count or escaping the recency window.
@@ -1574,7 +1604,23 @@ mod tests {
             None,
         );
         let sql = built(&running, &OperationsScope::Instance, all_access()).page_sql;
-        assert!(sql.contains("WHERE status IN ('queued', 'running', 'waiting')"));
+        assert!(sql.contains("WHERE status IN ('queued', 'running')"));
+
+        let waiting = OperationsQuery::normalize(
+            None,
+            None,
+            Some(OperationStatusFilter::Waiting),
+            None,
+            None,
+        );
+        let query = built(&waiting, &OperationsScope::Instance, all_access());
+        assert!(query.page_sql.contains("WHERE status = 'waiting'"));
+        assert!(query
+            .count_sql
+            .contains("COUNT(*) FILTER (WHERE status = 'waiting') AS total"));
+        assert!(query
+            .count_sql
+            .contains("COUNT(*) FILTER (WHERE status IN ('queued', 'running')) AS running_count"));
 
         let finished = OperationsQuery::normalize(
             None,
@@ -1970,8 +2016,8 @@ mod tests {
             "newest first; hidden project, control-plane backup and stale rows excluded"
         );
         assert_eq!(page.total, 5);
-        // rollback (running), restore (running), autofix (waiting)
-        assert_eq!(page.running_count, 3);
+        // Review is visible but only rollback and restore are running.
+        assert_eq!(page.running_count, 2);
 
         let rollback_entry = &page.operations[1];
         assert_eq!(rollback_entry.kind, OperationKind::Rollback);
@@ -2026,8 +2072,8 @@ mod tests {
             )
             .await
             .expect("running filter");
-        assert_eq!(running.total, 3);
-        assert_eq!(running.running_count, 3);
+        assert_eq!(running.total, 2);
+        assert_eq!(running.running_count, 2);
 
         // An instance administrator also sees the hidden project and the
         // control-plane backup.
@@ -2036,7 +2082,7 @@ mod tests {
             .await
             .expect("admin list");
         assert_eq!(admin.total, 7);
-        assert_eq!(admin.running_count, 5);
+        assert_eq!(admin.running_count, 4);
 
         // Hiding the project the service is linked to hides its rows too.
         let hide_visible = OperationsScope::Projects {
@@ -2048,6 +2094,109 @@ mod tests {
             .expect("other list");
         assert_eq!(other.total, 1);
         assert_eq!(other.operations[0].project_id, Some(hidden));
+    }
+
+    #[tokio::test]
+    async fn old_autofix_reviews_stay_visible_without_counting_as_running() {
+        use sea_orm::{ActiveModelTrait, ConnectionTrait, Set};
+        use temps_entities::projects;
+
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let db = test_db.db.clone();
+        let project = projects::ActiveModel {
+            name: Set("review-app".to_string()),
+            slug: Set("review-app".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_presets::PresetType::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let old = Utc::now() - Duration::days(84);
+        let insert = "INSERT INTO agent_runs (project_id, trigger_type, status, created_at) \
+                      VALUES ($1, 'autofixer', $2, $3) RETURNING id";
+        let mut review_ids = Vec::new();
+        for status in ["analyzed", "fix_ready"] {
+            let id = exec(
+                &db,
+                insert,
+                vec![project.id.into(), status.into(), old.into()],
+            )
+            .await;
+            review_ids.push(format!("autofix:{id}"));
+        }
+        // Terminal history ages out; queued and computing work still counts.
+        exec(
+            &db,
+            insert,
+            vec![project.id.into(), "completed".into(), old.into()],
+        )
+        .await;
+        let service = OperationsService::new(db.clone());
+        let scope = OperationsScope::SingleProject {
+            project_id: project.id,
+        };
+        let query = |status| OperationsQuery::normalize(None, None, Some(status), None, None);
+        let waiting = service
+            .list_operations(&query(OperationStatusFilter::Waiting), &scope, all_access())
+            .await
+            .expect("list old reviews");
+        assert_eq!(waiting.total, 2);
+        assert_eq!(waiting.running_count, 0);
+        for op in &waiting.operations {
+            assert!(review_ids.contains(&op.id));
+            assert_eq!(op.status, OperationStatus::Waiting);
+            assert!(
+                op.link.starts_with("/projects/review-app/agents/"),
+                "review must be actionable: {}",
+                op.link
+            );
+        }
+        for status in [
+            OperationStatusFilter::Running,
+            OperationStatusFilter::Finished,
+        ] {
+            let page = service
+                .list_operations(&query(status), &scope, all_access())
+                .await
+                .expect("list filtered feed");
+            assert_eq!(page.total, 0);
+            assert_eq!(page.running_count, 0);
+        }
+        for status in ["pending", "analyzing"] {
+            exec(
+                &db,
+                insert,
+                vec![project.id.into(), status.into(), old.into()],
+            )
+            .await;
+        }
+        let running = service
+            .list_operations(&query(OperationStatusFilter::Running), &scope, all_access())
+            .await
+            .expect("list active work");
+        assert_eq!(running.total, 2);
+        assert_eq!(running.running_count, 2);
+        // Resuming a reviewed run moves it back into the running feed.
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "UPDATE agent_runs SET status = 'fixing' WHERE project_id = $1 AND status = 'analyzed'",
+            vec![project.id.into()],
+        ))
+        .await
+        .expect("resume review");
+        let waiting = service
+            .list_operations(&query(OperationStatusFilter::Waiting), &scope, all_access())
+            .await
+            .expect("list remaining review");
+        assert_eq!(waiting.total, 1);
+        assert_eq!(waiting.running_count, 3);
     }
 
     /// A restore is scoped by the service it restores *and* by the backup it

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { getSettings, updateSettings } from '@/api/client'
+import { errorWithStatus } from '@/lib/http-error-status'
 import type {
   AppSettings,
   AppSettingsResponse,
@@ -165,6 +166,27 @@ export interface ObservabilityRetentionSettings {
 }
 
 /**
+ * How long analytics data and the identifiers attached to it are kept.
+ *
+ * `events_days` always has a window (the console cannot switch it off); the
+ * other three are `null` for "keep", which is the explicit way to opt out of a
+ * cleanup. The server rejects out-of-range values with a 400 naming the field.
+ */
+export interface AnalyticsRetentionSettings {
+  /** Page views and custom events, in days (1–3650). */
+  events_days: number
+  /** Error-tracking events, in days; null keeps them. */
+  error_events_days: number | null
+  /** Visitors not seen for this many days are deleted; null keeps them. */
+  visitor_days: number | null
+  /**
+   * Stored IP addresses nothing references any more are deleted after this
+   * many days; null keeps them.
+   */
+  unreferenced_ip_days: number | null
+}
+
+/**
  * Geolocation database settings.
  *
  * Mirrors the Rust `GeoSettingsMasked` response / `GeoSettings` request. The
@@ -224,6 +246,7 @@ export interface PlatformSettings extends AppSettingsResponse {
   monitored_services_count: number | null
   observability_compression: ObservabilityCompressionSettings
   observability_retention: ObservabilityRetentionSettings
+  analytics_retention: AnalyticsRetentionSettings
   container_logs: ContainerLogSettings
   /** Geolocation refresh policy, with the MaxMind key masked to a boolean. */
   geo: GeoSettings
@@ -251,7 +274,15 @@ export async function getPlatformSettings(): Promise<PlatformSettings> {
   const response = await getSettings()
 
   if (!response.data) {
-    throw new Error('Settings endpoint returned no data')
+    // Keep the HTTP status and the server's reason: a refused read must not
+    // look like an empty answer, nor be retried as one.
+    const detail = (response.error as { detail?: unknown } | undefined)?.detail
+    throw errorWithStatus(
+      typeof detail === 'string' && detail
+        ? detail
+        : 'Settings endpoint returned no data',
+      response.error
+    )
   }
 
   // OpenAPI represents Rust `Option<T>` response fields as optional, while the
@@ -353,6 +384,9 @@ export function buildPlatformSettingsUpdateBody(
     monitoring: updated.monitoring,
     observability_compression: updated.observability_compression,
     observability_retention: updated.observability_retention,
+    // Same reasoning: omitting this would reset the analytics windows -- and
+    // turn a configured "keep" (null) back into a default cleanup window.
+    analytics_retention: updated.analytics_retention,
     // Same reasoning: omitting this would reset Docker log rotation and the
     // collected-log cache/head budgets to defaults on every unrelated save.
     container_logs: updated.container_logs,

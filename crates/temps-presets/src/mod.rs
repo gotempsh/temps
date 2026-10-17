@@ -8,6 +8,7 @@ mod autopack_preset;
 mod build_system;
 mod compiled_workspace;
 mod docker;
+pub mod compose_check;
 pub mod docker_compose;
 mod docker_custom;
 pub mod dockerfile_expose;

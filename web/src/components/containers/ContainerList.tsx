@@ -165,7 +165,7 @@ function ContainerRow({
             {statusText}
           </span>
         </div>
-        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-500 dark:text-neutral-400">
+        <div className="mt-1 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-neutral-600 dark:text-neutral-400">
           <code className="font-mono truncate max-w-[24rem]">
             {container.image_name}
           </code>
@@ -243,7 +243,7 @@ function ContainerRow({
             <button
               type="button"
               aria-label="Container actions"
-              className="inline-flex size-8 items-center justify-center rounded-md text-neutral-500 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
+              className="inline-flex size-8 items-center justify-center rounded-md text-neutral-600 hover:bg-neutral-100 hover:text-neutral-900 dark:text-neutral-400 dark:hover:bg-white/10 dark:hover:text-white"
             >
               <MoreHorizontal className="size-4" aria-hidden="true" />
             </button>
@@ -258,7 +258,7 @@ function ContainerRow({
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onSelect={() => onAction?.('stop')}
-                  className="text-red-600 focus:text-red-600 dark:text-red-400 dark:focus:text-red-400"
+                  className="text-red-700 focus:text-red-600 dark:text-red-400 dark:focus:text-red-400"
                 >
                   <Square className="mr-2 size-4" aria-hidden="true" />
                   Stop

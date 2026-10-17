@@ -17,14 +17,14 @@ import { Globe2, ShieldAlert } from 'lucide-react'
 
 const ROLE_SCOPE = {
   user: {
-    title: 'All-project access',
+    title: 'All-service access',
     description:
-      'Can access every existing project and every project created later. Project access is not limited to selected projects.',
+      'Can access every existing service and every service created later. Service access is not limited to selected services.',
   },
   admin: {
     title: 'Full platform control',
     description:
-      'Can manage all projects, users, roles, settings, and system resources, including destructive operations.',
+      'Can manage all services, users, roles, settings, and system resources, including destructive operations.',
   },
 } as const
 

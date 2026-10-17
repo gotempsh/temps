@@ -9,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamRole } from '@/api/client'
 import { RolePermissionDetails } from '@/components/users/RolePermissionDetails'
+import { TeamFieldHint } from '@/components/users/TeamFieldHint'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -61,6 +62,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 
 const createUserSchema = z.object({
   name: z.string().min(3, 'Name must be at least 3 characters'),
@@ -79,13 +81,13 @@ const ROLE_OPTIONS = [
     value: 'user' as const,
     label: 'User',
     description:
-      'Can deploy and operate every existing and future project, but cannot manage users or system settings.',
+      'Can deploy and operate every existing and future service, but cannot manage users or system settings.',
   },
   {
     value: 'admin' as const,
     label: 'Administrator',
     description:
-      'Full control of projects, users, roles, settings, and system resources.',
+      'Full control of services, users, roles, settings, and system resources.',
   },
 ]
 
@@ -94,21 +96,21 @@ const TEAM_ROLE_OPTIONS: Array<{
   label: string
   description: string
 }> = [
-  { value: 'viewer', label: 'Viewer', description: 'Can view team projects.' },
+  { value: 'viewer', label: 'Viewer', description: 'Can view team services.' },
   {
     value: 'deployer',
     label: 'Deployer',
-    description: 'Can view and deploy team projects.',
+    description: 'Can view and deploy team services.',
   },
   {
     value: 'admin',
     label: 'Team admin',
-    description: 'Can operate projects and manage team members.',
+    description: 'Can operate services and manage team members.',
   },
   {
     value: 'owner',
     label: 'Team owner',
-    description: 'Full control of the team and its project access.',
+    description: 'Full control of the team and its service access.',
   },
 ]
 
@@ -141,6 +143,14 @@ export function CreateUser() {
   const teamsQuery = useQuery(
     listTeamsOptions({ query: { page: 1, page_size: 100 } })
   )
+
+  const teamsStatus = teamsQuery.isPending
+    ? 'pending'
+    : teamsQuery.isError
+      ? 'error'
+      : teamsQuery.data?.teams.length
+        ? 'available'
+        : 'empty'
 
   const form = useForm<CreateUserFormData>({
     resolver: zodResolver(createUserSchema),
@@ -205,15 +215,23 @@ export function CreateUser() {
     pendingTeamAssignment.current = data.teamId
       ? { teamId: Number(data.teamId), role: data.teamRole }
       : null
-    await createUser.mutateAsync({
-      body: {
-        username: data.name,
-        email: data.email,
-        password: data.password,
-        roles: [data.role],
-        must_change_password: data.mustChangePassword,
-      },
-    })
+    try {
+      await createUser.mutateAsync({
+        body: {
+          username: data.name,
+          email: data.email,
+          password: data.password,
+          roles: [data.role],
+          must_change_password: data.mustChangePassword,
+        },
+      })
+    } catch (error) {
+      // The mutation's error handler already shows the failure toast with the
+      // server's reason. Letting the rejection reach react-hook-form's submit
+      // handler would also surface it as an unhandled rejection, thrown as a
+      // bare object with no message or stack.
+      reportSubmitFailure(error)
+    }
   }
 
   const retryTeamAssignment = async () => {
@@ -506,16 +524,13 @@ export function CreateUser() {
                             ))}
                           </SelectContent>
                         </Select>
-                        <FormDescription>
-                          Optional. Adds the user to the selected team after
-                          creating their account.
+                        <FormDescription
+                          className={
+                            teamsQuery.isError ? 'text-destructive' : undefined
+                          }
+                        >
+                          <TeamFieldHint status={teamsStatus} />
                         </FormDescription>
-                        {teamsQuery.isError && (
-                          <p className="text-sm text-destructive">
-                            Teams could not be loaded. You can still create the
-                            user and add them from the Teams page later.
-                          </p>
-                        )}
                         <FormMessage />
                       </FormItem>
                     )}
@@ -561,7 +576,7 @@ export function CreateUser() {
                 {selectedTeamId && (
                   <div className="rounded-lg border border-border/60 bg-muted/40 p-4 text-sm text-muted-foreground">
                     Team membership and the platform role are separate. A User
-                    still has all-project access from their platform role;
+                    still has all-service access from their platform role;
                     joining a team does not narrow those permissions.
                   </div>
                 )}

@@ -364,7 +364,7 @@ export function EnvironmentConfigurationCard({
           ? parseInt(formData.websocket_idle_timeout_seconds)
           : null,
         // Same semantics as the timeout overrides above: empty string clears
-        // the override (inherit project/global default, itself unlimited by
+        // the override (inherit service/global default, itself unlimited by
         // default), "0" is a valid, distinct override meaning "explicitly
         // unlimited for this environment."
         max_concurrent_connections: formData.max_concurrent_connections
@@ -388,7 +388,7 @@ export function EnvironmentConfigurationCard({
     <form onSubmit={handleSubmit}>
       <div className="space-y-3">
         {/* Git Configuration Section — only for projects that deploy from
-                Git. A static-files, uploaded-source or Docker-image project has
+                Git. A static-files, uploaded-source or Docker-image service has
                 no branch to deploy from and no repository to push to, so both
                 controls here are inapplicable rather than unconfigured. */}
         {hasGitRepo && (
@@ -415,13 +415,19 @@ export function EnvironmentConfigurationCard({
             {/* Deploy on push toggle */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Deploy on push</Label>
+                <Label
+                  htmlFor="env-automatic-deploy"
+                  className="text-sm font-medium"
+                >
+                  Deploy on push
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically deploy when a commit is pushed to this branch.
                   Disable to deploy on demand only.
                 </p>
               </div>
               <Switch
+                id="env-automatic-deploy"
                 checked={formData.automatic_deploy}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -567,7 +573,7 @@ export function EnvironmentConfigurationCard({
                   />
                   <p className="text-xs text-muted-foreground mt-1">
                     Maximum memory allocation. Leave empty to inherit the
-                    project/default limit, or set <code>0</code> (
+                    service/default limit, or set <code>0</code> (
                     <strong>Uncapped</strong>) to run with no memory limit.
                   </p>
                 </div>
@@ -609,13 +615,16 @@ export function EnvironmentConfigurationCard({
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Enable On-Demand</Label>
+                <Label htmlFor="env-on-demand" className="text-sm font-medium">
+                  Enable On-Demand
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Automatically stop containers after idle timeout and restart
                   on the next request.
                 </p>
               </div>
               <Switch
+                id="env-on-demand"
                 checked={formData.on_demand}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -669,7 +678,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 {environment.sleeping && (
-                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-600 dark:text-yellow-400 text-xs">
+                  <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-700 dark:text-yellow-400 text-xs">
                     <Moon className="h-3.5 w-3.5" />
                     This environment is currently sleeping. It will wake on the
                     next request.
@@ -684,7 +693,7 @@ export function EnvironmentConfigurationCard({
         <SettingsSection title="Request timeouts" icon={Clock}>
           <p className="text-xs text-muted-foreground mb-4">
             Override the global request timeout defaults for this environment.
-            Leave blank to inherit the project/global default (no timeout,
+            Leave blank to inherit the service/global default (no timeout,
             unless an operator configured one). Enter 0 to explicitly force no
             timeout for this environment. Nonzero values are always clamped
             server-side to the operator&apos;s global hard ceiling.
@@ -748,7 +757,7 @@ export function EnvironmentConfigurationCard({
             upstream. Protects the proxy&apos;s own connection budget from a
             stalled or malicious app — mainly relevant when this environment
             shares a node with other tenants. Leave blank to inherit the
-            project/global default (unlimited, unless an operator configured
+            service/global default (unlimited, unless an operator configured
             one). Enter 0 to explicitly force unlimited for this environment.
             Requests over the limit get an immediate 503 instead of queuing.
           </p>
@@ -811,6 +820,7 @@ export function EnvironmentConfigurationCard({
                   <SelectItem value="node">
                     {BUILD_LOCATION_LABELS.node}
                   </SelectItem>
+                  <SelectItem value="ci">{BUILD_LOCATION_LABELS.ci}</SelectItem>
                 </SelectContent>
               </Select>
             </div>
@@ -818,22 +828,31 @@ export function EnvironmentConfigurationCard({
               A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
               <code>temps.sh/role=dedicated</code> node builds only for
               environments that select it in Target Nodes. When no worker can
-              take a build (none joined, none of the right architecture,
-              multi-architecture builds), it runs on the control plane and the
-              build log says why. Worker builds do not receive build arguments.
+              take a build, it runs on the control plane when local builds are
+              enabled, and the build log says why. CI uses the configured GitHub
+              Actions runner and never falls back locally.{' '}
+              <Link to="/settings/nodes#ci-builder" className="underline">
+                Configure CI builder
+              </Link>
+              .
             </p>
-            {nodesQuery.isSuccess && activeNodes.length === 0 && (
-              <p className="text-xs text-muted-foreground">
-                No worker node is active yet, so builds run on the control
-                plane.{' '}
-                <Link
-                  to="/settings/nodes"
-                  className="underline underline-offset-2"
-                >
-                  Add a worker node
-                </Link>
-              </p>
-            )}
+            {nodesQuery.isSuccess &&
+              activeNodes.length === 0 &&
+              (formData.build_location === 'inherit'
+                ? project.deployment_config?.buildLocation
+                : formData.build_location) !== 'ci' && (
+                <p className="text-xs text-muted-foreground">
+                  No worker node is active yet. Node builds use the control
+                  plane when local builds are enabled; otherwise they need a
+                  worker.{' '}
+                  <Link
+                    to="/settings/nodes"
+                    className="underline underline-offset-2"
+                  >
+                    Add a worker node
+                  </Link>
+                </p>
+              )}
           </div>
         </SettingsSection>
 
@@ -844,7 +863,10 @@ export function EnvironmentConfigurationCard({
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium flex items-center gap-1.5">
+                  <Label
+                    htmlFor="env-protected"
+                    className="text-sm font-medium flex items-center gap-1.5"
+                  >
                     <Shield className="h-4 w-4 shrink-0" />
                     Protected
                   </Label>
@@ -854,6 +876,7 @@ export function EnvironmentConfigurationCard({
                   </p>
                 </div>
                 <Switch
+                  id="env-protected"
                   checked={formData.protected}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -867,12 +890,18 @@ export function EnvironmentConfigurationCard({
               {/* Anti-affinity toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                 <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium">Anti-affinity</Label>
+                  <Label
+                    htmlFor="env-anti-affinity"
+                    className="text-sm font-medium"
+                  >
+                    Anti-affinity
+                  </Label>
                   <p className="text-xs text-muted-foreground">
                     Spread replicas across different nodes (best-effort).
                   </p>
                 </div>
                 <Switch
+                  id="env-anti-affinity"
                   checked={formData.anti_affinity}
                   onCheckedChange={(checked) =>
                     setFormData((prev) => ({
@@ -1047,7 +1076,7 @@ export function EnvironmentConfigurationCard({
                 <Label className="text-sm font-medium">Attack Mode</Label>
                 <p className="text-xs text-muted-foreground">
                   Require a CAPTCHA challenge for visitors. Inherit uses the
-                  project default (currently{' '}
+                  service default (currently{' '}
                   {project.attack_mode ? 'on' : 'off'}).
                 </p>
               </div>
@@ -1109,12 +1138,18 @@ export function EnvironmentConfigurationCard({
 
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Security Headers</Label>
+                <Label
+                  htmlFor="env-security-headers"
+                  className="text-sm font-medium"
+                >
+                  Security Headers
+                </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
                 </p>
               </div>
               <Switch
+                id="env-security-headers"
                 checked={formData.security?.enabled ?? false}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({
@@ -1166,7 +1201,10 @@ export function EnvironmentConfigurationCard({
             {/* Password Protection */}
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium flex items-center gap-1.5">
+                <Label
+                  htmlFor="env-password-protection"
+                  className="text-sm font-medium flex items-center gap-1.5"
+                >
                   <KeyRound className="h-4 w-4 shrink-0" />
                   Password Protection
                 </Label>
@@ -1175,6 +1213,7 @@ export function EnvironmentConfigurationCard({
                 </p>
               </div>
               <Switch
+                id="env-password-protection"
                 checked={formData.password_enabled}
                 onCheckedChange={(checked) =>
                   setFormData((prev) => ({

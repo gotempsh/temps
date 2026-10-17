@@ -295,8 +295,12 @@ fn build_range_statement(filter: &RangeQuery, min_keys: Option<i64>) -> Statemen
                  ) sub"
             )
         } else {
+            // Gauges average per bucket; per-interval delta counters
+            // (`proxy.requests*`) sum, so a bucket is the real count for its
+            // span. The column keeps the name `avg_value` for the row mapper.
+            let agg = super::bucket_aggregate(&filter.name);
             format!(
-                "SELECT time_bucket({step}, time) AS bucket, AVG(value) AS avg_value \
+                "SELECT time_bucket({step}, time) AS bucket, {agg}(value) AS avg_value \
                  FROM service_metrics \
                  WHERE source_kind = $1 \
                    AND source_id = $2 \
@@ -1166,6 +1170,81 @@ mod tests {
     /// against a real TimescaleDB schema, and the parameterised SQL must be
     /// accepted by the server (placeholder types, `jsonb_to_recordset`,
     /// `make_interval`, `drop_chunks`).
+    /// A 5-minute bucket over 60s samples must report the *sum* of the
+    /// per-interval deltas for `proxy.requests*` (so the chart and a window
+    /// total agree at every range), while a gauge in the same bucket keeps
+    /// averaging.
+    #[tokio::test]
+    async fn range_query_sums_delta_counters_and_averages_gauges_on_real_db() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping metrics store database test: {error}");
+                return;
+            }
+            Err(error) => panic!("metrics store test database setup failed: {error}"),
+        };
+        let store = TimescaleMetricsStore::new(test_db.connection_arc());
+        let source_id = 900_002;
+
+        // Start of a 5-minute bucket well inside the raw-table window.
+        let step_secs = 300;
+        let bucket_start = {
+            let t = (Utc::now() - Duration::minutes(30)).timestamp();
+            DateTime::<Utc>::from_timestamp(t - t % step_secs, 0).expect("valid timestamp")
+        };
+
+        let mut points = Vec::new();
+        for (i, (requests, p95)) in [(10.0, 100.0), (20.0, 200.0), (30.0, 300.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let time = bucket_start + Duration::seconds(10 + 60 * i as i64);
+            for (name, value, kind) in [
+                ("proxy.requests", requests, MetricKind::Counter),
+                ("proxy.request_duration_p95_ms", p95, MetricKind::Gauge),
+            ] {
+                let mut p = make_gauge(name, value);
+                p.source_kind = SourceKind::Node;
+                p.source_id = source_id;
+                p.kind = kind;
+                p.time = time;
+                p.engine = Some("proxy".to_string());
+                points.push(p);
+            }
+        }
+        store.write_batch(points).await.expect("write_batch");
+
+        let query = |name: &str| RangeQuery {
+            source_kind: SourceKind::Node,
+            source_id,
+            name: name.to_string(),
+            from: bucket_start - Duration::minutes(1),
+            to: bucket_start + Duration::minutes(10),
+            step: Duration::seconds(step_secs),
+            monotonic: false,
+        };
+
+        let requests = store
+            .query_range(query("proxy.requests"))
+            .await
+            .expect("query proxy.requests");
+        assert_eq!(requests.len(), 1, "all three samples share one bucket");
+        assert_eq!(
+            requests[0].1, 60.0,
+            "delta counters sum per bucket, not average"
+        );
+
+        let p95 = store
+            .query_range(query("proxy.request_duration_p95_ms"))
+            .await
+            .expect("query proxy.request_duration_p95_ms");
+        assert_eq!(p95.len(), 1);
+        assert_eq!(p95[0].1, 200.0, "gauges still average per bucket");
+    }
+
     #[tokio::test]
     async fn parameterised_queries_round_trip_hostile_values_on_real_db() {
         use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};

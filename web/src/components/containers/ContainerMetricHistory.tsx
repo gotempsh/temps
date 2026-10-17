@@ -65,7 +65,7 @@ export function ContainerMetricHistory({
       aria-label={`${label} usage over the last hour`}
     >
       <MetricSparkline data={values} height={16} />
-      <span className="text-right text-[10px] tabular-nums text-neutral-500 dark:text-neutral-400">
+      <span className="text-right text-[10px] tabular-nums text-neutral-600 dark:text-neutral-400">
         {label} {latest == null ? 'No data' : format(latest)}
       </span>
     </div>

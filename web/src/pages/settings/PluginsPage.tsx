@@ -21,15 +21,7 @@ import { Button } from '@/components/ui/button'
 import { PageHeader, Status, useUrlState } from '@temps-sdk/ds'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogCancel,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -48,7 +40,6 @@ import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   AlertCircle,
   Plus,
-  Loader2,
   Puzzle,
   RefreshCw,
   Shield,
@@ -73,7 +64,8 @@ import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsD
 export function PluginsPage() {
   const navigate = useNavigate()
   const platformFeatures = usePlatformFeatures()
-  const requiresPersistentStorage = platformFeatures.data?.external_plugins === false
+  const requiresPersistentStorage =
+    platformFeatures.data?.external_plugins === false
 
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
@@ -95,7 +87,10 @@ export function PluginsPage() {
   const tab = getUrlState('tab') === 'running' ? 'running' : 'browse'
   const setTab = (value: string) =>
     patchUrlState({ tab: value === 'browse' ? undefined : value })
-  const managementPending = requiresPersistentStorage || reloadPlugins.isPending || uninstallPlugin.isPending
+  const managementPending =
+    requiresPersistentStorage ||
+    reloadPlugins.isPending ||
+    uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
@@ -146,9 +141,9 @@ export function PluginsPage() {
         <Alert>
           <AlertTitle>Plugins need persistent storage</AlertTitle>
           <AlertDescription>
-            Browse available plugins here. Installing them requires a full-profile
-            instance that retains plugin binaries and data. This stateless control
-            plane replaces its local disk when it restarts.
+            Browse available plugins here. Installing them requires a
+            full-profile instance that retains plugin binaries and data. This
+            stateless control plane replaces its local disk when it restarts.
           </AlertDescription>
         </Alert>
       )}
@@ -184,39 +179,21 @@ export function PluginsPage() {
         onSensitiveError={handleSensitiveActionError}
       />
       {canManagePlugins && verificationDialog}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={canManagePlugins && uninstallName !== null}
         onOpenChange={(open) => {
-          if (!open && !uninstallPlugin.isPending) setUninstallName(null)
+          if (!open) setUninstallName(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Uninstall {uninstallName}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This stops the plugin and removes it from navigation. Its data is
-              preserved so you can reinstall it later.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={uninstallPlugin.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <Button
-              variant="destructive"
-              disabled={managementPending}
-              onClick={() => {
-                if (uninstallName) void handleUninstall(uninstallName)
-              }}
-            >
-              {uninstallPlugin.isPending && (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              )}
-              {uninstallPlugin.isPending ? 'Uninstalling…' : 'Uninstall'}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        verb="Uninstall"
+        resourceType="plugin"
+        resourceName={uninstallName ?? ''}
+        irreversible={false}
+        consequences="This stops the plugin and removes it from navigation. Its data is preserved so you can reinstall it later."
+        isPending={uninstallPlugin.isPending}
+        onConfirm={() => {
+          if (uninstallName) void handleUninstall(uninstallName)
+        }}
+      />
       <PageHeader
         title="Plugins"
         description="Extend Temps with tools for your deployments."

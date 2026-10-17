@@ -12,6 +12,9 @@ pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
 pub mod m20261002_000001_secret_checks_and_history;
 
+mod m20261016_000001_builder_limits;
+pub mod m20261016_000002_ci_build_dispatch;
+pub mod m20261017_000001_retain_ci_cancellation;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -303,11 +306,18 @@ mod m20260921_000005_add_docker_socket_mounted_to_deployments;
 mod m20260924_000001_add_sync_error_to_git_provider_connections;
 mod m20260927_000001_add_port_bindings_to_deployment_containers;
 mod m20260928_000001_add_node_id_to_sandboxes;
+mod m20260928_000001_create_project_groups;
 mod m20260928_000001_wireguard_mesh;
+mod m20260928_000002_create_project_group_env_vars;
+mod m20260928_000003_add_project_group_repository;
+mod m20260928_000004_create_project_group_routes;
+mod m20260929_000001_create_template_instantiations;
 mod m20260929_000001_node_pairings;
+mod m20260929_000002_add_project_hosting;
 mod m20260929_000002_node_pairing_rejection;
 mod m20260929_000003_node_ssh_enrollments;
 mod m20260929_000004_mesh_hub;
+mod m20260930_000001_add_project_instantiation_token;
 mod m20261002_000001_add_bunny_hostname_owned;
 mod m20261005_000001_ai_gateway_objects;
 mod m20261005_000001_certificate_address_history;
@@ -319,6 +329,18 @@ mod m20261008_000001_create_service_data_imports;
 mod m20261009_000001_unconfirm_legacy_worker_container_removals;
 mod m20261011_000001_create_public_status_pages;
 mod m20261012_000001_ai_provider_keys_self_hosted;
+mod m20261012_000002_create_status_page_domains;
+mod m20261012_000003_managed_daemon_beta_images;
+mod m20261013_000001_webhook_delivery_identity;
+mod m20261013_000002_add_kind_to_ai_conversations;
+mod m20261013_000003_allow_source_built_service_release;
+mod m20261014_000001_add_instantiation_claim_token;
+mod m20261014_000002_create_project_ip_access_rules;
+mod m20261014_000002_index_ip_geolocation_references;
+mod m20261014_000003_ip_geolocation_last_used_at;
+mod m20261014_000004_managed_daemon_unpublished_tags;
+mod m20261015_000001_compose_validation_reports;
+mod m20261016_000001_ai_usage_logs_project_attribution;
 
 pub struct Migrator;
 
@@ -709,6 +731,37 @@ impl MigratorTrait for Migrator {
             Box::new(m20261009_000001_unconfirm_legacy_worker_container_removals::Migration),
             Box::new(m20261011_000001_create_public_status_pages::Migration),
             Box::new(m20261012_000001_ai_provider_keys_self_hosted::Migration),
+            Box::new(m20261012_000002_create_status_page_domains::Migration),
+            Box::new(m20261012_000003_managed_daemon_beta_images::Migration),
+            Box::new(m20261013_000001_webhook_delivery_identity::Migration),
+            Box::new(m20261013_000002_add_kind_to_ai_conversations::Migration),
+            // Project groups, template instantiations and project hosting.
+            // Registered after everything main shipped so they run last on a
+            // database that already applied main's migrations; none of the
+            // tables above are touched by them.
+            Box::new(m20260928_000001_create_project_groups::Migration),
+            Box::new(m20260928_000002_create_project_group_env_vars::Migration),
+            Box::new(m20260928_000003_add_project_group_repository::Migration),
+            Box::new(m20260928_000004_create_project_group_routes::Migration),
+            Box::new(m20260929_000001_create_template_instantiations::Migration),
+            Box::new(m20260929_000002_add_project_hosting::Migration),
+            Box::new(m20260930_000001_add_project_instantiation_token::Migration),
+            // Source-built services of an app template keep their release.
+            Box::new(m20261013_000003_allow_source_built_service_release::Migration),
+            // Each claim of a template instantiation gets an ownership token.
+            Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
+            // Per-project / per-environment IP allow and deny lists.
+            Box::new(m20261014_000002_create_project_ip_access_rules::Migration),
+            // Partial indexes on the columns that reference stored IP addresses.
+            Box::new(m20261014_000002_index_ip_geolocation_references::Migration),
+            Box::new(m20261014_000003_ip_geolocation_last_used_at::Migration),
+            // Rewrite the never-published `:0.3.4` managed image tag to `:0.3.4-beta`.
+            Box::new(m20261014_000004_managed_daemon_unpublished_tags::Migration),
+            Box::new(m20261015_000001_compose_validation_reports::Migration),
+            Box::new(m20261016_000001_ai_usage_logs_project_attribution::Migration),
+            Box::new(m20261016_000001_builder_limits::Migration),
+            Box::new(m20261016_000002_ci_build_dispatch::Migration),
+            Box::new(m20261017_000001_retain_ci_cancellation::Migration),
         ]
     }
 }
@@ -763,6 +816,18 @@ mod registry_tests {
             (
                 "m20260903_000001_add_service_project_identity",
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",
+            ),
+            (
+                "m20260903_000001_add_service_project_identity",
+                "m20261013_000003_allow_source_built_service_release",
+            ),
+            (
+                "m20261013_000003_allow_source_built_service_release",
+                "m20261014_000001_add_instantiation_claim_token",
+            ),
+            (
+                "m20260929_000001_create_template_instantiations",
+                "m20261014_000001_add_instantiation_claim_token",
             ),
             (
                 "m20260904_000001_reset_ambiguous_managed_status_monitors",

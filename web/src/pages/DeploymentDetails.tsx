@@ -16,6 +16,7 @@ import {
   sendFailureReportMutation,
   triggerProjectPipelineMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ComposeCheckAction } from '@/components/deployments/ComposeCheckAction'
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
@@ -56,6 +57,10 @@ import {
   failureTimeoutSummary,
 } from '@/lib/deployment-failure-guidance'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
+import {
+  canRollbackTo,
+  deploymentMenuHasActions,
+} from '@/lib/deployment-rollback'
 import {
   deploymentRedeployPlan,
   resolveDeploymentSourceType,
@@ -310,6 +315,11 @@ function commitWebUrls(
   }
 }
 
+function isComposeProject(project: ProjectResponse): boolean {
+  const preset = project.preset ?? ''
+  return preset === 'docker-compose' || preset === 'dockercompose'
+}
+
 interface OverviewActions {
   onRedeploy: () => void
   onCancel: () => void
@@ -411,14 +421,12 @@ function SecondaryActions({
   deployment: DeploymentResponse
   actions: OverviewActions
 }) {
-  const showMenu = ['completed', 'paused', 'running', 'pending'].includes(
-    deployment.status
-  )
+  const showMenu = deploymentMenuHasActions(deployment)
   return (
     <>
       <Button variant="outline" onClick={actions.onRedeploy} title="Redeploy">
         <RotateCw className="h-4 w-4" />
-        <span className="hidden sm:inline">Redeploy</span>
+        <span className="max-sm:sr-only">Redeploy</span>
       </Button>
       {showMenu && (
         <DropdownMenu>
@@ -447,7 +455,7 @@ function SecondaryActions({
                 Pause Deployment
               </DropdownMenuItem>
             )}
-            {deployment.status === 'completed' && (
+            {canRollbackTo(deployment) && (
               <DropdownMenuItem
                 onClick={actions.onRollback}
                 disabled={actions.rollbackPending}
@@ -524,7 +532,9 @@ function CancelledReason({
             </Badge>
           )}
           {failure && failure.code !== 'unknown' && (
-            <code className="rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive/80">
+            // Opaque surface, not another destructive/10 tint: the banner it sits
+            // in is already tinted, and stacked tints measured 4.35:1.
+            <code className="rounded border border-destructive/30 bg-background px-1.5 py-0.5 text-xs text-destructive">
               {failure.code}
             </code>
           )}
@@ -591,7 +601,7 @@ function CancelledReason({
           {failure && (
             <p className="text-xs font-medium text-muted-foreground">Error</p>
           )}
-          <p className="whitespace-pre-wrap break-words text-sm text-destructive/80">
+          <p className="whitespace-pre-wrap break-words text-sm text-destructive">
             {isExpanded ? failureReason.fullReason : failureReason.summary}
           </p>
           {failureReason.hasMore && (
@@ -729,6 +739,7 @@ function DeployFailureReport({
                 <Skeleton className="h-64 w-full" />
               ) : (
                 <Textarea
+                  aria-label="Failure report"
                   value={reportText}
                   onChange={(e) => setEditedText(e.target.value)}
                   className="h-64 font-mono text-xs"
@@ -1030,7 +1041,7 @@ function DeploymentHeader({
             <Clock className="h-3.5 w-3.5" />
             {buildStats.map((stat, i) => (
               <span key={stat.label} className="inline-flex items-center gap-1">
-                {i > 0 && <span className="text-muted-foreground/40">·</span>}
+                {i > 0 && <span className="text-muted-foreground">·</span>}
                 <span>{stat.label}</span>
                 <span className="font-medium tabular-nums text-foreground">
                   {stat.value}
@@ -1328,7 +1339,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   const assistantContext = deployment
     ? [
         'The user is viewing a deployment in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+        `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
         `Deployment #${deployment.id} — status: ${deployment.status ?? 'unknown'}${deployment.environment ? `, environment: ${deployment.environment}` : ''}.`,
         deployment.branch ? `Branch: ${deployment.branch}.` : '',
         deployment.commit_hash
@@ -1553,6 +1564,13 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         <DeployFailureReport project={project} deployment={deployment} />
+
+        {isComposeProject(project) && (
+          <ComposeCheckAction
+            projectId={deployment.project_id}
+            deploymentId={deployment.id}
+          />
+        )}
 
         {resourceBadges.length > 0 && (
           <div className="flex flex-wrap items-center gap-2">

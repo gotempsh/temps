@@ -66,14 +66,15 @@ impl TempsPlugin for EventsPlugin {
         // Default to the PG-backed read trait. If CH is enabled at config
         // time, swap the trait object for `ClickHouseEventsBackend`.
         // Writes always continue against PG via `events_writer`.
-        let events_backend: Arc<dyn crate::services::AnalyticsEvents> =
-            if server_config.is_clickhouse_enabled() {
-                let db = context.require_service::<sea_orm::DatabaseConnection>();
-                build_clickhouse_backend(&server_config, db)
-            } else {
-                debug!("ClickHouse analytics backend disabled (TEMPS_CLICKHOUSE_* unset)");
-                events_service.clone()
-            };
+        let events_backend: Arc<dyn crate::services::AnalyticsEvents> = if server_config
+            .is_clickhouse_enabled()
+        {
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
+            build_clickhouse_backend(&server_config, db, config_service.clickhouse_compression())
+        } else {
+            debug!("ClickHouse analytics backend disabled (TEMPS_CLICKHOUSE_* unset)");
+            events_service.clone()
+        };
 
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
@@ -146,11 +147,14 @@ impl TempsPlugin for EventsPlugin {
 
 /// Build the ClickHouse-backed read trait object and spawn the fan-out
 /// worker. Migrations are applied on a background task so plugin
-/// `configure_routes` returns promptly; if migrations fail, the backend
-/// will surface the error on the next query rather than blocking startup.
+/// `configure_routes` returns promptly, and are retried until they apply (a
+/// server still starting heals by waiting; a decode failure is re-checked at a
+/// slow cadence and recovers once the operator fixes the server) instead of
+/// being attempted once and left to surface as `Code: 60` per query.
 fn build_clickhouse_backend(
     server_config: &temps_config::ServerConfig,
     db: Arc<sea_orm::DatabaseConnection>,
+    compression: temps_clickhouse::ClickHouseCompression,
 ) -> Arc<dyn crate::services::AnalyticsEvents> {
     use temps_analytics_backend::clickhouse::{ClickHouseBackend, ClickHouseConfig};
 
@@ -165,7 +169,8 @@ fn build_clickhouse_backend(
             .clickhouse_password
             .clone()
             .unwrap_or_default(),
-    );
+    )
+    .with_compression(compression);
     let backend = ClickHouseBackend::new(cfg);
     let client = Arc::new(backend.client_clone());
 
@@ -179,21 +184,21 @@ fn build_clickhouse_backend(
     // block plugin init on remote calls.
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         let client_for_migrations = Arc::clone(&client);
-        handle.spawn(async move {
-            match temps_analytics_backend::migrations::apply_migrations(&client_for_migrations)
-                .await
-            {
-                Ok(report) => info!(
+        temps_clickhouse::spawn_retrying(
+            "analytics",
+            temps_clickhouse::MigrationRetryPolicy::default(),
+            move || {
+                let client = Arc::clone(&client_for_migrations);
+                async move { temps_analytics_backend::migrations::apply_migrations(&client).await }
+            },
+            |report| {
+                info!(
                     applied = ?report.applied,
                     skipped_count = report.skipped.len(),
                     "ClickHouse migrations applied"
-                ),
-                Err(e) => warn!(
-                    error = %e,
-                    "ClickHouse migrations failed; queries will surface the error per-call"
-                ),
-            }
-        });
+                )
+            },
+        );
 
         // Spawn the fan-out worker. It owns one client clone for inserts
         // and a DB clone for the outbox claim/release.

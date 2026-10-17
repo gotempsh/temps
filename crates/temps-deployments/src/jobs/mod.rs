@@ -84,6 +84,7 @@ pub mod prepare_source_bundle;
 pub mod pull_external_image;
 pub mod scan_vulnerabilities;
 pub mod take_screenshot;
+pub(crate) mod temps_yaml;
 pub mod verify_local_image;
 
 pub use build_image::*;

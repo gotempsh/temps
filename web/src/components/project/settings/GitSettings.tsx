@@ -15,7 +15,7 @@ import {
   getRepositoryPresetLiveOptions,
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
-  getComposeSecurityOptions,
+  getProjectComposeValidationOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
   reinstallGitlabWebhookMutation,
@@ -24,6 +24,8 @@ import {
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
+import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
+import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
 import { Badge } from '@/components/ui/badge'
@@ -83,10 +85,13 @@ import {
 } from '@/lib/compose-port-discovery'
 import {
   composePreviewErrorMessage,
+  composePreviewFailedCheck,
   composePreviewPolicyCheck,
   fetchComposePreview,
   isPublicRepositoryRateLimitError,
 } from '@/lib/compose-preview'
+import { composeValidationWarning } from '@/lib/compose-check'
+import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
 import {
   normalizePresetPath,
@@ -172,7 +177,7 @@ function GitSettingsInline({
   })
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
-    meta: { errorTitle: 'Failed to update project settings' },
+    meta: { errorTitle: 'Failed to update service settings' },
   })
   const updateAutomaticDeploy = useMutation({
     ...updateAutomaticDeployMutation(),
@@ -524,8 +529,9 @@ function GitSettingsInline({
   )
   const excludedComposeServices: string[] =
     composeConfig.excludedServices || composeConfig.excluded_services || []
-  const composeSecurityQuery = useQuery(
-    getComposeSecurityOptions({ path: { id: project.id } })
+  const composeSecurityQuery = useComposeSecurityPolicy(
+    project.id,
+    isComposePreset
   )
   const [focusedComposeCheck, setFocusedComposeCheck] = useState<string | null>(
     null
@@ -533,6 +539,9 @@ function GitSettingsInline({
   const composePreviewQuery = useQuery({
     queryKey: [
       'effective-compose-preview',
+      // Connected previews check against this project's saved environment,
+      // so two projects on the same repository must not share a result.
+      project.id,
       repositoryData?.id,
       publicProvider,
       publicRepository?.instanceUrl,
@@ -564,6 +573,9 @@ function GitSettingsInline({
           composeOverride: debouncedOverrideDraft || undefined,
           excludedServices: excludedComposeServices,
           previewPolicy: composeSecurityQuery.data?.policy,
+          // Connected repositories run the deploy-time check with the saved
+          // policy and the production environment's variables.
+          projectId: isPublicRepo ? undefined : project.id,
         },
         signal
       ),
@@ -578,6 +590,18 @@ function GitSettingsInline({
   })
   const composePreviewRateLimited =
     isPublicRepo && isPublicRepositoryRateLimitError(composePreviewQuery.error)
+  const composePreviewCheckFailure = composePreviewFailedCheck(
+    composePreviewQuery.error
+  )
+  const composeValidationQuery = useQuery({
+    ...getProjectComposeValidationOptions({
+      path: { project_id: project.id },
+    }),
+    enabled: isComposePreset,
+  })
+  const storedComposeWarning = composeValidationWarning(
+    composeValidationQuery.data
+  )
 
   const navigate = useNavigate()
   const goToChangeRepo = () =>
@@ -635,7 +659,7 @@ function GitSettingsInline({
                 No repository connected
               </h3>
               <p className="text-sm text-muted-foreground">
-                Connect a Git repository to enable deployments for this project.
+                Connect a Git repository to enable deployments for this service.
               </p>
             </div>
             <Button onClick={goToChangeRepo}>
@@ -817,7 +841,7 @@ function GitSettingsInline({
               No Git repository connected
             </CardTitle>
             <CardDescription>
-              This project currently deploys source archives uploaded through
+              This service currently deploys source archives uploaded through
               Drop. Connect a repository to enable deployments from commits and
               branches.
             </CardDescription>
@@ -1346,6 +1370,22 @@ function GitSettingsInline({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
+            {storedComposeWarning && (
+              <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm dark:border-amber-400/30 dark:bg-amber-950/20">
+                <p className="font-medium text-amber-800 dark:text-amber-300">
+                  {storedComposeWarning.title}
+                </p>
+                <p className="mt-1 break-words text-muted-foreground">
+                  {storedComposeWarning.detail}
+                </p>
+                {storedComposeWarning.hint && (
+                  <p className="mt-1 text-muted-foreground">
+                    {storedComposeWarning.hint}
+                  </p>
+                )}
+              </div>
+            )}
+
             <PublicPortsInline project={project} saveGitField={saveGitField} />
 
             <ExcludedServicesInline
@@ -1406,7 +1446,22 @@ function GitSettingsInline({
                       <EyeOff className="size-3" />
                       Environment values redacted
                     </Badge>
+                    {composePreviewQuery.data?.check?.passed && (
+                      <Badge
+                        variant="outline"
+                        className="gap-1.5 border-emerald-500/30 bg-emerald-500/5 font-normal text-emerald-700 dark:text-emerald-300"
+                      >
+                        <ShieldCheck className="size-3" />
+                        Passes deploy checks
+                      </Badge>
+                    )}
                   </div>
+
+                  {composePreviewQuery.data?.overrideWarning && (
+                    <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm text-amber-800 dark:border-amber-400/30 dark:bg-amber-950/20 dark:text-amber-300">
+                      {composePreviewQuery.data.overrideWarning}
+                    </div>
+                  )}
 
                   <div className="overflow-hidden rounded-lg border bg-background text-foreground lg:grid lg:grid-cols-2 lg:divide-x lg:divide-border dark:bg-zinc-950 dark:text-zinc-100 dark:lg:divide-white/10">
                     <section className="min-w-0">
@@ -1511,7 +1566,7 @@ function GitSettingsInline({
                       {composeSecurityQuery.isError ? (
                         <div className="flex h-[360px] flex-col items-center justify-center gap-3 p-6 text-center">
                           <p className="text-sm text-destructive">
-                            Could not load this project&apos;s Compose security
+                            Could not load this service&apos;s Compose security
                             policy.
                           </p>
                           <Button
@@ -1560,7 +1615,7 @@ function GitSettingsInline({
                                 <p className="text-sm text-muted-foreground">
                                   If you trust this stack, an instance
                                   administrator can disable this check for this
-                                  project.
+                                  service.
                                 </p>
                                 <Button
                                   size="sm"
@@ -1638,12 +1693,25 @@ function GitSettingsInline({
                     </section>
                   </div>
 
+                  {composePreviewCheckFailure && (
+                    <ComposeCheckReportView
+                      report={composePreviewCheckFailure}
+                      className="rounded-lg border p-3"
+                    />
+                  )}
+
                   <p className="text-[11px] leading-relaxed text-muted-foreground">
                     This preview applies disabled services and your override.
                     Temps-managed security, network, labels, and runtime
                     environment layers are added during deployment and cannot be
-                    edited here. Deployment validates referenced files and the
-                    full Compose security policy. Environment and build-argument
+                    edited here. For a connected repository the preview also
+                    runs the deployment&apos;s Compose check: it resolves{' '}
+                    <span className="font-mono">
+                      ${'{'}VAR{'}'}
+                    </span>{' '}
+                    with the production environment&apos;s variables and applies
+                    the saved security policy. Deployment additionally validates
+                    referenced files on disk. Environment and build-argument
                     values are always replaced with{' '}
                     <span className="font-mono text-foreground">
                       &lt;redacted&gt;
@@ -1663,6 +1731,7 @@ function GitSettingsInline({
           <CardContent className="p-0 divide-y">
             <div className="flex items-center gap-4 p-6">
               <Switch
+                aria-label="Automatic deployments"
                 checked={autoDeployOn}
                 onCheckedChange={handleAutoDeployToggle}
               />
@@ -2895,6 +2964,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 
   return (
     <div className="space-y-5">
+      <FollowedRepositoryNotice project={project} onChanged={refetch} />
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-xl font-semibold">Connect repository</h2>
@@ -3228,7 +3298,15 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
 }
 
 export function GitSettings(props: GitSettingsProps & { embedded?: boolean }) {
-  return <GitSettingsInline {...props} view="git" />
+  return (
+    <div className="space-y-4">
+      <FollowedRepositoryNotice
+        project={props.project}
+        onChanged={props.refetch}
+      />
+      <GitSettingsInline {...props} view="git" />
+    </div>
+  )
 }
 
 export function BuildSettings(

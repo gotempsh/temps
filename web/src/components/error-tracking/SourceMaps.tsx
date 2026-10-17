@@ -12,6 +12,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
   Dialog,
@@ -130,6 +131,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source maps')
     },
+    // The dialog stays open (and locked) until the request settles, so the
+    // same target cannot be confirmed twice while the first delete is running.
+    onSettled: () => setDeleteConfirm(null),
   })
 
   // Delete single source map mutation
@@ -149,6 +153,7 @@ export function SourceMaps({ project }: SourceMapsProps) {
     onError: () => {
       toast.error('Failed to delete source map')
     },
+    onSettled: () => setDeleteConfirm(null),
   })
 
   const releases = releasesData?.releases ?? []
@@ -163,8 +168,9 @@ export function SourceMaps({ project }: SourceMapsProps) {
       deleteFileMutation.mutate({
         path: { project_id: project.id, source_map_id: deleteConfirm.fileId },
       })
+    } else {
+      setDeleteConfirm(null)
     }
-    setDeleteConfirm(null)
   }
 
   return (
@@ -276,50 +282,31 @@ export function SourceMaps({ project }: SourceMapsProps) {
       />
 
       {/* Delete confirmation dialog */}
-      <Dialog
-        open={!!deleteConfirm}
-        onOpenChange={(open) => !open && setDeleteConfirm(null)}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>
-              Delete Source Map{deleteConfirm?.type === 'release' ? 's' : ''}
-            </DialogTitle>
-            <DialogDescription>
-              {deleteConfirm?.type === 'release'
-                ? `This will delete all source maps for release "${deleteConfirm.release}". This action cannot be undone.`
-                : `This will delete the source map "${deleteConfirm?.fileName}". This action cannot be undone.`}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setDeleteConfirm(null)}
-            >
-              Cancel
-            </Button>
-            <Button
-              type="button"
-              variant="destructive"
-              onClick={handleConfirmDelete}
-              disabled={
-                deleteReleaseMutation.isPending || deleteFileMutation.isPending
-              }
-            >
-              {deleteReleaseMutation.isPending ||
-              deleteFileMutation.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete'
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDeleteDialog
+        open={deleteConfirm !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteConfirm(null)
+        }}
+        resourceType={
+          deleteConfirm?.type === 'release'
+            ? 'source maps for release'
+            : 'source map'
+        }
+        resourceName={
+          (deleteConfirm?.type === 'release'
+            ? deleteConfirm.release
+            : deleteConfirm?.fileName) ?? ''
+        }
+        consequences={
+          deleteConfirm?.type === 'release'
+            ? 'Every source map uploaded for this release is removed, so its stack traces are no longer symbolicated.'
+            : 'Stack traces that reference this file are no longer symbolicated.'
+        }
+        isPending={
+          deleteReleaseMutation.isPending || deleteFileMutation.isPending
+        }
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

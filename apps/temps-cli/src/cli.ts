@@ -31,6 +31,8 @@ import { registerSettingsCommands } from './commands/settings/index.js'
 import { registerUsersCommands } from './commands/users/index.js'
 import { registerApiKeysCommands } from './commands/apikeys/index.js'
 import { registerTeamsCommands } from './commands/teams/index.js'
+import { registerProjectGroupsCommands } from './commands/project-groups/index.js'
+import { registerInstantiationsCommands } from './commands/instantiations/index.js'
 import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
@@ -191,6 +193,8 @@ export function createProgram(): Command {
   registerSettingsCommands(program)
   registerUsersCommands(program)
   registerTeamsCommands(program)
+  registerProjectGroupsCommands(program)
+  registerInstantiationsCommands(program)
   registerApiKeysCommands(program)
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)

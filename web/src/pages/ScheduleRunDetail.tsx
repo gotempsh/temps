@@ -51,12 +51,14 @@ import {
 } from '@/components/ui/tooltip'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import {
   cancelBackup,
   cancelScheduleRun,
   listScheduleRunJobsOptions,
 } from '@/lib/schedule-runs'
 import { formatBytes } from '@/lib/utils'
+import { PageState } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -283,6 +285,31 @@ export function ScheduleRunDetail() {
     )
   }
 
+  // Only a verified 404 proves the run is gone; a failed read says nothing
+  // about it and is explained in the jobs card below.
+  if (isJobsError && isVerifiedNotFound(jobsError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={DatabaseBackup}
+        title="Run not found"
+        description={`Run #${runIdNum} does not exist for this schedule. It may have been removed with the schedule's history.`}
+        action={
+          <div className="flex flex-wrap justify-center gap-2">
+            <Button asChild>
+              <Link to={`/backups/schedules/${scheduleIdNum}`}>
+                Back to schedule
+              </Link>
+            </Button>
+            <Button asChild variant="outline">
+              <Link to="/backups">All backups</Link>
+            </Button>
+          </div>
+        }
+      />
+    )
+  }
+
   return (
     <TooltipProvider>
       <div className="space-y-6">
@@ -346,7 +373,7 @@ export function ScheduleRunDetail() {
                 ) : (
                   <Ban className="h-4 w-4" />
                 )}
-                <span className="hidden sm:inline">Cancel run</span>
+                <span className="max-sm:sr-only">Cancel run</span>
               </Button>
             )}
 

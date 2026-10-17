@@ -102,10 +102,10 @@ export function ImageRetentionCard({
           <CardHeader>
             <CardTitle>Built Image Retention</CardTitle>
             <CardDescription>
-              How long this project&apos;s built Docker images are kept before
+              How long this service&apos;s built Docker images are kept before
               the nightly cleanup removes them. Rolling back or promoting a
               deployment requires its image, so this is effectively the
-              project&apos;s rollback window.
+              service&apos;s rollback window.
             </CardDescription>
           </CardHeader>
           <CardContent>

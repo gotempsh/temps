@@ -170,7 +170,7 @@ export function DeploymentContainerLogs({
                   <span className="ml-auto text-xs text-muted-foreground shrink-0">
                     {formatBytes(log.size_bytes)}
                   </span>
-                  <span className="text-xs text-muted-foreground shrink-0 hidden sm:inline">
+                  <span className="text-xs text-muted-foreground shrink-0 max-sm:sr-only">
                     <TimeAgo date={new Date(log.captured_at)} />
                   </span>
                 </button>
@@ -206,7 +206,10 @@ export function DeploymentContainerLogs({
                             Download
                           </Button>
                         </div>
-                        <pre className="max-h-96 overflow-auto p-3 text-xs font-mono whitespace-pre-wrap break-all">
+                        <pre
+                          tabIndex={0}
+                          className="max-h-96 overflow-auto p-3 text-xs font-mono whitespace-pre-wrap break-all"
+                        >
                           {content?.content || '(empty)'}
                         </pre>
                       </div>

@@ -36,6 +36,7 @@ export function RepositoryPresetLogos({
 
   return (
     <div
+      role="group"
       className="flex h-8 shrink-0 items-center gap-1 px-1.5"
       aria-label={`Detected presets for ${repository.full_name}`}
     >

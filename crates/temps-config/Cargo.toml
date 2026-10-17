@@ -15,6 +15,7 @@ temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 temps-core = { path = "../temps-core" }
+temps-clickhouse = { path = "../temps-clickhouse" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = { workspace = true }

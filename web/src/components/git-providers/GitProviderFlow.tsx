@@ -25,6 +25,7 @@ import {
 } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
@@ -1699,14 +1700,20 @@ export function GitProviderFlow({
                       <div>
                         <p className="text-muted-foreground">Callback URL:</p>
                         <div className="flex items-center gap-2">
-                          <code className="text-xs bg-muted px-2 py-1 rounded flex-1 overflow-x-auto">
-                            {window.location.origin}
-                            /api/webhook/git/github/callback
-                          </code>
+                          <ScrollRegion
+                            className="min-w-0 flex-1 rounded bg-muted px-2 py-1"
+                            regionLabel="Callback URL, scrollable"
+                          >
+                            <code className="block w-max whitespace-nowrap text-xs">
+                              {window.location.origin}
+                              /api/webhook/git/github/callback
+                            </code>
+                          </ScrollRegion>
                           <Button
                             size="sm"
                             variant="ghost"
                             className="shrink-0 h-7 w-7 p-0"
+                            aria-label="Copy callback URL"
                             onClick={handleCopyCallback}
                           >
                             {copiedCallback ? (

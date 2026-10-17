@@ -55,7 +55,7 @@ const formSchema = z.object({
 type FormData = z.infer<typeof formSchema>
 
 const DEFAULTS: FormData = {
-  enabled: false,
+  enabled: true,
   zone: '',
   max_concurrent: 3,
   hourly_cap: 10,
@@ -196,7 +196,11 @@ export function OnDemandTlsPage() {
 
   const source: OnDemandTlsSettingsSource = settings
   const blockers = onDemandTlsBlockers(zone, source)
-  const derivedZone = effectiveZone(zone, settings.external_url)
+  const derivedZone = effectiveZone(
+    zone,
+    settings.external_url,
+    settings.preview_domain
+  )
   const savedEnabled = settings.on_demand_tls?.enabled ?? false
 
   return (

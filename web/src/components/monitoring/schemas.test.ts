@@ -44,3 +44,54 @@ describe('notification routing schemas', () => {
     )
   })
 })
+
+describe('provider numeric fields that were emptied', () => {
+  const email = {
+    name: 'Ops mail',
+    provider_type: 'email' as const,
+    config: {
+      smtp_host: 'smtp.example.test',
+      smtp_port: 587,
+      from_address: 'alerts@example.test',
+      to_addresses: ['ops@example.test'],
+    },
+  }
+  const webhook = {
+    name: 'Hook',
+    provider_type: 'webhook' as const,
+    config: { url: 'https://hooks.example.test/in', timeout_secs: 30 },
+  }
+
+  test('an emptied SMTP port (NaN) fails the email validation instead of passing', () => {
+    const result = providerSchema.safeParse({
+      ...email,
+      config: { ...email.config, smtp_port: Number.NaN },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test('an out-of-range SMTP port is still rejected', () => {
+    const result = providerSchema.safeParse({
+      ...email,
+      config: { ...email.config, smtp_port: 70000 },
+    })
+    expect(result.success).toBe(false)
+  })
+
+  test('an emptied timeout (NaN) means "use the default" and is accepted as unset', () => {
+    const result = providerSchema.safeParse({
+      ...webhook,
+      config: { ...webhook.config, timeout_secs: Number.NaN },
+    })
+    expect(result.success).toBe(true)
+    if (result.success) expect(result.data.config.timeout_secs).toBeUndefined()
+  })
+
+  test('an out-of-range timeout is still rejected', () => {
+    const result = providerSchema.safeParse({
+      ...webhook,
+      config: { ...webhook.config, timeout_secs: 301 },
+    })
+    expect(result.success).toBe(false)
+  })
+})

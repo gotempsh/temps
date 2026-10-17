@@ -15,17 +15,7 @@ import { Badge } from '@/components/ui/badge'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   getApiKeyOptions,
   getApiKeyQueryKey,
@@ -173,6 +163,7 @@ export default function ApiKeyDetail() {
   const navigate = useNavigate()
   const { id } = useParams<{ id: string }>()
   const queryClient = useQueryClient()
+  const [confirmingDelete, setConfirmingDelete] = useState(false)
 
   const apiKeyId = Number(id)
   const validId = Number.isInteger(apiKeyId) && apiKeyId > 0
@@ -312,34 +303,23 @@ export default function ApiKeyDetail() {
               Activate
             </Button>
           )}
-          <AlertDialog>
-            <AlertDialogTrigger asChild>
-              <Button variant="destructive" size="sm">
-                <Trash2 className="mr-2 h-4 w-4" />
-                Delete
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete API Key</AlertDialogTitle>
-                <AlertDialogDescription>
-                  Are you sure you want to delete &quot;{apiKey.name}&quot;?
-                  This action cannot be undone and will immediately invalidate
-                  all requests using this key.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  disabled={deleteMutation.isPending}
-                  onClick={() => deleteMutation.mutate()}
-                >
-                  {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+          <Button
+            variant="destructive"
+            size="sm"
+            onClick={() => setConfirmingDelete(true)}
+          >
+            <Trash2 className="mr-2 h-4 w-4" />
+            Delete
+          </Button>
+          <ConfirmDeleteDialog
+            open={confirmingDelete}
+            onOpenChange={setConfirmingDelete}
+            resourceType="API key"
+            resourceName={apiKey.name}
+            consequences={`Key ${apiKey.key_prefix}... stops working immediately; any application using it loses access.`}
+            isPending={deleteMutation.isPending}
+            onConfirm={() => deleteMutation.mutate()}
+          />
         </>
       }
       facts={apiKeyFacts(apiKey)}

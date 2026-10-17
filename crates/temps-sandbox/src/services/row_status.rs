@@ -11,6 +11,7 @@
 //! through [`update_when`], which only applies while the row is still in a
 //! state the caller expects, and reports when it is not.
 
+use chrono::{DateTime, Utc};
 use sea_orm::{
     sea_query::SimpleExpr, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter,
 };
@@ -26,6 +27,11 @@ pub enum Expect<'a> {
     Status(&'a str),
     /// The row must not be destroyed (any live status).
     Live,
+    /// The row must be `running` and untouched since `last_activity_at` was
+    /// read. For a verdict about a VM reached from a row snapshot: a resume
+    /// (or any later activity) moves the timestamp, so a stale verdict cannot
+    /// stop a sandbox that came back to life after it was probed.
+    RunningSince(DateTime<Utc>),
 }
 
 impl Expect<'_> {
@@ -33,6 +39,9 @@ impl Expect<'_> {
         match self {
             Expect::Status(status) => sandboxes::Column::Status.eq(status),
             Expect::Live => sandboxes::Column::Status.ne(DESTROYED),
+            Expect::RunningSince(since) => sandboxes::Column::Status
+                .eq("running")
+                .and(sandboxes::Column::LastActivityAt.eq(since)),
         }
     }
 }
@@ -95,6 +104,28 @@ mod tests {
             status: Set("stopped".to_string()),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn running_since_pins_the_status_and_the_activity_timestamp() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(7, "stopped")]])
+            .into_connection();
+        let since = Utc::now();
+
+        update_when(&db, stop(7), Expect::RunningSince(since))
+            .await
+            .expect("update");
+
+        let sql = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|t| t.statements())
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.contains(r#""status" = 'running'"#), "{sql}");
+        assert!(sql.contains(r#""last_activity_at" = "#), "{sql}");
     }
 
     #[tokio::test]

@@ -117,6 +117,19 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Capability Not Declared")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::RateLimited { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("AI Gateway Rate Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::BudgetExceeded { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("AI Gateway Budget Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::ProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(error.to_string()),
         }
     }
 }

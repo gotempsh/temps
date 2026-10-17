@@ -5,7 +5,7 @@ import { requireAuth } from '../../config/store.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, formatRelativeTime } from '../../ui/output.js'
-import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { setupClient, client, getErrorMessage, requireApiShape } from '../../lib/api-client.js'
 import { getProjects } from '../../api/sdk.gen.js'
 import type { ProjectResponse } from '../../api/types.gen.js'
 
@@ -35,7 +35,16 @@ export async function list(options: ListOptions): Promise<void> {
       throw new Error(getErrorMessage(error))
     }
 
-    return data?.projects ?? []
+    const body = requireApiShape(
+      data,
+      'listing projects',
+      (value): value is { projects: ProjectResponse[] } =>
+        typeof value === 'object' &&
+        value !== null &&
+        'projects' in value &&
+        Array.isArray(value.projects),
+    )
+    return body.projects
   })
 
   if (options.json) {

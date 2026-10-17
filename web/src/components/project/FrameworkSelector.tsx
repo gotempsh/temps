@@ -201,7 +201,7 @@ export function FrameworkSelector({
           user to "pick one manually" hides an auth problem that will break
           the next step too, so it gets its own actionable state. */}
       {error && isGitAuthError(error) && (
-        <GitConnectionExpiredAlert operation="detect this project's framework" />
+        <GitConnectionExpiredAlert operation="detect this service's framework" />
       )}
       {error && !isGitAuthError(error) && shouldShowAllPresets && (
         <Alert>
@@ -217,7 +217,7 @@ export function FrameworkSelector({
         <Alert>
           <AlertCircle className="h-4 w-4" />
           <AlertDescription>
-            Select a preset for your project from the list below.
+            Select a preset for your service from the list below.
           </AlertDescription>
         </Alert>
       )}

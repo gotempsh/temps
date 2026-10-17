@@ -15,6 +15,7 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { NumberInput } from '@/components/ui/number-input'
 import {
   Select,
   SelectContent,
@@ -28,6 +29,7 @@ import { Eye, EyeOff, Loader2 } from 'lucide-react'
 import { InputHTMLAttributes, useEffect, useRef, useState } from 'react'
 import { UseFormReturn } from 'react-hook-form'
 import { toast } from 'sonner'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 import { ProviderFormData } from './schemas'
 
 interface ProviderFormProps {
@@ -155,6 +157,16 @@ export function ProviderForm({
   const providerType = form.watch('provider_type')
   const tlsMode = form.watch('config.tls_mode')
 
+  // The page's mutation reports a failed save with the server's reason; a
+  // rejection left to react-hook-form would escape as an unhandled one.
+  const submitProvider = async (data: ProviderFormData) => {
+    try {
+      await onSubmit(data)
+    } catch (error) {
+      reportSubmitFailure(error)
+    }
+  }
+
   // Suggest port based on TLS mode
   const getSuggestedPort = () => {
     switch (tlsMode) {
@@ -172,7 +184,7 @@ export function ProviderForm({
     <Form {...form}>
       <form
         id={formId}
-        onSubmit={form.handleSubmit(onSubmit, showToastFormError)}
+        onSubmit={form.handleSubmit(submitProvider, showToastFormError)}
         className="space-y-4 py-4"
       >
         <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -248,15 +260,16 @@ export function ProviderForm({
                     <FormItem>
                       <FormLabel>SMTP Port</FormLabel>
                       <FormControl>
-                        <Input
-                          {...field}
-                          type="number"
+                        <NumberInput
+                          name={field.name}
+                          ref={field.ref}
+                          onBlur={field.onBlur}
                           placeholder={getSuggestedPort()}
-                          onChange={(e) =>
-                            field.onChange(
-                              e.target.value ? parseInt(e.target.value) : ''
-                            )
+                          inputMode="numeric"
+                          onValueChange={(value) =>
+                            field.onChange(value ?? Number.NaN)
                           }
+                          value={field.value}
                         />
                       </FormControl>
                       <FormDescription>
@@ -596,18 +609,17 @@ export function ProviderForm({
                   <FormItem>
                     <FormLabel>Timeout (seconds)</FormLabel>
                     <FormControl>
-                      <Input
-                        {...field}
-                        type="number"
+                      <NumberInput
+                        name={field.name}
+                        ref={field.ref}
+                        onBlur={field.onBlur}
                         placeholder="30"
                         min={1}
                         max={300}
-                        onChange={(e) =>
-                          field.onChange(
-                            e.target.value ? parseInt(e.target.value) : 30
-                          )
+                        onValueChange={(value) =>
+                          field.onChange(value ?? Number.NaN)
                         }
-                        value={field.value || 30}
+                        value={field.value}
                       />
                     </FormControl>
                     <FormMessage />
@@ -719,7 +731,10 @@ export function ProviderForm({
               <h4 className="text-sm font-medium mb-2">
                 Webhook Payload Format
               </h4>
-              <pre className="text-xs text-muted-foreground overflow-x-auto">
+              <pre
+                tabIndex={0}
+                className="text-xs text-muted-foreground overflow-x-auto"
+              >
                 <HighlightedCode
                   code={`{
   "id": "notification-uuid",

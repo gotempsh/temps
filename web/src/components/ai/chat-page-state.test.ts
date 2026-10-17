@@ -66,7 +66,7 @@ describe('createProjectChat', () => {
       projectName: 'Example project',
       contextType: 'project',
       contextId: 'fresh-context-id',
-      title: 'Project chat',
+      title: 'Service chat',
       autoStart: false,
     })
   })

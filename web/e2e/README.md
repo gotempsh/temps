@@ -35,7 +35,9 @@ e2e/
     command-palette.spec.ts   command palette search/navigation
   authenticated/               specs that reuse the saved session
     navigation.spec.ts        every sidebar destination renders real content
-    project-create.spec.ts    creates a project from a public git URL
+    project-create.spec.ts    creates a service from a public git URL
+    project-list-grouping.spec.ts  /projects: services-rename notice, empty
+                              install vs empty project card (route-mocked)
     api-key-create.spec.ts    RBAC role-assignment wizard; the minted secret authenticates
     user-creation.spec.ts     user creation + team-assignment retry (route-mocked)
     drop-handoff.spec.ts      empty-state ZIP/folder upload handoff (route-mocked)

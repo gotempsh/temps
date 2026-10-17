@@ -170,7 +170,7 @@ export function DomainChallengeStep({
             {wildcardDomain}
           </code>
           <br />
-          This will allow all your projects to use subdomains automatically.
+          This will allow all your services to use subdomains automatically.
         </AlertDescription>
       </Alert>
 

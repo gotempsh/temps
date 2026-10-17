@@ -119,6 +119,12 @@ const aiNavItems: PlatformNavItem[] = [
     featureKey: 'ai-gateway',
   },
   {
+    title: 'Limits',
+    url: '/ai-gateway/limits',
+    icon: Gauge,
+    featureKey: 'ai-gateway',
+  },
+  {
     title: 'Activity',
     url: '/ai-gateway/activity',
     icon: Activity,
@@ -481,7 +487,10 @@ function GettingStartedNavItem() {
               tooltip={`Platform setup — ${completedCount}/${totalCount}`}
               className="justify-center"
             >
-              <Link to="/setup">
+              <Link
+                to="/setup"
+                aria-label={`Platform setup, ${completedCount} of ${totalCount} steps complete`}
+              >
                 <BadgeCheck />
               </Link>
             </SidebarMenuButton>
@@ -982,7 +991,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         backLabel="Back to menu"
       />
       <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Project navigation">
+        <SidebarMenu aria-label="Service navigation">
           {items.map((item) => (
             <SidebarMenuItem key={item.section} data-tour={item.section}>
               <SidebarMenuButton

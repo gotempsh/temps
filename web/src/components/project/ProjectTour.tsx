@@ -48,7 +48,7 @@ const STEPS: TourStep[] = [
     route: 'project',
     anchor: 'project',
     title: 'Overview',
-    body: 'Your project home — deployments, status and setup all live here.',
+    body: 'Your service home — deployments, status and setup all live here.',
   },
   {
     route: 'analytics',

@@ -131,7 +131,7 @@ test('Compose policy exceptions require acknowledgment and persist independently
     await expect(completeMigration).toBeDisabled()
     await page
       .getByRole('checkbox', {
-        name: 'I have reviewed the exceptions this project needs for its next deployment.',
+        name: 'I have reviewed the exceptions this service needs for its next deployment.',
       })
       .check()
     await completeMigration.click()

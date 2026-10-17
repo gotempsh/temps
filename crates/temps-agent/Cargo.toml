@@ -36,6 +36,7 @@ bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
 temps-auth = { path = "../temps-auth" }
 temps-deployer = { path = "../temps-deployer" }
+temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network" }
 temps-wireguard = { path = "../temps-wireguard" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }
@@ -60,3 +61,5 @@ tempfile = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `test-util` provides the paused clock the build-queue tests use.
+tokio = { workspace = true, features = ["test-util"] }

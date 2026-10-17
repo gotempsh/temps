@@ -2417,4 +2417,113 @@ mod tests {
             }
         }
     }
+
+    // ── Wire compression against a server whose default codec is ZSTD ────
+    //
+    // ClickHouse 26.9 made ZSTD the default `network_compression_method`; the
+    // `clickhouse` client only decodes LZ4, so before the compression mode was
+    // pinned every row-returning query failed with `decompression error:
+    // incorrect magic number` and the migrations never applied. This drives
+    // the production `ClickHouseBackend` + migration runner against a stock
+    // 26.9 server in both modes. Skips when Docker is unavailable.
+
+    #[tokio::test]
+    async fn backend_decodes_and_migrates_in_both_compression_modes_on_a_zstd_default_server() {
+        use temps_analytics_backend::clickhouse::{ClickHouseBackend, ClickHouseConfig};
+        use temps_analytics_backend::AnalyticsBackend;
+        use temps_clickhouse::ClickHouseCompression;
+        use testcontainers::{
+            core::{wait::HttpWaitStrategy, ContainerPort, Mount, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+
+        let image = GenericImage::new("clickhouse/clickhouse-server", "26.9")
+            .with_exposed_port(ContainerPort::Tcp(8123))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/ping")
+                    .with_port(ContainerPort::Tcp(8123))
+                    .with_expected_status_code(200u16),
+            ))
+            .with_env_var("CLICKHOUSE_PASSWORD", "test")
+            // Data is throwaway; keep it off the Docker disk.
+            .with_mount(Mount::tmpfs_mount("/var/lib/clickhouse"))
+            .with_mount(Mount::tmpfs_mount("/var/log/clickhouse-server"));
+        let container = match image.start().await {
+            Ok(container) => container,
+            Err(e) => {
+                eprintln!("Skipping ClickHouse compression test: cannot start container ({e})");
+                return;
+            }
+        };
+        let (Ok(host), Ok(port)) = (
+            container.get_host().await,
+            container.get_host_port_ipv4(8123).await,
+        ) else {
+            eprintln!("Skipping ClickHouse compression test: cannot resolve container address");
+            return;
+        };
+        let url = format!("http://{host}:{port}");
+
+        // Wait for the HTTP query path with the uncompressed client, which has
+        // no codec to disagree about.
+        let waiter = ClickHouseBackend::new(
+            ClickHouseConfig::new(&url, "default", "default", "test")
+                .with_compression(ClickHouseCompression::None),
+        )
+        .client_clone();
+        let mut ready = false;
+        for _ in 0..50 {
+            if waiter.query("SELECT 1").execute().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if !ready {
+            eprintln!("Skipping ClickHouse compression test: server never became ready");
+            return;
+        }
+
+        for mode in ClickHouseCompression::ALL {
+            // The analytics migration runner works in the client's database
+            // and does not create it.
+            let database = format!("analytics_{mode}");
+            waiter
+                .query(&format!("CREATE DATABASE IF NOT EXISTS `{database}`"))
+                .execute()
+                .await
+                .unwrap_or_else(|e| panic!("{mode} mode: create database failed: {e}"));
+
+            let backend = ClickHouseBackend::new(
+                ClickHouseConfig::new(&url, &database, "default", "test").with_compression(mode),
+            );
+            backend
+                .health_check()
+                .await
+                .unwrap_or_else(|e| panic!("{mode} mode: health check failed: {e}"));
+
+            let client = backend.client_clone();
+            let report = temps_analytics_backend::migrations::apply_migrations(&client)
+                .await
+                .unwrap_or_else(|e| panic!("{mode} mode: migrations failed: {e}"));
+            assert_eq!(report.applied.len(), 6, "{mode} mode: {:?}", report.applied);
+
+            // Reading the tracking table back is a row-returning query: the
+            // exact shape that failed with a ZSTD-default server.
+            let recorded = client
+                .query("SELECT name FROM _temps_ch_migrations FINAL ORDER BY name")
+                .fetch_all::<String>()
+                .await
+                .unwrap_or_else(|e| panic!("{mode} mode: reading tracking rows failed: {e}"));
+            assert_eq!(recorded.len(), 6, "{mode} mode: {recorded:?}");
+            assert_eq!(recorded[0], "0001_events", "{mode} mode");
+
+            // A second pass skips everything.
+            let again = temps_analytics_backend::migrations::apply_migrations(&client)
+                .await
+                .unwrap_or_else(|e| panic!("{mode} mode: second pass failed: {e}"));
+            assert!(again.applied.is_empty(), "{mode} mode");
+        }
+    }
 }

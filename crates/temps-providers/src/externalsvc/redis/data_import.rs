@@ -132,7 +132,7 @@ impl RedisService {
         const ABANDONED: u8 = 2;
 
         let operation = format!("allocate a logical database for '{resource}'");
-        let worker = RedisService::new(self.name.clone(), self.docker.clone());
+        let worker = RedisService::new(self.instance_name(), self.docker.clone());
         *worker.config.write().await = Some(redis.clone());
         let state = Arc::new(AtomicU8::new(RUNNING));
         let task_state = state.clone();

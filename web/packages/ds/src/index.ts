@@ -46,7 +46,14 @@ export {
   type TimeChartBand,
   type TimeChartMarker,
 } from './time-chart'
-export { useUrlState, type UrlState, type UrlStateValue } from './url-state'
+export {
+  useComposedSearchParams,
+  useUrlBoundText,
+  useUrlSearchText,
+  useUrlState,
+  type UrlState,
+  type UrlStateValue,
+} from './url-state'
 export { notify } from './notify'
 export * from './fmt'
 
@@ -86,6 +93,12 @@ export { SettingsGroup } from './settings-group'
 
 export { RecordLink } from './record-link'
 
-export { Tabs, TabsList, TabsTrigger, TabsContent, ScrollableTabsList } from '@temps-sdk/ui'
+export {
+  Tabs,
+  TabsList,
+  TabsTrigger,
+  TabsContent,
+  ScrollableTabsList,
+} from '@temps-sdk/ui'
 
 export { CredentialProviderMark } from './credential-provider-mark'

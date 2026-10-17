@@ -67,7 +67,7 @@ function stageLabel(
       return 'Starting deployment'
     default:
       if (detectedLabel) return `Deploy ${detectedLabel}`
-      return hasFiles ? 'Retry preset detection' : 'Select project files'
+      return hasFiles ? 'Retry preset detection' : 'Select source files'
   }
 }
 
@@ -242,7 +242,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
         return
       }
 
-      if (!candidate) throw new Error('Choose a detected project')
+      if (!candidate) throw new Error('Choose a detected app')
 
       // Only persist directory/preset, and only when they actually changed.
       const currentDirectory =
@@ -417,7 +417,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
 
                 {inspection && inspection.candidates.length > 1 && (
                   <div className="space-y-2">
-                    <Label>Detected projects</Label>
+                    <Label>Detected apps</Label>
                     <DetectedPresetGrid
                       candidates={inspection.candidates}
                       selectedIndex={Number(candidateIndex)}

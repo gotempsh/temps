@@ -209,7 +209,7 @@ export function ProjectOverview({
     <>
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <div className="@container/overview">
-        <div className="grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">
             <CardHeader className="flex flex-row items-start justify-between gap-4 pb-2">
               <div className="min-w-0">
@@ -330,11 +330,11 @@ export function ProjectOverview({
           />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <EnvironmentHealthCard project={project} />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <TopRoutesCard
             projectSlug={project.slug}
             routes={topRoutes}
@@ -372,7 +372,7 @@ export function ProjectOverview({
           className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
         >
           <Sparkles className="size-4 shrink-0" />
-          Take a tour of your project
+          Take a tour of your service
         </button>
       </div>
     </>
@@ -435,7 +435,7 @@ function VisitorAnalyticsCard({
               <p className="font-medium">Add browser analytics</p>
               <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
                 Track visitors, page views, and returning activity from this
-                project.
+                service.
               </p>
             </div>
             <Button variant="outline" size="sm" asChild>
@@ -581,7 +581,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
         {isLoading ? (
           <Skeleton className="h-52 w-full" />
         ) : !environment ? (
-          <SignalError message="No environments found for this project." />
+          <SignalError message="No environments found for this service." />
         ) : notConfigured ? (
           <div className="flex h-52 flex-col items-start justify-center gap-3 rounded-md border border-dashed p-5">
             <div>
@@ -702,7 +702,7 @@ function TopRoutesCard({
         ) : routes.length === 0 ? (
           <CompactListEmpty
             title="No paths recorded"
-            detail="Routes appear here as soon as the project receives traffic."
+            detail="Routes appear here as soon as the service receives traffic."
           />
         ) : (
           <div>

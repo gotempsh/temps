@@ -1447,24 +1447,23 @@ fn normalize_acme_contact_email(email: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Configure on-demand HTTP-01 TLS only when certificate issuance can work.
+/// Enable on-demand HTTP-01 TLS whenever the preview domain is a public zone.
 ///
-/// A public zone without an ACME contact is not a partially configured state:
-/// every issuance is guaranteed to fail. Keep the feature disabled until setup
-/// has persisted a contact, and clear stale state when setup is re-run in local
-/// mode or without one.
+/// Setup turns it on for every install that can be reached by Let's Encrypt and
+/// records the zone, so stable environment URLs not covered by a wildcard
+/// certificate get HTTPS without a further step. A loopback or private zone is
+/// not reachable for the HTTP-01 challenge, so setup clears any stale state when
+/// it is re-run in local mode.
+///
+/// The ACME contact email is deliberately not a precondition: it can be set
+/// after setup (`letsencrypt.email`) and is resolved on every issuance, so the
+/// feature starts working without a restart. Until then issuance fails with a
+/// clear "no ACME contact email configured" error, and the proxy warns at boot.
 fn configure_on_demand_tls(app_settings: &mut AppSettings, preview_domain: &str) {
     let zone = preview_domain.trim();
-    let has_acme_contact = app_settings
-        .letsencrypt
-        .email
-        .as_deref()
-        .and_then(normalize_acme_contact_email)
-        .is_some();
     let sslip_ip_is_public =
         sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
-    let can_issue =
-        !zone.is_empty() && !is_loopback_zone(zone) && sslip_ip_is_public && has_acme_contact;
+    let can_issue = !zone.is_empty() && !is_loopback_zone(zone) && sslip_ip_is_public;
 
     app_settings.on_demand_tls.enabled = can_issue;
     app_settings.on_demand_tls.zone = can_issue.then(|| zone.to_ascii_lowercase());
@@ -3415,24 +3414,23 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_tls_requires_a_public_zone_and_acme_contact() {
+    fn on_demand_tls_is_enabled_for_a_public_zone_without_waiting_for_a_contact() {
         let mut settings = AppSettings::default();
+        assert!(settings.letsencrypt.email.is_none());
 
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("not-an-email".to_string());
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("certs@example.com".to_string());
         configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ");
         assert!(settings.on_demand_tls.enabled);
         assert_eq!(
             settings.on_demand_tls.zone.as_deref(),
             Some("1-1-1-1.sslip.io")
+        );
+
+        settings.letsencrypt.email = Some("certs@example.com".to_string());
+        configure_on_demand_tls(&mut settings, "apps.example.com");
+        assert!(settings.on_demand_tls.enabled);
+        assert_eq!(
+            settings.on_demand_tls.zone.as_deref(),
+            Some("apps.example.com")
         );
 
         configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io");
@@ -3442,6 +3440,9 @@ mod tests {
         configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io");
         assert!(!settings.on_demand_tls.enabled);
         assert_eq!(settings.on_demand_tls.zone, None);
+
+        configure_on_demand_tls(&mut settings, "localhost");
+        assert!(!settings.on_demand_tls.enabled);
     }
 
     #[test]

@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Nextest configuration for the whole workspace.
+#
+# Why this file exists: before it, nothing killed a stuck test. One test that
+# awaited something that never completed held a CI job until the job's
+# `timeout-minutes` cancelled it, ~90 minutes later, with no test named in the
+# log -- nextest buffers a test's output until the test ends, so a hung test
+# prints nothing at all. A timeout turns that into a `TIMEOUT` line naming the
+# test, a few minutes in, and (with nextest's default fail-fast) stops the run.
+#
+# The timeouts are deliberately loose: they are a backstop for hangs, not a
+# performance budget. The slowest legitimate tests seen in CI are the Docker
+# ones; measured on a warm runner, the heaviest take 2-3 minutes, and a cold
+# runner pulling the PostgreSQL / TimescaleDB images roughly doubles that.
+#
+# `period` is how often a slow test is reported (`SLOW [> 60s]`), and
+# `terminate-after` is how many periods pass before the test is killed, so the
+# kill happens at `period * terminate-after`.
+
+[profile.default]
+# 60s * 10 = 10 minutes for any single test. Every unit/integration group in
+# rust-tests.yml reads this profile.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# Tests that legitimately run for minutes. Each provisions several containers
+# and streams a real dump/restore or backup, so they get 20 minutes.
+#
+#   orchestrator_*                PostgreSQL major-version upgrade runs; two
+#                                 image pulls plus dump/restore, 2-6 minutes
+#                                 each on a cold runner.
+#   *_backup_and_restore_to_s3    An S3-compatible container plus a service
+#                                 container and a WAL-G / mongodump stream.
+#   mariadb_pitr_full_chain_e2e   Full binlog point-in-time-recovery chain; its
+#                                 CI step already caps the whole run at 20m.
+#   binary(starters)              temps-presets starters: real builds with a
+#                                 900s build budget of their own.
+[[profile.default.overrides]]
+filter = 'test(~orchestrator_) or test(~backup_and_restore_to_s3) or test(~mariadb_pitr_full_chain_e2e) or binary(starters)'
+slow-timeout = { period = "120s", terminate-after = 10 }

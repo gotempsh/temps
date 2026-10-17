@@ -55,6 +55,31 @@ test.describe('command palette', () => {
       })
     })
 
+    // Project groups ("Projects" in the console) are searched alongside the
+    // services; one fixed group keeps the ranking below deterministic.
+    await page.route(/\/api\/project-groups(?:\?|$)/, async (route) => {
+      await route.fulfill({
+        contentType: 'application/json',
+        json: {
+          groups: [
+            {
+              id: 77,
+              name: 'Checkout Suite',
+              slug: 'checkout-suite',
+              description: null,
+              repository: null,
+              created_at: '2026-09-01T00:00:00Z',
+              updated_at: '2026-09-01T00:00:00Z',
+              projects: [],
+            },
+          ],
+          page: 1,
+          page_size: 100,
+          total: 1,
+        },
+      })
+    })
+
     await page.goto('/settings')
     await expectAppMounted(page)
     await page.getByRole('button', { name: /Find/ }).click()
@@ -92,7 +117,7 @@ test.describe('command palette', () => {
   // "Results" (the fixed per-section groups only render on an empty input) --
   // so ordering, not grouping, is what carries the priority guarantee now.
   // The section a hit came from rides along as a right-aligned label.
-  test('prioritizes project matches over common pages', async ({ page }) => {
+  test('prioritizes service matches over common pages', async ({ page }) => {
     await page.getByRole('combobox').fill('monitor')
 
     const headings = page.locator('[cmdk-group-heading]')
@@ -124,7 +149,9 @@ test.describe('command palette', () => {
 
     // Each hit still says which section it came from, since the grouping no
     // longer does.
-    await expect(project.locator(':scope > span').last()).toHaveText('Project')
+    // A deployable app is a Service in the console; "Project" now names a
+    // group of services.
+    await expect(project.locator(':scope > span').last()).toHaveText('Service')
     await expect(navigation.locator(':scope > span').last()).toHaveText(
       'Navigation'
     )
@@ -132,6 +159,19 @@ test.describe('command palette', () => {
     // Icons survive the flattening: projects render an avatar, pages an svg.
     await expect(project.locator(':scope > span').first()).toBeVisible()
     await expect(navigation.locator(':scope > svg')).toHaveCount(1)
+  })
+
+  test('finds a project (group of services) and opens its overview', async ({
+    page,
+  }) => {
+    await page.getByRole('combobox').fill('checkout')
+
+    const group = page.locator('[cmdk-item][data-value="group:77"]')
+    await expect(group).toBeVisible()
+    await expect(group.locator(':scope > span').last()).toHaveText('Project')
+
+    await group.click()
+    await expect(page).toHaveURL(/\/p\/checkout-suite$/)
   })
 
   test('finds Temps Cloud by name and by what it does', async ({ page }) => {

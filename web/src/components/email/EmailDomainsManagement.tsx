@@ -17,6 +17,7 @@ import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -54,7 +55,7 @@ import {
   Info,
   RefreshCw,
 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { problemMessage } from './sharedUtils'
@@ -133,6 +134,7 @@ function StatusDot({
           : 'Unknown'
   return (
     <span
+      role="img"
       className={cn(
         'inline-block size-2 rounded-full ring-2 ring-background',
         tone,
@@ -230,7 +232,7 @@ function DnsRecordStatusBadge({
   switch (status) {
     case 'verified':
       return (
-        <div className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span className="text-xs font-medium">Verified</span>
         </div>
@@ -313,7 +315,7 @@ export function DnsVerificationSummary({
   if (allVerified) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/30">
-        <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-500" />
+        <CheckCircle2 className="size-5 text-emerald-700 dark:text-emerald-500" />
         <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
           All {totalCount} required DNS records verified successfully
         </span>
@@ -325,7 +327,7 @@ export function DnsVerificationSummary({
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border bg-muted/40 p-3">
       <span className="text-sm font-medium">DNS status</span>
       {verifiedCount > 0 && (
-        <div className="flex items-center gap-1 text-sm text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1 text-sm text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span>{verifiedCount} verified</span>
         </div>
@@ -480,6 +482,7 @@ function LoadingSkeleton() {
 export function EmailDomainsManagement() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [domainToDelete, setDomainToDelete] = useState<EmailDomain | null>(null)
 
   const domainsQuery = useQuery({
     queryKey: ['email-domains'],
@@ -564,10 +567,10 @@ export function EmailDomainsManagement() {
     onError: (error: Error) => {
       toast.error('Failed to delete domain', { description: error.message })
     },
+    onSettled: () => setDomainToDelete(null),
   })
 
   const handleVerify = (id: number) => verifyMutation.mutate(id)
-  const handleDelete = (id: number) => deleteMutation.mutate(id)
   const handleOpen = (id: number) => navigate(`/email/domains/${id}`)
 
   // Provider lookup by id — avoids N+1 fetches per row.
@@ -787,7 +790,7 @@ export function EmailDomainsManagement() {
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
-                            onClick={() => handleDelete(domain.id)}
+                            onClick={() => setDomainToDelete(domain)}
                           >
                             Delete
                           </DropdownMenuItem>
@@ -803,6 +806,20 @@ export function EmailDomainsManagement() {
           </div>
         </>
       )}
+
+      <ConfirmDeleteDialog
+        open={domainToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="email domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences="Email can no longer be sent from this domain, and its DNS records are no longer tracked."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (domainToDelete) deleteMutation.mutate(domainToDelete.id)
+        }}
+      />
     </div>
   )
 }

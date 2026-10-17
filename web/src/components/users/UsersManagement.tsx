@@ -11,20 +11,11 @@ import {
   removeRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { RouteUserWithRoles } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
@@ -44,7 +35,10 @@ import { EmptyState } from '@/components/ui/empty-state'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useAuth } from '@/contexts/AuthContext'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -66,12 +60,12 @@ const availableRoles = [
   {
     value: 'admin',
     label: 'Administrator',
-    description: 'Full control of projects, users, settings, and the system.',
+    description: 'Full control of services, users, settings, and the system.',
   },
   {
     value: 'user',
     label: 'User',
-    description: 'Can deploy and operate every existing and future project.',
+    description: 'Can deploy and operate every existing and future service.',
   },
 ]
 
@@ -94,12 +88,17 @@ export function UsersManagement({
   reloadUsers,
   onEditUser,
 }: UsersManagementProps) {
-  const [userToDelete, setUserToDelete] = useState<number | null>(null)
+  const [userToDelete, setUserToDelete] = useState<RouteUserWithRoles | null>(
+    null
+  )
   const [userToManageRoles, setUserToManageRoles] =
     useState<RouteUserWithRoles | null>(null)
   const [userToResetPassword, setUserToResetPassword] =
     useState<ResetPasswordTarget | null>(null)
   const { user: currentUser } = useAuth()
+  // Creating a user needs `users:write`, which only instance administrators
+  // hold; offering it to anyone else just leads to a refusal.
+  const canManageUsers = useIsInstanceAdmin()
   const queryClient = useQueryClient()
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
@@ -181,20 +180,13 @@ export function UsersManagement({
     },
   })
 
-  const handleDeleteUser = async (userId: number) => {
-    await deleteUser.mutateAsync({
-      path: {
-        user_id: userId,
-      },
-    })
-  }
-
   const handleRoleChange = async (
     userId: number,
     roleType: string,
     currentRoles: string[]
   ) => {
     // Remove all existing roles first (since only one role can be active)
+    // confirm-delete-guard: ignore -- part of switching a user's role, which the role dialog confirms
     for (const existingRole of currentRoles) {
       if (existingRole !== roleType) {
         await removeRole.mutateAsync({
@@ -237,38 +229,48 @@ export function UsersManagement({
         title="Users"
         description="Manage user access and roles"
         actions={
-          <CreateActionButton
-            onClick={() => navigate('/settings/users/new')}
-            label="Add User"
-            icon={<UserPlus className="h-4 w-4" />}
-          />
+          // Not rendered at all for a role that cannot use it: a disabled
+          // administrative action only invites the question why.
+          canManageUsers ? (
+            <CreateActionButton
+              onClick={() => navigate('/settings/users/new')}
+              label="Add User"
+              icon={<UserPlus className="h-4 w-4" />}
+            />
+          ) : undefined
         }
       />
 
-      <AlertDialog
+      {!canManageUsers && (
+        <AdminOnlyNote
+          action="add, edit or remove users"
+          role={currentUser?.role}
+        />
+      )}
+
+      <ConfirmDeleteDialog
         open={userToDelete !== null}
-        onOpenChange={(open) => !open && setUserToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              user and remove their access to the platform.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => userToDelete && handleDeleteUser(userToDelete)}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteUser.isPending}
-            >
-              {deleteUser.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setUserToDelete(null)
+        }}
+        resourceType="user"
+        resourceName={
+          userToDelete?.user.name ||
+          userToDelete?.user.username ||
+          userToDelete?.user.email ||
+          `#${userToDelete?.user.id ?? ''}`
+        }
+        consequences={
+          userToDelete?.user.email
+            ? `${userToDelete.user.email} will lose access to the platform and its sessions will end.`
+            : 'This user will lose access to the platform and its sessions will end.'
+        }
+        isPending={deleteUser.isPending}
+        onConfirm={() => {
+          if (userToDelete)
+            deleteUser.mutate({ path: { user_id: userToDelete.user.id } })
+        }}
+      />
 
       <Dialog
         open={!!userToManageRoles}
@@ -408,19 +410,22 @@ export function UsersManagement({
         <ReadFailure
           resource="Users"
           error={error}
-          onRetry={reloadUsers}
+          onRetry={isForbiddenRead(error) ? undefined : reloadUsers}
           retrying={retrying}
         />
       ) : !users?.length ? (
         <EmptyState
+          size="compact"
           icon={UserPlus}
           title="No users found"
           description="Get started by creating a new user."
           action={
-            <Button onClick={() => navigate('/settings/users/new')}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add User
-            </Button>
+            canManageUsers ? (
+              <Button onClick={() => navigate('/settings/users/new')}>
+                <Plus className="mr-2 h-4 w-4" />
+                Add User
+              </Button>
+            ) : undefined
           }
         />
       ) : (
@@ -478,61 +483,72 @@ export function UsersManagement({
                   </div>
                 </div>
                 <div className="relative z-10 ml-4">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon">
-                        <MoreHorizontal className="h-4 w-4" />
-                        <span className="sr-only">Open menu</span>
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        onClick={() =>
-                          onEditUser({
-                            id: user.user.id,
-                            name: user.user.username || user.user.name || '',
-                            email: user.user.email || '',
-                          })
-                        }
-                      >
-                        <Edit2 className="mr-2 h-4 w-4" />
-                        Edit
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={() => setUserToManageRoles(user)}
-                      >
-                        <Shield className="mr-2 h-4 w-4" />
-                        Manage Roles
-                      </DropdownMenuItem>
-                      {currentUser?.id === user.user.id ? (
-                        <DropdownMenuItem onClick={() => navigate('/account')}>
-                          <KeyRound className="mr-2 h-4 w-4" />
-                          Change your password
-                        </DropdownMenuItem>
-                      ) : (
-                        <DropdownMenuItem
-                          disabled={!!user.user.deleted_at}
-                          onClick={() =>
-                            setUserToResetPassword({
-                              id: user.user.id,
-                              name: user.user.name || user.user.username || '',
-                              email: user.user.email || '',
-                            })
-                          }
-                        >
-                          <KeyRound className="mr-2 h-4 w-4" />
-                          Reset password
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuSeparator />
-                      <DropdownMenuItem
-                        onClick={() => setUserToDelete(user.user.id)}
-                        className="text-destructive"
-                      >
-                        <Trash2 className="mr-2 h-4 w-4" />
-                        Delete
-                      </DropdownMenuItem>
-                    </DropdownMenuContent>
+                  {/* Always mounted; keyed on the permission so a menu left
+                      open when access is revoked does not spring back open
+                      when it is granted again. */}
+                  <DropdownMenu key={canManageUsers ? 'manage' : 'view'}>
+                    {canManageUsers && (
+                      <>
+                        <DropdownMenuTrigger asChild>
+                          <Button variant="ghost" size="icon">
+                            <MoreHorizontal className="h-4 w-4" />
+                            <span className="sr-only">Open menu</span>
+                          </Button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end">
+                          <DropdownMenuItem
+                            onClick={() =>
+                              onEditUser({
+                                id: user.user.id,
+                                name:
+                                  user.user.username || user.user.name || '',
+                                email: user.user.email || '',
+                              })
+                            }
+                          >
+                            <Edit2 className="mr-2 h-4 w-4" />
+                            Edit
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            onClick={() => setUserToManageRoles(user)}
+                          >
+                            <Shield className="mr-2 h-4 w-4" />
+                            Manage Roles
+                          </DropdownMenuItem>
+                          {currentUser?.id === user.user.id ? (
+                            <DropdownMenuItem
+                              onClick={() => navigate('/account')}
+                            >
+                              <KeyRound className="mr-2 h-4 w-4" />
+                              Change your password
+                            </DropdownMenuItem>
+                          ) : (
+                            <DropdownMenuItem
+                              disabled={!!user.user.deleted_at}
+                              onClick={() =>
+                                setUserToResetPassword({
+                                  id: user.user.id,
+                                  name:
+                                    user.user.name || user.user.username || '',
+                                  email: user.user.email || '',
+                                })
+                              }
+                            >
+                              <KeyRound className="mr-2 h-4 w-4" />
+                              Reset password
+                            </DropdownMenuItem>
+                          )}
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onClick={() => setUserToDelete(user)}
+                            className="text-destructive"
+                          >
+                            <Trash2 className="mr-2 h-4 w-4" />
+                            Delete
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </>
+                    )}
                   </DropdownMenu>
                 </div>
               </div>

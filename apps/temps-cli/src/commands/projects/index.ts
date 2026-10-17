@@ -8,6 +8,8 @@ import { show } from './show.js'
 import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
 import { projectSourceAction } from './source.js'
+import { projectHostingAction } from './hosting.js'
+import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 import { cloudflareCapabilityAction } from './cloudflare-capability.js'
 
@@ -16,14 +18,17 @@ export function registerProjectsCommands(program: Command): void {
     .command('projects')
     .alias('project')
     .alias('p')
-    .description('Manage projects')
+    .description(
+      'Manage services: each one deployable app (the console calls these Services). ' +
+        'To group services that ship together into a Project, as the console calls it, use `project-groups`.'
+    )
 
   registerProjectSecretsCommands(projects)
 
   projects
     .command('list')
     .alias('ls')
-    .description('List all projects')
+    .description('List all services')
     .option('--json', 'Output in JSON format')
     .option('--page <n>', 'Page number')
     .option('--per-page <n>', 'Items per page')
@@ -32,24 +37,25 @@ export function registerProjectsCommands(program: Command): void {
   projects
     .command('create')
     .alias('new')
-    .description('Create a new project (git-based or manual deployment)')
-    .option('-n, --name <name>', 'Project name')
-    .option('-d, --description <description>', 'Project description')
+    .description('Create a new service (git-based or manual deployment); add it to a project with `project-groups add`')
+    .option('-n, --name <name>', 'Service name')
+    .option('-d, --description <description>', 'Service description')
     .option('--repo <repository>', 'Repository in owner/name format (nested groups supported: group/subgroup/name)')
     .option('--branch <branch>', 'Git branch')
     .option('--directory <directory>', 'Root directory (relative to repo)')
     .option('--preset <preset>', 'Build preset (e.g., nextjs, nodejs, static, docker)')
     .option('--connection <id>', 'Git connection ID')
-    .option('--manual', 'Create a manual (non-git) project - deploy via Docker image or static files')
+    .option('--manual', 'Create a manual (non-git) service - deploy via Docker image or static files')
     .option(
       '--source-type <type>',
       'Manual deployment method: manual (flexible), docker_image, or static_files'
     )
     .option('--image <image>', 'Docker image for the first deployment (manual mode)')
     .option('--port <port>', 'Application/container port (manual mode, default: 3000)')
+    .option('--external', 'The app runs elsewhere (Vercel, Netlify, a VPS): Temps only receives its telemetry and never deploys it (needs --name with --yes)')
     .option(
       '--delivery-provider <provider>',
-      'Delivery provider for the new project: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`)'
+      'Delivery provider for the new service: none, cloudflare or bunny (default: instance setting; see `projects cloudflare-capability`)'
     )
     .option('-y, --yes', 'Skip optional prompts (services, env vars, set-default)')
     .action(create)
@@ -57,22 +63,29 @@ export function registerProjectsCommands(program: Command): void {
   projects
     .command('cloudflare-capability')
     .alias('delivery-capability')
-    .description('Show whether Cloudflare/Bunny delivery is ready and which one new projects get by default')
+    .description('Show whether Cloudflare/Bunny delivery is ready and which one new services get by default')
     .option('--json', 'Output in JSON format')
     .action(cloudflareCapabilityAction)
 
   projects
     .command('show')
     .alias('get')
-    .description('Show project details')
-    .option('-p, --project <project>', 'Project slug or ID')
+    .description('Show service details, including the project (group) it belongs to')
+    .option('-p, --project <project>', 'Service slug or ID')
     .option('--json', 'Output in JSON format')
     .action(show)
 
   projects
+    .command('group')
+    .description('Show which project (group of services) a service belongs to')
+    .option('-p, --project <project>', 'Service slug or ID')
+    .option('--json', 'Output in JSON format')
+    .action(projectGroupAction)
+
+  projects
     .command('update')
     .alias('edit')
-    .description('Update project name and description')
+    .description('Update service name and description')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-n, --name <name>', 'New project name')
     .option('-d, --description <description>', 'New project description')
@@ -82,7 +95,7 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('settings')
-    .description('Update project settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
+    .description('Update service settings (name, slug, attack mode, preview environments, vulnerability scanning, image retention)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--name <name>', 'Project display name (does not change the URL)')
     .option('--slug <slug>', 'Project URL slug')
@@ -127,13 +140,20 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('source')
-    .description('Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)')
+    .description('Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--type <type>', 'Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git)')
     .option('--allow-alternate', 'Also accept an uploaded source archive from `drop`, keeping the current source as default')
     .option('--no-allow-alternate', 'Only deploy from the configured source')
     .option('--json', 'Output in JSON format')
     .action(projectSourceAction)
+
+  projects
+    .command('hosting [hosting]')
+    .description('Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--json', 'Output in JSON format')
+    .action(projectHostingAction)
 
   projects
     .command('config')
@@ -154,7 +174,7 @@ export function registerProjectsCommands(program: Command): void {
   projects
     .command('delete')
     .alias('rm')
-    .description('Delete a project')
+    .description('Delete a service')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation (alias for --force)')

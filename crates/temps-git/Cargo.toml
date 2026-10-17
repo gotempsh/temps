@@ -32,7 +32,7 @@ temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-monitoring = { path = "../temps-monitoring" }
-temps-presets = { path = "../temps-presets" }
+temps-presets = { path = "../temps-presets", features = ["openapi"] }
 temps-queue = { path = "../temps-queue" }
 octocrab = { workspace = true }
 serde = { workspace = true }

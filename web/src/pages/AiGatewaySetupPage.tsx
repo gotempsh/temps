@@ -160,7 +160,10 @@ console.log(response.choices[0].message.content);`,
                 value={effectiveSnippetProvider}
                 onValueChange={setSnippetProvider}
               >
-                <SelectTrigger className="h-8 w-full sm:w-[200px]">
+                <SelectTrigger
+                  aria-label="Snippet provider"
+                  className="h-8 w-full sm:w-[200px]"
+                >
                   <SelectValue placeholder="Provider" />
                 </SelectTrigger>
                 <SelectContent>

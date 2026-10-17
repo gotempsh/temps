@@ -211,6 +211,17 @@ impl CustomDomainService {
             )));
         }
 
+        // A hostname attached to a status page (#1412) is reserved for that
+        // page; the proxy would never route it to the project anyway.
+        if temps_entities::status_page_domains::attached_hostname_conflict(self.db.as_ref(), domain)
+            .await?
+        {
+            return Err(CustomDomainError::DuplicateDomain(format!(
+                "'{}' is attached to a status page; remove it there first",
+                domain
+            )));
+        }
+
         Ok(())
     }
 
@@ -436,7 +447,32 @@ impl CustomDomainService {
             ..Default::default()
         };
 
-        let custom_domain = new_custom_domain.insert(self.db.as_ref()).await?;
+        // Claim under the shared hostname lock so a status page cannot attach
+        // the same name between the checks above and this insert (#1412).
+        let txn = self.db.begin().await?;
+        let inserted = async {
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, &domain).await?;
+            if temps_entities::status_page_domains::attached_hostname_conflict(&txn, &domain)
+                .await?
+            {
+                return Err(CustomDomainError::DuplicateDomain(format!(
+                    "'{}' is attached to a status page; remove it there first",
+                    domain
+                )));
+            }
+            Ok(new_custom_domain.insert(&txn).await?)
+        }
+        .await;
+        let custom_domain = match inserted {
+            Ok(custom_domain) => {
+                txn.commit().await?;
+                custom_domain
+            }
+            Err(e) => {
+                let _ = txn.rollback().await;
+                return Err(e);
+            }
+        };
 
         debug!(
             "Custom domain created successfully: {} with ID: {}",

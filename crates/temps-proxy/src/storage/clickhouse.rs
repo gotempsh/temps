@@ -87,6 +87,9 @@ pub struct ClickHouseProxyLogConfig {
     pub database: String,
     pub user: String,
     pub password: String,
+    /// Wire compression, resolved from the stored `clickhouse.compression`
+    /// setting. [`ClickHouseProxyLogConfig::new`] starts at the default (LZ4).
+    pub compression: temps_clickhouse::ClickHouseCompression,
 }
 
 // Manual Debug that masks the password so it can never leak into logs.
@@ -97,6 +100,7 @@ impl std::fmt::Debug for ClickHouseProxyLogConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"***")
+            .field("compression", &self.compression)
             .finish()
     }
 }
@@ -113,7 +117,17 @@ impl ClickHouseProxyLogConfig {
             database: database.into(),
             user: user.into(),
             password: password.into(),
+            compression: temps_clickhouse::ClickHouseCompression::default(),
         }
+    }
+
+    /// Use `compression` for the client built from this config.
+    pub fn with_compression(
+        mut self,
+        compression: temps_clickhouse::ClickHouseCompression,
+    ) -> Self {
+        self.compression = compression;
+        self
     }
 }
 
@@ -632,11 +646,13 @@ impl ClickHouseProxyLogStore {
         config: ClickHouseProxyLogConfig,
         resolver: Arc<dyn temps_core::RetentionResolver>,
     ) -> Self {
-        let client = ::clickhouse::Client::default()
-            .with_url(&config.url)
-            .with_database(&config.database)
-            .with_user(&config.user)
-            .with_password(&config.password);
+        let client = temps_clickhouse::build_client(
+            &config.url,
+            &config.database,
+            &config.user,
+            &config.password,
+            config.compression,
+        );
         Self { client, resolver }
     }
 
@@ -740,6 +756,27 @@ fn sort_column(sort_by: Option<&str>) -> &'static str {
         Some("is_bot") => "is_bot",
         Some("is_system_request") => "is_system_request",
         _ => "timestamp",
+    }
+}
+
+/// Full `ORDER BY` expression for a list page: the requested column, then
+/// `timestamp` and `request_id` as tiebreakers.
+///
+/// Rows sharing the sort value (a status code, a method, a host) would
+/// otherwise come back in an unspecified order and `LIMIT/OFFSET` pages would
+/// overlap, so "Next page" repeats rows. ClickHouse rows carry no serial id;
+/// `request_id` is unique per request. `order_col` is allowlist-derived and
+/// `order_dir` is a fixed enum, so the result is safe to interpolate.
+fn order_by_clause(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+    let order_col = sort_column(sort_by);
+    let order_dir = match sort_order {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    if order_col == "timestamp" {
+        format!("timestamp {order_dir}, request_id {order_dir}")
+    } else {
+        format!("{order_col} {order_dir}, timestamp {order_dir}, request_id {order_dir}")
     }
 }
 
@@ -969,7 +1006,7 @@ impl ClickHouseProxyLogStore {
 impl ProxyLogStorage for ClickHouseProxyLogStore {
     async fn write_batch(
         &self,
-        entries: Vec<CreateProxyLogRequest>,
+        entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
         if entries.is_empty() {
             return Ok(());
@@ -1119,11 +1156,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // exactly the shape the DDL calls out as duplicate-tolerant: the worst
         // case is one retried request showing twice on a page until the next
         // merge, versus merge-on-read over every part on every page load.
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
         let offset = (page.saturating_sub(1)) * page_size;
 
         let select_sql = format!(
@@ -1137,7 +1170,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ? OFFSET ?"
         );
 
@@ -1183,11 +1216,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // Same page projection as `list_with_filters`, minus the count()
         // aggregate — feed callers discard the total. ORDER BY column is
         // allowlist-derived; direction is a fixed enum (injection-safe).
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
         let select_sql = format!(
             "SELECT \
                 toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
@@ -1199,7 +1228,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ?"
         );
 
@@ -2504,7 +2533,7 @@ mod tests {
         entry.is_bot = Some(true);
         entry.bot_name = Some("GPTBot".to_string());
         store
-            .write_batch(vec![entry])
+            .write_batch(&[entry])
             .await
             .expect("insert proxy-log fixture");
 
@@ -2554,7 +2583,7 @@ mod tests {
         failed.project_id = Some(7);
         failed.status_code = 503;
         store
-            .write_batch(vec![ok, failed])
+            .write_batch(&[ok, failed])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2612,7 +2641,7 @@ mod tests {
         served.status_code = 200;
 
         store
-            .write_batch(vec![upgrade, served])
+            .write_batch(&[upgrade, served])
             .await
             .expect("insert proxy-log fixtures");
 
@@ -2666,7 +2695,7 @@ mod tests {
         crawler.bot_name = Some("ExampleBot".to_string());
 
         store
-            .write_batch(vec![fast, slow_error, monitor, crawler])
+            .write_batch(&[fast, slow_error, monitor, crawler])
             .await
             .expect("insert traffic aggregation fixtures");
 
@@ -2814,7 +2843,7 @@ mod tests {
         no_latency.path = "/api/no-latency".to_string();
         no_latency.response_time_ms = None;
         store
-            .write_batch(vec![no_latency])
+            .write_batch(&[no_latency])
             .await
             .expect("insert traffic fixture without latency");
 
@@ -2850,6 +2879,31 @@ mod tests {
         assert!(dbg.contains("***"));
         assert!(!dbg.contains("super-secret"));
         assert!(dbg.contains("otel"));
+    }
+
+    #[test]
+    fn configured_compression_reaches_the_proxy_log_client() {
+        use temps_clickhouse::ClickHouseCompression;
+
+        let build = |mode| {
+            let store = ClickHouseProxyLogStore::new(
+                ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "pw")
+                    .with_compression(mode),
+                Arc::new(temps_core::FixedRetentionResolver),
+            );
+            format!("{:?}", store.client())
+        };
+
+        let lz4 = build(ClickHouseCompression::Lz4);
+        assert!(lz4.contains("compression: Lz4"), "{lz4}");
+        assert!(
+            lz4.contains("\"network_compression_method\": \"lz4\""),
+            "{lz4}"
+        );
+
+        let none = build(ClickHouseCompression::None);
+        assert!(none.contains("compression: None"), "{none}");
+        assert!(!none.contains("network_compression_method"), "{none}");
     }
 
     #[test]
@@ -3007,6 +3061,23 @@ mod tests {
         assert_eq!(
             opt_headers_json(r#"{"a":"b"}"#.to_string()),
             Some(serde_json::json!({"a": "b"}))
+        );
+    }
+
+    #[test]
+    fn order_by_clause_breaks_ties_with_timestamp_and_request_id() {
+        assert_eq!(
+            order_by_clause(Some("status_code"), Some("asc")),
+            "status_code ASC, timestamp ASC, request_id ASC"
+        );
+        assert_eq!(
+            order_by_clause(Some("method"), None),
+            "method DESC, timestamp DESC, request_id DESC"
+        );
+        // Sorting by timestamp must not repeat the column.
+        assert_eq!(
+            order_by_clause(None, Some("desc")),
+            "timestamp DESC, request_id DESC"
         );
     }
 
@@ -3183,7 +3254,7 @@ mod tests {
             ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
             Arc::new(temps_core::FixedRetentionResolver),
         );
-        assert!(store.write_batch(vec![]).await.is_ok());
+        assert!(store.write_batch(&[]).await.is_ok());
     }
 
     #[tokio::test]
