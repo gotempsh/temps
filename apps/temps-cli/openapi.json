@@ -56655,7 +56655,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/HealthCheckConfig",
-                "description": "Deploy-time probe override; omit to inherit the project probe."
+                "description": "Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged."
               },
               {
                 "type": "null"

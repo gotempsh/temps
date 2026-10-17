@@ -1373,12 +1373,36 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
+    /// Retain paused containers' port metadata to distinguish workers from
+    /// unavailable web applications. Backend construction separately excludes
+    /// paused deployments, even when a container status is stale.
+    async fn load_deployment_containers(
+        &self,
+        deployment: &deployments::Model,
+    ) -> Result<Vec<temps_entities::deployment_containers::Model>, RouteLoadError> {
+        use sea_orm::{ColumnTrait, Condition, QueryFilter};
+        use temps_entities::deployment_containers;
+
+        let mut query = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
+            .filter(deployment_containers::Column::DeletedAt.is_null());
+        if deployment.state != "paused" {
+            query = query.filter(
+                Condition::any()
+                    .add(deployment_containers::Column::ContainerPort.is_null())
+                    .add(deployment_containers::Column::Status.is_null())
+                    .add(deployment_containers::Column::Status.eq("running")),
+            );
+        }
+        Ok(query.all(self.db.as_ref()).await?)
+    }
+
     /// Load all routes from the database into the cache with full models.
     /// This queries environment_domains, custom_routes, and project_custom_domains.
     /// Returns a list of sleeping on-demand environments that were skipped during route loading.
     pub async fn load_routes(&self) -> Result<Vec<SleepingEnvironmentEntry>, RouteLoadError> {
         let _reload_guard = self.route_reload_lock.lock().await;
-        use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::{
             custom_routes, deployments, environment_domains, environments, project_custom_domains,
             settings,
@@ -1487,42 +1511,7 @@ impl CachedPeerTable {
 
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
-                        use temps_entities::deployment_containers;
-                        let containers = if deployment.state == "paused" {
-                            // `pause_deployment` flips this row to "paused" BEFORE
-                            // touching any container, and per-container `status`
-                            // writes happen afterward with best-effort retry — if
-                            // one of those writes fails even after retrying, the
-                            // container row can be left stuck at "running" even
-                            // though Docker actually stopped it. Trusting
-                            // `deployment.state` here (rather than only the
-                            // per-container status) closes that gap: a paused
-                            // deployment is never routable, independent of
-                            // whether every container's own status row caught up.
-                            Vec::new()
-                        } else {
-                            deployment_containers::Entity::find()
-                                .filter(
-                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
-                                )
-                                .filter(deployment_containers::Column::DeletedAt.is_null())
-                                // A container row survives (deleted_at stays NULL) for the
-                                // deployment's whole lifecycle, but `status` still moves
-                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
-                                // deployment pause, or a manual per-container stop) without
-                                // ever being soft-deleted. Only route live traffic to
-                                // containers that are actually up, or where a container has
-                                // never had a status recorded yet.
-                                .filter(
-                                    Condition::any()
-                                        .add(deployment_containers::Column::ContainerPort.is_null())
-                                        .add(deployment_containers::Column::Status.is_null())
-                                        .add(deployment_containers::Column::Status.eq("running")),
-                                )
-                                .all(self.db.as_ref())
-                                .await
-                                .unwrap_or_default()
-                        };
+                        let containers = self.load_deployment_containers(deployment).await?;
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&environment.project_id) {
@@ -1550,7 +1539,7 @@ impl CachedPeerTable {
                             Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
                             })
-                        } else if !containers.is_empty() {
+                        } else if deployment.state != "paused" && !containers.is_empty() {
                             let public_port = project
                                 .and_then(|project| project.preset_config.as_ref())
                                 .and_then(|config| match config {
@@ -1796,36 +1785,7 @@ impl CachedPeerTable {
 
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
-                        use temps_entities::deployment_containers;
-                        let containers = if deployment.state == "paused" {
-                            // See the matching comment in the primary-domain branch
-                            // above: trust `deployment.state` over per-container
-                            // `status`, which can lag behind on a retry-exhausted
-                            // write.
-                            Vec::new()
-                        } else {
-                            deployment_containers::Entity::find()
-                                .filter(
-                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
-                                )
-                                .filter(deployment_containers::Column::DeletedAt.is_null())
-                                // A container row survives (deleted_at stays NULL) for the
-                                // deployment's whole lifecycle, but `status` still moves
-                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
-                                // deployment pause, or a manual per-container stop) without
-                                // ever being soft-deleted. Only route live traffic to
-                                // containers that are actually up, or where a container has
-                                // never had a status recorded yet.
-                                .filter(
-                                    Condition::any()
-                                        .add(deployment_containers::Column::ContainerPort.is_null())
-                                        .add(deployment_containers::Column::Status.is_null())
-                                        .add(deployment_containers::Column::Status.eq("running")),
-                                )
-                                .all(self.db.as_ref())
-                                .await
-                                .unwrap_or_default()
-                        };
+                        let containers = self.load_deployment_containers(deployment).await?;
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&custom_domain.project_id) {
@@ -1864,7 +1824,7 @@ impl CachedPeerTable {
                             Some(BackendType::StaticDir {
                                 path: static_dir.clone(),
                             })
-                        } else if !target_containers.is_empty() {
+                        } else if deployment.state != "paused" && !target_containers.is_empty() {
                             // Container deployment - proxy to containers
                             let mut backend_entries = Vec::with_capacity(target_containers.len());
                             for c in &target_containers {
@@ -2050,34 +2010,7 @@ impl CachedPeerTable {
                 if let Some(deployment) = deployments_cache.get(&deployment_id) {
                     // Load all active containers for this deployment
                     use temps_entities::deployment_containers;
-                    // "paused" is deliberately checked here rather than folded into
-                    // the "accept any state" comment above it: that comment is about
-                    // NOT filtering on state (e.g. "completed") to avoid a race with
-                    // `mark_deployment_complete`'s write ordering. Excluding "paused"
-                    // is unrelated to that race — it's a deliberate, terminal,
-                    // user-initiated state, not a transient one a deploy passes
-                    // through — and (per the matching comment two branches up) it's
-                    // more trustworthy than per-container `status`, which can lag
-                    // behind on a retry-exhausted write.
-                    let containers = if deployment.state == "paused" {
-                        Vec::new()
-                    } else {
-                        deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            // See the matching comment above: `status` (not just
-                            // `deleted_at`) governs routability, so a paused/stopped
-                            // deployment's containers don't keep serving live traffic.
-                            .filter(
-                                Condition::any()
-                                    .add(deployment_containers::Column::ContainerPort.is_null())
-                                    .add(deployment_containers::Column::Status.is_null())
-                                    .add(deployment_containers::Column::Status.eq("running")),
-                            )
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default()
-                    };
+                    let containers = self.load_deployment_containers(deployment).await?;
 
                     // Fetch project if not cached
                     if !projects_cache.contains_key(&env.project_id) {
@@ -2105,7 +2038,7 @@ impl CachedPeerTable {
                         Some(BackendType::StaticDir {
                             path: static_dir.clone(),
                         })
-                    } else if !containers.is_empty() {
+                    } else if deployment.state != "paused" && !containers.is_empty() {
                         // For Compose deployments, the main route uses only
                         // the first explicitly configured public port. A stack
                         // with no public ports remains private instead of
@@ -2520,29 +2453,7 @@ impl CachedPeerTable {
                     environments_cache.get(&env.id),
                 ) {
                     // Load all active containers for this deployment
-                    use temps_entities::deployment_containers;
-                    let containers = if deployment.state == "paused" {
-                        // See the matching comment further up: trust
-                        // `deployment.state` over per-container `status`, which
-                        // can lag behind on a retry-exhausted write.
-                        Vec::new()
-                    } else {
-                        deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            // See the matching comment above: `status` (not just
-                            // `deleted_at`) governs routability, so a paused/stopped
-                            // deployment's containers don't keep serving live traffic.
-                            .filter(
-                                Condition::any()
-                                    .add(deployment_containers::Column::ContainerPort.is_null())
-                                    .add(deployment_containers::Column::Status.is_null())
-                                    .add(deployment_containers::Column::Status.eq("running")),
-                            )
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default()
-                    };
+                    let containers = self.load_deployment_containers(deployment).await?;
 
                     // Determine backend type: static directory or upstream containers
                     let portless = !containers.is_empty()
@@ -2557,7 +2468,7 @@ impl CachedPeerTable {
                         Some(BackendType::StaticDir {
                             path: static_dir.clone(),
                         })
-                    } else if !containers.is_empty() {
+                    } else if deployment.state != "paused" && !containers.is_empty() {
                         let public_port =
                             project
                                 .preset_config
@@ -3971,6 +3882,102 @@ mod tests {
             started_at: Some(now),
             cpu_limit_cores: None,
             port_bindings: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_paused_workers_have_no_live_or_unavailable_hostnames() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::{
+            custom_routes, dns_managed_domains, environment_domains, environments,
+            project_custom_domains, settings,
+        };
+        let now = chrono::Utc::now();
+        let environment: environments::Model = serde_json::from_value(serde_json::json!({
+            "id": 1, "project_id": 1, "name": "production", "slug": "production",
+            "subdomain": "worker-production", "host": "worker.example.com", "upstreams": [],
+            "current_deployment_id": 1, "created_at": now, "updated_at": now,
+            "is_preview": false, "protected": false, "sleeping": false
+        }))
+        .unwrap();
+        let project: projects::Model = serde_json::from_value(serde_json::json!({
+            "id": 1, "name": "worker", "slug": "worker", "repo_name": "worker",
+            "repo_owner": "example", "directory": ".", "main_branch": "main", "preset": "dockerfile",
+            "created_at": now, "updated_at": now, "pull_only_root_directory": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false,
+            "ai_write_actions_enabled": false, "error_source_context_enabled": false,
+            "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
+            "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
+            "preview_envs_wake_timeout_seconds": 30, "source_type": "docker_image", "project_type": temps_entities::types::ProjectType::Server,
+            "cross_project_trace_sharing": true, "cloud_telemetry_fidelity": "metered",
+            "cloud_telemetry_attribute_allowlist": [], "cloud_telemetry_write_mode": "local", "cloud_analytics_write_mode": "local"
+        })).unwrap();
+        let deployment: deployments::Model = serde_json::from_value(serde_json::json!({
+            "id": 1, "project_id": 1, "environment_id": 1, "slug": "worker-deploy",
+            "state": "paused", "created_at": now, "updated_at": now, "docker_socket_mounted": false
+        }))
+        .unwrap();
+        // Exercise every hostname-producing branch in a full reload, including
+        // stale Running metadata left behind by a failed pause-status write.
+        for port in [None, Some(8080)] {
+            for status in ["stopped", "running"] {
+                let mut container = route_test_container(1, None, 8080);
+                container.container_port = port;
+                container.status = Some(status.into());
+                let containers = vec![container];
+                let custom_domain: project_custom_domains::Model = serde_json::from_value(serde_json::json!({
+                    "id": 1, "project_id": 1, "environment_id": 1, "domain": "custom-worker.example.com",
+                    "status": "active", "created_at": now, "updated_at": now
+                })).unwrap();
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![settings::Model {
+                        id: 1,
+                        data: serde_json::json!({"preview_domain":"preview.example.com"}),
+                        created_at: now,
+                        updated_at: now,
+                    }]])
+                    .append_query_results([Vec::<dns_managed_domains::Model>::new()])
+                    .append_query_results([vec![environment_domains::Model {
+                        id: 1,
+                        environment_id: 1,
+                        domain: "worker.example.com".into(),
+                        created_at: now,
+                    }]])
+                    .append_query_results([vec![environment.clone()]])
+                    .append_query_results([vec![deployment.clone()]])
+                    .append_query_results([containers.clone()])
+                    .append_query_results([vec![project.clone()]])
+                    .append_query_results([Vec::<custom_routes::Model>::new()])
+                    .append_query_results([vec![custom_domain]])
+                    .append_query_results([containers.clone()])
+                    .append_query_results([vec![environment.clone()]])
+                    .append_query_results([containers.clone()])
+                    .append_query_results([vec![environment.clone()]])
+                    .append_query_results([containers])
+                    .into_connection();
+                let table = CachedPeerTable::new(Arc::new(db));
+                table
+                    .generation_authoritative
+                    .store(false, Ordering::Release);
+                table.load_routes().await.unwrap();
+                assert!(!table.has_route_for_deployment(1));
+                for host in [
+                    "worker.example.com",
+                    "custom-worker.example.com",
+                    "worker-production",
+                    "worker-production.preview.example.com",
+                ] {
+                    assert!(
+                        table.get_route(host).is_none(),
+                        "paused deployment must not serve {host}"
+                    );
+                    assert_eq!(
+                        table.get_unavailable_route(host).is_some(),
+                        port.is_some(),
+                        "portless worker must not reserve unavailable hostname {host} ({status})"
+                    );
+                }
+            }
         }
     }
 
