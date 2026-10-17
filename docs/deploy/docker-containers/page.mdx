@@ -327,7 +327,7 @@ A Redis subscriber, queue consumer or scheduler can deploy without a dummy HTTP 
 | Probe | Example | Readiness requirement |
 |---|---|---|
 | `http` | `GET /ready` for a web API | Existing HTTP readiness behavior; requires a port. |
-| `tcp` | Connect to a TCP service on port 6379 | A TCP connection succeeds; requires a port. |
+| `tcp` | Connect to a TCP service on port 6379 | A TCP connection succeeds and sends data or remains open for 100 ms; requires a port. Immediate closure/reset behind a port forwarder fails the attempt. |
 | `process` | A Redis subscriber stays running | Continuous `Running` with unchanged restart count for `stable_for` seconds. |
 | `exec` | A dependency check executable exits 0 | The configured command succeeds inside the candidate container. |
 

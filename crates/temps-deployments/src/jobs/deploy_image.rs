@@ -1119,6 +1119,32 @@ fn http_probe_status_is_healthy(status: reqwest::StatusCode) -> bool {
     status.is_success() || status.is_redirection() || matches!(status.as_u16(), 404 | 405)
 }
 
+/// A published-port proxy can complete the handshake before discovering that
+/// the application refuses connections. Reject that immediate EOF/reset rather
+/// than promoting a deployment whose only listener is the forwarding proxy.
+async fn confirm_tcp_probe_connection(
+    stream: &tokio::net::TcpStream,
+    deadline: tokio::time::Instant,
+) -> std::io::Result<()> {
+    let confirmation_deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+    let mut byte = [0_u8; 1];
+    match tokio::time::timeout_at(deadline.min(confirmation_deadline), stream.peek(&mut byte))
+        .await
+    {
+        Ok(Ok(0)) => Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "TCP connection closed before readiness was confirmed; check the application listener behind the published port",
+        )),
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error),
+        Err(_) if confirmation_deadline <= deadline => Ok(()),
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "TCP probe deadline expired before the connection could be confirmed",
+        )),
+    }
+}
+
 impl ReadinessProbeState {
     fn record_transport_error(&mut self, error: &reqwest::Error) {
         self.last_was_connect_error = error.is_connect();
@@ -1335,7 +1361,12 @@ async fn wait_for_non_http_probe(
                     )
                     .await
                     {
-                        Ok(Ok(_)) => return Ok(()),
+                        Ok(Ok(stream)) => {
+                            match confirm_tcp_probe_connection(&stream, attempt_deadline).await {
+                                Ok(()) => return Ok(()),
+                                Err(error) => last_failure = error.to_string(),
+                            }
+                        }
                         Ok(Err(error)) => last_failure = error.to_string(),
                         Err(_) => last_failure = "TCP connection timed out".to_string(),
                     }
@@ -9413,5 +9444,52 @@ mod health_probe_tests {
         )
         .await
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_rejects_a_forwarder_that_accepts_then_closes() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let forwarder = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let error = wait_for_non_http_probe(
+            &ProbeDeployer::running(),
+            "tcp-service",
+            &probe("tcp"),
+            Some(&address),
+            Duration::from_millis(250),
+            None,
+        )
+        .await
+        .unwrap_err();
+        forwarder.abort();
+        assert!(error.to_string().contains("TCP connection closed"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_tcp_confirmation_accepts_a_banner_and_honors_deadlines() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_millis(10)
+        )
+        .await
+        .is_err());
+        server.write_all(b"ready\n").await.unwrap();
+        assert!(confirm_tcp_probe_connection(
+            &stream,
+            tokio::time::Instant::now() + Duration::from_secs(1)
+        )
+        .await
+        .is_ok());
     }
 }
