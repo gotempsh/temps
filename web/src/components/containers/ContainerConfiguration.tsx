@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import {
   ContainerDetailResponse,
   getContainerEnvironmentVariable,
@@ -70,7 +71,7 @@ export function ContainerConfiguration({
           />
           <Field label="Image" mono copyable value={container.image_name} />
           <Field label="Status" value={container.status} />
-          {container.container_port == null ? (
+          {containerWorkload(container) === 'worker' ? (
             <Field
               label="Background worker health at deploy"
               value={container.health_state || 'unknown'}

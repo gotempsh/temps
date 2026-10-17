@@ -10,7 +10,8 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, Order, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    EntityTrait, Iterable, Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -220,6 +221,15 @@ impl OutageDetectionService {
             return false;
         };
         deployments::Entity::find_by_id(current_deployment_id)
+            .select_only()
+            .columns(deployments::Column::iter().filter(|column| !matches!(column, deployments::Column::State)))
+            // Reuse the pause gate for an inapplicable HTTP monitor. This also
+            // suppresses old queued HTTP failures after a worker is promoted,
+            // including the final check under the incident's advisory lock.
+            .column_as(sea_orm::sea_query::Expr::cust(r#"CASE WHEN static_dir_location IS NULL
+                AND EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = deployments.id AND c.deleted_at IS NULL)
+                AND NOT EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = deployments.id AND c.deleted_at IS NULL AND c.container_port IS NOT NULL)
+                THEN 'paused' ELSE state END"#), deployments::Column::State)
             .one(conn)
             .await
             .ok()
@@ -933,6 +943,64 @@ impl OutageDetectionService {
         states.remove(&monitor_id);
     }
 
+    /// Retire HTTP state after an environment adopts a portless worker. No
+    /// recovery notification is sent: no HTTP request proved the service healthy.
+    async fn retire_http_monitor(&self, monitor_id: i32) -> Result<(), OutageError> {
+        let txn = self.db.begin().await?;
+        let monitor = status_monitors::Entity::find_by_id(monitor_id)
+            .one(&txn)
+            .await?
+            .ok_or(OutageError::MonitorNotFound(monitor_id))?;
+        let Some(environment_id) = monitor.environment_id else {
+            return Ok(());
+        };
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [sea_orm::Value::BigInt(Some(i64::from(environment_id)))],
+        ))
+        .await?;
+        // The row lock serializes retirement with deployment promotion. Delayed
+        // retirement events must never reset a newer HTTP deployment's monitor.
+        let environment = environments::Entity::find_by_id(environment_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        let Some(deployment_id) = environment.and_then(|env| env.current_deployment_id) else {
+            return Ok(());
+        };
+        let applies = txn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+SELECT EXISTS (
+  SELECT 1 FROM deployments d WHERE d.id = $1 AND d.static_dir_location IS NULL
+    AND EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = d.id AND c.deleted_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = d.id AND c.deleted_at IS NULL AND c.container_port IS NOT NULL)
+) AS portless"#, [deployment_id.into()])).await?
+            .map(|row| row.try_get::<bool>("", "portless")).transpose()?.unwrap_or(false);
+        if !applies {
+            return Ok(());
+        }
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+INSERT INTO status_checks (monitor_id, status, checked_at, error_message)
+SELECT $1, 'unknown', now(), 'HTTP monitoring does not apply to a background worker'
+WHERE NOT EXISTS (
+  SELECT 1 FROM (SELECT status, error_message FROM status_checks WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT 1) latest
+  WHERE status = 'unknown' AND error_message = 'HTTP monitoring does not apply to a background worker'
+)"#, [monitor_id.into()])).await?;
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE status_incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE monitor_id = $1 AND status != 'resolved'",
+            [monitor_id.into()])).await?;
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE alarms SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE environment_id = $1 AND alarm_type = 'outage' AND status IN ('firing', 'acknowledged') AND metadata->>'monitor_id' = $2",
+            [sea_orm::Value::Int(Some(environment_id)), monitor_id.to_string().into()])).await?;
+        txn.commit().await?;
+        self.clear_monitor_state(monitor_id).await;
+        debug!(
+            monitor_id,
+            environment_id, "Retired HTTP monitor state for background worker"
+        );
+        Ok(())
+    }
+
     /// Start event-driven outage detection by listening to StatusCheckCompleted jobs
     /// This is the primary method for detecting outages in real-time.
     pub async fn start_monitoring(self: Arc<Self>, mut job_receiver: Box<dyn JobReceiver>) {
@@ -946,6 +1014,12 @@ impl OutageDetectionService {
                         job.monitor_id, job.status
                     );
 
+                    if job.status == "not_applicable" {
+                        if let Err(error) = self.retire_http_monitor(job.monitor_id).await {
+                            error!(monitor_id = job.monitor_id, reason = %error, "Failed to retire HTTP monitor state");
+                        }
+                        continue;
+                    }
                     let status = MonitorStatus::from_str(&job.status);
                     match self
                         .process_check(job.monitor_id, status, job.error_message)
@@ -1078,6 +1152,91 @@ pub(crate) mod tests {
             Arc::new(NoopNotificationService),
             Arc::new(NoopJobQueue),
         ))
+    }
+
+    #[tokio::test]
+    async fn health_probe_retirement_clears_stale_http_incidents_and_old_deployment_alarms() {
+        use sea_orm::{MockExecResult, Value};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(1, Some(1))]])
+                .append_query_results([vec![make_environment_model(1, Some(10))]])
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "portless",
+                    Value::Bool(Some(true)),
+                )])]])
+                .append_exec_results((0..4).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .into_connection(),
+        );
+        let notifications = Arc::new(TrackingNotificationService::new());
+        let service = OutageDetectionService::new(
+            db.clone(),
+            notifications.clone(),
+            create_test_alarm_service(db.clone()),
+        );
+        service.monitor_states.write().await.insert(
+            1,
+            MonitorState {
+                status: MonitorStatus::Down,
+                active_incident_id: Some(42),
+                consecutive_failures: 3,
+            },
+        );
+        service.retire_http_monitor(1).await.unwrap();
+        assert!(service.get_monitor_statuses().await.is_empty());
+        assert_eq!(
+            notifications.send_count(),
+            0,
+            "retirement must not claim HTTP recovery"
+        );
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("'unknown'"));
+        assert!(sql.contains("UPDATE status_incidents"));
+        assert!(sql.contains("UPDATE alarms"));
+        assert!(sql.contains("metadata->>'monitor_id'"));
+        assert!(
+            !sql.contains("deployment_id = $"),
+            "old deployment alarms must also retire"
+        );
+        assert!(
+            sql.contains("WHERE NOT EXISTS"),
+            "repeated retirement must not append duplicate unknown checks"
+        );
+        assert!(!sql.contains("'operational'"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_delayed_retirement_does_not_clear_a_new_http_deployment() {
+        use sea_orm::{MockExecResult, Value};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(1, Some(1))]])
+                .append_query_results([vec![make_environment_model(1, Some(20))]])
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "portless",
+                    Value::Bool(Some(false)),
+                )])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = OutageDetectionService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            create_test_alarm_service(db.clone()),
+        );
+        service.retire_http_monitor(1).await.unwrap();
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(!sql.contains("UPDATE status_incidents"));
+        assert!(!sql.contains("UPDATE alarms"));
+        assert!(!sql.contains("INSERT"));
     }
 
     #[test]

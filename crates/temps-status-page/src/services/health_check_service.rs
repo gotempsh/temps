@@ -5,7 +5,7 @@ use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect, Select, Set, TransactionTrait,
+    QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
@@ -747,8 +747,38 @@ impl HealthCheckService {
             debug!(
                 monitor_id = monitor.id,
                 deployment_id = current_deployment_id,
-                "Skipping HTTP monitor for background worker"
+                "Retiring HTTP monitor for background worker"
             );
+            let already_retired = status_checks::Entity::find()
+                .filter(status_checks::Column::MonitorId.eq(monitor.id))
+                .order_by_desc(status_checks::Column::CheckedAt)
+                .order_by_desc(status_checks::Column::Id)
+                .one(db.as_ref())
+                .await?
+                .is_some_and(|check| {
+                    check.status == "unknown"
+                        && check.error_message.as_deref()
+                            == Some("HTTP monitoring does not apply to a background worker")
+                });
+            if already_retired {
+                return Ok(());
+            }
+            // This is retirement of an inapplicable HTTP monitor, not a successful
+            // HTTP check or a runtime worker probe. The outage service rechecks the
+            // current deployment and idempotently retires its old incidents/alarms.
+            job_queue
+                .send(Job::StatusCheckCompleted(StatusCheckCompletedJob {
+                    monitor_id: monitor.id,
+                    status: "not_applicable".into(),
+                    error_message: None,
+                }))
+                .await
+                .map_err(|error| {
+                    StatusPageError::Internal(format!(
+                        "Cannot retire HTTP monitor {}: {error}",
+                        monitor.id
+                    ))
+                })?;
             return Ok(());
         }
         let probe = MonitorProbeSnapshot {
@@ -2438,7 +2468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_probe_portless_monitor_never_checks_http_or_emits_an_outage() {
+    async fn health_probe_portless_monitor_requests_retirement_without_checking_http() {
         use sea_orm::{DatabaseBackend, MockDatabase};
         // Every entry path (periodic, MonitorCreated and DeploymentSucceeded)
         // uses check_monitor. Supplying only these reads also makes any attempt
@@ -2449,6 +2479,7 @@ mod tests {
                     .append_query_results([vec![make_env(1, false)]])
                     .append_query_results([vec![health_probe_deployment()]])
                     .append_query_results([vec![health_probe_counts(2, 0)]])
+                    .append_query_results([Vec::<status_checks::Model>::new()])
                     .into_connection(),
             );
             let config = test_config_service(&db, "postgres://localhost/test");
@@ -2465,7 +2496,7 @@ mod tests {
             .await
             .unwrap();
             let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
-            assert_eq!(log.len(), 3);
+            assert_eq!(log.len(), 4);
             let log = format!("{log:?}");
             assert!(!log.contains("INSERT"));
             assert!(
@@ -2475,11 +2506,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn health_probe_retired_http_monitor_does_not_repeat_retirement_jobs() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        struct NoJobs;
+        #[async_trait::async_trait]
+        impl JobQueue for NoJobs {
+            async fn send(&self, _: Job) -> Result<(), QueueError> {
+                panic!("completed retirement must not be requeued");
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                panic!("not used");
+            }
+        }
+        let now = Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 0)]])
+                .append_query_results([vec![status_checks::Model {
+                    id: 1,
+                    monitor_id: 1,
+                    status: "unknown".into(),
+                    checked_at: now,
+                    created_at: now,
+                    response_time_ms: None,
+                    error_message: Some(
+                        "HTTP monitoring does not apply to a background worker".into(),
+                    ),
+                }]])
+                .into_connection(),
+        );
+        HealthCheckService::check_monitor(
+            db.clone(),
+            reqwest::Client::new(),
+            test_config_service(&db, "postgres://localhost/test"),
+            make_monitor(1, Some(1)),
+            Arc::new(NoJobs),
+        )
+        .await
+        .unwrap();
+    }
+
     struct RejectHealthProbeJobs;
     #[async_trait::async_trait]
     impl JobQueue for RejectHealthProbeJobs {
         async fn send(&self, _job: Job) -> Result<(), QueueError> {
-            panic!("portless HTTP monitoring must not emit outage jobs")
+            match _job {
+                Job::StatusCheckCompleted(job) => assert_eq!(job.status, "not_applicable"),
+                _ => panic!("portless HTTP monitoring must only retire its old HTTP state"),
+            }
+            Ok(())
         }
         fn subscribe(&self) -> Box<dyn JobReceiver> {
             panic!("probe test does not subscribe")

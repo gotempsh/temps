@@ -52,6 +52,36 @@ pub struct ResolvedContainerResourceLimits {
     pub memory_limit: Option<i32>,
 }
 
+fn resolve_reused_health(
+    build_outputs: Option<&serde_json::Value>,
+    environment: Option<&temps_entities::deployment_config::DeploymentConfig>,
+    project: Option<&temps_entities::deployment_config::DeploymentConfig>,
+) -> Result<Option<temps_core::repo_config::HealthCheckConfig>, DeploymentError> {
+    let repo_health = build_outputs.and_then(|outputs| outputs.get("health"));
+    let health = if let Some(value) = repo_health {
+        Some(
+            serde_json::from_value::<temps_core::repo_config::HealthCheckConfig>(value.clone())
+                .map_err(|error| {
+                    DeploymentError::InvalidInput(format!(
+                        "Cannot reuse image health configuration: {error}"
+                    ))
+                })?,
+        )
+    } else {
+        environment
+            .and_then(|config| config.health.clone())
+            .or_else(|| project.and_then(|config| config.health.clone()))
+    };
+    if let Some(health) = &health {
+        health.validate().map_err(|reason| {
+            DeploymentError::InvalidInput(format!(
+                "Cannot reuse image health configuration: {reason}"
+            ))
+        })?;
+    }
+    Ok(health)
+}
+
 /// Runtime inspection paired with the persisted deployment health and port state.
 #[derive(Debug)]
 pub struct EnvironmentContainer {
@@ -2857,6 +2887,30 @@ impl DeploymentService {
             .then_some(worker_build))
     }
 
+    /// Repository health travels with the reused image. Target environment settings
+    /// retain their usual precedence over project defaults when no repo probe exists.
+    async fn reused_image_health(
+        &self,
+        origin_deployment_id: i32,
+        environment: &environments::Model,
+        project: &projects::Model,
+    ) -> Result<Option<temps_core::repo_config::HealthCheckConfig>, DeploymentError> {
+        use temps_entities::deployment_jobs;
+        let outputs = deployment_jobs::Entity::find()
+            .filter(deployment_jobs::Column::DeploymentId.eq(origin_deployment_id))
+            .filter(deployment_jobs::Column::JobType.eq("BuildImageJob"))
+            .filter(deployment_jobs::Column::Outputs.is_not_null())
+            .order_by_desc(deployment_jobs::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .and_then(|job| job.outputs);
+        resolve_reused_health(
+            outputs.as_ref(),
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        )
+    }
+
     async fn configure_reuse_deploy_builder(
         &self,
         mut builder: crate::jobs::DeployImageJobBuilder,
@@ -2875,6 +2929,15 @@ impl DeploymentService {
 
         let environment_config = environment.deployment_config.as_ref();
         let project_config = project.deployment_config.as_ref();
+        builder = builder.health_check_timeout_secs(
+            temps_entities::deployment_config::resolve_health_check_timeout_seconds(
+                environment_config
+                    .and_then(|config| config.health_check_timeout_seconds)
+                    .or_else(|| {
+                        project_config.and_then(|config| config.health_check_timeout_seconds)
+                    }),
+            ),
+        );
         if let Some(target_nodes) = environment_config
             .and_then(|config| config.configured_target_nodes().map(<[i32]>::to_vec))
             .or_else(|| {
@@ -3737,6 +3800,7 @@ impl DeploymentService {
                     .service_name(rollback_slug.clone())
                     .health_check_path(None)
                     .health_check_path_override(rollback_health_check_path)
+                    .health(self.reused_image_health(rollback_asset_origin.deployment_id, &environment, &project).await?)
                     .command(rollback_command)
                     .replicas(rollback_replicas)
                     .port(exposed_port)
@@ -4337,6 +4401,7 @@ impl DeploymentService {
                     .audit_logger(self.audit_logger.get().cloned())
                     .job_id("deploy_container".to_string())
                     .build_job_id("external-image".to_string())
+                    .health(self.reused_image_health(promotion_asset_origin.deployment_id, &target_env, &project).await?)
                     .target(crate::jobs::DeploymentTarget::Docker {
                         registry_url: "local".to_string(),
                         network: Some(temps_core::NETWORK_NAME.to_string()),
@@ -6616,6 +6681,57 @@ mod tests {
 
         fn get_native_platform(&self) -> String {
             "linux/amd64".to_string()
+        }
+    }
+
+    #[test]
+    fn health_probe_reuse_preserves_repo_probe_and_target_setting_precedence() {
+        use temps_core::repo_config::HealthCheckConfig;
+        use temps_entities::deployment_config::DeploymentConfig;
+        let exec = HealthCheckConfig {
+            probe_type: Some("exec".into()),
+            command: vec!["check-worker".into()],
+            ..Default::default()
+        };
+        let project = DeploymentConfig {
+            health: Some(exec.clone()),
+            ..Default::default()
+        };
+        let environment = DeploymentConfig {
+            health: Some(HealthCheckConfig {
+                probe_type: Some("process".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_reused_health(None, None, Some(&project)).unwrap(),
+            Some(exec.clone())
+        );
+        assert_eq!(
+            resolve_reused_health(None, Some(&environment), Some(&project)).unwrap(),
+            environment.health
+        );
+        assert_eq!(
+            resolve_reused_health(
+                Some(&serde_json::json!({"health":exec})),
+                Some(&environment),
+                Some(&project)
+            )
+            .unwrap(),
+            Some(exec)
+        );
+        for health in [
+            serde_json::json!({"type":"typo"}),
+            serde_json::json!({"type":"exec","command":[]}),
+            serde_json::json!("malformed"),
+        ] {
+            assert!(resolve_reused_health(
+                Some(&serde_json::json!({"health":health})),
+                None,
+                Some(&project)
+            )
+            .is_err());
         }
     }
 

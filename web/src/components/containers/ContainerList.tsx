@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import { ContainerInfoResponse, ProjectResponse } from '@/api/client'
 import {
   getContainerMetricsOptions,
@@ -175,7 +176,7 @@ function ContainerRow({
               {container.node_name}
             </span>
           )}
-          {container.container_port == null && (
+          {containerWorkload(container) === 'worker' && (
             <span
               className="inline-flex items-center gap-2"
               title={

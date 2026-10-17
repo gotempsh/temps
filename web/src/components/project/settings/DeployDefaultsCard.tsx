@@ -36,7 +36,11 @@ import { useMutation } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
-import { configuredProbeType, parseHealthCommand } from './health-probe'
+import {
+  configuredProbeType,
+  healthProbeFormSchema,
+  healthConfigFromForm,
+} from './health-probe'
 
 const schema = z
   .object({
@@ -58,28 +62,10 @@ const schema = z
             Number(value) <= 3600),
         { message: 'Enter a whole number of seconds between 30 and 3600' }
       ),
-    probeType: z.enum(['auto', 'http', 'tcp', 'process', 'exec']),
-    stableFor: z.number().int().min(1).max(3600),
-    probeTimeout: z.number().int().min(1).max(300),
-    probeInterval: z.number().int().min(1).max(3600),
-    probeCommand: z.string(),
-    healthPath: z.string().startsWith('/'),
     automaticDeploy: z.boolean(),
     buildLocation: z.enum(['control_plane', 'node', 'ci']),
   })
-  .superRefine((values, ctx) => {
-    if (
-      values.probeType === 'exec' &&
-      !parseHealthCommand(values.probeCommand)
-    ) {
-      ctx.addIssue({
-        code: 'custom',
-        path: ['probeCommand'],
-        message:
-          'Enter a JSON argument array, for example ["redis-cli", "ping"]',
-      })
-    }
-  })
+  .and(healthProbeFormSchema)
 
 const probeExamples = {
   auto: 'HTTP when a port is declared in settings or by the image; process otherwise.',
@@ -172,19 +158,7 @@ export function DeployDefaultsCard({
           exposedPort: optionalInt(values.port),
           healthCheckTimeoutSeconds:
             optionalInt(values.healthCheckTimeout) ?? 300,
-          health: {
-            type: values.probeType === 'auto' ? undefined : values.probeType,
-            stable_for: values.stableFor,
-            command:
-              values.probeType === 'exec'
-                ? (parseHealthCommand(values.probeCommand) ?? [])
-                : [],
-            timeout: values.probeTimeout,
-            interval: values.probeInterval,
-            path: values.healthPath,
-            status: 200,
-            retries: 3,
-          },
+          health: healthConfigFromForm(values),
           automaticDeploy: values.automaticDeploy,
           buildLocation: values.buildLocation,
         },
@@ -200,7 +174,11 @@ export function DeployDefaultsCard({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSave)}>
+      <form
+        onSubmit={form.handleSubmit(handleSave, () =>
+          toast.error('Check the highlighted deployment settings')
+        )}
+      >
         <Card className="bg-background text-foreground">
           <CardHeader>
             <CardTitle>Default Deployment Configuration</CardTitle>

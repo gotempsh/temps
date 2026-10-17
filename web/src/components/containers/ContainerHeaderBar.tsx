@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { containerWorkload } from './container-workload'
 import { Status } from '@temps-sdk/ds'
 import { ContainerInfoResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
@@ -127,7 +128,7 @@ export function ContainerHeaderBar({
                 </div>
               )}
               {selectedContainer &&
-                selectedContainer.container_port == null && (
+                containerWorkload(selectedContainer) === 'worker' && (
                   <div
                     className="inline-flex items-center gap-2"
                     title={
