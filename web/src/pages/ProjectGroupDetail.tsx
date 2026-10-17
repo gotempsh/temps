@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useState } from 'react'
-import { Link, useParams, useSearchParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
   ChevronDown,
@@ -21,13 +21,17 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
-import { groupHref, serviceCount } from '@/lib/terminology'
+import {
+  groupConnectRepositoryHref,
+  groupHref,
+  IMPORT_PARAM,
+  serviceCount,
+} from '@/lib/terminology'
 import { AddServicesDialog } from '@/components/project-groups/AddServicesDialog'
 import { GroupServicesPanel } from '@/components/project-groups/GroupServicesPanel'
 import { GroupVariablesPanel } from '@/components/project-groups/GroupVariablesPanel'
 import { GroupSettingsPanel } from '@/components/project-groups/GroupSettingsPanel'
 import { GroupRepositoryPanel } from '@/components/project-groups/GroupRepositoryPanel'
-import { ConnectRepositoryDialog } from '@/components/project-groups/ConnectRepositoryDialog'
 import { ImportServicesDialog } from '@/components/project-groups/ImportServicesDialog'
 import { newServiceInGroupHref } from '@/components/project-groups/useJoinGroupAfterCreate'
 import {
@@ -50,11 +54,11 @@ export function ProjectGroupDetail() {
     ? (requested as Tab)
     : 'overview'
   const [adding, setAdding] = useState(false)
-  const [connecting, setConnecting] = useState(false)
+  const navigate = useNavigate()
   const [importing, setImporting] = useState(false)
-  // "From the repository" without a repository connects one first, then
-  // continues into the import.
-  const [importAfterConnect, setImportAfterConnect] = useState(false)
+  // "From the repository" without a repository connects one on its own page
+  // first, which returns here with `?import=1` to continue into the import.
+  const importRequested = searchParams.get(IMPORT_PARAM) === '1'
 
   const {
     data: group,
@@ -76,6 +80,26 @@ export function ProjectGroupDetail() {
   }, [group?.name, setBreadcrumbs, slug])
 
   usePageTitle(group?.name ?? 'Project')
+
+  const connectHref = groupConnectRepositoryHref(slug)
+
+  // Arriving with `?import=1` opens the import; closing it drops the
+  // parameter so a reload does not open it again.
+  const importOpen =
+    importing || (importRequested && Boolean(group?.repository))
+  const setImportOpen = (open: boolean) => {
+    setImporting(open)
+    if (!open && importRequested) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete(IMPORT_PARAM)
+          return next
+        },
+        { replace: true }
+      )
+    }
+  }
 
   if (isLoading) {
     return (
@@ -167,8 +191,9 @@ export function ProjectGroupDetail() {
                   if (group.repository) {
                     setImporting(true)
                   } else {
-                    setImportAfterConnect(true)
-                    setConnecting(true)
+                    navigate(
+                      groupConnectRepositoryHref(slug, { thenImport: true })
+                    )
                   }
                 }}
               >
@@ -213,7 +238,7 @@ export function ProjectGroupDetail() {
         <TabsContent value="overview" className="mt-6 space-y-8">
           <GroupRepositoryPanel
             group={group}
-            onConnect={() => setConnecting(true)}
+            onConnect={() => navigate(connectHref)}
             onImport={() => setImporting(true)}
           />
           <GroupServicesPanel
@@ -227,28 +252,16 @@ export function ProjectGroupDetail() {
         <TabsContent value="settings" className="mt-6">
           <GroupSettingsPanel
             group={group}
-            onConnectRepository={() => setConnecting(true)}
+            onConnectRepository={() => navigate(connectHref)}
           />
         </TabsContent>
       </Tabs>
 
       <AddServicesDialog group={group} open={adding} onOpenChange={setAdding} />
-      <ConnectRepositoryDialog
-        group={group}
-        open={connecting}
-        onOpenChange={(open) => {
-          setConnecting(open)
-          if (!open) setImportAfterConnect(false)
-        }}
-        onConnected={() => {
-          if (importAfterConnect) setImporting(true)
-          setImportAfterConnect(false)
-        }}
-      />
       <ImportServicesDialog
         group={group}
-        open={importing}
-        onOpenChange={setImporting}
+        open={importOpen}
+        onOpenChange={setImportOpen}
       />
     </PageContainer>
   )

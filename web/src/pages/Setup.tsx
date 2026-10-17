@@ -90,7 +90,7 @@ function buildRecommendations(
     })
   }
 
-  if (!s.externalUrlSet) {
+  if (!s.externalUrlSet && !s.unreadable.externalUrl) {
     recs.push({
       key: 'external-url',
       icon: Globe,
@@ -102,7 +102,11 @@ function buildRecommendations(
     })
   }
 
-  if (s.wildcardDomainReady && !s.dnsProviderConnected) {
+  if (
+    s.wildcardDomainReady &&
+    !s.dnsProviderConnected &&
+    !s.unreadable.dnsProviders
+  ) {
     recs.push({
       key: 'dns-auto',
       icon: ShieldCheck,

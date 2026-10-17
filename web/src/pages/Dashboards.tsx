@@ -21,16 +21,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -174,42 +165,24 @@ export default function Dashboards({ project }: DashboardsProps) {
         </div>
       )}
 
-      <AlertDialog
-        open={!!pendingDelete}
+      <ConfirmDeleteDialog
+        open={pendingDelete !== null}
         onOpenChange={(open) => {
           if (!open) setPendingDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete dashboard?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently deletes
-              {pendingDelete ? ` “${pendingDelete.name}”` : ' this dashboard'}.
-              This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              disabled={deleteMutation.isPending}
-              onClick={(e) => {
-                e.preventDefault()
-                if (pendingDelete) {
-                  deleteMutation.mutate({
-                    path: { id: pendingDelete.id },
-                    query: { project_id: project.id },
-                  })
-                }
-              }}
-            >
-              {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="dashboard"
+        resourceName={pendingDelete?.name ?? ''}
+        consequences={`Its widgets and layout are removed from project ${project.name}.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (pendingDelete) {
+            deleteMutation.mutate({
+              path: { id: pendingDelete.id },
+              query: { project_id: project.id },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

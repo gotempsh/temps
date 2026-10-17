@@ -28,7 +28,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -340,11 +340,14 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
-      <ConfirmDialog
+      <ConfirmDeleteDialog
         open={ruleToDelete !== null}
-        onOpenChange={(open) => !open && setRuleToDelete(null)}
-        title={`Delete ${ruleToDelete?.name ?? 'alert rule'}?`}
-        description="This permanently deletes the alert rule. It will stop sending notifications immediately. This cannot be undone."
+        onOpenChange={(open) => {
+          if (!open) setRuleToDelete(null)
+        }}
+        resourceType="alert rule"
+        resourceName={ruleToDelete?.name ?? ''}
+        consequences="It will stop sending notifications immediately."
         onConfirm={handleConfirmDelete}
       />
     </div>

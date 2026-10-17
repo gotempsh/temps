@@ -72,6 +72,10 @@ const PTY_READ_CHUNK_BYTES: usize = 16 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(300);
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(8);
 const SNAPSHOT_EXTRACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How much of the extractor's stderr is kept for the failure message. The
+/// extractor parses an untrusted guest image, so its output is bounded rather
+/// than trusted to be short.
+const SNAPSHOT_EXTRACTOR_STDERR_BYTES: usize = 2048;
 const MIN_SNAPSHOT_STAGING_BYTES: u64 = CACHE_SLACK_MB * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -82,6 +86,35 @@ enum SnapshotExtractorError {
     Wait(#[source] std::io::Error),
     #[error("sandboxed debugfs exceeded its {timeout_seconds} second timeout")]
     TimedOut { timeout_seconds: u64 },
+}
+
+/// Failure text for a non-zero extractor exit: the status, what the tool said
+/// (it is the only evidence of *why*), and the cause that status most often
+/// means on a host that passed `temps firecracker setup`.
+fn snapshot_export_failure_message(status: std::process::ExitStatus, stderr: &str) -> String {
+    let said = if stderr.is_empty() {
+        "it printed nothing".to_string()
+    } else {
+        format!("it said: {stderr}")
+    };
+    let hint = if stderr.contains("Unexpected capabilities but not setuid") {
+        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
+         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
+    } else if stderr.contains("No permissions to create new namespace") {
+        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
+         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
+         AppArmor profile, or set that sysctl to 0"
+    } else {
+        ""
+    };
+    format!("sandboxed debugfs snapshot export failed with status {status}; {said}{hint}")
+}
+
+#[derive(Debug)]
+struct SnapshotExtractorOutput {
+    status: std::process::ExitStatus,
+    /// Bounded head of the extractor's stderr; empty when it printed nothing.
+    stderr: String,
 }
 
 struct FuseSnapshotStaging {
@@ -194,19 +227,19 @@ impl FirecrackerSandboxConfig {
         }
     }
 
-    fn fc_root(&self) -> PathBuf {
+    pub(crate) fn fc_root(&self) -> PathBuf {
         self.data_dir.join("firecracker")
     }
     fn firecracker_bin(&self) -> PathBuf {
         self.fc_root().join("bin/firecracker")
     }
-    fn agent_bin(&self) -> PathBuf {
+    pub(crate) fn agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-vm-agent")
     }
     /// Static musl `temps-pty-agent`, injected next to the VM agent so the
     /// guest can serve interactive terminals. Optional: a host without it
     /// still creates sandboxes, just without terminals.
-    fn pty_agent_bin(&self) -> PathBuf {
+    pub(crate) fn pty_agent_bin(&self) -> PathBuf {
         self.fc_root().join("bin/temps-pty-agent")
     }
     fn kernel_glob_dir(&self) -> PathBuf {
@@ -220,6 +253,22 @@ impl FirecrackerSandboxConfig {
     }
     fn vm_dir(&self, name: &str) -> PathBuf {
         self.vms_dir().join(name)
+    }
+}
+
+/// What a VMM-process check plus an agent ping say about a VM. No VMM process
+/// is proof the VM is down. A VMM that is running but whose guest agent missed
+/// a ping is *not* proof of anything (a VM that is booting, swapping or
+/// saturated misses pings), so it is an error, not `false`: callers that
+/// act on "not running" (the row reconciliation) must not act on it.
+fn liveness_verdict(vmm_running: bool, agent_answered: bool) -> Result<bool, &'static str> {
+    match (vmm_running, agent_answered) {
+        (false, _) => Ok(false),
+        (true, true) => Ok(true),
+        (true, false) => Err(
+            "the VMM process is running but its guest agent did not answer a ping within 3s \
+             (the VM may still be booting or be overloaded)",
+        ),
     }
 }
 
@@ -1416,11 +1465,38 @@ impl FirecrackerSandboxProvider {
     async fn run_snapshot_extractor(
         command: &mut tokio::process::Command,
         timeout: Duration,
-    ) -> Result<std::process::ExitStatus, SnapshotExtractorError> {
-        command.kill_on_drop(true);
+    ) -> Result<SnapshotExtractorOutput, SnapshotExtractorError> {
+        command
+            .kill_on_drop(true)
+            .stderr(std::process::Stdio::piped());
         let mut child = command.spawn().map_err(SnapshotExtractorError::Start)?;
+        // Drain stderr concurrently so a chatty extractor cannot block on a
+        // full pipe, keeping only the first bytes: the cause of a failure is
+        // reported before any follow-on noise.
+        let stderr_task = child.stderr.take().map(|mut stderr| {
+            tokio::spawn(async move {
+                let mut kept = Vec::with_capacity(SNAPSHOT_EXTRACTOR_STDERR_BYTES);
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stderr.read(&mut chunk).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            let room = SNAPSHOT_EXTRACTOR_STDERR_BYTES - kept.len();
+                            kept.extend_from_slice(&chunk[..read.min(room)]);
+                        }
+                    }
+                }
+                String::from_utf8_lossy(&kept).trim().to_string()
+            })
+        });
         match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(Ok(status)) => Ok(status),
+            Ok(Ok(status)) => {
+                let stderr = match stderr_task {
+                    Some(task) => task.await.unwrap_or_default(),
+                    None => String::new(),
+                };
+                Ok(SnapshotExtractorOutput { status, stderr })
+            }
             Ok(Err(error)) => Err(SnapshotExtractorError::Wait(error)),
             Err(_) => {
                 // `kill` waits for the child after sending SIGKILL. The
@@ -1434,8 +1510,42 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// Run the child without ambient capabilities.
+    ///
+    /// Unprivileged bubblewrap exits 1 with "Unexpected capabilities but not
+    /// setuid, old file caps config?" when it starts with any capability set.
+    /// A server started by systemd with `AmbientCapabilities=` (the standard
+    /// way to let a non-root `temps serve` bind port 80/443) passes that
+    /// capability to every child, so the snapshot export failed on exactly the
+    /// hosts that follow the install guide. The extractor needs no capability,
+    /// so the ambient set is cleared in the child before `exec`; the server
+    /// itself keeps its own.
+    #[cfg(target_os = "linux")]
+    fn without_ambient_capabilities(command: &mut tokio::process::Command) {
+        // SAFETY: the closure runs between fork and exec and calls only
+        // `prctl`, which is async-signal-safe. A kernel without ambient
+        // capabilities (< 4.3) answers EINVAL, which is ignored: such a
+        // child has none to clear.
+        unsafe {
+            command.pre_exec(|| {
+                libc::prctl(
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                    0,
+                    0,
+                    0,
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn without_ambient_capabilities(_command: &mut tokio::process::Command) {}
+
     fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
         let mut command = tokio::process::Command::new("bwrap");
+        Self::without_ambient_capabilities(&mut command);
         command
             .args([
                 "--unshare-all",
@@ -1555,8 +1665,7 @@ impl FirecrackerSandboxProvider {
             let mut dump_command = Self::sandboxed_debugfs_command(&staging, source);
             dump_command
                 .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
+                .stdout(std::process::Stdio::null());
             let dump = Self::run_snapshot_extractor(&mut dump_command, SNAPSHOT_EXTRACTION_TIMEOUT)
                 .await
                 .map_err(|error| {
@@ -1598,10 +1707,10 @@ impl FirecrackerSandboxProvider {
                     max_size_bytes,
                 });
             }
-            if !dump.success() {
+            if !dump.status.success() {
                 return Err(self.err(
                     sandbox_name,
-                    format!("sandboxed debugfs snapshot export failed with status {dump}"),
+                    snapshot_export_failure_message(dump.status, &dump.stderr),
                 ));
             }
 
@@ -1745,6 +1854,7 @@ impl FirecrackerSandboxProvider {
 #[async_trait]
 impl SandboxProvider for FirecrackerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         let name = self.resolve_name(&config);
         let vm_dir = self.config.vm_dir(&name);
         let image = config
@@ -1847,14 +1957,15 @@ impl SandboxProvider for FirecrackerSandboxProvider {
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
-        if self.vm_pid(&handle.sandbox_name).is_none() {
-            return Ok(false);
-        }
-        Ok(matches!(
-            self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
-                .await,
-            Ok(Response::Pong)
-        ))
+        let vmm_running = self.vm_pid(&handle.sandbox_name).is_some();
+        let agent_answered = vmm_running
+            && matches!(
+                self.rpc(&handle.sandbox_name, &Request::Ping, Duration::from_secs(3))
+                    .await,
+                Ok(Response::Pong)
+            );
+        liveness_verdict(vmm_running, agent_answered)
+            .map_err(|reason| self.err(&handle.sandbox_name, reason))
     }
 
     async fn write_file(
@@ -2216,6 +2327,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         artifact: &super::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
+        config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
         if artifact.backend != super::SandboxBackend::Firecracker {
             return Err(AgentError::SandboxCreationFailed {
                 run_id: config.run_id,
@@ -2693,6 +2805,14 @@ fn firecracker_snapshot_host_available() -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_missing_vmm_is_down_but_a_missed_ping_is_not_proof() {
+        assert_eq!(liveness_verdict(false, false), Ok(false));
+        assert_eq!(liveness_verdict(true, true), Ok(true));
+        let unknown = liveness_verdict(true, false).expect_err("a missed ping is unknown");
+        assert!(unknown.contains("did not answer a ping"), "{unknown}");
+    }
+
     use super::*;
 
     fn provider_at(data_dir: PathBuf) -> FirecrackerSandboxProvider {
@@ -2721,6 +2841,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -3258,6 +3379,73 @@ mod tests {
         assert!(matches!(error, SnapshotExtractorError::TimedOut { .. }));
     }
 
+    #[tokio::test]
+    async fn snapshot_extractor_reports_a_bounded_stderr_head() {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo first-line >&2; head -c 100000 /dev/zero | tr '\\0' x >&2; exit 3");
+
+        let output = FirecrackerSandboxProvider::run_snapshot_extractor(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stderr.starts_with("first-line"), "{}", output.stderr);
+        assert!(output.stderr.len() <= SNAPSHOT_EXTRACTOR_STDERR_BYTES);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn extractor_children_start_without_ambient_capabilities() {
+        // The hook must not break exec, and the child must report an empty
+        // ambient set. (The set is already empty under test; the systemd
+        // case is covered by the hook being applied to the bwrap command.)
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg("grep -q '^CapAmb:[[:space:]]*0*$' /proc/self/status");
+        FirecrackerSandboxProvider::without_ambient_capabilities(&mut command);
+
+        let output = FirecrackerSandboxProvider::run_snapshot_extractor(
+            &mut command,
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.status.success(), "{:?}", output);
+    }
+
+    #[tokio::test]
+    async fn export_failure_message_carries_the_tool_output() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exit 1");
+        let status = command.status().await.unwrap();
+
+        let silent = snapshot_export_failure_message(status, "");
+        assert!(silent.contains("it printed nothing"), "{silent}");
+
+        let said = snapshot_export_failure_message(status, "debugfs: Bad magic number");
+        assert!(
+            said.contains("it said: debugfs: Bad magic number"),
+            "{said}"
+        );
+        assert!(!said.contains("AppArmor"), "{said}");
+
+        let userns = snapshot_export_failure_message(
+            status,
+            "bwrap: No permissions to create new namespace",
+        );
+        assert!(
+            userns.contains("apparmor_restrict_unprivileged_userns"),
+            "{userns}"
+        );
+    }
+
     #[test]
     fn disconnected_fuse_mount_errors_require_lazy_unmount() {
         for raw_error in [libc::ENOTCONN, libc::EIO] {
@@ -3380,6 +3568,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: Some(0),
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

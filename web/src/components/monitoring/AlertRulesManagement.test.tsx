@@ -70,7 +70,7 @@ test('Delete asks for confirmation naming the rule and sends nothing until confi
   const view = renderRules()
   await openDeleteDialog(view)
 
-  expect(await view.findByText(`Delete ${RULE.name}?`)).toBeTruthy()
+  expect(await view.findByText(`Delete alert rule ${RULE.name}?`)).toBeTruthy()
   expect(api.called('DELETE', '/projects/7/error-alert-rules/11')).toBe(false)
 
   await act(async () => {

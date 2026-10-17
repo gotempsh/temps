@@ -391,7 +391,8 @@ impl MetricsStore for ClickhouseMetricsStore {
     /// - range ≤ 90 days → at least 1-hour buckets
     /// - range > 90 days → at least 1-day buckets
     ///
-    /// For gauges: `avg(value)` per bucket. For monotonic counters: per-scrape
+    /// For gauges: `avg(value)` per bucket; for per-interval delta counters
+    /// ([`super::is_delta_counter`]): `sum(value)`. For monotonic counters: per-scrape
     /// `max(value)` (collapses label-set rows to the grand total) → per-bucket
     /// `max` → `lagInFrame` delta floored at 0 (resets become 0, no first-bucket
     /// spike). `FINAL` dedups retried scrapes.
@@ -480,12 +481,15 @@ impl MetricsStore for ClickhouseMetricsStore {
                 label_filter = label_filter,
             )
         } else {
-            // Gauge: avg(value) per bucket. toStartOfInterval(DateTime64, … SECOND)
-            // yields a second-resolution `DateTime`; * 1000 gives the i64 ms.
+            // Gauge: avg(value) per bucket; per-interval delta counters
+            // (`proxy.requests*`) use sum(value) so a bucket is the real count
+            // for its span. toStartOfInterval(DateTime64, … SECOND) yields a
+            // second-resolution `DateTime`; * 1000 gives the i64 ms.
+            let agg = super::bucket_aggregate(nm).to_lowercase();
             format!(
                 "SELECT \
                    toInt64(toUnixTimestamp(toStartOfInterval(time, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
-                   avg(value) AS avg_value \
+                   {agg}(value) AS avg_value \
                  FROM service_metrics FINAL \
                  WHERE source_kind = ? AND source_id = ? AND name = '{nm}' \
                    AND time >= fromUnixTimestamp64Milli(?) \
@@ -494,6 +498,7 @@ impl MetricsStore for ClickhouseMetricsStore {
                  ORDER BY bucket_ms ASC",
                 step = step_secs,
                 nm = nm,
+                agg = agg,
                 label_filter = label_filter,
             )
         };

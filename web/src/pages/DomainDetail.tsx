@@ -58,6 +58,10 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import {
+  isDomainDetailQuery,
+  refreshDomainDetail,
+} from '@/pages/domain-detail-queries'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import {
@@ -332,42 +336,14 @@ export function DomainDetail() {
     !orderReadFailed
 
   const fetchingCount = useIsFetching({
-    predicate: (q) => {
-      const k = q.queryKey?.[0]
-      if (typeof k !== 'string') return false
-      return (
-        k.includes('getDomainById') ||
-        k.includes('getDomainOrder') ||
-        k.includes('getHttpChallengeDebug') ||
-        k.includes('getPublicIp') ||
-        k.includes('listProviders')
-      )
-    },
+    predicate: (q) => isDomainDetailQuery(q.queryKey),
   })
   const isRefreshing = fetchingCount > 0
 
-  const refreshAll = async (opts?: { clearOrder?: boolean }) => {
-    if (opts?.clearOrder) {
-      queryClient.removeQueries({ queryKey: orderQueryKey })
-    }
-    await Promise.all([
-      queryClient.invalidateQueries({ queryKey: domainQueryKey }),
-      queryClient.invalidateQueries({ queryKey: orderQueryKey }),
-      queryClient.invalidateQueries({
-        predicate: (q) => {
-          const key = q.queryKey?.[0]
-          return (
-            typeof key === 'object' &&
-            key !== null &&
-            '_id' in key &&
-            (key._id === 'getHttpChallengeDebug' ||
-              key._id === 'getPublicIp' ||
-              key._id === 'listDnsProviders')
-          )
-        },
-      }),
-    ])
-  }
+  const refreshAll = (opts?: { clearOrder?: boolean }) =>
+    refreshDomainDetail(queryClient, {
+      clearOrder: opts?.clearOrder ? orderQueryKey : undefined,
+    })
 
   useEffect(() => {
     if (domain) {
@@ -397,8 +373,12 @@ export function DomainDetail() {
   // A failed mutation usually leaves the backend in a new state (a failed
   // validation sets `failed` and `last_error`), so re-read instead of keeping
   // the status the page was showing before the attempt.
-  const refreshAfterFailure = async () => {
-    await refreshAll()
+  //
+  // Registered through `onSettled`, never `onError`: a mutation's own `onError`
+  // replaces the app-wide error toast, and a refusal the server did not store
+  // on the domain (a limit, an operation already running) would go unannounced.
+  const refreshWhenFailed = async (_data: unknown, error: unknown) => {
+    if (error) await refreshAll()
   }
 
   const createOrder = useMutation({
@@ -408,7 +388,7 @@ export function DomainDetail() {
       toast.success('ACME order created successfully')
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const finalizeOrder = useMutation({
@@ -418,7 +398,7 @@ export function DomainDetail() {
     // with the error, and the CA may invalidate the order). Refetch right away
     // so the page does not keep showing `challenge_requested` until a reload.
     // A failed validation is returned as an error, so `onSuccess` never runs.
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
     onSuccess: async () => {
       toast.success(
         'DNS challenge verified! TLS certificate provisioning in progress.'
@@ -455,7 +435,7 @@ export function DomainDetail() {
       }
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const setupDns = useMutation({
@@ -474,7 +454,7 @@ export function DomainDetail() {
       })
       await refreshAll()
     },
-    onError: refreshAfterFailure,
+    onSettled: refreshWhenFailed,
   })
 
   const handleCreateOrder = () => {

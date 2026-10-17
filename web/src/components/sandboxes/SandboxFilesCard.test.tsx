@@ -765,3 +765,278 @@ test('a backend with undocumented write semantics gets a hedged warning', async 
   expect(writes).toHaveLength(0)
   api.restore()
 })
+
+const WORK_DIR = '/home/temps/workspace'
+
+function listing(
+  path: string,
+  entries: { name: string; kind: string }[],
+  paging: {
+    page?: number
+    total?: number
+    pageSize?: number
+    truncated?: boolean
+  } = {}
+) {
+  const pageSize = paging.pageSize ?? 100
+  const page = paging.page ?? 1
+  const total = paging.total ?? (page - 1) * pageSize + entries.length
+  return jsonResponse({
+    path,
+    exists: true,
+    is_dir: true,
+    entries,
+    page,
+    page_size: pageSize,
+    total,
+    truncated: paging.truncated ?? false,
+    has_more: page * pageSize < total,
+  })
+}
+
+function listedPath(request: Request) {
+  return new URL(request.url).searchParams.get('path')
+}
+
+test('the browser lists the work dir, enters a directory and opens a file from it', async () => {
+  const api = mockApi({
+    ...modeRoute(),
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) =>
+      listedPath(request) === WORK_DIR
+        ? listing(WORK_DIR, [
+            { name: 'src', kind: 'directory' },
+            { name: 'notes.txt', kind: 'file' },
+          ])
+        : listing(`${WORK_DIR}/src`, [{ name: 'main.ts', kind: 'file' }]),
+    'GET /v1/sandboxes/sbx_1/fs/stat': (request) =>
+      jsonResponse({
+        path: listedPath(request),
+        exists: true,
+        is_file: true,
+        is_dir: false,
+        size: 3,
+      }),
+    'GET /v1/sandboxes/sbx_1/fs/read': (request) =>
+      jsonResponse({
+        path: listedPath(request),
+        size: 3,
+        contents_b64: encodeText('hi\n'),
+      }),
+  })
+  const view = renderCard()
+
+  // Directories come first in the order the server returns them.
+  fireEvent.click(await view.findByRole('button', { name: /src/ }))
+  fireEvent.click(await view.findByRole('button', { name: /main\.ts/ }))
+
+  const editor = (await view.findByLabelText(
+    `Contents of ${WORK_DIR}/src/main.ts`
+  )) as HTMLTextAreaElement
+  expect(editor.value).toBe('hi\n')
+  expect((view.getByLabelText('File path') as HTMLInputElement).value).toBe(
+    `${WORK_DIR}/src/main.ts`
+  )
+  api.restore()
+})
+
+test('the up button climbs one directory and stops at the root', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) =>
+      listing(listedPath(request) ?? '', []),
+  })
+  const view = renderCard()
+
+  await view.findByText('This directory is empty.')
+  const up = view.getByRole('button', {
+    name: 'Up one directory',
+  }) as HTMLButtonElement
+  fireEvent.click(up)
+  await waitFor(() => expect(view.getByTitle('/home/temps')).toBeTruthy())
+  fireEvent.click(up)
+  fireEvent.click(up)
+  await waitFor(() => expect(view.getByTitle('/')).toBeTruthy())
+  expect(up.disabled).toBe(true)
+  api.restore()
+})
+
+test('a listing that failed says why instead of showing an empty folder', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      jsonResponse({ title: 'File Operation Failed', detail: 'boom' }, 500),
+  })
+  const view = renderCard()
+
+  await view.findByText(/Could not list \/home\/temps\/workspace/)
+  expect(view.queryByText('This directory is empty.')).toBeNull()
+  api.restore()
+})
+
+test('a stopped sandbox is never asked for a listing', () => {
+  const api = mockApi({})
+  const view = renderCard({ status: 'stopped', lifecycle: 'ephemeral' })
+
+  expect(
+    view.getByText('Directories can be browsed once the sandbox is running.')
+  ).toBeTruthy()
+  expect(api.called('GET', '/v1/sandboxes/sbx_1/fs/list')).toBe(false)
+  api.restore()
+})
+
+test('a long directory is read one page at a time', async () => {
+  const requested: string[] = []
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page') ?? '1')
+      requested.push(`${page}`)
+      return page === 1
+        ? listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+            page: 1,
+            pageSize: 1,
+            total: 2,
+          })
+        : listing(WORK_DIR, [{ name: 'b.txt', kind: 'file' }], {
+            page: 2,
+            pageSize: 1,
+            total: 2,
+          })
+    },
+  })
+  const view = renderCard()
+
+  await view.findByRole('button', { name: /a\.txt/ })
+  // The shared pagination states where the user is in the whole directory.
+  expect(view.getByText('Showing 1–1 of 2')).toBeTruthy()
+  const previous = view.getByRole('button', {
+    name: 'Previous page',
+  }) as HTMLButtonElement
+  expect(previous.disabled).toBe(true)
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+
+  await view.findByRole('button', { name: /b\.txt/ })
+  expect(requested).toEqual(['1', '2'])
+  expect(
+    (view.getByRole('button', { name: 'Next page' }) as HTMLButtonElement)
+      .disabled
+  ).toBe(true)
+  api.restore()
+})
+
+test('a refresh that fails keeps the listing on screen under the error', async () => {
+  let failing = false
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      failing
+        ? jsonResponse({ title: 'File Operation Failed', detail: 'boom' }, 500)
+        : listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }]),
+  })
+  const view = renderCard()
+  await view.findByRole('button', { name: /a\.txt/ })
+
+  failing = true
+  fireEvent.click(view.getByRole('button', { name: 'Refresh directory' }))
+
+  await view.findByText(/Could not list \/home\/temps\/workspace/)
+  expect(view.getByRole('button', { name: /a\.txt/ })).toBeTruthy()
+  api.restore()
+})
+
+test('a directory cut at the scan cap says only part of it is listed', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+        total: 10000,
+        truncated: true,
+      }),
+  })
+  const view = renderCard()
+
+  await view.findByText(/only the first 10,000 are listed/)
+  api.restore()
+})
+
+test('a page the directory has shrunk past offers the first page', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const page = Number(new URL(request.url).searchParams.get('page') ?? '1')
+      return page === 1
+        ? listing(WORK_DIR, [{ name: 'a.txt', kind: 'file' }], {
+            page: 1,
+            pageSize: 1,
+            total: 2,
+          })
+        : listing(WORK_DIR, [], { page, pageSize: 1, total: 1 })
+    },
+  })
+  const view = renderCard()
+
+  await view.findByRole('button', { name: /a\.txt/ })
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+
+  expect(await view.findByText(/past the end of the directory/)).toBeTruthy()
+  fireEvent.click(view.getByRole('button', { name: 'Go to first page' }))
+  await view.findByRole('button', { name: /a\.txt/ })
+  api.restore()
+})
+
+test('entering a directory starts again from its first page', async () => {
+  const pages: Record<string, string[]> = {}
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': (request) => {
+      const url = new URL(request.url)
+      const path = url.searchParams.get('path') ?? ''
+      const page = url.searchParams.get('page') ?? '1'
+      pages[path] = [...(pages[path] ?? []), page]
+      if (path === WORK_DIR) {
+        return page === '1'
+          ? listing(WORK_DIR, [{ name: 'src', kind: 'directory' }], {
+              page: 1,
+              pageSize: 1,
+              total: 2,
+            })
+          : listing(WORK_DIR, [{ name: 'z', kind: 'directory' }], {
+              page: 2,
+              pageSize: 1,
+              total: 2,
+            })
+      }
+      return listing(path, [{ name: 'main.ts', kind: 'file' }])
+    },
+  })
+  const view = renderCard()
+
+  await view.findByRole('button', { name: /src/ })
+  fireEvent.click(view.getByRole('button', { name: 'Next page' }))
+  fireEvent.click(await view.findByRole('button', { name: /^z/ }))
+
+  await view.findByRole('button', { name: /main\.ts/ })
+  expect(pages[`${WORK_DIR}/z`]).toEqual(['1'])
+  api.restore()
+})
+
+test('saving a new file adds it to the listing of its directory', async () => {
+  let written = false
+  const api = mockApi({
+    'GET /v1/sandboxes/sbx_1/fs/list': () =>
+      listing(WORK_DIR, written ? [{ name: 'notes.txt', kind: 'file' }] : []),
+    'GET /v1/sandboxes/sbx_1/fs/stat': () =>
+      jsonResponse({
+        path: PATH,
+        exists: written,
+        is_file: written,
+        is_dir: false,
+        size: written ? 5 : 0,
+      }),
+    'POST /v1/sandboxes/sbx_1/fs/write': () => {
+      written = true
+      return new Response(null, { status: 204 })
+    },
+  })
+  const view = renderCard()
+  await view.findByText('This directory is empty.')
+
+  await openAndSave(view, PATH, 'hello')
+
+  await view.findByRole('button', { name: /notes\.txt/ })
+  expect(view.queryByText('This directory is empty.')).toBeNull()
+  api.restore()
+})

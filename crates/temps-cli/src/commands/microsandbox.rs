@@ -30,6 +30,11 @@ use temps_agents::sandbox::microsandbox::{
 };
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use temps_agents::sandbox::{stage_pty_agent_binary, PTY_AGENT_BINARY_NAME};
+
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+use super::upgrade::{
+    fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
+};
 #[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 use {
     std::collections::HashMap,
@@ -58,7 +63,10 @@ pub enum MicrosandboxSubcommand {
 
 #[derive(Args)]
 pub struct MicrosandboxSetupCommand {
-    /// Data directory for storing configuration and runtime files
+    /// Data directory for storing configuration and runtime files. Must be
+    /// the directory the server runs with (its `TEMPS_DATA_DIR`); when
+    /// omitted, `~/.temps` is used, or `~/.temps/data` on installs that keep
+    /// their keys there.
     #[arg(long, env = "TEMPS_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
@@ -93,10 +101,13 @@ impl MicrosandboxSetupCommand {
     }
 
     async fn run(self) -> anyhow::Result<()> {
-        let data_dir = match &self.data_dir {
-            Some(dir) => dir.clone(),
-            None => temps_agents::sandbox::microsandbox::host_data_dir(),
-        };
+        let home = dirs::home_dir();
+        // A running `temps serve` is the authority on its own data directory;
+        // a shell inherits none of the server's TEMPS_DATA_DIR.
+        let resolved =
+            super::data_dir_discovery::resolve(self.data_dir.as_deref(), home.as_deref());
+        let data_dir = resolved.dir.clone();
+        let how = resolved.source.describe();
         let config = MicrosandboxSandboxConfig::from_data_dir(data_dir.clone());
 
         println!();
@@ -110,9 +121,33 @@ impl MicrosandboxSetupCommand {
             "{}",
             "  =================================================".bright_cyan()
         );
+        println!("  Data directory: {} ({})", data_dir.display(), how);
         println!("  Runtime home: {}", config.home().display());
         println!("  Runtime version: v{}", MICROSANDBOX_VERSION);
         println!();
+        for warning in &resolved.warnings {
+            warn(warning);
+        }
+        if !resolved.warnings.is_empty() {
+            println!();
+        }
+
+        // The runtime is read from the *server's* data directory. A second
+        // runtime under another candidate directory is the signature of a
+        // setup that went somewhere the server never looks.
+        if let Some(home) = &home {
+            for other in other_runtime_homes(&data_dir, home) {
+                warn(&format!(
+                    "another microsandbox runtime exists under {}; a server started with \
+                     TEMPS_DATA_DIR={} uses that one, not this one. Re-run with \
+                     `--data-dir {}` if that is the server's directory",
+                    other.display(),
+                    other.parent().unwrap_or(&other).display(),
+                    other.parent().unwrap_or(&other).display(),
+                ));
+            }
+            println!();
+        }
 
         if self.check {
             let capability = microsandbox_capability(&data_dir);
@@ -152,6 +187,7 @@ impl MicrosandboxSetupCommand {
             if !matches!(
                 reason,
                 temps_agents::sandbox::microsandbox::MicrosandboxUnavailable::RuntimeNotInstalled { .. }
+                    | temps_agents::sandbox::microsandbox::MicrosandboxUnavailable::RuntimeVersionMismatch { .. }
             ) {
                 fail(&reason.to_string());
                 anyhow::bail!("this host cannot run the microsandbox backend");
@@ -170,7 +206,15 @@ impl MicrosandboxSetupCommand {
         ));
 
         // Stage 3: guest terminal agent.
-        stage_pty_agent(&pty_agent_dest, self.pty_agent_bin.as_deref())?;
+        let released =
+            fetch_missing_pty_agent(&pty_agent_dest, self.pty_agent_bin.as_deref()).await;
+        stage_pty_agent(
+            &pty_agent_dest,
+            self.pty_agent_bin.as_deref(),
+            released
+                .as_ref()
+                .and_then(|r| r.path(PTY_AGENT_BINARY_NAME)),
+        )?;
 
         // Stage 4: boot a real VM through the server's provider.
         if self.skip_smoke {
@@ -202,6 +246,7 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
         memory_limit_mb: Some(256),
         pids_limit: None,
         disk_size_mb: None,
+        allow_docker: false,
         network_mode: Some("none".to_string()),
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(60),
@@ -240,6 +285,40 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
     Ok(())
 }
 
+/// Fetch `temps-pty-agent` from the release matching this binary when no
+/// flag, no sibling file and no earlier staging provides it. Announced, and a
+/// failure only leaves the existing "not found" warning in place.
+#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+async fn fetch_missing_pty_agent(
+    dest: &std::path::Path,
+    explicit: Option<&std::path::Path>,
+) -> Option<ReleaseGuestAgents> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)));
+    if !guest_agent_needs_fetch(explicit, beside.as_deref(), dest) {
+        return None;
+    }
+    println!("  fetching temps-pty-agent from the release that matches this binary (checksum-verified)...");
+    match fetch_guest_agents_from_release(&[PTY_AGENT_BINARY_NAME]).await {
+        Ok(agents) if agents.path(PTY_AGENT_BINARY_NAME).is_some() => Some(agents),
+        Ok(agents) => {
+            warn(&format!(
+                "release {} does not ship temps-pty-agent; upgrade to a release that does, \
+                 or pass --pty-agent-bin <path>",
+                agents.tag()
+            ));
+            None
+        }
+        Err(e) => {
+            warn(&format!(
+                "could not fetch temps-pty-agent from the release: {e}"
+            ));
+            None
+        }
+    }
+}
+
 /// Install the guest terminal agent at `dest` from `explicit` or, failing
 /// that, a `temps-pty-agent` file next to the running executable (release
 /// archives ship it there).
@@ -252,13 +331,17 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
 fn stage_pty_agent(
     dest: &std::path::Path,
     explicit: Option<&std::path::Path>,
+    released: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let source = explicit.map(PathBuf::from).or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
-            .filter(|p| p.exists())
-    });
+    let source = explicit
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|d| d.join(PTY_AGENT_BINARY_NAME)))
+                .filter(|p| p.exists())
+        })
+        .or(released);
     let Some(source) = source else {
         if dest.exists() {
             ok(&format!(
@@ -302,15 +385,69 @@ fn report_terminal_support(terminal: &temps_agents::sandbox::TerminalCapability)
     );
 }
 
+/// Runtime homes under the other places a Temps data directory commonly
+/// lives that already hold an `msb`, excluding the one being set up.
+fn other_runtime_homes(data_dir: &std::path::Path, home: &std::path::Path) -> Vec<PathBuf> {
+    super::doctor::other_data_dirs_with(
+        data_dir,
+        home,
+        &std::path::Path::new("microsandbox").join("bin").join("msb"),
+    )
+    .into_iter()
+    .map(|dir| dir.join("microsandbox"))
+    .collect()
+}
+
 fn ok(message: &str) {
     println!("  {} {}", "✓".green().bold(), message);
 }
 
-#[cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
 fn warn(message: &str) {
     println!("  {} {}", "!".yellow().bold(), message);
 }
 
 fn fail(message: &str) {
     println!("  {} {}", "✗".red().bold(), message);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn install_msb(data_dir: &std::path::Path) {
+        let bin = data_dir.join("microsandbox").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("msb"), b"").unwrap();
+    }
+
+    #[test]
+    fn reports_a_runtime_installed_under_the_other_candidate_directory() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".temps");
+        let nested = root.join("data");
+        install_msb(&root);
+        install_msb(&nested);
+
+        // Setting up the nested directory must point at the stray root copy
+        // and vice versa — never at the directory being set up.
+        assert_eq!(
+            other_runtime_homes(&nested, home.path()),
+            vec![root.join("microsandbox")]
+        );
+        assert_eq!(
+            other_runtime_homes(&root, home.path()),
+            vec![nested.join("microsandbox")]
+        );
+    }
+
+    #[test]
+    fn single_runtime_home_produces_no_warning() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".temps");
+        install_msb(&root);
+        assert!(other_runtime_homes(&root, home.path()).is_empty());
+        // An empty candidate directory (no msb) is not a runtime home.
+        std::fs::create_dir_all(root.join("data").join("microsandbox")).unwrap();
+        assert!(other_runtime_homes(&root, home.path()).is_empty());
+    }
 }

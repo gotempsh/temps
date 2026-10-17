@@ -36,7 +36,10 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
+import { EmptyState } from '@/components/ui/empty-state'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -46,16 +49,6 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import {
   extendTimeoutMutation,
   getApplicationWorkspaceOptions,
@@ -539,37 +532,20 @@ export default function Sandboxes({
             </div>
           )}
 
-          <AlertDialog
+          <ConfirmDeleteDialog
             open={stopTarget !== null}
             onOpenChange={(open) => {
               if (!open) setStopTarget(null)
             }}
-          >
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogTitle>Delete sandbox?</AlertDialogTitle>
-                <AlertDialogDescription>
-                  This tears down the container for{' '}
-                  <span className="font-mono">{stopTarget?.id}</span>. The row
-                  is kept for audit but cannot be restarted. This cannot be
-                  undone.
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={() => {
-                    if (stopTarget)
-                      deleteMutation.mutate({ path: { id: stopTarget.id } })
-                  }}
-                  disabled={deleteMutation.isPending}
-                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                >
-                  {deleteMutation.isPending ? 'Deleting…' : 'Delete'}
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
+            resourceType="sandbox"
+            resourceName={stopTarget?.name || stopTarget?.id || ''}
+            consequences={`This tears down the container for ${stopTarget?.id ?? ''}. The row is kept for audit but cannot be restarted.`}
+            isPending={deleteMutation.isPending}
+            onConfirm={() => {
+              if (stopTarget)
+                deleteMutation.mutate({ path: { id: stopTarget.id } })
+            }}
+          />
         </>
       )}
       <CreateSandboxSheet
@@ -685,11 +661,7 @@ export function ManagedApplicationWorkspaces({
       )}
 
       {!loading && !error && visibleEntries.length === 0 && !visibleGlobal && (
-        <p className="text-sm text-muted-foreground">
-          {computeOnly
-            ? 'No workspace-owned compute is attached.'
-            : 'No workspaces are available yet.'}
-        </p>
+        <WorkspacesEmptyState computeOnly={computeOnly} />
       )}
 
       {error && (
@@ -699,6 +671,39 @@ export function ManagedApplicationWorkspaces({
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * Nothing to list. A workspace belongs to an application, so the way to get
+ * one is to create a project; that action is offered to administrators only,
+ * everyone else gets the same explanation and a link to the project list.
+ */
+function WorkspacesEmptyState({ computeOnly }: { computeOnly: boolean }) {
+  const canCreateProject = useIsInstanceAdmin()
+  if (computeOnly) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No workspace-owned compute is attached.
+      </p>
+    )
+  }
+  return (
+    <div className="rounded-lg border bg-card text-card-foreground">
+      <EmptyState
+        size="compact"
+        icon={FolderOpen}
+        title="No workspaces yet"
+        description="Each project gets a workspace that keeps its services and working context, with compute when you need it. Create a project to start one."
+        action={
+          <Button asChild variant={canCreateProject ? 'default' : 'outline'}>
+            <Link to={canCreateProject ? '/projects/new' : '/projects'}>
+              {canCreateProject ? 'Create project' : 'Open projects'}
+            </Link>
+          </Button>
+        }
+      />
+    </div>
   )
 }
 

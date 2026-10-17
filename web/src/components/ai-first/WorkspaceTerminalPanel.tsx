@@ -28,6 +28,7 @@ import type { ApplicationWorkspaceResponse } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Skeleton } from '@/components/ui/skeleton'
 import { fitTerminalToHost } from '@/components/sandboxes/sandbox-terminal-dom'
 import {
@@ -628,9 +629,14 @@ export function WorkspaceTerminalOnboarding({
         >
           {availability.setupCommand && (
             <div className="flex items-center gap-2">
-              <code className="min-w-0 overflow-x-auto whitespace-nowrap rounded bg-background px-2 py-1.5 font-mono text-[10px]">
-                {availability.setupCommand}
-              </code>
+              <ScrollRegion
+                className="min-w-0 rounded bg-background px-2 py-1.5"
+                regionLabel="Terminal setup command, scrollable"
+              >
+                <code className="block w-max whitespace-nowrap font-mono text-[10px]">
+                  {availability.setupCommand}
+                </code>
+              </ScrollRegion>
               <CopyButton
                 className="size-7 shrink-0 rounded-md"
                 label="Copy terminal setup command"

@@ -11,6 +11,8 @@
  * instead of showing a switch that is on but does nothing.
  */
 
+import { z } from 'zod'
+
 export const ON_DEMAND_TLS_SETTINGS_PATH = '/settings/on-demand-tls'
 
 /** Where the Let's Encrypt contact email is edited. */
@@ -31,6 +33,7 @@ interface OnDemandTlsLike {
 export interface OnDemandTlsSettingsSource {
   on_demand_tls?: OnDemandTlsLike | null
   external_url?: string | null
+  preview_domain?: string | null
   letsencrypt?: { email?: string | null } | null
 }
 
@@ -116,20 +119,47 @@ export function isLoopbackHost(host: string): boolean {
 }
 
 /**
- * Mirrors `derive_zone`: an explicit zone wins, otherwise a `*.sslip.io`
- * external URL is its own zone. `null` means the proxy would disable the
- * feature at startup.
+ * A preview domain that can be a zone: a dotted DNS name that is not a
+ * loopback name (Let's Encrypt cannot reach those). Mirrors
+ * `public_preview_domain` in the proxy startup wiring.
+ */
+function publicPreviewDomain(
+  previewDomain: string | null | undefined
+): string | null {
+  const domain = (previewDomain ?? '')
+    .trim()
+    .replace(/^\*\./, '')
+    .replace(/\.$/, '')
+    .toLowerCase()
+  if (!domain.includes('.')) return null
+  const labels = domain.split('.')
+  if (!labels.every((label) => /^[a-z0-9-]+$/.test(label))) return null
+  const loopback =
+    domain === 'localho.st' ||
+    domain.endsWith('.localho.st') ||
+    isLoopbackHost(domain) ||
+    domain.startsWith('127.')
+  return loopback ? null : domain
+}
+
+/**
+ * Mirrors `derive_zone`: an explicit zone wins, then a `*.sslip.io` external
+ * URL is its own zone, then a public preview domain. `null` means the proxy
+ * would disable the feature at startup.
  */
 export function effectiveZone(
   zone: string | null | undefined,
-  externalUrl: string | null | undefined
+  externalUrl: string | null | undefined,
+  previewDomain?: string | null
 ): string | null {
   const configured = zone?.trim().replace(/\.$/, '').toLowerCase()
   if (configured) return configured
   const host = externalUrl ? hostOf(externalUrl) : null
-  if (!host) return null
-  const normalized = host.replace(/\.$/, '')
-  return normalized.endsWith('sslip.io') ? normalized : null
+  if (host) {
+    const normalized = host.replace(/\.$/, '')
+    if (normalized.endsWith('sslip.io')) return normalized
+  }
+  return publicPreviewDomain(previewDomain)
 }
 
 export interface OnDemandTlsBlocker {
@@ -159,11 +189,11 @@ export function onDemandTlsBlockers(
       fixHref: CERTIFICATE_SETTINGS_PATH,
     })
   }
-  if (!effectiveZone(zone, settings.external_url)) {
+  if (!effectiveZone(zone, settings.external_url, settings.preview_domain)) {
     blockers.push({
       id: 'no-zone',
       message:
-        'No zone is set and none can be derived: the external URL is not a *.sslip.io address. Enter the domain whose direct subdomains should receive certificates.',
+        'No zone is set and none can be derived: the external URL is not a *.sslip.io address and the preview domain is not a public domain. Enter the domain whose direct subdomains should receive certificates.',
       fixLabel: null,
       fixHref: null,
     })
@@ -179,6 +209,42 @@ export function onDemandTlsBlockers(
   }
   return blockers
 }
+
+/**
+ * True when on-demand issuance is on and would run, but the only thing in the
+ * way is a missing Let's Encrypt contact email. This is the state the console
+ * shouts about: every environment URL without a wildcard certificate is
+ * waiting on one field. Other blockers (loopback, no zone) mean nothing is
+ * being attempted, so an email prompt would be noise.
+ */
+export function needsAcmeContactEmail(
+  settings: OnDemandTlsSettingsSource | undefined
+): boolean {
+  if (!settings?.on_demand_tls?.enabled) return false
+  const blockers = onDemandTlsBlockers(settings.on_demand_tls.zone, settings)
+  return blockers.length === 1 && blockers[0].id === 'no-email'
+}
+
+/** Same rule the settings form applies to the contact email. */
+export const CONTACT_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+
+/**
+ * Zod schema for the contact email field. Trims before validating so the saved
+ * value never carries stray whitespace; both the banner and any future inline
+ * prompt share it so they accept exactly what the settings form accepts.
+ */
+export const contactEmailSchema = z.object({
+  email: z
+    .string()
+    .trim()
+    .min(1, 'Enter an email address')
+    .regex(
+      CONTACT_EMAIL_PATTERN,
+      'Enter a valid email address, such as ops@your-domain.com'
+    ),
+})
+
+export type ContactEmailFormData = z.infer<typeof contactEmailSchema>
 
 /** Empty or whitespace becomes `null` ("derive from the external URL"). */
 export function normalizeZoneInput(

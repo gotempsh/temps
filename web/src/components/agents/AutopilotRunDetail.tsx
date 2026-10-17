@@ -44,6 +44,7 @@ import {
 import type { AgentRunLogResponse as AgentRunLog } from '@/api/client/types.gen'
 import { AutopilotStatusBadge } from './AutopilotStatusBadge'
 import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'
+import { invalidateOperations } from '@/lib/operations'
 import {
   addContext,
   createPr,
@@ -996,6 +997,9 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
     ...runQueryOptions,
     enabled: !!runId,
     refetchInterval: (query) => {
+      // Creating a PR is a synchronous push request. Keep observing the run
+      // until it settles, even while the cached phase is still fix_ready.
+      if (isCreatingPr) return 5000
       const run = query.state.data?.run
       if (!run) return false
       const phase = run.phase || ''
@@ -1006,6 +1010,10 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
   })
 
   const currentRun = data?.run
+  useEffect(() => {
+    if (currentRun?.status === 'pushing') void invalidateOperations(queryClient)
+  }, [currentRun?.status, queryClient])
+
   const isAutofixerRun = currentRun?.trigger_source_type === 'error_group'
   const errorGroupId = isAutofixerRun
     ? (currentRun?.trigger_source_id ?? null)
@@ -1059,6 +1067,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       eventSource.close()
       setStoppedStreamKey(streamKey)
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     })
 
     eventSource.onerror = () => {
@@ -1162,6 +1171,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
       })
       setStreamLogs([])
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
       toast.success('Fix generation started')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to start fix')
@@ -1177,11 +1187,14 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         path: { project_id: project.id, run_id: run.id },
         throwOnError: true,
       })
-      queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
       toast.success('Pull request created')
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to create PR')
     } finally {
+      // Refresh the run on errors too: the server may have entered pushing
+      // before a failed response, and its persisted state drives polling.
+      void queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
       setIsCreatingPr(false)
     }
   }
@@ -1204,6 +1217,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
         })
       }
       queryClient.invalidateQueries({ queryKey: runQueryOptions.queryKey })
+      void invalidateOperations(queryClient)
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Failed to send message')
     } finally {
@@ -1421,6 +1435,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           />
           <Button
             size="sm"
+            aria-label="Send context"
             onClick={onSendContext}
             disabled={!contextInput.trim() || isSendingContext}
           >

@@ -253,13 +253,25 @@ export function MajorUpgradeDetail() {
   }
 
   if (httpStatusOf(upgradeQuery.error) === 404) {
+    // The icon-only arrow in `backAction` is easy to miss on a page that has
+    // nothing else on it, and the service itself may be the missing record,
+    // so offer a labelled way out to both the service and the list.
     return (
       <PageState
         variant="failed"
         icon={XCircle}
         title="Upgrade not found"
-        description={`Upgrade #${upgradeIdNum} does not exist for service ${serviceIdNum}.`}
-        action={backAction}
+        description={`Upgrade #${upgradeIdNum} does not exist for service ${serviceIdNum}. It may have been removed, or the link may be out of date.`}
+        action={
+          <div className="flex flex-wrap items-center justify-center gap-2">
+            <Button asChild variant="outline">
+              <Link to={`/storage/${id}`}>Back to service</Link>
+            </Button>
+            <Button asChild variant="ghost">
+              <Link to="/storage">All storage services</Link>
+            </Button>
+          </div>
+        }
       />
     )
   }

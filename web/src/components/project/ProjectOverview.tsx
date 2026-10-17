@@ -209,7 +209,7 @@ export function ProjectOverview({
     <>
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
       <div className="@container/overview">
-        <div className="grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">
             <CardHeader className="flex flex-row items-start justify-between gap-4 pb-2">
               <div className="min-w-0">
@@ -330,11 +330,11 @@ export function ProjectOverview({
           />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <EnvironmentHealthCard project={project} />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <TopRoutesCard
             projectSlug={project.slug}
             routes={topRoutes}

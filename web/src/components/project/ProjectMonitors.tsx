@@ -69,16 +69,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 interface ProjectMonitorsProps {
   project: ProjectResponse
@@ -317,7 +308,8 @@ function MonitorCard({
 export function ProjectMonitors({ project }: ProjectMonitorsProps) {
   const queryClient = useQueryClient()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
-  const [monitorToDelete, setMonitorToDelete] = useState<number | null>(null)
+  const [monitorToDelete, setMonitorToDelete] =
+    useState<MonitorResponse | null>(null)
 
   // Form with validation
   const form = useForm<CreateMonitorFormData>({
@@ -597,7 +589,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               key={monitor.id}
               monitor={monitor}
               projectSlug={project.slug}
-              onDelete={() => setMonitorToDelete(monitor.id)}
+              onDelete={() => setMonitorToDelete(monitor)}
               environment={environments?.find(
                 (env) => env.id === monitor.environment_id
               )}
@@ -619,32 +611,19 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         />
       )}
 
-      {/* Delete Confirmation Dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={monitorToDelete !== null}
-        onOpenChange={() => setMonitorToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete Monitor</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete this monitor? This action cannot
-              be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                monitorToDelete && handleDeleteMonitor(monitorToDelete)
-              }
-              className="bg-destructive hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setMonitorToDelete(null)
+        }}
+        resourceType="monitor"
+        resourceName={monitorToDelete?.name ?? ''}
+        consequences="Its uptime and response-time history is deleted with it and checks stop running."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (monitorToDelete) handleDeleteMonitor(monitorToDelete.id)
+        }}
+      />
     </div>
   )
 }

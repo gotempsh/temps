@@ -46,6 +46,7 @@
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -70,6 +71,20 @@ pub trait OnDemandCertProvisioner: Send + Sync {
     /// (epoch seconds) the implementation persisted, so the in-process negative
     /// cache can mirror the DB without a round-trip.
     async fn provision(&self, hostname: &str, email: &str) -> Result<(), CertProvisionFailure>;
+
+    /// Of `hostnames`, the ones a serving certificate already covers (an exact
+    /// row or a one-level wildcard such as `*.apps.example.com`). Used by
+    /// [`OnDemandCertManager::pre_provision`] so a wildcard-covered
+    /// environment URL never reaches the gate, where it would spend a
+    /// concurrency slot and an hourly-cap token on an order that is not needed.
+    ///
+    /// The default reports nothing as covered, which keeps implementations
+    /// without a certificate store (and test fakes) on the plain gate path.
+    /// Implementations must fail open: on a lookup error return an empty set so
+    /// the provisioner's own guard decides.
+    async fn covered_hostnames(&self, _hostnames: &[String]) -> HashSet<String> {
+        HashSet::new()
+    }
 }
 
 /// Failure detail returned by [`OnDemandCertProvisioner::provision`]. Carries
@@ -184,6 +199,17 @@ struct IpNoveltyCounter {
     count: AtomicU32,
 }
 
+/// Result of [`OnDemandCertManager::pre_provision`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PreProvisionSummary {
+    /// Hostnames offered.
+    pub total: usize,
+    /// Skipped because a certificate (exact or wildcard) already covers them.
+    pub covered: usize,
+    /// Handed to the issuance consumer.
+    pub enqueued: usize,
+}
+
 /// On-demand certificate manager. Lives in the proxy process.
 pub struct OnDemandCertManager {
     config: OnDemandCertConfig,
@@ -199,6 +225,10 @@ pub struct OnDemandCertManager {
 
     /// Per-source-IP novelty limiter (ADR §4 random-SNI flood final layer).
     ip_novelty: DashMap<IpAddr, IpNoveltyCounter>,
+
+    /// Same provisioner the consumer drives; kept here for the coverage lookup
+    /// in [`Self::pre_provision`].
+    provisioner: Arc<dyn OnDemandCertProvisioner>,
 
     /// Global hourly issuance counter window-start (epoch seconds).
     hourly_window_start: AtomicU64,
@@ -238,6 +268,7 @@ impl OnDemandCertManager {
             job_tx,
             route_table,
             ip_novelty: DashMap::new(),
+            provisioner: Arc::clone(&provisioner),
             hourly_window_start: AtomicU64::new(now_epoch_secs()),
             hourly_count: AtomicU32::new(0),
         });
@@ -464,6 +495,37 @@ impl OnDemandCertManager {
     /// semaphore, and runs each issuance in a panic-isolated task so a panic in
     /// `DomainService`/the ACME client is recorded as a failure and never
     /// reaches a Pingora worker thread (ADR §Risks).
+    /// Eagerly enqueue issuance for stable, cert-eligible hostnames taken from
+    /// a route-table load, skipping the ones a certificate already covers.
+    ///
+    /// This is the pre-provisioning path (no TLS handshake in flight, so there
+    /// is no peer IP). Coverage is resolved in one batched lookup before the
+    /// gate runs, because the gate's dedup and hourly cap are keyed on enqueue:
+    /// without the filter every reload would spend cap on hosts that a wildcard
+    /// certificate already serves, starving the hosts that genuinely need an
+    /// order.
+    pub async fn pre_provision(&self, hostnames: &[String]) -> PreProvisionSummary {
+        let mut summary = PreProvisionSummary {
+            total: hostnames.len(),
+            ..PreProvisionSummary::default()
+        };
+        if hostnames.is_empty() {
+            return summary;
+        }
+
+        let covered = self.provisioner.covered_hostnames(hostnames).await;
+        for hostname in hostnames {
+            if covered.contains(hostname) {
+                summary.covered += 1;
+                continue;
+            }
+            if let EnqueueOutcome::Enqueued = self.try_enqueue(hostname, None) {
+                summary.enqueued += 1;
+            }
+        }
+        summary
+    }
+
     fn spawn_consumer(
         self: Arc<Self>,
         mut job_rx: mpsc::Receiver<OnDemandCertJob>,
@@ -607,6 +669,7 @@ mod tests {
     struct FakeProvisioner {
         calls: Arc<Mutex<Vec<String>>>,
         succeed: bool,
+        covered: HashSet<String>,
     }
 
     #[async_trait]
@@ -626,6 +689,14 @@ mod tests {
                     backoff_until_epoch: None,
                 })
             }
+        }
+
+        async fn covered_hostnames(&self, hostnames: &[String]) -> HashSet<String> {
+            hostnames
+                .iter()
+                .filter(|h| self.covered.contains(*h))
+                .cloned()
+                .collect()
         }
     }
 
@@ -685,8 +756,73 @@ mod tests {
         let p = Arc::new(FakeProvisioner {
             calls: Arc::clone(&calls),
             succeed,
+            covered: HashSet::new(),
         });
         (p, calls)
+    }
+
+    fn fake_covering(
+        covered: &[&str],
+    ) -> (Arc<dyn OnDemandCertProvisioner>, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let p: Arc<dyn OnDemandCertProvisioner> = Arc::new(FakeProvisioner {
+            calls: calls.clone(),
+            succeed: true,
+            covered: covered.iter().map(|h| h.to_string()).collect(),
+        });
+        (p, calls)
+    }
+
+    #[tokio::test]
+    async fn test_pre_provision_skips_covered_hosts_without_spending_the_cap() {
+        let (p, calls) = fake_covering(&["a.1.2.3.4.sslip.io", "b.1.2.3.4.sslip.io"]);
+        let rt = empty_route_table();
+        for host in ["a", "b", "c"] {
+            rt.insert_route_for_test(&format!("{host}.1.2.3.4.sslip.io"), route(true));
+        }
+        let mgr = manager_with("1.2.3.4.sslip.io", rt, p);
+
+        let hosts: Vec<String> = ["a", "b", "c"]
+            .iter()
+            .map(|h| format!("{h}.1.2.3.4.sslip.io"))
+            .collect();
+        let summary = mgr.pre_provision(&hosts).await;
+
+        assert_eq!(
+            summary,
+            PreProvisionSummary {
+                total: 3,
+                covered: 2,
+                enqueued: 1
+            }
+        );
+        // Covered hosts were never tracked, so they hold no gate state.
+        assert!(mgr.state_of("a.1.2.3.4.sslip.io").is_none());
+        assert!(mgr.state_of("b.1.2.3.4.sslip.io").is_none());
+        assert!(mgr.state_of("c.1.2.3.4.sslip.io").is_some());
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*calls.lock().unwrap(), vec!["c.1.2.3.4.sslip.io"]);
+    }
+
+    #[tokio::test]
+    async fn test_pre_provision_without_coverage_info_enqueues_every_eligible_host() {
+        let (p, _) = fake(true);
+        let rt = empty_route_table();
+        rt.insert_route_for_test("a.1.2.3.4.sslip.io", route(true));
+        rt.insert_route_for_test("eph.1.2.3.4.sslip.io", route(false));
+        let mgr = manager_with("1.2.3.4.sslip.io", rt, p);
+
+        let hosts = vec![
+            "a.1.2.3.4.sslip.io".to_string(),
+            "eph.1.2.3.4.sslip.io".to_string(),
+        ];
+        let summary = mgr.pre_provision(&hosts).await;
+
+        // The gate still applies: the ephemeral host has no cert-eligible route.
+        assert_eq!(summary.enqueued, 1);
+        assert_eq!(summary.covered, 0);
+        assert!(mgr.pre_provision(&[]).await == PreProvisionSummary::default());
     }
 
     fn ip() -> Option<IpAddr> {

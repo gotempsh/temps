@@ -63,7 +63,7 @@ test('deleting an email provider asks first, naming it, and sends nothing until 
   const view = renderProviders()
   await openDeleteDialog(view)
 
-  expect(await view.findByText(`Delete ${PROVIDER.name}?`)).toBeTruthy()
+  expect(await view.findByText(`Delete email provider ${PROVIDER.name}?`)).toBeTruthy()
   expect(api.called('DELETE', '/email-providers/5')).toBe(false)
 
   await act(async () => {

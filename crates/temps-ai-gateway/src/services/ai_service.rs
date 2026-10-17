@@ -131,7 +131,9 @@ impl GatewayAiService {
                     // provider default and bypass the policy.
                     return first_model(Some(allowed_models));
                 }
-                break;
+                // NULL `allowed_models` means this scope sets no model policy
+                // (its row may exist only to carry rate limits or a budget),
+                // so the next scope's policy still applies.
             }
         }
         if let Some(model) = explicit {
@@ -1375,6 +1377,20 @@ mod tests {
             .into_connection();
         let svc = service_over(db);
         assert_eq!(svc.resolve_model(None, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_project_row_without_policy_inherits_instance_allowlist() {
+        // A project row that only carries limits (NULL allowed_models) must not
+        // shadow the instance-wide allow-list.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                config_row("project:7", None),
+                config_row("instance", Some(serde_json::json!(["gpt-5-nano"]))),
+            ]])
+            .into_connection();
+        let svc = service_over(db);
+        assert_eq!(svc.resolve_model(Some(7), Some("gpt-5.6")).await, None);
     }
 
     #[tokio::test]

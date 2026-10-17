@@ -4,16 +4,7 @@ import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
 import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -60,7 +51,7 @@ interface McpServersSettingsProps {
 
 export function McpServersSettings({ project }: McpServersSettingsProps) {
   const queryClient = useQueryClient()
-  const [mcpToDelete, setMcpToDelete] = useState<string | null>(null)
+  const [mcpToDelete, setMcpToDelete] = useState<McpDefinition | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingMcp, setEditingMcp] = useState<McpDefinition | null>(null)
 
@@ -185,7 +176,7 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           className="text-destructive"
-                          onClick={() => setMcpToDelete(mcp.slug)}
+                          onClick={() => setMcpToDelete(mcp)}
                         >
                           Delete
                         </DropdownMenuItem>
@@ -247,34 +238,22 @@ export function McpServersSettings({ project }: McpServersSettingsProps) {
         }}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={mcpToDelete !== null}
-        onOpenChange={() => setMcpToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete MCP server?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this MCP server definition. Workflows
-              referencing it will no longer have access to it.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (mcpToDelete)
-                  deleteMutation.mutate({
-                    path: { project_id: project.id, slug: mcpToDelete },
-                  })
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setMcpToDelete(null)
+        }}
+        resourceType="MCP server"
+        resourceName={mcpToDelete?.name || mcpToDelete?.slug || ''}
+        consequences="Workflows referencing it will no longer have access to it."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (mcpToDelete)
+            deleteMutation.mutate({
+              path: { project_id: project.id, slug: mcpToDelete.slug },
+            })
+        }}
+      />
     </div>
   )
 }

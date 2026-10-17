@@ -15,7 +15,8 @@ use crate::{
     handler::handler::LbApiDoc,
     service::{
         challenge_service::ChallengeService, ip_access_control_service::IpAccessControlService,
-        lb_service::LbService, proxy_log_service::ProxyLogService,
+        lb_service::LbService, project_ip_access_service::ProjectIpAccessService,
+        proxy_log_service::ProxyLogService,
     },
 };
 
@@ -134,6 +135,10 @@ impl TempsPlugin for ProxyPlugin {
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
 
+            // Per-project / per-environment IP allow/deny lists (management
+            // side; enforcement is the gate installed in the proxy slot).
+            let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
+
             // Create Challenge service for CAPTCHA
             let challenge_service = Arc::new(ChallengeService::new(db.clone()));
 
@@ -142,6 +147,7 @@ impl TempsPlugin for ProxyPlugin {
             context.register_service(proxy_log_service);
             context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
+            context.register_service(project_ip_access_service);
             context.register_service(challenge_service);
 
             tracing::debug!("Proxy plugin services registered successfully");
@@ -177,15 +183,36 @@ impl TempsPlugin for ProxyPlugin {
             // Same handoff for ProjectIpGate. Absent a registered plugin,
             // the slot stays on OpenIpGate — every project remains
             // unrestricted, matching a build with no such plugin present.
+            //
+            // When neither the bootstrap nor a plugin supplied a gate, install
+            // the built-in per-project/environment allow/deny list gate. A
+            // plugin gate (e.g. one with its own policy templates) always
+            // wins: the slot is write-once, and we only build ours when it is
+            // still unclaimed after the plugin lookup.
             if let Some(slot) = self.project_ip_gate_slot.get() {
-                if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
+                if slot.is_claimed() {
+                    tracing::debug!(
+                        "proxy: ProjectIpGate slot already contains the authoritative \
+                         gate constructed by the proxy bootstrap"
+                    );
+                } else if let Some(gate) = context.get_service::<dyn temps_core::ProjectIpGate>() {
                     if slot.set(gate) {
                         tracing::debug!("proxy: ProjectIpGate wired in from a registered plugin");
-                    } else {
-                        tracing::debug!(
-                            "proxy: ProjectIpGate slot already contains the authoritative \
-                             gate constructed by the proxy bootstrap"
-                        );
+                    }
+                } else {
+                    let db = context.require_service::<DbConnection>();
+                    let gate = Arc::new(crate::ip_access::ProjectIpAccessGate::new(db));
+                    // A failed initial load must not leave the slot open: the
+                    // error aborts plugin initialisation, and the slot stays
+                    // fail-closed because it is never finished.
+                    gate.hydrate().await.map_err(|e| {
+                        PluginError::InitializationFailed(format!(
+                            "project IP access gate failed to load its rules: {e}"
+                        ))
+                    })?;
+                    gate.spawn_refresh_loop(&tokio::runtime::Handle::current());
+                    if slot.set(gate) {
+                        tracing::debug!("proxy: built-in project IP access gate installed");
                     }
                 }
                 slot.finish_registration();
@@ -211,6 +238,12 @@ impl TempsPlugin for ProxyPlugin {
         let proxy_log_service = context.require_service::<ProxyLogService>();
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
+        let project_ip_access_state =
+            Arc::new(crate::handler::project_ip_access::ProjectIpAccessState {
+                service: context.require_service::<ProjectIpAccessService>(),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: project_access_checker.clone(),
+            });
 
         // Create the app state directly
         let app_state = Arc::new(crate::handler::types::AppState { lb_service });
@@ -227,6 +260,10 @@ impl TempsPlugin for ProxyPlugin {
             .merge(
                 crate::handler::ip_access_control::create_routes()
                     .with_state(ip_access_control_service),
+            )
+            .merge(
+                crate::handler::project_ip_access::create_routes()
+                    .with_state(project_ip_access_state),
             );
 
         Some(PluginRoutes::new(router))
@@ -253,10 +290,15 @@ impl TempsPlugin for ProxyPlugin {
         let lb_spec = LbApiDoc::openapi();
         let proxy_logs_spec = crate::handler::proxy_logs::openapi();
         let ip_access_control_spec = crate::handler::ip_access_control::openapi();
+        let project_ip_access_spec = crate::handler::project_ip_access::openapi();
 
         let merged = temps_core::openapi::merge_openapi_schemas(
             lb_spec,
-            vec![proxy_logs_spec, ip_access_control_spec],
+            vec![
+                proxy_logs_spec,
+                ip_access_control_spec,
+                project_ip_access_spec,
+            ],
         );
 
         Some(merged)
@@ -326,6 +368,19 @@ mod tests {
         assert!(lb_service.is_some(), "LB service should be registered");
     }
 
+    /// Stand-in for the audit service the console registers in real boot.
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn test_plugin_metadata() {
         let plugin = ProxyPlugin::new();
@@ -373,10 +428,12 @@ mod tests {
         let challenge_service = Arc::new(ChallengeService::new(db_connection.clone()));
 
         // Register all services in the service registry
-        service_registry.register(db_connection);
+        service_registry.register(db_connection.clone());
         service_registry.register(lb_service);
         service_registry.register(proxy_log_service);
         service_registry.register(ip_access_control_service);
+        service_registry.register(Arc::new(ProjectIpAccessService::new(db_connection.clone())));
+        service_registry.register(Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>);
         service_registry.register(challenge_service);
 
         let plugin_context = PluginContext::new(service_registry, state_registry);

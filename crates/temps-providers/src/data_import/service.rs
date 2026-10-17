@@ -624,7 +624,8 @@ impl DataImportService {
         })?;
         let instance = self
             .manager
-            .get_service_instance(service.name.clone(), service_type)
+            .resolve_service_instance(&service.name, service_type)
+            .await
             .map_err(|e| map_manager_error(service_id, "load the service engine", e))?;
         Ok(ResolvedTarget { service, instance })
     }

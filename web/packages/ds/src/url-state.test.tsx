@@ -3,7 +3,7 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { MemoryRouter, useLocation, useNavigate } from 'react-router'
-import { useUrlBoundText, useUrlState } from './url-state'
+import { useUrlBoundText, useUrlSearchText, useUrlState } from './url-state'
 
 import {
   act,
@@ -242,5 +242,225 @@ test('a navigation that lands on the query already shown discards a cancelled pa
   )
   expect(params.get('q')).toBe('abc')
   expect(params.get('page')).toBe('2')
+  view.unmount()
+})
+
+function SearchTextBox({ paramKey }: { paramKey?: string }) {
+  const [text, setText, committed] = useUrlSearchText(paramKey, {
+    resetKeys: ['page'],
+  })
+  const location = useLocation()
+  return (
+    <div>
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+      <output data-testid="search">{location.search}</output>
+      <output data-testid="committed">{committed}</output>
+    </div>
+  )
+}
+
+const typeFast = (input: HTMLInputElement, value: string) => {
+  let typed = ''
+  for (const char of value) {
+    typed += char
+    fireEvent.change(input, { target: { value: typed } })
+  }
+}
+
+test('useUrlSearchText keeps fast typing, writes the key and resets page', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?page=4&tab=a']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  typeFast(input, 'qa-ui-qj14a')
+  expect(input.value).toBe('qa-ui-qj14a')
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
+    )
+    expect(params.get('q')).toBe('qa-ui-qj14a')
+    expect(params.has('page')).toBe(false)
+    expect(params.get('tab')).toBe('a')
+  })
+  expect(view.getByTestId('committed').textContent).toBe('qa-ui-qj14a')
+  expect(input.value).toBe('qa-ui-qj14a')
+  view.unmount()
+})
+
+// Appends each character to what the box *currently shows*, like a keystroke.
+// `typeFast` sends the cumulative expected string every time, so a character
+// the box dropped would be re-supplied by the next event and go unnoticed.
+const typeByKeystroke = (input: HTMLInputElement, value: string) => {
+  for (const char of value) {
+    fireEvent.change(input, { target: { value: input.value + char } })
+  }
+}
+
+test('useUrlSearchText keeps spaces and special characters exactly as typed', async () => {
+  const typed = ' my var: a&b=c %20 #x+y/z ü '
+  const view = render(
+    <MemoryRouter initialEntries={['/list']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  typeByKeystroke(input, typed)
+  // Leading/trailing whitespace is not trimmed while typing.
+  expect(input.value).toBe(typed)
+  await waitFor(() => {
+    expect(view.getByTestId('committed').textContent).toBe(typed)
+  })
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe(typed)
+  expect(input.value).toBe(typed)
+  view.unmount()
+})
+
+test('useUrlSearchText restores the text from the URL on a fresh mount', () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?find=pages']}>
+      <SearchTextBox paramKey="find" />
+    </MemoryRouter>
+  )
+  expect((view.getByLabelText('search') as HTMLInputElement).value).toBe(
+    'pages'
+  )
+  view.unmount()
+})
+
+test('useUrlSearchText clearing the box removes the key from the URL', async () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/list?q=abc&tab=a']}>
+      <SearchTextBox />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  fireEvent.change(input, { target: { value: '' } })
+  expect(input.value).toBe('')
+  await waitFor(() => {
+    const params = new URLSearchParams(
+      view.getByTestId('search').textContent ?? ''
+    )
+    expect(params.has('q')).toBe(false)
+    expect(params.get('tab')).toBe('a')
+  })
+  view.unmount()
+})
+
+test('useUrlSearchText with a shared urlState composes with a sibling patch in the same tick', async () => {
+  function Shared() {
+    const urlState = useUrlState<'q' | 'types'>()
+    const [text, setText] = useUrlSearchText('q', { urlState })
+    const location = useLocation()
+    return (
+      <div>
+        <input
+          aria-label="search"
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+        />
+        <button onClick={() => urlState.patch({ types: 'npm' })}>npm</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/scan']}>
+      <Shared />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  // Type, then click a filter before the router has committed the search.
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'openssl' } })
+    fireEvent.click(view.getByText('npm'))
+  })
+  await settle(1200)
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('openssl')
+  expect(params.get('types')).toBe('npm')
+  expect(input.value).toBe('openssl')
+  view.unmount()
+})
+
+test('separate useUrlState instances compose a search edit and a sibling write in one tick', async () => {
+  function Search() {
+    const [text, setText] = useUrlSearchText('q')
+    return (
+      <input
+        aria-label="search"
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+      />
+    )
+  }
+  function Tabs() {
+    const { patch } = useUrlState<'tab'>()
+    const location = useLocation()
+    return (
+      <div>
+        <button onClick={() => patch({ tab: 'history' })}>history</button>
+        <output data-testid="search">{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <MemoryRouter initialEntries={['/runtime']}>
+      <Search />
+      <Tabs />
+    </MemoryRouter>
+  )
+  const input = view.getByLabelText('search') as HTMLInputElement
+  await act(async () => {
+    fireEvent.change(input, { target: { value: 'oom' } })
+    fireEvent.click(view.getByText('history'))
+  })
+  await settle(1200)
+  const params = new URLSearchParams(
+    view.getByTestId('search').textContent ?? ''
+  )
+  expect(params.get('q')).toBe('oom')
+  expect(params.get('tab')).toBe('history')
+  expect(input.value).toBe('oom')
+  view.unmount()
+})
+
+test('independent routers do not share pending writes', async () => {
+  function Writer({ name }: { name: string }) {
+    const { patch } = useUrlState<string>()
+    const location = useLocation()
+    return (
+      <div>
+        <button onClick={() => patch({ [name]: name })}>{name}</button>
+        <output data-testid={`${name}-search`}>{location.search}</output>
+      </div>
+    )
+  }
+  const view = render(
+    <div>
+      <MemoryRouter initialEntries={['/one']}>
+        <Writer name="first" />
+      </MemoryRouter>
+      <MemoryRouter initialEntries={['/two']}>
+        <Writer name="second" />
+      </MemoryRouter>
+    </div>
+  )
+  await act(async () => {
+    fireEvent.click(view.getByText('first'))
+    fireEvent.click(view.getByText('second'))
+  })
+  expect(view.getByTestId('first-search').textContent).toBe('?first=first')
+  expect(view.getByTestId('second-search').textContent).toBe('?second=second')
   view.unmount()
 })

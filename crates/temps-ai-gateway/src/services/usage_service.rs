@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set, Statement,
+    ActiveModelTrait, DatabaseBackend, DatabaseConnection, EntityTrait, FromQueryResult, Set,
+    Statement,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -80,6 +81,34 @@ pub struct UsageLogEntry {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    /// Project the call is attributed to (deployment-token callers only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i32>,
+    /// Deployment token the call is attributed to
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<i32>,
+}
+
+/// Per-project spend and volume, for cost reporting.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ProjectUsage {
+    pub project_id: i32,
+    pub request_count: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    /// Estimated cost in microcents (1/10000 of a cent), from the model price list
+    pub estimated_cost_microcents: i64,
+    /// The part of `estimated_cost_microcents` the operator pays for: requests
+    /// made with a caller-supplied provider key are excluded. This is the
+    /// figure a project's monthly budget is measured against.
+    pub operator_cost_microcents: i64,
+    /// The project's effective monthly budget after inheritance, in microcents;
+    /// `null` when it has no cap. Left `None` by the usage service and filled in
+    /// by the handler, which owns the link to the limits service.
+    pub monthly_budget_microcents: Option<i64>,
+    /// Requests served with a caller-supplied provider key (not operator spend)
+    pub byok_request_count: i64,
+    pub error_count: i64,
 }
 
 /// A page of recent usage log entries plus the total count for pagination.
@@ -113,6 +142,23 @@ pub struct AiRequestContext {
     pub tags: Vec<String>,
     pub request_id: Option<String>,
     pub trace_id: Option<String>,
+    /// Project the caller's deployment token belongs to. Set by the handler
+    /// from the authenticated principal, never from request headers.
+    pub project_id: Option<i32>,
+    /// Deployment token that made the call.
+    pub token_id: Option<i32>,
+}
+
+impl AiRequestContext {
+    /// Attribute the request to the deployment token that authenticated it.
+    /// Human callers (sessions, API keys) are attributed by `user_id` instead.
+    pub fn attributed_to(mut self, auth: &temps_auth::AuthContext) -> Self {
+        if let Some(token) = auth.deployment_token_info() {
+            self.project_id = Some(token.project_id);
+            self.token_id = Some(token.token_id);
+        }
+        self
+    }
 }
 
 /// Filters for querying AI usage data.
@@ -124,6 +170,8 @@ pub struct AiRequestContext {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct UsageFilter {
     pub user_id: Option<i32>,
+    /// Restrict to usage attributed to this project (deployment-token callers).
+    pub project_id: Option<i32>,
     pub conversation_id: Option<String>,
     /// Comma-separated tags to filter by (AND logic).
     pub tags: Option<String>,
@@ -213,6 +261,25 @@ struct UsageLogRow {
     tags: Option<String>,
     request_id: Option<String>,
     trace_id: Option<String>,
+    project_id: Option<i32>,
+    token_id: Option<i32>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct ProjectUsageRow {
+    project_id: Option<i32>,
+    request_count: Option<i64>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    estimated_cost_microcents: Option<i64>,
+    operator_cost_microcents: Option<i64>,
+    byok_request_count: Option<i64>,
+    error_count: Option<i64>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct SpendRow {
+    spend: Option<i64>,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -327,6 +394,14 @@ impl UsageService {
         is_byok: bool,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
+        // Callers that already priced the request keep their figure; everything
+        // else is priced from the model list so spend caps and per-project
+        // reports have a cost to work with.
+        let estimated_cost_microcents = if estimated_cost_microcents == 0 {
+            crate::services::pricing::estimate_cost_microcents(model, input_tokens, output_tokens)
+        } else {
+            estimated_cost_microcents
+        };
         let record = ai_usage_logs::ActiveModel {
             timestamp: Set(chrono::Utc::now()),
             user_id: Set(user_id),
@@ -343,6 +418,8 @@ impl UsageService {
             tags: Set(context.tags.clone()),
             request_id: Set(context.request_id.clone()),
             trace_id: Set(context.trace_id.clone()),
+            project_id: Set(context.project_id),
+            token_id: Set(context.token_id),
             ..Default::default()
         };
 
@@ -471,6 +548,100 @@ impl UsageService {
                 error_count: r.error_count.unwrap_or(0),
             })
             .collect())
+    }
+
+    /// Spend and volume per project for a time range, most expensive first.
+    ///
+    /// Only usage attributed to a project (deployment-token callers) appears;
+    /// rows from before attribution existed have no project and are excluded.
+    /// Bounded by `limit` so a large instance cannot return an unbounded set.
+    pub async fn get_by_project(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: u64,
+    ) -> Result<Vec<ProjectUsage>, AiGatewayError> {
+        let rows = ProjectUsageRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"SELECT
+                project_id,
+                COUNT(*) as request_count,
+                COALESCE(SUM(input_tokens), 0)::INT8 as input_tokens,
+                COALESCE(SUM(output_tokens), 0)::INT8 as output_tokens,
+                COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as estimated_cost_microcents,
+                COALESCE(SUM(estimated_cost_microcents) FILTER (WHERE is_byok = false), 0)::INT8 as operator_cost_microcents,
+                COUNT(*) FILTER (WHERE is_byok = true) as byok_request_count,
+                COUNT(*) FILTER (WHERE status >= 400) as error_count
+            FROM ai_usage_logs
+            WHERE project_id IS NOT NULL AND timestamp >= $1 AND timestamp <= $2
+            GROUP BY project_id
+            ORDER BY estimated_cost_microcents DESC, request_count DESC
+            LIMIT $3"#,
+            [from.into(), to.into(), (limit as i64).into()],
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(ProjectUsage {
+                    project_id: r.project_id?,
+                    request_count: r.request_count.unwrap_or(0),
+                    input_tokens: r.input_tokens.unwrap_or(0),
+                    output_tokens: r.output_tokens.unwrap_or(0),
+                    estimated_cost_microcents: r.estimated_cost_microcents.unwrap_or(0),
+                    operator_cost_microcents: r.operator_cost_microcents.unwrap_or(0),
+                    monthly_budget_microcents: None,
+                    byok_request_count: r.byok_request_count.unwrap_or(0),
+                    error_count: r.error_count.unwrap_or(0),
+                })
+            })
+            .collect())
+    }
+
+    /// The provider name behind a route such as `gateway_key:7` (the key's
+    /// provider, e.g. `openai`), so usage rows group with those logged by the
+    /// request handlers. Anything that is not a resolvable key route is
+    /// returned unchanged.
+    pub async fn provider_name_for_route(&self, route: &str) -> String {
+        let Some(key_id) = route
+            .strip_prefix("gateway_key:")
+            .and_then(|raw| raw.parse::<i32>().ok())
+        else {
+            return route.to_string();
+        };
+        match temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(key)) => key.provider,
+            Ok(None) => route.to_string(),
+            Err(error) => {
+                tracing::warn!(key_id, %error, "Could not resolve the provider of an AI key");
+                route.to_string()
+            }
+        }
+    }
+
+    /// Operator-funded spend of one project since `since`, in microcents.
+    /// Requests made with a caller-supplied provider key cost the operator
+    /// nothing and are excluded. Served by `idx_ai_usage_logs_project_timestamp`.
+    pub async fn project_spend_since(
+        &self,
+        project_id: i32,
+        since: DateTime<Utc>,
+    ) -> Result<i64, AiGatewayError> {
+        let row = SpendRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"SELECT COALESCE(SUM(estimated_cost_microcents), 0)::INT8 as spend
+            FROM ai_usage_logs
+            WHERE project_id = $1 AND timestamp >= $2 AND is_byok = false"#,
+            [project_id.into(), since.into()],
+        ))
+        .one(self.db.as_ref())
+        .await?;
+        Ok(row.and_then(|r| r.spend).unwrap_or(0))
     }
 
     /// Get time-series usage data bucketed by interval.
@@ -671,7 +842,9 @@ impl UsageService {
                 conversation_id,
                 array_to_string(tags, ',') as tags,
                 request_id,
-                trace_id
+                trace_id,
+                project_id,
+                token_id
             FROM ai_usage_logs
             WHERE {}
             ORDER BY timestamp DESC
@@ -784,7 +957,9 @@ impl UsageService {
                 conversation_id,
                 array_to_string(tags, ',') as tags,
                 request_id,
-                trace_id
+                trace_id,
+                project_id,
+                token_id
             FROM ai_usage_logs
             WHERE conversation_id = $1
               AND ($3::int IS NULL OR user_id = $3)
@@ -817,6 +992,12 @@ impl UsageService {
         if let Some(user_id) = filter.user_id {
             conditions.push(format!("user_id = ${}", param_idx));
             values.push(user_id.into());
+            param_idx += 1;
+        }
+
+        if let Some(project_id) = filter.project_id {
+            conditions.push(format!("project_id = ${}", param_idx));
+            values.push(project_id.into());
             param_idx += 1;
         }
 
@@ -962,12 +1143,94 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
             .collect(),
         request_id: r.request_id,
         trace_id: r.trace_id,
+        project_id: r.project_id,
+        token_id: r.token_id,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn by_project_reports_operator_cost_apart_from_total_cost() {
+        use sea_orm::{MockDatabase, Value};
+        let row = std::collections::BTreeMap::from([
+            ("project_id".to_string(), Value::Int(Some(7))),
+            ("request_count".to_string(), Value::BigInt(Some(4))),
+            ("input_tokens".to_string(), Value::BigInt(Some(100))),
+            ("output_tokens".to_string(), Value::BigInt(Some(50))),
+            (
+                "estimated_cost_microcents".to_string(),
+                Value::BigInt(Some(900)),
+            ),
+            (
+                "operator_cost_microcents".to_string(),
+                Value::BigInt(Some(600)),
+            ),
+            ("byok_request_count".to_string(), Value::BigInt(Some(1))),
+            ("error_count".to_string(), Value::BigInt(Some(0))),
+        ]);
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row]])
+                .into_connection(),
+        ));
+        let now = chrono::Utc::now();
+        let projects = service.get_by_project(now, now, 10).await.unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].project_id, 7);
+        assert_eq!(projects[0].estimated_cost_microcents, 900);
+        assert_eq!(projects[0].operator_cost_microcents, 600);
+    }
+
+    #[tokio::test]
+    async fn a_key_route_resolves_to_the_key_provider() {
+        use sea_orm::MockDatabase;
+        let key = temps_entities::ai_provider_keys::Model {
+            id: 7,
+            provider: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            api_key_encrypted: "enc".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![key]])
+                .into_connection(),
+        ));
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:7").await,
+            "anthropic"
+        );
+    }
+
+    #[tokio::test]
+    async fn routes_that_are_not_resolvable_keys_are_left_alone() {
+        use sea_orm::MockDatabase;
+        // No query results queued: a lookup that wrongly ran would error out.
+        let service = UsageService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        assert_eq!(service.provider_name_for_route("openai").await, "openai");
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:abc").await,
+            "gateway_key:abc"
+        );
+        // A key that no longer exists, or a failing read, falls back to the route.
+        assert_eq!(
+            service.provider_name_for_route("gateway_key:9").await,
+            "gateway_key:9"
+        );
+    }
 
     #[test]
     fn test_shift_params_basic() {
@@ -1121,6 +1384,8 @@ mod tests {
             tags: Some("agent:support,env:prod".to_string()),
             request_id: Some("req_abc".to_string()),
             trace_id: Some("trace_xyz".to_string()),
+            project_id: Some(7),
+            token_id: Some(9),
         };
 
         let entry = usage_log_from_row(row);
@@ -1148,6 +1413,8 @@ mod tests {
             tags: Some("".to_string()),
             request_id: None,
             trace_id: None,
+            project_id: None,
+            token_id: None,
         };
 
         let entry = usage_log_from_row(row);
@@ -1194,6 +1461,8 @@ mod tests {
             tags: vec![],
             request_id: None,
             trace_id: None,
+            project_id: None,
+            token_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -1220,6 +1489,8 @@ mod tests {
             tags: vec!["agent:support".to_string()],
             request_id: Some("req_123".to_string()),
             trace_id: Some("trace_456".to_string()),
+            project_id: None,
+            token_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();
@@ -1249,5 +1520,144 @@ mod tests {
         assert!(json.contains("\"message_count\":5"));
         assert!(json.contains("claude-sonnet-4-6"));
         assert!(json.contains("gpt-4o"));
+    }
+
+    fn usage_log_model(
+        project_id: Option<i32>,
+        token_id: Option<i32>,
+    ) -> temps_entities::ai_usage_logs::Model {
+        temps_entities::ai_usage_logs::Model {
+            id: 1,
+            timestamp: Utc::now(),
+            user_id: None,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            input_tokens: 1_000,
+            output_tokens: 100,
+            latency_ms: 10,
+            estimated_cost_microcents: 3_500,
+            status: 200,
+            is_streaming: false,
+            is_byok: false,
+            conversation_id: None,
+            tags: vec![],
+            request_id: None,
+            trace_id: None,
+            project_id,
+            token_id,
+        }
+    }
+
+    #[tokio::test]
+    async fn deployment_token_usage_is_stored_with_project_and_token() {
+        use sea_orm::MockDatabase;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![usage_log_model(Some(7), Some(11))]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+        let context = AiRequestContext {
+            project_id: Some(7),
+            token_id: Some(11),
+            ..Default::default()
+        };
+
+        service
+            .log_usage_with_context(
+                None, "openai", "gpt-4o", 1_000, 100, 10, 0, 200, false, false, &context,
+            )
+            .await
+            .expect("usage insert succeeds");
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("project_id") && sql.contains("token_id"),
+            "{sql}"
+        );
+        assert!(sql.contains("Int(Some(7))"), "project id not bound: {sql}");
+        assert!(sql.contains("Int(Some(11))"), "token id not bound: {sql}");
+        // gpt-4o is $2.50/M in, $10/M out: 1000 * 2.5 + 100 * 10 microcents.
+        assert!(
+            sql.contains("BigInt(Some(3500))"),
+            "cost was not estimated: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn human_caller_usage_is_stored_without_project_attribution() {
+        use sea_orm::MockDatabase;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![usage_log_model(None, None)]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+
+        service
+            .log_usage(
+                Some(5),
+                "openai",
+                "gpt-4o",
+                10,
+                10,
+                10,
+                0,
+                200,
+                false,
+                false,
+            )
+            .await
+            .expect("usage insert succeeds");
+
+        drop(service);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("Int(None)"),
+            "project/token must bind NULL: {sql}"
+        );
+        assert!(!sql.contains("Int(Some(7))"), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn an_explicit_cost_is_not_overridden_by_the_estimate() {
+        use sea_orm::MockDatabase;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![usage_log_model(None, None)]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+
+        service
+            .log_usage(
+                None, "openai", "gpt-4o", 1_000, 100, 10, 42, 200, false, false,
+            )
+            .await
+            .expect("usage insert succeeds");
+
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("BigInt(Some(42))"), "{sql}");
+        assert!(!sql.contains("BigInt(Some(3500))"), "{sql}");
+    }
+
+    #[test]
+    fn project_filter_adds_a_bound_condition() {
+        let service = UsageService::new(Arc::new(
+            sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let to = Utc::now();
+        let from = to - chrono::Duration::hours(1);
+        let filter = UsageFilter {
+            project_id: Some(7),
+            ..Default::default()
+        };
+        let (clause, values) = service.build_filter_clause(from, to, &filter);
+        assert!(clause.contains("project_id = $3"), "{clause}");
+        assert_eq!(values.len(), 3);
     }
 }

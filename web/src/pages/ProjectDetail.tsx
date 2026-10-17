@@ -73,6 +73,7 @@ import {
   readFailureExplanation,
   readFailureServerDetail,
 } from '@/lib/read-failure'
+import { ReadFailure } from '@/components/ui/read-failure'
 import {
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
@@ -97,7 +98,6 @@ import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useState } from 'react'
 import {
-  Navigate,
   Route,
   Routes,
   useNavigate,
@@ -387,10 +387,21 @@ export function ProjectDetail() {
     hasProject: !!project,
   })
 
-  // Only a verified 404 means the project is gone. A 5xx, a 403 or a dropped
+  // Only a verified 404 means the project is gone. A 5xx or a dropped
   // connection says nothing about whether it exists, so those offer a retry.
   if (loadState === 'not-found') {
     return <NotFound />
+  }
+
+  // A refused read is an answer, not an outage: say the account lacks access
+  // (with the server's reason) and offer no Retry, which would be refused
+  // again.
+  if (loadState === 'forbidden') {
+    return (
+      <div className="p-4 sm:p-6">
+        <ReadFailure resource="Service" error={error} />
+      </div>
+    )
   }
 
   if (loadState === 'failed') {
@@ -765,9 +776,8 @@ export function ProjectDetail() {
               <Route
                 path="git/change-repository"
                 element={
-                  <Navigate
+                  <RedirectWithQuery
                     to={`/projects/${project.slug}/connect-repository`}
-                    replace
                   />
                 }
               />
@@ -800,9 +810,8 @@ export function ProjectDetail() {
               <Route
                 path="databases"
                 element={
-                  <Navigate
+                  <RedirectWithQuery
                     to={legacyDatabasesRedirectPath(project.slug)}
-                    replace
                   />
                 }
               />

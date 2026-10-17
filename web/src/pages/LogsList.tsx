@@ -35,7 +35,8 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { useNavigate } from 'react-router'
+import { useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import { LogsEmptyState } from '@/components/observability/LogsEmptyState'
 
 interface LogsListProps {
@@ -77,22 +78,26 @@ function severityBadge(severity: LogSeverity, text?: string) {
 
 export default function LogsList({ project }: LogsListProps) {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const urlState = useUrlState<
+    'range' | 'severity' | 'service' | 'q' | 'trace'
+  >()
+  const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
   usePageTitle(`Logs - ${project.name}`)
 
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
-  )
-  const [severity, setSeverity] = useState<string>(
-    () => searchParams.get('severity') || ALL
-  )
-  const [service, setService] = useState(
-    () => searchParams.get('service') || ''
-  )
-  const [search, setSearch] = useState(() => searchParams.get('q') || '')
+  // Every filter lives in the URL (replace, not push) so reload, back/forward
+  // and shared links keep it. Text boxes keep what was typed locally and mirror
+  // it to the URL, so a re-render can never drop a keystroke.
+  const timeRange = state.range || '24h'
+  const setTimeRange = (value: TimeRange) =>
+    patch({ range: value === '24h' ? undefined : value })
+  const severity = state.severity || ALL
+  const setSeverity = (value: string) =>
+    patch({ severity: value === ALL ? undefined : value })
+  const [service, setService] = useUrlSearchText('service', { urlState })
+  const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
-  const traceId = searchParams.get('trace') || ''
+  const traceId = state.trace || ''
   const [page, setPage] = useState(1)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
@@ -115,24 +120,6 @@ export default function LogsList({ project }: LogsListProps) {
     setPage(1)
     setExpanded(new Set())
   }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
-
-  // Persist filters to the URL.
-  useEffect(() => {
-    const params = new URLSearchParams()
-    if (timeRange !== '24h') params.set('range', timeRange)
-    if (severity !== ALL) params.set('severity', severity)
-    if (debouncedService) params.set('service', debouncedService)
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (traceId) params.set('trace', traceId)
-    setSearchParams(params, { replace: true })
-  }, [
-    timeRange,
-    severity,
-    debouncedService,
-    debouncedSearch,
-    traceId,
-    setSearchParams,
-  ])
 
   const { startTime, endTime } = useMemo(() => {
     const range = resolveTimeRange(timeRange)
@@ -188,9 +175,7 @@ export default function LogsList({ project }: LogsListProps) {
   }
 
   const clearTrace = () => {
-    const params = new URLSearchParams(searchParams)
-    params.delete('trace')
-    setSearchParams(params, { replace: true })
+    patch({ trace: undefined })
   }
 
   return (

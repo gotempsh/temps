@@ -13,6 +13,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
+import { useFeatureMaturity } from '@/hooks/useFeatureMaturity'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   Link as LinkIcon,
@@ -182,19 +183,49 @@ export function NewProjectShell({
         onValueChange={(value) => onSelectSource(value as ProjectSource)}
       >
         <TabsList aria-label="Service setup">
-          {sources.map((source) => {
-            const Icon = source.icon
-            return (
-              <TabsTrigger key={source.key} value={source.key}>
-                <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                {source.title}
-                <FeatureMaturityBadge featureKey={source.featureKey} compact />
-              </TabsTrigger>
-            )
-          })}
+          {sources.map((source) => (
+            <SourceTab key={source.key} source={source} />
+          ))}
         </TabsList>
         <TabsContent value={activeSource ?? ''}>{children}</TabsContent>
       </Tabs>
+    </div>
+  )
+}
+
+/**
+ * One setup-source tab.
+ *
+ * The maturity badge is a focusable control, and a tab may not contain one
+ * (axe `nested-interactive`; tabs treat their children as presentational), so
+ * it sits beside the trigger, laid over the end of it, instead of inside. The
+ * trigger reserves room for it only while a badge is actually shown.
+ */
+function SourceTab({
+  source,
+}: {
+  source: {
+    key: string
+    icon: ComponentType<{ className?: string }>
+    title: string
+    featureKey?: string
+  }
+}) {
+  const Icon = source.icon
+  const { feature } = useFeatureMaturity(source.featureKey)
+  const hasBadge = Boolean(feature && feature.maturity !== 'stable')
+
+  return (
+    <div className="relative flex items-stretch">
+      <TabsTrigger value={source.key} className={hasBadge ? 'pr-6' : undefined}>
+        <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+        {source.title}
+      </TabsTrigger>
+      {hasBadge ? (
+        <span className="absolute right-0 top-1/2 -translate-y-1/2">
+          <FeatureMaturityBadge featureKey={source.featureKey} compact />
+        </span>
+      ) : null}
     </div>
   )
 }

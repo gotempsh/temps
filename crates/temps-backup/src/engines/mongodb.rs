@@ -280,6 +280,17 @@ impl BackupEngine for MongodbEngine {
 /// `mongodump --archive --gzip` into the attempt's directory inside the
 /// sidecar's own filesystem. No bind mount: the archive is read back with
 /// the Docker archive API.
+///
+/// The credentials travel as a percent-encoded connection URI in the
+/// container's environment (`MONGODB_URI`), never as `-u`/`-p` arguments.
+/// `mongodump` reads any argv token starting with `-` as a flag, including in
+/// the value position of a space-separated `-p`, and the generated service
+/// passwords are drawn from a charset containing `-`. A password that began
+/// with one was quoted correctly by the shell and still failed every attempt
+/// with `expected argument for flag '-p, --password'`, leaving the backup
+/// `running` until its retries ran out. A URI is a single token that starts
+/// with `mongodb://`, so it cannot be mistaken for a flag, and keeping it out
+/// of argv also keeps the password out of the process list.
 fn mongodump_spec(
     attempt: &DumpAttempt,
     backup_id: i32,
@@ -288,13 +299,15 @@ fn mongodump_spec(
     password: &str,
 ) -> OneShotSpec {
     let dump_cmd = format!(
-        "mkdir -p {} && mongodump --host={} --archive={} --gzip \
-         -u {} -p {} --authenticationDatabase admin",
+        "mkdir -p {} && mongodump --uri=\"$MONGODB_URI\" --archive={} --gzip",
         v2_common::shell_escape(&attempt.container_dir()),
-        v2_common::shell_escape(target_container),
         v2_common::shell_escape(&attempt.container_path(SIDECAR_ARCHIVE)),
-        v2_common::shell_escape(username),
-        v2_common::shell_escape(password),
+    );
+    let mongodb_uri = format!(
+        "mongodb://{}:{}@{}:27017/?authSource=admin",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+        target_container,
     );
     OneShotSpec {
         image: MONGO_SIDECAR_IMAGE.to_string(),
@@ -303,7 +316,7 @@ fn mongodump_spec(
         backup_id,
         entrypoint: vec!["sh".to_string(), "-c".to_string()],
         cmd: vec![dump_cmd],
-        env: vec![],
+        env: vec![format!("MONGODB_URI={mongodb_uri}")],
         binds: vec![],
         network_mode: Some(temps_core::NETWORK_NAME.to_string()),
         user: Some("root".to_string()),
@@ -520,6 +533,38 @@ mod tests {
         assert!(spec.name.starts_with("temps-mongodump-b-uuid-"));
         assert!(spec.cmd[0].contains(&first.container_path(SIDECAR_ARCHIVE)));
         assert!(!spec.cmd[0].contains(&retry.container_path(SIDECAR_ARCHIVE)));
+    }
+
+    #[test]
+    fn mongodump_credentials_never_reach_argv_whatever_their_shape() {
+        let parent = tempfile::tempdir().expect("parent");
+        let attempt =
+            DumpAttempt::new_in(parent.path(), MONGO_TOOL, ENGINE_KEY, "b-uuid").expect("attempt");
+
+        // A leading `-` is what mongodump's parser mistook for a flag; the
+        // other characters would reshape an unescaped URI.
+        let password = "-NPtX2D2@9q:/?#Td_&Mt!7 g";
+        let spec = mongodump_spec(&attempt, 7, "temps-mongodb-x", "svc-admin", password);
+
+        let command = &spec.cmd[0];
+        assert!(
+            !command.contains(password)
+                && !command.contains(" -u ")
+                && !command.contains("--password"),
+            "credentials must not be arguments of mongodump: {command}"
+        );
+        assert!(command.contains("--uri=\"$MONGODB_URI\""));
+        assert_eq!(
+            spec.env,
+            vec![format!(
+                "MONGODB_URI=mongodb://svc-admin:{}@temps-mongodb-x:27017/?authSource=admin",
+                urlencoding::encode(password)
+            )]
+        );
+        assert!(
+            !spec.env[0].contains(password),
+            "the password must be percent-encoded inside the URI"
+        );
     }
 
     #[test]

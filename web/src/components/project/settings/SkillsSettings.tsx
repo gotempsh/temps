@@ -2,16 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -52,7 +43,9 @@ interface SkillsSettingsProps {
 
 export function SkillsSettings({ project }: SkillsSettingsProps) {
   const queryClient = useQueryClient()
-  const [skillToDelete, setSkillToDelete] = useState<string | null>(null)
+  const [skillToDelete, setSkillToDelete] = useState<SkillDefinition | null>(
+    null
+  )
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingSkill, setEditingSkill] = useState<SkillDefinition | null>(null)
 
@@ -180,7 +173,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
                     <DropdownMenuSeparator />
                     <DropdownMenuItem
                       className="text-destructive"
-                      onClick={() => setSkillToDelete(skill.slug)}
+                      onClick={() => setSkillToDelete(skill)}
                     >
                       Delete
                     </DropdownMenuItem>
@@ -219,34 +212,22 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
         }}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={skillToDelete !== null}
-        onOpenChange={() => setSkillToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete skill?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this skill definition. Workflows
-              referencing it will no longer have access to it.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (skillToDelete)
-                  deleteMutation.mutate({
-                    path: { project_id: project.id, slug: skillToDelete },
-                  })
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setSkillToDelete(null)
+        }}
+        resourceType="skill"
+        resourceName={skillToDelete?.name || skillToDelete?.slug || ''}
+        consequences="Workflows referencing it will no longer have access to it."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (skillToDelete)
+            deleteMutation.mutate({
+              path: { project_id: project.id, slug: skillToDelete.slug },
+            })
+        }}
+      />
     </div>
   )
 }

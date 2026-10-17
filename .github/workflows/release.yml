@@ -303,9 +303,27 @@ jobs:
           file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
 
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target x86_64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/x86_64-unknown-linux-musl/release/temps-pty-agent
+          cp target/x86_64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-amd64.tar.gz temps temps-vm-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-amd64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-amd64.tar.gz
 
       - name: Generate checksum
@@ -398,9 +416,27 @@ jobs:
           file temps-vm-agent | grep -qE 'statically linked|static-pie linked' \
             || { echo "::error::temps-vm-agent must be a static binary"; exit 1; }
 
+      # Guest-side terminal agent for the Firecracker and microsandbox
+      # backends. `temps firecracker setup` / `temps microsandbox setup` stage
+      # it from next to the `temps` executable, and a guest rejects anything
+      # that is not a static Linux ELF, so it is built the same way as the VM
+      # agent and ships in the same tarball.
+      - name: Build sandbox terminal agent (static musl)
+        run: cargo build --release -p temps-pty-agent --bin temps-pty-agent --target aarch64-unknown-linux-musl
+        env:
+          CARGO_INCREMENTAL: 0
+
+      - name: Package sandbox terminal agent
+        run: |
+          strip target/aarch64-unknown-linux-musl/release/temps-pty-agent
+          cp target/aarch64-unknown-linux-musl/release/temps-pty-agent temps-pty-agent
+          file temps-pty-agent
+          file temps-pty-agent | grep -qE 'statically linked|static-pie linked' \
+            || { echo "::error::temps-pty-agent must be a static binary"; exit 1; }
+
       - name: Create tarball
         run: |
-          tar -czf temps-linux-arm64.tar.gz temps temps-vm-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
+          tar -czf temps-linux-arm64.tar.gz temps temps-vm-agent temps-pty-agent LICENSE LICENSE-MIT NOTICE -C release-inputs runtime-images.json
           ls -lh temps-linux-arm64.tar.gz
 
       - name: Generate checksum

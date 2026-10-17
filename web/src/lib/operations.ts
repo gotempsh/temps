@@ -47,6 +47,12 @@ export const RUNNING_OPERATIONS_QUERY = {
   page_size: OPERATIONS_RUNNING_PAGE_SIZE,
 } as const
 
+/** Query for paused work, separate from both activity and terminal history. */
+export const WAITING_OPERATIONS_QUERY = {
+  status: 'waiting',
+  page_size: OPERATIONS_HISTORY_PAGE_SIZE,
+} as const
+
 /** Query for the tray's "Recent" (finished) section. */
 export const FINISHED_OPERATIONS_QUERY = {
   status: 'finished',
@@ -93,7 +99,6 @@ export function operationsPollInterval({
 const ACTIVE_STATUSES: ReadonlySet<OperationStatus> = new Set([
   'queued',
   'running',
-  'waiting',
 ])
 
 export function isActiveOperationStatus(status: OperationStatus): boolean {
@@ -174,7 +179,11 @@ export function operationContext(operation: OperationEntry): string | null {
  * otherwise when it started (or was created, if it hasn't started yet).
  */
 export function operationTimestamp(operation: OperationEntry): string {
-  if (!isActiveOperationStatus(operation.status) && operation.finished_at) {
+  if (
+    operation.status !== 'waiting' &&
+    !isActiveOperationStatus(operation.status) &&
+    operation.finished_at
+  ) {
     return operation.finished_at
   }
   return operation.started_at ?? operation.created_at
@@ -287,7 +296,10 @@ export function uniqueOperations(
 export interface OperationsTrayFeed {
   /** In-flight operations on the current running page, newest first. */
   running: OperationEntry[]
-  /** Finished operations on the current history page, never repeating a running row. */
+  /** Work awaiting human action on the current review page. */
+  waiting: OperationEntry[]
+  waitingNav: OperationsPageNav
+  /** Finished operations on the current history page, never repeating another row. */
   recent: OperationEntry[]
   /** Server-side in-flight count. Drives the badge. */
   runningCount: number
@@ -298,28 +310,36 @@ export interface OperationsTrayFeed {
 }
 
 /**
- * Derive the tray's sections from one page of the running feed and one page
- * of the finished feed. The badge count and the running rows come from the
+ * Derive the tray's sections from one page each of active work, reviews
+ * and finished history. The badge count and the running rows come from the
  * same (`status=running`) response, so every counted operation is on some
  * running page the tray can step to.
  */
 export function operationsTrayFeed({
   runningPage,
   finishedPage,
+  waitingPage,
 }: {
   runningPage: OperationsListResponse | undefined
   finishedPage: OperationsListResponse | undefined
+  waitingPage?: OperationsListResponse
 }): OperationsTrayFeed {
   const running = uniqueOperations(runningPage?.operations)
+  const waiting = uniqueOperations(
+    waitingPage?.operations,
+    new Set(running.map((op) => op.id))
+  )
   // A row that just finished may briefly appear in both feeds; show it once,
   // where the badge counts it, until the next poll moves it.
   const recent = uniqueOperations(
     finishedPage?.operations,
-    new Set(running.map((operation) => operation.id))
+    new Set([...running, ...waiting].map((operation) => operation.id))
   )
   return {
     running,
+    waiting,
     recent,
+    waitingNav: operationsPageNav(waitingPage),
     runningCount: runningPage?.running_count ?? 0,
     runningNav: operationsPageNav(runningPage),
     recentNav: operationsPageNav(finishedPage),
@@ -328,7 +348,7 @@ export function operationsTrayFeed({
 
 /**
  * Whether any operation in `previousIds` is missing from `currentIds`, i.e.
- * something finished (or was cancelled) between two running-feed responses.
+ * something finished, was cancelled or paused for review between responses.
  */
 export function operationsLeftRunning(
   previousIds: readonly string[],
@@ -341,23 +361,26 @@ export function operationsLeftRunning(
 
 export interface OperationGroups {
   active: OperationEntry[]
+  waiting: OperationEntry[]
   finished: OperationEntry[]
 }
 
 /**
- * Split the feed into in-flight and finished work, preserving the server's
- * newest-first order inside each group.
+ * Split the feed into active, awaiting review and finished work, preserving
+ * the server's newest-first order inside each group.
  */
 export function groupOperations(
   operations: readonly OperationEntry[]
 ): OperationGroups {
   const active: OperationEntry[] = []
+  const waiting: OperationEntry[] = []
   const finished: OperationEntry[] = []
   for (const operation of operations) {
     if (isActiveOperationStatus(operation.status)) active.push(operation)
+    else if (operation.status === 'waiting') waiting.push(operation)
     else finished.push(operation)
   }
-  return { active, finished }
+  return { active, waiting, finished }
 }
 
 /** Accessible name for the header trigger. */

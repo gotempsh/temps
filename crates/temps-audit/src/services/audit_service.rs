@@ -502,6 +502,7 @@ mod tests {
             is_hosting_provider: None,
             created_at: now,
             updated_at: now,
+            last_used_at: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

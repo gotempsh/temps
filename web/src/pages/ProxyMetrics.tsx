@@ -54,7 +54,10 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
+import { refetchUnlessRefused, shouldRetryQuery } from '@/lib/query-retry'
 import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
 import {
   formatProxyTimeLabel,
@@ -126,7 +129,8 @@ type NodePanelDef = {
 const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by status class',
-    description: 'Per-interval request count, split by response status class',
+    description:
+      'Requests per time bucket, split by response status class. Bucket width grows with the selected range, so a longer range shows larger counts',
     series: [
       {
         metric: 'proxy.requests',
@@ -158,7 +162,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Requests by destination',
     description:
-      'Per-interval request count, split by destination: service routes, console fallback, or handled by the proxy itself',
+      'Requests per time bucket, split by destination: service routes, console fallback, or handled by the proxy itself',
     series: [
       {
         metric: 'proxy.requests_project',
@@ -300,7 +304,7 @@ const NODE_PANELS: NodePanelDef[] = [
   {
     title: 'Streaming sessions',
     description:
-      'WebSocket tunnels and SSE streams that closed, averaged per collection interval (not a total for the bucket). These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
+      'WebSocket tunnels and SSE streams that closed in each time bucket. These are held open deliberately — up to 1h idle for WebSockets — so activity here is expected and is not proxy latency',
     series: [
       {
         metric: 'proxy.streaming_sessions',
@@ -413,8 +417,11 @@ function proxySeriesQuery(metric: string, window: ResolvedProxyWindow) {
           },
     }),
     staleTime: 15_000,
-    refetchInterval: 30_000,
-    retry: 1,
+    // A refused read (a role without settings:read) is neither retried nor
+    // polled again: the answer cannot change until the role does.
+    refetchInterval: refetchUnlessRefused(30_000),
+    retry: (failureCount: number, error: unknown) =>
+      failureCount < 1 && shouldRetryQuery(failureCount, error),
   }
 }
 
@@ -1300,6 +1307,10 @@ export default function ProxyMetrics() {
 
   usePageTitle('Proxy')
 
+  // Node metrics need settings:read, which only instance administrators hold.
+  // Everyone else gets one explanation instead of 26 refused series queries.
+  const canReadNodeMetrics = useIsInstanceAdmin()
+
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
@@ -1339,6 +1350,8 @@ export default function ProxyMetrics() {
             <FilteredSummaryStats window={resolved} filter={filter} />
             <FilteredCharts window={resolved} filter={filter} />
           </>
+        ) : !canReadNodeMetrics ? (
+          <NodeMetricsAccessDenied />
         ) : (
           <>
             <NodeSummaryStats window={resolved} />

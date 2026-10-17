@@ -3,23 +3,15 @@
 
 import {
   deleteDnsProvider as deleteProvider,
-  listDnsProviders as listProviders,
   testProviderConnection,
   type DnsProviderResponse,
 } from '@/api/client'
-import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { errorWithStatus } from '@/lib/http-error-status'
+import { isForbiddenRead, readFailureServerDetail } from '@/lib/read-failure'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
@@ -30,8 +22,15 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import {
+  DNS_PROVIDERS_QUERY_KEY,
+  dnsProvidersQueryOptions,
+} from '@/lib/dns-providers-query'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
@@ -82,28 +81,47 @@ export function DnsProviders() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
+  // Adding, testing and deleting providers needs `dns_providers:write`, which
+  // only instance administrators hold.
+  const canManageProviders = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
   const [providerToDelete, setProviderToDelete] =
     useState<DnsProviderResponse | null>(null)
+  // A confirmation armed under a role that has since lost write access must
+  // not come back when the role is restored, so the pending target is dropped
+  // in the same render that sees the loss (not in an effect, which would paint
+  // the stale dialog first).
+  const [couldManage, setCouldManage] = useState(canManageProviders)
+  if (couldManage !== canManageProviders) {
+    setCouldManage(canManageProviders)
+    if (!canManageProviders) setProviderToDelete(null)
+  }
 
   const {
     data: dnsProviders,
     isLoading,
     error,
     refetch,
-  } = useQuery({
-    queryKey: ['dnsProviders'],
-    queryFn: async () => {
-      const response = await listProviders()
-      return response.data
-    },
-    retry: false,
-  })
+    isFetching,
+  } = useQuery(dnsProvidersQueryOptions())
 
   const deleteProviderMut = useMutation({
-    mutationFn: (id: number) => deleteProvider({ path: { id } }),
+    mutationFn: async (id: number) => {
+      const response = await deleteProvider({ path: { id } })
+      // The generated client resolves a refused request with `error` set
+      // rather than throwing; without this a 403 is reported as a deletion.
+      if (response.error) {
+        throw errorWithStatus(
+          readFailureServerDetail(response.error) ??
+            `The server refused to delete DNS provider ${id}`,
+          response.error
+        )
+      }
+      return response.data
+    },
     onSuccess: () => {
       toast.success('DNS provider deleted successfully')
-      queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
+      queryClient.invalidateQueries({ queryKey: DNS_PROVIDERS_QUERY_KEY })
       setProviderToDelete(null)
     },
     onError: (error: Error) => {
@@ -142,8 +160,9 @@ export function DnsProviders() {
 
   usePageTitle('DNS Providers')
 
-  const handleDeleteProvider = async () => {
-    if (!providerToDelete) return
+  const handleDeleteProvider = () => {
+    // The role can change under a cached list; never fire a refused write.
+    if (!providerToDelete || !canManageProviders) return
     deleteProviderMut.mutate(providerToDelete.id)
   }
 
@@ -177,25 +196,32 @@ export function DnsProviders() {
             >
               <RefreshCw className="h-4 w-4" />
             </Button>
-            {!isLoading && Boolean(dnsProviders?.length) && (
-              <CreateActionButton
-                size="sm"
-                onClick={() => navigate('/dns-providers/add')}
-                label="Add DNS Provider"
-              />
-            )}
+            {!isLoading &&
+              canManageProviders &&
+              Boolean(dnsProviders?.length) && (
+                <CreateActionButton
+                  size="sm"
+                  onClick={() => navigate('/dns-providers/add')}
+                  label="Add DNS Provider"
+                />
+              )}
           </div>
         </div>
 
+        {!canManageProviders && (
+          <AdminOnlyNote
+            action="add, test or delete DNS providers"
+            role={currentRole}
+          />
+        )}
+
         {error ? (
-          <Alert variant="destructive">
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Error</AlertTitle>
-            <AlertDescription>
-              Failed to load DNS providers. Please try again later or contact
-              support if the issue persists.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="DNS providers"
+            error={error}
+            onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+            retrying={isFetching}
+          />
         ) : isLoading ? (
           <div className="divide-y rounded-lg border">
             {Array.from({ length: 3 }).map((_, i) => (
@@ -212,16 +238,20 @@ export function DnsProviders() {
             ))}
           </div>
         ) : !dnsProviders?.length ? (
-          <EmptyPlaceholder
+          <EmptyState
+            size="compact"
             icon={Globe}
             title="No DNS providers found"
             description="Get started by adding a DNS provider like Cloudflare or Namecheap to enable automatic DNS record management"
-          >
-            <Button onClick={() => navigate('/dns-providers/add')}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add DNS Provider
-            </Button>
-          </EmptyPlaceholder>
+            action={
+              canManageProviders ? (
+                <Button onClick={() => navigate('/dns-providers/add')}>
+                  <Plus className="mr-2 h-4 w-4" />
+                  Add DNS Provider
+                </Button>
+              ) : undefined
+            }
+          />
         ) : (
           <div className="overflow-hidden rounded-lg border">
             <ul role="list" className="divide-y">
@@ -287,20 +317,22 @@ export function DnsProviders() {
                     onClick={(e) => e.stopPropagation()}
                     onPointerDown={(e) => e.stopPropagation()}
                   >
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => handleTestConnection(provider)}
-                      disabled={testConnectionMut.isPending}
-                      className="hidden gap-2 sm:inline-flex"
-                    >
-                      {testConnectionMut.isPending ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <TestTube2 className="h-4 w-4" />
-                      )}
-                      Test
-                    </Button>
+                    {canManageProviders && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => handleTestConnection(provider)}
+                        disabled={testConnectionMut.isPending}
+                        className="hidden gap-2 sm:inline-flex"
+                      >
+                        {testConnectionMut.isPending ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <TestTube2 className="h-4 w-4" />
+                        )}
+                        Test
+                      </Button>
+                    )}
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <Button
@@ -320,23 +352,27 @@ export function DnsProviders() {
                         >
                           View Details
                         </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => handleTestConnection(provider)}
-                        >
-                          <TestTube2 className="h-4 w-4 mr-2" />
-                          Test Connection
-                        </DropdownMenuItem>
-                        <DropdownMenuSeparator />
-                        <DropdownMenuItem
-                          className="text-destructive cursor-pointer"
-                          onSelect={(e) => {
-                            e.preventDefault()
-                            setProviderToDelete(provider)
-                          }}
-                        >
-                          <Trash2 className="h-4 w-4 mr-2" />
-                          Delete Provider
-                        </DropdownMenuItem>
+                        {canManageProviders && (
+                          <>
+                            <DropdownMenuItem
+                              onClick={() => handleTestConnection(provider)}
+                            >
+                              <TestTube2 className="h-4 w-4 mr-2" />
+                              Test Connection
+                            </DropdownMenuItem>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              className="text-destructive cursor-pointer"
+                              onSelect={(e) => {
+                                e.preventDefault()
+                                setProviderToDelete(provider)
+                              }}
+                            >
+                              <Trash2 className="h-4 w-4 mr-2" />
+                              Delete Provider
+                            </DropdownMenuItem>
+                          </>
+                        )}
                       </DropdownMenuContent>
                     </DropdownMenu>
                   </div>
@@ -349,40 +385,21 @@ export function DnsProviders() {
       </div>
 
       {/* Delete Confirmation Dialog */}
-      <AlertDialog
-        open={!!providerToDelete}
-        onOpenChange={(open) => !open && setProviderToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete DNS Provider</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete &quot;{providerToDelete?.name}
-              &quot;? This action cannot be undone and will remove all
-              associated managed domains.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setProviderToDelete(null)}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProviderMut.isPending}
-              onClick={handleDeleteProvider}
-            >
-              {deleteProviderMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        // Closed as soon as the role loses write access (and the pending
+        // target is cleared above): a still-open confirmation whose button
+        // silently does nothing is worse than none.
+        open={canManageProviders && providerToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="DNS provider"
+        resourceName={providerToDelete?.name ?? ''}
+        confirmLabel="Delete Provider"
+        consequences="All managed domains associated with this provider are removed, and DNS records for them will no longer be automatically managed."
+        isPending={deleteProviderMut.isPending}
+        onConfirm={handleDeleteProvider}
+      />
     </div>
   )
 }

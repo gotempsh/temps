@@ -6,7 +6,20 @@ import * as TabsPrimitive from '@radix-ui/react-tabs'
 
 import { cn } from '@/lib/utils'
 
-const Tabs = TabsPrimitive.Root
+// `min-w-0` lets the root shrink inside a flex row. Without it the (w-full,
+// overflow-x-auto) list keeps its content width, runs past the card and
+// viewport, and the tabs it holds sit outside every scroll container.
+const Tabs = React.forwardRef<
+  React.ElementRef<typeof TabsPrimitive.Root>,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Root>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Root
+    ref={ref}
+    className={cn('min-w-0', className)}
+    {...props}
+  />
+))
+Tabs.displayName = TabsPrimitive.Root.displayName
 
 const TabsList = React.forwardRef<
   React.ElementRef<typeof TabsPrimitive.List>,

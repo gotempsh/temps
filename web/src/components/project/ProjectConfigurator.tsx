@@ -14,6 +14,7 @@ import {
   listPresetsOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import { detectPublicPresets } from '@/api/client/sdk.gen'
 import {
   CreatableServiceTypeRoute,
@@ -1000,8 +1001,7 @@ export function ProjectConfigurator({
       // variables as short as possible.
       toast.success('Service created')
       await finish(data, `/projects/${data.slug}?new=true`)
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      await invalidateProjectLists(queryClient)
     },
   })
 

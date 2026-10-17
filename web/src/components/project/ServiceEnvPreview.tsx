@@ -70,6 +70,12 @@ export function ServiceEnvPreview({
                 variant="ghost"
                 size="sm"
                 className="h-6 w-6 p-0"
+                aria-label={
+                  isOpen
+                    ? `Collapse ${serviceName} variables`
+                    : `Expand ${serviceName} variables`
+                }
+                aria-expanded={isOpen}
                 onClick={handleToggleExpand}
               >
                 {isOpen ? (

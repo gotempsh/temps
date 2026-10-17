@@ -138,99 +138,100 @@ export function SpanWaterfall({
           colorBy === 'service' && !isError ? serviceColor(svc) : undefined
         return (
           <TooltipProvider key={node.span.span_id}>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <button
-                  type="button"
-                  onClick={() =>
-                    onSelect(isSelected ? null : node.span.span_id)
-                  }
-                  className={cn(
-                    'flex w-full min-w-[360px] items-center border-b px-3 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[560px] sm:px-4',
-                    rowClassName?.(node.span),
-                    isSelected && 'bg-accent'
-                  )}
-                >
-                  <div
-                    className="flex min-w-[90px] flex-1 items-center gap-1.5 pr-2 sm:pr-3"
-                    style={{ paddingLeft: `${node.depth * 16}px` }}
+            <div
+              className={cn(
+                'flex w-full min-w-[360px] items-center border-b transition-colors hover:bg-accent/50 sm:min-w-[560px]',
+                rowClassName?.(node.span),
+                isSelected && 'bg-accent'
+              )}
+            >
+              {/* The collapse toggle is a sibling of the select button, not a
+                  child: a control nested in a button is invalid ARIA
+                  (axe `nested-interactive`) and unreachable by some AT. */}
+              <div className="flex shrink-0 items-center gap-1.5 pl-3 sm:pl-4">
+                <span
+                  aria-hidden="true"
+                  className="shrink-0"
+                  style={{ width: `${node.depth * 16}px` }}
+                />
+                {node.children.length > 0 ? (
+                  <button
+                    type="button"
+                    aria-label={isCollapsed ? 'Expand span' : 'Collapse span'}
+                    aria-expanded={!isCollapsed}
+                    onClick={() => toggleCollapse(node.span.span_id)}
+                    className="flex h-3 w-3 shrink-0 items-center justify-center rounded-sm hover:bg-accent"
                   >
-                    {node.children.length > 0 ? (
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        aria-label={
-                          isCollapsed ? 'Expand span' : 'Collapse span'
-                        }
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          toggleCollapse(node.span.span_id)
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault()
-                            e.stopPropagation()
-                            toggleCollapse(node.span.span_id)
-                          }
-                        }}
-                        className="flex h-3 w-3 shrink-0 items-center justify-center rounded-sm hover:bg-accent"
-                      >
-                        {isCollapsed ? (
-                          <ChevronRight className="h-3 w-3 text-muted-foreground" />
-                        ) : (
-                          <ChevronDown className="h-3 w-3 text-muted-foreground" />
-                        )}
-                      </span>
+                    {isCollapsed ? (
+                      <ChevronRight className="h-3 w-3 text-muted-foreground" />
                     ) : (
-                      <span className="w-3 shrink-0" />
+                      <ChevronDown className="h-3 w-3 text-muted-foreground" />
                     )}
-                    {colorBy === 'service' ? (
-                      <span
-                        className="h-2.5 w-2.5 shrink-0 rounded-full"
-                        style={{ backgroundColor: serviceColor(svc) }}
-                      />
-                    ) : (
-                      statusIcon(node.span.status_code)
-                    )}
-                    {renderRowBadge?.(node.span)}
-                    <span className="min-w-0 flex-1 truncate text-xs">
-                      {node.span.name}
-                    </span>
-                    {isCollapsed && (
-                      <span className="shrink-0 rounded-sm bg-muted px-1 text-[10px] text-muted-foreground">
-                        +{countDescendants(node)}
-                      </span>
-                    )}
-                  </div>
-                  <div className="relative h-6 w-[110px] shrink-0 sm:w-[230px] lg:w-[360px]">
-                    <div
-                      className={cn(
-                        'absolute top-1 h-4 min-w-[2px] rounded-sm',
-                        isError ? 'bg-red-500/80' : !barColor && 'bg-primary/70'
+                  </button>
+                ) : (
+                  <span className="w-3 shrink-0" />
+                )}
+              </div>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      onSelect(isSelected ? null : node.span.span_id)
+                    }
+                    className="flex min-w-0 flex-1 items-center py-1.5 pr-3 text-left sm:pr-4"
+                  >
+                    <div className="flex min-w-[90px] flex-1 items-center gap-1.5 pl-1.5 pr-2 sm:pr-3">
+                      {colorBy === 'service' ? (
+                        <span
+                          className="h-2.5 w-2.5 shrink-0 rounded-full"
+                          style={{ backgroundColor: serviceColor(svc) }}
+                        />
+                      ) : (
+                        statusIcon(node.span.status_code)
                       )}
-                      style={{
-                        left: `${leftPct}%`,
-                        width: `${widthPct}%`,
-                        backgroundColor: barColor,
-                      }}
-                    />
+                      {renderRowBadge?.(node.span)}
+                      <span className="min-w-0 flex-1 truncate text-xs">
+                        {node.span.name}
+                      </span>
+                      {isCollapsed && (
+                        <span className="shrink-0 rounded-sm bg-muted px-1 text-[10px] text-muted-foreground">
+                          +{countDescendants(node)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="relative h-6 w-[110px] shrink-0 sm:w-[230px] lg:w-[360px]">
+                      <div
+                        className={cn(
+                          'absolute top-1 h-4 min-w-[2px] rounded-sm',
+                          isError
+                            ? 'bg-red-500/80'
+                            : !barColor && 'bg-primary/70'
+                        )}
+                        style={{
+                          left: `${leftPct}%`,
+                          width: `${widthPct}%`,
+                          backgroundColor: barColor,
+                        }}
+                      />
+                    </div>
+                    <span className="w-[56px] shrink-0 whitespace-nowrap text-right text-[10px] tabular-nums text-muted-foreground sm:w-[62px]">
+                      {formatDuration(spanDuration)}
+                    </span>
+                  </button>
+                </TooltipTrigger>
+                <TooltipContent side="top" className="max-w-xs">
+                  <div className="space-y-1">
+                    <p className="font-medium">{node.span.name}</p>
+                    {svc && <p className="text-xs">Service: {svc}</p>}
+                    <p className="text-xs">
+                      Duration: {formatDuration(spanDuration)}
+                    </p>
+                    <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
                   </div>
-                  <span className="w-[56px] shrink-0 whitespace-nowrap text-right text-[10px] tabular-nums text-muted-foreground sm:w-[62px]">
-                    {formatDuration(spanDuration)}
-                  </span>
-                </button>
-              </TooltipTrigger>
-              <TooltipContent side="top" className="max-w-xs">
-                <div className="space-y-1">
-                  <p className="font-medium">{node.span.name}</p>
-                  {svc && <p className="text-xs">Service: {svc}</p>}
-                  <p className="text-xs">
-                    Duration: {formatDuration(spanDuration)}
-                  </p>
-                  <p className="text-xs">Kind: {kindLabel(node.span.kind)}</p>
-                </div>
-              </TooltipContent>
-            </Tooltip>
+                </TooltipContent>
+              </Tooltip>
+            </div>
           </TooltipProvider>
         )
       })}

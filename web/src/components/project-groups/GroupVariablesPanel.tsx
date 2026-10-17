@@ -18,16 +18,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { GroupEnvVarResponse, ProjectGroupResponse } from '@/api/client'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -316,27 +307,19 @@ export function GroupVariablesPanel({
         onClose={() => setEditing(null)}
       />
 
-      <AlertDialog
-        open={Boolean(deleting)}
-        onOpenChange={(open) => !open && setDeleting(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove {deleting?.key}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Services in {group.name} stop receiving it on their next
-              deployment. Running deployments keep their current value until
-              then.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void confirmDelete()}>
-              Remove variable
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={deleting !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleting(null)
+        }}
+        resourceType="shared variable"
+        resourceName={deleting?.key ?? ''}
+        verb="Remove"
+        confirmLabel="Remove variable"
+        consequences={`Services in ${group.name} stop receiving it on their next deployment. Running deployments keep their current value until then.`}
+        isPending={remove.isPending}
+        onConfirm={() => void confirmDelete()}
+      />
     </section>
   )
 }

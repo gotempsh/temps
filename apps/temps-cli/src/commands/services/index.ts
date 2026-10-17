@@ -150,7 +150,43 @@ interface CreateOptions {
   type?: string
   name?: string
   set?: string[]
+  backend?: string
+  bucket?: string[]
   yes?: boolean
+}
+
+const S3_BACKENDS = ['rustfs', 'garage']
+const S3_SERVICE_TYPES = ['s3', 'blob']
+
+/**
+ * Fold --backend / repeatable --bucket into the service parameters. They are
+ * only meaningful for S3-compatible services, and win over a conflicting
+ * --set so the dedicated flag is never silently ignored.
+ */
+export function applyS3Flags(
+  serviceType: string,
+  parameters: Record<string, unknown>,
+  options: { backend?: string; bucket?: string[] }
+): Record<string, unknown> {
+  const backend = options.backend?.trim().toLowerCase()
+  const buckets = (options.bucket ?? []).map((b) => b.trim()).filter((b) => b !== '')
+  if (!backend && buckets.length === 0) return parameters
+  if (!S3_SERVICE_TYPES.includes(serviceType)) {
+    throw new Error(
+      `--backend and --bucket only apply to S3-compatible services (${S3_SERVICE_TYPES.join(', ')}), not "${serviceType}"`
+    )
+  }
+  const result = { ...parameters }
+  if (backend) {
+    if (!S3_BACKENDS.includes(backend)) {
+      throw new Error(`Unknown --backend "${options.backend}". Available: ${S3_BACKENDS.join(', ')}`)
+    }
+    result.backend = backend
+  }
+  if (buckets.length > 0) {
+    result.buckets = buckets
+  }
+  return result
 }
 
 interface ShowOptions {
@@ -259,6 +295,8 @@ export function registerServicesCommands(program: Command): void {
     .option('-t, --type <type>', 'Service type (postgres, mongodb, redis, s3)')
     .option('-n, --name <name>', 'Service name')
     .option('-s, --set <key=value>', 'Set a parameter (repeatable)', collectSet, [])
+    .option('--backend <backend>', 'S3 storage engine: rustfs (default) or garage (s3/blob only)')
+    .option('--bucket <name>', 'Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET)', collectSet, [])
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createServiceAction)
 
@@ -605,10 +643,11 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
   let parameters: Record<string, unknown> = {}
 
   const hasSetParams = options.set && options.set.length > 0
+  const hasS3Flags = Boolean(options.backend) || (options.bucket?.length ?? 0) > 0
 
   // Automation mode: -y with type+name, OR type+name+set (explicit params = no need for -y)
   const isAutomation = (options.yes && options.type && options.name) ||
-    (options.type && options.name && hasSetParams)
+    (options.type && options.name && (hasSetParams || hasS3Flags))
 
   if (isAutomation) {
     // Validate service type
@@ -630,6 +669,12 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
     } else {
       // Apply default parameters for this service type (e.g., database/username for postgres)
       parameters = { ...(SERVICE_TYPE_DEFAULTS[serviceType] ?? {}) }
+    }
+    try {
+      parameters = applyS3Flags(serviceType, parameters, options)
+    } catch (e) {
+      warning((e as Error).message)
+      return
     }
   } else {
     // Interactive mode — use --type and --name if provided, prompt for the rest
@@ -661,15 +706,27 @@ async function createServiceAction(options: CreateOptions): Promise<void> {
     }
 
     // Get parameters schema for the service type (returns JSON Schema)
+    try {
+      parameters = applyS3Flags(serviceType, parameters, options)
+    } catch (e) {
+      warning((e as Error).message)
+      return
+    }
+
+    // Describe the engine the user asked for, so defaults match what is created
     const { data: typeInfo } = await getServiceTypeParameters({
       client,
       path: { service_type: serviceType },
+      query: parameters.backend ? { backend: String(parameters.backend) } : undefined,
     })
 
     const schema = typeInfo as JsonSchema | undefined
     const promptParams = schemaToPromptParams(schema ?? {})
-    // Only show user-configurable params (skip readonly ones the backend auto-generates)
-    const configurableParams = promptParams.filter(p => !p.readonly || p.required)
+    // Only show user-configurable params (skip readonly ones the backend auto-generates,
+    // and anything already supplied through a dedicated flag)
+    const configurableParams = promptParams.filter(
+      p => (!p.readonly || p.required) && !(p.name in parameters)
+    )
 
     if (configurableParams.length > 0) {
       info(`\nConfigure ${SERVICE_TYPE_LABELS[serviceType] || serviceType} parameters:`)

@@ -14,7 +14,7 @@ use ::microsandbox::sandbox::{
     DeploymentProfile, FsEntryKind, FsSetAttrs, RlimitResource, SandboxHandle as MsbSandboxHandle,
     SandboxStatus, SecurityProfile,
 };
-use ::microsandbox::setup::{InstallOptions, ResolvedRuntime};
+use ::microsandbox::setup::{InstallOptions, ResolvedRuntime, RuntimeOrigin};
 use ::microsandbox::{
     ExecEvent, LocalBackend, MicrosandboxError, NetworkPolicy, NetworkProfile, Sandbox,
 };
@@ -439,27 +439,64 @@ impl MicrosandboxSandboxProvider {
     /// Install the pinned runtime pair (`msb` + `libkrunfw`) into this
     /// provider's home. Downloads the official release archive for this
     /// platform and verifies the installed pair. Idempotent: an existing
-    /// complete installation is kept.
+    /// pair of the pinned version is kept; one of any other version (left by
+    /// an older Temps) is replaced, since the SDK refuses to launch with a
+    /// runtime that is not exactly its own version.
     pub async fn install_runtime(&self) -> Result<ResolvedRuntime, AgentError> {
         let home = self.config.home();
         std::fs::create_dir_all(&home)?;
         set_dir_private(&home);
         let local = self.local()?;
-        let options = InstallOptions {
+        let mut options = InstallOptions {
             version: MICROSANDBOX_VERSION.to_string(),
             ..InstallOptions::default()
         };
+
+        let install_error = |e: MicrosandboxError| AgentError::SandboxProviderUnavailable {
+            provider: PROVIDER_NAME.to_string(),
+            reason: format!(
+                "installing microsandbox runtime v{} into {} failed: {}",
+                MICROSANDBOX_VERSION,
+                home.display(),
+                e
+            ),
+        };
+
+        if let Ok(existing) = ::microsandbox::setup::resolve_runtime(local.config()) {
+            if let Err(mismatch) = check_runtime_version(&existing) {
+                // Only the copy under this home is ours to replace. A runtime
+                // chosen through MSB_PATH or the SDK config would keep winning
+                // over whatever is installed here, so replacing the home
+                // copy would not fix anything — say so instead.
+                if existing.origin != RuntimeOrigin::Home {
+                    return Err(AgentError::SandboxProviderUnavailable {
+                        provider: PROVIDER_NAME.to_string(),
+                        reason: format!(
+                            "{mismatch}; it was selected through {:?} rather than the Temps \
+                             runtime home {}, so it was left untouched — point it at a \
+                             v{} runtime or remove the override",
+                            existing.origin,
+                            home.display(),
+                            MICROSANDBOX_VERSION
+                        ),
+                    });
+                }
+                tracing::info!(
+                    msb_path = %existing.msb_path.display(),
+                    expected = MICROSANDBOX_VERSION,
+                    "replacing microsandbox runtime that does not match this build: {}",
+                    mismatch
+                );
+                options.force = true;
+                return ::microsandbox::setup::install_runtime(local.config(), options)
+                    .await
+                    .map_err(install_error);
+            }
+        }
+
         ::microsandbox::setup::ensure_runtime(local.config(), options)
             .await
-            .map_err(|e| AgentError::SandboxProviderUnavailable {
-                provider: PROVIDER_NAME.to_string(),
-                reason: format!(
-                    "installing microsandbox runtime v{} into {} failed: {}",
-                    MICROSANDBOX_VERSION,
-                    home.display(),
-                    e
-                ),
-            })
+            .map_err(install_error)
     }
 
     fn resolve_name(&self, config: &SandboxCreateConfig) -> String {
@@ -877,7 +914,7 @@ impl MicrosandboxSandboxProvider {
             .image(image)
             .cpus(plan.cpus)
             .memory(plan.memory_mib)
-            .security(SecurityProfile::Restricted)
+            .security(guest_security_profile(config.allow_docker))
             .labels([
                 ("sh.temps.backend", PROVIDER_NAME.to_string()),
                 ("sh.temps.run_id", run_id.to_string()),
@@ -1940,6 +1977,14 @@ fn parse_uid_gid(stdout: &str) -> Option<(u32, u32)> {
     lines.next().is_none().then_some((uid, gid))
 }
 
+fn guest_security_profile(allow_docker: bool) -> SecurityProfile {
+    if allow_docker {
+        SecurityProfile::Default
+    } else {
+        SecurityProfile::Restricted
+    }
+}
+
 fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBackend, AgentError> {
     let home = config.home();
     LocalBackend::builder()
@@ -1958,11 +2003,45 @@ fn build_local_backend(config: &MicrosandboxSandboxConfig) -> Result<LocalBacken
         })
 }
 
+/// Compare the installed `msb` with the version this build pins.
+///
+/// The SDK launches only a runtime whose embedded version equals its own
+/// crate version, and otherwise fails every sandbox create with an opaque
+/// "no tested sandbox launch contract" error. Checking here — by reading the
+/// binary's embedded version, never executing it — turns that into an
+/// up-front, actionable readiness failure.
+fn check_runtime_version(runtime: &ResolvedRuntime) -> Result<(), MicrosandboxUnavailable> {
+    let found = ::microsandbox::setup::resolve_runtime_version(&runtime.msb_path)
+        .map(|version| version.map(|v| v.to_string()))
+        .map_err(|e| e.to_string());
+    classify_runtime_version(&runtime.msb_path, found)
+}
+
+/// Pure half of [`check_runtime_version`], unit-tested below.
+fn classify_runtime_version(
+    msb_path: &Path,
+    found: Result<Option<String>, String>,
+) -> Result<(), MicrosandboxUnavailable> {
+    let mismatch = |installed: String| MicrosandboxUnavailable::RuntimeVersionMismatch {
+        msb_path: msb_path.display().to_string(),
+        installed,
+        expected: MICROSANDBOX_VERSION.to_string(),
+    };
+    match found {
+        Ok(Some(version)) if version == MICROSANDBOX_VERSION => Ok(()),
+        Ok(Some(version)) => Err(mismatch(format!("v{version}"))),
+        Ok(None) => Err(mismatch(
+            "an unversioned build (no embedded version)".to_string(),
+        )),
+        Err(detail) => Err(mismatch(format!("unreadable ({detail})"))),
+    }
+}
+
 fn resolve_runtime(
     local: &LocalBackend,
     home: &Path,
 ) -> Result<ResolvedRuntime, MicrosandboxUnavailable> {
-    ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
+    let runtime = ::microsandbox::setup::resolve_runtime(local.config()).map_err(|e| match e {
         MicrosandboxError::RuntimeNotInstalled(detail) => {
             MicrosandboxUnavailable::RuntimeNotInstalled {
                 home: home.display().to_string(),
@@ -1975,7 +2054,9 @@ fn resolve_runtime(
             version: MICROSANDBOX_VERSION.to_string(),
             detail: other.to_string(),
         },
-    })
+    })?;
+    check_runtime_version(&runtime)?;
+    Ok(runtime)
 }
 
 /// The SDK reserves the `MSB_` environment prefix for its own runtime
@@ -2066,6 +2147,50 @@ fn workspace_has_entries(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pinned_runtime_version_matches_the_sdk_this_build_links() {
+        // The SDK launches only a runtime equal to its own version, and
+        // `install_runtime` downloads `MICROSANDBOX_VERSION`. If a dependency
+        // bump moves the crate without moving the constant, setup installs a
+        // runtime the SDK then rejects at every sandbox create.
+        assert_eq!(
+            MICROSANDBOX_VERSION,
+            InstallOptions::default().version,
+            "MICROSANDBOX_VERSION must equal the pinned microsandbox crate version"
+        );
+    }
+
+    #[test]
+    fn runtime_version_check_accepts_only_the_pinned_version() {
+        let msb = Path::new("/h/microsandbox/bin/msb");
+        assert!(classify_runtime_version(msb, Ok(Some(MICROSANDBOX_VERSION.into()))).is_ok());
+
+        let older = classify_runtime_version(msb, Ok(Some("0.7.7".into()))).unwrap_err();
+        match &older {
+            MicrosandboxUnavailable::RuntimeVersionMismatch {
+                msb_path,
+                installed,
+                expected,
+            } => {
+                assert_eq!(msb_path, "/h/microsandbox/bin/msb");
+                assert_eq!(installed, "v0.7.7");
+                assert_eq!(expected, MICROSANDBOX_VERSION);
+            }
+            other => panic!("expected RuntimeVersionMismatch, got {other:?}"),
+        }
+
+        for found in [Ok(None), Err("bad ELF header".to_string())] {
+            assert!(
+                matches!(
+                    classify_runtime_version(msb, found),
+                    Err(MicrosandboxUnavailable::RuntimeVersionMismatch { .. })
+                ),
+                "an unversioned or unreadable msb must not be reported as ready"
+            );
+        }
+    }
+
     use crate::sandbox::microsandbox::host_data_dir;
 
     fn create_config() -> SandboxCreateConfig {
@@ -2082,6 +2207,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -2382,6 +2508,77 @@ mod tests {
         Some(provider)
     }
 
+    #[test]
+    fn docker_opt_in_selects_guest_root_semantics() {
+        assert_eq!(guest_security_profile(false), SecurityProfile::Restricted);
+        assert_eq!(guest_security_profile(true), SecurityProfile::Default);
+        let mut config = create_config();
+        config.allow_docker = true;
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Docker)
+            .is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Firecracker)
+            .is_err());
+        assert!(config.validate_allow_docker(SandboxBackend::Local).is_err());
+        assert!(config
+            .validate_allow_docker(SandboxBackend::Microsandbox)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn e2e_allow_docker_installs_and_runs_nested_container() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        let mut config = e2e_config("nested-docker", "full");
+        config.allow_docker = true;
+        config.memory_limit_mb = Some(1024);
+        config.disk_size_mb = Some(4096);
+        let provider = &provider;
+        with_sandbox(provider, config, |handle| async move {
+            let result = sh(
+                provider,
+                &handle,
+                r#"
+                set -eu
+                grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status
+                apk add --no-cache docker
+                mkdir -p /sys/fs/cgroup
+                mountpoint -q /sys/fs/cgroup || mount -t cgroup2 none /sys/fs/cgroup
+                dockerd --storage-driver=vfs --iptables=false --bridge=none >/tmp/dockerd.log 2>&1 &
+                daemon=$!
+                trap 'kill "$daemon" 2>/dev/null || true' EXIT
+                ready=0
+                for i in $(seq 1 30); do
+                    if docker info >/dev/null 2>&1; then ready=1; break; fi
+                    sleep 1
+                done
+                if [ "$ready" != 1 ]; then cat /tmp/dockerd.log; exit 1; fi
+                docker run --rm --network none alpine:3.20 echo temps-nested-docker-ok
+            "#,
+            )
+            .await;
+            assert_eq!(result.exit_code, 0, "{}\n{}", result.stdout, result.stderr);
+            assert!(result.stdout.contains("temps-nested-docker-ok"));
+            provider.stop(&handle).await.unwrap();
+            provider.start(&handle).await.unwrap();
+            provider.evict(&handle.sandbox_name);
+            let resumed = sh(
+                provider,
+                &handle,
+                "grep -Eq '^NoNewPrivs:[[:space:]]+0$' /proc/self/status && docker --version",
+            )
+            .await;
+            assert_eq!(
+                resumed.exit_code, 0,
+                "{}\n{}",
+                resumed.stdout, resumed.stderr
+            );
+        })
+        .await;
+    }
+
     fn e2e_config(label: &str, network_mode: &str) -> SandboxCreateConfig {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2535,6 +2732,64 @@ mod tests {
     const EGRESS_PROBE: &str = "wget -q -T 5 -O - http://1.1.1.1/cdn-cgi/trace";
     /// Number of IPv4 routes in the guest (header line excluded).
     const ROUTE_COUNT: &str = "tail -n +2 /proc/net/route | wc -l";
+
+    /// What a service manager that kills the whole unit does to a VM: the VMM
+    /// process dies with nothing told to the SDK. The provider must then say
+    /// the VM is down (the verdict the sandbox API reconciles rows on), not
+    /// keep reporting a stale `running`, and `start` must boot it again.
+    #[tokio::test]
+    async fn e2e_a_killed_vm_is_reported_down_and_boots_again() {
+        let Some(provider) = e2e_provider() else {
+            return;
+        };
+        with_sandbox(&provider, e2e_config("killed", "none"), |handle| {
+            let provider = &provider;
+            async move {
+                assert!(provider.is_alive(&handle).await.unwrap());
+
+                let killed = std::process::Command::new("pkill")
+                    .args(["-9", "-f", &handle.sandbox_name])
+                    .status()
+                    .expect("run pkill");
+                assert!(
+                    killed.success(),
+                    "no process matched {}",
+                    handle.sandbox_name
+                );
+
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while provider.is_alive(&handle).await.unwrap_or(true) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} still reported alive 15s after its VMM was killed",
+                        handle.sandbox_name
+                    );
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                // A down VM is still found by name: that is what lets the
+                // registry say "not running" instead of "not found".
+                let recovered = provider
+                    .recover_by_name(&handle.sandbox_name)
+                    .await
+                    .unwrap();
+                assert!(recovered.is_some(), "a killed VM must still be recoverable");
+
+                provider.start(&handle).await.expect("boot the VM again");
+                assert!(provider.is_alive(&handle).await.unwrap());
+                let echoed = provider
+                    .exec(
+                        &handle,
+                        vec!["echo".into(), "back".into()],
+                        HashMap::new(),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(echoed.stdout.trim(), "back");
+            }
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn e2e_lifecycle_exec_files_and_isolated_network() {

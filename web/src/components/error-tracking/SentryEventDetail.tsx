@@ -651,6 +651,7 @@ export function SentryEventDetail({
                   <Button
                     variant="ghost"
                     size="sm"
+                    aria-label="Copy raw event JSON"
                     onClick={() =>
                       copyToClipboard(JSON.stringify(event, null, 2), 'raw')
                     }

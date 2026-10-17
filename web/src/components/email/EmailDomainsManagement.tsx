@@ -17,6 +17,7 @@ import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -54,7 +55,7 @@ import {
   Info,
   RefreshCw,
 } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { problemMessage } from './sharedUtils'
@@ -481,6 +482,7 @@ function LoadingSkeleton() {
 export function EmailDomainsManagement() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [domainToDelete, setDomainToDelete] = useState<EmailDomain | null>(null)
 
   const domainsQuery = useQuery({
     queryKey: ['email-domains'],
@@ -565,10 +567,10 @@ export function EmailDomainsManagement() {
     onError: (error: Error) => {
       toast.error('Failed to delete domain', { description: error.message })
     },
+    onSettled: () => setDomainToDelete(null),
   })
 
   const handleVerify = (id: number) => verifyMutation.mutate(id)
-  const handleDelete = (id: number) => deleteMutation.mutate(id)
   const handleOpen = (id: number) => navigate(`/email/domains/${id}`)
 
   // Provider lookup by id — avoids N+1 fetches per row.
@@ -788,7 +790,7 @@ export function EmailDomainsManagement() {
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
-                            onClick={() => handleDelete(domain.id)}
+                            onClick={() => setDomainToDelete(domain)}
                           >
                             Delete
                           </DropdownMenuItem>
@@ -804,6 +806,20 @@ export function EmailDomainsManagement() {
           </div>
         </>
       )}
+
+      <ConfirmDeleteDialog
+        open={domainToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="email domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences="Email can no longer be sent from this domain, and its DNS records are no longer tracked."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (domainToDelete) deleteMutation.mutate(domainToDelete.id)
+        }}
+      />
     </div>
   )
 }

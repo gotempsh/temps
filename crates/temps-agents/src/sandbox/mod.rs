@@ -4,6 +4,7 @@
 pub mod docker;
 pub mod firecracker;
 pub mod git_credential_bundle;
+pub mod guest_agent_build;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;
@@ -163,6 +164,9 @@ pub struct SandboxHandle {
 
 /// Configuration for creating a new sandbox.
 pub struct SandboxCreateConfig {
+    /// Permit guest Docker installation by retaining normal guest-root semantics.
+    /// Only microsandbox supports this opt-in; never grants host Docker access.
+    pub allow_docker: bool,
     /// The agent run this sandbox belongs to. Used as the fallback
     /// container suffix (`temps-sandbox-<run_id>`) and for the per-run
     /// home volume.
@@ -222,6 +226,21 @@ pub struct SandboxCreateConfig {
     /// host. Only read by [`node_routing::NodeRoutingSandboxProvider`];
     /// concrete providers ignore it.
     pub node_id: Option<i32>,
+}
+
+impl SandboxCreateConfig {
+    /// Fail closed rather than silently ignoring an unsupported guest privilege request.
+    pub(crate) fn validate_allow_docker(&self, backend: SandboxBackend) -> Result<(), AgentError> {
+        if self.allow_docker && backend != SandboxBackend::Microsandbox {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "sandbox run {}: allow_docker requires the microsandbox backend; {} does not support guest Docker",
+                    self.run_id, backend
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The error [`SandboxProvider::read_file_bounded`] returns for a file over
@@ -615,10 +634,10 @@ pub fn check_guest_agent(bytes: &[u8]) -> Result<(), GuestAgentRejection> {
     Ok(())
 }
 
-/// Why a guest terminal agent could not be staged on the host.
+/// Why a guest agent (`temps-pty-agent` or `temps-vm-agent`) could not be staged on the host.
 #[derive(Debug, thiserror::Error)]
 pub enum PtyAgentStagingError {
-    #[error("guest terminal agent {path} does not exist")]
+    #[error("guest agent {path} does not exist")]
     Missing { path: PathBuf },
 
     #[error("{path} {reason}")]
@@ -627,7 +646,7 @@ pub enum PtyAgentStagingError {
         reason: GuestAgentRejection,
     },
 
-    #[error("cannot stage guest terminal agent {source_path} at {dest}: {reason}")]
+    #[error("cannot stage guest agent {source_path} at {dest}: {reason}")]
     Io {
         source_path: PathBuf,
         dest: PathBuf,
@@ -635,7 +654,7 @@ pub enum PtyAgentStagingError {
     },
 }
 
-/// Copy a guest terminal agent from `source` to `dest` (mode 0755),
+/// Copy a guest agent (the terminal or the VM agent) from `source` to `dest` (mode 0755),
 /// refusing anything the guest cannot run — not a Linux ELF, built for
 /// another CPU, or dynamically linked — so a wrong build fails at setup
 /// instead of at the first terminal (see [`check_guest_agent`]).
@@ -643,7 +662,7 @@ pub enum PtyAgentStagingError {
 /// Both microVM backends' setup commands stage through this, so they agree on
 /// what a valid agent is.
 pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgentStagingError> {
-    use std::io::Read;
+    use std::io::{Read, Seek};
     use std::os::unix::fs::PermissionsExt;
 
     let io_err = |e: std::io::Error| PtyAgentStagingError::Io {
@@ -670,16 +689,87 @@ pub fn stage_pty_agent_binary(source: &Path, dest: &Path) -> Result<(), PtyAgent
         path: source.to_path_buf(),
         reason,
     })?;
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(io_err)?;
-    }
-    // Write beside the destination and rename, so a running server never
-    // reads a half-copied agent.
-    let tmp = dest.with_extension("staging");
-    std::fs::copy(source, &tmp).map_err(io_err)?;
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755)).map_err(io_err)?;
-    std::fs::rename(&tmp, dest).map_err(io_err)?;
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent).map_err(io_err)?;
+    // Every writer owns a distinct file in the destination filesystem. Setup
+    // and startup refresh may race, but only a complete agent is published.
+    let mut staged = tempfile::Builder::new()
+        .prefix(".temps-guest-agent-")
+        .tempfile_in(parent)
+        .map_err(io_err)?;
+    file.rewind().map_err(io_err)?;
+    std::io::copy(&mut file, staged.as_file_mut()).map_err(io_err)?;
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .map_err(io_err)?;
+    staged.as_file().sync_all().map_err(io_err)?;
+    staged.persist(dest).map_err(|e| io_err(e.error))?;
     Ok(())
+}
+
+/// What [`sync_pty_agent_binary`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtyAgentSync {
+    /// The staged copy already matched the shipped one.
+    AlreadyCurrent,
+    /// The staged copy was missing or different and has been replaced.
+    Staged,
+}
+
+/// Bring the agent staged at `dest` in line with the one shipped at `source`.
+///
+/// `temps upgrade` and the installer replace the `temps-pty-agent` that sits
+/// beside the `temps` executable; the copy each microVM backend injects into
+/// guests lives in the data directory and would otherwise only change when
+/// someone re-ran a `setup` command. The server calls this at startup so a new
+/// release's agent is the one guests get, with no operator step.
+///
+/// Compares content rather than timestamps (a rollback to an older release
+/// must also replace a newer staged copy) and reuses
+/// [`stage_pty_agent_binary`], so an unusable source is rejected and the
+/// replacement is atomic.
+pub fn sync_pty_agent_binary(
+    source: &Path,
+    dest: &Path,
+) -> Result<PtyAgentSync, PtyAgentStagingError> {
+    if files_have_same_content(source, dest) {
+        return Ok(PtyAgentSync::AlreadyCurrent);
+    }
+    stage_pty_agent_binary(source, dest)?;
+    Ok(PtyAgentSync::Staged)
+}
+
+/// Whether both files exist and hold identical bytes. Any read failure counts
+/// as "different" so the caller falls through to staging, which reports the
+/// real error with the paths attached.
+fn files_have_same_content(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else {
+        return false;
+    };
+    match (fa.metadata(), fb.metadata()) {
+        (Ok(ma), Ok(mb)) if ma.len() == mb.len() => {}
+        _ => return false,
+    }
+    let mut buf_a = [0u8; 64 * 1024];
+    let mut buf_b = [0u8; 64 * 1024];
+    loop {
+        let Ok(n) = fa.read(&mut buf_a) else {
+            return false;
+        };
+        if n == 0 {
+            // Equal lengths were checked above, so `a` ending means `b` ends.
+            return true;
+        }
+        if fb.read_exact(&mut buf_b[..n]).is_err() || buf_a[..n] != buf_b[..n] {
+            return false;
+        }
+    }
 }
 
 /// Whether `header` (a file's leading bytes) starts an ELF image. The guests
@@ -1254,6 +1344,28 @@ done
         self.recover_by_name(container_name).await
     }
 
+    /// Release what a sandbox whose container is already gone may have left
+    /// behind (for Docker: its isolated network and egress proxy, which pin
+    /// a subnet from the daemon's finite address pool). Called when a
+    /// sandbox is destroyed and no container could be recovered for it, so
+    /// the normal `destroy` path never ran. Idempotent. Default: nothing to
+    /// release.
+    async fn release_orphaned_resources(&self, container_name: &str) -> Result<(), AgentError> {
+        let _ = container_name;
+        Ok(())
+    }
+
+    /// [`release_orphaned_resources`](Self::release_orphaned_resources) on a
+    /// specific node (ADR-048). `None` = the local host.
+    async fn release_orphaned_resources_on(
+        &self,
+        node_id: Option<i32>,
+        container_name: &str,
+    ) -> Result<(), AgentError> {
+        let _ = node_id;
+        self.release_orphaned_resources(container_name).await
+    }
+
     /// Whether this provider can create sandboxes on `backend`. Consumers
     /// call this before create so a request for an unprovisioned backend
     /// (e.g. `firecracker` on a Docker-only host) fails with a clear error
@@ -1657,6 +1769,111 @@ mod tests {
         // No temporary left behind, and re-staging over an existing file works.
         assert!(!dest.with_extension("staging").exists());
         stage_pty_agent_binary(&elf, &dest).unwrap();
+    }
+
+    #[test]
+    fn overlapping_agent_writes_publish_only_complete_binaries() {
+        use std::sync::{Arc, Barrier};
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("agent");
+        let payloads = [
+            test_elf::static_for_host(&vec![1; 2 * 1024 * 1024]),
+            test_elf::static_for_host(&vec![2; 2 * 1024 * 1024]),
+        ];
+        let sources = [dir.path().join("source-a"), dir.path().join("source-b")];
+        for (source, bytes) in sources.iter().zip(&payloads) {
+            std::fs::write(source, bytes).unwrap();
+        }
+        stage_pty_agent_binary(&sources[0], &dest).unwrap();
+        let gate = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            for source in &sources {
+                let gate = gate.clone();
+                let dest = &dest;
+                scope.spawn(move || {
+                    gate.wait();
+                    for _ in 0..12 {
+                        stage_pty_agent_binary(source, dest).unwrap();
+                    }
+                });
+            }
+            gate.wait();
+            for _ in 0..48 {
+                let published = std::fs::read(&dest).unwrap();
+                assert!(
+                    payloads.contains(&published),
+                    "published a partial or mixed binary"
+                );
+            }
+        });
+        assert!(payloads.contains(&std::fs::read(&dest).unwrap()));
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            3,
+            "temporary files leaked"
+        );
+    }
+
+    #[test]
+    fn sync_replaces_a_stale_agent_and_leaves_a_current_one_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shipped");
+        let dest = dir.path().join("guest").join(PTY_AGENT_BINARY_NAME);
+
+        std::fs::write(&source, test_elf::static_for_host(b"v1")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged,
+            "a missing staged copy is created"
+        );
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::AlreadyCurrent
+        );
+
+        // Same length, different bytes: a release that only changed content.
+        std::fs::write(&source, test_elf::static_for_host(b"v2")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            test_elf::static_for_host(b"v2")
+        );
+
+        // Different length, e.g. a downgrade to a smaller build.
+        std::fs::write(&source, test_elf::static_for_host(b"v3-longer")).unwrap();
+        assert_eq!(
+            sync_pty_agent_binary(&source, &dest).unwrap(),
+            PtyAgentSync::Staged
+        );
+        assert!(!dest.with_extension("staging").exists());
+    }
+
+    #[test]
+    fn sync_never_replaces_a_working_agent_with_an_unusable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good");
+        let dest = dir.path().join(PTY_AGENT_BINARY_NAME);
+        let good_bytes = test_elf::static_for_host(b"good");
+        std::fs::write(&good, &good_bytes).unwrap();
+        sync_pty_agent_binary(&good, &dest).unwrap();
+
+        // The macOS build next to a development `temps`.
+        let foreign = dir.path().join("foreign");
+        std::fs::write(&foreign, [0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]).unwrap();
+        assert!(matches!(
+            sync_pty_agent_binary(&foreign, &dest).unwrap_err(),
+            PtyAgentStagingError::Rejected { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), good_bytes);
+
+        assert!(matches!(
+            sync_pty_agent_binary(&dir.path().join("absent"), &dest).unwrap_err(),
+            PtyAgentStagingError::Missing { .. }
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), good_bytes);
     }
 
     #[test]

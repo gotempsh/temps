@@ -157,6 +157,7 @@ async fn build_sandbox_provider(
     use crate::sandbox::SandboxBackend;
 
     let data_dir = crate::sandbox::microsandbox::host_data_dir();
+    refresh_staged_pty_agents(&data_dir);
     let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
         std::collections::HashMap::new();
 
@@ -188,6 +189,164 @@ async fn build_sandbox_provider(
         default
     );
     Arc::new(RoutingSandboxProvider::new(backends, default))
+}
+
+/// Keep the guest agents each microVM backend injects in step with the ones
+/// shipped beside this executable (release archive, installer, `deploy.sh`
+/// and `temps upgrade` all place them there): `temps-pty-agent` for terminals
+/// and, for Firecracker, `temps-vm-agent` -- the only transport into a VM, so
+/// without it the backend is unavailable.
+///
+/// Only backends an operator has already set up are touched -- their state
+/// directory exists -- so a host that never opted into microVMs gets no new
+/// directories. Failures are logged and otherwise ignored: a stale agent
+/// degrades the backend (reported by the capability status) but must never
+/// stop the server from starting. Runs before the providers are probed, so a
+/// Firecracker host whose setup predated a release that ships the VM agent
+/// becomes available on the first start after upgrading.
+fn refresh_staged_pty_agents(data_dir: &std::path::Path) {
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+    else {
+        return;
+    };
+    refresh_staged_guest_agents_from(data_dir, &exe_dir);
+}
+
+fn refresh_staged_guest_agents_from(data_dir: &std::path::Path, exe_dir: &std::path::Path) {
+    use crate::sandbox::firecracker::FirecrackerSandboxConfig;
+    use crate::sandbox::microsandbox::MicrosandboxSandboxConfig;
+    use crate::sandbox::{sync_pty_agent_binary, PtyAgentSync, PTY_AGENT_BINARY_NAME};
+    const VM_AGENT_BINARY_NAME: &str = "temps-vm-agent";
+
+    let microsandbox = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let firecracker = FirecrackerSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    // (backend, state dir that proves setup ran, shipped file name, staged path)
+    let targets = [
+        (
+            "microsandbox",
+            microsandbox.home(),
+            PTY_AGENT_BINARY_NAME,
+            microsandbox.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            PTY_AGENT_BINARY_NAME,
+            firecracker.pty_agent_bin(),
+        ),
+        (
+            "firecracker",
+            firecracker.fc_root(),
+            VM_AGENT_BINARY_NAME,
+            firecracker.agent_bin(),
+        ),
+    ];
+    // The copy that is checked for being outdated is the one beside the
+    // executable when there is one (the sync above made the staged copy
+    // identical to it, and it is the one `temps upgrade` replaces), else the
+    // staged copy itself. Each file is reported once.
+    let mut checked = std::collections::HashSet::new();
+    for (backend, state_dir, name, staged) in targets {
+        if !state_dir.is_dir() {
+            continue;
+        }
+        let source = exe_dir.join(name);
+        if !source.is_file() {
+            tracing::debug!(
+                backend,
+                "no {} beside the temps executable ({}); the staged copy is not refreshed",
+                name,
+                source.display()
+            );
+            if staged.is_file() && checked.insert(staged.clone()) {
+                warn_if_agent_outdated(backend, name, &staged);
+            }
+            continue;
+        }
+        match sync_pty_agent_binary(&source, &staged) {
+            Ok(PtyAgentSync::AlreadyCurrent) => tracing::debug!(
+                backend,
+                staged = %staged.display(),
+                "staged {} is current",
+                name
+            ),
+            Ok(PtyAgentSync::Staged) => tracing::info!(
+                backend,
+                staged = %staged.display(),
+                source = %source.display(),
+                "updated the staged {} to the one shipped with this temps",
+                name
+            ),
+            Err(error) => {
+                tracing::warn!(backend, "could not refresh the staged {}: {}", name, error);
+                // The sync left the previous staged copy in place, and that is
+                // the one guests get; the shipped file matching this build
+                // says nothing about it, so check it on its own.
+                if staged.is_file() && checked.insert(staged.clone()) {
+                    warn_if_agent_outdated(backend, name, &staged);
+                }
+            }
+        }
+        if checked.insert(source.clone()) {
+            warn_if_agent_outdated(backend, name, &source);
+        }
+    }
+}
+
+/// Warn when the guest agent at `path` was built from a different commit than
+/// this `temps`, which is how a host ends up pairing a new server with an
+/// agent that was never replaced (a manual install, a console update that does
+/// not carry the agent, an installer from before agents were shipped).
+fn warn_if_agent_outdated(backend: &str, name: &str, path: &std::path::Path) {
+    use crate::sandbox::guest_agent_build::{
+        classify, host_build, read_agent_build, AgentBuildStatus,
+    };
+
+    let host = host_build();
+    let recorded = match read_agent_build(path) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(
+                backend,
+                agent = name,
+                path = %path.display(),
+                "could not read the build of {}: {}",
+                name,
+                error
+            );
+            return;
+        }
+    };
+    match classify(recorded.as_deref(), host) {
+        AgentBuildStatus::Current => tracing::debug!(
+            backend,
+            agent = name,
+            build = host,
+            "{} matches this temps build",
+            name
+        ),
+        AgentBuildStatus::Unknown => tracing::debug!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            "cannot compare the build of {} with this temps (no commit information)",
+            name
+        ),
+        AgentBuildStatus::Outdated { agent, host } => tracing::warn!(
+            backend,
+            agent = name,
+            path = %path.display(),
+            agent_build = agent.as_deref().unwrap_or("predates build ids"),
+            host_build = %host,
+            "{} was built from a different commit than this temps; sandboxes may misbehave \
+             until it is replaced. Install the {} that ships with this release \
+             (`temps upgrade`, or the release archive), then restart temps",
+            name,
+            name
+        ),
+    }
 }
 
 /// The host-default backend from the platform setting. Docker unless the
@@ -984,6 +1143,69 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn startup_refresh_updates_all_three_targets_and_leaves_unconfigured_backends_alone() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let pty = test_elf::static_for_host(b"new-pty");
+        let vm = test_elf::static_for_host(b"new-vm");
+        std::fs::write(exe.path().join("temps-pty-agent"), &pty).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), &vm).unwrap();
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(!ms.home().exists());
+        assert!(!fc.fc_root().exists());
+        std::fs::create_dir_all(ms.pty_agent_bin().parent().unwrap()).unwrap();
+        std::fs::write(ms.pty_agent_bin(), test_elf::static_for_host(b"old")).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert!(
+            !fc.fc_root().exists(),
+            "refresh must not configure another backend"
+        );
+        for dest in [ms.pty_agent_bin(), fc.pty_agent_bin(), fc.agent_bin()] {
+            std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+            std::fs::write(dest, test_elf::static_for_host(b"stale")).unwrap();
+        }
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+        // Missing and rejected shipped sources preserve working copies.
+        std::fs::remove_file(exe.path().join("temps-pty-agent")).unwrap();
+        std::fs::write(exe.path().join("temps-vm-agent"), b"invalid").unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert_eq!(std::fs::read(ms.pty_agent_bin()).unwrap(), pty);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), vm);
+    }
+
+    #[test]
+    fn startup_refresh_continues_after_a_target_fails() {
+        use crate::sandbox::{
+            firecracker::FirecrackerSandboxConfig, microsandbox::MicrosandboxSandboxConfig,
+            test_elf,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let exe = tempfile::tempdir().unwrap();
+        let bytes = test_elf::static_for_host(b"current");
+        for name in ["temps-pty-agent", "temps-vm-agent"] {
+            std::fs::write(exe.path().join(name), &bytes).unwrap();
+        }
+        let ms = MicrosandboxSandboxConfig::from_data_dir(root.path().to_path_buf());
+        let fc = FirecrackerSandboxConfig::from_data_dir(root.path().to_path_buf());
+        std::fs::create_dir_all(ms.pty_agent_bin()).unwrap(); // rename onto a directory must fail
+        std::fs::create_dir_all(fc.fc_root()).unwrap();
+        refresh_staged_guest_agents_from(root.path(), exe.path());
+        assert!(ms.pty_agent_bin().is_dir());
+        assert_eq!(std::fs::read(fc.pty_agent_bin()).unwrap(), bytes);
+        assert_eq!(std::fs::read(fc.agent_bin()).unwrap(), bytes);
+    }
 
     #[test]
     fn default_backend_honours_only_registered_microvm_backends() {

@@ -635,7 +635,12 @@ async fn test_instantiation_claim_token_migration_is_nullable_and_reversible() -
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].try_get::<Option<String>>("", "claim_token")?, None);
 
-    Migrator::down(&db, Some(steps)).await?;
+    // Only the target was applied above (`up(Some(1))`), so one step reverts
+    // exactly it. `steps` counts the migrations registered after it too;
+    // rolling back that many would also undo migrations *before* the target
+    // (including the one that creates `template_instantiations`) as soon as
+    // another migration is appended.
+    Migrator::down(&db, Some(1)).await?;
     assert!(
         claim_token_column().await?.is_empty(),
         "the column must be gone after down"

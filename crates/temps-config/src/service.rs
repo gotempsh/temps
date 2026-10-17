@@ -46,8 +46,9 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, BlobSettings, ClickHouseCompression, GeoLicenseKeyIntent,
-    KvSettings, PreviewGatewaySettings, PublicHostnameStrategy,
+    AgentSandboxSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
+    BuildLimitsSettings, ClickHouseCompression, GeoLicenseKeyIntent, KvSettings,
+    ObservabilityRetentionSettings, PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
@@ -895,6 +896,16 @@ struct SettingsCacheState {
     generation: u64,
 }
 
+/// What the analytics retention sweep needs from the settings row; see
+/// [`ConfigService::get_retention_policy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    pub analytics: AnalyticsRetentionSettings,
+    /// `observability_retention.proxy_logs_days`, the instance-wide window the
+    /// stored-IP floor is derived from.
+    pub proxy_logs_days: u32,
+}
+
 pub struct ConfigService {
     config: Arc<ServerConfig>,
     db: Arc<DbConnection>,
@@ -912,6 +923,13 @@ pub struct ConfigService {
     /// this (via [`ConfigService::start_settings_listener`]); throwaway
     /// `ConfigService::new()` instances never start it.
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The build limits of the newest settings snapshot that reached the
+    /// cache, `None` until settings have been read once. Fed from the same
+    /// two places that publish the other process-wide settings, so a save in
+    /// this process and a `settings_change` NOTIFY from another one both
+    /// reach subscribers. Subscribers are woken only when the value actually
+    /// changes. See [`ConfigService::subscribe_build_limits`].
+    build_limits: tokio::sync::watch::Sender<Option<BuildLimitsSettings>>,
     /// The ClickHouse wire-compression mode this process builds its clients
     /// with. Resolved once at startup from the stored
     /// `clickhouse.compression` setting (see
@@ -959,7 +977,41 @@ impl ConfigService {
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
+            build_limits: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
+        }
+    }
+
+    /// Follow the build limits (`AppSettings.build_limits`).
+    ///
+    /// The receiver holds the latest value (`None` until settings have been
+    /// read once) and is notified only when the limits change, whichever
+    /// process saved them. The deployer uses this to apply new limits to the
+    /// running build gate instead of waiting for a restart.
+    pub fn subscribe_build_limits(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<BuildLimitsSettings>> {
+        self.build_limits.subscribe()
+    }
+
+    /// Hand the build limits of a snapshot that is becoming the cached one to
+    /// subscribers. Called under the settings-cache generation guard, like
+    /// [`publish_process_wide_settings`], so a stale read cannot publish.
+    fn publish_build_limits(&self, settings: &AppSettings) {
+        let published = self.build_limits.send_if_modified(|current| {
+            if current.as_ref() == Some(&settings.build_limits) {
+                return false;
+            }
+            *current = Some(settings.build_limits.clone());
+            true
+        });
+        if published {
+            debug!(
+                max_concurrent = settings.build_limits.max_concurrent,
+                cpu_limit_cores = settings.build_limits.cpu_limit_cores,
+                memory_limit_mb = settings.build_limits.memory_limit_mb,
+                "Published changed build limits to subscribers"
+            );
         }
     }
 
@@ -1420,10 +1472,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .one(self.db.as_ref())
             .await?;
 
-        let settings = record
-            .map(|r| AppSettings::from_json(r.data))
-            .unwrap_or_default();
-        self.cache_settings_if_current(generation, settings.clone())
+        // A row that does not decode as a whole is read as the defaults (see
+        // `AppSettings::from_json`). That is the right answer for callers, but
+        // not a statement about the operator's build limits, so it must not
+        // reach the running build gate and silently reset them.
+        let (settings, decoded) = match record {
+            Some(r) => match serde_json::from_value::<AppSettings>(r.data.clone()) {
+                Ok(settings) => (settings, true),
+                Err(error) => {
+                    debug!(%error, "Settings row did not decode; using defaults for this read");
+                    (AppSettings::from_json(r.data), false)
+                }
+            },
+            None => (AppSettings::default(), true),
+        };
+        self.cache_settings(generation, settings.clone(), decoded)
             .await;
         Ok(settings)
     }
@@ -1443,6 +1506,52 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         };
         serde_json::from_value(value).map_err(|_| ConfigServiceError::MalformedSettingsSection {
             section: "agent_sandbox",
+        })
+    }
+
+    /// Load only the retention inputs the analytics sweep deletes by, straight
+    /// from the authoritative settings row.
+    ///
+    /// The sweep removes data permanently, so it must never run on a policy
+    /// that was invented rather than read. [`Self::get_settings`] returns the
+    /// whole default document when any field fails to decode, which would
+    /// replace a saved 365-day policy with the 90-day default (and a saved
+    /// "keep addresses" with the 30-day one) over an unrelated bad section.
+    /// Here an unrelated malformed section is ignored, while a missing section
+    /// is the default and a malformed retention section is an error, so the
+    /// caller skips the pass instead of acting.
+    pub async fn get_retention_policy(&self) -> Result<RetentionPolicy, ConfigServiceError> {
+        let record = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        let Some(data) = record.map(|row| row.data) else {
+            // No row yet: a fresh install running on defaults.
+            return Ok(RetentionPolicy {
+                analytics: AnalyticsRetentionSettings::default(),
+                proxy_logs_days: ObservabilityRetentionSettings::default().proxy_logs_days,
+            });
+        };
+        let section = |name: &'static str| data.get(name).filter(|value| !value.is_null()).cloned();
+        let analytics = match section("analytics_retention") {
+            None => AnalyticsRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention",
+                }
+            })?,
+        };
+        let observability: ObservabilityRetentionSettings = match section("observability_retention")
+        {
+            None => ObservabilityRetentionSettings::default(),
+            Some(value) => serde_json::from_value(value).map_err(|_| {
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "observability_retention",
+                }
+            })?,
+        };
+        Ok(RetentionPolicy {
+            analytics,
+            proxy_logs_days: observability.proxy_logs_days,
         })
     }
 
@@ -1474,7 +1583,19 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    #[cfg(test)]
     async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        self.cache_settings(generation, settings, true).await
+    }
+
+    /// `publish_limits` is false for a snapshot that is a fallback to the
+    /// defaults rather than what the row says.
+    async fn cache_settings(
+        &self,
+        generation: u64,
+        settings: AppSettings,
+        publish_limits: bool,
+    ) -> bool {
         let mut cache = self.settings_cache.write().await;
         if cache.generation != generation {
             return false;
@@ -1484,6 +1605,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
         publish_process_wide_settings(&settings);
+        if publish_limits {
+            self.publish_build_limits(&settings);
+        }
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1499,6 +1623,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         cache.generation = cache.generation.wrapping_add(1);
         publish_process_wide_settings(&settings);
+        self.publish_build_limits(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1687,6 +1812,17 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // a stale snapshot can neither erase a check the job just recorded nor
         // revert a key that was stored while this request was in flight.
         preserve_geo_recorded_state(&mut settings, &locked_settings, geo_license_key_intent);
+        // Lowering the proxy-log window must not delete addresses that older
+        // logs still point at. The hold is derived here, from the row this
+        // transaction locked, never from the handler's snapshot or the client:
+        // two saves racing from the same snapshot would otherwise compute the
+        // hold from a window one of them had already replaced.
+        settings.analytics_retention = settings.analytics_retention.clone().with_ip_hold(
+            locked_settings.analytics_retention.ip_hold_until,
+            locked_settings.observability_retention.proxy_logs_days,
+            settings.observability_retention.proxy_logs_days,
+            now,
+        );
 
         let previous_compression = existing
             .as_ref()
@@ -4518,6 +4654,128 @@ mod tests {
         assert!(update.contains(r#""allowed_node_ids":[0,3]"#), "{update}");
     }
 
+    fn retention_row(data: serde_json::Value) -> settings::Model {
+        settings::Model {
+            id: 1,
+            data,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_policy_survives_an_unrelated_malformed_section() {
+        // `preview_domain: 42` makes the whole document undecodable, which
+        // `get_settings` turns into the defaults. The sweep must still see the
+        // 365-day events window and "keep addresses" that were saved.
+        let row = retention_row(serde_json::json!({
+            "preview_domain": 42,
+            "analytics_retention": {
+                "events_days": 365,
+                "unreferenced_ip_days": null,
+            },
+            "observability_retention": { "proxy_logs_days": 90 },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let policy = service.get_retention_policy().await.expect("policy");
+
+        assert_eq!(policy.analytics.events_days, 365);
+        assert_eq!(policy.analytics.unreferenced_ip_days, None);
+        assert_eq!(policy.proxy_logs_days, 90);
+    }
+
+    #[tokio::test]
+    async fn a_malformed_retention_section_is_an_error_not_a_default() {
+        let row = retention_row(serde_json::json!({
+            "analytics_retention": { "events_days": "forever" },
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = service
+            .get_retention_policy()
+            .await
+            .expect_err("the pass must be skipped");
+
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: "analytics_retention"
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_policy_defaults_apply_only_when_nothing_was_saved() {
+        let empty = retention_row(serde_json::json!({}));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![empty], Vec::<settings::Model>::new()])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+
+        let sections_absent = service.get_retention_policy().await.expect("policy");
+        let no_row = service.get_retention_policy().await.expect("policy");
+
+        for policy in [sections_absent, no_row] {
+            assert_eq!(policy.analytics, AnalyticsRetentionSettings::default());
+            assert_eq!(
+                policy.proxy_logs_days,
+                ObservabilityRetentionSettings::default().proxy_logs_days
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_ip_hold_is_derived_from_the_locked_proxy_log_window() {
+        // The caller's snapshot may be older than the row this save locks: the
+        // window it lowers is the one stored, not the one it last read.
+        let mut locked = settings_row("old.example.test");
+        locked.data["observability_retention"] = serde_json::json!({ "proxy_logs_days": 90 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([vec![locked.clone()], vec![locked.clone()], vec![locked]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db.clone());
+        let mut lowered = AppSettings {
+            preview_domain: "new.example.test".into(),
+            ..Default::default()
+        };
+        lowered.observability_retention.proxy_logs_days = 7;
+        // A client-supplied hold is replaced, never trusted.
+        lowered.analytics_retention.ip_hold_until = Some(Utc::now() + chrono::Duration::days(1));
+
+        service
+            .update_settings(lowered)
+            .await
+            .expect("settings save lowering the window");
+        let saved = service.get_settings().await.expect("saved settings");
+
+        let hold = saved
+            .analytics_retention
+            .ip_hold_until
+            .expect("lowering the window from 90 days holds addresses");
+        let held_for = hold - Utc::now();
+        assert!(
+            held_for > chrono::Duration::days(90)
+                && held_for <= chrono::Duration::days(91) + chrono::Duration::minutes(1),
+            "held for the locked 90-day window plus the lookup slack, got {held_for}"
+        );
+    }
+
     #[tokio::test]
     async fn initialize_cluster_ca_material_persists_first_complete_pair() {
         let empty = settings_row_with_cluster_ca(None, None);
@@ -5426,6 +5684,122 @@ mod tests {
             .is_empty());
         drop(svc);
         database.cleanup().await;
+    }
+
+    fn settings_row_with_build_limits(limits: BuildLimitsSettings) -> settings::Model {
+        let s = AppSettings {
+            build_limits: limits,
+            ..AppSettings::default()
+        };
+        settings::Model {
+            id: 1,
+            data: s.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_limit_subscribers_see_loaded_and_changed_limits_only() {
+        let first = BuildLimitsSettings {
+            max_concurrent: 3,
+            cpu_limit_cores: 1.5,
+            memory_limit_mb: 1024,
+        };
+        let changed = BuildLimitsSettings {
+            max_concurrent: 1,
+            ..first.clone()
+        };
+        // The third row differs only in an unrelated field.
+        let mut unrelated = settings_row_with_build_limits(changed.clone());
+        unrelated.data["preview_domain"] = serde_json::json!("other.example.com");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row_with_build_limits(first.clone())],
+                vec![settings_row_with_build_limits(changed.clone())],
+                vec![unrelated],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+        assert_eq!(*limits.borrow_and_update(), None, "nothing loaded yet");
+
+        // Another process saved: its NOTIFY invalidates the cache, which
+        // reloads the row.
+        svc.invalidate_settings_cache().await;
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(first));
+
+        svc.invalidate_settings_cache().await;
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(changed));
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !limits.has_changed().expect("sender alive"),
+            "a save that leaves the build limits alone must not wake subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_settings_row_does_not_reset_published_build_limits() {
+        let saved = BuildLimitsSettings {
+            max_concurrent: 6,
+            cpu_limit_cores: 4.0,
+            memory_limit_mb: 8192,
+        };
+        let mut malformed = settings_row_with_build_limits(saved.clone());
+        malformed.data["build_limits"] = serde_json::json!("not-an-object");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row_with_build_limits(saved.clone())],
+                vec![malformed],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+
+        svc.invalidate_settings_cache().await;
+        assert_eq!(*limits.borrow_and_update(), Some(saved.clone()));
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !limits.has_changed().expect("sender alive"),
+            "the default fallback must not be published as the operator's limits"
+        );
+        assert_eq!(*limits.borrow(), Some(saved));
+    }
+
+    #[tokio::test]
+    async fn build_limit_subscribers_see_a_local_save() {
+        let saved = BuildLimitsSettings {
+            max_concurrent: 4,
+            cpu_limit_cores: 2.0,
+            memory_limit_mb: 2048,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+            ])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+
+        let settings = AppSettings {
+            build_limits: saved.clone(),
+            ..AppSettings::default()
+        };
+        svc.update_settings(settings).await.expect("settings save");
+
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(saved));
     }
 
     #[tokio::test]

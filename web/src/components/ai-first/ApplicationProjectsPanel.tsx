@@ -24,12 +24,15 @@ import {
 } from '@/api/client'
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useQuery } from '@tanstack/react-query'
 import { ApplicationDataServicesPanel } from './ApplicationDataServicesPanel'
 import { RichProjectPicker, type ProjectPickerItem } from './RichProjectPicker'
 import { APPLICATION_PROJECT_DEFAULTS } from './application-project-defaults'
+
+type ApplicationService = ApplicationResponse['projects'][number]
 
 type Props = {
   application: ApplicationResponse
@@ -44,6 +47,9 @@ export function ApplicationProjectsPanel({
   const [linkId, setLinkId] = useState<number | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [unlinkTarget, setUnlinkTarget] = useState<ApplicationService | null>(
+    null
+  )
 
   const projectsQuery = useQuery({
     ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
@@ -164,17 +170,7 @@ export function ApplicationProjectsPanel({
                 <Button
                   aria-label={`Unlink ${project.name}`}
                   disabled={busy !== null || application.projects.length === 1}
-                  onClick={() =>
-                    void run(`unlink-${project.id}`, () =>
-                      unlinkApplicationProject({
-                        path: {
-                          application_public_id: application.public_id,
-                          project_id: project.id,
-                        },
-                        throwOnError: true,
-                      })
-                    )
-                  }
+                  onClick={() => setUnlinkTarget(project)}
                   size="icon"
                   title={
                     application.projects.length === 1
@@ -294,6 +290,32 @@ export function ApplicationProjectsPanel({
       </section>
 
       <ApplicationDataServicesPanel application={application} />
+
+      <ConfirmDeleteDialog
+        open={unlinkTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setUnlinkTarget(null)
+        }}
+        resourceType="service"
+        resourceName={unlinkTarget?.name ?? ''}
+        verb="Unlink"
+        consequences={`It is detached from ${application.name}. The project itself, its deployments and its data are kept and can be linked again.`}
+        irreversible={false}
+        isPending={busy !== null && busy.startsWith('unlink-')}
+        onConfirm={() => {
+          if (!unlinkTarget) return
+          const target = unlinkTarget
+          void run(`unlink-${target.id}`, () =>
+            unlinkApplicationProject({
+              path: {
+                application_public_id: application.public_id,
+                project_id: target.id,
+              },
+              throwOnError: true,
+            })
+          ).then(() => setUnlinkTarget(null))
+        }}
+      />
 
       {error && (
         <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs text-destructive">

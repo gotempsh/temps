@@ -57,6 +57,15 @@ interface RepositoryListProps {
   providerType?: string | null
 }
 
+/**
+ * Columns of the compact list are sized by the room a name needs, not by the
+ * viewport: the page can be narrow at any viewport width (side panel open,
+ * sidebar expanded) and a fixed three columns would cut repository names
+ * down to a few letters there.
+ */
+export const COMPACT_GRID_CLASS =
+  'grid-cols-[repeat(auto-fill,minmax(min(100%,22rem),1fr))] gap-2'
+
 type SortOption = 'name' | 'pushed' | 'created'
 type FilterOption = 'all' | 'public' | 'private'
 
@@ -384,7 +393,7 @@ export function RepositoryList({
           className={cn(
             'grid',
             compactMode
-              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              ? COMPACT_GRID_CLASS
               : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
@@ -445,6 +454,7 @@ export function RepositoryList({
               </div>
               {!searchQuery && (
                 <Button
+                  type="button"
                   onClick={handleSyncRepositories}
                   disabled={syncMutation.isPending || isConnectionSyncing}
                   className="gap-2"
@@ -465,7 +475,7 @@ export function RepositoryList({
           className={cn(
             'grid',
             compactMode
-              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              ? COMPACT_GRID_CLASS
               : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
@@ -685,6 +695,7 @@ export function RepositoryList({
       {(currentPage > 1 || hasMorePages) && (
         <div className="flex items-center justify-center gap-2">
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
@@ -699,6 +710,7 @@ export function RepositoryList({
           </span>
 
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => p + 1)}

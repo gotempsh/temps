@@ -3486,6 +3486,7 @@ mod tests {
                 tags: vec![],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
         async fn save_image(

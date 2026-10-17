@@ -52,6 +52,7 @@ fn init_logging(client_mode: bool) {
 }
 
 fn main() -> std::io::Result<()> {
+    std::hint::black_box(&temps_pty_agent::BUILD_MARKER);
     let args = Args::parse();
     init_logging(args.relay || args.probe);
     let rt = tokio::runtime::Builder::new_multi_thread()

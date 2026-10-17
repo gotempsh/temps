@@ -15,6 +15,7 @@ import {
   listConnectionsOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import type {
   CreatableServiceTypeRoute,
   TemplateResponse,
@@ -596,8 +597,7 @@ function SingleServiceTemplateConfigurator({
         },
         `/projects/${data.project_slug}?new=true`
       )
-      await queryClient.invalidateQueries({ queryKey: ['getProjects'] })
-      await queryClient.invalidateQueries({ queryKey: ['listProjects'] })
+      await invalidateProjectLists(queryClient)
     },
     onError: (error, variables) => {
       // ADR 045: a slug this host grants the Docker socket to is admin-only

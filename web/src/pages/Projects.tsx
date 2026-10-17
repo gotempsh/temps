@@ -10,6 +10,7 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
+import { markReadFailureHandled } from '@/lib/route-query-failures'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
@@ -125,6 +126,7 @@ export function Projects() {
     data: rawProjectsData,
     isLoading: servicesLoading,
     isError,
+    error: servicesError,
     isFetching,
     refetch,
   } = useQuery({
@@ -138,8 +140,11 @@ export function Projects() {
     }),
     // Which list to ask for depends on the groups: wait for them rather than
     // render one layout and swap it for another. If they fail, every
-    // service is listed, with the failure said above it.
-    enabled: !groupsQuery.isLoading,
+    // service is listed, with the failure said above it. Once they have
+    // failed a first time they are being retried, so the list is asked for
+    // alongside the retries instead of after them: the two outages are one
+    // wait, not two.
+    enabled: !groupsQuery.isLoading || groupsQuery.failureCount > 0,
   })
 
   // TEMP: force an empty (brand-new install) dashboard while iterating on the
@@ -178,6 +183,17 @@ export function Projects() {
   useEffect(() => {
     if (isPageOutOfRange) setPagination(totalPages, pageSize, true)
   }, [isPageOutOfRange, pageSize, setPagination, totalPages])
+
+  // Both lists explain their own failure below, with their own Retry, so the
+  // route-level report has nothing to add.
+  const groupsError = groupsQuery.isError ? groupsQuery.error : null
+  useEffect(() => {
+    markReadFailureHandled(groupsError)
+  }, [groupsError])
+  const servicesFailure = isError ? servicesError : null
+  useEffect(() => {
+    markReadFailureHandled(servicesFailure)
+  }, [servicesFailure])
 
   // The server filters services; projects are filtered here by their own
   // name or any of their services' names.

@@ -49,6 +49,7 @@ export {
 export {
   useComposedSearchParams,
   useUrlBoundText,
+  useUrlSearchText,
   useUrlState,
   type UrlState,
   type UrlStateValue,

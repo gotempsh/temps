@@ -12,6 +12,9 @@ pub mod m20260921_000003_detection_retry;
 pub mod m20260921_000004_credential_catalog;
 pub mod m20261002_000001_secret_checks_and_history;
 
+mod m20261016_000001_builder_limits;
+pub mod m20261016_000002_ci_build_dispatch;
+pub mod m20261017_000001_retain_ci_cancellation;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -332,6 +335,12 @@ mod m20261013_000001_webhook_delivery_identity;
 mod m20261013_000002_add_kind_to_ai_conversations;
 mod m20261013_000003_allow_source_built_service_release;
 mod m20261014_000001_add_instantiation_claim_token;
+mod m20261014_000002_create_project_ip_access_rules;
+mod m20261014_000002_index_ip_geolocation_references;
+mod m20261014_000003_ip_geolocation_last_used_at;
+mod m20261014_000004_managed_daemon_unpublished_tags;
+mod m20261015_000001_compose_validation_reports;
+mod m20261016_000001_ai_usage_logs_project_attribution;
 
 pub struct Migrator;
 
@@ -741,6 +750,18 @@ impl MigratorTrait for Migrator {
             Box::new(m20261013_000003_allow_source_built_service_release::Migration),
             // Each claim of a template instantiation gets an ownership token.
             Box::new(m20261014_000001_add_instantiation_claim_token::Migration),
+            // Per-project / per-environment IP allow and deny lists.
+            Box::new(m20261014_000002_create_project_ip_access_rules::Migration),
+            // Partial indexes on the columns that reference stored IP addresses.
+            Box::new(m20261014_000002_index_ip_geolocation_references::Migration),
+            Box::new(m20261014_000003_ip_geolocation_last_used_at::Migration),
+            // Rewrite the never-published `:0.3.4` managed image tag to `:0.3.4-beta`.
+            Box::new(m20261014_000004_managed_daemon_unpublished_tags::Migration),
+            Box::new(m20261015_000001_compose_validation_reports::Migration),
+            Box::new(m20261016_000001_ai_usage_logs_project_attribution::Migration),
+            Box::new(m20261016_000001_builder_limits::Migration),
+            Box::new(m20261016_000002_ci_build_dispatch::Migration),
+            Box::new(m20261017_000001_retain_ci_cancellation::Migration),
         ]
     }
 }

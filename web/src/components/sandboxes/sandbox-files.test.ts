@@ -14,7 +14,10 @@ import {
   saveRisks,
   writeSemantics,
   writeMode,
+  initialDirectory,
   isEditableFile,
+  joinSandboxPath,
+  parentDirectory,
   MAX_EDITABLE_BYTES,
   validateSandboxPath,
 } from './sandbox-files'
@@ -327,5 +330,29 @@ describe('propertiesAfterSave', () => {
       uid: 0,
       symlink: false,
     })
+  })
+})
+
+describe('directory navigation helpers', () => {
+  test('starts in the work dir, falling back to the root', () => {
+    expect(initialDirectory('/home/temps/workspace/')).toBe(
+      '/home/temps/workspace'
+    )
+    expect(initialDirectory('')).toBe('/')
+    expect(initialDirectory(null)).toBe('/')
+    expect(initialDirectory('relative/dir')).toBe('/')
+  })
+
+  test('goes up one level and stops at the root', () => {
+    expect(parentDirectory('/home/temps/workspace')).toBe('/home/temps')
+    expect(parentDirectory('/home/temps/workspace/')).toBe('/home/temps')
+    expect(parentDirectory('/home')).toBe('/')
+    expect(parentDirectory('/')).toBe('/')
+  })
+
+  test('joins a name onto a directory without doubling slashes', () => {
+    expect(joinSandboxPath('/', 'etc')).toBe('/etc')
+    expect(joinSandboxPath('/home/temps', 'app.ts')).toBe('/home/temps/app.ts')
+    expect(joinSandboxPath('/home/temps/', 'app.ts')).toBe('/home/temps/app.ts')
   })
 })

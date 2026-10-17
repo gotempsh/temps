@@ -55,7 +55,13 @@ pub const PROVIDER_NAME: &str = "microsandbox";
 /// SDK crate version this backend is built and tested against. The runtime
 /// pair (`msb` + `libkrunfw`) installed by `temps microsandbox setup` is the
 /// matching release; the SDK refuses a mismatched pair.
-pub const MICROSANDBOX_VERSION: &str = "0.7.7";
+///
+/// Must equal the exact `microsandbox` version pinned in
+/// `crates/temps-agents/Cargo.toml`. A test in `sdk.rs` compares it with the
+/// SDK's own default runtime version so a dependency bump that forgets this
+/// constant fails CI instead of shipping a backend that installs a runtime
+/// the SDK then rejects.
+pub const MICROSANDBOX_VERSION: &str = "0.7.8";
 
 /// Console page that shows backend status and setup instructions.
 pub const SETUP_PATH: &str = "/agent-sandbox/sandbox";
@@ -94,6 +100,15 @@ pub enum MicrosandboxUnavailable {
         home: String,
         version: String,
         detail: String,
+    },
+
+    #[error(
+        "the microsandbox runtime at {msb_path} is {installed}, but this build of Temps needs v{expected} (msb + libkrunfw). Run `{SETUP_COMMAND}` to upgrade it"
+    )]
+    RuntimeVersionMismatch {
+        msb_path: String,
+        installed: String,
+        expected: String,
     },
 
     #[error("microsandbox configuration under {home} could not be loaded: {detail}")]
@@ -138,6 +153,7 @@ pub struct MicrosandboxCapability {
 impl MicrosandboxCapability {
     fn from_probe(
         probe: Result<(), MicrosandboxUnavailable>,
+        setup_command: &str,
         terminal: TerminalCapability,
     ) -> Self {
         match probe {
@@ -150,15 +166,16 @@ impl MicrosandboxCapability {
                 terminal,
             },
             Err(error) => {
-                // Only a missing runtime is fixed by the setup command; a host
-                // without a hypervisor needs a different machine or BIOS/VM
-                // setting, which the reason explains.
+                // Only a missing or outdated runtime is fixed by the setup
+                // command; a host without a hypervisor needs a different
+                // machine or BIOS/VM setting, which the reason explains.
                 let setup_command = matches!(
                     error,
                     MicrosandboxUnavailable::RuntimeNotInstalled { .. }
+                        | MicrosandboxUnavailable::RuntimeVersionMismatch { .. }
                         | MicrosandboxUnavailable::InvalidConfiguration { .. }
                 )
-                .then(|| SETUP_COMMAND.to_string());
+                .then(|| setup_command.to_string());
                 Self {
                     configured: false,
                     reason: Some(error.to_string()),
@@ -291,12 +308,59 @@ pub(crate) fn host_virtualization() -> Result<(), MicrosandboxUnavailable> {
 /// endpoint and by the standalone sandbox API to explain a rejected request.
 pub fn microsandbox_capability(data_dir: &Path) -> MicrosandboxCapability {
     let config = MicrosandboxSandboxConfig::from_data_dir(data_dir.to_path_buf());
+    let setup_command = setup_command_for(data_dir);
+    let terminal_setup_command = format!("{setup_command} --pty-agent-bin <path>");
     let terminal =
-        TerminalCapability::from_staged_binary(&config.pty_agent_bin(), TERMINAL_SETUP_COMMAND);
+        TerminalCapability::from_staged_binary(&config.pty_agent_bin(), &terminal_setup_command);
     MicrosandboxCapability::from_probe(
         host_virtualization().and_then(|()| runtime_probe(&config)),
+        &setup_command,
         terminal,
     )
+}
+
+/// The setup command an operator should run to install the runtime for
+/// `data_dir`. A bare `temps microsandbox setup` resolves its data directory
+/// from the *invoking shell* (`TEMPS_DATA_DIR`, else `~/.temps`), which is
+/// not necessarily what the server was started with — a server launched
+/// with `TEMPS_DATA_DIR=~/.temps/data` reads its runtime from there, and a
+/// setup run from a shell without that variable would install a second,
+/// unused runtime next to it. So when the server's directory differs from
+/// the shell default, the command names it explicitly.
+pub fn setup_command_for(data_dir: &Path) -> String {
+    command_with_data_dir(SETUP_COMMAND, data_dir)
+}
+
+/// `command`, with `--data-dir <data_dir>` appended when `data_dir` is not
+/// the directory a shell without `TEMPS_DATA_DIR` would pick (`~/.temps`).
+/// Shared by every microVM backend's setup hint.
+pub fn command_with_data_dir(command: &str, data_dir: &Path) -> String {
+    if data_dir == default_data_dir().as_path() {
+        return command.to_string();
+    }
+    format!(
+        "{command} --data-dir {}",
+        shell_quote(&data_dir.to_string_lossy())
+    )
+}
+
+/// `~/.temps`: where a shell with no `TEMPS_DATA_DIR` puts Temps state.
+fn default_data_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".temps")
+}
+
+/// Quote `value` for a POSIX shell only when it needs it, so the common
+/// case stays copy-paste readable.
+fn shell_quote(value: &str) -> String {
+    let plain = !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-:@+=,".contains(&b));
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', r"'\''"))
+    }
 }
 
 /// Whether the pinned runtime pair is installed under the config's home.
@@ -388,7 +452,11 @@ mod tests {
 
     #[test]
     fn capability_onboards_instead_of_hiding() {
-        let ready = MicrosandboxCapability::from_probe(Ok(()), TerminalCapability::supported());
+        let ready = MicrosandboxCapability::from_probe(
+            Ok(()),
+            SETUP_COMMAND,
+            TerminalCapability::supported(),
+        );
         assert!(ready.configured);
         assert!(ready.reason.is_none());
         assert!(ready.terminal.supported);
@@ -399,6 +467,7 @@ mod tests {
                 version: MICROSANDBOX_VERSION.into(),
                 detail: "absent".into(),
             }),
+            SETUP_COMMAND,
             TerminalCapability::supported(),
         );
         assert!(!missing.configured);
@@ -411,6 +480,7 @@ mod tests {
             Err(MicrosandboxUnavailable::HypervisorUnavailable {
                 detail: "no kvm".into(),
             }),
+            SETUP_COMMAND,
             TerminalCapability::supported(),
         );
         assert!(!no_hv.configured);
@@ -433,13 +503,14 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("not staged"));
-        assert_eq!(
-            cap.terminal.setup_command.as_deref(),
-            Some(TERMINAL_SETUP_COMMAND)
+        let terminal_command = cap.terminal.setup_command.as_deref().unwrap_or_default();
+        assert!(
+            terminal_command.contains("--pty-agent-bin"),
+            "the terminal fix must name the flag that stages the agent: {terminal_command}"
         );
         assert!(
-            TERMINAL_SETUP_COMMAND.contains("--pty-agent-bin"),
-            "the terminal fix must name the flag that stages the agent"
+            terminal_command.contains(&dir.path().to_string_lossy().to_string()),
+            "the terminal fix must target the server's data dir: {terminal_command}"
         );
 
         let config = MicrosandboxSandboxConfig::from_data_dir(dir.path().to_path_buf());
@@ -476,11 +547,52 @@ mod tests {
     }
 
     #[test]
+    fn outdated_runtime_is_fixed_by_the_setup_command() {
+        let cap = MicrosandboxCapability::from_probe(
+            Err(MicrosandboxUnavailable::RuntimeVersionMismatch {
+                msb_path: "/d/microsandbox/bin/msb".into(),
+                installed: "v0.7.7".into(),
+                expected: MICROSANDBOX_VERSION.into(),
+            }),
+            "temps microsandbox setup --data-dir /d",
+            TerminalCapability::supported(),
+        );
+        assert!(!cap.configured);
+        let reason = cap.reason.unwrap();
+        assert!(reason.contains("v0.7.7"), "{reason}");
+        assert!(reason.contains(MICROSANDBOX_VERSION), "{reason}");
+        assert!(reason.contains("/d/microsandbox/bin/msb"), "{reason}");
+        assert_eq!(
+            cap.setup_command.as_deref(),
+            Some("temps microsandbox setup --data-dir /d")
+        );
+    }
+
+    #[test]
+    fn setup_command_names_a_data_dir_that_differs_from_the_shell_default() {
+        assert_eq!(setup_command_for(&default_data_dir()), SETUP_COMMAND);
+
+        let nested = default_data_dir().join("data");
+        let command = setup_command_for(&nested);
+        assert!(command.starts_with("temps microsandbox setup --data-dir "));
+        assert!(command.ends_with(&*nested.to_string_lossy()), "{command}");
+    }
+
+    #[test]
+    fn shell_quote_only_quotes_when_needed() {
+        assert_eq!(shell_quote("/home/u/.temps/data"), "/home/u/.temps/data");
+        assert_eq!(shell_quote("/srv/my data"), "'/srv/my data'");
+        assert_eq!(shell_quote("/srv/it's"), r"'/srv/it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
     fn unsupported_build_offers_no_setup_command() {
         let cap = MicrosandboxCapability::from_probe(
             Err(MicrosandboxUnavailable::UnsupportedBuild {
                 target: "musl".into(),
             }),
+            SETUP_COMMAND,
             TerminalCapability::supported(),
         );
         assert!(!cap.configured);

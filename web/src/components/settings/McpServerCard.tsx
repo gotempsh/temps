@@ -14,8 +14,10 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertTriangle, Bot, ExternalLink } from 'lucide-react'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
+import { Bot, ExternalLink } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
@@ -57,7 +59,7 @@ function connectExamples(baseUrl: string): CodeExample[] {
 }
 
 export function McpServerCard() {
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
   const [connectClientId, setConnectClientId] = useState(MCP_CLIENTS[0].id)
 
@@ -87,14 +89,11 @@ export function McpServerCard() {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <Alert variant="destructive">
-            <AlertTriangle className="h-4 w-4" />
-            <AlertTitle>Failed to load settings</AlertTitle>
-            <AlertDescription>
-              The server returned an error. Check console logs or contact your
-              administrator.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="MCP server settings"
+            error={error}
+            onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+          />
         </CardContent>
       </Card>
     )

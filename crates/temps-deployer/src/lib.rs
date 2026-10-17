@@ -25,16 +25,21 @@ use thiserror::Error;
 pub type ImageImportStream =
     Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
 
+pub mod build_gate;
 pub mod build_protocol;
 pub mod build_timings;
+pub mod build_verification;
 pub mod compose;
+pub mod compose_interpolation;
 mod compose_remote;
+pub mod runner_protocol;
 
 /// Callback function type for processing build logs in real-time
 pub type LogCallback =
     std::sync::Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub mod docker;
+pub mod image_scan;
 /// Host-level Docker socket grant (ADR 045).
 ///
 /// Re-exported from `temps-core`, where the type lives so the agent, the
@@ -210,6 +215,12 @@ pub enum BuilderError {
     #[error("Other error: {0}")]
     Other(String),
 
+    /// The build node had no free build slot within its queue window and
+    /// refused the build before starting it. Nothing was built, so a caller
+    /// that can build elsewhere may do so.
+    #[error("Build node busy: {0}")]
+    Busy(String),
+
     /// The local Docker daemon is unavailable in this process. Returned when
     /// a build is requested on a control-plane node that runs no workloads;
     /// applications must be deployed on worker nodes joined with `temps join`.
@@ -298,6 +309,98 @@ pub struct ImageInfo {
     pub created: Option<String>,
     /// Working directory (WORKDIR from Dockerfile)
     pub working_dir: Option<String>,
+    /// The rest of the image's runtime configuration. `None` when the daemon
+    /// (or an agent that predates this field) did not report it, which is
+    /// different from an image that declares none of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ImageConfig>,
+}
+
+/// Bounds on [`ImageConfig`], so an image's configuration cannot inflate the
+/// agent's inspection response past what the control plane will read.
+pub const MAX_IMAGE_CONFIG_PORTS: usize = 256;
+pub const MAX_IMAGE_CONFIG_ENV_ENTRIES: usize = 256;
+pub const MAX_IMAGE_CONFIG_ENV_BYTES: usize = 16 * 1024;
+pub const MAX_IMAGE_CONFIG_ENTRYPOINT_ENTRIES: usize = 64;
+pub const MAX_IMAGE_CONFIG_ENTRYPOINT_BYTES: usize = 4 * 1024;
+pub const MAX_IMAGE_CONFIG_USER_BYTES: usize = 256;
+
+/// Runtime configuration baked into an image, read on the node that owns it.
+///
+/// A worker build returns this so the control plane never needs a local copy
+/// of the image to learn which port it listens on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ImageConfig {
+    /// Ports from `EXPOSE`, sorted ascending, without protocol.
+    #[serde(default)]
+    pub exposed_ports: Vec<u16>,
+    /// `USER`, when the image sets one.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// `ENV` entries as `NAME=value`. Values are whatever the Dockerfile
+    /// baked in; callers must not persist or log them.
+    #[serde(default)]
+    pub env: Vec<String>,
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
+}
+
+impl ImageConfig {
+    /// Build a bounded config from a daemon's raw image configuration.
+    ///
+    /// `exposed` entries look like `8080/tcp`; anything that does not parse
+    /// is skipped. Every list is cut at its limit rather than failing, since
+    /// a truncated description of an unusual image is more useful than none.
+    pub fn from_raw(
+        exposed: &[String],
+        user: Option<&str>,
+        env: &[String],
+        entrypoint: &[String],
+    ) -> Self {
+        let mut exposed_ports: Vec<u16> = exposed
+            .iter()
+            .filter_map(|spec| spec.split('/').next()?.parse::<u16>().ok())
+            .collect();
+        exposed_ports.sort_unstable();
+        exposed_ports.dedup();
+        exposed_ports.truncate(MAX_IMAGE_CONFIG_PORTS);
+
+        let user = user
+            .map(str::trim)
+            .filter(|user| !user.is_empty() && user.len() <= MAX_IMAGE_CONFIG_USER_BYTES)
+            .map(str::to_string);
+
+        Self {
+            exposed_ports,
+            user,
+            env: bounded_strings(
+                env,
+                MAX_IMAGE_CONFIG_ENV_ENTRIES,
+                MAX_IMAGE_CONFIG_ENV_BYTES,
+            ),
+            entrypoint: bounded_strings(
+                entrypoint,
+                MAX_IMAGE_CONFIG_ENTRYPOINT_ENTRIES,
+                MAX_IMAGE_CONFIG_ENTRYPOINT_BYTES,
+            ),
+        }
+    }
+}
+
+/// The longest prefix of `items` within `max_entries` entries and
+/// `max_bytes` total bytes. An entry that would cross the byte limit ends
+/// the list; it is never cut in half.
+fn bounded_strings(items: &[String], max_entries: usize, max_bytes: usize) -> Vec<String> {
+    let mut total = 0_usize;
+    let mut kept = Vec::new();
+    for item in items.iter().take(max_entries) {
+        total = total.saturating_add(item.len());
+        if total > max_bytes {
+            break;
+        }
+        kept.push(item.clone());
+    }
+    kept
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -790,6 +893,19 @@ pub trait ImageBuilder: Send + Sync {
         request: BuildRequestWithCallback,
     ) -> Result<BuildResult, BuilderError>;
 
+    /// Materialize an immutable registry image under the deployment's local tag.
+    async fn fetch_registry_image(
+        &self,
+        reference: &str,
+        tag: &str,
+        credentials: Option<remote::RemotePullCredentials>,
+    ) -> Result<(), BuilderError> {
+        let _ = credentials;
+        Err(BuilderError::Other(format!(
+            "Cannot pull registry image '{reference}' as '{tag}' on this builder"
+        )))
+    }
+
     /// Import an image from a tar archive
     async fn import_image(&self, image_path: PathBuf, tag: &str) -> Result<String, BuilderError>;
 
@@ -879,6 +995,22 @@ pub trait ImageBuilder: Send + Sync {
         Err(BuilderError::Other(format!(
             "This image builder cannot export path '{source_path}' from image '{image_name}'"
         )))
+    }
+
+    /// Scan `image_name` for vulnerabilities on the daemon that holds it.
+    ///
+    /// `Ok(None)` means this builder cannot scan remotely -- the local
+    /// runtime, or an agent that predates the endpoint -- and the caller
+    /// scans with its own scanner. `Err` means the scan was attempted and did
+    /// not produce a report. `expected_image_id`, when given, must match the
+    /// image the tag currently names, so findings are never attributed to an
+    /// image other than the one that was built.
+    async fn scan_image_vulnerabilities(
+        &self,
+        _image_name: &str,
+        _expected_image_id: Option<&str>,
+    ) -> Result<Option<image_scan::ImageScanReport>, BuilderError> {
+        Ok(None)
     }
 
     /// Extract files from an image to a destination path
@@ -1079,6 +1211,72 @@ impl std::fmt::Display for RestartPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_config_keeps_sorted_unique_ports_and_skips_unparsable_ones() {
+        let config = ImageConfig::from_raw(
+            &[
+                "8080/tcp".to_string(),
+                "80/tcp".to_string(),
+                "8080/udp".to_string(),
+                "not-a-port/tcp".to_string(),
+                "70000/tcp".to_string(),
+            ],
+            Some("  app  "),
+            &["A=1".to_string()],
+            &["/app/server".to_string()],
+        );
+        assert_eq!(config.exposed_ports, vec![80, 8080]);
+        assert_eq!(config.user.as_deref(), Some("app"));
+        assert_eq!(config.env, vec!["A=1".to_string()]);
+        assert_eq!(config.entrypoint, vec!["/app/server".to_string()]);
+    }
+
+    #[test]
+    fn image_config_is_bounded() {
+        let ports: Vec<String> = (1..=MAX_IMAGE_CONFIG_PORTS as u32 + 50)
+            .map(|port| format!("{port}/tcp"))
+            .collect();
+        let env: Vec<String> = (0..MAX_IMAGE_CONFIG_ENV_ENTRIES + 10)
+            .map(|index| format!("K{index}=v"))
+            .collect();
+        let config = ImageConfig::from_raw(&ports, None, &env, &[]);
+        assert_eq!(config.exposed_ports.len(), MAX_IMAGE_CONFIG_PORTS);
+        assert_eq!(config.env.len(), MAX_IMAGE_CONFIG_ENV_ENTRIES);
+
+        let big = vec!["X".repeat(MAX_IMAGE_CONFIG_ENV_BYTES / 2 + 1); 3];
+        let config = ImageConfig::from_raw(&[], None, &big, &[]);
+        assert_eq!(
+            config.env.len(),
+            1,
+            "the entry that crosses the byte limit ends the list"
+        );
+        let config = ImageConfig::from_raw(
+            &[],
+            Some(&"u".repeat(MAX_IMAGE_CONFIG_USER_BYTES + 1)),
+            &[],
+            &[],
+        );
+        assert_eq!(config.user, None);
+        assert_eq!(ImageConfig::from_raw(&[], Some("  "), &[], &[]).user, None);
+    }
+
+    /// The image configuration is added to a wire type older agents already
+    /// speak: their JSON has no `config`, and must read as "not reported".
+    #[test]
+    fn image_info_from_an_older_agent_has_no_config() {
+        let info: ImageInfo = serde_json::from_str(
+            r#"{"id":"sha256:a","architecture":"amd64","os":"linux","platform":"linux/amd64","size_bytes":1,"tags":[],"created":null,"working_dir":null}"#,
+        )
+        .unwrap();
+        assert!(info.config.is_none());
+        let encoded = serde_json::to_string(&info).unwrap();
+        assert!(
+            !encoded.contains("config"),
+            "an unreported config must not be sent as an empty one: {encoded}"
+        );
+    }
+
     use std::fs;
     use tempfile::TempDir;
 

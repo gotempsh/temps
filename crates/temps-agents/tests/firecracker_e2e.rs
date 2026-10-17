@@ -46,6 +46,7 @@ fn create_config(run_id: i32) -> SandboxCreateConfig {
         memory_limit_mb: Some(256),
         pids_limit: None,
         disk_size_mb: None,
+        allow_docker: false,
         network_mode: None, // default = full (TAP + NAT)
         env_vars: HashMap::from([("SANDBOX_GREETING".to_string(), "from-env".to_string())]),
         idle_timeout: Duration::from_secs(300),

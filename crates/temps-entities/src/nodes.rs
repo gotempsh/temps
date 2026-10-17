@@ -102,6 +102,9 @@ pub struct Model {
     /// durably queued and cleared by the next heartbeat, so failover completes
     /// once per outage and survives a control-plane restart.
     pub failover_at: Option<DBDateTime>,
+    /// Database-backed builder concurrency, queue wait and execution deadlines.
+    #[serde(default)]
+    pub build_limits: Option<Json>,
     /// Operator-controlled opt-in for serving public HTTP/HTTPS on this worker.
     pub public_ingress_enabled: bool,
     /// Last runtime state reported by an ingress-capable agent. `None` means
@@ -215,6 +218,7 @@ mod tests {
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
             failover_at: None,
+            build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
             public_ingress_last_error: None,

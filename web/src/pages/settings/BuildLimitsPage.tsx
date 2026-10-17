@@ -1,15 +1,17 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button } from '@temps-sdk/ds'
 import { PageHeader, SettingsGroup } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, Loader2, Save } from 'lucide-react'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { Loader2, Save } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -27,7 +29,7 @@ const DEFAULTS: BuildLimitsSettings = {
 
 export function BuildLimitsPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -60,7 +62,7 @@ export function BuildLimitsPage() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
-      toast.success('Build limits saved, applied on the next temps serve start')
+      toast.success('Build limits saved and applied')
     } catch {
       toast.error('Failed to save build limits')
     }
@@ -68,19 +70,16 @@ export function BuildLimitsPage() {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="h-8 w-8 animate-spin" />
-      </div>
+      <SettingsFormSkeleton title="Build limits" label="Loading build limits" />
     )
   }
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
@@ -90,7 +89,9 @@ export function BuildLimitsPage() {
       <div className="max-w-5xl space-y-10">
         <SettingsGroup title="Build capacity">
           <p className="text-sm text-muted-foreground">
-            Control-plane builds only. Worker nodes are not affected.
+            Control-plane builds only. Worker nodes are not affected. Changes
+            apply immediately: running builds finish with the limits they
+            started with, queued and new builds use the new ones.
           </p>
           <div className="space-y-2">
             <Label htmlFor="max_concurrent">Max concurrent builds</Label>
@@ -163,17 +164,6 @@ export function BuildLimitsPage() {
               </p>
             )}
           </div>
-        </SettingsGroup>
-        <SettingsGroup title="Applying changes">
-          <Alert>
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Restart required</AlertTitle>
-            <AlertDescription>
-              All three settings take effect on the next
-              <code className="mx-1 rounded bg-muted px-1">temps serve</code>
-              start.
-            </AlertDescription>
-          </Alert>
         </SettingsGroup>
       </div>
 

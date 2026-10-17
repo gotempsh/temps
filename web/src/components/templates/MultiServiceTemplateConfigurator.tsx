@@ -33,6 +33,7 @@ import {
   retryInstantiation,
 } from '@/api/client/sdk.gen'
 import { getProjectGroupOptions } from '@/api/client/@tanstack/react-query.gen'
+import { invalidateProjectLists } from '@/lib/project-list-cache'
 import type {
   ExternalServiceInfo,
   InstantiateTemplateRequest,
@@ -374,8 +375,7 @@ export function MultiServiceTemplateConfigurator({
   const invalidateAll = useCallback(async () => {
     await Promise.all([
       invalidateGroups(),
-      queryClient.invalidateQueries({ queryKey: ['getProjects'] }),
-      queryClient.invalidateQueries({ queryKey: ['listProjects'] }),
+      invalidateProjectLists(queryClient),
       queryClient.invalidateQueries({ queryKey: ['external-services'] }),
     ])
   }, [invalidateGroups, queryClient])

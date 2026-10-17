@@ -7,6 +7,7 @@ import {
   CompactErrorFallback,
   ErrorBoundary,
   ErrorFallback,
+  RouteQueryFailureBanner,
 } from '@/components/error'
 import { ThemeProvider } from '@/components/providers/ThemeProvider'
 import { ThemeWrapper } from '@/components/theme/ThemeWrapper'
@@ -19,6 +20,7 @@ import {
   type ConsoleExtensions,
 } from '@temps-sdk/console-kit'
 import {
+  MutationCache,
   QueryCache,
   QueryClient,
   QueryClientProvider,
@@ -44,12 +46,19 @@ import {
 import { ProblemDetails } from './api/client'
 import { client } from './api/client/client.gen'
 import { attachHttpStatus } from './lib/http-error-status'
+import {
+  installUnhandledRejectionReporter,
+  markErrorReported,
+} from './lib/unhandled-rejections'
+import { announceMutationFailure } from './lib/mutation-error-toast'
 import { shouldRetryQuery } from './lib/query-retry'
 import { Header } from './components/dashboard/Header'
 import AppSidebar from './components/dashboard/Sidebar'
+import { ComposeVersionAlert } from './components/alerts/ComposeVersionAlert'
 import { DiskSpaceAlert } from './components/alerts/DiskSpaceAlert'
 import { UpdateAvailableBanner } from './components/alerts/UpdateAvailableBanner'
 import { AiHarnessPendingBanner } from './components/alerts/AiHarnessPendingBanner'
+import { AcmeContactEmailBanner } from './components/alerts/AcmeContactEmailBanner'
 import { ProtectedLayout } from './components/layout/ProtectedLayout'
 import SandboxPreviewAccess from './pages/SandboxPreviewAccess'
 import { SettingsLayout } from './components/settings/SettingsLayout'
@@ -87,6 +96,11 @@ const PlatformTools = lazy(() =>
 )
 const Projects = lazy(() =>
   import('./pages/Projects').then((m) => ({ default: m.Projects }))
+)
+const ConnectGroupRepository = lazy(() =>
+  import('./pages/ConnectGroupRepository').then((m) => ({
+    default: m.ConnectGroupRepository,
+  }))
 )
 const ProjectGroupDetail = lazy(() =>
   import('./pages/ProjectGroupDetail').then((m) => ({
@@ -420,6 +434,11 @@ const AiGateway = lazy(() =>
     default: m.AiGatewayPage,
   }))
 )
+const AiGatewayLimitsPage = lazy(() =>
+  import('./pages/AiGatewayLimitsPage').then((m) => ({
+    default: m.AiGatewayLimitsPage,
+  }))
+)
 const AiGatewayUsagePage = lazy(() =>
   import('./pages/AiGatewayUsagePage').then((m) => ({
     default: m.AiGatewayUsagePage,
@@ -585,6 +604,11 @@ const FullAppRoutes = () => {
               version dismissible, links the upgrade docs. */}
               <UpdateAvailableBanner />
               <AiHarnessPendingBanner />
+              {/* Docker Compose CLI too old/missing for Compose deployments. */}
+              <ComposeVersionAlert />
+              {/* HTTPS for environment URLs needs a Let's Encrypt contact; asks
+              for it inline while on-demand TLS is on and nothing else blocks. */}
+              <AcmeContactEmailBanner />
               {/* Wrap header with independent error boundary */}
               <ErrorBoundary
                 fallback={(error, _errorInfo, resetError) => (
@@ -630,6 +654,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div className="flex-1 min-h-0 overflow-y-auto py-2 px-0 sm:p-4">
+                  <RouteQueryFailureBanner />
                   <Routes>
                     {extraRoutes?.map((r) => (
                       <Route key={r.path} path={r.path} element={r.element} />
@@ -649,6 +674,10 @@ const FullAppRoutes = () => {
                     <Route path="/tools" element={<PlatformTools />} />
                     <Route path="/projects" element={<Projects />} />
                     <Route path="/p/:slug" element={<ProjectGroupDetail />} />
+                    <Route
+                      path="/p/:slug/repository"
+                      element={<ConnectGroupRepository />}
+                    />
                     <Route
                       path="/drop"
                       element={
@@ -886,6 +915,10 @@ const FullAppRoutes = () => {
                     <Route
                       path="/ai-gateway/usage"
                       element={<AiGatewayUsagePage />}
+                    />
+                    <Route
+                      path="/ai-gateway/limits"
+                      element={<AiGatewayLimitsPage />}
                     />
                     <Route
                       path="/ai-gateway/activity"
@@ -1139,25 +1172,14 @@ const AppContent = () => {
   )
 }
 
-// Helper to generate friendly error titles from mutation operations
-const getErrorTitle = (
-  context: any,
-  defaultTitle?: string
-): string | undefined => {
-  // Check for custom error title in mutation meta
-  if (context?.meta?.errorTitle) {
-    return context.meta.errorTitle
-  }
-  const mutationKey = context?.mutationKey?.[0]
-  if (mutationKey) {
-    // e.g., "createProject" -> "Failed to create project"
-    return `Failed to ${mutationKey.replace(/([A-Z])/g, ' $1').toLowerCase()}`
-  }
-
-  return defaultTitle
-}
-
 const queryClient = new QueryClient({
+  // Runs for every failed mutation, including those that define their own
+  // `onError` (which replaces the default one below). Whoever announces the
+  // failure, a handler that also awaits the mutation without a catch must not
+  // have it announced a second time by the unhandled-rejection reporter.
+  mutationCache: new MutationCache({
+    onError: (error) => markErrorReported(error),
+  }),
   queryCache: new QueryCache({
     onError: (error, query) => {
       // ProblemDetails response bodies never carry a "status" field -- the
@@ -1217,7 +1239,9 @@ const queryClient = new QueryClient({
       retry: shouldRetryQuery,
     },
     mutations: {
-      onError: (error: unknown, _variables, context) => {
+      // `meta` and `mutationKey` arrive in the fourth argument; the third is
+      // the `onMutate` result, which is `undefined` for these mutations.
+      onError: (error: unknown, _variables, _onMutateResult, context) => {
         const problemDetails = error as ProblemDetails
 
         // Sensitive mutations own this response: they open a step-up dialog
@@ -1276,16 +1300,8 @@ const queryClient = new QueryClient({
           return
         }
 
-        // Get custom error title
-        const customTitle = getErrorTitle(context, problemDetails.title)
-
-        if (problemDetails.title) {
-          toast.error(customTitle || problemDetails.title, {
-            description: problemDetails.detail,
-          })
-        } else {
-          toast.error(customTitle || 'An error occurred')
-        }
+        // Authored title (`meta.errorTitle`) plus the server's reason.
+        announceMutationFailure(problemDetails, context)
       },
     },
   },
@@ -1315,6 +1331,16 @@ export const TempsConsole = ({
   useEffect(() => {
     if (!document.documentElement.lang) document.documentElement.lang = 'en'
   }, [])
+
+  // An API failure nobody awaited with a `catch` would otherwise end as an
+  // "uncaught exception: Object" with nothing on screen.
+  useEffect(
+    () =>
+      installUnhandledRejectionReporter((notice) =>
+        toast.error(notice.title, { description: notice.description })
+      ),
+    []
+  )
 
   return (
     <ThemeProvider defaultTheme="system" enableSystem attribute="class">

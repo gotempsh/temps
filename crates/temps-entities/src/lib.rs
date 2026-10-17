@@ -117,6 +117,7 @@ pub mod postgres_major_upgrades;
 pub mod preset;
 pub mod project_custom_domains;
 pub mod project_delivery_settings;
+pub mod project_ip_access_rules;
 pub mod project_services;
 pub mod project_telemetry_write_intervals;
 pub mod projects;
@@ -234,6 +235,7 @@ pub mod prelude;
 pub mod compose_security;
 pub mod compose_security_policies;
 pub mod compose_security_policy_changes;
+pub mod compose_validation_reports;
 
 pub mod compose_security_legacy_migrations;
 

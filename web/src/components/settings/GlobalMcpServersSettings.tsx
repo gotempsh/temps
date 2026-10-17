@@ -1,19 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { McpCredentialRevealControls } from '@/components/agents/McpCredentialRevealControls'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent } from '@/components/ui/card'
 import {
@@ -61,7 +52,7 @@ export function GlobalMcpServersSettings() {
   usePageTitle('MCP Servers')
   const navigate = useNavigate()
 
-  const [mcpToDelete, setMcpToDelete] = useState<string | null>(null)
+  const [mcpToDelete, setMcpToDelete] = useState<McpDefinition | null>(null)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingMcp, setEditingMcp] = useState<McpDefinition | null>(null)
 
@@ -171,32 +162,25 @@ export function GlobalMcpServersSettings() {
         }}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={mcpToDelete !== null}
-        onOpenChange={() => setMcpToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete global MCP server?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will permanently delete this MCP server. All services that
-              reference it will lose access.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (mcpToDelete)
-                  deleteMutation.mutate({ path: { slug: mcpToDelete } })
-              }}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        onOpenChange={(open) => {
+          if (!open) setMcpToDelete(null)
+        }}
+        resourceType="global MCP server"
+        resourceName={mcpToDelete?.name ?? ''}
+        consequences={
+          <>
+            Every service that references <code>{mcpToDelete?.slug}</code> will
+            lose access to it.
+          </>
+        }
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (mcpToDelete)
+            deleteMutation.mutate({ path: { slug: mcpToDelete.slug } })
+        }}
+      />
     </div>
   )
 }
@@ -265,7 +249,7 @@ interface McpListProps {
   mcpServers: McpDefinition[]
   onOpen: (slug: string) => void
   onEdit: (mcp: McpDefinition) => void
-  onDelete: (slug: string) => void
+  onDelete: (mcp: McpDefinition) => void
 }
 
 function McpCompactRows({
@@ -312,7 +296,7 @@ function McpCompactRows({
             <McpRowMenu
               onView={() => onOpen(mcp.slug)}
               onEdit={() => onEdit(mcp)}
-              onDelete={() => onDelete(mcp.slug)}
+              onDelete={() => onDelete(mcp)}
             />
             <ChevronRight className="size-4 shrink-0 text-muted-foreground/50" />
           </li>

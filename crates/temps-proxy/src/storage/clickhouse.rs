@@ -759,6 +759,27 @@ fn sort_column(sort_by: Option<&str>) -> &'static str {
     }
 }
 
+/// Full `ORDER BY` expression for a list page: the requested column, then
+/// `timestamp` and `request_id` as tiebreakers.
+///
+/// Rows sharing the sort value (a status code, a method, a host) would
+/// otherwise come back in an unspecified order and `LIMIT/OFFSET` pages would
+/// overlap, so "Next page" repeats rows. ClickHouse rows carry no serial id;
+/// `request_id` is unique per request. `order_col` is allowlist-derived and
+/// `order_dir` is a fixed enum, so the result is safe to interpolate.
+fn order_by_clause(sort_by: Option<&str>, sort_order: Option<&str>) -> String {
+    let order_col = sort_column(sort_by);
+    let order_dir = match sort_order {
+        Some("asc") => "ASC",
+        _ => "DESC",
+    };
+    if order_col == "timestamp" {
+        format!("timestamp {order_dir}, request_id {order_dir}")
+    } else {
+        format!("{order_col} {order_dir}, timestamp {order_dir}, request_id {order_dir}")
+    }
+}
+
 impl ClickHouseProxyLogStore {
     /// Translate the full `ProxyLogsQuery` (plus the separately-passed date
     /// bounds) into a WHERE fragment + ordered bind list. Every value is a bound
@@ -1135,11 +1156,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // exactly the shape the DDL calls out as duplicate-tolerant: the worst
         // case is one retried request showing twice on a page until the next
         // merge, versus merge-on-read over every part on every page load.
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
         let offset = (page.saturating_sub(1)) * page_size;
 
         let select_sql = format!(
@@ -1153,7 +1170,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ? OFFSET ?"
         );
 
@@ -1199,11 +1216,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // Same page projection as `list_with_filters`, minus the count()
         // aggregate — feed callers discard the total. ORDER BY column is
         // allowlist-derived; direction is a fixed enum (injection-safe).
-        let order_col = sort_column(filters.sort_by.as_deref());
-        let order_dir = match filters.sort_order.as_deref() {
-            Some("asc") => "ASC",
-            _ => "DESC",
-        };
+        let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
         let select_sql = format!(
             "SELECT \
                 toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
@@ -1215,7 +1228,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
-             ORDER BY {order_col} {order_dir} \
+             ORDER BY {order_by} \
              LIMIT ?"
         );
 
@@ -3048,6 +3061,23 @@ mod tests {
         assert_eq!(
             opt_headers_json(r#"{"a":"b"}"#.to_string()),
             Some(serde_json::json!({"a": "b"}))
+        );
+    }
+
+    #[test]
+    fn order_by_clause_breaks_ties_with_timestamp_and_request_id() {
+        assert_eq!(
+            order_by_clause(Some("status_code"), Some("asc")),
+            "status_code ASC, timestamp ASC, request_id ASC"
+        );
+        assert_eq!(
+            order_by_clause(Some("method"), None),
+            "method DESC, timestamp DESC, request_id DESC"
+        );
+        // Sorting by timestamp must not repeat the column.
+        assert_eq!(
+            order_by_clause(None, Some("desc")),
+            "timestamp DESC, request_id DESC"
         );
     }
 

@@ -2802,11 +2802,12 @@ impl DeploymentService {
     /// `image_name`, for a rollback/promotion that must reach those workers.
     ///
     /// Used for a mixed-architecture worker build always -- the control
-    /// plane never holds its other architectures -- and for any worker
-    /// build when this control plane runs no workloads, since it then has
-    /// no copy of the image to stream from. A full-profile control plane
-    /// keeps streaming a single-architecture image from its own copy, as
-    /// before.
+    /// plane never holds its other architectures -- for any worker build
+    /// when this control plane runs no workloads, since it then has no copy
+    /// of the image to stream from, and for a build whose node reported the
+    /// image's configuration, which was therefore not copied back. A
+    /// full-profile control plane keeps streaming a single-architecture
+    /// image from its own copy when the build reported none, as before.
     async fn reused_worker_build(
         &self,
         project_id: i32,
@@ -2840,10 +2841,13 @@ impl DeploymentService {
             .node_scheduler
             .get()
             .is_some_and(|scheduler| !scheduler.local_workloads_enabled());
-        Ok(
-            (worker_build.is_per_architecture() || control_plane_has_no_copy)
-                .then_some(worker_build),
-        )
+        // A build whose node reported the image's configuration was not
+        // copied back to the control plane, so its worker is the source.
+        let control_plane_was_not_given_a_copy = worker_build.image_config.is_some();
+        Ok((worker_build.is_per_architecture()
+            || control_plane_has_no_copy
+            || control_plane_was_not_given_a_copy)
+            .then_some(worker_build))
     }
 
     async fn configure_reuse_deploy_builder(
@@ -6599,6 +6603,7 @@ mod tests {
                 tags: vec![image_name.to_string()],
                 created: None,
                 working_dir: None,
+                config: None,
             })
         }
 
@@ -8059,6 +8064,7 @@ mod tests {
             labels: Set(serde_json::json!({})),
             capacity: Set(serde_json::json!({})),
             dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
             public_ingress_enabled: Set(false),
             public_ingress_unsupported_reasons: Set(serde_json::json!([])),
             created_at: Set(Utc::now()),
@@ -11969,6 +11975,45 @@ mod tests {
             .expect("the worker is the only source of the image");
         assert_eq!(reused.builder_node_id, Some(5));
         assert!(!reused.is_per_architecture());
+        Ok(())
+    }
+
+    /// A node that reported the image's configuration was not asked to send
+    /// the image back, so even a full-profile control plane has no copy: the
+    /// reuse must name the worker and carry the reported ports.
+    #[tokio::test]
+    async fn rollback_of_a_build_that_was_not_copied_back_uses_the_worker_and_its_ports(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+        insert_build_outputs(
+            &db,
+            deployment.id,
+            serde_json::json!({
+                "image_tag": "app-1:latest",
+                "image_id": "sha256:arm",
+                "builder_node_id": 5,
+                "image_tags_by_platform": { "linux/arm64": "app-1:latest" },
+                "image_config": { "exposed_ports": [8080], "working_dir": "/app" }
+            }),
+        )
+        .await?;
+        let full = create_deployment_service_for_test(db.clone());
+        full.set_node_scheduler(Arc::new(crate::services::NodeScheduler::new(Arc::new(
+            crate::services::NodeService::new(db.clone()),
+        ))));
+
+        let reused = full
+            .reused_worker_build(deployment.project_id, deployment.id, "app-1:latest")
+            .await?
+            .expect("the worker is the only holder of an image that was not copied back");
+
+        assert_eq!(reused.builder_node_id, Some(5));
+        assert_eq!(
+            reused.image_config.map(|config| config.exposed_ports),
+            Some(vec![8080])
+        );
         Ok(())
     }
 }

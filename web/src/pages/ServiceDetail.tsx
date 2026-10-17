@@ -43,7 +43,9 @@ import {
   backupDestinationState,
 } from '@/lib/service-backup-setup'
 import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
+import { MigrateS3Dialog } from '@/components/storage/MigrateS3Dialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
+import { s3EngineLabel, s3MigrationSupported } from '@/lib/s3-engine'
 import {
   listPgUpgrades,
   phaseIndex,
@@ -79,10 +81,8 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -153,6 +153,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 
@@ -217,8 +218,8 @@ export function ServiceDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
-  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
+  const [isMigrateS3DialogOpen, setIsMigrateS3DialogOpen] = useState(false)
   const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] =
     useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -660,8 +661,7 @@ export function ServiceDetail() {
     )
   }
 
-  const handleDelete = async () => {
-    if (deleteConfirmName.trim() !== service?.service?.name) return
+  const handleDelete = () => {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
 
@@ -689,6 +689,22 @@ export function ServiceDetail() {
           </>
         }
         aside={<Skeleton className="h-48 w-full rounded-lg" />}
+      />
+    )
+  }
+
+  if (queryError && isVerifiedNotFound(queryError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="Service not found"
+        description="This storage service does not exist, or it has been deleted."
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
       />
     )
   }
@@ -725,6 +741,15 @@ export function ServiceDetail() {
     label: service.service.status,
   }
 
+  const s3Engine = s3EngineLabel(
+    service.service.service_type,
+    service.current_parameters
+  )
+  const canMigrateS3 = s3MigrationSupported(
+    service.service.service_type,
+    service.current_parameters
+  )
+
   const facts: DetailFact[] = [
     {
       label: 'Type',
@@ -738,6 +763,7 @@ export function ServiceDetail() {
         </span>
       ),
     },
+    ...(s3Engine ? [{ label: 'Engine', value: s3Engine }] : []),
     {
       label: 'Topology',
       value:
@@ -957,6 +983,15 @@ export function ServiceDetail() {
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
+                {canMigrateS3 ? (
+                  <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
+                    onClick={() => setIsMigrateS3DialogOpen(true)}
+                  >
+                    <DatabaseZap className="h-4 w-4 mr-2" />
+                    Migrate data from another S3 service…
+                  </DropdownMenuItem>
+                ) : null}
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
                     className="min-h-12 sm:min-h-8"
@@ -1950,100 +1985,43 @@ export function ServiceDetail() {
         </DialogContent>
       </Dialog>
 
-      <Dialog
+      <ConfirmDeleteDialog
         open={isDeleteDialogOpen}
-        onOpenChange={(open) => {
-          setIsDeleteDialogOpen(open)
-          if (!open) setDeleteConfirmName('')
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Service</DialogTitle>
-            <DialogDescription>
-              This action cannot be undone and all data associated with this
-              service will be permanently removed.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="confirm-delete-service-name">
-              Type <ConfirmNameBadge value={service.service.name} /> to confirm
-            </Label>
-            <Input
-              id="confirm-delete-service-name"
-              value={deleteConfirmName}
-              onChange={(e) => setDeleteConfirmName(e.target.value)}
-              placeholder={service.service.name}
-              autoComplete="off"
-              autoFocus
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setIsDeleteDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteConfirmName.trim() !== service.service.name}
-              busy={deleteService.isPending}
-              busyLabel="Deleting…"
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        onOpenChange={setIsDeleteDialogOpen}
+        resourceType="service"
+        resourceName={service.service.name}
+        requireTypedName
+        consequences="All data associated with this service will be permanently removed."
+        isPending={deleteService.isPending}
+        onConfirm={handleDelete}
+      />
 
-      <Dialog
-        open={!!memberToRemove}
+      <ConfirmDeleteDialog
+        open={memberToRemove !== null}
         onOpenChange={(open) => {
           if (!open) setMemberToRemove(null)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove Cluster Member</DialogTitle>
-            <DialogDescription>
-              Stop and remove{' '}
-              <span className="font-mono text-foreground">
-                {memberToRemove?.container_name}
-              </span>{' '}
-              from this cluster. The container, its data volume, and the
-              member&apos;s DNS record will be deleted. The pg_auto_failover
-              monitor will mark the node as unreachable; run{' '}
-              <span className="font-mono">pg_autoctl drop node</span> manually
-              if you want a fully-clean monitor view.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setMemberToRemove(null)}
-              disabled={removeMember.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() =>
-                memberToRemove &&
-                removeMember.mutate({
-                  serviceId: parseInt(id!),
-                  memberId: memberToRemove.id,
-                })
-              }
-              busy={removeMember.isPending}
-              busyLabel="Removing…"
-            >
-              Remove Member
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        resourceType="cluster member"
+        resourceName={memberToRemove?.container_name ?? ''}
+        verb="Remove"
+        consequences={
+          <>
+            Stops and removes it from {service.service.name}. The container, its
+            data volume, and the member&apos;s DNS record will be deleted. The
+            pg_auto_failover monitor will mark the node as unreachable; run{' '}
+            <span className="font-mono">pg_autoctl drop node</span> manually if
+            you want a fully-clean monitor view.
+          </>
+        }
+        isPending={removeMember.isPending}
+        onConfirm={() => {
+          if (memberToRemove)
+            removeMember.mutate({
+              serviceId: parseInt(id!),
+              memberId: memberToRemove.id,
+            })
+        }}
+      />
 
       <Dialog
         open={!!memberToPromote}
@@ -2098,6 +2076,14 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
+      />
+
+      <MigrateS3Dialog
+        open={isMigrateS3DialogOpen}
+        onOpenChange={setIsMigrateS3DialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
         onSuccess={() => refetch()}
       />
 

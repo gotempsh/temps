@@ -8,19 +8,8 @@ import {
   deleteProjectMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
-import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CloudTelemetryBackfillCard } from './CloudTelemetryBackfillCard'
 import { MonitoringCard } from './MonitoringCard'
 import {
@@ -193,7 +182,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   }
 
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
-  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
     meta: {
@@ -202,7 +190,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
   })
 
   const handleDeleteProject = async () => {
-    if (deleteConfirmName.trim() !== project?.name) return
     setIsDeleteDialogOpen(false)
     try {
       await toast.promise(
@@ -354,51 +341,21 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
           platform. This action is not reversible, so please continue with
           caution.
         </p>
-        <AlertDialog
-          open={isDeleteDialogOpen}
-          onOpenChange={(open) => {
-            setIsDeleteDialogOpen(open)
-            if (!open) setDeleteConfirmName('')
-          }}
+        <Button
+          variant="destructive"
+          onClick={() => setIsDeleteDialogOpen(true)}
         >
-          <AlertDialogTrigger asChild>
-            <Button variant="destructive">Delete service</Button>
-          </AlertDialogTrigger>
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogTitle>Are you absolutely sure?</AlertDialogTitle>
-              <AlertDialogDescription>
-                This action cannot be undone. This will permanently delete this
-                service and remove all associated data from our servers.
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <div className="space-y-2">
-              <Label htmlFor="confirm-delete-project-name">
-                Type <ConfirmNameBadge value={project?.name ?? ''} /> to confirm
-              </Label>
-              <Input
-                id="confirm-delete-project-name"
-                value={deleteConfirmName}
-                onChange={(e) => setDeleteConfirmName(e.target.value)}
-                placeholder={project?.name}
-                autoComplete="off"
-              />
-            </div>
-            <AlertDialogFooter>
-              <AlertDialogCancel>Cancel</AlertDialogCancel>
-              <AlertDialogAction
-                onClick={handleDeleteProject}
-                disabled={
-                  deleteProjectMutationM.isPending ||
-                  deleteConfirmName.trim() !== project?.name
-                }
-                className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              >
-                {deleteProjectMutationM.isPending ? 'Deleting...' : 'Delete'}
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+          Delete service
+        </Button>
+        <ConfirmDeleteDialog
+          open={isDeleteDialogOpen}
+          onOpenChange={setIsDeleteDialogOpen}
+          resourceType="service"
+          resourceName={project?.name ?? ''}
+          consequences="Its deployments, environments, domains, environment variables and all associated data are permanently removed."
+          requireTypedName
+          onConfirm={() => void handleDeleteProject()}
+        />
       </SettingsSection>
     </div>
   )

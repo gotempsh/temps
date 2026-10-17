@@ -8,6 +8,7 @@ import { toast } from 'sonner'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 
@@ -76,6 +77,7 @@ export function SandboxPreviewPasswordCard({
   const [value, setValue] = useState('')
   const [confirm, setConfirm] = useState('')
   const [show, setShow] = useState(false)
+  const [confirmingClear, setConfirmingClear] = useState(false)
 
   const invalidate = () => {
     // The generated keys, not ad-hoc ones: the detail page and the preview
@@ -107,6 +109,8 @@ export function SandboxPreviewPasswordCard({
       invalidate()
       toast.success('Preview password removed')
     },
+    // Not onError: a local onError replaces the app-wide error toast.
+    onSettled: () => setConfirmingClear(false),
   })
 
   const trimmed = value
@@ -148,10 +152,11 @@ export function SandboxPreviewPasswordCard({
             <Button
               size="sm"
               variant="ghost"
-              onClick={() => clearMutation.mutate({ path: { id: sandboxId } })}
+              onClick={() => setConfirmingClear(true)}
               disabled={clearMutation.isPending}
               className="text-destructive hover:text-destructive h-7"
               title="Remove password protection"
+              aria-label="Remove password protection"
             >
               {clearMutation.isPending ? (
                 <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -271,6 +276,18 @@ export function SandboxPreviewPasswordCard({
           </div>
         </form>
       </CardContent>
+      <ConfirmDeleteDialog
+        open={confirmingClear}
+        onOpenChange={setConfirmingClear}
+        verb="Remove"
+        resourceType="preview password for sandbox"
+        resourceName={sandboxId}
+        irreversible={false}
+        confirmLabel="Remove password"
+        consequences={`Preview URLs become reachable by anyone who knows the sandbox ID, and existing login cookies stop mattering. The password ending in …${hint ?? ''} is discarded.`}
+        isPending={clearMutation.isPending}
+        onConfirm={() => clearMutation.mutate({ path: { id: sandboxId } })}
+      />
     </Card>
   )
 }

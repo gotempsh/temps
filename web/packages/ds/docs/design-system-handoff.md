@@ -99,7 +99,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 - **`Detail`** (record): **title → verdict → 4-6 facts → main column → aside**.
   Reference screen: `design-system/` deployment detail.
 - **`Settings`** (form): `Field`s, `FormErrors` above a sticky save bar that
-  stays mounted regardless of `dirty`. Reference screen: `design-system/`
+  stays mounted regardless of `dirty`; `saveLabel` names the outcome
+  ("Save repository") instead of the default "Save changes". Reference screen: `design-system/`
   project settings form.
 - **`CardGrid`** (list, card layout): same header shape as `Ledger`
   (title/description/actions/toolbar), a responsive grid body instead of a

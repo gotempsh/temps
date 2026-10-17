@@ -41,7 +41,7 @@ use crate::services::job_tracker::JobTracker;
 use crate::services::placement;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
-use crate::services::registry::StandaloneSandboxRegistry;
+use crate::services::registry::{StandaloneSandboxRegistry, VmProbe};
 use crate::services::row_status::{self, Expect};
 use crate::services::snapshot_service::SnapshotService;
 
@@ -147,6 +147,8 @@ impl std::fmt::Display for SandboxLifecycle {
 /// options — we accept what SDK clients send and ignore the rest.
 #[derive(Debug, Clone, Default)]
 pub struct CreateSandboxRequest {
+    /// Opt in to normal guest-root semantics for Docker (microsandbox only).
+    pub allow_docker: bool,
     /// Optional Docker image override. `None` → platform default.
     pub image: Option<String>,
     /// Optional human-readable name. Defaults to the internal ID.
@@ -440,6 +442,81 @@ pub struct NodeEviction {
 /// How many sandboxes an eviction destroys at once.
 const EVICTION_CONCURRENCY: usize = 8;
 
+/// How many VM liveness checks the startup reconciliation runs at once.
+const VM_RECONCILE_CONCURRENCY: usize = 8;
+
+/// How long the startup reconciliation waits for one VM's liveness check.
+/// Longer than a vsock ping, shorter than anything an operator would call a
+/// hung start.
+const VM_RECONCILE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How many ids the startup reconciliation names in its summary.
+const VM_RECONCILE_REPORTED_IDS: usize = 50;
+
+/// Rows loaded per page by [`SandboxService::reconcile_all_running_vms`]:
+/// the most rows the reconciliation holds at once, however many sandboxes the
+/// instance has.
+const VM_RECONCILE_PAGE_SIZE: u64 = 100;
+
+/// What the startup reconciliation found, for the one summary log line.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct VmReconcileReport {
+    /// Running rows examined.
+    pub checked: usize,
+    /// Rows whose VM answered: left alone.
+    pub alive: usize,
+    /// Public ids of rows moved from `running` to `stopped` because their VM
+    /// is not running, capped at [`VM_RECONCILE_REPORTED_IDS`] so the report
+    /// stays small however many VMs a restart took down. Each move also has
+    /// its own `vm_lost` event and log line.
+    pub marked_stopped: Vec<String>,
+    /// How many rows were moved to `stopped` (the full count behind
+    /// `marked_stopped`).
+    pub marked_stopped_total: usize,
+    /// Rows whose VM is down but whose row was left as it was: a managed
+    /// application workspace (which reports a lost runtime as `recovering`),
+    /// a row that changed since it was read, or a failed database write.
+    pub not_marked: usize,
+    /// Rows left as they were because the check neither confirmed nor ruled
+    /// out a live VM (error or timeout).
+    pub unverified: usize,
+}
+
+impl VmReconcileReport {
+    /// Fold the report of another page into this one.
+    fn absorb(&mut self, page: VmReconcileReport) {
+        self.checked += page.checked;
+        self.alive += page.alive;
+        self.marked_stopped_total += page.marked_stopped_total;
+        self.not_marked += page.not_marked;
+        self.unverified += page.unverified;
+        let room = VM_RECONCILE_REPORTED_IDS.saturating_sub(self.marked_stopped.len());
+        self.marked_stopped
+            .extend(page.marked_stopped.into_iter().take(room));
+    }
+
+    /// Whether every row examined has a confirmed live VM.
+    pub fn all_alive(&self) -> bool {
+        self.alive == self.checked
+    }
+}
+
+/// Whether the startup reconciliation may judge this row. Firecracker and
+/// microsandbox VMMs are started by Temps alone, so a down one is final.
+/// Docker containers carry `unless-stopped`: after a host reboot dockerd may
+/// still be bringing them back when Temps starts, so a down container proves
+/// nothing yet and is left to the check on first access.
+pub fn reconcilable_at_startup(row: &sandboxes::Model) -> bool {
+    matches!(row.backend.as_deref(), Some("firecracker" | "microsandbox"))
+}
+
+/// One row's liveness verdict in [`SandboxService::reconcile_running_vms`].
+enum VmCheck {
+    Alive,
+    Down(temps_agents::error::AgentError),
+    Unknown(String),
+}
+
 /// How long an eviction waits for one container destroy. A node that
 /// accepts connections but never answers (overloaded, frozen) would
 /// otherwise hold every call for the provider's full lifecycle timeout.
@@ -615,6 +692,8 @@ pub struct NodeSandboxes {
 /// columns out of the public surface.
 #[derive(Debug, Clone)]
 pub struct SandboxSummary {
+    /// Whether normal guest-root semantics were requested for Docker.
+    pub allow_docker: bool,
     pub public_id: String,
     pub name: String,
     pub status: String,
@@ -656,6 +735,12 @@ pub struct SandboxSummary {
 impl From<&sandboxes::Model> for SandboxSummary {
     fn from(m: &sandboxes::Model) -> Self {
         Self {
+            allow_docker: m
+                .metadata
+                .as_ref()
+                .and_then(|v| v.get("allow_docker"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             public_id: m.public_id.clone(),
             name: m.name.clone(),
             status: m.status.clone(),
@@ -2057,6 +2142,7 @@ impl SandboxService {
         // unless the operator changed it), so existing clients see no
         // behavior change.
         let backend = parse_requested_backend(req.backend.as_deref())?;
+        validate_allow_docker(req.allow_docker, backend)?;
 
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
@@ -2119,6 +2205,7 @@ impl SandboxService {
 
         let metadata_value = {
             let mut meta = serde_json::Map::new();
+            meta.insert("allow_docker".into(), serde_json::json!(req.allow_docker));
             if !req.ports.is_empty() {
                 meta.insert("ports".into(), serde_json::json!(req.ports));
             }
@@ -2219,6 +2306,7 @@ impl SandboxService {
             memory_limit_mb: req.memory_limit_mb,
             pids_limit: req.pids_limit,
             disk_size_mb: req.disk_size_mb,
+            allow_docker: req.allow_docker,
             network_mode: None,
             env_vars: req.env,
             idle_timeout: Duration::from_secs(timeout),
@@ -2263,10 +2351,11 @@ impl SandboxService {
                     self.remove_work_dir(&public_id_value).await;
                 }
                 self.mark_destroyed(row.id).await.ok();
-                if e.image_pull_failure().is_some() {
-                    // The image could not be pulled: report which image and
-                    // why, so the caller can tell a missing tag from a
-                    // sandbox runtime fault.
+                if e.image_pull_failure().is_some() || e.network_pool_exhaustion().is_some() {
+                    // The image could not be pulled, or the host has no
+                    // address space left for the sandbox's network: report
+                    // which, so the caller can tell a missing tag or a full
+                    // host from a sandbox runtime fault.
                     return Err(from_agent_error(&public_id_value, e));
                 }
                 return Err(SandboxError::CreateFailed {
@@ -2345,6 +2434,7 @@ impl SandboxService {
                 "backend": row.backend,
                 "image": row.image,
                 "disk_size_mb": req.disk_size_mb,
+                "allow_docker": req.allow_docker,
                 "node_id": node_id,
             })),
         )
@@ -4286,10 +4376,21 @@ TEMPS_ASKPASS_EOF\n\
         public_id_value: &str,
         user_id: i32,
     ) -> Result<sandboxes::Model, SandboxError> {
-        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        let mut row = self.find_by_public_id(public_id_value, user_id).await?;
         ensure_not_agent_run(&row)?;
         if row.status == "running" {
-            return Ok(row);
+            // A row can say `running` for a VM that died with the Temps service
+            // or the host. Resume is what the "VM not running" error tells the
+            // caller to run, so it must not be a no-op for that row: when the
+            // provider proves the VM is down, reconcile the row and boot it.
+            // Anything short of proof (alive, or the check failed) keeps the
+            // idempotent answer.
+            match self.registry.probe(row.id, public_id_value).await {
+                VmProbe::Down(cause) if self.mark_vm_lost(&row, &cause, "resume").await => {
+                    row.status = "stopped".to_string();
+                }
+                VmProbe::Alive(_) | VmProbe::Down(_) | VmProbe::Unknown(_) => return Ok(row),
+            }
         }
         if row.status != "stopped" {
             return Err(SandboxError::InvalidState {
@@ -4726,6 +4827,232 @@ TEMPS_ASKPASS_EOF\n\
 
     // ── Helpers shared with the exec/fs modules ──────────────────────────
 
+    /// A provider handle for a sandbox that must be running, for exec, files
+    /// and terminals. Maps provider errors to typed [`SandboxError`]s and, when
+    /// the provider reports the VM is down while the row still says `running`,
+    /// reconciles the row to `stopped` so listings stop lying and
+    /// `sandbox resume` has something to resume.
+    pub(crate) async fn live_handle(
+        &self,
+        row: &sandboxes::Model,
+    ) -> Result<temps_agents::sandbox::SandboxHandle, SandboxError> {
+        match self.registry.probe(row.id, &row.public_id).await {
+            VmProbe::Alive(handle) => Ok(handle),
+            VmProbe::Down(error) => {
+                self.mark_vm_lost(row, &error, "access").await;
+                Err(from_agent_error(&row.public_id, error))
+            }
+            VmProbe::Unknown(error) => Err(from_agent_error(&row.public_id, error)),
+        }
+    }
+
+    /// Move a `running` row whose VM the provider reports as down to `stopped`,
+    /// leaving `expires_at` and the rest of the row untouched, and record a
+    /// `vm_lost` event naming the cause. Conditional on the row still being
+    /// `running` *and* untouched since `row` was read, so it never overwrites a
+    /// concurrent pause or destroy, nor a resume that landed after the probe
+    /// (a resume moves `last_activity_at`).
+    /// Returns whether this call changed the row. Failures are logged, not
+    /// raised: the caller is already reporting the underlying problem.
+    pub(crate) async fn mark_vm_lost(
+        &self,
+        row: &sandboxes::Model,
+        cause: &temps_agents::error::AgentError,
+        source: &'static str,
+    ) -> bool {
+        // Managed application workspaces report a lost runtime as the derived
+        // status `recovering`, which is what makes their own recovery (and the
+        // data-network reconciliation, which only visits `running | recovering`
+        // rows) run. Stopping the row would hide that.
+        if row.status != "running" || managed_application_id_from_name(&row.name).is_some() {
+            return false;
+        }
+        // The verdict was reached from a probe that may have run while the
+        // control plane itself had the VM down (snapshot capture, restart,
+        // disk resize); those start it again and leave the row `running`.
+        // Take the claim that excludes them, then ask again: the first answer
+        // may describe a stop that has since finished.
+        let Some(_unplanned) = self.registry.observe_unplanned(row.id) else {
+            tracing::debug!(
+                sandbox_id = %row.public_id,
+                internal_id = row.id,
+                source,
+                "VM is down for a planned stop; not marking the sandbox lost"
+            );
+            return false;
+        };
+        match tokio::time::timeout(
+            VM_RECONCILE_DEADLINE,
+            self.registry.probe(row.id, &row.public_id),
+        )
+        .await
+        {
+            Ok(VmProbe::Down(_)) => {}
+            Ok(VmProbe::Alive(_)) | Ok(VmProbe::Unknown(_)) | Err(_) => return false,
+        }
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("stopped".to_string()),
+            ..Default::default()
+        };
+        match row_status::update_when(
+            self.db.as_ref(),
+            changes,
+            Expect::RunningSince(row.last_activity_at),
+        )
+        .await
+        {
+            Ok(Some(_)) => {
+                // Only once the row really moved: a stale copy of the row must
+                // not kill the jobs of a sandbox that was resumed meanwhile.
+                self.jobs.abort_all(row.id).await;
+                tracing::warn!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    backend = ?row.backend,
+                    node_id = ?row.node_id,
+                    source,
+                    reason = %cause,
+                    "Sandbox row said running but its VM is not; marked stopped (resume it to boot the VM again)"
+                );
+                self.record_event(
+                    row.id,
+                    "vm_lost",
+                    Some(serde_json::json!({
+                        "source": source,
+                        "backend": row.backend,
+                        "reason": cause.to_string(),
+                    })),
+                )
+                .await;
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                tracing::error!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    error = %error,
+                    "Could not mark a sandbox whose VM is not running as stopped"
+                );
+                false
+            }
+        }
+    }
+
+    /// Startup reconciliation: for every control-plane VM sandbox row that
+    /// says `running`, ask the provider whether its VM really is, and move the
+    /// ones that are not to `stopped`. Rows are read in id-ordered pages of
+    /// [`VM_RECONCILE_PAGE_SIZE`], each page checked before the next is read,
+    /// so memory stays constant however many sandboxes exist and slow checks
+    /// cannot pile rows up. A page that cannot be read ends the run early
+    /// (logged); the lazy check on first access covers whatever was not seen.
+    pub async fn reconcile_all_running_vms(&self) -> VmReconcileReport {
+        self.reconcile_running_vms_paged(VM_RECONCILE_PAGE_SIZE)
+            .await
+    }
+
+    async fn reconcile_running_vms_paged(&self, page_size: u64) -> VmReconcileReport {
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+
+        let mut report = VmReconcileReport::default();
+        let mut after_id = 0;
+        loop {
+            let page = sandboxes::Entity::find()
+                .filter(sandboxes::Column::Status.eq("running"))
+                .filter(sandboxes::Column::NodeId.is_null())
+                .filter(sandboxes::Column::AgentRunId.is_null())
+                .filter(sandboxes::Column::Backend.is_in(["firecracker", "microsandbox"]))
+                .filter(sandboxes::Column::Id.gt(after_id))
+                .order_by_asc(sandboxes::Column::Id)
+                .limit(page_size)
+                .all(self.db.as_ref())
+                .await;
+            let rows = match page {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        after_id,
+                        error = %error,
+                        "Could not read the next page of running sandboxes for VM reconciliation; stopping early"
+                    );
+                    break;
+                }
+            };
+            let Some(last) = rows.last() else { break };
+            after_id = last.id;
+            let full_page = u64::try_from(rows.len()).is_ok_and(|n| n >= page_size);
+            report.absorb(self.reconcile_running_vms(rows).await);
+            if !full_page {
+                break;
+            }
+        }
+        report
+    }
+
+    /// Check one bounded page of rows (see [`Self::reconcile_all_running_vms`]),
+    /// with bounded concurrency and a per-sandbox deadline so a wedged VM
+    /// cannot stall startup. A liveness check that fails without proving the
+    /// VM is down (error, timeout) leaves the row alone: the lazy check on
+    /// first access decides later.
+    pub async fn reconcile_running_vms(&self, rows: Vec<sandboxes::Model>) -> VmReconcileReport {
+        use futures::StreamExt;
+
+        let total = rows.len();
+        // Verdicts are consumed as they arrive: only the bounded number of
+        // in-flight checks is ever held, not one result per row.
+        let mut verdicts = futures::stream::iter(rows)
+            .map(|row| async move {
+                let check = match tokio::time::timeout(
+                    VM_RECONCILE_DEADLINE,
+                    self.registry.probe(row.id, &row.public_id),
+                )
+                .await
+                {
+                    Ok(VmProbe::Alive(_)) => VmCheck::Alive,
+                    Ok(VmProbe::Down(error)) => VmCheck::Down(error),
+                    Ok(VmProbe::Unknown(error)) => VmCheck::Unknown(error.to_string()),
+                    Err(_) => VmCheck::Unknown(format!(
+                        "liveness check did not answer within {}s",
+                        VM_RECONCILE_DEADLINE.as_secs()
+                    )),
+                };
+                (row, check)
+            })
+            .buffer_unordered(VM_RECONCILE_CONCURRENCY);
+
+        let mut report = VmReconcileReport {
+            checked: total,
+            ..Default::default()
+        };
+        while let Some((row, check)) = verdicts.next().await {
+            match check {
+                VmCheck::Alive => report.alive += 1,
+                VmCheck::Down(cause) => {
+                    if self.mark_vm_lost(&row, &cause, "startup").await {
+                        report.marked_stopped_total += 1;
+                        if report.marked_stopped.len() < VM_RECONCILE_REPORTED_IDS {
+                            report.marked_stopped.push(row.public_id.clone());
+                        }
+                    } else {
+                        report.not_marked += 1;
+                    }
+                }
+                VmCheck::Unknown(reason) => {
+                    tracing::warn!(
+                        sandbox_id = %row.public_id,
+                        internal_id = row.id,
+                        backend = ?row.backend,
+                        reason = %reason,
+                        "Could not tell whether a running sandbox's VM is alive at startup; leaving its row as is"
+                    );
+                    report.unverified += 1;
+                }
+            }
+        }
+        report
+    }
+
     /// Load + authorize + return the internal ID **without** waking a
     /// suspended workspace.
     ///
@@ -4793,7 +5120,10 @@ TEMPS_ASKPASS_EOF\n\
             return Err(SandboxError::InvalidState {
                 sandbox_id: public_id_value.to_string(),
                 state: row.status.clone(),
-                operation: "exec or filesystem operation".into(),
+                operation: format!(
+                    "run exec or filesystem operations until it is resumed \
+                     (`bunx @temps-sdk/cli sandbox resume {public_id_value}`)"
+                ),
             });
         }
 
@@ -4811,7 +5141,10 @@ TEMPS_ASKPASS_EOF\n\
         if row.status == "running" && lifecycle == SandboxLifecycle::Workspace {
             match self.registry.get(row.id, public_id_value).await {
                 Ok(_) => {}
-                Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {
+                Err(
+                    temps_agents::error::AgentError::SandboxNotFound { .. }
+                    | temps_agents::error::AgentError::SandboxNotRunning { .. },
+                ) => {
                     tracing::warn!(
                         sandbox_id = public_id_value,
                         internal_id = row.id,
@@ -5076,6 +5409,7 @@ fn application_sandbox_create_config(
         memory_limit_mb: Some(config.memory_limit_mb),
         pids_limit: Some(config.pids_limit),
         disk_size_mb: Some(config.disk_limit_mb),
+        allow_docker: false,
         network_mode: None,
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -5141,6 +5475,19 @@ fn source_target_restore_script() -> &'static str {
     "if [ \"$(id -u)\" -eq 0 ] && [ -d /dev/fd/9 ] && id -u temps >/dev/null 2>&1; then chown \"$(id -u temps):$(id -g temps)\" /dev/fd/9; chmod 755 /dev/fd/9; fi"
 }
 
+/// Guest privilege escalation is a creation-time, explicit backend opt-in.
+fn validate_allow_docker(
+    allow_docker: bool,
+    backend: Option<temps_agents::sandbox::SandboxBackend>,
+) -> Result<(), SandboxError> {
+    if allow_docker && backend != Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
+        return Err(SandboxError::Validation {
+            message: "allow_docker requires backend=microsandbox; Docker inside Firecracker is not supported yet".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Parse the backend a create request asked for. `None` = host default.
 fn parse_requested_backend(
     requested: Option<&str>,
@@ -5170,11 +5517,21 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                 &temps_agents::sandbox::microsandbox::host_data_dir(),
             );
             match capability.reason {
-                Some(reason) => format!(
-                    "backend 'microsandbox' is not available on this host: {} (see {})",
-                    reason,
-                    temps_agents::sandbox::microsandbox::SETUP_PATH
-                ),
+                Some(reason) => {
+                    // Name the command with the server's own data directory:
+                    // a bare `temps microsandbox setup` from another shell
+                    // can install the runtime somewhere the server never reads.
+                    let fix = capability
+                        .setup_command
+                        .map(|command| format!("; to fix, run `{command}` on the server host"))
+                        .unwrap_or_default();
+                    format!(
+                        "backend 'microsandbox' is not available on this host: {}{} (see {})",
+                        reason,
+                        fix,
+                        temps_agents::sandbox::microsandbox::SETUP_PATH
+                    )
+                }
                 // Ready now but not registered: the server started before
                 // the runtime was installed.
                 None => "backend 'microsandbox' is not available on this host: the runtime \
@@ -5182,8 +5539,25 @@ fn backend_unavailable_message(backend: temps_agents::sandbox::SandboxBackend) -
                     .to_string(),
             }
         }
+        temps_agents::sandbox::SandboxBackend::Firecracker => {
+            // Registration is decided once, at startup, from the server's own
+            // data directory. Name that directory and the command that
+            // provisions it: a bare `temps firecracker setup` from a shell
+            // without the server's TEMPS_DATA_DIR provisions a different one.
+            let data_dir = temps_agents::sandbox::microsandbox::host_data_dir();
+            let command = temps_agents::sandbox::microsandbox::command_with_data_dir(
+                "temps firecracker setup",
+                &data_dir,
+            );
+            format!(
+                "backend 'firecracker' is not available on this host: it is not provisioned \
+                 under {} (or the server has not been restarted since setup); run `{}` on \
+                 the server host, then restart temps",
+                data_dir.join("firecracker").display(),
+                command
+            )
+        }
         temps_agents::sandbox::SandboxBackend::Docker
-        | temps_agents::sandbox::SandboxBackend::Firecracker
         | temps_agents::sandbox::SandboxBackend::Local => {
             format!("backend '{}' is not available on this host", backend)
         }
@@ -5565,9 +5939,20 @@ pub(crate) mod tests {
             message.starts_with("backend 'microsandbox' is not available on this host: "),
             "{message}"
         );
+        let firecracker =
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker);
+        assert!(
+            firecracker.starts_with("backend 'firecracker' is not available on this host: "),
+            "{firecracker}"
+        );
+        assert!(
+            firecracker.contains("temps firecracker setup"),
+            "{firecracker}"
+        );
+        assert!(firecracker.contains("restart temps"), "{firecracker}");
         assert_eq!(
-            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Firecracker),
-            "backend 'firecracker' is not available on this host"
+            backend_unavailable_message(temps_agents::sandbox::SandboxBackend::Docker),
+            "backend 'docker' is not available on this host"
         );
     }
 
@@ -5871,6 +6256,20 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn allow_docker_requires_explicit_microsandbox_backend() {
+        use temps_agents::sandbox::SandboxBackend;
+        for backend in [
+            None,
+            Some(SandboxBackend::Docker),
+            Some(SandboxBackend::Firecracker),
+        ] {
+            assert!(validate_allow_docker(true, backend).is_err());
+            assert!(validate_allow_docker(false, backend).is_ok());
+        }
+        assert!(validate_allow_docker(true, Some(SandboxBackend::Microsandbox)).is_ok());
+    }
+
+    #[test]
     fn request_carries_preview_password() {
         // The field is plumbed through the service input DTO so handlers
         // don't need to reach around the service to wire it in.
@@ -5954,6 +6353,16 @@ pub(crate) mod tests {
         const _: () = assert!(MIN_TIMEOUT_SECS < DEFAULT_TIMEOUT_SECS);
         const _: () = assert!(DEFAULT_TIMEOUT_SECS < MAX_TIMEOUT_SECS);
         assert_eq!(MAX_TIMEOUT_SECS, 86400);
+    }
+
+    #[test]
+    fn allow_docker_is_reported_from_persisted_metadata() {
+        let mut row = agent_run_row(None);
+        assert!(!SandboxSummary::from(&row).allow_docker);
+        row.metadata = Some(serde_json::json!({"allow_docker": true}));
+        assert!(SandboxSummary::from(&row).allow_docker);
+        row.metadata = Some(serde_json::json!({"allow_docker": false}));
+        assert!(!SandboxSummary::from(&row).allow_docker);
     }
 
     fn agent_run_row(run_id: Option<i32>) -> sandboxes::Model {
@@ -6592,7 +7001,16 @@ mod storage_cleanup_tests {
         provider: FakeProvider,
         data_root: PathBuf,
     ) -> (Arc<SandboxService>, Arc<StandaloneSandboxRegistry>) {
-        let db = Arc::new(db);
+        build_service_shared(Arc::new(db), provider, data_root)
+    }
+
+    /// [`build_service`] over a connection the test keeps a handle to, so it
+    /// can read the statement log back once the service is dropped.
+    fn build_service_shared(
+        db: Arc<sea_orm::DatabaseConnection>,
+        provider: FakeProvider,
+        data_root: PathBuf,
+    ) -> (Arc<SandboxService>, Arc<StandaloneSandboxRegistry>) {
         let registry = Arc::new(StandaloneSandboxRegistry::local_only(
             Arc::new(provider) as Arc<dyn SandboxProvider>
         ));
@@ -7219,6 +7637,569 @@ mod storage_cleanup_tests {
             msg
         );
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    // ── A VM that is not running is not "not found" ──────────────────────
+
+    /// Run `work` against a service on a mock database and return what it
+    /// produced together with the SQL the service issued.
+    async fn with_statement_log<T, F, Fut>(
+        tag: &str,
+        results: impl IntoIterator<Item = Vec<sandboxes::Model>>,
+        events: usize,
+        provider: FakeProvider,
+        work: F,
+    ) -> (T, String)
+    where
+        F: FnOnce(Arc<SandboxService>) -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let data_root = unique_data_root(tag);
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres).append_query_results(results);
+        for _ in 0..events {
+            mock = mock.append_query_results([vec![destroyed_event()]]);
+        }
+        let db = Arc::new(mock.into_connection());
+        let (service, registry) = build_service_shared(db.clone(), provider, data_root.clone());
+        let output = work(service.clone()).await;
+        drop(service);
+        drop(registry);
+        let log = Arc::try_unwrap(db)
+            .expect("nothing holds the database after the service is dropped")
+            .into_transaction_log();
+        let _ = std::fs::remove_dir_all(&data_root);
+        (output, format!("{log:?}"))
+    }
+
+    #[tokio::test]
+    async fn a_dead_vm_is_a_409_naming_the_backend_and_the_row_is_marked_stopped() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let (result, sql) = with_statement_log(
+            "dead-vm",
+            [vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]],
+            1,
+            provider,
+            |service| async move { service.live_handle(&row).await },
+        )
+        .await;
+
+        let err = result.expect_err("a dead VM has no handle to give");
+        match &err {
+            SandboxError::VmNotRunning {
+                sandbox_id,
+                backend,
+                reason,
+                recovery,
+            } => {
+                assert_eq!(*recovery, crate::error::VmRecovery::Resume);
+                assert_eq!(sandbox_id, PUBLIC_ID);
+                assert_eq!(backend.as_deref(), Some("docker"));
+                assert_eq!(reason, "its container is stopped");
+            }
+            other => panic!("expected VmNotRunning, got {other:?}"),
+        }
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        assert!(sql.contains("UPDATE"), "the row must be reconciled: {sql}");
+        assert!(sql.contains("vm_lost"), "the event must be recorded: {sql}");
+    }
+
+    /// A liveness check that errors proves nothing about the VM, so the row
+    /// is left alone (a Docker stale-policy failure must not stop a sandbox).
+    #[tokio::test]
+    async fn a_failed_liveness_check_does_not_touch_the_row() {
+        let provider = FakeProvider::new();
+        provider.alive_check_fails.store(true, Ordering::SeqCst);
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let (result, sql) = with_statement_log(
+            "liveness-error",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            provider,
+            |service| async move { service.live_handle(&row).await },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SandboxError::VmNotRunning { backend: None, .. })
+            ),
+            "{:?}",
+            result.err()
+        );
+        assert!(!sql.contains("UPDATE"), "no write expected: {sql}");
+    }
+
+    #[tokio::test]
+    async fn a_live_vm_gives_its_handle_and_writes_nothing() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let (result, sql) = with_statement_log(
+            "live-vm",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.live_handle(&row).await },
+        )
+        .await;
+
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(!sql.contains("UPDATE"), "no write expected: {sql}");
+    }
+
+    /// A pause or destroy that lands between the liveness probe and the
+    /// reconcile wins: the conditional update matches nothing and no
+    /// `vm_lost` event is written for a transition that did not happen.
+    #[tokio::test]
+    async fn marking_a_vm_lost_does_not_override_a_concurrent_status_change() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: 7,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let (changed, sql) = with_statement_log(
+            "mark-race",
+            [Vec::<sandboxes::Model>::new()],
+            0,
+            provider,
+            |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
+        )
+        .await;
+
+        assert!(!changed);
+        assert!(sql.contains("UPDATE"), "{sql}");
+        assert!(!sql.contains("vm_lost"), "no event without a change: {sql}");
+    }
+
+    /// Snapshot capture, restart and disk resize take the VM down on purpose
+    /// and start it again. A request that sees it down meanwhile must not
+    /// rewrite the row to `stopped`, or the sandbox would come back to life
+    /// unreachable.
+    #[tokio::test]
+    async fn a_planned_stop_is_not_a_lost_vm() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: row.id,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let data_root = unique_data_root("planned-stop");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
+        let (service, registry) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let planned = registry.begin_planned_downtime(row.id).await;
+        assert!(
+            !service.mark_vm_lost(&row, &cause, "access").await,
+            "a VM that is down for a planned stop must not be marked lost"
+        );
+        drop(planned);
+        assert!(
+            service.mark_vm_lost(&row, &cause, "access").await,
+            "once the planned stop is over a down VM is lost again"
+        );
+
+        drop(service);
+        drop(registry);
+        let log = Arc::try_unwrap(db)
+            .expect("nothing holds the database after the service is dropped")
+            .into_transaction_log();
+        let _ = std::fs::remove_dir_all(&data_root);
+        let sql = format!("{log:?}");
+        assert_eq!(sql.matches("UPDATE").count(), 1, "{sql}");
+    }
+
+    /// A verdict reached while the control plane had the VM down is stale by
+    /// the time it is acted on if the planned stop has finished and the VM is
+    /// back: the claim is only worth something with a fresh look.
+    #[tokio::test]
+    async fn a_stale_down_verdict_is_not_acted_on_when_the_vm_is_back() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: row.id,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let (changed, sql) = with_statement_log(
+            "stale-verdict",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
+        )
+        .await;
+
+        assert!(!changed);
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// The reconciliation reads running VM rows page by page and covers every
+    /// one of them, however small the page.
+    #[tokio::test]
+    async fn startup_reconciliation_walks_every_page() {
+        let mut first = row_with(PUBLIC_ID, "ephemeral", "running");
+        first.id = 1;
+        let mut second = row_with(PUBLIC_ID, "ephemeral", "running");
+        second.id = 2;
+        let mut third = row_with(PUBLIC_ID, "ephemeral", "running");
+        third.id = 3;
+        let data_root = unique_data_root("reconcile-pages");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![first, second], vec![third]])
+                .into_connection(),
+        );
+        let (service, _registry) =
+            build_service_shared(db.clone(), FakeProvider::new(), data_root.clone());
+
+        let report = service.reconcile_running_vms_paged(2).await;
+        drop(service);
+        drop(_registry);
+        let log = Arc::try_unwrap(db)
+            .expect("nothing holds the database after the service is dropped")
+            .into_transaction_log();
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        assert_eq!(report.checked, 3);
+        assert_eq!(report.alive, 3);
+        let sql = format!("{log:?}");
+        assert_eq!(sql.matches("LIMIT").count(), 2, "one query per page: {sql}");
+        assert!(
+            sql.contains("Int(Some(2))"),
+            "second page starts after the last id of the first: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_running_rows_are_marked_lost() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "stopped");
+        let cause = AgentError::SandboxNotFound {
+            run_id: 7,
+            sandbox: "temps-sandbox-deadbeef01234567".into(),
+        };
+        let (changed, sql) = with_statement_log(
+            "mark-stopped-row",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
+        )
+        .await;
+
+        assert!(!changed);
+        assert!(sql.contains("[]"), "no statement expected: {sql}");
+    }
+
+    #[test]
+    fn startup_reconciliation_only_judges_vmm_backends() {
+        let with_backend = |backend: Option<&str>| sandboxes::Model {
+            backend: backend.map(str::to_string),
+            ..row(PUBLIC_ID, None)
+        };
+        assert!(reconcilable_at_startup(&with_backend(Some("firecracker"))));
+        assert!(reconcilable_at_startup(&with_backend(Some("microsandbox"))));
+        // dockerd may still be restarting these after a reboot.
+        assert!(!reconcilable_at_startup(&with_backend(Some("docker"))));
+        assert!(!reconcilable_at_startup(&with_backend(None)));
+    }
+
+    /// A managed application workspace reports a lost runtime as the derived
+    /// status `recovering`; stopping its row would hide that from its own
+    /// recovery and the data-network reconciliation.
+    #[tokio::test]
+    async fn managed_application_workspaces_are_never_marked_lost() {
+        let row = sandboxes::Model {
+            name: "ai-application:app_example".to_string(),
+            lifecycle: "workspace".to_string(),
+            ..row(PUBLIC_ID, None)
+        };
+        let cause = AgentError::SandboxNotFound {
+            run_id: 7,
+            sandbox: "temps-sandbox-deadbeef01234567".into(),
+        };
+        let (changed, sql) = with_statement_log(
+            "mark-app-workspace",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.mark_vm_lost(&row, &cause, "access").await },
+        )
+        .await;
+
+        assert!(!changed);
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// The "VM not running" error says to run `resume`; for a row that still
+    /// says `running` that must boot the VM, not answer "already running".
+    #[tokio::test]
+    async fn resume_boots_a_running_row_whose_vm_is_down() {
+        let data_root = unique_data_root("resume-dead-running");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // find_by_public_id: the stale row.
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            // mark_vm_lost: conditional running -> stopped update.
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+            // its `vm_lost` event.
+            .append_query_results([vec![destroyed_event()]])
+            // resume: stopped -> running update.
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            // its `resumed` event.
+            .append_query_results([vec![destroyed_event()]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let starts = provider.starts.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let row = service
+            .resume_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect("resume must boot a dead VM behind a running row");
+
+        assert_eq!(row.status, "running");
+        assert_eq!(starts.load(Ordering::SeqCst), 1, "the VM must be started");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_of_a_running_row_with_a_live_vm_stays_a_no_op() {
+        let data_root = unique_data_root("resume-live-running");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let starts = provider.starts.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let row = service
+            .resume_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect("idempotent on a running sandbox");
+
+        assert_eq!(row.status, "running");
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_stops_rows_whose_vm_is_down() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let rows = vec![row_with(PUBLIC_ID, "ephemeral", "running")];
+        let (report, sql) = with_statement_log(
+            "reconcile-dead",
+            [vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]],
+            1,
+            provider,
+            |service| async move { service.reconcile_running_vms(rows).await },
+        )
+        .await;
+
+        assert_eq!(
+            report,
+            VmReconcileReport {
+                checked: 1,
+                alive: 0,
+                marked_stopped: vec![PUBLIC_ID.to_string()],
+                marked_stopped_total: 1,
+                not_marked: 0,
+                unverified: 0,
+            }
+        );
+        assert!(sql.contains("vm_lost"), "{sql}");
+    }
+
+    /// A resume that lands after the probe moves `last_activity_at`; the
+    /// verdict about the old row must not stop the sandbox that came back.
+    #[tokio::test]
+    async fn a_stale_verdict_is_pinned_to_the_activity_timestamp_it_was_read_at() {
+        let row = row_with(PUBLIC_ID, "ephemeral", "running");
+        let cause = AgentError::SandboxNotRunning {
+            run_id: 7,
+            sandbox_id: PUBLIC_ID.into(),
+            container: "temps-sandbox-deadbeef01234567".into(),
+            backend: "firecracker".into(),
+            reason: "its firecracker process exited".into(),
+        };
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let (_, sql) = with_statement_log(
+            "mark-pinned",
+            [Vec::<sandboxes::Model>::new()],
+            0,
+            provider,
+            |service| async move { service.mark_vm_lost(&row, &cause, "startup").await },
+        )
+        .await;
+
+        // The statement log is the Debug form of the transaction, so the
+        // quotes around identifiers are escaped.
+        assert!(sql.contains(r#"last_activity_at\" = $4"#), "{sql}");
+        assert!(sql.contains("ChronoDateTimeUtc"), "{sql}");
+        assert!(sql.contains(r#"String(Some("running"))"#), "{sql}");
+    }
+
+    /// A down VM whose row is not rewritten (here a managed application
+    /// workspace) is counted, so the startup log cannot claim every VM is
+    /// alive.
+    #[tokio::test]
+    async fn startup_reconciliation_counts_down_rows_it_did_not_rewrite() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let mut managed = row_with(PUBLIC_ID, "ephemeral", "running");
+        managed.name = format!("{APPLICATION_WORKSPACE_NAME_PREFIX}app_0123456789abcdef");
+        let (report, sql) = with_statement_log(
+            "reconcile-managed",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            provider,
+            |service| async move { service.reconcile_running_vms(vec![managed]).await },
+        )
+        .await;
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.alive, 0);
+        assert_eq!(report.not_marked, 1);
+        assert!(report.marked_stopped.is_empty());
+        assert!(!report.all_alive());
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// A restart that took down many VMs still yields a small report: every
+    /// row is moved and counted, but only a bounded sample of ids is kept.
+    #[tokio::test]
+    async fn the_startup_report_names_a_bounded_sample_of_ids() {
+        let provider = FakeProvider::new();
+        provider.alive.store(false, Ordering::SeqCst);
+        let total = VM_RECONCILE_REPORTED_IDS + 10;
+        let rows: Vec<sandboxes::Model> = (0..total)
+            .map(|index| {
+                let mut row = row_with(PUBLIC_ID, "ephemeral", "running");
+                row.id = i32::try_from(index).unwrap_or(i32::MAX) + 1;
+                row
+            })
+            .collect();
+        // Each move is an UPDATE then a `vm_lost` event insert, so the mock's
+        // results alternate row, event.
+        let data_root = unique_data_root("reconcile-many");
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres);
+        for _ in 0..total {
+            mock = mock
+                .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+                .append_query_results([vec![destroyed_event()]]);
+        }
+        let (service, _registry) = build_service_shared(
+            Arc::new(mock.into_connection()),
+            provider,
+            data_root.clone(),
+        );
+        let report = service.reconcile_running_vms(rows).await;
+        let _ = std::fs::remove_dir_all(&data_root);
+
+        assert_eq!(report.checked, total);
+        assert_eq!(report.marked_stopped_total, total);
+        assert_eq!(report.marked_stopped.len(), VM_RECONCILE_REPORTED_IDS);
+        assert_eq!(report.not_marked, 0);
+    }
+
+    #[tokio::test]
+    async fn startup_reconciliation_leaves_live_vms_alone() {
+        let rows = vec![row_with(PUBLIC_ID, "ephemeral", "running")];
+        let (report, sql) = with_statement_log(
+            "reconcile-alive",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            FakeProvider::new(),
+            |service| async move { service.reconcile_running_vms(rows).await },
+        )
+        .await;
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.alive, 1);
+        assert!(report.marked_stopped.is_empty());
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// When the liveness check cannot say either way the row stays as it is,
+    /// and the report counts it so the startup log can say so.
+    #[tokio::test]
+    async fn startup_reconciliation_does_not_guess_when_the_check_fails() {
+        let provider = FakeProvider::new();
+        provider.alive_check_fails.store(true, Ordering::SeqCst);
+        let rows = vec![row_with(PUBLIC_ID, "ephemeral", "running")];
+        let (report, sql) = with_statement_log(
+            "reconcile-unknown",
+            Vec::<Vec<sandboxes::Model>>::new(),
+            0,
+            provider,
+            |service| async move { service.reconcile_running_vms(rows).await },
+        )
+        .await;
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.unverified, 1);
+        assert!(report.marked_stopped.is_empty());
+        assert!(!sql.contains("UPDATE"), "{sql}");
+    }
+
+    /// An id with no row at all is still a plain 404: the 409 is only for
+    /// sandboxes that exist.
+    #[tokio::test]
+    async fn an_id_with_no_row_is_still_not_found() {
+        let (result, _) = with_statement_log(
+            "no-row",
+            [Vec::<sandboxes::Model>::new()],
+            0,
+            FakeProvider::new(),
+            |service| async move { service.resolve_id(PUBLIC_ID, 1).await },
+        )
+        .await;
+
+        let err = result.expect_err("no such sandbox");
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(err).status_code,
+            axum::http::StatusCode::NOT_FOUND
+        );
+    }
+
+    /// An ephemeral sandbox the reconciliation stopped tells the caller how
+    /// to continue instead of a bare "stopped".
+    #[tokio::test]
+    async fn a_stopped_ephemeral_sandbox_says_how_to_resume_it() {
+        let (result, _) = with_statement_log(
+            "stopped-hint",
+            [vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]],
+            0,
+            FakeProvider::new(),
+            |service| async move { service.resolve_id(PUBLIC_ID, 1).await },
+        )
+        .await;
+
+        let message = result.expect_err("stopped ephemeral").to_string();
+        assert!(message.contains("stopped"), "{message}");
+        assert!(
+            message.contains(&format!("sandbox resume {PUBLIC_ID}")),
+            "{message}"
+        );
     }
 
     // ── Workspace-from-project (ADR-036 §5) ──────────────────────────────
@@ -8575,6 +9556,7 @@ mod storage_cleanup_tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(3600),

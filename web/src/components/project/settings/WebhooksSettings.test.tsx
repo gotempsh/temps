@@ -68,7 +68,12 @@ test('choosing Delete keeps the confirmation open instead of opening the webhook
     fireEvent.click(await view.findByText('Delete'))
   })
 
-  expect(await view.findByText('Delete webhook?')).toBeTruthy()
+  // The confirmation names the webhook being deleted.
+  expect(
+    await view.findByRole('heading', {
+      name: `Delete webhook ${WEBHOOK.url}?`,
+    })
+  ).toBeTruthy()
   // The card's own click handler (open the webhook) must not have fired.
   expect(view.queryByText('webhook detail page')).toBeNull()
   expect(api.called('DELETE', '/projects/7/webhooks/3')).toBe(false)

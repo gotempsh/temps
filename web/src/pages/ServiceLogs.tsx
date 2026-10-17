@@ -22,6 +22,8 @@ import {
   useLogHistoryInfinite,
 } from '@/hooks/useLogHistory'
 import { serviceLogAvailability } from '@/lib/service-log-availability'
+import { isVerifiedNotFound } from '@/lib/read-failure'
+import { PageState } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
   ArrowLeft,
@@ -35,6 +37,7 @@ import {
 import type { DateRange } from 'react-day-picker'
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Link, useParams } from 'react-router'
+import { useUrlSearchText } from '@temps-sdk/ds'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {
@@ -99,10 +102,18 @@ export function ServiceLogs() {
   const { id } = useParams<{ id: string }>()
   const serviceId = id ? parseInt(id, 10) : NaN
 
-  const { data: service, isLoading: serviceLoading } = useQuery({
+  const {
+    data: service,
+    isLoading: serviceLoading,
+    error: serviceError,
+  } = useQuery({
     ...getServiceOptions({ path: { id: serviceId } }),
     enabled: !Number.isNaN(serviceId),
   })
+  // Only a verified 404 proves the service is gone; the log search is not
+  // sent for it, and the page says so instead of waiting on logs that
+  // cannot exist.
+  const serviceMissing = isVerifiedNotFound(serviceError)
 
   const {
     data: linkedProjects,
@@ -119,7 +130,7 @@ export function ServiceLogs() {
     linkedProjectCount: linkedProjects?.length,
   })
 
-  const [text, setText] = useState('')
+  const [text, setText] = useUrlSearchText('q')
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -182,6 +193,7 @@ export function ServiceLogs() {
       refreshKey,
     },
     !Number.isNaN(serviceId) &&
+      !serviceMissing &&
       startTime !== undefined &&
       logAvailability === 'available'
   )
@@ -271,6 +283,22 @@ export function ServiceLogs() {
         : customRange?.from
           ? `From ${customRange.from.toLocaleDateString()}`
           : 'Custom range'
+
+  if (serviceMissing) {
+    return (
+      <PageState
+        variant="empty"
+        icon={ScrollText}
+        title="Service not found"
+        description={`No storage service has ID ${id ?? ''}, so there are no logs to show. It may have been deleted.`}
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
+      />
+    )
+  }
 
   return (
     <div className="flex-1 overflow-auto">

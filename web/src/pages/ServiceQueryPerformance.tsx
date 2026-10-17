@@ -66,6 +66,7 @@ import {
   ArrowUp,
   ChevronLeft,
   ChevronRight,
+  Database,
   Loader2,
   RefreshCw,
   Trash2,
@@ -73,6 +74,8 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
+import { PageState } from '@temps-sdk/ds'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 
 // ---------------------------------------------------------------------------
@@ -779,7 +782,11 @@ export function ServiceQueryPerformance() {
 
   const [activeSection, setActiveSection] = useState<SectionId>('slow-queries')
 
-  const { data: serviceData, isLoading: serviceLoading } = useQuery({
+  const {
+    data: serviceData,
+    isLoading: serviceLoading,
+    error: serviceError,
+  } = useQuery({
     ...getServiceOptions({ path: { id: serviceId } }),
     enabled: !!serviceId,
   })
@@ -854,6 +861,18 @@ export function ServiceQueryPerformance() {
               <Skeleton className="h-4 w-72" />
               <Skeleton className="h-48 w-full" />
             </div>
+          ) : isVerifiedNotFound(serviceError) ? (
+            <PageState
+              variant="empty"
+              icon={Database}
+              title="Service not found"
+              description={`No storage service has ID ${id ?? ''}, so there is no query performance to show. It may have been deleted.`}
+              action={
+                <Button onClick={() => navigate('/storage')}>
+                  All storage services
+                </Button>
+              }
+            />
           ) : activeSection === 'slow-queries' ? (
             <SlowQueriesContent
               serviceId={serviceId}

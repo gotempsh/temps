@@ -33,6 +33,94 @@ use temps_agents::sandbox::{
     user::SANDBOX_CHOWN, RuntimeCompatibility, SandboxCreateConfig, SandboxHandle, SandboxProvider,
 };
 
+/// Outcome of [`StandaloneSandboxRegistry::probe`].
+#[derive(Debug)]
+pub enum VmProbe {
+    /// The VM answered its liveness check.
+    Alive(SandboxHandle),
+    /// The provider answered and the VM is not running, or it has no trace of
+    /// it (`SandboxNotRunning` / `SandboxNotFound`).
+    Down(AgentError),
+    /// The check itself failed (provider or node error): the VM may or may not
+    /// be running.
+    Unknown(AgentError),
+}
+
+/// Why a down VM is down, as far as the backend lets us say. Firecracker and
+/// microsandbox VMMs are children of the Temps service, so a restart that kills
+/// the service's whole control group (systemd's default) or a host reboot takes
+/// them down; Docker containers and local processes are not, so that guess
+/// would be wrong for them.
+fn not_running_reason(backend: temps_agents::sandbox::SandboxBackend) -> String {
+    use temps_agents::sandbox::SandboxBackend;
+    match backend {
+        SandboxBackend::Firecracker | SandboxBackend::Microsandbox => format!(
+            "its {backend} VM process exited or was stopped (for example when the Temps service \
+             restarted or the host rebooted)"
+        ),
+        SandboxBackend::Docker => "its container is stopped".to_string(),
+        SandboxBackend::Local => "its process is not running".to_string(),
+    }
+}
+
+/// Which sandboxes the control plane is deliberately taking down right now
+/// (snapshot capture, restart, disk resize).
+///
+/// A planned stop makes the VM look exactly like a lost one to a concurrent
+/// request, and the row still says `running` while it lasts. Whoever wants to
+/// conclude "the VM is lost" must hold a shared claim, which cannot be taken
+/// while a planned stop is in flight and keeps one from starting until the
+/// conclusion is written. Entries exist only while somebody holds or awaits a
+/// claim, so the map is bounded by the operations in flight.
+#[derive(Default)]
+struct PlannedDowntime {
+    locks: std::sync::Mutex<HashMap<i32, Arc<RwLock<()>>>>,
+}
+
+impl PlannedDowntime {
+    fn lock_for(&self, id: i32) -> Arc<RwLock<()>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks.entry(id).or_default().clone()
+    }
+
+    /// Drop the entry once nobody else references it. Called after the
+    /// caller's own guard (and so its `Arc` clone) is gone.
+    fn release(&self, id: i32) {
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks.get(&id).is_some_and(|l| Arc::strong_count(l) == 1) {
+            locks.remove(&id);
+        }
+    }
+}
+
+/// The lock guards are held only for their `Drop`.
+#[allow(dead_code)]
+enum Claim {
+    Planned(tokio::sync::OwnedRwLockWriteGuard<()>),
+    Observing(tokio::sync::OwnedRwLockReadGuard<()>),
+}
+
+/// Held for the whole of a planned stop-and-start of one sandbox. Dropping it
+/// ends the planned downtime.
+#[must_use = "the planned downtime ends when this guard is dropped"]
+pub struct PlannedDowntimeGuard {
+    claim: Option<Claim>,
+    owner: Arc<PlannedDowntime>,
+    id: i32,
+}
+
+/// Proof that no planned stop of the sandbox is running, and none can start
+/// while it is held. See [`StandaloneSandboxRegistry::observe_unplanned`].
+#[must_use = "the claim is released when this guard is dropped"]
+pub struct UnplannedDowntimeClaim(#[allow(dead_code)] PlannedDowntimeGuard);
+
+impl Drop for PlannedDowntimeGuard {
+    fn drop(&mut self) {
+        self.claim.take();
+        self.owner.release(self.id);
+    }
+}
+
 pub struct StandaloneSandboxRegistry {
     provider: Arc<dyn SandboxProvider>,
     handles: RwLock<HashMap<i32, SandboxHandle>>,
@@ -46,6 +134,9 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// Stop-then-start operations the control plane itself performs. See
+    /// [`PlannedDowntime`].
+    planned_downtime: Arc<PlannedDowntime>,
     /// Finds the node hosting a sandbox (ADR-048) when its handle has to be
     /// recovered by name. Required: without it a worker sandbox would be
     /// looked for on the control plane and silently reported missing.
@@ -96,6 +187,7 @@ impl StandaloneSandboxRegistry {
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            planned_downtime: Arc::new(PlannedDowntime::default()),
             nodes,
         }
     }
@@ -327,9 +419,10 @@ impl StandaloneSandboxRegistry {
     }
 
     /// Look up an existing handle for use by exec/read/write. Verifies
-    /// liveness — returns `SandboxNotFound` if the container exists but
-    /// is stopped, because non-lifecycle operations need a running
-    /// sandbox. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
+    /// liveness — returns `SandboxNotRunning` (naming the backend and why)
+    /// if the VM or container is known but stopped, because non-lifecycle
+    /// operations need a running sandbox. `SandboxNotFound` is only for a
+    /// provider that has no trace of it at all. Lifecycle operations (`start`/`stop`/`restart`/`destroy`)
     /// use `get_or_recover` directly instead. A liveness check that fails
     /// outright is handled by [`Self::liveness_failure`]: `SandboxNotFound`
     /// for a local sandbox, the provider's error for a worker sandbox.
@@ -338,17 +431,56 @@ impl StandaloneSandboxRegistry {
     /// derives the container label from it so recovery after a server
     /// restart finds the container by name.
     pub async fn get(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
-        let handle = self.get_or_recover(id, public_id).await?;
+        match self.probe(id, public_id).await {
+            VmProbe::Alive(handle) => Ok(handle),
+            VmProbe::Down(error) | VmProbe::Unknown(error) => Err(error),
+        }
+    }
+
+    /// [`Self::get`] that also says whether the error proves the VM is gone.
+    /// Callers that act on that (reconciling a row to `stopped`) must not act
+    /// on [`VmProbe::Unknown`]: a liveness check that errors, or a worker that
+    /// cannot be reached, says nothing about whether the VM is running.
+    pub async fn probe(&self, id: i32, public_id: &str) -> VmProbe {
+        let handle = match self.get_or_recover(id, public_id).await {
+            Ok(handle) => handle,
+            // The control-plane provider answered and has no trace of the VM.
+            // A worker's "not found" is a reply over the network from a node
+            // that may be misrouted or mid-restart, so it is not proof.
+            Err(error @ AgentError::SandboxNotFound { .. }) => {
+                return match self.node_of(id).await {
+                    Ok(None) => VmProbe::Down(error),
+                    Ok(Some(_)) | Err(_) => VmProbe::Unknown(error),
+                };
+            }
+            Err(error) => return VmProbe::Unknown(error),
+        };
         match self.provider.is_alive(&handle).await {
-            Ok(true) => Ok(handle),
-            Ok(false) => Err(AgentError::SandboxNotFound {
-                run_id: id,
-                sandbox: format!(
-                    "{} (container {} is not running)",
-                    public_id, handle.sandbox_name
-                ),
-            }),
-            Err(error) => Err(Self::liveness_failure(id, public_id, &handle, error)),
+            Ok(true) => VmProbe::Alive(handle),
+            Ok(false) => VmProbe::Down(Self::not_running(id, public_id, &handle)),
+            Err(error) => VmProbe::Unknown(Self::liveness_failure(id, public_id, &handle, error)),
+        }
+    }
+
+    /// The provider answered the liveness check and the VM is down.
+    /// Typical causes: the Temps service was restarted (a systemd unit that
+    /// kills its whole control group takes Firecracker/microsandbox VMs with
+    /// it), the host rebooted, or the VMM crashed or was OOM-killed.
+    fn not_running(id: i32, public_id: &str, handle: &SandboxHandle) -> AgentError {
+        tracing::warn!(
+            sandbox_id = public_id,
+            internal_id = id,
+            backend = %handle.backend,
+            node_id = ?handle.node_id,
+            container = %handle.sandbox_name,
+            "Sandbox VM is not running"
+        );
+        AgentError::SandboxNotRunning {
+            run_id: id,
+            sandbox_id: public_id.to_string(),
+            container: handle.sandbox_name.clone(),
+            backend: handle.backend.to_string(),
+            reason: not_running_reason(handle.backend),
         }
     }
 
@@ -412,9 +544,36 @@ impl StandaloneSandboxRegistry {
         let handle = match self.get_or_recover(id, public_id).await {
             Ok(h) => h,
             Err(AgentError::SandboxNotFound { .. }) => {
-                // Nothing to remove — treat as already destroyed. The
+                // No container to remove — treat as already destroyed. The
                 // caller will still transition the DB row to "destroyed".
+                //
+                // The container being gone does not mean everything is: a
+                // failed create or a manual `docker rm` leaves the isolated
+                // network (and the subnet it pins) behind, and `provider
+                // .destroy` is never reached without a handle. Release those
+                // here so deleting the sandbox always frees its network.
                 self.handles.write().await.remove(&id);
+                self.recovered_in_this_generation.write().await.remove(&id);
+                match self.node_of(id).await {
+                    Ok(node_id) => {
+                        if let Err(error) = self
+                            .provider
+                            .release_orphaned_resources_on(node_id, Self::label_for(public_id))
+                            .await
+                        {
+                            tracing::warn!(
+                                sandbox_id = %public_id,
+                                internal_id = id,
+                                "Failed to release leftover resources of removed sandbox: {error}"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        sandbox_id = %public_id,
+                        internal_id = id,
+                        "Could not resolve the node of removed sandbox to release its leftover resources: {error}"
+                    ),
+                }
                 return Ok(());
             }
             Err(e) => return Err(e),
@@ -459,8 +618,49 @@ impl StandaloneSandboxRegistry {
     /// Restart a container (stop + start) preserving its filesystem.
     /// Same post-restart recovery as `start`/`stop`.
     pub async fn restart(&self, id: i32, public_id: &str) -> Result<(), AgentError> {
+        let _planned = self.begin_planned_downtime(id).await;
         let handle = self.get_or_recover(id, public_id).await?;
         self.provider.restart(&handle).await
+    }
+
+    /// Mark the sandbox as being taken down on purpose until the returned
+    /// guard is dropped. Waits for any other planned stop or pending
+    /// conclusion about the sandbox. Callers that stop and start a VM without
+    /// going through [`Self::restart`] / [`Self::resize_disk`] (snapshot
+    /// capture) hold this around the whole stop-to-start window.
+    pub async fn begin_planned_downtime(&self, id: i32) -> PlannedDowntimeGuard {
+        // The guard exists before the wait so that a caller dropped while
+        // queued (client disconnect, timeout) still runs `release` and does
+        // not leave an idle entry in the map. It is declared before the lock
+        // handle, so the handle's clone is gone by the time `release` counts.
+        let mut guard = PlannedDowntimeGuard {
+            claim: None,
+            owner: self.planned_downtime.clone(),
+            id,
+        };
+        let lock = self.planned_downtime.lock_for(id);
+        guard.claim = Some(Claim::Planned(lock.write_owned().await));
+        guard
+    }
+
+    /// Claim the right to conclude that a sandbox's VM was lost. `None` while
+    /// a planned stop of that sandbox is in flight: its VM being down says
+    /// nothing, and the operation will start it again. While the claim is
+    /// held no planned stop can begin, so a liveness check made after taking
+    /// it describes a VM nobody is about to stop.
+    pub fn observe_unplanned(&self, id: i32) -> Option<UnplannedDowntimeClaim> {
+        let claim = self.planned_downtime.lock_for(id).try_read_owned();
+        match claim {
+            Ok(claim) => Some(UnplannedDowntimeClaim(PlannedDowntimeGuard {
+                claim: Some(Claim::Observing(claim)),
+                owner: self.planned_downtime.clone(),
+                id,
+            })),
+            Err(_) => {
+                self.planned_downtime.release(id);
+                None
+            }
+        }
     }
 
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
@@ -470,6 +670,7 @@ impl StandaloneSandboxRegistry {
         public_id: &str,
         new_size_mb: u64,
     ) -> Result<(), AgentError> {
+        let _planned = self.begin_planned_downtime(id).await;
         let handle = self.get_or_recover(id, public_id).await?;
         self.provider.resize_disk(&handle, new_size_mb).await
     }
@@ -637,6 +838,10 @@ mod tests {
         liveness: Liveness,
         /// Node each `recover_by_name_on` call was routed to.
         recovered_on: std::sync::Mutex<Vec<Option<i32>>>,
+        /// `(node, container name)` of every `release_orphaned_resources_on`.
+        released: std::sync::Mutex<Vec<(Option<i32>, String)>>,
+        /// Whether releasing leftovers fails, like a daemon that is down.
+        release_fails: bool,
     }
 
     impl FakeProvider {
@@ -655,6 +860,8 @@ mod tests {
                 recovery_delay: Duration::ZERO,
                 liveness: Liveness::Running,
                 recovered_on: std::sync::Mutex::new(Vec::new()),
+                released: std::sync::Mutex::new(Vec::new()),
+                release_fails: false,
             }
         }
 
@@ -873,6 +1080,24 @@ mod tests {
             }))
         }
 
+        async fn release_orphaned_resources_on(
+            &self,
+            node_id: Option<i32>,
+            container_name: &str,
+        ) -> Result<(), AgentError> {
+            self.released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((node_id, container_name.to_string()));
+            if self.release_fails {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "fake".into(),
+                    reason: "daemon unreachable".into(),
+                });
+            }
+            Ok(())
+        }
+
         async fn recover_by_name_on(
             &self,
             node_id: Option<i32>,
@@ -1023,8 +1248,12 @@ mod tests {
         }
     }
 
+    /// A VM that is known to the provider but not running (the state a
+    /// Firecracker or microsandbox sandbox is in after the Temps service
+    /// restarted and took the VMM with it) is "not running", not "not found":
+    /// the caller must be able to tell the user the sandbox exists.
     #[tokio::test]
-    async fn get_reports_stopped_container_as_missing_sandbox() {
+    async fn get_reports_stopped_container_as_not_running_with_backend_and_ids() {
         let provider = Arc::new(
             FakeProvider::new()
                 .with_known("abc123")
@@ -1033,10 +1262,132 @@ mod tests {
         let reg = StandaloneSandboxRegistry::local_only(provider);
 
         let err = reg.get(42, "sbx_abc123").await.unwrap_err();
+        match err {
+            AgentError::SandboxNotRunning {
+                run_id,
+                sandbox_id,
+                container,
+                backend,
+                reason,
+            } => {
+                assert_eq!(run_id, 42);
+                assert_eq!(sandbox_id, "sbx_abc123");
+                assert_eq!(container, "temps-sandbox-abc123");
+                assert_eq!(backend, "docker");
+                assert_eq!(reason, "its container is stopped");
+            }
+            other => panic!("expected SandboxNotRunning, got {other:?}"),
+        }
+    }
+
+    /// No trace of the sandbox at the provider (never created, or its files
+    /// were deleted) stays `SandboxNotFound`: there is no VM to describe.
+    #[tokio::test]
+    async fn get_still_reports_an_unknown_container_as_not_found() {
+        let provider = Arc::new(FakeProvider::new()); // No known containers.
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+
+        let err = reg.get(42, "sbx_abc123").await.unwrap_err();
         assert!(
             matches!(err, AgentError::SandboxNotFound { run_id: 42, .. }),
             "{err:?}"
         );
+    }
+
+    /// The control-plane provider having no trace of a VM is proof it is gone;
+    /// a worker saying so over the network is not, so it must not be used to
+    /// rewrite the row.
+    #[tokio::test]
+    async fn probe_trusts_a_local_not_found_but_not_a_workers() {
+        let local = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+        assert!(
+            matches!(
+                local.probe(42, "sbx_abc123").await,
+                VmProbe::Down(AgentError::SandboxNotFound { .. })
+            ),
+            "a local provider without the VM proves it is gone"
+        );
+
+        let worker = StandaloneSandboxRegistry::new(
+            Arc::new(FakeProvider::new()),
+            Arc::new(FixedNode(Ok(Some(2)))),
+        );
+        assert!(
+            matches!(
+                worker.probe(42, "sbx_abc123").await,
+                VmProbe::Unknown(AgentError::SandboxNotFound { .. })
+            ),
+            "a worker's not-found is not proof"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conclusion_about_a_lost_vm_waits_out_a_planned_stop() {
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+
+        let planned = reg.begin_planned_downtime(7).await;
+        assert!(reg.observe_unplanned(7).is_none());
+        // Other sandboxes are unaffected.
+        assert!(reg.observe_unplanned(8).is_some());
+        drop(planned);
+
+        let claim = reg.observe_unplanned(7).expect("planned stop is over");
+        // While the claim is held a planned stop waits for it.
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(50), reg.begin_planned_downtime(7));
+        assert!(waiting.await.is_err(), "the planned stop must wait");
+        drop(claim);
+        let _ = reg.begin_planned_downtime(7).await;
+    }
+
+    /// A request that gives up while queued behind a planned stop must not
+    /// leave its lock entry behind, even when the stop it queued behind has
+    /// already finished (so nothing else is left to tidy the map).
+    #[tokio::test]
+    async fn a_cancelled_wait_for_a_planned_stop_leaves_no_entry() {
+        use futures::FutureExt;
+
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+
+        let held = reg.begin_planned_downtime(7).await;
+        let mut waiting = Box::pin(reg.begin_planned_downtime(7));
+        assert!(
+            (&mut waiting).now_or_never().is_none(),
+            "the wait must be queued behind the held stop"
+        );
+        drop(held);
+        drop(waiting);
+
+        let locks = reg.planned_downtime.locks.lock().expect("lock map");
+        assert!(locks.is_empty(), "{} stale entries", locks.len());
+    }
+
+    #[tokio::test]
+    async fn planned_downtime_entries_do_not_accumulate() {
+        let reg = StandaloneSandboxRegistry::local_only(Arc::new(FakeProvider::new()));
+        for id in 0..50 {
+            drop(reg.begin_planned_downtime(id).await);
+            drop(reg.observe_unplanned(id));
+        }
+        let held = reg.begin_planned_downtime(99).await;
+        assert!(reg.observe_unplanned(99).is_none());
+        drop(held);
+        let locks = reg.planned_downtime.locks.lock().expect("lock map");
+        assert!(locks.is_empty(), "{} stale entries", locks.len());
+    }
+
+    #[tokio::test]
+    async fn probe_does_not_treat_a_failed_liveness_check_as_proof() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_liveness(Liveness::CheckFails),
+        );
+        let reg = StandaloneSandboxRegistry::local_only(provider);
+        assert!(matches!(
+            reg.probe(42, "sbx_abc123").await,
+            VmProbe::Unknown(_)
+        ));
     }
 
     #[tokio::test]
@@ -1148,6 +1499,84 @@ mod tests {
             0,
             "nothing to destroy at the provider layer"
         );
+    }
+
+    /// A sandbox whose container is already gone can still own an isolated
+    /// network, which pins a subnet from the daemon's address pool. Deleting
+    /// it must release that on the node the row names, using the container
+    /// label, even though `provider.destroy` has no handle to run with.
+    #[tokio::test]
+    async fn destroy_of_a_missing_container_releases_its_leftover_network() {
+        let provider = Arc::new(FakeProvider::new());
+        let reg =
+            StandaloneSandboxRegistry::new(provider.clone(), Arc::new(FixedNode(Ok(Some(7)))));
+
+        reg.destroy(42, "sbx_abc123")
+            .await
+            .expect("destroy is idempotent");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            *provider.released.lock().expect("released"),
+            vec![(Some(7), "abc123".to_string())]
+        );
+    }
+
+    /// Failing to release leftovers must not turn an already-gone sandbox
+    /// into a failed delete: the caller still has to mark the row destroyed.
+    #[tokio::test]
+    async fn destroy_of_a_missing_container_survives_a_failed_release() {
+        let mut fake = FakeProvider::new();
+        fake.release_fails = true;
+        let provider = Arc::new(fake);
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+
+        reg.destroy(42, "sbx_abc123")
+            .await
+            .expect("a failed release does not fail the destroy");
+
+        assert_eq!(provider.released.lock().expect("released").len(), 1);
+    }
+
+    /// A live container is torn down through `provider.destroy`, which owns
+    /// removing its network; the orphan path must not run as well.
+    #[tokio::test]
+    async fn destroy_of_a_live_container_does_not_use_the_orphan_path() {
+        let provider = Arc::new(FakeProvider::new().with_known("abc123"));
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+
+        reg.destroy(42, "sbx_abc123").await.expect("destroy");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(provider.released.lock().expect("released").is_empty());
+    }
+
+    /// A cached handle whose container was removed behind the registry's
+    /// back still goes through `provider.destroy`, which owns removing the
+    /// sandbox's network and proxy (the worker does so even when the
+    /// container is already absent). The registry must drop its entry and
+    /// not double-release through the orphan path.
+    #[tokio::test]
+    async fn destroy_with_a_stale_cached_handle_goes_through_the_provider() {
+        let provider = Arc::new(FakeProvider::new()); // The container is not known.
+        let reg = StandaloneSandboxRegistry::local_only(provider.clone());
+        reg.handles.write().await.insert(
+            42,
+            SandboxHandle {
+                node_id: None,
+                sandbox_id: "stale-docker-id".to_string(),
+                sandbox_name: "temps-sandbox-abc123".to_string(),
+                work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
+            },
+        );
+
+        reg.destroy(42, "sbx_abc123").await.expect("destroy");
+
+        assert_eq!(provider.destroys.load(Ordering::SeqCst), 1);
+        assert!(provider.released.lock().expect("released").is_empty());
+        assert!(!reg.handles.read().await.contains_key(&42));
     }
 
     /// Warm-path check: when the handle IS in the map, lifecycle ops use
@@ -1342,6 +1771,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1374,6 +1804,7 @@ mod tests {
             memory_limit_mb: None,
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

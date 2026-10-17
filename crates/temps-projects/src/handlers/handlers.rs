@@ -1719,38 +1719,33 @@ pub async fn set_alternate_sources(
     Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
 }
 
-#[utoipa::path(
-    delete,
-    path = "/projects/{id}",
-    tag = "Projects",
-    params(
-        ("id" = i32, Path, description = "Project ID")
-    ),
-    responses(
-        (status = 204, description = "Project deleted successfully"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "Project not found"),
-        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
-        (status = 500, description = "Internal server error")
-    ),
-    security(
-        ("bearer_auth" = [])
-    )
-)]
-pub async fn delete_project(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i32>,
-    RequireAuth(auth): RequireAuth,
-    Extension(metadata): Extension<RequestMetadata>,
-) -> Result<impl IntoResponse, Problem> {
-    project_permission_guard!(auth, ProjectsDelete, id, state.project_access_checker);
-    project_scope_guard!(auth, id);
-
-    // Get project details before deletion
-    let project = state.project_service.get_project(id).await?;
-
-    state.project_service.begin_project_deletion(id).await?;
+/// Tear a project down: fence it, stop everything serving for it, release its
+/// resources and finally remove its rows.
+///
+/// Runs on a spawned task (see [`delete_project`]) so a client disconnect
+/// cannot abort it between steps. Every step is safe to retry, so a failure
+/// leaves the project fenced and a repeated `DELETE` finishes the job.
+async fn run_project_teardown(
+    state: Arc<AppState>,
+    id: i32,
+    project: crate::services::types::Project,
+    audit_context: AuditContext,
+) -> Result<(), Problem> {
+    // Failures are logged here, inside the task: after a client disconnect
+    // nobody awaits this result, so an unlogged error would leave the project
+    // fenced with no trace of why the cleanup stopped.
+    state
+        .project_service
+        .begin_project_deletion(id)
+        .await
+        .map_err(|error| {
+            warn!(
+                project_id = id,
+                %error,
+                "Project deletion did not start; project was not fenced"
+            );
+            Problem::from(error)
+        })?;
 
     // Stop serving anything public for this project now: if cleanup below
     // fails, the project stays fenced but `ProjectDeleted` is never emitted.
@@ -1798,14 +1793,18 @@ pub async fn delete_project(
     state
         .project_service
         .delete_project(id, &project.name)
-        .await?;
+        .await
+        .map_err(|error| {
+            error!(
+                project_id = id,
+                project_name = %project.name,
+                %error,
+                "Failed to delete project rows; project stays fenced, retry the delete to finish it"
+            );
+            Problem::from(error)
+        })?;
 
-    // Create audit event
-    let audit_context = AuditContext {
-        user_id: auth.user_id(),
-        ip_address: Some(metadata.ip_address.to_string()),
-        user_agent: metadata.user_agent,
-    };
+    info!(project_id = id, project_name = %project.name, "Project deleted");
 
     let audit_event = ProjectDeletedAudit {
         context: audit_context,
@@ -1817,6 +1816,73 @@ pub async fn delete_project(
     if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
         error!("Failed to create audit log: {:?}", e);
         // Continue with the operation even if audit logging fails
+    }
+
+    Ok(())
+}
+
+#[utoipa::path(
+    delete,
+    path = "/projects/{id}",
+    tag = "Projects",
+    params(
+        ("id" = i32, Path, description = "Project ID")
+    ),
+    responses(
+        (status = 204, description = "Project deleted successfully"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 409, description = "Project still has CDN delivery bindings; remove them first"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn delete_project(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    project_permission_guard!(auth, ProjectsDelete, id, state.project_access_checker);
+    project_scope_guard!(auth, id);
+
+    // Get project details before deletion
+    let project = state.project_service.get_project(id).await?;
+
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.to_string()),
+        user_agent: metadata.user_agent,
+    };
+
+    // The teardown is a multi-step sequence (fence, cancel deployments, remove
+    // containers, remove archives, delete rows) that must not stop half-way.
+    // Axum drops the handler future when the client disconnects, which would
+    // leave the project fenced (`is_deleted = true`) but still listed and
+    // serving. Run it on its own task so it always completes; the handler only
+    // awaits the result. Dropping the `JoinHandle` detaches the task rather
+    // than cancelling it.
+    let teardown = tokio::spawn(run_project_teardown(
+        state.clone(),
+        id,
+        project,
+        audit_context,
+    ));
+
+    match teardown.await {
+        Ok(result) => result?,
+        Err(join_error) => {
+            error!(project_id = id, %join_error, "Project deletion task failed");
+            return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deletion Failed")
+                .with_detail(format!(
+                    "Project {id} deletion task did not complete: {join_error}. \
+                     The project may be partially deleted; retry the delete to finish it."
+                )));
+        }
     }
 
     Ok(StatusCode::NO_CONTENT.into_response())
@@ -5058,5 +5124,58 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "mutual exclusion must produce 400 Bad Request"
         );
+    }
+
+    /// A client disconnect drops the handler future between teardown steps and
+    /// leaves the project fenced but still listed and serving. The handler must
+    /// therefore hand the whole sequence to a spawned task and only await it.
+    #[test]
+    fn delete_project_runs_teardown_on_a_detached_task() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("pub async fn delete_project(")
+            .expect("delete_project handler exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("/// Update project settings")
+            .expect("end of delete_project handler");
+        let handler = &tail[..end];
+
+        assert!(
+            handler.contains("tokio::spawn(run_project_teardown("),
+            "teardown must run on a spawned task so a client disconnect cannot abort it"
+        );
+        for step in [
+            "begin_project_deletion",
+            "cancel_all_project_deployments",
+            "cleanup_project_containers",
+            "cleanup_project_archives",
+            ".delete_project(",
+        ] {
+            assert!(
+                !handler.contains(step),
+                "`{step}` must run inside run_project_teardown, not in the request future"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn spawned_task_survives_the_awaiting_future_being_dropped() {
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = done_tx.send(());
+        });
+
+        // Dropping the awaiting future is what a disconnect does to a handler.
+        let waiter = tokio::spawn(async move {
+            let _ = task.await;
+        });
+        waiter.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), done_rx)
+            .await
+            .expect("spawned work must finish")
+            .expect("spawned work must signal completion");
     }
 }

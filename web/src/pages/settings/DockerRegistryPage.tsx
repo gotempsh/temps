@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Button } from '@/components/ui/button'
 import { DockerRegistrySettings } from '@/components/settings/DockerRegistrySettings'
 import { RegistryMirrorSettings } from '@/components/settings/RegistryMirrorSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, Loader2, Save } from 'lucide-react'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { Loader2, Save } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -27,7 +28,7 @@ interface DockerRegistryFormData {
 
 export function DockerRegistryPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -102,11 +103,10 @@ export function DockerRegistryPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 

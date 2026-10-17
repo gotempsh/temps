@@ -24,6 +24,8 @@ export function MaskedValue({ value, className = '' }: MaskedValueProps) {
         variant="ghost"
         size="icon"
         className="h-7 w-7 flex-shrink-0"
+        aria-label={isVisible ? 'Hide value' : 'Show value'}
+        aria-pressed={isVisible}
         onClick={() => setIsVisible(!isVisible)}
       >
         {isVisible ? (

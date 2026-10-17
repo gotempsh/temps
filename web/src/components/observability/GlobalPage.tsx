@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -24,7 +25,7 @@ import {
   OBSERVABILITY_PAGE_SIZE,
   observationError,
 } from '@/lib/global-observability'
-import { RefreshCw, Search, X } from 'lucide-react'
+import { Inbox, RefreshCw, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
 import { useUrlBoundText } from '@temps-sdk/ds'
 
@@ -223,15 +224,18 @@ export function QueryContent({
     )
   if (empty)
     return (
-      <div className="rounded-lg border border-dashed p-8 text-center">
-        <h2 className="font-medium">No {title.toLowerCase()} in this view</h2>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Choose another service or time range, or clear your search. If you
-          have not sent data yet, open a service to configure collection.
-        </p>
-        <Button asChild variant="outline" className="mt-4">
-          <Link to="/projects">Open projects</Link>
-        </Button>
+      <div className="rounded-lg border bg-card text-card-foreground">
+        <EmptyState
+          size="compact"
+          icon={Inbox}
+          title={`No ${title.toLowerCase()} in this view`}
+          description="Choose another service or time range, or clear your search. If you have not sent data yet, open a service to configure collection."
+          action={
+            <Button asChild variant="outline">
+              <Link to="/projects">Open projects</Link>
+            </Button>
+          }
+        />
       </div>
     )
   return <>{children}</>

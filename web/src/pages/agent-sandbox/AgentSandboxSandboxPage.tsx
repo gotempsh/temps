@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { toast } from 'sonner'
@@ -28,7 +30,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { NumberInput } from '@/components/ui/number-input'
 import { Label } from '@/components/ui/label'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import {
   CPU_LIMIT_RANGE,
   MEMORY_LIMIT_RANGE,
@@ -123,7 +125,7 @@ function getResourcePresetLabel(cpu: number, memory: number): string {
 
 export function AgentSandboxSandboxPage() {
   usePageTitle('Sandbox Configuration')
-  const { data: settings, isLoading } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const [runtime, setRuntime] = useState('node')
@@ -302,6 +304,15 @@ export function AgentSandboxSandboxPage() {
     )
   }
 
+  if (error) {
+    return (
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
+    )
+  }
+
   return (
     <>
       {/* Bottom padding leaves room for the sticky save bar so its drop
@@ -328,11 +339,15 @@ export function AgentSandboxSandboxPage() {
                   size="sm"
                   onClick={() => void fetchSandboxStatus()}
                   disabled={statusLoading}
+                  aria-label="Refresh Docker status"
                 >
                   {statusLoading ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Loader2
+                      className="h-3.5 w-3.5 animate-spin"
+                      aria-hidden="true"
+                    />
                   ) : (
-                    <RefreshCw className="h-3.5 w-3.5" />
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden="true" />
                   )}
                 </Button>
               </div>

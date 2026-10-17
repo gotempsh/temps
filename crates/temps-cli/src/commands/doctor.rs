@@ -1238,7 +1238,7 @@ fn initial_admin_result(users: Option<i64>) -> CheckResult {
 /// Resolve the default installation layout without overriding an explicit
 /// `--data-dir` or `TEMPS_DATA_DIR`. Current installs use `~/.temps`, while
 /// older deployment scripts placed runtime secrets in `~/.temps/data`.
-fn default_data_dir(home: &Path) -> PathBuf {
+pub(super) fn default_data_dir(home: &Path) -> PathBuf {
     let root = home.join(".temps");
     let nested = root.join("data");
     let root_has_runtime_files =
@@ -1251,6 +1251,22 @@ fn default_data_dir(home: &Path) -> PathBuf {
     } else {
         root
     }
+}
+
+/// Other candidate data directories (`~/.temps` and the nested
+/// `~/.temps/data`) that already hold `marker` — a path relative to a data
+/// directory, such as `microsandbox/bin/msb` — excluding `data_dir` itself.
+///
+/// `temps microsandbox setup` / `temps firecracker setup` run from a shell
+/// have no `TEMPS_DATA_DIR`, so they can install into a directory the server
+/// never reads. A hit here is the signature of that mistake.
+pub(super) fn other_data_dirs_with(data_dir: &Path, home: &Path, marker: &Path) -> Vec<PathBuf> {
+    let root = home.join(".temps");
+    [root.clone(), root.join("data")]
+        .into_iter()
+        .filter(|candidate| candidate != data_dir)
+        .filter(|candidate| candidate.join(marker).is_file())
+        .collect()
 }
 
 /// Read the geolocation section of the singleton settings row.
@@ -1593,6 +1609,24 @@ mod tests {
             .expect("write nested auth secret");
 
         assert_eq!(default_data_dir(home.path()), nested);
+    }
+
+    #[test]
+    fn other_data_dirs_with_names_the_sibling_install_only() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".temps");
+        let nested = root.join("data");
+        let marker = Path::new("firecracker/state.json");
+        std::fs::create_dir_all(root.join("firecracker")).unwrap();
+        std::fs::write(root.join(marker), b"{}").unwrap();
+
+        // Provisioned under the root only: setting up the nested dir must
+        // point at the root, and setting up the root must report nothing.
+        assert_eq!(
+            other_data_dirs_with(&nested, home.path(), marker),
+            vec![root.clone()]
+        );
+        assert!(other_data_dirs_with(&root, home.path(), marker).is_empty());
     }
 
     #[test]

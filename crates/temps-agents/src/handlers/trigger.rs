@@ -856,6 +856,7 @@ pub async fn smoke_test_agent(
             memory_limit_mb: Some(512),
             pids_limit: None,
             disk_size_mb: None,
+            allow_docker: false,
             // Use the default egress-filtered bridge network (same as production
             // sandboxes).  The old "host" override was a security hole: it gave
             // the smoke-test container unrestricted access to all host-network

@@ -28,16 +28,7 @@ import {
   updateProjectGroupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectGroupResponse } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import {
   Form,
@@ -140,6 +131,16 @@ export function GroupSettingsPanel({
       group={group}
     />
   )
+
+  const deleteConsequences = `${
+    group.projects.length > 0
+      ? `Its ${serviceCount(group.projects.length)} keep running and become standalone. `
+      : ''
+  }${
+    varCount > 0
+      ? `Its ${varCount} shared ${varCount === 1 ? 'variable is' : 'variables are'} deleted, and services stop receiving ${varCount === 1 ? 'it' : 'them'} on their next deployment.`
+      : 'It has no shared variables.'
+  }`
 
   const deletion = (
     <div className="space-y-3">
@@ -252,53 +253,30 @@ export function GroupSettingsPanel({
         </div>
       </div>
 
-      <AlertDialog
-        open={Boolean(removing)}
-        onOpenChange={(open) => !open && setRemoving(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Remove {removing?.name} from {group.name}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              It becomes a standalone service and stops receiving this
-              project&apos;s shared variables on its next deployment.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void removeService()}>
-              Remove from project
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={removing !== null}
+        onOpenChange={(open) => {
+          if (!open) setRemoving(null)
+        }}
+        resourceType="service"
+        resourceName={removing?.name ?? ''}
+        verb="Remove"
+        confirmLabel="Remove from project"
+        consequences={`It leaves ${group.name}, becomes a standalone service and stops receiving this project's shared variables on its next deployment.`}
+        irreversible={false}
+        isPending={remove.isPending}
+        onConfirm={() => void removeService()}
+      />
 
-      <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete project “{group.name}”?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {group.projects.length > 0
-                ? `Its ${serviceCount(group.projects.length)} keep running and become standalone. `
-                : ''}
-              {varCount > 0
-                ? `Its ${varCount} shared ${varCount === 1 ? 'variable is' : 'variables are'} deleted, and services stop receiving ${varCount === 1 ? 'it' : 'them'} on their next deployment.`
-                : 'It has no shared variables.'}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={() => void deleteGroup()}
-            >
-              Delete project
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        resourceType="project"
+        resourceName={group.name}
+        consequences={deleteConsequences}
+        isPending={destroy.isPending}
+        onConfirm={() => void deleteGroup()}
+      />
     </SectionNavLayout>
   )
 }

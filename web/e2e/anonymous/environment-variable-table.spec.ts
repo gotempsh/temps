@@ -499,7 +499,11 @@ for (const width of [1440, 390]) {
       fullPage: true,
     })
     await dialog.getByRole('button', { name: 'Delete', exact: true }).click()
-    await dialog.getByRole('button', { name: 'Confirm delete' }).click()
+    // The confirmation is an alert dialog portalled outside the region.
+    await page
+      .getByRole('alertdialog')
+      .getByRole('button', { name: 'Delete', exact: true })
+      .click()
     await expect(dialog.getByRole('button', { name: 'Check now' })).toHaveCount(
       0
     )

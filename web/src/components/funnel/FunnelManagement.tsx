@@ -9,16 +9,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   listFunnelsOptions,
   deleteFunnelMutation,
@@ -44,7 +35,8 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
     from: subDays(new Date(), 30),
     to: new Date(),
   })
-  const [deletingId, setDeletingId] = React.useState<number | null>(null)
+  const [deletingFunnel, setDeletingFunnel] =
+    React.useState<FunnelResponse | null>(null)
 
   const dateRangeQuery = React.useMemo(() => {
     if (!dateRange?.from || !dateRange?.to) return null
@@ -82,19 +74,15 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
     path: `/projects/${project.slug}/analytics/funnels/create`,
   })
 
-  const handleDelete = (funnelId: number) => {
-    setDeletingId(funnelId)
-  }
-
   const confirmDelete = () => {
-    if (deletingId === null) return
+    if (deletingFunnel === null) return
     deleteFunnel.mutate({
       path: {
         project_id: project.id,
-        funnel_id: deletingId,
+        funnel_id: deletingFunnel.id,
       },
     })
-    setDeletingId(null)
+    setDeletingFunnel(null)
   }
 
   return (
@@ -189,7 +177,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
               funnel={funnel}
               project={project}
               dateRange={dateRangeQuery!}
-              onDelete={() => handleDelete(funnel.id)}
+              onDelete={() => setDeletingFunnel(funnel)}
               onView={() =>
                 navigate(
                   `/projects/${project.slug}/analytics/funnels/${funnel.id}`
@@ -205,28 +193,16 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
         </div>
       )}
 
-      <AlertDialog
-        open={deletingId !== null}
+      <ConfirmDeleteDialog
+        open={deletingFunnel !== null}
         onOpenChange={(open) => {
-          if (!open) setDeletingId(null)
+          if (!open) setDeletingFunnel(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete funnel?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. The funnel and its configuration
-              will be permanently removed.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={confirmDelete}>
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="funnel"
+        resourceName={deletingFunnel?.name ?? ''}
+        consequences="The funnel and its configuration are removed."
+        onConfirm={confirmDelete}
+      />
     </div>
   )
 }

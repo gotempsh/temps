@@ -39,8 +39,12 @@ pub enum SandboxSnapshotError {
         target_backend: String,
     },
 
-    /// The backend does not support snapshots (for example, Local).
-    #[error("Snapshot is not supported by backend '{backend}'")]
+    /// The backend does not support snapshots (for example, Local or
+    /// microsandbox).
+    #[error(
+        "Snapshot is not supported by backend '{backend}'; \
+         use a 'firecracker' or 'docker' sandbox to take snapshots"
+    )]
     NotSupported { backend: String },
 
     /// Snapshots are not available yet for sandboxes on worker nodes
@@ -98,9 +102,11 @@ pub enum SandboxSnapshotError {
     #[error("Snapshot {snapshot_id} uses an unsupported legacy artifact format: {reason}")]
     LegacyArtifactUnsupported { snapshot_id: String, reason: String },
 
-    /// The source sandbox doesn't exist or was already destroyed.
-    #[error("Sandbox {sandbox_id} not found")]
-    SandboxNotFound { sandbox_id: String },
+    /// The source sandbox doesn't exist, was already destroyed, or its
+    /// provider handle could not be recovered (for example the VM is not
+    /// running). `reason` carries the registry's own explanation.
+    #[error("Sandbox {sandbox_id} not found: {reason}")]
+    SandboxNotFound { sandbox_id: String, reason: String },
 
     /// The sandbox is not running — snapshots require a live container.
     ///
@@ -136,6 +142,27 @@ pub enum SandboxError {
     /// The requested sandbox does not exist or has been destroyed.
     #[error("Sandbox {sandbox_id} not found")]
     NotFound { sandbox_id: String },
+
+    /// The sandbox row exists (it is listed, and owned by the caller) but its
+    /// VM or container is not running and the provider cannot serve the
+    /// request: the VMM exited, was killed together with the Temps service,
+    /// or the host rebooted, or the provider no longer has the VM's files.
+    /// Distinct from [`SandboxError::NotFound`], which is only for ids that do
+    /// not exist, so the caller is told what happened and how to recover
+    /// instead of being sent looking for a sandbox that is still listed.
+    /// `backend` is `None` when the provider lost the VM entirely and
+    /// there is no handle to read it from. Mapped to HTTP 409.
+    #[error(
+        "Sandbox {sandbox_id} exists, but its {} is not running: {reason}. {}",
+        vm_label(backend.as_deref()),
+        recovery.advice(sandbox_id)
+    )]
+    VmNotRunning {
+        sandbox_id: String,
+        backend: Option<String>,
+        reason: String,
+        recovery: VmRecovery,
+    },
 
     /// A background job tracked by [`JobTracker`] was not found in the
     /// requested sandbox. Separate from `NotFound` so callers can tell the
@@ -178,6 +205,15 @@ pub enum SandboxError {
         image: String,
         reason: String,
     },
+
+    /// The container runtime has no address space left for the sandbox's
+    /// isolated network (Docker: every `default-address-pools` range is
+    /// subnetted). A capacity limit of the host, not a fault of the request
+    /// and not a server bug: nothing about the request can fix it, but
+    /// deleting unused sandboxes or widening the pools does. Mapped to HTTP
+    /// 503 with that guidance in `reason`.
+    #[error("Sandbox {sandbox_id} could not get an isolated network: {reason}")]
+    NetworkCapacityExhausted { sandbox_id: String, reason: String },
 
     /// The sandbox exists but is not in a state that allows the requested
     /// operation (e.g. exec on a stopped sandbox). Mapped to HTTP 409.
@@ -348,6 +384,48 @@ pub enum SandboxError {
     },
 }
 
+/// How to get a sandbox whose VM is not running back, which depends on what
+/// the provider reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VmRecovery {
+    /// The provider found the VM and it is down: its disk is intact and
+    /// `sandbox resume` boots it again.
+    Resume,
+    /// The provider could not find the VM, or could not check it. Whether the
+    /// VM's files still exist is unknown, so the advice does not promise a
+    /// resume or a restart (a failed `resume` also lands here, and `restart`
+    /// refuses a stopped row), and does not tell the caller to delete it: a
+    /// guest that is merely slow to answer lands here too. Retry, then look at
+    /// the server logs; delete only if the sandbox is not needed.
+    RestartOrRecreate,
+}
+
+impl VmRecovery {
+    fn advice(self, sandbox_id: &str) -> String {
+        match self {
+            VmRecovery::Resume => format!(
+                "Run `bunx @temps-sdk/cli sandbox resume {sandbox_id}` to boot it again with its disk intact. \
+                 If that fails because the VM's files are gone, delete it with \
+                 `bunx @temps-sdk/cli sandbox rm {sandbox_id}` and create a new one."
+            ),
+            VmRecovery::RestartOrRecreate => format!(
+                "Retry in a moment. If it keeps failing, check the Temps server logs for sandbox \
+                 {sandbox_id}: its VM may be gone, or its guest may not be answering. If you no \
+                 longer need its disk, delete it with `bunx @temps-sdk/cli sandbox rm {sandbox_id}` \
+                 and create a new one."
+            ),
+        }
+    }
+}
+
+/// What the error message calls the thing that is not running.
+fn vm_label(backend: Option<&str>) -> String {
+    match backend {
+        Some(backend) => format!("{backend} VM"),
+        None => "VM".to_string(),
+    }
+}
+
 /// Translate a lower-level `AgentError` from the shared `SandboxProvider`
 /// into a `SandboxError` with the standalone sandbox ID attached. The
 /// provider's errors are keyed by `run_id` (an internal numeric id) — the
@@ -361,9 +439,36 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             reason: reason.to_string(),
         };
     }
-    match err {
-        AgentError::SandboxNotFound { .. } => SandboxError::NotFound {
+    if let Some(reason) = err.network_pool_exhaustion() {
+        let reason = if reason.contains("default-address-pools") {
+            reason.to_string()
+        } else {
+            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+        };
+        return SandboxError::NetworkCapacityExhausted {
             sandbox_id: sandbox_id.to_string(),
+            reason,
+        };
+    }
+    match err {
+        // Every caller reaches the provider with a sandbox row already
+        // loaded (an id with no row is `NotFound` before the provider is
+        // asked), so a provider that cannot find the VM means the sandbox
+        // exists but has nothing running behind it: a 409 with the way back,
+        // not a 404 for an id that is still listed.
+        AgentError::SandboxNotFound { sandbox, .. } => SandboxError::VmNotRunning {
+            sandbox_id: sandbox_id.to_string(),
+            backend: None,
+            reason: format!("the provider cannot find it ({sandbox})"),
+            recovery: VmRecovery::RestartOrRecreate,
+        },
+        AgentError::SandboxNotRunning {
+            backend, reason, ..
+        } => SandboxError::VmNotRunning {
+            sandbox_id: sandbox_id.to_string(),
+            backend: Some(backend),
+            reason,
+            recovery: VmRecovery::Resume,
         },
         AgentError::SandboxExecFailed { reason, .. } => SandboxError::ExecFailed {
             sandbox_id: sandbox_id.to_string(),
@@ -540,16 +645,100 @@ mod tests {
         assert!(msg.contains("stop or cancel"), "msg: {}", msg);
     }
 
+    /// A provider that cannot find the VM of a sandbox whose row exists is
+    /// not "not found": the id is valid and listed. It is a 409 that names
+    /// the public id (never the internal run id) and how to recover.
     #[test]
-    fn from_agent_error_preserves_not_found() {
+    fn provider_not_found_for_an_existing_row_is_vm_not_running() {
         let agent = AgentError::SandboxNotFound {
             run_id: 42,
-            sandbox: "sbx_test".into(),
+            sandbox: "temps-sandbox-test".into(),
         };
         let err = from_agent_error("sbx_public", agent);
-        assert!(matches!(err, SandboxError::NotFound { .. }));
-        // The public ID propagates, not the internal run_id
-        assert_eq!(err.to_string(), "Sandbox sbx_public not found");
+        assert!(
+            matches!(&err, SandboxError::VmNotRunning { sandbox_id, backend: None, .. }
+                if sandbox_id == "sbx_public"),
+            "{err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_public"), "{msg}");
+        assert!(msg.contains("temps-sandbox-test"), "{msg}");
+        // A failed `resume` lands here too, so it must not send the caller
+        // back to `resume`, nor to `restart` (which refuses a stopped row).
+        assert!(!msg.contains("sandbox resume"), "{msg}");
+        assert!(!msg.contains("sandbox restart"), "{msg}");
+        assert!(msg.contains("sandbox rm sbx_public"), "{msg}");
+        // Unknown liveness lands here too: the advice must not claim the
+        // VM's files are gone.
+        assert!(msg.contains("server logs"), "{msg}");
+        assert!(!msg.contains("files are gone"), "{msg}");
+        assert!(!msg.contains("42"), "internal run id leaked: {msg}");
+    }
+
+    #[test]
+    fn not_running_vm_keeps_the_backend_and_the_liveness_reason() {
+        let err = from_agent_error(
+            "sbx_public",
+            AgentError::SandboxNotRunning {
+                run_id: 42,
+                sandbox_id: "sbx_internal".into(),
+                container: "temps-sandbox-public".into(),
+                backend: "firecracker".into(),
+                reason: "its firecracker process exited".into(),
+            },
+        );
+        match &err {
+            SandboxError::VmNotRunning {
+                sandbox_id,
+                backend,
+                reason,
+                recovery,
+            } => {
+                assert_eq!(sandbox_id, "sbx_public");
+                assert_eq!(backend.as_deref(), Some("firecracker"));
+                assert_eq!(reason, "its firecracker process exited");
+                assert_eq!(*recovery, VmRecovery::Resume);
+            }
+            other => panic!("expected VmNotRunning, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("sbx_public exists"), "{msg}");
+        assert!(msg.contains("firecracker VM is not running"), "{msg}");
+        assert!(msg.contains("its firecracker process exited"), "{msg}");
+        assert!(msg.contains("sandbox resume sbx_public"), "{msg}");
+    }
+
+    #[test]
+    fn vm_not_running_is_a_409_problem_and_unknown_ids_stay_404() {
+        let not_running = temps_core::problemdetails::Problem::from(SandboxError::VmNotRunning {
+            sandbox_id: "sbx_a".into(),
+            backend: Some("microsandbox".into()),
+            reason: "its microsandbox process exited".into(),
+            recovery: VmRecovery::Resume,
+        });
+        assert_eq!(not_running.status_code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            not_running.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/sandbox-vm-not-running")
+        );
+        assert_eq!(
+            not_running.body.get("title").and_then(|v| v.as_str()),
+            Some("Sandbox VM Not Running")
+        );
+        let detail = not_running
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("sbx_a") && detail.contains("microsandbox VM"),
+            "{detail}"
+        );
+
+        let missing = temps_core::problemdetails::Problem::from(SandboxError::NotFound {
+            sandbox_id: "sbx_nope".into(),
+        });
+        assert_eq!(missing.status_code, axum::http::StatusCode::NOT_FOUND);
     }
 
     #[test]
@@ -630,5 +819,59 @@ mod tests {
         };
         let err = from_agent_error("sbx_x", agent);
         assert!(matches!(err, SandboxError::ExecFailed { .. }));
+    }
+
+    #[test]
+    fn exhausted_address_pools_map_to_a_capacity_error_with_guidance() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "create isolated network for sandbox 'temps-sandbox-abc': Docker \
+                         responded with status code 400: all predefined address pools have \
+                         been fully subnetted"
+                    .into(),
+            },
+        );
+        match &err {
+            SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
+                assert_eq!(sandbox_id, "sbx_abc");
+                assert!(reason.contains("default-address-pools"), "{reason}");
+                assert!(reason.contains("Delete sandboxes"), "{reason}");
+            }
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
+        let reason = temps_agents::error::network_pool_exhausted_reason(
+            "temps-sandbox-abc",
+            "all predefined address pools have been fully subnetted",
+        );
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxCreationFailed {
+                run_id: 7,
+                provider: "docker".into(),
+                reason: reason.clone(),
+            },
+        );
+        match err {
+            SandboxError::NetworkCapacityExhausted { reason: got, .. } => assert_eq!(got, reason),
+            other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_provider_unavailability_stays_a_generic_unavailable() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".into(),
+                reason: "daemon unreachable".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
     }
 }

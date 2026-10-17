@@ -18,18 +18,9 @@ import {
   updateTeamMemberRoleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TeamMemberResponse, TeamRole } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -75,7 +66,10 @@ import {
   Users,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router'
+import { Link, useNavigate, useParams } from 'react-router'
+import { PageState } from '@temps-sdk/ds'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import {
   ROLE_DESCRIPTIONS,
@@ -387,7 +381,13 @@ export function TeamDetail() {
   const [memberToRemove, setMemberToRemove] =
     useState<TeamMemberResponse | null>(null)
 
-  const { data: team, isLoading: teamLoading } = useQuery({
+  const {
+    data: team,
+    isLoading: teamLoading,
+    error: teamError,
+    refetch: refetchTeam,
+    isFetching: teamFetching,
+  } = useQuery({
     ...getTeamOptions({ path: { team_id: teamId } }),
     enabled: Number.isFinite(teamId),
   })
@@ -442,6 +442,40 @@ export function TeamDetail() {
 
   const memberList = members ?? []
   const grantList = grants ?? []
+
+  // A team that cannot be read is not an empty team: without this the page
+  // drew an "Edit team" shell with no members around an unknown id.
+  if (teamError && !team) {
+    return (
+      <div className="w-full min-w-0 space-y-6">
+        {isVerifiedNotFound(teamError) ? (
+          <PageState
+            variant="empty"
+            icon={Users}
+            title="Team not found"
+            description={`No team has ID ${teamIdParam ?? ''}. It may have been deleted.`}
+            action={
+              <Button asChild>
+                <Link to="/settings/teams">Back to teams</Link>
+              </Button>
+            }
+          />
+        ) : (
+          <>
+            <ReadFailure
+              resource="Team"
+              error={teamError}
+              onRetry={() => void refetchTeam()}
+              retrying={teamFetching}
+            />
+            <Button asChild variant="outline" size="sm">
+              <Link to="/settings/teams">Back to teams</Link>
+            </Button>
+          </>
+        )}
+      </div>
+    )
+  }
 
   return (
     <div className="w-full min-w-0 space-y-6">
@@ -629,44 +663,32 @@ export function TeamDetail() {
         onOpenChange={setAddOpen}
       />
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={memberToRemove !== null}
         onOpenChange={(open) => {
           if (!open) setMemberToRemove(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove member?</AlertDialogTitle>
-            <AlertDialogDescription>
-              {memberToRemove?.user_name ?? 'This user'} loses access to every
-              service they could only reach through this team. This takes effect
-              immediately.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={removeMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (memberToRemove) {
-                  removeMutation.mutate({
-                    path: {
-                      team_id: teamId,
-                      user_id: memberToRemove.user_id,
-                    },
-                  })
-                }
-              }}
-              disabled={removeMutation.isPending}
-            >
-              {removeMutation.isPending ? 'Removing…' : 'Remove'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="team member"
+        resourceName={
+          memberToRemove?.user_name ||
+          memberToRemove?.user_email ||
+          (memberToRemove ? `user #${memberToRemove.user_id}` : '')
+        }
+        verb="Remove"
+        consequences={`They lose access to every service they could only reach through ${team?.name ?? 'this team'}. This takes effect immediately.`}
+        irreversible={false}
+        isPending={removeMutation.isPending}
+        onConfirm={() => {
+          if (memberToRemove) {
+            removeMutation.mutate({
+              path: {
+                team_id: teamId,
+                user_id: memberToRemove.user_id,
+              },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

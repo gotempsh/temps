@@ -134,7 +134,8 @@ import {
   ResizablePanel,
   ResizablePanelGroup,
 } from '@/components/ui/resizable'
-import { useNavigate, useParams, useSearchParams } from 'react-router'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import {
   containerPathLevel,
@@ -1703,9 +1704,14 @@ export function ServiceDataBrowser() {
           <Alert variant="destructive">
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              Failed to load service details. Please try again.
+              {serviceError && isVerifiedNotFound(serviceError)
+                ? `Storage service ${id ?? ''} does not exist or has been deleted.`
+                : 'Failed to load service details. Please try again.'}
             </AlertDescription>
           </Alert>
+          <Button asChild variant="outline" className="mt-4">
+            <Link to="/storage">All storage services</Link>
+          </Button>
         </div>
       </div>
     )

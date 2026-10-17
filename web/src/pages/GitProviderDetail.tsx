@@ -23,14 +23,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -574,44 +567,16 @@ export default function GitProviderDetail() {
 
       {verificationDialog}
 
-      {/* Delete Confirmation Dialog */}
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Git Provider</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone. Its {connections?.length ?? 0}{' '}
-              connection(s) and their synced repositories are deleted with it.
-              Services still deployed from this provider block the delete — the
-              error names them.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setShowDeleteDialog(false)}
-              disabled={deleteMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDeleteDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        resourceType="git provider"
+        resourceName={provider.name}
+        consequences={`Its ${connections?.length ?? 0} connection(s) and their synced repositories are deleted with it. Services still deployed from this provider block the delete — the error names them.`}
+        confirmLabel="Delete provider"
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDelete}
+      />
     </>
   )
 }

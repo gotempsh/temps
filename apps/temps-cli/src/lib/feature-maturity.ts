@@ -94,7 +94,10 @@ async function loadFeatureMaturity(): Promise<FeatureMaturity[] | undefined> {
     const { data, error } = await getFeatureMaturity({
       signal: AbortSignal.timeout(1_500),
     })
-    if (error || !data) return undefined
+    // A server (or anything in front of it) that answers 2xx with something
+    // other than the registry array must read as "no notice", not crash the
+    // target command later in `maturityNotice`.
+    if (error || !Array.isArray(data)) return undefined
     return data
   } catch {
     // Older servers do not expose maturity metadata. Never make the target

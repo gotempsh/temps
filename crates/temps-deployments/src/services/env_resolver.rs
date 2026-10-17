@@ -231,7 +231,7 @@ pub(super) fn merge_environment_variable_layers(
 /// merged afterwards and can override these defaults.
 type LinkedServiceVariables = BTreeMap<String, Vec<HashMap<String, String>>>;
 
-fn select_effective_environment_variables(
+pub(super) fn select_effective_environment_variables(
     variables: Vec<env_vars::Model>,
     links: &[env_var_environments::Model],
     environment_id: i32,

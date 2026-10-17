@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.37`
+> Generated from: `@temps-sdk/cli@0.1.38`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.37 [command]
+bunx @temps-sdk/cli@0.1.38 [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.37 [command]
+npx @temps-sdk/cli@0.1.38 [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.37 login
+bunx @temps-sdk/cli@0.1.38 login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.37 configure
+bunx @temps-sdk/cli@0.1.38 configure
 ```
 
 ## Global Options
@@ -90,7 +90,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`dns-provider`](#dns-provider) - Manage DNS providers and managed domains
 - [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
-- [`ip-access`](#ip-access) - Manage IP access control rules
+- [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
@@ -5674,7 +5674,7 @@ Remove a delivery binding and the DNS record it manages
 
 ## `ip-access` (alias: `ipa`)
 
-Manage IP access control rules
+Manage instance-wide IP access control rules, and per-project lists (ip-access project)
 
 **Subcommands:**
 
@@ -5684,6 +5684,7 @@ Manage IP access control rules
 - `update` - Update an IP access control rule
 - `remove` (`rm`) - Delete an IP access control rule
 - `check` - Check if an IP address is blocked
+- `project` - Allow or deny IP ranges for one project or environment
 
 ### `ip-access list` (alias: `ls`)
 
@@ -5753,6 +5754,70 @@ Check if an IP address is blocked
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--ip <ip>` | IP address to check | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `ip-access project`
+
+Allow or deny IP ranges for one project or environment
+
+**Subcommands:**
+
+- `show` - Show the IP access list
+- `set` - Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+- `clear` - Remove the list (an environment then follows the project list)
+- `test` - Check whether an address would be allowed
+
+#### `ip-access project show`
+
+Show the IP access list
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project set`
+
+Replace the IP access list. A list that would lock out this machine needs --acknowledge-lockout
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--mode <mode>` | disabled, allow (only listed) or deny (block listed) | - | Yes |
+| `--cidr <cidr>` | Address or CIDR range; repeat or comma-separate | `` | No |
+| `--tailscale` | Include the Tailscale ranges (100.64.0.0/10 and fd7a:115c:a1e0::/48) | - | No |
+| `--acknowledge-lockout` | Apply even if it would block the address you are calling from | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `ip-access project clear`
+
+Remove the list (an environment then follows the project list)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+
+#### `ip-access project test`
+
+Check whether an address would be allowed
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
+| `--ip <ip>` | Address to evaluate | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -7916,6 +7981,7 @@ Create a new sandbox
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
+| `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox list` (alias: `ls`)
@@ -9305,51 +9371,51 @@ Stop the Temps server and database started by `temps start`
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.37 login
+bunx @temps-sdk/cli@0.1.38 login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@0.1.38 --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.37 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.38 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.37 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.38 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.37 runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.38 runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.37 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.38 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.37 environments list --project my-app
+bunx @temps-sdk/cli@0.1.38 environments list --project my-app
 
 # Set an environment variable on the intended server (prompts for the value)
-bunx @temps-sdk/cli@0.1.37 --target-context production environments vars set --project my-app DATABASE_URL --environments production
+bunx @temps-sdk/cli@0.1.38 --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.37 environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.38 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Request a certificate for a domain on the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production domains add --domain app.example.com
+bunx @temps-sdk/cli@0.1.38 --target-context production domains add --domain app.example.com
 
 # Route the domain to a project environment
-bunx @temps-sdk/cli@0.1.37 --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
+bunx @temps-sdk/cli@0.1.38 --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.37 domains list
+bunx @temps-sdk/cli@0.1.38 domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.37 --target-context production domains remove --domain app.example.com
+bunx @temps-sdk/cli@0.1.38 --target-context production domains remove --domain app.example.com
 ```
 
 ## Environment Variables
@@ -9369,7 +9435,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.37 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.38 configure show` to view current configuration.
 
 ## Support
 

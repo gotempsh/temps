@@ -13,16 +13,7 @@ import {
   updateS3SourceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { S3SourceResponse } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -620,51 +611,18 @@ export function S3SourcesManagement() {
         </div>
       )}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={sourceToDelete !== null}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
-            setSourceToDelete(null)
-          }
+          if (!open) setSourceToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete S3 source?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will remove
-              {sourceToDelete ? (
-                <>
-                  {' '}
-                  <span className="font-medium text-foreground">
-                    {sourceToDelete.name}
-                  </span>{' '}
-                  (<code>{sourceToDelete.bucket_name}</code>)
-                </>
-              ) : null}{' '}
-              from Temps. Backup schedules pointing at this source will fail on
-              their next run, and services that rely on it for WAL archiving
-              will stop shipping new data until reconfigured. Objects already in
-              the bucket will not be deleted. This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                confirmDeleteSource()
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete source'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="S3 source"
+        resourceName={sourceToDelete?.name ?? ''}
+        confirmLabel="Delete source"
+        consequences={`Removes it (bucket ${sourceToDelete?.bucket_name ?? ''}) from Temps. Backup schedules pointing at this source will fail on their next run, and services that rely on it for WAL archiving will stop shipping new data until reconfigured. Objects already in the bucket will not be deleted.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDeleteSource}
+      />
     </div>
   )
 }

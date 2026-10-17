@@ -45,6 +45,7 @@ import { Input } from '@/components/ui/input'
 import { SearchableSelect } from '@/components/ui/searchable-select'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
@@ -264,6 +265,9 @@ interface UsageLogEntry {
   status: number
   is_streaming: boolean
   is_byok: boolean
+  /** Set when the call came from a deployment token; absent otherwise. */
+  project_id?: number
+  token_id?: number
 }
 
 interface UsageLogPage {
@@ -460,6 +464,10 @@ function ProviderKeyModelDetail({
   const queryClient = useQueryClient()
   const [modelId, setModelId] = useState('')
   const [modelFilter, setModelFilter] = useState('')
+  const [modelToDelete, setModelToDelete] = useState<{
+    id: number
+    model_id: string
+  } | null>(null)
   const queryKey = ['providerModelInventory', providerKey.id]
   const detailQuery = useQuery({
     queryKey,
@@ -543,6 +551,7 @@ function ProviderKeyModelDetail({
       toast.error('Could not delete model', {
         description: apiErrorMessage(error),
       }),
+    onSettled: () => setModelToDelete(null),
   })
 
   const models = useMemo(
@@ -696,7 +705,12 @@ function ProviderKeyModelDetail({
                           variant="ghost"
                           size="icon"
                           className="h-8 w-8"
-                          onClick={() => deleteMutation.mutate(model.id)}
+                          onClick={() =>
+                            setModelToDelete({
+                              id: model.id,
+                              model_id: model.model_id,
+                            })
+                          }
                           title="Delete manual model"
                         >
                           <Trash2 className="h-3.5 w-3.5 text-destructive" />
@@ -731,6 +745,19 @@ function ProviderKeyModelDetail({
           Add model
         </Button>
       </form>
+      <ConfirmDeleteDialog
+        open={modelToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setModelToDelete(null)
+        }}
+        resourceType="manual model"
+        resourceName={modelToDelete?.model_id ?? ''}
+        consequences={`It is removed from ${providerKey.display_name}; requests for it are no longer routed through this key until it is added again.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (modelToDelete) deleteMutation.mutate(modelToDelete.id)
+        }}
+      />
     </div>
   )
 }
@@ -1583,6 +1610,7 @@ export function UsageAnalytics() {
                     <TableHead>Time</TableHead>
                     <TableHead>Provider</TableHead>
                     <TableHead>Model</TableHead>
+                    <TableHead>Caller</TableHead>
                     <TableHead className="hidden md:table-cell">
                       Tokens
                     </TableHead>
@@ -1609,6 +1637,11 @@ export function UsageAnalytics() {
                       </TableCell>
                       <TableCell className="font-mono text-xs">
                         {log.model}
+                      </TableCell>
+                      <TableCell className="text-muted-foreground text-xs whitespace-nowrap">
+                        {log.project_id === undefined
+                          ? '—'
+                          : `Project #${log.project_id}${log.token_id === undefined ? '' : ` · token #${log.token_id}`}`}
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
                         {formatTokenCount(log.input_tokens + log.output_tokens)}
@@ -3291,7 +3324,12 @@ function TraceDetailView({
 // ── AgentActivity ───────────────────────────────────────────────────
 
 export function AgentActivity() {
-  const { projects } = useProjects()
+  const {
+    projects,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+  } = useProjects()
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
@@ -3364,7 +3402,7 @@ export function AgentActivity() {
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Agent Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
               value={projectId?.toString() ?? ''}
@@ -3411,11 +3449,33 @@ export function AgentActivity() {
       )}
 
       {/* Traces list */}
-      {!projectId ? (
+      {!projectId && projectsLoading ? (
+        <div className="space-y-2">
+          <Skeleton className="h-16 w-full" />
+          <Skeleton className="h-16 w-full" />
+        </div>
+      ) : !projectId && projectsError ? (
+        <ReadFailure
+          resource="Services"
+          error={projectsError}
+          onRetry={refetchProjects}
+        />
+      ) : !projectId ? (
         <EmptyState
+          size="compact"
           icon={Bot}
-          title="No service selected"
-          description="Select a service to view AI agent activity traces."
+          title="No services yet"
+          description="AI activity is recorded per service. Deploy a service that calls an AI provider and its traces appear here."
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button asChild>
+                <Link to="/projects/new">Deploy a service</Link>
+              </Button>
+              <Button asChild variant="outline">
+                <Link to="/ai-gateway/setup">Set up the AI gateway</Link>
+              </Button>
+            </div>
+          }
         />
       ) : tracesLoading ? (
         <div className="space-y-2">
@@ -3691,7 +3751,7 @@ export function ProjectAgentActivity({
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">AI Activity</h3>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
             onValueChange={(value) =>
@@ -3894,47 +3954,6 @@ export function ProjectAgentActivity({
         </p>
       )}
     </div>
-  )
-}
-
-function DeleteConfirmDialog({
-  open,
-  onOpenChange,
-  providerKey,
-  onConfirm,
-  isPending,
-}: {
-  open: boolean
-  onOpenChange: (open: boolean) => void
-  providerKey: ProviderKeyResponse | null
-  onConfirm: (id: number) => void
-  isPending: boolean
-}) {
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle>Delete Provider Key</DialogTitle>
-          <DialogDescription>
-            Are you sure you want to delete &quot;{providerKey?.display_name}
-            &quot;? This will stop routing requests through this provider key.
-          </DialogDescription>
-        </DialogHeader>
-        <DialogFooter>
-          <Button variant="outline" onClick={() => onOpenChange(false)}>
-            Cancel
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => providerKey && onConfirm(providerKey.id)}
-            disabled={isPending}
-          >
-            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            Delete
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   )
 }
 
@@ -4868,16 +4887,19 @@ console.log(response.choices[0].message.content);`,
         </DialogContent>
       </Dialog>
 
-      {/* Delete Confirmation Dialog */}
-      <DeleteConfirmDialog
+      <ConfirmDeleteDialog
         open={deleteDialogOpen}
         onOpenChange={(open) => {
           setDeleteDialogOpen(open)
           if (!open) setSelectedKey(null)
         }}
-        providerKey={selectedKey}
-        onConfirm={(id) => deleteMutation.mutate(id)}
+        resourceType="provider key"
+        resourceName={selectedKey?.display_name ?? ''}
+        consequences="Requests will no longer be routed through this provider key."
         isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (selectedKey) deleteMutation.mutate(selectedKey.id)
+        }}
       />
     </div>
   )

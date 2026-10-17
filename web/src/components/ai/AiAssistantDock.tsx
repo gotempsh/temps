@@ -19,6 +19,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { useIsMobile } from '@/components/hooks/use-mobile'
 import { ProjectAvatar } from '@/components/project/ProjectAvatar'
 import { Button } from '@/components/ui/button'
 import {
@@ -321,7 +322,38 @@ export function DockBody({
   // When true, the body shows the project picker for starting a fresh
   // project-scoped chat (a new thread, not tied to a deployment/alert).
   const [picking, setPicking] = useState(false)
-  const [railOpen, setRailOpen] = useState(true)
+  // The chat list sits beside the conversation from `md` up. Below that it
+  // would take 320px of a 390px phone and push the conversation (and its
+  // header controls) off-screen, so on phones it starts closed and, when
+  // opened, replaces the conversation until a chat is picked or it is hidden.
+  // The two layouts keep separate state so resizing never strands either one.
+  const isMobile = useIsMobile()
+  const [desktopRailOpen, setDesktopRailOpen] = useState(true)
+  const [mobileRailOpen, setMobileRailOpen] = useState(false)
+  const railOpen = isMobile ? mobileRailOpen : desktopRailOpen
+  const setRailOpen = isMobile ? setMobileRailOpen : setDesktopRailOpen
+  // On phones the list and the conversation swap in place, so the control that
+  // was pressed disappears. Hand focus to its counterpart instead of letting it
+  // fall to <body>.
+  const railToggleRef = useRef<HTMLButtonElement | null>(null)
+  const railCloseRef = useRef<HTMLButtonElement | null>(null)
+  const restoreToggleFocusRef = useRef(false)
+  const closeMobileRail = () => {
+    restoreToggleFocusRef.current = true
+    setMobileRailOpen(false)
+  }
+  useEffect(() => {
+    if (!isMobile) {
+      restoreToggleFocusRef.current = false
+      return
+    }
+    if (mobileRailOpen) {
+      railCloseRef.current?.focus()
+    } else if (restoreToggleFocusRef.current) {
+      restoreToggleFocusRef.current = false
+      railToggleRef.current?.focus()
+    }
+  }, [isMobile, mobileRailOpen])
 
   // Unified list across every project.
   const loadList = useCallback(() => {
@@ -349,7 +381,9 @@ export function DockBody({
     (publicId: string | null) => {
       setActivePublicId(publicId)
       if (!conversationListNeedsRefresh(publicId, conversations)) return
-      setRailOpen(true)
+      // Revealing the list on a phone would cover the conversation that was
+      // just created, so only the side-by-side layout opens it.
+      setDesktopRailOpen(true)
       loadList()
     },
     [conversations, loadList]
@@ -375,6 +409,10 @@ export function DockBody({
     // conversation for an unsaved draft.
     setActivePublicId(c.public_id)
     setPicking(false)
+    // Picking a chat (including the one already open) removes the focused
+    // list button, so hand focus to the toggle like the close button does.
+    restoreToggleFocusRef.current = true
+    setMobileRailOpen(false)
     setActive({
       projectId: c.project_id,
       projectSlug: c.project_slug ?? undefined,
@@ -571,11 +609,23 @@ export function DockBody({
   // column (header included) so the list lines up with the top of the page
   // instead of starting under the conversation title.
   const rail = isPage && railOpen && (
-    <aside className="flex h-full w-80 shrink-0 flex-col border-r">
+    <aside className="flex h-full w-full shrink-0 flex-col border-r md:w-80">
       <div className="flex items-center justify-between gap-2 px-4 pb-2 pt-4">
         <h2 className="text-sm font-medium text-muted-foreground">Chats</h2>
-        <span className="text-xs tabular-nums text-muted-foreground">
-          {conversations.length}
+        <span className="flex items-center gap-2">
+          <span className="text-xs tabular-nums text-muted-foreground">
+            {conversations.length}
+          </span>
+          <button
+            type="button"
+            ref={railCloseRef}
+            onClick={closeMobileRail}
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground md:hidden"
+            aria-label="Close chat list"
+            title="Close chat list"
+          >
+            <X className="h-4 w-4" />
+          </button>
         </span>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-4">
@@ -613,6 +663,7 @@ export function DockBody({
       <div
         className={cn(
           isPage && 'flex h-full min-w-0 flex-1 flex-col gap-3 p-4',
+          isPage && railOpen && 'max-md:hidden',
           !isPage && 'contents'
         )}
       >
@@ -622,7 +673,9 @@ export function DockBody({
               {isPage ? (
                 <button
                   type="button"
+                  ref={railToggleRef}
                   onClick={() => setRailOpen((v) => !v)}
+                  aria-expanded={railOpen}
                   className="-ml-1 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
                   aria-label={railOpen ? 'Hide chat list' : 'Show chat list'}
                   title={railOpen ? 'Hide chat list' : 'Show chat list'}

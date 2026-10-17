@@ -10,17 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
   DialogContent,
@@ -251,12 +241,15 @@ function SecretRow({
   onDeleted,
 }: SecretRowProps) {
   const location = useLocation()
+  const [isDeleteOpen, setIsDeleteOpen] = useState(false)
   const deleteMutation = useMutation({
     ...deleteProjectSecretMutation(),
     onSuccess: () => {
+      setIsDeleteOpen(false)
       onDeleted()
     },
     onError: (err: Error) => {
+      setIsDeleteOpen(false)
       toast.error(
         err instanceof Error ? err.message : 'Failed to delete secret'
       )
@@ -297,40 +290,28 @@ function SecretRow({
       >
         <Pencil className="h-4 w-4" />
       </Button>
-      <AlertDialog>
-        <AlertDialogTrigger asChild>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="text-muted-foreground hover:text-destructive"
-            aria-label={`Delete secret ${secret.key}`}
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete secret {secret.key}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Running containers keep their mounted secret file until the next
-              deployment. New deployments will not receive this secret.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() =>
-                deleteMutation.mutate({
-                  path: { project_id: projectId, secret_id: secret.id },
-                })
-              }
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="text-muted-foreground hover:text-destructive"
+        aria-label={`Delete secret ${secret.key}`}
+        onClick={() => setIsDeleteOpen(true)}
+      >
+        <Trash2 className="h-4 w-4" />
+      </Button>
+      <ConfirmDeleteDialog
+        open={isDeleteOpen}
+        onOpenChange={setIsDeleteOpen}
+        resourceType="secret"
+        resourceName={secret.key}
+        consequences="Running containers keep their mounted secret file until the next deployment. New deployments will not receive this secret."
+        isPending={deleteMutation.isPending}
+        onConfirm={() =>
+          deleteMutation.mutate({
+            path: { project_id: projectId, secret_id: secret.id },
+          })
+        }
+      />
     </div>
   )
 }

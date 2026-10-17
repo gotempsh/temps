@@ -40,6 +40,14 @@ pub struct ByokOverride {
     pub system_key_id: Option<i32>,
 }
 
+impl ByokOverride {
+    /// The caller brought their own provider key, so the request spends their
+    /// provider credits and adds nothing to the operator's bill.
+    pub fn is_caller_funded(&self) -> bool {
+        self.api_key.is_some()
+    }
+}
+
 /// Provider and credentials resolved for one request.
 #[derive(Clone)]
 pub struct ResolvedCredentials {

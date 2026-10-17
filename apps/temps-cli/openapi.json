@@ -2820,6 +2820,19 @@
         ],
         "type": "string"
       },
+      "AnalyticsIngestEndpoint": {
+        "description": "The public address an app Temps does not deploy should send analytics to.\n\nServed separately from the platform settings because `GET /settings`\nneeds `settings:read`, which a project member does not hold, while the\ninstall snippet this value goes into is shown to every role that can read\nthe project's analytics. Only the one address the snippet embeds is\nexposed; no other setting travels with it.",
+        "properties": {
+          "external_url": {
+            "description": "The configured external URL, without a trailing slash. `null` when no\nexternal URL is stored (or no settings service is available), in which\ncase the caller must decide what to show instead; it is never guessed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "AnalyticsIngestKey": {
         "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
         "properties": {
@@ -2932,6 +2945,57 @@
           "project_id",
           "project_name"
         ],
+        "type": "object"
+      },
+      "AnalyticsRetentionSettings": {
+        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed -- so upgrading never starts deleting data on its own,\nexcept for the unreferenced-IP cleanup, which only drops cache rows that\nnothing points at.",
+        "properties": {
+          "error_events_days": {
+            "default": null,
+            "description": "Retain captured error events for this many days. `null` keeps them\nuntil the project is deleted. Error groups keep their counters.",
+            "example": 90,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "events_days": {
+            "default": 90,
+            "description": "Retain analytics events (page views, custom events) for this many\ndays. Applied as the TimescaleDB retention policy of the `events`\nhypertable. ClickHouse-backed analytics keep their own storage TTL.",
+            "example": 90,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "unreferenced_ip_days": {
+            "default": 30,
+            "description": "Delete a stored client IP address (and its derived location) once\nnothing references it and it has not been looked up for this many\ndays. Never applied sooner than the proxy-log retention\n(`observability_retention.proxy_logs_days`): request logs kept outside\nPostgreSQL still point at the address. `null` keeps every address ever\nseen.",
+            "example": 30,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "visitor_days": {
+            "default": null,
+            "description": "Delete visitors that have not been seen for this many days. Their\nevents, proxy logs and error events stay (until their own retention\nends) but are no longer linked to a visitor; session replays of the\nvisitor are deleted with it. `null` keeps visitors indefinitely.",
+            "example": 425,
+            "format": "int32",
+            "maximum": 3650,
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "AnalyticsSessionEventsResponse": {
@@ -3553,6 +3617,16 @@
             },
             "description": "Transfer and preview limits for files in persistent AI workspaces.\nThese are runtime settings because operators have different control\nplane memory budgets and commonly work with very different asset sizes."
           },
+          "analytics_retention": {
+            "$ref": "#/components/schemas/AnalyticsRetentionSettings",
+            "default": {
+              "error_events_days": null,
+              "events_days": 90,
+              "unreferenced_ip_days": 30,
+              "visitor_days": null
+            },
+            "description": "Retention windows for product analytics data and for the personal\nidentifiers (visitors, client IP addresses) attached to it.\nApplied by a background job, not at save time, so a change takes\neffect within the job's interval."
+          },
           "anonymous_telemetry_enabled": {
             "default": null,
             "description": "Admin preference for anonymous product telemetry (the events sent to\nthe Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud\nmirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).\n\n- `None` (default) — the operator has not chosen; the built-in default\n  applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).\n- `Some(true)` / `Some(false)` — an admin turned it on/off from\n  Settings › Telemetry. Applied at runtime without a restart.\n\nThe `TEMPS_TELEMETRY=0` environment variable is a host-level kill\nswitch that wins over this value unconditionally. The dedicated\n`PATCH /settings/telemetry` endpoint is the only write path: the\ngeneric settings save restores the stored value under the row lock, so\nan older client round-tripping the whole document cannot flip it.",
@@ -3799,7 +3873,7 @@
             "$ref": "#/components/schemas/OnDemandTlsSettings",
             "default": {
               "deployment_url_mode": "http",
-              "enabled": false,
+              "enabled": true,
               "hourly_cap": 10,
               "max_concurrent": 3,
               "zone": null
@@ -3949,6 +4023,10 @@
           "ai_workspace_file_limits": {
             "$ref": "#/components/schemas/AiWorkspaceFileLimitsSettings",
             "description": "Persistent AI workspace file transfer and preview limits."
+          },
+          "analytics_retention": {
+            "$ref": "#/components/schemas/AnalyticsRetentionSettings",
+            "description": "Retention of analytics events and of the visitors and client IP\naddresses attached to them."
           },
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
@@ -4162,6 +4240,7 @@
           "monitoring",
           "observability_compression",
           "observability_retention",
+          "analytics_retention",
           "clickhouse",
           "geo",
           "effective_metrics_store",
@@ -6304,12 +6383,36 @@
         ],
         "type": "object"
       },
+      "BuildLimits": {
+        "description": "Operator settings persisted on each node. These are control-plane operations,\nindependent of the proxy request path. Existing agents keep their fixed limits.",
+        "properties": {
+          "build_timeout_seconds": {
+            "default": 1800,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "concurrency": {
+            "default": 1,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queue_wait_seconds": {
+            "default": 300,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "BuildLimitsSettings": {
-        "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global semaphore in the deployer crate\ngates every `DockerRuntime::build_image` call to `max_concurrent`. When\nthe semaphore is full, additional builds queue and wait — they do not\nfail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
+        "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global gate in the deployer crate\nadmits at most `max_concurrent` `DockerRuntime::build_image` calls at a\ntime. When the gate is full, additional builds queue and wait — they do\nnot fail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\nChanges apply live, with no restart. Builds already running finish with the\nlimits they started with; queued and new builds use the new ones. Lowering\n`max_concurrent` never stops a running build: new builds wait until enough\nof them finish to get under the new limit.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
         "properties": {
           "cpu_limit_cores": {
             "default": 0,
-            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Read once at startup; a change\ntakes effect after `temps serve` restarts.",
+            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Applies live to builds that start\nafter the change; a running build keeps the cap it started with.",
             "example": 2,
             "format": "float",
             "minimum": 0,
@@ -6317,7 +6420,7 @@
           },
           "max_concurrent": {
             "default": 2,
-            "description": "Maximum number of `docker build` operations allowed to run at the\nsame time on the control plane. Additional builds queue. Min 1.",
+            "description": "Maximum number of `docker build` operations allowed to run at the\nsame time on the control plane. Additional builds queue. Min 1.\nApplies live: raising it starts queued builds right away; lowering it\nlets running builds finish and holds new ones until they do.",
             "example": 2,
             "format": "int32",
             "minimum": 1,
@@ -6325,7 +6428,7 @@
           },
           "memory_limit_mb": {
             "default": 0,
-            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Same scope as `cpu_limit_cores`: applied only\nby the legacy builder, ignored by BuildKit, read once at startup.\nValues above 2047 MB are reduced to 2047 MB, the most the build API\naccepts through the client, with a warning in the server log.",
+            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Same scope as `cpu_limit_cores`: applied only\nby the legacy builder, ignored by BuildKit, applied live to builds that\nstart after the change.\nValues above 2047 MB are reduced to 2047 MB, the most the build API\naccepts through the client, with a warning in the server log.",
             "example": 2048,
             "format": "int32",
             "minimum": 0,
@@ -6338,9 +6441,55 @@
         "description": "Where a source deployment's image is built.\n\nThe control plane is the default and the historical behaviour. `Node`\nmoves the build — the most CPU- and memory-hungry step of a deployment —\nonto a worker node so it stops competing with the proxy, the database\nand running workloads on the control plane. A node labelled\n`temps.sh/role=builder` is preferred; otherwise the node the deployment\nis placed on builds it.\n\n`Node` is a preference, not a requirement: when no worker can take the\nbuild (none joined, none of the right architecture, or a\nmulti-architecture build) the build runs on the control plane and the\nbuild log says why. A static site may build on a worker of any\narchitecture, since its output is read from that node and never runs.",
         "enum": [
           "control_plane",
-          "node"
+          "node",
+          "ci"
         ],
         "type": "string"
+      },
+      "BuildSpec": {
+        "description": "Paths are relative to the root of the tar archive.\n\nDeliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,\nand a stray `{:?}` must not be able to put them in a log.",
+        "properties": {
+          "build_args": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Values for the Dockerfile's `ARG` instructions, applied exactly as\n`docker build --build-arg` would be (protocol v2). The control plane\ndecides which values may leave it -- never one marked secret or a\nplatform credential -- and sends only names the Dockerfile declares.\nThey travel inside this spec over the node's authenticated build\nchannel and are held in memory on both sides; neither side writes\nthem to disk or to a log.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "cache_namespace": {
+            "description": "BuildKit's predefined `BUILDKIT_CACHE_MOUNT_NS`: the control plane's\nper-project/environment/ref namespace for `RUN --mount=type=cache`.\nNot a project variable and not a credential, so it is the one build\nargument a worker receives. Without it, every project built on the\nsame worker shares writable cache mounts. Optional on the wire: an\nagent that predates it ignores the field and builds as before.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dockerfile": {
+            "type": "string"
+          },
+          "image_name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "image_name",
+          "dockerfile"
+        ],
+        "type": "object"
       },
       "BulkActivationEstimateResponse": {
         "description": "The quote.",
@@ -7577,6 +7726,105 @@
         },
         "required": [
           "children"
+        ],
+        "type": "object"
+      },
+      "CiExecutorSettings": {
+        "properties": {
+          "control_plane_url": {
+            "type": "string"
+          },
+          "dispatch_token": {
+            "description": "Write-only. Stored encrypted; omitted by the status endpoint.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "writeOnly": true
+          },
+          "git_ref": {
+            "type": "string"
+          },
+          "identity": {
+            "$ref": "#/components/schemas/TrustedIdentityIssuer"
+          },
+          "image_repository": {
+            "type": "string"
+          },
+          "limits": {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
+          "organization": {
+            "type": "boolean"
+          },
+          "owner": {
+            "type": "string"
+          },
+          "registry_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RemotePullCredentials",
+                "description": "Repository-scoped push/pull credentials. Never included in status."
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "writeOnly": true
+          },
+          "repository": {
+            "type": "string"
+          },
+          "runner_archive_sha256": {
+            "type": "string"
+          },
+          "runner_archive_url": {
+            "description": "Pinned release archive used by the generated CI shim.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "owner",
+          "repository",
+          "organization",
+          "git_ref",
+          "control_plane_url",
+          "runner_archive_url",
+          "runner_archive_sha256",
+          "identity",
+          "image_repository",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "CiExecutorStatus": {
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "settings": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CiExecutorSettings"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "setup_path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -9042,6 +9290,191 @@
         ],
         "type": "string"
       },
+      "ComposeCheckCommand": {
+        "description": "The `docker compose` invocation a check ran, sanitized for display.",
+        "properties": {
+          "argv": {
+            "description": "Program and arguments. Contains paths and option names only; no\nvariable values are passed on the command line.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "exit_code": {
+            "description": "Process exit code; `None` when it was killed or did not start.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stderr": {
+            "description": "The tail of stderr with variable values, quoted text, assignments,\nURLs and absolute paths removed. Line numbers and error wording are\nkept.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "argv"
+        ],
+        "type": "object"
+      },
+      "ComposeCheckErrorClass": {
+        "description": "Stable, user-facing class of a Compose check failure. The deploy job, the\npreview and the check action all report the same class for the same input.",
+        "enum": [
+          "interpolation",
+          "policy_violation",
+          "invalid_path",
+          "invalid_yaml",
+          "invalid_override",
+          "unsupported_compose_version",
+          "config_resolution",
+          "compose_unavailable",
+          "internal"
+        ],
+        "type": "string"
+      },
+      "ComposeCheckReport": {
+        "description": "Result of running the deploy-time resolution and policy validation.",
+        "properties": {
+          "command": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckCommand"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error": {
+            "description": "The same message the deployment would fail with. Variable values are\nredacted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_class": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckErrorClass"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "notes": {
+            "description": "Caveats about what this check could not cover.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "passed": {
+            "description": "Whether the configuration would pass the deploy-time checks.",
+            "type": "boolean"
+          },
+          "referenced_variables": {
+            "description": "Variables the file references, in sorted order. Names only.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "resolution_ran": {
+            "description": "Whether `docker compose config` actually ran for this check.",
+            "type": "boolean"
+          },
+          "resolution_reasons": {
+            "description": "Why `docker compose config` had to run (project override, include,\nextends, YAML tags). Empty when the file was validated directly.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "unset_variables": {
+            "description": "Variables referenced without a default that are not set; Compose\nsubstitutes an empty string for each.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "passed",
+          "resolution_reasons",
+          "resolution_ran",
+          "unset_variables",
+          "referenced_variables",
+          "notes"
+        ],
+        "type": "object"
+      },
+      "ComposeHostStatusResponse": {
+        "description": "The host's Docker Compose CLI as probed at startup.",
+        "properties": {
+          "available": {
+            "description": "Whether the Compose CLI ran.",
+            "type": "boolean"
+          },
+          "checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "minimum_version": {
+            "type": "string"
+          },
+          "missing_flags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "probed": {
+            "description": "False until the startup probe finishes.",
+            "type": "boolean"
+          },
+          "problem": {
+            "description": "Operator-facing explanation when not supported.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "description": "Whether every `docker compose config` option Temps needs is present.",
+            "type": "boolean"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "probed",
+          "available",
+          "supported",
+          "minimum_version",
+          "missing_flags"
+        ],
+        "type": "object"
+      },
+      "ComposeOverrideRedundancy": {
+        "description": "How a saved project override relates to the repository Compose file.",
+        "enum": [
+          "identical",
+          "superset"
+        ],
+        "type": "string"
+      },
       "ComposePortMapping": {
         "description": "A Docker Compose service port mapping, reduced to the information the UI\nneeds to build a public route without confusing host and container ports.",
         "properties": {
@@ -9077,6 +9510,28 @@
           },
           {
             "properties": {
+              "compose_check": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComposeCheckReport",
+                    "description": "The deploy-time Compose check that rejected the configuration, when\nit ran: the `docker compose config` command, its sanitized output and\nthe referenced variable names. Variable values are never included."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "error_class": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ComposeCheckErrorClass",
+                    "description": "The class a deployment of the same configuration would fail with."
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "policy_check": {
                 "oneOf": [
                   {
@@ -9108,6 +9563,14 @@
               "null"
             ]
           },
+          "environmentId": {
+            "description": "Environment whose variables resolve `${VAR}`; defaults to the\nproject's production environment. Requires `project_id`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "excludedServices": {
             "items": {
               "type": "string"
@@ -9119,7 +9582,15 @@
           },
           "previewPolicy": {
             "$ref": "#/components/schemas/ComposeSecurityPolicy",
-            "description": "Advisory preview only. Deployment reloads the saved project policy."
+            "description": "Advisory preview only. Deployment reloads the saved project policy.\nIgnored when `project_id` is set: the saved policy is used instead."
+          },
+          "projectId": {
+            "description": "The project this Compose file deploys. When set, the preview runs the\ndeploy job's check with that project's saved security policy and the\nenvironment's variables (values are never returned), so it fails with\nthe same error class a deployment would.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -9129,6 +9600,17 @@
       },
       "ComposePreviewResponse": {
         "properties": {
+          "check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckReport",
+                "description": "The deploy-time Compose check this preview ran (resolution, policy,\nreferenced variable names). `None` when the check is unavailable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "disabledServices": {
             "items": {
               "type": "string"
@@ -9144,6 +9626,24 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "overrideRedundancy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeOverrideRedundancy",
+                "description": "Set when the override repeats the whole repository file."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "overrideWarning": {
+            "description": "What to do about `override_redundancy`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "path": {
             "type": "string"
@@ -9414,6 +9914,49 @@
           "environmentVariables",
           "looksLikeDatabase",
           "ports"
+        ],
+        "type": "object"
+      },
+      "ComposeValidationReportResponse": {
+        "description": "The last stored Compose check for a project.",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error_class": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ComposeCheckErrorClass"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "outdated": {
+            "description": "True when the check ran under an older validation revision than this\nserver's and has not been repeated yet.",
+            "type": "boolean"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "passed",
+          "outdated",
+          "checked_at"
         ],
         "type": "object"
       },
@@ -11187,6 +11730,14 @@
             "description": "Filter by model name",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -13678,6 +14229,10 @@
               "string",
               "null"
             ]
+          },
+          "allow_docker": {
+            "description": "Permit installing/running Docker with normal guest-root privileges.\nRequires backend=\"microsandbox\". Does not install Docker or expose the host socket.",
+            "type": "boolean"
           },
           "backend": {
             "description": "Isolation backend: `\"docker\"` (default), `\"firecracker\"` (ADR-029,\nhardware-virtualized microVM — requires a host provisioned with\n`temps firecracker setup`) or `\"microsandbox\"` (ADR-050, experimental\nlibkrun microVM — requires `temps microsandbox setup`). Omit for the\nplatform default; existing clients are unaffected. Requesting an\nunavailable backend fails with 400 rather than silently downgrading\nisolation.",
@@ -17012,6 +17567,89 @@
         ],
         "type": "string"
       },
+      "DirectoryEntry": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/DirectoryEntryKind"
+          },
+          "name": {
+            "description": "Name within the directory, without any path.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "DirectoryEntryKind": {
+        "description": "What a directory entry is. Symlinks are reported, never followed.",
+        "enum": [
+          "file",
+          "directory",
+          "symlink",
+          "other"
+        ],
+        "type": "string"
+      },
+      "DirectoryListingResponse": {
+        "properties": {
+          "entries": {
+            "description": "Directories first, then everything else, each group in byte order of\nthe name. One page of the directory.",
+            "items": {
+              "$ref": "#/components/schemas/DirectoryEntry"
+            },
+            "type": "array"
+          },
+          "exists": {
+            "description": "`false` when the path does not exist (not an error).",
+            "type": "boolean"
+          },
+          "has_more": {
+            "description": "More entries exist after this page.",
+            "type": "boolean"
+          },
+          "is_dir": {
+            "description": "`false` when the path exists but is not a directory.",
+            "type": "boolean"
+          },
+          "page": {
+            "description": "1-based page these entries are.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "description": "Entries per page that was applied (default 20, at most 100).",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "total": {
+            "description": "Entries in the whole directory, so `ceil(total / page_size)` is the\nnumber of pages. At most 10000: see `truncated`.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "description": "The directory has more entries than the listing reads (10000), so\n`total` and the pages cover only the first 10000 names the filesystem\nreturned.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "path",
+          "exists",
+          "is_dir",
+          "entries",
+          "page",
+          "page_size",
+          "total",
+          "truncated",
+          "has_more"
+        ],
+        "type": "object"
+      },
       "DisableBlobResponse": {
         "description": "Response after disabling Blob service",
         "properties": {
@@ -19424,6 +20062,39 @@
           "path",
           "reason",
           "files"
+        ],
+        "type": "object"
+      },
+      "EffectiveLimits": {
+        "description": "The limits that apply to one project after inheritance.",
+        "properties": {
+          "max_cost_per_month_microcents": {
+            "description": "Operator-funded spend per UTC calendar month, in microcents\n(1/10000 of a cent); `null` means unlimited",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_cost_per_month_source": {
+            "$ref": "#/components/schemas/LimitSource"
+          },
+          "max_requests_per_minute": {
+            "description": "Requests per rolling minute; `null` means unlimited",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_requests_per_minute_source": {
+            "$ref": "#/components/schemas/LimitSource"
+          }
+        },
+        "required": [
+          "max_requests_per_minute_source",
+          "max_cost_per_month_source"
         ],
         "type": "object"
       },
@@ -28474,6 +29145,109 @@
         ],
         "type": "object"
       },
+      "ImageConfig": {
+        "description": "Runtime configuration baked into an image, read on the node that owns it.\n\nA worker build returns this so the control plane never needs a local copy\nof the image to learn which port it listens on.",
+        "properties": {
+          "entrypoint": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "env": {
+            "description": "`ENV` entries as `NAME=value`. Values are whatever the Dockerfile\nbaked in; callers must not persist or log them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "exposed_ports": {
+            "description": "Ports from `EXPOSE`, sorted ascending, without protocol.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "user": {
+            "description": "`USER`, when the image sets one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ImageInfo": {
+        "description": "Information about a Docker image, including architecture and platform details",
+        "properties": {
+          "architecture": {
+            "description": "Image architecture (e.g., \"amd64\", \"arm64\")",
+            "type": "string"
+          },
+          "config": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ImageConfig",
+                "description": "The rest of the image's runtime configuration. `None` when the daemon\n(or an agent that predates this field) did not report it, which is\ndifferent from an image that declares none of it."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created": {
+            "description": "Creation timestamp",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Image ID (sha256:...)",
+            "type": "string"
+          },
+          "os": {
+            "description": "Operating system (e.g., \"linux\")",
+            "type": "string"
+          },
+          "platform": {
+            "description": "Full platform string (e.g., \"linux/amd64\")",
+            "type": "string"
+          },
+          "size_bytes": {
+            "description": "Image size in bytes",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tags": {
+            "description": "Image tags",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "working_dir": {
+            "description": "Working directory (WORKDIR from Dockerfile)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "architecture",
+          "os",
+          "platform",
+          "size_bytes",
+          "tags"
+        ],
+        "type": "object"
+      },
       "ImageRetentionSettings": {
         "description": "System-wide retention policy for locally-built deployment images.\n\nThe nightly cleanup removes a Temps-built image only once *every*\ndeployment that references it is older than the owning project's retention\nwindow. Deleting an image makes rollback/promotion to that deployment\nimpossible, so the default is deliberately generous: it is a rollback\nwindow, not a cache TTL.",
         "properties": {
@@ -30322,6 +31096,28 @@
         ],
         "type": "object"
       },
+      "IpAccessCidrEntry": {
+        "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
+        "properties": {
+          "cidr": {
+            "description": "Canonical CIDR, e.g. `10.0.0.0/8` or `fd7a:115c:a1e0::/48`.",
+            "example": "100.64.0.0/10",
+            "type": "string"
+          },
+          "description": {
+            "description": "Optional human label, e.g. `Office`.",
+            "example": "Tailscale",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cidr"
+        ],
+        "type": "object"
+      },
       "IpAccessControlQuery": {
         "description": "Query parameters for listing IP access control rules",
         "properties": {
@@ -30378,6 +31174,15 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "IpAccessMode": {
+        "description": "How a scope's CIDR list is applied.",
+        "enum": [
+          "disabled",
+          "allow",
+          "deny"
+        ],
+        "type": "string"
       },
       "JobStatusResponse": {
         "description": "Snapshot of a background job. `status` is one of \"running\" | \"exited\"\n| \"failed\"; `exit_code` is populated only when `status == \"exited\"`.",
@@ -30884,6 +31689,83 @@
             "type": "string"
           }
         },
+        "type": "object"
+      },
+      "LimitSettingsBody": {
+        "description": "Limits as stored for one scope. `null` inherits from the next level\n(project → instance → built-in); `0` means unlimited.",
+        "properties": {
+          "max_cost_per_month_microcents": {
+            "description": "Operator-funded spend per UTC calendar month, in microcents\n(1/10000 of a cent; 1 USD = 1,000,000 microcents)",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_requests_per_minute": {
+            "description": "Requests per rolling minute",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "LimitSource": {
+        "description": "Where an effective limit came from.",
+        "enum": [
+          "project",
+          "instance",
+          "built_in"
+        ],
+        "type": "string"
+      },
+      "LimitsOverviewResponse": {
+        "properties": {
+          "built_in_max_requests_per_minute": {
+            "description": "Requests per minute applied to a project when nothing is configured",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "instance": {
+            "$ref": "#/components/schemas/LimitSettingsBody",
+            "description": "Instance-wide limits as stored (what the admin set)"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_overrides": {
+            "description": "Projects that override the instance defaults",
+            "items": {
+              "$ref": "#/components/schemas/ProjectLimitOverride"
+            },
+            "type": "array"
+          },
+          "total_project_overrides": {
+            "description": "Total number of projects with overrides, across all pages",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "instance",
+          "built_in_max_requests_per_minute",
+          "project_overrides",
+          "total_project_overrides",
+          "page",
+          "page_size"
+        ],
         "type": "object"
       },
       "LineContext": {
@@ -31407,7 +32289,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/OperationStatusFilter",
-                "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default)."
+                "description": "`running` (queued, running), `waiting` (needs human review),\n`finished` (succeeded, failed, cancelled) or `all` (default)."
               },
               {
                 "type": "null"
@@ -33772,6 +34654,21 @@
         ],
         "type": "object"
       },
+      "MigrateS3ServiceRequest": {
+        "description": "Copy every bucket of another managed S3 service into this one.",
+        "properties": {
+          "source_service_id": {
+            "description": "Managed S3 service to copy from (RustFS or Garage). It is only read.",
+            "example": 12,
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_service_id"
+        ],
+        "type": "object"
+      },
       "MigrationStep": {
         "description": "A single step in the migration execution plan.\n\nSteps are presented to the user before execution so they know exactly\nwhat will happen. During execution, each step runs in order and reports\nits outcome before proceeding to the next.",
         "properties": {
@@ -35118,6 +36015,9 @@
               "null"
             ]
           },
+          "build_limits": {
+            "$ref": "#/components/schemas/BuildLimits"
+          },
           "capacity": {
             "description": "Resource capacity/usage metrics from the latest heartbeat"
           },
@@ -35199,6 +36099,7 @@
           "status",
           "labels",
           "capacity",
+          "build_limits",
           "created_at",
           "public_ingress_enabled",
           "public_ingress_unsupported_reasons"
@@ -36594,7 +37495,7 @@
         "type": "object"
       },
       "OnDemandTlsSettings": {
-        "description": "On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).\n\nWhen `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01\nissuance for allowlisted, STABLE hostnames (per-environment aliases and the\nconsole host) that have no active cert, rather than silently failing the\nhandshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).\n\nOff by default — operators opt in explicitly, except QuickStart (`sslip.io`)\ninstalls where `temps setup` auto-enables it and derives `zone`.",
+        "description": "On-demand (lazy) HTTP-01 TLS issuance settings (ADR-018).\n\nWhen `enabled`, the proxy's `certificate_callback` triggers ACME HTTP-01\nissuance for allowlisted, STABLE hostnames (per-environment aliases and the\nconsole host) that have no active cert, rather than silently failing the\nhandshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).\n\nNew installations start with it on (`AppSettings::default`); the zone comes\nfrom `zone` or is derived from `external_url`/`preview_domain`, and nothing\nis issued while none can be derived or `external_url` is loopback. A settings\nrow stored before this section existed stays off until the operator enables\nit.",
         "properties": {
           "deployment_url_mode": {
             "default": "http",
@@ -36604,8 +37505,8 @@
           },
           "enabled": {
             "default": false,
-            "description": "Master switch. When `false` (default) the proxy's on-demand cert gate\nrejects every SNI and no issuance is ever triggered.",
-            "example": false,
+            "description": "Master switch. When `false` the proxy's on-demand cert gate rejects\nevery SNI and no issuance is ever triggered. New installations start\nwith it `true`; a stored settings row that predates this section keeps\n`false`.",
+            "example": true,
             "type": "boolean"
           },
           "hourly_cap": {
@@ -36914,6 +37815,7 @@
         "description": "Which slice of the feed to return.",
         "enum": [
           "running",
+          "waiting",
           "finished",
           "all"
         ],
@@ -36939,7 +37841,7 @@
             "type": "integer"
           },
           "running_count": {
-            "description": "Queued, running and waiting operations matching the scope, `kind` and\n`project_id` filters — independent of the `status` filter, so the tray\nbadge stays correct while browsing finished operations.",
+            "description": "Queued and running operations matching the scope, `kind` and\n`project_id` filters — independent of the `status` filter, so the tray\nbadge stays correct while browsing finished operations.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
@@ -40016,6 +40918,16 @@
         ],
         "type": "string"
       },
+      "PolicySource": {
+        "description": "Which policy decided a test.",
+        "enum": [
+          "draft",
+          "environment",
+          "project",
+          "none"
+        ],
+        "type": "string"
+      },
       "PortMapping": {
         "description": "Port mapping",
         "properties": {
@@ -41278,6 +42190,122 @@
         ],
         "type": "object"
       },
+      "ProjectIpAccessDetail": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ProjectIpAccessResponse"
+          },
+          {
+            "properties": {
+              "your_ip": {
+                "description": "The address this request arrived from, as the console resolved it.\nIt is the address the project will see only if the console and the\nproject are reached over the same network path.",
+                "example": "203.0.113.9",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "type": "object"
+          }
+        ],
+        "description": "A stored policy plus the address the console saw for the caller, so the\nUI can offer \"add my IP\" and warn before a lock-out."
+      },
+      "ProjectIpAccessResponse": {
+        "description": "One scope's stored policy.",
+        "properties": {
+          "cidrs": {
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": "array"
+          },
+          "configured": {
+            "description": "`false` when nothing is stored for this scope. For an environment that\nmeans it inherits the project-wide policy.",
+            "type": "boolean"
+          },
+          "environment_id": {
+            "description": "`null` for the project-wide policy.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_cidrs": {
+            "description": "Maximum number of CIDRs a policy may hold.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "updated_at": {
+            "example": "2026-10-13T09:30:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "configured",
+          "mode",
+          "cidrs",
+          "max_cidrs"
+        ],
+        "type": "object"
+      },
+      "ProjectLimitOverride": {
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/LimitSettingsBody"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "limits"
+        ],
+        "type": "object"
+      },
+      "ProjectLimitsResponse": {
+        "properties": {
+          "effective": {
+            "$ref": "#/components/schemas/EffectiveLimits",
+            "description": "Limits actually enforced after inheritance"
+          },
+          "month_spend_microcents": {
+            "description": "Operator-funded spend so far this UTC month, in microcents",
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "stored": {
+            "$ref": "#/components/schemas/LimitSettingsBody",
+            "description": "This project's own limits as stored; `null` fields inherit"
+          }
+        },
+        "required": [
+          "project_id",
+          "stored",
+          "effective",
+          "month_spend_microcents"
+        ],
+        "type": "object"
+      },
       "ProjectMonitorHealth": {
         "description": "Health summary for a single project based on its production monitors",
         "properties": {
@@ -41928,6 +42956,65 @@
         ],
         "type": "string"
       },
+      "ProjectUsage": {
+        "description": "Per-project spend and volume, for cost reporting.",
+        "properties": {
+          "byok_request_count": {
+            "description": "Requests served with a caller-supplied provider key (not operator spend)",
+            "format": "int64",
+            "type": "integer"
+          },
+          "error_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "estimated_cost_microcents": {
+            "description": "Estimated cost in microcents (1/10000 of a cent), from the model price list",
+            "format": "int64",
+            "type": "integer"
+          },
+          "input_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "monthly_budget_microcents": {
+            "description": "The project's effective monthly budget after inheritance, in microcents;\n`null` when it has no cap. Left `None` by the usage service and filled in\nby the handler, which owns the link to the limits service.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "operator_cost_microcents": {
+            "description": "The part of `estimated_cost_microcents` the operator pays for: requests\nmade with a caller-supplied provider key are excluded. This is the\nfigure a project's monthly budget is measured against.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "request_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "request_count",
+          "input_tokens",
+          "output_tokens",
+          "estimated_cost_microcents",
+          "operator_cost_microcents",
+          "byok_request_count",
+          "error_count"
+        ],
+        "type": "object"
+      },
       "ProjectUsageInfoResponse": {
         "properties": {
           "connection_id": {
@@ -41955,6 +43042,34 @@
           "connection_id",
           "connection_name"
         ],
+        "type": "object"
+      },
+      "ProjectUsageQueryParams": {
+        "properties": {
+          "from": {
+            "description": "ISO 8601 start time (defaults to 24h ago)",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "limit": {
+            "description": "Max projects returned (defaults to 50, max 100)",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "to": {
+            "description": "ISO 8601 end time (defaults to now)",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "ProjectsHealthResponse": {
@@ -44427,6 +45542,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "description": "Filter by provider name",
             "type": [
@@ -45124,6 +46247,38 @@
           "source_type",
           "created_at"
         ],
+        "type": "object"
+      },
+      "RemotePullCredentials": {
+        "description": "Registry credentials to forward to the worker's `POST /agent/images/pull`\ncall. Mirrors the wire shape of `temps_agent::RegistryCredentials` field\nfor field; `temps-deployer` does not depend on `temps-agent` (the same\nreason `import_image` below builds its own request rather than sharing a\nDTO type), so this struct only needs to serialize to the JSON body the\nagent handler already deserializes.",
+        "properties": {
+          "identity_token": {
+            "description": "**Never logged or included in error messages.**",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "password": {
+            "description": "**Never logged or included in error messages.**",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "server_address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "username": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "RemoveNodeResponse": {
@@ -47264,6 +48419,117 @@
         },
         "type": "object"
       },
+      "RunnerClaim": {
+        "properties": {
+          "identity_token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "identity_token"
+        ],
+        "type": "object"
+      },
+      "RunnerFailure": {
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "message"
+        ],
+        "type": "object"
+      },
+      "RunnerLogs": {
+        "properties": {
+          "lines": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines"
+        ],
+        "type": "object"
+      },
+      "RunnerResult": {
+        "properties": {
+          "build_id": {
+            "type": "string"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "image": {
+            "$ref": "#/components/schemas/ImageInfo"
+          },
+          "platforms": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "build_id",
+          "run_id",
+          "digest",
+          "platforms",
+          "image",
+          "duration_ms"
+        ],
+        "type": "object"
+      },
+      "RunnerWork": {
+        "properties": {
+          "registry_credentials": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RemotePullCredentials"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "registry_tag": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "spec": {
+            "$ref": "#/components/schemas/BuildSpec"
+          },
+          "timeout_seconds": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "token": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "token",
+          "spec",
+          "registry_tag",
+          "run_id",
+          "timeout_seconds"
+        ],
+        "type": "object"
+      },
       "RuntimeCredentialsResponse": {
         "description": "Live connection variables for a service in one environment.\n\nEvery value is plaintext — this is the response of the audited issuance\nendpoint, not of the masked bulk read. Callers must treat it as a\ncredential: do not log it, do not cache it, do not put it in an error.",
         "properties": {
@@ -47332,6 +48598,40 @@
           "region",
           "bucket_name",
           "force_path_style"
+        ],
+        "type": "object"
+      },
+      "S3MigrationReport": {
+        "description": "Outcome of copying one managed S3 service's buckets into another.",
+        "properties": {
+          "buckets": {
+            "description": "Buckets that were copied, by their name on the source.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "source_backend": {
+            "type": "string"
+          },
+          "source_service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "target_backend": {
+            "type": "string"
+          },
+          "target_service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source_service_id",
+          "target_service_id",
+          "source_backend",
+          "target_backend",
+          "buckets"
         ],
         "type": "object"
       },
@@ -47464,6 +48764,10 @@
               "null"
             ]
           },
+          "allow_docker": {
+            "description": "Normal guest-root semantics enabled for Docker (microsandbox only).",
+            "type": "boolean"
+          },
           "backend": {
             "description": "Isolation backend: \"docker\" | \"firecracker\" | \"microsandbox\". `None` on legacy rows\ncreated before the backend was recorded.",
             "type": [
@@ -47574,6 +48878,7 @@
           }
         },
         "required": [
+          "allow_docker",
           "id",
           "memory",
           "vcpus",
@@ -51528,6 +52833,31 @@
         },
         "required": [
           "hosting"
+        ],
+        "type": "object"
+      },
+      "SetProjectIpAccessRequest": {
+        "description": "Request body for `PUT`: the complete policy for one scope.",
+        "properties": {
+          "acknowledge_lockout": {
+            "description": "Apply an allow list that excludes (or a deny list that includes) the\naddress this request came from. Without it such a save is refused\nwith 409 so an operator cannot lock themselves out by accident.",
+            "type": "boolean"
+          },
+          "cidrs": {
+            "description": "CIDRs (IPv4 or IPv6). A bare address is a single host. At most 256.",
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode",
+            "description": "`disabled` keeps the list but enforces nothing; `allow` admits only\nlisted clients; `deny` blocks listed clients."
+          }
+        },
+        "required": [
+          "mode",
+          "cidrs"
         ],
         "type": "object"
       },
@@ -55803,6 +57133,76 @@
         ],
         "type": "object"
       },
+      "TestProjectIpAccessRequest": {
+        "description": "Request body for the \"try an address against the rules\" endpoint.",
+        "properties": {
+          "cidrs": {
+            "items": {
+              "$ref": "#/components/schemas/IpAccessCidrEntry"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "ip": {
+            "description": "Address to evaluate.",
+            "example": "100.101.102.103",
+            "type": "string"
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IpAccessMode",
+                "description": "Evaluate this unsaved draft instead of the stored policy. Both `mode`\nand `cidrs` must be given together."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "ip"
+        ],
+        "type": "object"
+      },
+      "TestProjectIpAccessResponse": {
+        "properties": {
+          "allowed": {
+            "type": "boolean"
+          },
+          "ip": {
+            "description": "The address as evaluated (IPv4-mapped IPv6 is shown as IPv4).",
+            "type": "string"
+          },
+          "matched_cidr": {
+            "description": "The listed CIDR the address fell inside, when one did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IpAccessMode"
+          },
+          "reason": {
+            "description": "One-sentence explanation suitable for display.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/PolicySource"
+          }
+        },
+        "required": [
+          "ip",
+          "allowed",
+          "source",
+          "mode",
+          "reason"
+        ],
+        "type": "object"
+      },
       "TestProviderKeyRequest": {
         "properties": {
           "api_key": {
@@ -56080,6 +57480,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "description": "Filter by provider name",
             "type": [
@@ -56286,6 +57694,14 @@
             "description": "Max results (defaults to 10)",
             "format": "int64",
             "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
             "type": [
               "integer",
               "null"
@@ -57509,6 +58925,30 @@
           "scan_id",
           "status",
           "message"
+        ],
+        "type": "object"
+      },
+      "TrustedIdentityIssuer": {
+        "description": "Public trust policy; no hardcoded provider-specific token validator.",
+        "properties": {
+          "audience": {
+            "type": "string"
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "jwks_url": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "issuer",
+          "jwks_url",
+          "audience",
+          "subject"
         ],
         "type": "object"
       },
@@ -60865,6 +62305,14 @@
               "null"
             ]
           },
+          "project_id": {
+            "description": "Restrict to usage attributed to this project (deployment-token callers).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "type": [
               "string",
@@ -60987,6 +62435,14 @@
             "format": "int64",
             "type": "integer"
           },
+          "project_id": {
+            "description": "Project the call is attributed to (deployment-token callers only)",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "provider": {
             "type": "string"
           },
@@ -61008,6 +62464,14 @@
           },
           "timestamp": {
             "type": "string"
+          },
+          "token_id": {
+            "description": "Deployment token the call is attributed to",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "trace_id": {
             "type": [
@@ -61074,6 +62538,14 @@
             "description": "Filter by model name",
             "type": [
               "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "format": "int32",
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -67448,6 +68920,345 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/limits": {
+      "get": {
+        "operationId": "get_limits_overview",
+        "parameters": [
+          {
+            "description": "Page of project overrides (default 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default 20, max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitsOverviewResponse"
+                }
+              }
+            },
+            "description": "Instance defaults and per-project overrides"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/limits/instance": {
+      "put": {
+        "operationId": "update_instance_limits",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitSettingsBody"
+                }
+              }
+            },
+            "description": "Instance-wide defaults replaced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid limit"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/ai/limits/projects/{project_id}": {
+      "delete": {
+        "operationId": "reset_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Project limits cleared; the project inherits the instance defaults"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      },
+      "get": {
+        "operationId": "get_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectLimitsResponse"
+                }
+              }
+            },
+            "description": "Stored and effective limits plus this month's spend"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      },
+      "put": {
+        "operationId": "update_project_limits",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LimitSettingsBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LimitSettingsBody"
+                }
+              }
+            },
+            "description": "Project limits replaced, as stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid limit"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Limits"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/pending-actions/{action_public_id}": {
       "get": {
         "operationId": "get_user_pending_action",
@@ -68543,6 +70354,96 @@
         "x-maturity": "experimental"
       }
     },
+    "/ai/usage/by-project": {
+      "get": {
+        "operationId": "get_usage_by_project",
+        "parameters": [
+          {
+            "description": "ISO 8601 start time (defaults to 24h ago)",
+            "in": "query",
+            "name": "from",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "ISO 8601 end time (defaults to now)",
+            "in": "query",
+            "name": "to",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max projects (defaults to 50, max 100)",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectUsage"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Spend and volume per project, most expensive first"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query parameters"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Requires an instance administrator"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "AI Gateway Usage"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/ai/usage/by-provider": {
       "get": {
         "operationId": "get_usage_by_provider",
@@ -68563,6 +70464,16 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           }
         ],
@@ -68626,6 +70537,16 @@
       "get": {
         "operationId": "get_conversations",
         "parameters": [
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
           {
             "description": "ISO 8601 start time (defaults to 24h ago)",
             "in": "query",
@@ -68856,6 +70777,16 @@
             }
           },
           {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
             "description": "Filter by HTTP status code (exact match)",
             "in": "query",
             "name": "status",
@@ -69010,6 +70941,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -69094,6 +71035,16 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           }
         ],
@@ -69183,6 +71134,16 @@
             "schema": {
               "format": "int64",
               "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by project ID (deployment-token usage; instance administrators only)",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
               "type": "integer"
             }
           }
@@ -83605,6 +85566,19 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "Managed S3 storage engine to describe (`rustfs` or `garage`). Defaults\nto `rustfs`; ignored for service types without backends.",
+            "example": "garage",
+            "in": "query",
+            "name": "backend",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -85257,6 +87231,70 @@
         "summary": "Return the freshness status (last-received timestamp) for a service.",
         "tags": [
           "Metrics"
+        ]
+      }
+    },
+    "/external-services/{id}/migrate-s3": {
+      "post": {
+        "description": "Plain S3 semantics, so data moves between any two backends (RustFS to\nGarage and back). The source is only read and existing target objects are\nkept. Re-run it after switching writers to pick up late writes.",
+        "operationId": "migrate_s3_service",
+        "parameters": [
+          {
+            "description": "Target external service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MigrateS3ServiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/S3MigrationReport"
+                }
+              }
+            },
+            "description": "Buckets copied"
+          },
+          "400": {
+            "description": "Either service is not a migratable managed S3 service"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Copy every bucket of another managed S3 service into this one",
+        "tags": [
+          "External Services"
         ]
       }
     },
@@ -91018,6 +93056,287 @@
         "x-maturity": "experimental"
       }
     },
+    "/internal/ci-builds/{build_id}/claim": {
+      "post": {
+        "operationId": "claim_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerClaim"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunnerWork"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Runner identity rejected"
+          },
+          "409": {
+            "description": "Build already claimed or terminal"
+          },
+          "425": {
+            "description": "Provider run has not been recorded; retry claim"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/context": {
+      "get": {
+        "operationId": "get_ci_build_context",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-tar": {}
+            },
+            "description": "Streamed agent-protocol context tar"
+          },
+          "401": {
+            "description": "One-build token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/failure": {
+      "post": {
+        "operationId": "fail_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerFailure"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Build failed and token revoked"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/lease": {
+      "get": {
+        "operationId": "check_ci_build_lease",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Lease active"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build cancelled or expired"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/logs": {
+      "post": {
+        "operationId": "append_ci_build_logs",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerLogs"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Log batch appended"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Build inactive or batch exceeds limit"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
+    "/internal/ci-builds/{build_id}/result": {
+      "post": {
+        "operationId": "complete_ci_build",
+        "parameters": [
+          {
+            "description": "Opaque build UUID",
+            "in": "path",
+            "name": "build_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunnerResult"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Verified result accepted and token revoked"
+          },
+          "401": {
+            "description": "Token required"
+          },
+          "403": {
+            "description": "Token rejected"
+          },
+          "409": {
+            "description": "Verification rejected or build inactive"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI runner"
+        ]
+      }
+    },
     "/internal/nodes": {
       "get": {
         "operationId": "admin_list_nodes",
@@ -91197,6 +93516,67 @@
           }
         ],
         "summary": "Get a specific node by ID (admin — session auth via RequireAuth)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/build-limits": {
+      "put": {
+        "operationId": "admin_set_node_build_limits",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildLimits"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildLimits"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid limits or node role"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Nodes"
         ]
@@ -96906,7 +99286,7 @@
             }
           },
           {
-            "description": "`running` (queued, running, waiting), `finished` (succeeded, failed,\ncancelled) or `all` (default).",
+            "description": "`running` (queued, running), `waiting` (needs human review),\n`finished` (succeeded, failed, cancelled) or `all` (default).",
             "in": "query",
             "name": "status",
             "required": false,
@@ -103039,6 +105419,52 @@
         ]
       }
     },
+    "/platform/compose-status": {
+      "get": {
+        "operationId": "get_compose_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeHostStatusResponse"
+                }
+              }
+            },
+            "description": "Docker Compose CLI status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The host's Docker Compose CLI, as probed at startup. Compose deployments\nthat need `docker compose config` fail on an unsupported CLI; the console\nshows a platform warning from this.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
     "/platform/features": {
       "get": {
         "description": "Always present, in every profile — a client must be able to tell\n\"unavailable here, and here is why\" from \"endpoint does not exist\".",
@@ -108279,6 +110705,54 @@
         ]
       }
     },
+    "/projects/{project_id}/analytics/ingest-endpoint": {
+      "get": {
+        "description": "This is the `basePath` of the install snippet. It is its own endpoint\nbecause `GET /settings` needs `settings:read`, which a project member does\nnot hold; this one needs only `AnalyticsRead` on the project, exactly like\nlisting the keys the same snippet embeds, and exposes nothing but the one\naddress. `external_url: null` means none is stored.",
+        "operationId": "get_analytics_ingest_key_endpoint",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestEndpoint"
+                }
+              }
+            },
+            "description": "The configured external URL, or null when none is stored"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The public address an app Temps does not deploy should send analytics to.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
     "/projects/{project_id}/analytics/ingest-keys": {
       "get": {
         "description": "Includes revoked keys: revocation is soft, and an operator investigating\n\"which key sent this?\" needs to see the rows that no longer work. Every\n`public_key` is returned unmasked — see [`create_analytics_ingest_key`].",
@@ -109657,6 +112131,81 @@
         ]
       }
     },
+    "/projects/{project_id}/compose-validation": {
+      "get": {
+        "operationId": "get_project_compose_validation",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ComposeValidationReportResponse"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Last stored check, or null"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The project's most recent stored Compose check (from its last deployment\nor the revalidation after an upgrade); `null` when it was never checked.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
     "/projects/{project_id}/custom-domains": {
       "get": {
         "operationId": "list_custom_domains_for_project",
@@ -110708,6 +113257,114 @@
         "summary": "Cancel a deployment",
         "tags": [
           "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/deployments/{deployment_id}/compose-check": {
+      "post": {
+        "operationId": "run_deployment_compose_check",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Deployment ID",
+            "in": "path",
+            "name": "deployment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeCheckReport"
+                }
+              }
+            },
+            "description": "Check result (passed or the failure)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a Docker Compose project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, deployment or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The Compose file could not be read from the Git provider"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Run the deploy job's Compose configuration check for a deployment, without\ndeploying: the deployment's commit, the project's current override,\nexclusions and security policy, and the environment's variables. Returns\nthe error the deployment would fail with, its class, and the exact\n`docker compose config` command with sanitized output. Read-only.",
+        "tags": [
+          "Compose"
         ]
       }
     },
@@ -115073,6 +117730,405 @@
         "x-maturity": "experimental"
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/ip-access": {
+      "delete": {
+        "description": "The environment goes back to inheriting the project-wide policy.",
+        "operationId": "delete_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Policy removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment or policy not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "description": "`configured: false` means the environment inherits the project-wide policy.",
+        "operationId": "get_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "The environment's own IP access policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "Replaces (does not extend) the project-wide policy for this environment.\nMode `disabled` exempts the environment from a project-wide list.",
+        "operationId": "put_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "Policy saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Policy would lock out the caller"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/ip-access/test": {
+      "post": {
+        "description": "Evaluates the policy that governs the environment (its own, else the\nproject's), or an unsaved draft when `mode` and `cidrs` are supplied.",
+        "operationId": "test_environment_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestProjectIpAccessResponse"
+                }
+              }
+            },
+            "description": "Evaluation result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid address or draft"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Try an address against an environment's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/projects/{project_id}/error-alert-rules": {
       "get": {
         "operationId": "list_alert_rules",
@@ -118947,6 +122003,365 @@
           "Project Groups"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/projects/{project_id}/ip-access": {
+      "delete": {
+        "description": "The project becomes reachable from any address again (environments with\ntheir own policy keep it).",
+        "operationId": "delete_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Policy removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or policy not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "get": {
+        "description": "Returns `configured: false` and mode `disabled` when nothing is stored.",
+        "operationId": "get_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "The project-wide IP access policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      },
+      "put": {
+        "description": "Replaces the whole project-wide policy. An `allow` list must name at least\none CIDR. A save that would lock out the caller's own address is refused\nwith `409` unless `acknowledge_lockout` is `true`.",
+        "operationId": "put_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectIpAccessDetail"
+                }
+              }
+            },
+            "description": "Policy saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid policy"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Policy would lock out the caller"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/ip-access/test": {
+      "post": {
+        "description": "Evaluates the stored policy, or an unsaved draft when `mode` and `cidrs`\nare supplied, using the same matcher the proxy uses.",
+        "operationId": "test_project_ip_access",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestProjectIpAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestProjectIpAccessResponse"
+                }
+              }
+            },
+            "description": "Evaluation result"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid address or draft"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Try an address against a project's IP access policy",
+        "tags": [
+          "Project IP Access"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/projects/{project_id}/logs": {
@@ -127685,6 +131100,113 @@
         ]
       }
     },
+    "/settings/ci-builder": {
+      "get": {
+        "operationId": "get_ci_builder",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiExecutorStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
+        ]
+      },
+      "put": {
+        "operationId": "set_ci_builder",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CiExecutorSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CiExecutorStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid settings"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
+        ]
+      }
+    },
+    "/settings/ci-builder/provision": {
+      "post": {
+        "operationId": "provision_ci_builder",
+        "responses": {
+          "204": {
+            "description": "Builder repository and pinned shim provisioned"
+          },
+          "400": {
+            "description": "Configuration/provider error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "500": {
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "CI builder"
+        ]
+      }
+    },
     "/settings/cluster-ca/rotate": {
       "post": {
         "operationId": "rotate_cluster_ca",
@@ -133079,6 +136601,80 @@
         "x-maturity": "experimental"
       }
     },
+    "/v1/sandboxes/{id}/fs/list": {
+      "get": {
+        "operationId": "list_dir",
+        "parameters": [
+          {
+            "description": "Absolute path of a directory inside the sandbox",
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "1-based page (default 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entries per page (default 20, max 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryListingResponse"
+                }
+              }
+            },
+            "description": "One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)"
+          },
+          "400": {
+            "description": "Validation error, or the directory is not readable by the sandbox user"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "409": {
+            "description": "Sandbox is not running (stopped or paused), so its filesystem cannot be listed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/v1/sandboxes/{id}/fs/mkdir": {
       "post": {
         "operationId": "mkdir",
@@ -135505,6 +139101,10 @@
       "name": "AI Gateway Usage"
     },
     {
+      "description": "Rate limits and spend caps for AI gateway callers",
+      "name": "AI Gateway Limits"
+    },
+    {
       "description": "Model pricing endpoints",
       "name": "AI Gateway Pricing"
     },
@@ -135523,6 +139123,10 @@
     {
       "description": "Cron jobs management API",
       "name": "Crons"
+    },
+    {
+      "description": "Docker Compose configuration diagnostics",
+      "name": "Compose"
     },
     {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
@@ -135603,6 +139207,10 @@
     {
       "description": "IP access control management endpoints",
       "name": "IP Access Control"
+    },
+    {
+      "description": "Per-project and per-environment client IP allow/deny lists",
+      "name": "Project IP Access"
     },
     {
       "description": "Static file serving endpoints",

@@ -4473,6 +4473,9 @@ fn application_workspace_failure_detail(
                 "Temps could not start workspace compute. Try again; if it continues, contact your Temps administrator."
             }
         }
+        SandboxError::NetworkCapacityExhausted { .. } => {
+            "This Temps host has no private sandbox network capacity available. Contact your Temps administrator, then try again."
+        }
         SandboxError::Unavailable { .. } => {
             "The sandbox runtime is unavailable on this Temps host. Contact your Temps administrator, then try again."
         }
@@ -4504,9 +4507,9 @@ fn application_workspace_failure_problem(error: &temps_sandbox::error::SandboxEr
     use temps_sandbox::error::SandboxError;
 
     let status = match error {
-        SandboxError::Unavailable { .. } | SandboxError::ImageUnavailable { .. } => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        SandboxError::Unavailable { .. }
+        | SandboxError::ImageUnavailable { .. }
+        | SandboxError::NetworkCapacityExhausted { .. } => StatusCode::SERVICE_UNAVAILABLE,
         SandboxError::Timeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         SandboxError::InvalidState { .. } | SandboxError::RuntimeVariableConflict { .. } => {
             StatusCode::CONFLICT

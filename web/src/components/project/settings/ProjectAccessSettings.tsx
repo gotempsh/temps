@@ -20,16 +20,7 @@ import {
   revokeProjectAccessMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectAccessResponse, TeamRole } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import {
@@ -395,49 +386,33 @@ export function ProjectAccessSettings({ project }: ProjectAccessSettingsProps) {
         </DialogContent>
       </Dialog>
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={grantToRevoke !== null}
         onOpenChange={(open) => {
           if (!open) setGrantToRevoke(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Revoke access?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Members of{' '}
-              {grantToRevoke
-                ? `"${teamName(grantToRevoke.team_id)}"`
-                : 'this team'}{' '}
-              lose access to this service immediately, unless another team also
-              grants it to them.
-              {grantList.length === 1 &&
-                ' This is the last grant — revoking it makes the service open to everyone again.'}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={revokeMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                if (grantToRevoke) {
-                  revokeMutation.mutate({
-                    path: {
-                      project_id: project.id,
-                      team_id: grantToRevoke.team_id,
-                    },
-                  })
-                }
-              }}
-              disabled={revokeMutation.isPending}
-            >
-              {revokeMutation.isPending ? 'Revoking…' : 'Revoke access'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        verb="Revoke"
+        confirmLabel="Revoke access"
+        resourceType="access for team"
+        resourceName={grantToRevoke ? teamName(grantToRevoke.team_id) : ''}
+        consequences={`Members of this team lose access to this service immediately, unless another team also grants it to them.${
+          grantList.length === 1
+            ? ' This is the last grant — revoking it makes the service open to everyone again.'
+            : ''
+        }`}
+        irreversible={false}
+        isPending={revokeMutation.isPending}
+        onConfirm={() => {
+          if (grantToRevoke) {
+            revokeMutation.mutate({
+              path: {
+                project_id: project.id,
+                team_id: grantToRevoke.team_id,
+              },
+            })
+          }
+        }}
+      />
     </div>
   )
 }

@@ -103,7 +103,7 @@ impl PrepareSourceBundleJob {
         {
             return Err(WorkflowError::InvalidArchiveEntry {
                 path: path.display().to_string(),
-                reason: "entry path escapes the source root".to_string(),
+                reason: "its path resolves outside the archive root; use paths relative to the archive root".to_string(),
             });
         }
         Ok(())
@@ -156,7 +156,7 @@ impl PrepareSourceBundleJob {
                     .enclosed_name()
                     .ok_or_else(|| WorkflowError::InvalidArchiveEntry {
                         path: entry_display_name(&entry),
-                        reason: "entry path escapes the source root".to_string(),
+                        reason: "its path resolves outside the archive root; use paths relative to the archive root".to_string(),
                     })?;
             Self::validate_path(&enclosed)?;
             match classify_drop_entry(&enclosed) {
@@ -186,7 +186,7 @@ impl PrepareSourceBundleJob {
             {
                 return Err(WorkflowError::InvalidArchiveEntry {
                     path: entry_display_name(&entry),
-                    reason: "symbolic links are not allowed".to_string(),
+                    reason: "symbolic links are not allowed; replace the link with the file or directory it points to".to_string(),
                 });
             }
             if entry.is_dir() {

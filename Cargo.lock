@@ -10102,9 +10102,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -12164,6 +12164,7 @@ dependencies = [
  "temps-dns-resolver",
  "temps-network",
  "temps-providers",
+ "temps-vulnerability-scanner",
  "temps-wireguard",
  "thiserror 2.0.21",
  "tokio",
@@ -12415,6 +12416,7 @@ dependencies = [
  "async-trait",
  "axum",
  "axum-macros",
+ "bollard",
  "chrono",
  "hex",
  "moka",
@@ -12429,6 +12431,7 @@ dependencies = [
  "sha2 0.11.0",
  "temps-ai",
  "temps-auth",
+ "temps-config",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -13119,6 +13122,7 @@ name = "temps-deployer"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-sdk-s3",
  "bollard",
@@ -13149,6 +13153,7 @@ dependencies = [
  "temps-entities",
  "temps-file-store",
  "temps-network",
+ "temps-presets",
  "temps-routes",
  "testcontainers",
  "thiserror 2.0.21",
@@ -13184,6 +13189,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "jsonwebtoken 11.1.0",
  "libc",
  "mockall",
  "octocrab",
@@ -13198,6 +13204,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-pki-types",
  "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
  "serde",
  "serde_derive",
  "serde_json",
@@ -13220,6 +13227,7 @@ dependencies = [
  "temps-log-aggregator",
  "temps-logs",
  "temps-metrics",
+ "temps-migrations",
  "temps-monitoring",
  "temps-network",
  "temps-otel",
@@ -14633,6 +14641,8 @@ dependencies = [
  "chrono",
  "flate2",
  "futures",
+ "hex",
+ "hmac 0.13.0",
  "http 1.5.0",
  "hyper",
  "hyper-util",
@@ -14646,6 +14656,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx 0.8.6",
  "tar",
  "tempfile",
@@ -15151,6 +15162,7 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-database",
+ "temps-deployer",
  "temps-entities",
  "temps-projects",
  "testcontainers",
@@ -15201,6 +15213,7 @@ dependencies = [
  "defguard_wireguard_rs",
  "hkdf 0.13.0",
  "hmac 0.13.0",
+ "nix 0.31.3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

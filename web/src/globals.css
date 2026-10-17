@@ -582,3 +582,18 @@ body {
   color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
   user-select: none;
 }
+
+/* Radix renders an aria-hidden, transparent checkbox beside every Switch,
+   Checkbox and RadioGroup item that sits inside a <form>, so the control takes
+   part in native form submission and `change` events. It parks the input with
+   `translateX(-100%)` from wherever its static position lands -- at the start
+   of a flex row that is left of the viewport, which layout audits report as a
+   control outside the screen with no scroll container. The input is never
+   seen or focused by a person, so give it no box: it still submits and
+   dispatches, but occupies nothing. */
+:where(button[role='switch'], button[role='checkbox'], button[role='radio'])
+  + input[aria-hidden='true'][tabindex='-1'] {
+  width: 0 !important;
+  height: 0 !important;
+  transform: none !important;
+}

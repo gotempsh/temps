@@ -88,6 +88,8 @@ pub enum Commands {
     Join(JoinCommand),
     /// Run the worker node agent server
     Agent(AgentCommand),
+    /// Execute one authenticated CI build and return its verified registry result.
+    Runner(commands::runner::RunnerCommand),
     /// Manage cluster worker nodes (list, show, drain, remove)
     Node(NodeCommand),
     /// Inspect the multi-host overlay (status, peers, diag)
@@ -338,6 +340,7 @@ pub fn dispatch_with_request_policy_gate(
         Commands::Doctor(doctor_cmd) => doctor_cmd.execute(),
         Commands::Join(join_cmd) => join_cmd.execute(),
         Commands::Agent(agent_cmd) => agent_cmd.execute(),
+        Commands::Runner(command) => command.execute(),
         Commands::Node(node_cmd) => node_cmd.execute(),
         Commands::Network(network_cmd) => network_cmd.execute(),
         Commands::Edge(edge_cmd) => edge_cmd.execute(),
@@ -709,6 +712,7 @@ mod command_tree_tests {
             "backup restore",
             "backup restore-service",
             "build",
+            "runner",
             "deploy git",
             "deploy image",
             "deploy static",

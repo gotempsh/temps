@@ -1250,6 +1250,24 @@ export type AnalyticsCapability = {
 export type AnalyticsFacet = 'summary' | 'traffic' | 'pages' | 'events' | 'breakdown' | 'speed';
 
 /**
+ * The public address an app Temps does not deploy should send analytics to.
+ *
+ * Served separately from the platform settings because `GET /settings`
+ * needs `settings:read`, which a project member does not hold, while the
+ * install snippet this value goes into is shown to every role that can read
+ * the project's analytics. Only the one address the snippet embeds is
+ * exposed; no other setting travels with it.
+ */
+export type AnalyticsIngestEndpoint = {
+    /**
+     * The configured external URL, without a trailing slash. `null` when no
+     * external URL is stored (or no settings service is available), in which
+     * case the caller must decide what to show instead; it is never guessed.
+     */
+    external_url?: string | null;
+};
+
+/**
  * An analytics ingest key as returned by the admin API.
  *
  * `public_key` is present in full on every response — see the module docs.
@@ -1297,6 +1315,56 @@ export type AnalyticsIngestKey = {
 export type AnalyticsProjectOption = {
     project_id: number;
     project_name: string;
+};
+
+/**
+ * How long product analytics data, and the identifiers attached to it, are
+ * kept.
+ *
+ * `ip_geolocations` holds the full client IP address and is referenced by
+ * events, proxy logs, error events, visitors, performance metrics and audit
+ * logs. Before these settings existed nothing ever removed an IP once stored,
+ * and nothing removed visitors, so the retention of the referencing tables
+ * said nothing about how long an address was kept.
+ *
+ * A job removes an IP row only when **no** table references it, so the
+ * effective retention of an address is the longest window among the data that
+ * still points at it. Audit logs keep their IP for as long as the audit
+ * record exists.
+ *
+ * `None` on an optional window means "keep" -- the behaviour before the
+ * setting existed -- so upgrading never starts deleting data on its own,
+ * except for the unreferenced-IP cleanup, which only drops cache rows that
+ * nothing points at.
+ */
+export type AnalyticsRetentionSettings = {
+    /**
+     * Retain captured error events for this many days. `null` keeps them
+     * until the project is deleted. Error groups keep their counters.
+     */
+    error_events_days?: number | null;
+    /**
+     * Retain analytics events (page views, custom events) for this many
+     * days. Applied as the TimescaleDB retention policy of the `events`
+     * hypertable. ClickHouse-backed analytics keep their own storage TTL.
+     */
+    events_days?: number;
+    /**
+     * Delete a stored client IP address (and its derived location) once
+     * nothing references it and it has not been looked up for this many
+     * days. Never applied sooner than the proxy-log retention
+     * (`observability_retention.proxy_logs_days`): request logs kept outside
+     * PostgreSQL still point at the address. `null` keeps every address ever
+     * seen.
+     */
+    unreferenced_ip_days?: number | null;
+    /**
+     * Delete visitors that have not been seen for this many days. Their
+     * events, proxy logs and error events stay (until their own retention
+     * ends) but are no longer linked to a visitor; session replays of the
+     * visitor are deleted with it. `null` keeps visitors indefinitely.
+     */
+    visitor_days?: number | null;
 };
 
 export type AnalyticsSessionEventsResponse = {
@@ -1649,6 +1717,13 @@ export type AppSettings = {
      */
     ai_workspace_file_limits?: AiWorkspaceFileLimitsSettings;
     /**
+     * Retention windows for product analytics data and for the personal
+     * identifiers (visitors, client IP addresses) attached to it.
+     * Applied by a background job, not at save time, so a change takes
+     * effect within the job's interval.
+     */
+    analytics_retention?: AnalyticsRetentionSettings;
+    /**
      * Admin preference for anonymous product telemetry (the events sent to
      * the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
      * mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
@@ -1922,6 +1997,11 @@ export type AppSettingsResponse = {
      * Persistent AI workspace file transfer and preview limits.
      */
     ai_workspace_file_limits: AiWorkspaceFileLimitsSettings;
+    /**
+     * Retention of analytics events and of the visitors and client IP
+     * addresses attached to them.
+     */
+    analytics_retention: AnalyticsRetentionSettings;
     /**
      * Build-time resource limits (control-plane only). No sensitive content,
      * passed through as-is.
@@ -2962,14 +3042,29 @@ export type BuildConfiguration = {
 };
 
 /**
+ * Operator settings persisted on each node. These are control-plane operations,
+ * independent of the proxy request path. Existing agents keep their fixed limits.
+ */
+export type BuildLimits = {
+    build_timeout_seconds?: number;
+    concurrency?: number;
+    queue_wait_seconds?: number;
+};
+
+/**
  * Control-plane build resource limits.
  *
  * Caps how many builds run concurrently AND how much CPU/memory each build
- * is allowed to consume. A single global semaphore in the deployer crate
- * gates every `DockerRuntime::build_image` call to `max_concurrent`. When
- * the semaphore is full, additional builds queue and wait — they do not
- * fail. Per-build CPU/memory caps are forwarded to Docker via
+ * is allowed to consume. A single global gate in the deployer crate
+ * admits at most `max_concurrent` `DockerRuntime::build_image` calls at a
+ * time. When the gate is full, additional builds queue and wait — they do
+ * not fail. Per-build CPU/memory caps are forwarded to Docker via
  * `BuildImageOptions { memory, cpuquota, cpuperiod }`.
+ *
+ * Changes apply live, with no restart. Builds already running finish with the
+ * limits they started with; queued and new builds use the new ones. Lowering
+ * `max_concurrent` never stops a running build: new builds wait until enough
+ * of them finish to get under the new limit.
  *
  * `cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means "no explicit cap"
  * — fall back to the legacy 50%-of-host heuristic for backwards
@@ -2981,19 +3076,22 @@ export type BuildLimitsSettings = {
      * a core). 0 means "use the legacy 50%-of-host default". Applied only
      * by Docker's legacy builder: BuildKit, the default since Docker 18.09,
      * ignores the CPU and memory options of the image build API, so on
-     * BuildKit hosts this has no effect. Read once at startup; a change
-     * takes effect after `temps serve` restarts.
+     * BuildKit hosts this has no effect. Applies live to builds that start
+     * after the change; a running build keeps the cap it started with.
      */
     cpu_limit_cores?: number;
     /**
      * Maximum number of `docker build` operations allowed to run at the
      * same time on the control plane. Additional builds queue. Min 1.
+     * Applies live: raising it starts queued builds right away; lowering it
+     * lets running builds finish and holds new ones until they do.
      */
     max_concurrent?: number;
     /**
      * Memory allowed per build, in megabytes. 0 means "use the legacy
      * 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
-     * by the legacy builder, ignored by BuildKit, read once at startup.
+     * by the legacy builder, ignored by BuildKit, applied live to builds that
+     * start after the change.
      * Values above 2047 MB are reduced to 2047 MB, the most the build API
      * accepts through the client, with a warning in the server log.
      */
@@ -3016,7 +3114,41 @@ export type BuildLimitsSettings = {
  * build log says why. A static site may build on a worker of any
  * architecture, since its output is read from that node and never runs.
  */
-export type BuildLocation = 'control_plane' | 'node';
+export type BuildLocation = 'control_plane' | 'node' | 'ci';
+
+/**
+ * Paths are relative to the root of the tar archive.
+ *
+ * Deliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,
+ * and a stray `{:?}` must not be able to put them in a log.
+ */
+export type BuildSpec = {
+    /**
+     * Values for the Dockerfile's `ARG` instructions, applied exactly as
+     * `docker build --build-arg` would be (protocol v2). The control plane
+     * decides which values may leave it -- never one marked secret or a
+     * platform credential -- and sends only names the Dockerfile declares.
+     * They travel inside this spec over the node's authenticated build
+     * channel and are held in memory on both sides; neither side writes
+     * them to disk or to a log.
+     */
+    build_args?: {
+        [key: string]: string;
+    };
+    /**
+     * BuildKit's predefined `BUILDKIT_CACHE_MOUNT_NS`: the control plane's
+     * per-project/environment/ref namespace for `RUN --mount=type=cache`.
+     * Not a project variable and not a credential, so it is the one build
+     * argument a worker receives. Without it, every project built on the
+     * same worker shares writable cache mounts. Optional on the wire: an
+     * agent that predates it ignores the field and builds as before.
+     */
+    cache_namespace?: string | null;
+    dockerfile: string;
+    image_name: string;
+    platform?: string | null;
+    version: number;
+};
 
 /**
  * The quote.
@@ -3584,6 +3716,29 @@ export type ChildBackupListResponse = {
      * Zero or more child backup entries ordered by `external_service_backups.id` ASC.
      */
     children: Array<ChildBackupEntryResponse>;
+};
+
+export type CiExecutorSettings = {
+    control_plane_url: string;
+    git_ref: string;
+    identity: TrustedIdentityIssuer;
+    image_repository: string;
+    limits: BuildLimits;
+    organization: boolean;
+    owner: string;
+    repository: string;
+    runner_archive_sha256: string;
+    /**
+     * Pinned release archive used by the generated CI shim.
+     */
+    runner_archive_url: string;
+};
+
+export type CiExecutorStatus = {
+    configured: boolean;
+    reason?: string | null;
+    settings?: CiExecutorSettings | null;
+    setup_path: string;
 };
 
 export type CleanupExpiredBackupsRequest = {
@@ -4436,6 +4591,103 @@ export type Comparator = 'gt' | 'gte' | 'lt' | 'lte';
 export type Comparison = 'below' | 'above';
 
 /**
+ * The `docker compose` invocation a check ran, sanitized for display.
+ */
+export type ComposeCheckCommand = {
+    /**
+     * Program and arguments. Contains paths and option names only; no
+     * variable values are passed on the command line.
+     */
+    argv: Array<string>;
+    /**
+     * Process exit code; `None` when it was killed or did not start.
+     */
+    exit_code?: number | null;
+    /**
+     * The tail of stderr with variable values, quoted text, assignments,
+     * URLs and absolute paths removed. Line numbers and error wording are
+     * kept.
+     */
+    stderr?: string | null;
+};
+
+/**
+ * Stable, user-facing class of a Compose check failure. The deploy job, the
+ * preview and the check action all report the same class for the same input.
+ */
+export type ComposeCheckErrorClass = 'interpolation' | 'policy_violation' | 'invalid_path' | 'invalid_yaml' | 'invalid_override' | 'unsupported_compose_version' | 'config_resolution' | 'compose_unavailable' | 'internal';
+
+/**
+ * Result of running the deploy-time resolution and policy validation.
+ */
+export type ComposeCheckReport = {
+    command?: ComposeCheckCommand | null;
+    /**
+     * The same message the deployment would fail with. Variable values are
+     * redacted.
+     */
+    error?: string | null;
+    error_class?: ComposeCheckErrorClass | null;
+    /**
+     * Caveats about what this check could not cover.
+     */
+    notes: Array<string>;
+    /**
+     * Whether the configuration would pass the deploy-time checks.
+     */
+    passed: boolean;
+    /**
+     * Variables the file references, in sorted order. Names only.
+     */
+    referenced_variables: Array<string>;
+    /**
+     * Whether `docker compose config` actually ran for this check.
+     */
+    resolution_ran: boolean;
+    /**
+     * Why `docker compose config` had to run (project override, include,
+     * extends, YAML tags). Empty when the file was validated directly.
+     */
+    resolution_reasons: Array<string>;
+    /**
+     * Variables referenced without a default that are not set; Compose
+     * substitutes an empty string for each.
+     */
+    unset_variables: Array<string>;
+};
+
+/**
+ * The host's Docker Compose CLI as probed at startup.
+ */
+export type ComposeHostStatusResponse = {
+    /**
+     * Whether the Compose CLI ran.
+     */
+    available: boolean;
+    checked_at?: string | null;
+    minimum_version: string;
+    missing_flags: Array<string>;
+    /**
+     * False until the startup probe finishes.
+     */
+    probed: boolean;
+    /**
+     * Operator-facing explanation when not supported.
+     */
+    problem?: string | null;
+    /**
+     * Whether every `docker compose config` option Temps needs is present.
+     */
+    supported: boolean;
+    version?: string | null;
+};
+
+/**
+ * How a saved project override relates to the repository Compose file.
+ */
+export type ComposeOverrideRedundancy = 'identical' | 'superset';
+
+/**
  * A Docker Compose service port mapping, reduced to the information the UI
  * needs to build a public route without confusing host and container ports.
  */
@@ -4458,27 +4710,48 @@ export type ComposePortMapping = {
  * Problem Details returned when a Compose preview cannot be rendered.
  */
 export type ComposePreviewProblemResponse = ProblemDetails & {
+    compose_check?: ComposeCheckReport | null;
+    error_class?: ComposeCheckErrorClass | null;
     policy_check?: ComposeSecurityCheck | null;
 };
 
 export type ComposePreviewRequest = {
     branch?: string | null;
     composeOverride?: string | null;
+    /**
+     * Environment whose variables resolve `${VAR}`; defaults to the
+     * project's production environment. Requires `project_id`.
+     */
+    environmentId?: number | null;
     excludedServices?: Array<string>;
     path: string;
     /**
      * Advisory preview only. Deployment reloads the saved project policy.
+     * Ignored when `project_id` is set: the saved policy is used instead.
      */
     previewPolicy?: ComposeSecurityPolicy;
+    /**
+     * The project this Compose file deploys. When set, the preview runs the
+     * deploy job's check with that project's saved security policy and the
+     * environment's variables (values are never returned), so it fails with
+     * the same error class a deployment would.
+     */
+    projectId?: number | null;
 };
 
 export type ComposePreviewResponse = {
+    check?: ComposeCheckReport | null;
     disabledServices: Array<string>;
     /**
      * Effective user-controlled Compose YAML with sensitive values redacted.
      */
     effectiveCompose: string;
     enabledServices: Array<string>;
+    overrideRedundancy?: ComposeOverrideRedundancy | null;
+    /**
+     * What to do about `override_redundancy`.
+     */
+    overrideWarning?: string | null;
     path: string;
     redactedValues: number;
     repositoryId: number;
@@ -4562,6 +4835,22 @@ export type ComposeServicePreviewResponse = {
      * is only the optional host-side Docker port.
      */
     ports: Array<ComposePortMapping>;
+};
+
+/**
+ * The last stored Compose check for a project.
+ */
+export type ComposeValidationReportResponse = {
+    checked_at: string;
+    error?: string | null;
+    error_class?: ComposeCheckErrorClass | null;
+    /**
+     * True when the check ran under an older validation revision than this
+     * server's and has not been repeated yet.
+     */
+    outdated: boolean;
+    passed: boolean;
+    project_id: number;
 };
 
 /**
@@ -5354,6 +5643,10 @@ export type ConversationsQueryParams = {
      * Filter by model name
      */
     model?: string | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by tags (comma-separated, AND logic)
      */
@@ -6595,6 +6888,11 @@ export type CreateS3SourceRequest = {
 
 export type CreateSandboxBody = {
     _runtime?: string | null;
+    /**
+     * Permit installing/running Docker with normal guest-root privileges.
+     * Requires backend="microsandbox". Does not install Docker or expose the host socket.
+     */
+    allow_docker?: boolean;
     /**
      * Isolation backend: `"docker"` (default), `"firecracker"` (ADR-029,
      * hardware-virtualized microVM — requires a host provisioned with
@@ -8139,6 +8437,59 @@ export type DigestSections = {
  */
 export type Direction = 'both' | 'above' | 'below';
 
+export type DirectoryEntry = {
+    kind: DirectoryEntryKind;
+    /**
+     * Name within the directory, without any path.
+     */
+    name: string;
+};
+
+/**
+ * What a directory entry is. Symlinks are reported, never followed.
+ */
+export type DirectoryEntryKind = 'file' | 'directory' | 'symlink' | 'other';
+
+export type DirectoryListingResponse = {
+    /**
+     * Directories first, then everything else, each group in byte order of
+     * the name. One page of the directory.
+     */
+    entries: Array<DirectoryEntry>;
+    /**
+     * `false` when the path does not exist (not an error).
+     */
+    exists: boolean;
+    /**
+     * More entries exist after this page.
+     */
+    has_more: boolean;
+    /**
+     * `false` when the path exists but is not a directory.
+     */
+    is_dir: boolean;
+    /**
+     * 1-based page these entries are.
+     */
+    page: number;
+    /**
+     * Entries per page that was applied (default 20, at most 100).
+     */
+    page_size: number;
+    path: string;
+    /**
+     * Entries in the whole directory, so `ceil(total / page_size)` is the
+     * number of pages. At most 10000: see `truncated`.
+     */
+    total: number;
+    /**
+     * The directory has more entries than the listing reads (10000), so
+     * `total` and the pages cover only the first 10000 names the filesystem
+     * returned.
+     */
+    truncated: boolean;
+};
+
 /**
  * Response after disabling Blob service
  */
@@ -9291,6 +9642,23 @@ export type DropSkippedPath = {
      */
     path: string;
     reason: DropSkipReason;
+};
+
+/**
+ * The limits that apply to one project after inheritance.
+ */
+export type EffectiveLimits = {
+    /**
+     * Operator-funded spend per UTC calendar month, in microcents
+     * (1/10000 of a cent); `null` means unlimited
+     */
+    max_cost_per_month_microcents?: number | null;
+    max_cost_per_month_source: LimitSource;
+    /**
+     * Requests per rolling minute; `null` means unlimited
+     */
+    max_requests_per_minute?: number | null;
+    max_requests_per_minute_source: LimitSource;
 };
 
 export type EligibleGitRepositoryResponse = {
@@ -13331,6 +13699,68 @@ export type HttpChecksCapabilities = {
 };
 
 /**
+ * Runtime configuration baked into an image, read on the node that owns it.
+ *
+ * A worker build returns this so the control plane never needs a local copy
+ * of the image to learn which port it listens on.
+ */
+export type ImageConfig = {
+    entrypoint?: Array<string>;
+    /**
+     * `ENV` entries as `NAME=value`. Values are whatever the Dockerfile
+     * baked in; callers must not persist or log them.
+     */
+    env?: Array<string>;
+    /**
+     * Ports from `EXPOSE`, sorted ascending, without protocol.
+     */
+    exposed_ports?: Array<number>;
+    /**
+     * `USER`, when the image sets one.
+     */
+    user?: string | null;
+};
+
+/**
+ * Information about a Docker image, including architecture and platform details
+ */
+export type ImageInfo = {
+    /**
+     * Image architecture (e.g., "amd64", "arm64")
+     */
+    architecture: string;
+    config?: ImageConfig | null;
+    /**
+     * Creation timestamp
+     */
+    created?: string | null;
+    /**
+     * Image ID (sha256:...)
+     */
+    id: string;
+    /**
+     * Operating system (e.g., "linux")
+     */
+    os: string;
+    /**
+     * Full platform string (e.g., "linux/amd64")
+     */
+    platform: string;
+    /**
+     * Image size in bytes
+     */
+    size_bytes: number;
+    /**
+     * Image tags
+     */
+    tags: Array<string>;
+    /**
+     * Working directory (WORKDIR from Dockerfile)
+     */
+    working_dir?: string | null;
+};
+
+/**
  * System-wide retention policy for locally-built deployment images.
  *
  * The nightly cleanup removes a Temps-built image only once *every*
@@ -14216,6 +14646,20 @@ export type IntegrationResponse = {
 };
 
 /**
+ * One CIDR in a policy, in canonical form (network address, explicit prefix).
+ */
+export type IpAccessCidrEntry = {
+    /**
+     * Canonical CIDR, e.g. `10.0.0.0/8` or `fd7a:115c:a1e0::/48`.
+     */
+    cidr: string;
+    /**
+     * Optional human label, e.g. `Office`.
+     */
+    description?: string | null;
+};
+
+/**
  * Query parameters for listing IP access control rules
  */
 export type IpAccessControlQuery = {
@@ -14237,6 +14681,11 @@ export type IpAccessControlResponse = {
     reason?: string | null;
     updated_at: string;
 };
+
+/**
+ * How a scope's CIDR list is applied.
+ */
+export type IpAccessMode = 'disabled' | 'allow' | 'deny';
 
 /**
  * Snapshot of a background job. `status` is one of "running" | "exited"
@@ -14524,6 +14973,48 @@ export type LemonSqueezyConfig = {
 export type LetsEncryptSettings = {
     email?: string | null;
     environment?: string;
+};
+
+/**
+ * Limits as stored for one scope. `null` inherits from the next level
+ * (project → instance → built-in); `0` means unlimited.
+ */
+export type LimitSettingsBody = {
+    /**
+     * Operator-funded spend per UTC calendar month, in microcents
+     * (1/10000 of a cent; 1 USD = 1,000,000 microcents)
+     */
+    max_cost_per_month_microcents?: number | null;
+    /**
+     * Requests per rolling minute
+     */
+    max_requests_per_minute?: number | null;
+};
+
+/**
+ * Where an effective limit came from.
+ */
+export type LimitSource = 'project' | 'instance' | 'built_in';
+
+export type LimitsOverviewResponse = {
+    /**
+     * Requests per minute applied to a project when nothing is configured
+     */
+    built_in_max_requests_per_minute: number;
+    /**
+     * Instance-wide limits as stored (what the admin set)
+     */
+    instance: LimitSettingsBody;
+    page: number;
+    page_size: number;
+    /**
+     * Projects that override the instance defaults
+     */
+    project_overrides: Array<ProjectLimitOverride>;
+    /**
+     * Total number of projects with overrides, across all pages
+     */
+    total_project_overrides: number;
 };
 
 /**
@@ -15653,6 +16144,16 @@ export type MicrosandboxCapability = {
 };
 
 /**
+ * Copy every bucket of another managed S3 service into this one.
+ */
+export type MigrateS3ServiceRequest = {
+    /**
+     * Managed S3 service to copy from (RustFS or Garage). It is only read.
+     */
+    source_service_id: number;
+};
+
+/**
  * A single step in the migration execution plan.
  *
  * Steps are presented to the user before execution so they know exactly
@@ -16380,6 +16881,7 @@ export type NodeInfoResponse = {
      * `None` until an agent that reports it has heartbeated.
      */
     architecture?: string | null;
+    build_limits: BuildLimits;
     /**
      * Resource capacity/usage metrics from the latest heartbeat
      */
@@ -17036,8 +17538,11 @@ export type OnDemandCertRow = {
  * console host) that have no active cert, rather than silently failing the
  * handshake. Ephemeral per-deployment hostnames are NEVER certed (ADR §2).
  *
- * Off by default — operators opt in explicitly, except QuickStart (`sslip.io`)
- * installs where `temps setup` auto-enables it and derives `zone`.
+ * New installations start with it on (`AppSettings::default`); the zone comes
+ * from `zone` or is derived from `external_url`/`preview_domain`, and nothing
+ * is issued while none can be derived or `external_url` is loopback. A settings
+ * row stored before this section existed stays off until the operator enables
+ * it.
  */
 export type OnDemandTlsSettings = {
     /**
@@ -17049,8 +17554,10 @@ export type OnDemandTlsSettings = {
      */
     deployment_url_mode?: string;
     /**
-     * Master switch. When `false` (default) the proxy's on-demand cert gate
-     * rejects every SNI and no issuance is ever triggered.
+     * Master switch. When `false` the proxy's on-demand cert gate rejects
+     * every SNI and no issuance is ever triggered. New installations start
+     * with it `true`; a stored settings row that predates this section keeps
+     * `false`.
      */
     enabled?: boolean;
     /**
@@ -17184,7 +17691,7 @@ export type OperationStatus = 'queued' | 'running' | 'waiting' | 'succeeded' | '
 /**
  * Which slice of the feed to return.
  */
-export type OperationStatusFilter = 'running' | 'finished' | 'all';
+export type OperationStatusFilter = 'running' | 'waiting' | 'finished' | 'all';
 
 /**
  * A page of the operations feed. Sorted by `created_at` descending (fixed).
@@ -17194,7 +17701,7 @@ export type OperationsListResponse = {
     page: number;
     page_size: number;
     /**
-     * Queued, running and waiting operations matching the scope, `kind` and
+     * Queued and running operations matching the scope, `kind` and
      * `project_id` filters — independent of the `status` filter, so the tray
      * badge stays correct while browsing finished operations.
      */
@@ -18590,6 +19097,11 @@ export type PluginGrantConfig = {
 export type PluginHostPermission = 'ai_generate' | 'projects_read' | 'environments_read' | 'deployments_read' | 'api_read' | 'api_write' | 'events_read';
 
 /**
+ * Which policy decided a test.
+ */
+export type PolicySource = 'draft' | 'environment' | 'project' | 'none';
+
+/**
  * Port mapping
  */
 export type PortMapping = {
@@ -19264,6 +19776,63 @@ export type ProjectInfo = {
 };
 
 /**
+ * A stored policy plus the address the console saw for the caller, so the
+ * UI can offer "add my IP" and warn before a lock-out.
+ */
+export type ProjectIpAccessDetail = ProjectIpAccessResponse & {
+    /**
+     * The address this request arrived from, as the console resolved it.
+     * It is the address the project will see only if the console and the
+     * project are reached over the same network path.
+     */
+    your_ip?: string | null;
+};
+
+/**
+ * One scope's stored policy.
+ */
+export type ProjectIpAccessResponse = {
+    cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * `false` when nothing is stored for this scope. For an environment that
+     * means it inherits the project-wide policy.
+     */
+    configured: boolean;
+    /**
+     * `null` for the project-wide policy.
+     */
+    environment_id?: number | null;
+    /**
+     * Maximum number of CIDRs a policy may hold.
+     */
+    max_cidrs: number;
+    mode: IpAccessMode;
+    project_id: number;
+    updated_at?: string | null;
+};
+
+export type ProjectLimitOverride = {
+    limits: LimitSettingsBody;
+    project_id: number;
+};
+
+export type ProjectLimitsResponse = {
+    /**
+     * Limits actually enforced after inheritance
+     */
+    effective: EffectiveLimits;
+    /**
+     * Operator-funded spend so far this UTC month, in microcents
+     */
+    month_spend_microcents: number;
+    project_id: number;
+    /**
+     * This project's own limits as stored; `null` fields inherit
+     */
+    stored: LimitSettingsBody;
+};
+
+/**
  * Health summary for a single project based on its production monitors
  */
 export type ProjectMonitorHealth = {
@@ -19613,12 +20182,58 @@ export type ProjectTemplate = {
  */
 export type ProjectType = 'static' | 'docker' | 'buildpack' | 'git';
 
+/**
+ * Per-project spend and volume, for cost reporting.
+ */
+export type ProjectUsage = {
+    /**
+     * Requests served with a caller-supplied provider key (not operator spend)
+     */
+    byok_request_count: number;
+    error_count: number;
+    /**
+     * Estimated cost in microcents (1/10000 of a cent), from the model price list
+     */
+    estimated_cost_microcents: number;
+    input_tokens: number;
+    /**
+     * The project's effective monthly budget after inheritance, in microcents;
+     * `null` when it has no cap. Left `None` by the usage service and filled in
+     * by the handler, which owns the link to the limits service.
+     */
+    monthly_budget_microcents?: number | null;
+    /**
+     * The part of `estimated_cost_microcents` the operator pays for: requests
+     * made with a caller-supplied provider key are excluded. This is the
+     * figure a project's monthly budget is measured against.
+     */
+    operator_cost_microcents: number;
+    output_tokens: number;
+    project_id: number;
+    request_count: number;
+};
+
 export type ProjectUsageInfoResponse = {
     connection_id: number;
     connection_name: string;
     id: number;
     name: string;
     slug: string;
+};
+
+export type ProjectUsageQueryParams = {
+    /**
+     * ISO 8601 start time (defaults to 24h ago)
+     */
+    from?: string | null;
+    /**
+     * Max projects returned (defaults to 50, max 100)
+     */
+    limit?: number | null;
+    /**
+     * ISO 8601 end time (defaults to now)
+     */
+    to?: string | null;
 };
 
 /**
@@ -20754,6 +21369,10 @@ export type RecentQueryParams = {
      */
     offset?: number | null;
     /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
+    /**
      * Filter by provider name
      */
     provider?: string | null;
@@ -21093,6 +21712,27 @@ export type RemoteDeploymentResponse = {
     slug: string;
     source_type: string;
     state: string;
+};
+
+/**
+ * Registry credentials to forward to the worker's `POST /agent/images/pull`
+ * call. Mirrors the wire shape of `temps_agent::RegistryCredentials` field
+ * for field; `temps-deployer` does not depend on `temps-agent` (the same
+ * reason `import_image` below builds its own request rather than sharing a
+ * DTO type), so this struct only needs to serialize to the JSON body the
+ * agent handler already deserializes.
+ */
+export type RemotePullCredentials = {
+    /**
+     * **Never logged or included in error messages.**
+     */
+    identity_token?: string | null;
+    /**
+     * **Never logged or included in error messages.**
+     */
+    password?: string | null;
+    server_address?: string | null;
+    username?: string | null;
 };
 
 export type RemoveNodeResponse = {
@@ -22089,6 +22729,36 @@ export type RunExternalServiceBackupRequest = {
     s3_source_id?: number | null;
 };
 
+export type RunnerClaim = {
+    identity_token: string;
+};
+
+export type RunnerFailure = {
+    message: string;
+};
+
+export type RunnerLogs = {
+    lines: Array<string>;
+};
+
+export type RunnerResult = {
+    build_id: string;
+    digest: string;
+    duration_ms: number;
+    image: ImageInfo;
+    platforms: Array<string>;
+    run_id: string;
+};
+
+export type RunnerWork = {
+    registry_credentials?: RemotePullCredentials | null;
+    registry_tag: string;
+    run_id: string;
+    spec: BuildSpec;
+    timeout_seconds: number;
+    token: string;
+};
+
 /**
  * Live connection variables for a service in one environment.
  *
@@ -22129,6 +22799,20 @@ export type S3CredentialsResponse = {
     force_path_style: boolean;
     region: string;
     secret_key: string;
+};
+
+/**
+ * Outcome of copying one managed S3 service's buckets into another.
+ */
+export type S3MigrationReport = {
+    /**
+     * Buckets that were copied, by their name on the source.
+     */
+    buckets: Array<string>;
+    source_backend: string;
+    source_service_id: number;
+    target_backend: string;
+    target_service_id: number;
 };
 
 /**
@@ -22193,6 +22877,10 @@ export type SandboxInner = {
      * `None` for sandboxes created via this API.
      */
     agent_run_id?: number | null;
+    /**
+     * Normal guest-root semantics enabled for Docker (microsandbox only).
+     */
+    allow_docker: boolean;
     /**
      * Isolation backend: "docker" | "firecracker" | "microsandbox". `None` on legacy rows
      * created before the backend was recorded.
@@ -24043,6 +24731,27 @@ export type SetProjectHostingRequest = {
      * running keep running until stopped); `hosted` lets it deploy again.
      */
     hosting: Hosting;
+};
+
+/**
+ * Request body for `PUT`: the complete policy for one scope.
+ */
+export type SetProjectIpAccessRequest = {
+    /**
+     * Apply an allow list that excludes (or a deny list that includes) the
+     * address this request came from. Without it such a save is refused
+     * with 409 so an operator cannot lock themselves out by accident.
+     */
+    acknowledge_lockout?: boolean;
+    /**
+     * CIDRs (IPv4 or IPv6). A bare address is a single host. At most 256.
+     */
+    cidrs: Array<IpAccessCidrEntry>;
+    /**
+     * `disabled` keeps the list but enforces nothing; `allow` admits only
+     * listed clients; `deny` blocks listed clients.
+     */
+    mode: IpAccessMode;
 };
 
 export type SetRepositoryInheritanceRequest = {
@@ -26191,6 +26900,36 @@ export type TestEmailResponse = {
     success: boolean;
 };
 
+/**
+ * Request body for the "try an address against the rules" endpoint.
+ */
+export type TestProjectIpAccessRequest = {
+    cidrs?: Array<IpAccessCidrEntry> | null;
+    /**
+     * Address to evaluate.
+     */
+    ip: string;
+    mode?: IpAccessMode | null;
+};
+
+export type TestProjectIpAccessResponse = {
+    allowed: boolean;
+    /**
+     * The address as evaluated (IPv4-mapped IPv6 is shown as IPv4).
+     */
+    ip: string;
+    /**
+     * The listed CIDR the address fell inside, when one did.
+     */
+    matched_cidr?: string | null;
+    mode: IpAccessMode;
+    /**
+     * One-sentence explanation suitable for display.
+     */
+    reason: string;
+    source: PolicySource;
+};
+
 export type TestProviderKeyRequest = {
     /**
      * The raw API key to test (may be empty for a self-hosted provider)
@@ -26331,6 +27070,10 @@ export type TimeseriesQueryParams = {
      */
     model?: string | null;
     /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
+    /**
      * Filter by provider name
      */
     provider?: string | null;
@@ -26446,6 +27189,10 @@ export type TopModelsQueryParams = {
      * Max results (defaults to 10)
      */
     limit?: number | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by tags (comma-separated, AND logic)
      */
@@ -26910,6 +27657,16 @@ export type TriggerScanResponse = {
     message: string;
     scan_id: number;
     status: string;
+};
+
+/**
+ * Public trust policy; no hardcoded provider-specific token validator.
+ */
+export type TrustedIdentityIssuer = {
+    audience: string;
+    issuer: string;
+    jwks_url: string;
+    subject: string;
 };
 
 /**
@@ -28519,6 +29276,10 @@ export type UsageFilter = {
      */
     cost_lte?: number | null;
     model?: string | null;
+    /**
+     * Restrict to usage attributed to this project (deployment-token callers).
+     */
+    project_id?: number | null;
     provider?: string | null;
     /**
      * Filter by HTTP status code (exact match).
@@ -28563,11 +29324,19 @@ export type UsageLogEntry = {
     latency_ms: number;
     model: string;
     output_tokens: number;
+    /**
+     * Project the call is attributed to (deployment-token callers only)
+     */
+    project_id?: number | null;
     provider: string;
     request_id?: string | null;
     status: number;
     tags: Array<string>;
     timestamp: string;
+    /**
+     * Deployment token the call is attributed to
+     */
+    token_id?: number | null;
     trace_id?: string | null;
 };
 
@@ -28598,6 +29367,10 @@ export type UsageQueryParams = {
      * Filter by model name
      */
     model?: string | null;
+    /**
+     * Filter by project ID (deployment-token usage; instance administrators only)
+     */
+    project_id?: number | null;
     /**
      * Filter by provider name
      */
@@ -29714,6 +30487,34 @@ export type WriteFilesResponse = {
  */
 export type ZoneListResponse = {
     zones: Array<DnsZone>;
+};
+
+export type CiExecutorSettingsWritable = {
+    control_plane_url: string;
+    /**
+     * Write-only. Stored encrypted; omitted by the status endpoint.
+     */
+    dispatch_token?: string | null;
+    git_ref: string;
+    identity: TrustedIdentityIssuer;
+    image_repository: string;
+    limits: BuildLimits;
+    organization: boolean;
+    owner: string;
+    registry_credentials?: RemotePullCredentials | null;
+    repository: string;
+    runner_archive_sha256: string;
+    /**
+     * Pinned release archive used by the generated CI shim.
+     */
+    runner_archive_url: string;
+};
+
+export type CiExecutorStatusWritable = {
+    configured: boolean;
+    reason?: string | null;
+    settings?: CiExecutorSettingsWritable | null;
+    setup_path: string;
 };
 
 /**
@@ -31610,6 +32411,191 @@ export type StopUserTurnResponses = {
 
 export type StopUserTurnResponse = StopUserTurnResponses[keyof StopUserTurnResponses];
 
+export type GetLimitsOverviewData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page of project overrides (default 1)
+         */
+        page?: number;
+        /**
+         * Page size (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/ai/limits';
+};
+
+export type GetLimitsOverviewErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetLimitsOverviewError = GetLimitsOverviewErrors[keyof GetLimitsOverviewErrors];
+
+export type GetLimitsOverviewResponses = {
+    /**
+     * Instance defaults and per-project overrides
+     */
+    200: LimitsOverviewResponse;
+};
+
+export type GetLimitsOverviewResponse = GetLimitsOverviewResponses[keyof GetLimitsOverviewResponses];
+
+export type UpdateInstanceLimitsData = {
+    body: LimitSettingsBody;
+    path?: never;
+    query?: never;
+    url: '/ai/limits/instance';
+};
+
+export type UpdateInstanceLimitsErrors = {
+    /**
+     * Invalid limit
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type UpdateInstanceLimitsError = UpdateInstanceLimitsErrors[keyof UpdateInstanceLimitsErrors];
+
+export type UpdateInstanceLimitsResponses = {
+    /**
+     * Instance-wide defaults replaced
+     */
+    200: LimitSettingsBody;
+};
+
+export type UpdateInstanceLimitsResponse = UpdateInstanceLimitsResponses[keyof UpdateInstanceLimitsResponses];
+
+export type ResetProjectLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type ResetProjectLimitsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+};
+
+export type ResetProjectLimitsError = ResetProjectLimitsErrors[keyof ResetProjectLimitsErrors];
+
+export type ResetProjectLimitsResponses = {
+    /**
+     * Project limits cleared; the project inherits the instance defaults
+     */
+    204: void;
+};
+
+export type ResetProjectLimitsResponse = ResetProjectLimitsResponses[keyof ResetProjectLimitsResponses];
+
+export type GetProjectLimitsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type GetProjectLimitsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetProjectLimitsError = GetProjectLimitsErrors[keyof GetProjectLimitsErrors];
+
+export type GetProjectLimitsResponses = {
+    /**
+     * Stored and effective limits plus this month's spend
+     */
+    200: ProjectLimitsResponse;
+};
+
+export type GetProjectLimitsResponse = GetProjectLimitsResponses[keyof GetProjectLimitsResponses];
+
+export type UpdateProjectLimitsData = {
+    body: LimitSettingsBody;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/ai/limits/projects/{project_id}';
+};
+
+export type UpdateProjectLimitsErrors = {
+    /**
+     * Invalid limit
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+};
+
+export type UpdateProjectLimitsError = UpdateProjectLimitsErrors[keyof UpdateProjectLimitsErrors];
+
+export type UpdateProjectLimitsResponses = {
+    /**
+     * Project limits replaced, as stored
+     */
+    200: LimitSettingsBody;
+};
+
+export type UpdateProjectLimitsResponse = UpdateProjectLimitsResponses[keyof UpdateProjectLimitsResponses];
+
 export type GetUserPendingActionData = {
     body?: never;
     path: {
@@ -32177,6 +33163,52 @@ export type UpdateAiSummaryPreferenceResponses = {
 
 export type UpdateAiSummaryPreferenceResponse = UpdateAiSummaryPreferenceResponses[keyof UpdateAiSummaryPreferenceResponses];
 
+export type GetUsageByProjectData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * ISO 8601 start time (defaults to 24h ago)
+         */
+        from?: string;
+        /**
+         * ISO 8601 end time (defaults to now)
+         */
+        to?: string;
+        /**
+         * Max projects (defaults to 50, max 100)
+         */
+        limit?: number;
+    };
+    url: '/ai/usage/by-project';
+};
+
+export type GetUsageByProjectErrors = {
+    /**
+     * Invalid query parameters
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Requires an instance administrator
+     */
+    403: ProblemDetails;
+};
+
+export type GetUsageByProjectError = GetUsageByProjectErrors[keyof GetUsageByProjectErrors];
+
+export type GetUsageByProjectResponses = {
+    /**
+     * Spend and volume per project, most expensive first
+     */
+    200: Array<ProjectUsage>;
+};
+
+export type GetUsageByProjectResponse = GetUsageByProjectResponses[keyof GetUsageByProjectResponses];
+
 export type GetUsageByProviderData = {
     body?: never;
     path?: never;
@@ -32189,6 +33221,10 @@ export type GetUsageByProviderData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/by-provider';
 };
@@ -32223,6 +33259,10 @@ export type GetConversationsData = {
     body?: never;
     path?: never;
     query?: {
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
         /**
          * ISO 8601 start time (defaults to 24h ago)
          */
@@ -32337,6 +33377,10 @@ export type GetUsageRecentData = {
          */
         model?: string;
         /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
+        /**
          * Filter by HTTP status code (exact match)
          */
         status?: number;
@@ -32410,6 +33454,10 @@ export type GetUsageSummaryData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/summary';
 };
@@ -32456,6 +33504,10 @@ export type GetUsageTimeseriesData = {
          * Bucket size: hour, day, week (defaults to day)
          */
         bucket?: string;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/timeseries';
 };
@@ -32502,6 +33554,10 @@ export type GetUsageTopModelsData = {
          * Max results (defaults to 10)
          */
         limit?: number;
+        /**
+         * Filter by project ID (deployment-token usage; instance administrators only)
+         */
+        project_id?: number;
     };
     url: '/ai/usage/top-models';
 };
@@ -41359,7 +42415,13 @@ export type GetServiceTypeParametersData = {
          */
         service_type: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Managed S3 storage engine to describe (`rustfs` or `garage`). Defaults
+         * to `rustfs`; ignored for service types without backends.
+         */
+        backend?: string | null;
+    };
     url: '/external-services/types/{service_type}/parameters';
 };
 
@@ -42455,6 +43517,50 @@ export type ExternalServiceMetricsStatusResponses = {
 };
 
 export type ExternalServiceMetricsStatusResponse = ExternalServiceMetricsStatusResponses[keyof ExternalServiceMetricsStatusResponses];
+
+export type MigrateS3ServiceData = {
+    body: MigrateS3ServiceRequest;
+    path: {
+        /**
+         * Target external service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/migrate-s3';
+};
+
+export type MigrateS3ServiceErrors = {
+    /**
+     * Either service is not a migratable managed S3 service
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MigrateS3ServiceResponses = {
+    /**
+     * Buckets copied
+     */
+    200: S3MigrationReport;
+};
+
+export type MigrateS3ServiceResponse = MigrateS3ServiceResponses[keyof MigrateS3ServiceResponses];
 
 export type RevealServiceParameterData = {
     body?: never;
@@ -46388,6 +47494,231 @@ export type RetryInstantiationResponses = {
 
 export type RetryInstantiationResponse = RetryInstantiationResponses[keyof RetryInstantiationResponses];
 
+export type ClaimCiBuildData = {
+    body: RunnerClaim;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/claim';
+};
+
+export type ClaimCiBuildErrors = {
+    /**
+     * Runner identity rejected
+     */
+    403: unknown;
+    /**
+     * Build already claimed or terminal
+     */
+    409: unknown;
+    /**
+     * Provider run has not been recorded; retry claim
+     */
+    425: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ClaimCiBuildResponses = {
+    200: RunnerWork;
+};
+
+export type ClaimCiBuildResponse = ClaimCiBuildResponses[keyof ClaimCiBuildResponses];
+
+export type GetCiBuildContextData = {
+    body?: never;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/context';
+};
+
+export type GetCiBuildContextErrors = {
+    /**
+     * One-build token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type GetCiBuildContextResponses = {
+    /**
+     * Streamed agent-protocol context tar
+     */
+    200: Blob | File;
+};
+
+export type GetCiBuildContextResponse = GetCiBuildContextResponses[keyof GetCiBuildContextResponses];
+
+export type FailCiBuildData = {
+    body: RunnerFailure;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/failure';
+};
+
+export type FailCiBuildErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive
+     */
+    409: unknown;
+};
+
+export type FailCiBuildResponses = {
+    /**
+     * Build failed and token revoked
+     */
+    204: void;
+};
+
+export type FailCiBuildResponse = FailCiBuildResponses[keyof FailCiBuildResponses];
+
+export type CheckCiBuildLeaseData = {
+    body?: never;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/lease';
+};
+
+export type CheckCiBuildLeaseErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build cancelled or expired
+     */
+    409: unknown;
+};
+
+export type CheckCiBuildLeaseResponses = {
+    /**
+     * Lease active
+     */
+    204: void;
+};
+
+export type CheckCiBuildLeaseResponse = CheckCiBuildLeaseResponses[keyof CheckCiBuildLeaseResponses];
+
+export type AppendCiBuildLogsData = {
+    body: RunnerLogs;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/logs';
+};
+
+export type AppendCiBuildLogsErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Build inactive or batch exceeds limit
+     */
+    409: unknown;
+};
+
+export type AppendCiBuildLogsResponses = {
+    /**
+     * Log batch appended
+     */
+    204: void;
+};
+
+export type AppendCiBuildLogsResponse = AppendCiBuildLogsResponses[keyof AppendCiBuildLogsResponses];
+
+export type CompleteCiBuildData = {
+    body: RunnerResult;
+    path: {
+        /**
+         * Opaque build UUID
+         */
+        build_id: string;
+    };
+    query?: never;
+    url: '/internal/ci-builds/{build_id}/result';
+};
+
+export type CompleteCiBuildErrors = {
+    /**
+     * Token required
+     */
+    401: unknown;
+    /**
+     * Token rejected
+     */
+    403: unknown;
+    /**
+     * Verification rejected or build inactive
+     */
+    409: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type CompleteCiBuildResponses = {
+    /**
+     * Verified result accepted and token revoked
+     */
+    204: void;
+};
+
+export type CompleteCiBuildResponse = CompleteCiBuildResponses[keyof CompleteCiBuildResponses];
+
 export type AdminListNodesData = {
     body?: never;
     path?: never;
@@ -46528,6 +47859,47 @@ export type AdminGetNodeResponses = {
 };
 
 export type AdminGetNodeResponse = AdminGetNodeResponses[keyof AdminGetNodeResponses];
+
+export type AdminSetNodeBuildLimitsData = {
+    body: BuildLimits;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/build-limits';
+};
+
+export type AdminSetNodeBuildLimitsErrors = {
+    /**
+     * Invalid limits or node role
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type AdminSetNodeBuildLimitsResponses = {
+    200: BuildLimits;
+};
+
+export type AdminSetNodeBuildLimitsResponse = AdminSetNodeBuildLimitsResponses[keyof AdminSetNodeBuildLimitsResponses];
 
 export type AdminListNodeContainersData = {
     body?: never;
@@ -50108,8 +51480,8 @@ export type ListOperationsData = {
          */
         page_size?: number;
         /**
-         * `running` (queued, running, waiting), `finished` (succeeded, failed,
-         * cancelled) or `all` (default).
+         * `running` (queued, running), `waiting` (needs human review),
+         * `finished` (succeeded, failed, cancelled) or `all` (default).
          */
         status?: OperationStatusFilter;
         /**
@@ -53093,6 +54465,35 @@ export type GetAccessInfoResponses = {
 };
 
 export type GetAccessInfoResponse = GetAccessInfoResponses[keyof GetAccessInfoResponses];
+
+export type GetComposeStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/platform/compose-status';
+};
+
+export type GetComposeStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type GetComposeStatusError = GetComposeStatusErrors[keyof GetComposeStatusErrors];
+
+export type GetComposeStatusResponses = {
+    /**
+     * Docker Compose CLI status
+     */
+    200: ComposeHostStatusResponse;
+};
+
+export type GetComposeStatusResponse = GetComposeStatusResponses[keyof GetComposeStatusResponses];
 
 export type GetPlatformFeaturesData = {
     body?: never;
@@ -56553,6 +57954,42 @@ export type RunActivityReportResponses = {
 
 export type RunActivityReportResponse = RunActivityReportResponses[keyof RunActivityReportResponses];
 
+export type GetAnalyticsIngestKeyEndpointData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-endpoint';
+};
+
+export type GetAnalyticsIngestKeyEndpointErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetAnalyticsIngestKeyEndpointResponses = {
+    /**
+     * The configured external URL, or null when none is stored
+     */
+    200: AnalyticsIngestEndpoint;
+};
+
+export type GetAnalyticsIngestKeyEndpointResponse = GetAnalyticsIngestKeyEndpointResponses[keyof GetAnalyticsIngestKeyEndpointResponses];
+
 export type ListAnalyticsIngestKeysData = {
     body?: never;
     path: {
@@ -57483,6 +58920,44 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type GetProjectComposeValidationData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/compose-validation';
+};
+
+export type GetProjectComposeValidationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectComposeValidationError = GetProjectComposeValidationErrors[keyof GetProjectComposeValidationErrors];
+
+export type GetProjectComposeValidationResponses = {
+    /**
+     * Last stored check, or null
+     */
+    200: ComposeValidationReportResponse | null;
+};
+
+export type GetProjectComposeValidationResponse = GetProjectComposeValidationResponses[keyof GetProjectComposeValidationResponses];
+
 export type ListCustomDomainsForProjectData = {
     body?: never;
     path: {
@@ -58203,6 +59678,60 @@ export type CancelDeploymentResponses = {
 };
 
 export type CancelDeploymentResponse = CancelDeploymentResponses[keyof CancelDeploymentResponses];
+
+export type RunDeploymentComposeCheckData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Deployment ID
+         */
+        deployment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/deployments/{deployment_id}/compose-check';
+};
+
+export type RunDeploymentComposeCheckErrors = {
+    /**
+     * Not a Docker Compose project
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, deployment or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * The Compose file could not be read from the Git provider
+     */
+    502: ProblemDetails;
+};
+
+export type RunDeploymentComposeCheckError = RunDeploymentComposeCheckErrors[keyof RunDeploymentComposeCheckErrors];
+
+export type RunDeploymentComposeCheckResponses = {
+    /**
+     * Check result (passed or the failure)
+     */
+    200: ComposeCheckReport;
+};
+
+export type RunDeploymentComposeCheckResponse = RunDeploymentComposeCheckResponses[keyof RunDeploymentComposeCheckResponses];
 
 export type ListDeploymentContainerLogsData = {
     body?: never;
@@ -61020,6 +62549,202 @@ export type DeployFromStaticResponses = {
 
 export type DeployFromStaticResponse = DeployFromStaticResponses[keyof DeployFromStaticResponses];
 
+export type DeleteEnvironmentIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type DeleteEnvironmentIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment or policy not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteEnvironmentIpAccessError = DeleteEnvironmentIpAccessErrors[keyof DeleteEnvironmentIpAccessErrors];
+
+export type DeleteEnvironmentIpAccessResponses = {
+    /**
+     * Policy removed
+     */
+    204: void;
+};
+
+export type DeleteEnvironmentIpAccessResponse = DeleteEnvironmentIpAccessResponses[keyof DeleteEnvironmentIpAccessResponses];
+
+export type GetEnvironmentIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type GetEnvironmentIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEnvironmentIpAccessError = GetEnvironmentIpAccessErrors[keyof GetEnvironmentIpAccessErrors];
+
+export type GetEnvironmentIpAccessResponses = {
+    /**
+     * The environment's own IP access policy
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type GetEnvironmentIpAccessResponse = GetEnvironmentIpAccessResponses[keyof GetEnvironmentIpAccessResponses];
+
+export type PutEnvironmentIpAccessData = {
+    body: SetProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access';
+};
+
+export type PutEnvironmentIpAccessErrors = {
+    /**
+     * Invalid policy
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy would lock out the caller
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PutEnvironmentIpAccessError = PutEnvironmentIpAccessErrors[keyof PutEnvironmentIpAccessErrors];
+
+export type PutEnvironmentIpAccessResponses = {
+    /**
+     * Policy saved
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type PutEnvironmentIpAccessResponse = PutEnvironmentIpAccessResponses[keyof PutEnvironmentIpAccessResponses];
+
+export type TestEnvironmentIpAccessData = {
+    body: TestProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/ip-access/test';
+};
+
+export type TestEnvironmentIpAccessErrors = {
+    /**
+     * Invalid address or draft
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TestEnvironmentIpAccessError = TestEnvironmentIpAccessErrors[keyof TestEnvironmentIpAccessErrors];
+
+export type TestEnvironmentIpAccessResponses = {
+    /**
+     * Evaluation result
+     */
+    200: TestProjectIpAccessResponse;
+};
+
+export type TestEnvironmentIpAccessResponse = TestEnvironmentIpAccessResponses[keyof TestEnvironmentIpAccessResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -63526,6 +65251,186 @@ export type GetInheritedEnvVarsResponses = {
 };
 
 export type GetInheritedEnvVarsResponse = GetInheritedEnvVarsResponses[keyof GetInheritedEnvVarsResponses];
+
+export type DeleteProjectIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type DeleteProjectIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or policy not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteProjectIpAccessError = DeleteProjectIpAccessErrors[keyof DeleteProjectIpAccessErrors];
+
+export type DeleteProjectIpAccessResponses = {
+    /**
+     * Policy removed
+     */
+    204: void;
+};
+
+export type DeleteProjectIpAccessResponse = DeleteProjectIpAccessResponses[keyof DeleteProjectIpAccessResponses];
+
+export type GetProjectIpAccessData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type GetProjectIpAccessErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectIpAccessError = GetProjectIpAccessErrors[keyof GetProjectIpAccessErrors];
+
+export type GetProjectIpAccessResponses = {
+    /**
+     * The project-wide IP access policy
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type GetProjectIpAccessResponse = GetProjectIpAccessResponses[keyof GetProjectIpAccessResponses];
+
+export type PutProjectIpAccessData = {
+    body: SetProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access';
+};
+
+export type PutProjectIpAccessErrors = {
+    /**
+     * Invalid policy
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Policy would lock out the caller
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type PutProjectIpAccessError = PutProjectIpAccessErrors[keyof PutProjectIpAccessErrors];
+
+export type PutProjectIpAccessResponses = {
+    /**
+     * Policy saved
+     */
+    200: ProjectIpAccessDetail;
+};
+
+export type PutProjectIpAccessResponse = PutProjectIpAccessResponses[keyof PutProjectIpAccessResponses];
+
+export type TestProjectIpAccessData = {
+    body: TestProjectIpAccessRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/ip-access/test';
+};
+
+export type TestProjectIpAccessErrors = {
+    /**
+     * Invalid address or draft
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type TestProjectIpAccessError = TestProjectIpAccessErrors[keyof TestProjectIpAccessErrors];
+
+export type TestProjectIpAccessResponses = {
+    /**
+     * Evaluation result
+     */
+    200: TestProjectIpAccessResponse;
+};
+
+export type TestProjectIpAccessResponse2 = TestProjectIpAccessResponses[keyof TestProjectIpAccessResponses];
 
 export type PurgeProjectLogsData = {
     body: PurgeLogsRequest;
@@ -68657,6 +70562,101 @@ export type RunAiProviderSmokeResponses = {
 
 export type RunAiProviderSmokeResponse = RunAiProviderSmokeResponses[keyof RunAiProviderSmokeResponses];
 
+export type GetCiBuilderData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder';
+};
+
+export type GetCiBuilderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type GetCiBuilderResponses = {
+    200: CiExecutorStatus;
+};
+
+export type GetCiBuilderResponse = GetCiBuilderResponses[keyof GetCiBuilderResponses];
+
+export type SetCiBuilderData = {
+    body: CiExecutorSettingsWritable;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder';
+};
+
+export type SetCiBuilderErrors = {
+    /**
+     * Invalid settings
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type SetCiBuilderResponses = {
+    200: CiExecutorStatus;
+};
+
+export type SetCiBuilderResponse = SetCiBuilderResponses[keyof SetCiBuilderResponses];
+
+export type ProvisionCiBuilderData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/ci-builder/provision';
+};
+
+export type ProvisionCiBuilderErrors = {
+    /**
+     * Configuration/provider error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Storage failed
+     */
+    500: unknown;
+};
+
+export type ProvisionCiBuilderResponses = {
+    /**
+     * Builder repository and pinned shim provisioned
+     */
+    204: void;
+};
+
+export type ProvisionCiBuilderResponse = ProvisionCiBuilderResponses[keyof ProvisionCiBuilderResponses];
+
 export type RotateClusterCaData = {
     body: RotateClusterCaRequest;
     path?: never;
@@ -72454,6 +74454,52 @@ export type ExtendTimeoutResponses = {
 };
 
 export type ExtendTimeoutResponse = ExtendTimeoutResponses[keyof ExtendTimeoutResponses];
+
+export type ListDirData = {
+    body?: never;
+    path: {
+        id: string;
+    };
+    query: {
+        /**
+         * Absolute path of a directory inside the sandbox
+         */
+        path: string;
+        /**
+         * 1-based page (default 1)
+         */
+        page?: number;
+        /**
+         * Entries per page (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/v1/sandboxes/{id}/fs/list';
+};
+
+export type ListDirErrors = {
+    /**
+     * Validation error, or the directory is not readable by the sandbox user
+     */
+    400: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Sandbox is not running (stopped or paused), so its filesystem cannot be listed
+     */
+    409: unknown;
+};
+
+export type ListDirResponses = {
+    /**
+     * One page of directory entries (exists=false when missing, is_dir=false for a file — not errors)
+     */
+    200: DirectoryListingResponse;
+};
+
+export type ListDirResponse = ListDirResponses[keyof ListDirResponses];
 
 export type MkdirData = {
     body: MkdirBody;

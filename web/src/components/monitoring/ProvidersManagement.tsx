@@ -31,8 +31,14 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { ConfirmDialog } from '@/components/ui/confirm-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import { EmptyState } from '@/components/ui/empty-state'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { Switch } from '@/components/ui/switch'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
@@ -97,10 +103,16 @@ export function ProvidersManagement({
   const {
     data: providers,
     isLoading,
+    error: providersError,
+    isFetching,
     refetch,
   } = useQuery({
     ...listNotificationProvidersOptions(),
   })
+  // Creating a provider is offered to administrators only; for anyone else it
+  // would just lead to a refusal.
+  const canManageProviders = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
 
   const updateEmailMutation = useMutation({
     ...updateNotificationEmailProviderMutation(),
@@ -370,7 +382,7 @@ export function ProvidersManagement({
         </p>
         {/* Only one of this and the empty-state button is ever mounted, so
             the `N` shortcut is registered exactly once either way. */}
-        {hasProviders && (
+        {hasProviders && canManageProviders && (
           <CreateActionButton
             onClick={() => navigate(addProviderHref)}
             label="Add Provider"
@@ -378,16 +390,44 @@ export function ProvidersManagement({
         )}
       </div>
 
-      {!hasProviders && !isLoading ? (
+      {!canManageProviders && (
+        <AdminOnlyNote action="add or change providers" role={currentRole} />
+      )}
+
+      {providersError && !hasProviders ? (
+        // A failed or refused read is not an empty list: it must not claim no
+        // provider exists and invite the user to add one.
+        <ReadFailure
+          resource="Notification providers"
+          error={providersError}
+          onRetry={
+            isForbiddenRead(providersError) ? undefined : () => void refetch()
+          }
+          retrying={isFetching}
+        />
+      ) : isLoading ? (
+        <div
+          role="status"
+          aria-label="Loading notification providers"
+          className="space-y-3 rounded-lg border p-4"
+        >
+          {Array.from({ length: 3 }, (_, index) => (
+            <Skeleton key={index} className="h-12 w-full" />
+          ))}
+        </div>
+      ) : !hasProviders ? (
         <EmptyState
+          size="compact"
           icon={Bell}
           title="No notification providers configured"
           description="Add your first notification provider to start receiving alerts about your deployments and infrastructure."
           action={
-            <CreateActionButton
-              onClick={() => navigate(addProviderHref)}
-              label="Add Provider"
-            />
+            canManageProviders ? (
+              <CreateActionButton
+                onClick={() => navigate(addProviderHref)}
+                label="Add Provider"
+              />
+            ) : undefined
           }
         />
       ) : (
@@ -521,11 +561,14 @@ export function ProvidersManagement({
         </DialogContent>
       </Dialog>
 
-      <ConfirmDialog
+      <ConfirmDeleteDialog
         open={providerToDelete !== null}
-        onOpenChange={(open) => !open && setProviderToDelete(null)}
-        title={`Delete ${providerToDelete?.name ?? 'provider'}?`}
-        description="This permanently deletes the notification provider. Notification routes that use it will stop delivering to it. This cannot be undone."
+        onOpenChange={(open) => {
+          if (!open) setProviderToDelete(null)
+        }}
+        resourceType="notification provider"
+        resourceName={providerToDelete?.name ?? ''}
+        consequences="Notification routes that use it will stop delivering to it."
         onConfirm={handleConfirmDelete}
       />
     </div>

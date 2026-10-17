@@ -1422,6 +1422,11 @@ impl GitProviderService for GitHubProvider {
             .send_with_retry(|| client.get(&url).headers(headers.clone()))
             .await?;
 
+        if let Some(error) =
+            super::git_provider::file_not_found(response.status(), owner, repo, path, branch)
+        {
+            return Err(error);
+        }
         if !response.status().is_success() {
             return Err(github_response_error(
                 response,
@@ -2964,6 +2969,61 @@ mod tag_pagination_tests {
                 token: "test-token".to_string(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn file_reads_classify_a_404_as_a_missing_file() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let missing = server
+            .mock("GET", "/repos/temps/example/contents/stack/shared.yaml")
+            .match_query(mockito::Matcher::Exact("ref=main".to_string()))
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+        let denied = server
+            .mock("GET", "/repos/temps/example/contents/private.yaml")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Resource not accessible by integration"}"#)
+            .create_async()
+            .await;
+        let provider = provider(server.url());
+
+        let error = provider
+            .get_file_content(
+                "test-token",
+                "temps",
+                "example",
+                "stack/shared.yaml",
+                Some("main"),
+            )
+            .await
+            .expect_err("a 404 must fail");
+        assert!(
+            matches!(&error, GitProviderError::FileNotFound { path, git_ref, .. }
+                if path == "stack/shared.yaml" && git_ref == "main"),
+            "{error}"
+        );
+        let error = provider
+            .get_file_content(
+                "test-token",
+                "temps",
+                "example",
+                "private.yaml",
+                Some("main"),
+            )
+            .await
+            .expect_err("a 403 must fail");
+        assert!(
+            !matches!(error, GitProviderError::FileNotFound { .. }),
+            "{error}"
+        );
+        missing.assert_async().await;
+        denied.assert_async().await;
     }
 
     fn github_tag_json(index: usize) -> serde_json::Value {

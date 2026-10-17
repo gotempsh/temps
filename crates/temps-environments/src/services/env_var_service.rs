@@ -11,7 +11,7 @@ use temps_core::EncryptionService;
 use temps_entities::{env_var_environments, env_vars, environments};
 use thiserror::Error;
 
-use super::types::{EnvVarEnvironment, EnvVarWithEnvironments, UpdateEnvVarOutcome};
+use super::types::{DeletedEnvVar, EnvVarEnvironment, EnvVarWithEnvironments, UpdateEnvVarOutcome};
 
 #[derive(Error, Debug)]
 pub enum EnvVarError {
@@ -475,6 +475,17 @@ impl EnvVarService {
                     let promoted_to_secret = !was_secret && final_is_secret;
                     let was_encrypted = env_var.is_encrypted;
                     let stored_value = env_var.value.clone();
+                    let previous_key = env_var.key.clone();
+                    let previous_include_in_preview = env_var.include_in_preview;
+                    let mut previous_environment_ids: Vec<i32> =
+                        env_var_environments::Entity::find()
+                            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+                            .all(txn)
+                            .await?
+                            .into_iter()
+                            .map(|link| link.environment_id)
+                            .collect();
+                    previous_environment_ids.sort_unstable();
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
@@ -539,7 +550,28 @@ impl EnvVarService {
                     // Non-secret rows return the supplied plaintext or
                     // None when value wasn't changed (caller already has
                     // the current value via list).
+                    let value_supplied = value.is_some();
                     let value = if var.is_secret { None } else { value };
+
+                    let mut new_environment_ids = environment_ids.clone();
+                    new_environment_ids.sort_unstable();
+                    new_environment_ids.dedup();
+                    let mut changed_fields: Vec<&'static str> = Vec::new();
+                    if previous_key != var.key {
+                        changed_fields.push("key");
+                    }
+                    if value_supplied {
+                        changed_fields.push("value");
+                    }
+                    if previous_environment_ids != new_environment_ids {
+                        changed_fields.push("environments");
+                    }
+                    if previous_include_in_preview != var.include_in_preview {
+                        changed_fields.push("include_in_preview");
+                    }
+                    if promoted_to_secret {
+                        changed_fields.push("is_secret");
+                    }
 
                     Ok(UpdateEnvVarOutcome {
                         var: EnvVarWithEnvironments {
@@ -554,6 +586,7 @@ impl EnvVarService {
                             is_secret: var.is_secret,
                         },
                         promoted_to_secret,
+                        changed_fields,
                     })
                 })
             })
@@ -595,9 +628,10 @@ impl EnvVarService {
         &self,
         project_id: i32,
         var_id: i32,
-    ) -> Result<(), EnvVarError> {
-        self.db
-            .transaction::<_, (), EnvVarError>(|txn| {
+    ) -> Result<DeletedEnvVar, EnvVarError> {
+        let deleted = self
+            .db
+            .transaction::<_, DeletedEnvVar, EnvVarError>(|txn| {
                 Box::pin(async move {
                     let env_var = Self::lock_for_write(txn, project_id, var_id)
                         .await?
@@ -608,20 +642,34 @@ impl EnvVarService {
                             ))
                         })?;
 
+                    let links = env_var_environments::Entity::find()
+                        .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+                        .all(txn)
+                        .await?;
+                    let mut environment_ids: Vec<i32> =
+                        links.into_iter().map(|link| link.environment_id).collect();
+                    environment_ids.sort_unstable();
+
                     env_var_environments::Entity::delete_many()
                         .filter(env_var_environments::Column::EnvVarId.eq(var_id))
                         .exec(txn)
                         .await?;
 
+                    let deleted = DeletedEnvVar {
+                        id: env_var.id,
+                        key: env_var.key.clone(),
+                        is_secret: env_var.is_secret,
+                        environment_ids,
+                    };
                     let active_var: env_vars::ActiveModel = env_var.into();
                     active_var.delete(txn).await?;
 
-                    Ok(())
+                    Ok(deleted)
                 })
             })
             .await?;
 
-        Ok(())
+        Ok(deleted)
     }
 
     /// Read one regular value for an authorized, audited HTTP reveal flow.
@@ -1150,6 +1198,7 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![before]])
                 .append_exec_results([checks_locked()])
+                .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
                 .append_query_results(vec![vec![after]])
                 .append_exec_results(vec![MockExecResult {
                     last_insert_id: 0,
@@ -1256,6 +1305,97 @@ mod tests {
         assert!(outcome.promoted_to_secret);
         assert!(outcome.var.is_secret);
         assert_eq!(outcome.var.value, None);
+    }
+
+    #[tokio::test]
+    async fn test_update_reports_changed_fields_without_the_value() {
+        // The handler audits an update from `changed_fields`; it must name the
+        // fields that changed and never carry a value.
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("old_value").unwrap();
+        let before = make_env_var_model_full(6, 10, "API_URL", &encrypted, true, false);
+        let after = make_env_var_model_full(6, 10, "API_URL", &encrypted, true, false);
+
+        let service = EnvVarService::new(mock_update_db(before, after), encryption_service);
+
+        let outcome = service
+            .update_environment_variable(
+                10,
+                6,
+                "API_URL".to_string(),
+                Some("rotated".to_string()),
+                vec![],
+                true,
+                None,
+            )
+            .await
+            .expect("update should succeed");
+
+        assert!(outcome.changed_fields.contains(&"value"));
+        assert!(!outcome.changed_fields.contains(&"key"));
+        assert!(!outcome.promoted_to_secret);
+    }
+
+    #[tokio::test]
+    async fn test_update_with_nothing_changed_reports_no_changed_fields() {
+        let encryption_service = make_encryption_service();
+        let encrypted = encryption_service.encrypt_string("same").unwrap();
+        let before = make_env_var_model_full(7, 10, "STABLE", &encrypted, true, false);
+        let after = make_env_var_model_full(7, 10, "STABLE", &encrypted, true, false);
+
+        let service = EnvVarService::new(mock_update_db(before, after), encryption_service);
+
+        let outcome = service
+            .update_environment_variable(10, 7, "STABLE".to_string(), None, vec![], false, None)
+            .await
+            .expect("no-op update should succeed");
+
+        assert!(
+            outcome.changed_fields.is_empty()
+                || outcome.changed_fields == vec!["include_in_preview"],
+            "unexpected changed fields: {:?}",
+            outcome.changed_fields
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_reports_the_removed_variable_for_auditing() {
+        let encryption_service = make_encryption_service();
+        let model = make_env_var_model_full(8, 10, "TO_REMOVE", "ciphertext", true, true);
+        let link = env_var_environments::Model {
+            id: 1,
+            env_var_id: 8,
+            environment_id: 5,
+            created_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![model]])
+                .append_exec_results([checks_locked()])
+                .append_query_results(vec![vec![link]])
+                .append_exec_results(vec![
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let deleted = service
+            .delete_environment_variable(10, 8)
+            .await
+            .expect("delete should succeed");
+
+        assert_eq!(deleted.id, 8);
+        assert_eq!(deleted.key, "TO_REMOVE");
+        assert!(deleted.is_secret);
+        assert_eq!(deleted.environment_ids, vec![5]);
     }
 
     #[tokio::test]
@@ -1409,6 +1549,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![before]])
             .append_exec_results([checks_locked()])
+            .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
             .append_query_results(vec![vec![after]])
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
@@ -1557,6 +1698,7 @@ mod integration_tests {
                     service
                         .delete_environment_variable(project_id, var_id)
                         .await
+                        .map(|_| ())
                 }
             });
             // Let the write lock the variable and queue behind the check row.

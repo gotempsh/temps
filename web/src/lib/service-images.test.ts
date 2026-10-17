@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { DEFAULT_RUSTFS_IMAGE } from './service-images'
+import { DEFAULT_GARAGE_IMAGE, DEFAULT_RUSTFS_IMAGE } from './service-images'
 
 describe('managed service image defaults', () => {
   test('uses the OTLP-capable RustFS release', () => {
     expect(DEFAULT_RUSTFS_IMAGE).toBe('rustfs/rustfs:1.0.0')
+  })
+
+  test('pins Garage to a release tag', () => {
+    expect(DEFAULT_GARAGE_IMAGE).toBe('dxflrs/garage:v2.1.0')
+    expect(DEFAULT_GARAGE_IMAGE.endsWith(':latest')).toBe(false)
   })
 })

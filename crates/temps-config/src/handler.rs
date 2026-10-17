@@ -483,6 +483,10 @@ pub struct AppSettingsResponse {
     /// Retention windows for raw proxy logs and OpenTelemetry data.
     pub observability_retention: ObservabilityRetentionSettings,
 
+    /// Retention of analytics events and of the visitors and client IP
+    /// addresses attached to them.
+    pub analytics_retention: temps_core::AnalyticsRetentionSettings,
+
     /// ClickHouse wire compression: the stored choice, the mode the running
     /// process actually uses, and what the startup probe found. Always
     /// present; `configured: false` explains what is missing instead of the
@@ -1127,6 +1131,7 @@ impl From<AppSettings> for AppSettingsResponse {
             monitored_services_count: None,
             observability_compression: settings.observability_compression,
             observability_retention: settings.observability_retention,
+            analytics_retention: settings.analytics_retention,
             clickhouse: ClickHouseSettingsResponse::from_stored(settings.clickhouse.compression),
             geo: GeoSettingsMasked::from(settings.geo),
             insecure_tls: settings.insecure_tls,
@@ -1287,6 +1292,7 @@ impl AppSettingsResponse {
         MonitoringSettingsMasked,
         ObservabilityCompressionSettings,
         ObservabilityRetentionSettings,
+        temps_core::AnalyticsRetentionSettings,
         ClickHouseSettingsResponse,
         ClickHouseConnectionStatus,
         ClickHouseConnectionState,
@@ -3110,6 +3116,22 @@ fn authorize_bulk_activation_guard_change(
         .build())
 }
 
+fn validate_analytics_retention(
+    retention: &temps_core::AnalyticsRetentionSettings,
+) -> Result<(), Problem> {
+    if let Some((field, days)) = retention.out_of_range() {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "analytics_retention.{field} must be between {} and {} days (got {days}); \
+                 use null to keep the data",
+                temps_core::MIN_ANALYTICS_RETENTION_DAYS,
+                temps_core::MAX_ANALYTICS_RETENTION_DAYS,
+            ))
+            .build());
+    }
+    Ok(())
+}
+
 fn validate_observability_retention(
     retention: &ObservabilityRetentionSettings,
 ) -> Result<(), Problem> {
@@ -3505,6 +3527,7 @@ async fn update_settings(
 
     validate_observability_compression(&settings.observability_compression)?;
     validate_observability_retention(&settings.observability_retention)?;
+    validate_analytics_retention(&settings.analytics_retention)?;
     validate_container_log_budgets(&settings.container_logs)?;
     validate_geo_settings(&settings.geo)?;
     normalize_trusted_private_networks(&mut settings.trusted_private_networks)?;
@@ -5856,6 +5879,57 @@ mod tests {
             error.body.get("detail").and_then(|value| value.as_str()),
             Some("observability_retention.otel_logs_days must be between 1 and 3650")
         );
+    }
+
+    #[test]
+    fn analytics_retention_validation_accepts_keep_and_boundaries() {
+        use temps_core::AnalyticsRetentionSettings;
+
+        validate_analytics_retention(&AnalyticsRetentionSettings::default())
+            .expect("defaults are valid");
+        validate_analytics_retention(&AnalyticsRetentionSettings {
+            events_days: 1,
+            error_events_days: Some(3650),
+            visitor_days: None,
+            unreferenced_ip_days: None,
+            ip_hold_until: None,
+        })
+        .expect("boundaries and null (keep) are valid");
+    }
+
+    #[test]
+    fn analytics_retention_validation_names_the_offending_window() {
+        use temps_core::AnalyticsRetentionSettings;
+
+        let error = validate_analytics_retention(&AnalyticsRetentionSettings {
+            visitor_days: Some(0),
+            ..Default::default()
+        })
+        .expect_err("a zero-day window must be rejected");
+        let detail = error
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(
+            detail.contains("analytics_retention.visitor_days"),
+            "detail should name the field, got: {detail}"
+        );
+        assert!(
+            detail.contains("null"),
+            "detail should mention null: {detail}"
+        );
+    }
+
+    #[test]
+    fn response_surfaces_analytics_retention_settings() {
+        let mut settings = AppSettings::default();
+        settings.analytics_retention.visitor_days = Some(425);
+
+        let response = AppSettingsResponse::from(settings);
+
+        assert_eq!(response.analytics_retention.visitor_days, Some(425));
+        assert_eq!(response.analytics_retention.events_days, 90);
     }
 
     #[test]
