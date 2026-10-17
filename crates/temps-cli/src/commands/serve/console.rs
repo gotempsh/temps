@@ -1541,7 +1541,7 @@ fn serve_static_from(site: &'static Dir<'static>, req: Request) -> Response {
     // by any API router (including external plugin proxies). The same goes for
     // `/ai/v1/*`: the AI gateway lives under `/api/ai/v1`, and answering a
     // client that dropped the `/api` prefix with the console HTML (200) makes
-    // every OpenAI SDK fail with an unparseable body instead of a pointer to
+    // every OpenAI SDK fail with an unparsable body instead of a pointer to
     // the right URL.
     if let Some(detail) = unmatched_api_detail(raw_path) {
         let body = format!(r#"{{"status":404,"title":"Not Found","detail":"{detail}"}}"#);
@@ -4752,9 +4752,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // around them. Bound in both listener modes: in dual-listener mode
     // `console_address` has no admin routes, but `public_app` below still
     // mounts the authenticated MCP endpoint, so it cannot stand in for it.
-    let ingress_app = config
-        .public_surface_address()
-        .map(|_| public_only_app(health_router(ready_flag.clone()), public_router.clone()));
+    let ingress_app = config.public_surface_address().map(|_| {
+        // Request spans for OpenTelemetry export; a no-op unless `--otel-export`.
+        // This is the listener the proxy forwards public ingest traffic to when
+        // `console_ingress_address` is set, so it needs the same layer as
+        // `public_app` below or that traffic would never be traced.
+        crate::otel_export::layer_requests(public_only_app(
+            health_router(ready_flag.clone()),
+            public_router.clone(),
+        ))
+    });
 
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))

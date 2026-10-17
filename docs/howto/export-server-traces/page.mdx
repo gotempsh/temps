@@ -196,6 +196,7 @@ Telemetry must never hurt the server, so:
 
 - **Headers are credentials.** They are accepted only from `OTEL_EXPORTER_OTLP_HEADERS`; there is no flag (flag values appear in `ps`) and no config-file key (the file is not encrypted). Header values are never logged: the startup line prints `authorization=***`.
 - **Endpoints are redacted in logs.** Embedded `user:password@` and query strings are stripped (`https://***@host/path?***`).
+- **`--otel-endpoint` is blanked in the process list.** An endpoint can carry credentials, so once the command line is parsed Temps overwrites the flag's value in `ps` / `/proc/<pid>/cmdline`, the same way it treats `--database-url`. There is a brief window before that happens, so for an endpoint with credentials prefer `OTEL_EXPORTER_OTLP_ENDPOINT` in the environment.
 - **Spans carry no request content.** Only method, route template and status code are recorded, plus the resource attributes listed above. `host.name` is the machine hostname; override it with `OTEL_RESOURCE_ATTRIBUTES=host.name=...` if that is sensitive in your backend.
 - Prefer `https://` endpoints (and `http/protobuf` or gRPC over TLS) for anything that leaves your network.
 

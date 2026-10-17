@@ -13096,7 +13096,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_path_to_error",
- "serde_yaml",
  "sha2 0.11.0",
  "sqlx 0.8.6",
  "sysinfo",
@@ -13112,6 +13111,7 @@ dependencies = [
  "url",
  "utoipa",
  "uuid",
+ "yaml_serde",
 ]
 
 [[package]]

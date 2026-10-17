@@ -382,7 +382,7 @@ fn parse_file(raw: &str) -> Result<OtelExportFile, String> {
     if raw.trim().is_empty() {
         return Ok(OtelExportFile::default());
     }
-    serde_yaml::from_str(raw).map_err(|e| {
+    yaml_serde::from_str(raw).map_err(|e| {
         let mut reason = format!("invalid YAML: {e}");
         if reason.contains("headers") {
             reason.push_str(

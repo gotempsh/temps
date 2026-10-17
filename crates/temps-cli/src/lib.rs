@@ -396,7 +396,12 @@ pub fn install_crypto_provider() {
 fn scrub_sensitive_argv(sensitive_values: &[String]) {
     /// `--pair` carries a one-time pairing secret (`--pair -` reads it
     /// from stdin instead; overwriting the `-` is harmless).
-    const SENSITIVE_FLAGS: &[&str] = &["--database-url", "--pair"];
+    ///
+    /// `--otel-endpoint` is scrubbed because an OTLP endpoint legitimately
+    /// carries credentials (`https://user:pass@host`, `?token=...`). Clap has
+    /// already parsed the value by now, so the exporter still receives it; only
+    /// the process table's copy is blanked.
+    const SENSITIVE_FLAGS: &[&str] = &["--database-url", "--pair", "--otel-endpoint"];
     let sensitive_values: Vec<&str> = sensitive_values.iter().map(String::as_str).collect();
     // Without a supported platform below there is nothing to scrub with.
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -616,6 +621,47 @@ mod argv_scrub_tests {
         assert_eq!(
             scrubbed(&["temps", "join", "--pair=tpair1.secret"], flags, &[]),
             ["temps", "join", "--pair=xxxxxxxxxxxxx"]
+        );
+    }
+
+    #[test]
+    fn an_otel_endpoint_with_credentials_is_overwritten_in_both_forms() {
+        let flags = &["--database-url", "--pair", "--otel-endpoint"];
+        assert_eq!(
+            scrubbed(
+                &[
+                    "temps",
+                    "serve",
+                    "--otel-endpoint",
+                    "https://u:p@c.example.test/?k=1",
+                    "--otel-export",
+                ],
+                flags,
+                &[],
+            ),
+            [
+                "temps",
+                "serve",
+                "--otel-endpoint",
+                "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+                "--otel-export",
+            ]
+        );
+        assert_eq!(
+            scrubbed(
+                &[
+                    "temps",
+                    "serve",
+                    "--otel-endpoint=https://u:p@c.example.test/"
+                ],
+                flags,
+                &[],
+            ),
+            [
+                "temps",
+                "serve",
+                "--otel-endpoint=xxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ]
         );
     }
 
