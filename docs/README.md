@@ -14,4 +14,5 @@ The documentation uses MDX (Markdown + JSX) and is pulled into the
 
 ## Feature configuration
 
+- [Background workers and deployment health probes](deploy/docker-containers/page.mdx#background-workers)
 - [Docker Compose security exceptions](features/compose-security-policies.md)

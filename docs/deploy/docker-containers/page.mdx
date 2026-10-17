@@ -46,9 +46,9 @@ CMD ["node", "server.js"]
 
 Push to your connected repository. Temps detects the Dockerfile, builds the image, runs health checks, and routes traffic to the new container.
 
-### The two requirements
+### Requirements for web containers
 
-1. **`EXPOSE` a port** — Temps reads the `EXPOSE` directive to know which port your application listens on. If you omit it, Temps falls back to the port configured in the dashboard (default `3000`).
+1. **Declare a port** — Set the port in deployment settings or use `EXPOSE` in your Dockerfile. An environment override takes precedence over the project override, then the image's first exposed port. A new image with no declared port is deployed as a background worker. Existing applications keep their previous implicit port through the upgrade migration; explicitly configure the port for new web applications without `EXPOSE`.
 2. **Listen on `0.0.0.0`** — Containers that bind to `localhost` or `127.0.0.1` only accept connections from inside the container. Temps routes traffic from the host, so your application must bind to all interfaces.
 
 ```javascript {{ title: 'server.js' }}
@@ -57,6 +57,8 @@ app.listen(port, '0.0.0.0');
 ```
 
 Temps injects a `PORT` environment variable that matches the `EXPOSE` value. You can use it, but it is not required — as long as the port in your code matches `EXPOSE`, traffic will be routed correctly.
+
+Background workers do not need either web requirement. See [background workers and health probes](#background-workers).
 
 ---
 
@@ -262,6 +264,8 @@ These variables are always available — you do not need to configure them:
 
 After starting your container, Temps verifies it is healthy before routing traffic to it.
 
+Choose **Health probe** beside **Startup timeout** under **Settings → Build & deploy → Deployment**, or configure `health` in `.temps.yaml`. Repository health configuration takes precedence over the environment health setting, which takes precedence over the project default. Existing explicit HTTP path overrides keep their precedence.
+
 ### Default behavior
 
 1. Temps waits for the container to enter `Running` state (up to 5 minutes)
@@ -277,26 +281,17 @@ Override the defaults in `.temps.yaml`:
 
 ```yaml {{ title: '.temps.yaml' }}
 health:
+  type: http
   path: /health
-  timeout: 10
-  interval: 30
-  retries: 3
 ```
 
 <Properties>
   <Property name="path" type="string">
     HTTP path to check. Defaults to `/`.
   </Property>
-  <Property name="timeout" type="integer">
-    Request timeout in seconds. Defaults to `5`.
-  </Property>
-  <Property name="interval" type="integer">
-    Seconds between checks. Defaults to `30`.
-  </Property>
-  <Property name="retries" type="integer">
-    Consecutive failures before marking unhealthy. Defaults to `3`.
-  </Property>
 </Properties>
+
+HTTP keeps the existing readiness rules above. Its retry cadence and accepted status codes are unchanged by selecting a probe type.
 
 A minimal health endpoint:
 
@@ -322,6 +317,72 @@ http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 ```
 
 </CodeGroup>
+
+---
+
+## Background workers and health probes {{ anchor: true, id: 'background-workers' }}
+
+A Redis subscriber, queue consumer or scheduler can deploy without a dummy HTTP listener. Use a Dockerfile whose final image has no `EXPOSE`, and leave both project and environment port overrides empty. Selecting `process` or `exec` changes the readiness check; it does not remove a port declared in settings or inherited from the image.
+
+| Probe | Example | Readiness requirement |
+|---|---|---|
+| `http` | `GET /ready` for a web API | Existing HTTP readiness behavior; requires a port. |
+| `tcp` | Connect to a TCP service on port 6379 | A TCP connection succeeds; requires a port. |
+| `process` | A Redis subscriber stays running | Continuous `Running` with unchanged restart count for `stable_for` seconds. |
+| `exec` | A dependency check executable exits 0 | The configured command succeeds inside the candidate container. |
+
+Automatic selection uses HTTP when a port is declared and process otherwise. The process stability window defaults to 15 seconds:
+
+```yaml {{ title: '.temps.yaml — background worker' }}
+health:
+  type: process
+  stable_for: 15
+```
+
+For a stronger check, ship a health command with your image. For example, a Redis subscriber image that includes `redis-cli` can check its dependency:
+
+```yaml {{ title: '.temps.yaml — exec probe' }}
+health:
+  type: exec
+  command: ["redis-cli", "-h", "redis", "ping"]
+  timeout: 5
+  interval: 10
+```
+
+Commands are argument arrays executed directly, without an implicit shell. For shell operators, supply the shell explicitly, for example `["sh", "-c", "test -f /tmp/worker-ready"]`. The executable and any shell must exist in the image. Nonzero exits are retried at `interval`; exit 126 or 127 fails immediately. An exec timeout fails readiness and stops the candidate to contain the unfinished command. On multi-node installations, upgrade worker agents together with the control plane so the health-exec endpoint is available.
+
+```yaml {{ title: '.temps.yaml — TCP service' }}
+health:
+  type: tcp
+  timeout: 5
+  interval: 10
+```
+
+`timeout` bounds each TCP connection or exec attempt (1–300 seconds, default 5); `interval` controls retries for those probes (1–3600 seconds, default 30). Process checks observe container state every second. **Startup timeout** bounds container startup and readiness for every kind (default 300 seconds; configurable from 30–3600). Invalid or unknown probes fail readiness. Containers that exit or enter a restart loop cannot pass the gate.
+
+Only a successful gate replaces the current deployment. When replacing a web deployment with a portless worker, Temps waits for route withdrawal before retiring the old containers. Portless workers receive no public route, domain, subdomain or screenshot job. Their container view shows **Background worker** and `healthy`, `unhealthy` or `unknown` **at deploy**, together with container metrics. Failed candidates retain a short failure reason; exec output is bounded to 4096 bytes and stays in authorized job logs, so commands should avoid printing credentials.
+
+<Note>
+  This release evaluates probes at deployment time, including image rollback and promotion. A recorded `healthy` state is not continuous uptime monitoring. Runtime probe evaluation and probe-driven alarms are deferred, as are automated remediation and heartbeat probes. Existing Docker crash, restart and resource monitoring continues. Docker Compose deployments keep their existing per-service healthcheck behavior.
+</Note>
+
+### Converting an existing web deployment
+
+The upgrade preserves the implicit port of existing web applications, including images without `EXPOSE`. To convert a former dummy-port worker, remove `EXPOSE` from the final image, clear the saved project and environment port overrides, choose `process` or `exec`, and redeploy. Verify **Background worker** in the container view. The previous HTTP monitor becomes not applicable and stale HTTP outages are retired; Temps does not fabricate an HTTP success for the worker.
+
+### Configuring probes through the API
+
+`PATCH /api/projects/{project_id}/deployment-config` accepts the same `health` object as YAML, together with `exposedPort` and `healthCheckTimeoutSeconds`. For example, the following clears the project's port override and selects process readiness:
+
+```json
+{
+  "exposedPort": null,
+  "healthCheckTimeoutSeconds": 300,
+  "health": { "type": "process", "stable_for": 15 }
+}
+```
+
+Environment overrides use `PUT /api/projects/{project_id}/environments/{id_or_slug}/settings`, with `health`, `exposed_port` and `health_check_timeout_seconds`. Omitted fields keep their current values; `health: null` clears that scope's health override. Clearing an environment override inherits the project setting. Both scopes' port overrides must be empty for an image without `EXPOSE` to become portless. On projects granted the host Docker socket, health changes require the existing instance-administrator authority and applicable step-up authentication.
 
 ---
 

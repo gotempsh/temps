@@ -156,6 +156,47 @@ bun run e2e:report                # open the HTML report after a run
 
 First run only: `bunx playwright install chromium`.
 
+### Deployment health probes
+
+`authenticated/health-probes.spec.ts` drives real HTTP/TCP/process/exec gates
+through the generated SDK using the browser's authenticated session. It builds
+three uniquely tagged BusyBox fixtures (HTTP, portless worker, delayed crash),
+pushes them to a disposable registry, and deploys them through the live API.
+No API responses or database rows are mocked. CI enables this scenario in
+`e2e-tests.yml` and provisions its own registry.
+
+For a local run, start a disposable Temps slot from this checkout and supply a
+registry that both its Docker daemon and the test runner can reach. The runner
+and Temps must use the same Docker daemon: this single-node scenario inspects
+its retained candidate directly to verify it stopped. Use your slot's console
+and public proxy ports, and provide login credentials through the usual
+`E2E_EMAIL` / `E2E_PASSWORD` variables:
+
+```bash
+cd web
+E2E_BASE_URL=http://localhost:8141 \
+HEALTH_PROBE_E2E_PROXY_URL=http://localhost:8140 \
+HEALTH_PROBE_E2E_REGISTRY=localhost:5113 \
+  bun run e2e -- health-probes.spec.ts --workers=1
+```
+
+The scenario checks default HTTP and explicit TCP success, closed-port failure
+for both, process crash after startup, exec nonzero/missing command/timeout,
+unknown-kind rejection, current-deployment preservation after failed probes,
+default process selection for portless images, persisted health metadata,
+probe-selector persistence after switching away from invalid hidden fields,
+worker presentation, disappearance of the prior HTTP response, sanitized
+retained failure details, and exec gating during rollback and promotion.
+The oversized exec output exercises the live capture path; exact byte
+truncation and cancellation races remain covered by the Rust protocol tests.
+
+It cleans up only its own deployment IDs, project, scratch directory and image
+tags. It never prunes Docker or modifies unrelated resources. Without
+`HEALTH_PROBE_E2E_REGISTRY`, the scenario is explicitly skipped; a skipped
+scenario is not evidence of a passing live deployment test. Allow up to
+15 minutes on a cold runner. Multi-node route/DNS acknowledgements and remote
+agent cleanup still need a separate cluster E2E run.
+
 `domain-tls-pebble` and `email-provider-mailpit` need a **dedicated** instance,
 not a normal `start-temps` slot: `--address` must be `0.0.0.0:5002` specifically
 (Pebble's fixed HTTP-01 validation port), plus `ACME_DIRECTORY_URL`/
