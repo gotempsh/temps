@@ -22,6 +22,11 @@ describe('platform navigation route resolution', () => {
     expect(isPlatformToolsRoute('/settings')).toBe(false)
   })
 
+  test('leaves Email to its own sidebar entry instead of All tools', () => {
+    expect(isPlatformToolsRoute('/email')).toBe(false)
+    expect(isPlatformToolsRoute('/email/domains/3')).toBe(false)
+  })
+
   test('does not accept a similar unrelated prefix', () => {
     expect(isPlatformToolsRoute('/toolsmith')).toBe(false)
     expect(isPlatformToolsRoute('/proxying')).toBe(false)

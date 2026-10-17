@@ -100,10 +100,7 @@ export function PluginsPage() {
     useSensitiveActionVerification()
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Plugins' },
-    ])
+    setBreadcrumbs([{ label: 'Plugins' }])
   }, [setBreadcrumbs])
 
   usePageTitle('Plugins')

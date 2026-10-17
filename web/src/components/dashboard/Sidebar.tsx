@@ -25,23 +25,18 @@ import {
   BadgeCheck,
   BarChart3,
   Bot,
-  Boxes,
   ChevronsUpDown,
   Check,
   Database,
-  DatabaseBackup,
   Folder,
-  Cpu,
   Gauge,
   GitBranch,
   GitFork,
-  Globe,
   Home,
   Layers,
   LogOut,
   Monitor,
   Moon,
-  Network,
   Search,
   ScrollText,
   MessageSquare,
@@ -59,10 +54,13 @@ import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
-import { isPlatformToolsRoute } from '@/lib/platform-navigation'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
-import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import {
+  isSettingsSidebarRoute,
+  primaryPlatformGroups,
+  type PlatformNavItem,
+} from './primary-navigation'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
@@ -88,96 +86,6 @@ import {
   settingsNavigationGroups,
   type SettingsNavigationIcon,
 } from '@/components/settings/settings-navigation'
-
-interface PlatformNavItem {
-  title: string
-  url: string
-  icon: LucideIcon
-  activeWhen?: (pathname: string) => boolean
-  featureKey?: string
-}
-
-interface PlatformNavGroup {
-  label: string
-  items: PlatformNavItem[]
-}
-
-// The fresh-install sidebar stays focused on daily work, grouped by intent so
-// the short list is easy to scan. Every secondary capability remains visible
-// on /tools and in Cmd+K.
-const primaryPlatformGroups: PlatformNavGroup[] = [
-  {
-    label: 'Applications',
-    items: [
-      // Experimental: the badge and page header carry the maturity promise
-      // (see `featureKeyForPath`), so the entry stays discoverable without
-      // presenting a prototype as a finished product.
-      {
-        title: 'AI workspace',
-        url: '/ai-first',
-        icon: Sparkles,
-        featureKey: 'ai-chat',
-      },
-      { title: 'Projects', url: '/projects', icon: Folder },
-      { title: 'Git connections', url: '/git-providers', icon: GitBranch },
-      { title: 'Domains', url: '/domains', icon: Globe },
-      // Lives under the /settings/nodes URL for historical reasons, but it is
-      // a build-and-deliver capability: without a worker node a control plane
-      // that runs no local workloads cannot build or deploy anything. See
-      // WORKER_NODES_URL below for why the sidebar does not treat it as a
-      // settings route.
-      {
-        title: 'Worker nodes',
-        url: WORKER_NODES_URL,
-        icon: Network,
-        featureKey: 'multi-node-worker-join',
-      },
-    ],
-  },
-  {
-    label: 'Storage',
-    items: [
-      { title: 'Databases', url: '/storage', icon: Database },
-      { title: 'Backups', url: '/backups', icon: DatabaseBackup },
-    ],
-  },
-  {
-    label: 'Observability',
-    items: [
-      { title: 'Analytics', url: '/analytics', icon: BarChart3 },
-      { title: 'Traces', url: '/traces', icon: GitFork },
-      { title: 'Logs', url: '/logs', icon: ScrollText },
-      { title: 'Errors', url: '/errors', icon: ShieldAlert },
-      {
-        title: 'Server metrics',
-        url: '/monitoring/server',
-        icon: Cpu,
-        activeWhen: (pathname) => pathname.startsWith('/monitoring/server'),
-      },
-      {
-        title: 'Monitoring',
-        url: '/monitoring/alerts',
-        icon: Gauge,
-        activeWhen: (pathname) =>
-          pathname.startsWith('/monitoring') &&
-          !pathname.startsWith('/monitoring/server'),
-        featureKey: 'alerts-metric-alerts',
-      },
-      { title: 'Proxy', url: '/proxy', icon: Activity },
-    ],
-  },
-  {
-    label: 'Administration',
-    items: [
-      {
-        title: 'All tools',
-        url: '/tools',
-        icon: Boxes,
-        activeWhen: isPlatformToolsRoute,
-      },
-    ],
-  },
-]
 
 // AI drill-down — swapped in for /ai-gateway, /chat, /agent-sandbox,
 // /skills, /mcp-servers, /ai-workflows, mirroring the Settings sidebar
@@ -260,7 +168,7 @@ function NavPlugins({
       }
     >
       <SidebarGroupLabel className={isMinimal && !isMobile ? 'hidden' : ''}>
-        Plugins
+        Installed plugins
       </SidebarGroupLabel>
       <SidebarMenu>
         {items.map((item) => {
@@ -369,9 +277,7 @@ export default function AppSidebar() {
   // page ("Applications"). Swapping to the settings sidebar there would
   // hide the entry that is currently active and highlight nothing, so the
   // route is explicitly excluded from the settings swap.
-  const settingsMode =
-    location.pathname.startsWith('/settings') &&
-    !location.pathname.startsWith(WORKER_NODES_URL)
+  const settingsMode = isSettingsSidebarRoute(location.pathname)
   const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
   const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =
