@@ -2907,11 +2907,16 @@ export type BuildConfiguration = {
  * Control-plane build resource limits.
  *
  * Caps how many builds run concurrently AND how much CPU/memory each build
- * is allowed to consume. A single global semaphore in the deployer crate
- * gates every `DockerRuntime::build_image` call to `max_concurrent`. When
- * the semaphore is full, additional builds queue and wait — they do not
- * fail. Per-build CPU/memory caps are forwarded to Docker via
+ * is allowed to consume. A single global gate in the deployer crate
+ * admits at most `max_concurrent` `DockerRuntime::build_image` calls at a
+ * time. When the gate is full, additional builds queue and wait — they do
+ * not fail. Per-build CPU/memory caps are forwarded to Docker via
  * `BuildImageOptions { memory, cpuquota, cpuperiod }`.
+ *
+ * Changes apply live, with no restart. Builds already running finish with the
+ * limits they started with; queued and new builds use the new ones. Lowering
+ * `max_concurrent` never stops a running build: new builds wait until enough
+ * of them finish to get under the new limit.
  *
  * `cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means "no explicit cap"
  * — fall back to the legacy 50%-of-host heuristic for backwards
@@ -2923,19 +2928,22 @@ export type BuildLimitsSettings = {
      * a core). 0 means "use the legacy 50%-of-host default". Applied only
      * by Docker's legacy builder: BuildKit, the default since Docker 18.09,
      * ignores the CPU and memory options of the image build API, so on
-     * BuildKit hosts this has no effect. Read once at startup; a change
-     * takes effect after `temps serve` restarts.
+     * BuildKit hosts this has no effect. Applies live to builds that start
+     * after the change; a running build keeps the cap it started with.
      */
     cpu_limit_cores?: number;
     /**
      * Maximum number of `docker build` operations allowed to run at the
      * same time on the control plane. Additional builds queue. Min 1.
+     * Applies live: raising it starts queued builds right away; lowering it
+     * lets running builds finish and holds new ones until they do.
      */
     max_concurrent?: number;
     /**
      * Memory allowed per build, in megabytes. 0 means "use the legacy
      * 50%-of-host default". Same scope as `cpu_limit_cores`: applied only
-     * by the legacy builder, ignored by BuildKit, read once at startup.
+     * by the legacy builder, ignored by BuildKit, applied live to builds that
+     * start after the change.
      * Values above 2047 MB are reduced to 2047 MB, the most the build API
      * accepts through the client, with a warning in the server log.
      */

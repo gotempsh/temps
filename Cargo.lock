@@ -13074,6 +13074,7 @@ name = "temps-deployer"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "aws-sdk-s3",
  "bollard",

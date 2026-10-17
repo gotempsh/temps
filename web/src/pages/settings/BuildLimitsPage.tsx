@@ -60,7 +60,7 @@ export function BuildLimitsPage() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
-      toast.success('Build limits saved, applied on the next temps serve start')
+      toast.success('Build limits saved and applied')
     } catch {
       toast.error('Failed to save build limits')
     }
@@ -90,7 +90,9 @@ export function BuildLimitsPage() {
       <div className="max-w-5xl space-y-10">
         <SettingsGroup title="Build capacity">
           <p className="text-sm text-muted-foreground">
-            Control-plane builds only. Worker nodes are not affected.
+            Control-plane builds only. Worker nodes are not affected. Changes
+            apply immediately: running builds finish with the limits they
+            started with, queued and new builds use the new ones.
           </p>
           <div className="space-y-2">
             <Label htmlFor="max_concurrent">Max concurrent builds</Label>
@@ -163,17 +165,6 @@ export function BuildLimitsPage() {
               </p>
             )}
           </div>
-        </SettingsGroup>
-        <SettingsGroup title="Applying changes">
-          <Alert>
-            <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Restart required</AlertTitle>
-            <AlertDescription>
-              All three settings take effect on the next
-              <code className="mx-1 rounded bg-muted px-1">temps serve</code>
-              start.
-            </AlertDescription>
-          </Alert>
         </SettingsGroup>
       </div>
 

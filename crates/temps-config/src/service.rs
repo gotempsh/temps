@@ -46,8 +46,8 @@ const GEO_SETTINGS_KEY: &str = "geo";
 
 use serde_derive::{Deserialize, Serialize};
 use temps_core::{
-    AgentSandboxSettings, AppSettings, GeoLicenseKeyIntent, PreviewGatewaySettings,
-    PublicHostnameStrategy,
+    AgentSandboxSettings, AppSettings, BuildLimitsSettings, GeoLicenseKeyIntent,
+    PreviewGatewaySettings, PublicHostnameStrategy,
 };
 
 /// Whether a settings write explicitly changes outbound private-network trust.
@@ -887,6 +887,13 @@ pub struct ConfigService {
     /// this (via [`ConfigService::start_settings_listener`]); throwaway
     /// `ConfigService::new()` instances never start it.
     listener_handle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// The build limits of the newest settings snapshot that reached the
+    /// cache, `None` until settings have been read once. Fed from the same
+    /// two places that publish the other process-wide settings, so a save in
+    /// this process and a `settings_change` NOTIFY from another one both
+    /// reach subscribers. Subscribers are woken only when the value actually
+    /// changes. See [`ConfigService::subscribe_build_limits`].
+    build_limits: tokio::sync::watch::Sender<Option<BuildLimitsSettings>>,
 }
 
 /// Publish the settings that sync call sites read from process-wide caches
@@ -923,6 +930,40 @@ impl ConfigService {
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
             listener_handle: std::sync::Mutex::new(None),
+            build_limits: tokio::sync::watch::channel(None).0,
+        }
+    }
+
+    /// Follow the build limits (`AppSettings.build_limits`).
+    ///
+    /// The receiver holds the latest value (`None` until settings have been
+    /// read once) and is notified only when the limits change, whichever
+    /// process saved them. The deployer uses this to apply new limits to the
+    /// running build gate instead of waiting for a restart.
+    pub fn subscribe_build_limits(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<BuildLimitsSettings>> {
+        self.build_limits.subscribe()
+    }
+
+    /// Hand the build limits of a snapshot that is becoming the cached one to
+    /// subscribers. Called under the settings-cache generation guard, like
+    /// [`publish_process_wide_settings`], so a stale read cannot publish.
+    fn publish_build_limits(&self, settings: &AppSettings) {
+        let published = self.build_limits.send_if_modified(|current| {
+            if current.as_ref() == Some(&settings.build_limits) {
+                return false;
+            }
+            *current = Some(settings.build_limits.clone());
+            true
+        });
+        if published {
+            debug!(
+                max_concurrent = settings.build_limits.max_concurrent,
+                cpu_limit_cores = settings.build_limits.cpu_limit_cores,
+                memory_limit_mb = settings.build_limits.memory_limit_mb,
+                "Published changed build limits to subscribers"
+            );
         }
     }
 
@@ -1395,6 +1436,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
         publish_process_wide_settings(&settings);
+        self.publish_build_limits(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1410,6 +1452,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
         cache.generation = cache.generation.wrapping_add(1);
         publish_process_wide_settings(&settings);
+        self.publish_build_limits(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -5161,6 +5204,93 @@ mod tests {
             .is_empty());
         drop(svc);
         database.cleanup().await;
+    }
+
+    fn settings_row_with_build_limits(limits: BuildLimitsSettings) -> settings::Model {
+        let s = AppSettings {
+            build_limits: limits,
+            ..AppSettings::default()
+        };
+        settings::Model {
+            id: 1,
+            data: s.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn build_limit_subscribers_see_loaded_and_changed_limits_only() {
+        let first = BuildLimitsSettings {
+            max_concurrent: 3,
+            cpu_limit_cores: 1.5,
+            memory_limit_mb: 1024,
+        };
+        let changed = BuildLimitsSettings {
+            max_concurrent: 1,
+            ..first.clone()
+        };
+        // The third row differs only in an unrelated field.
+        let mut unrelated = settings_row_with_build_limits(changed.clone());
+        unrelated.data["preview_domain"] = serde_json::json!("other.example.com");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row_with_build_limits(first.clone())],
+                vec![settings_row_with_build_limits(changed.clone())],
+                vec![unrelated],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+        assert_eq!(*limits.borrow_and_update(), None, "nothing loaded yet");
+
+        // Another process saved: its NOTIFY invalidates the cache, which
+        // reloads the row.
+        svc.invalidate_settings_cache().await;
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(first));
+
+        svc.invalidate_settings_cache().await;
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(changed));
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !limits.has_changed().expect("sender alive"),
+            "a save that leaves the build limits alone must not wake subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_limit_subscribers_see_a_local_save() {
+        let saved = BuildLimitsSettings {
+            max_concurrent: 4,
+            cpu_limit_cores: 2.0,
+            memory_limit_mb: 2048,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Sqlite)
+            .append_query_results(vec![
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+                vec![settings_row("example.test")],
+            ])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+
+        let settings = AppSettings {
+            build_limits: saved.clone(),
+            ..AppSettings::default()
+        };
+        svc.update_settings(settings).await.expect("settings save");
+
+        assert!(limits.has_changed().expect("sender alive"));
+        assert_eq!(*limits.borrow_and_update(), Some(saved));
     }
 
     #[tokio::test]

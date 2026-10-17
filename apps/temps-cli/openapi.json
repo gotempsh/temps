@@ -6243,11 +6243,11 @@
         "type": "object"
       },
       "BuildLimitsSettings": {
-        "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global semaphore in the deployer crate\ngates every `DockerRuntime::build_image` call to `max_concurrent`. When\nthe semaphore is full, additional builds queue and wait — they do not\nfail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
+        "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global gate in the deployer crate\nadmits at most `max_concurrent` `DockerRuntime::build_image` calls at a\ntime. When the gate is full, additional builds queue and wait — they do\nnot fail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\nChanges apply live, with no restart. Builds already running finish with the\nlimits they started with; queued and new builds use the new ones. Lowering\n`max_concurrent` never stops a running build: new builds wait until enough\nof them finish to get under the new limit.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
         "properties": {
           "cpu_limit_cores": {
             "default": 0,
-            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Read once at startup; a change\ntakes effect after `temps serve` restarts.",
+            "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Applies live to builds that start\nafter the change; a running build keeps the cap it started with.",
             "example": 2,
             "format": "float",
             "minimum": 0,
@@ -6255,7 +6255,7 @@
           },
           "max_concurrent": {
             "default": 2,
-            "description": "Maximum number of `docker build` operations allowed to run at the\nsame time on the control plane. Additional builds queue. Min 1.",
+            "description": "Maximum number of `docker build` operations allowed to run at the\nsame time on the control plane. Additional builds queue. Min 1.\nApplies live: raising it starts queued builds right away; lowering it\nlets running builds finish and holds new ones until they do.",
             "example": 2,
             "format": "int32",
             "minimum": 1,
@@ -6263,7 +6263,7 @@
           },
           "memory_limit_mb": {
             "default": 0,
-            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Same scope as `cpu_limit_cores`: applied only\nby the legacy builder, ignored by BuildKit, read once at startup.\nValues above 2047 MB are reduced to 2047 MB, the most the build API\naccepts through the client, with a warning in the server log.",
+            "description": "Memory allowed per build, in megabytes. 0 means \"use the legacy\n50%-of-host default\". Same scope as `cpu_limit_cores`: applied only\nby the legacy builder, ignored by BuildKit, applied live to builds that\nstart after the change.\nValues above 2047 MB are reduced to 2047 MB, the most the build API\naccepts through the client, with a warning in the server log.",
             "example": 2048,
             "format": "int32",
             "minimum": 0,

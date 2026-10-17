@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
