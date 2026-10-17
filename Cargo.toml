@@ -491,6 +491,19 @@ debug = false
 #      fix the dependency or establish safety for other consumers/features;
 #      re-review the key type and operations on every aws-sdk-s3 upgrade.
 #
+# 6. RUSTSEC-2026-0367 / -0368 / -0369: zip 8.6.0 (extract() SUID/SGID + symlink handling)
+#    - Fix: zip >= 9.0.0. The workspace `zip` dependency is already 9.x; the 8.6.0
+#      entry in Cargo.lock comes only from headless_chrome 1.0.22 (temps-screenshots,
+#      `fetch` feature) and utoipa-swagger-ui 10.0.1 (build-dependency), both of
+#      which require `zip ^8` in their latest releases (checked 2026-10-17). A
+#      [patch.crates-io] to 9.x is semver-incompatible and rejected.
+#    - Reachability: neither crate calls `ZipArchive::extract()` or
+#      `ZipStreamReader::extract()`. headless_chrome unpacks via `by_index()` +
+#      its own file writes (Chromium builds it downloads itself; `unzip` on macOS);
+#      utoipa-swagger-ui only reads the pinned Swagger UI archive in build.rs.
+#    - Ignored in .github/workflows/dependency-scan.yml; remove once both crates
+#      release against zip 9.
+#
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
