@@ -1372,10 +1372,21 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .one(self.db.as_ref())
             .await?;
 
-        let settings = record
-            .map(|r| AppSettings::from_json(r.data))
-            .unwrap_or_default();
-        self.cache_settings_if_current(generation, settings.clone())
+        // A row that does not decode as a whole is read as the defaults (see
+        // `AppSettings::from_json`). That is the right answer for callers, but
+        // not a statement about the operator's build limits, so it must not
+        // reach the running build gate and silently reset them.
+        let (settings, decoded) = match record {
+            Some(r) => match serde_json::from_value::<AppSettings>(r.data.clone()) {
+                Ok(settings) => (settings, true),
+                Err(error) => {
+                    debug!(%error, "Settings row did not decode; using defaults for this read");
+                    (AppSettings::from_json(r.data), false)
+                }
+            },
+            None => (AppSettings::default(), true),
+        };
+        self.cache_settings(generation, settings.clone(), decoded)
             .await;
         Ok(settings)
     }
@@ -1426,7 +1437,19 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
     }
 
+    #[cfg(test)]
     async fn cache_settings_if_current(&self, generation: u64, settings: AppSettings) -> bool {
+        self.cache_settings(generation, settings, true).await
+    }
+
+    /// `publish_limits` is false for a snapshot that is a fallback to the
+    /// defaults rather than what the row says.
+    async fn cache_settings(
+        &self,
+        generation: u64,
+        settings: AppSettings,
+        publish_limits: bool,
+    ) -> bool {
         let mut cache = self.settings_cache.write().await;
         if cache.generation != generation {
             return false;
@@ -1436,7 +1459,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
         publish_process_wide_settings(&settings);
-        self.publish_build_limits(&settings);
+        if publish_limits {
+            self.publish_build_limits(&settings);
+        }
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -5259,6 +5284,35 @@ mod tests {
             !limits.has_changed().expect("sender alive"),
             "a save that leaves the build limits alone must not wake subscribers"
         );
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_settings_row_does_not_reset_published_build_limits() {
+        let saved = BuildLimitsSettings {
+            max_concurrent: 6,
+            cpu_limit_cores: 4.0,
+            memory_limit_mb: 8192,
+        };
+        let mut malformed = settings_row_with_build_limits(saved.clone());
+        malformed.data["build_limits"] = serde_json::json!("not-an-object");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![settings_row_with_build_limits(saved.clone())],
+                vec![malformed],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut limits = svc.subscribe_build_limits();
+
+        svc.invalidate_settings_cache().await;
+        assert_eq!(*limits.borrow_and_update(), Some(saved.clone()));
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !limits.has_changed().expect("sender alive"),
+            "the default fallback must not be published as the operator's limits"
+        );
+        assert_eq!(*limits.borrow(), Some(saved));
     }
 
     #[tokio::test]

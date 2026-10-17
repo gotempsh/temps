@@ -290,17 +290,19 @@ mod tests {
         let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut handles = Vec::new();
         for id in 0..3 {
-            let gate = gate.clone();
+            let task_gate = gate.clone();
             let order_tx = order_tx.clone();
             handles.push(tokio::spawn(async move {
-                let permit = gate.acquire().await;
+                let permit = task_gate.acquire().await;
                 let _ = order_tx.send(id);
                 // Hold briefly so the next waiter cannot overtake.
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 drop(permit);
             }));
-            // Make arrival order deterministic.
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            // Make arrival order deterministic: wait until this one is queued.
+            while gate.queued() != id + 1 {
+                tokio::task::yield_now().await;
+            }
         }
         drop(order_tx);
 

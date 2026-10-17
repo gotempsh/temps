@@ -1194,10 +1194,17 @@ impl BuildResourceLimits {
     /// half-set pair would pin one dimension and starve the build on the
     /// other.
     pub fn from_settings(settings: &temps_core::BuildLimitsSettings) -> Option<Self> {
-        (settings.cpu_limit_cores > 0.0 && settings.memory_limit_mb > 0).then_some(Self {
+        Self {
             cpu_cores: settings.cpu_limit_cores,
             memory_mb: settings.memory_limit_mb,
-        })
+        }
+        .effective()
+    }
+
+    /// `self` if both dimensions are set, otherwise `None`. The one place
+    /// the pairing rule lives.
+    fn effective(self) -> Option<Self> {
+        (self.cpu_cores > 0.0 && self.memory_mb > 0).then_some(self)
     }
 }
 
@@ -1292,25 +1299,31 @@ fn apply_build_limits(
     resource_limits: Option<BuildResourceLimits>,
 ) {
     // A partial pair is discarded, whichever way the caller built it.
-    let resource_caps = resource_limits.filter(|r| r.cpu_cores > 0.0 && r.memory_mb > 0);
+    let resource_caps = resource_limits.and_then(BuildResourceLimits::effective);
     let permits = max_concurrent.max(1) as usize;
     let previous = limits.apply(max_concurrent, resource_caps);
     let current = BuildLimitsSnapshot {
         max_concurrent: permits,
         resource_caps,
     };
-    if let Some(previous) = previous {
-        if previous == current {
-            debug!("Build limits unchanged ({})", current);
-            return;
+    let caps_changed = match previous {
+        Some(previous) => {
+            if previous == current {
+                debug!("Build limits unchanged ({})", current);
+                return;
+            }
+            info!(
+                "Build limits changed at runtime: {} -> {}. Running builds keep the limits they \
+                 started with; queued and new builds use the new ones.",
+                previous, current
+            );
+            previous.resource_caps != resource_caps
         }
-        info!(
-            "Build limits changed at runtime: {} -> {}. Running builds keep the limits they \
-             started with; queued and new builds use the new ones.",
-            previous, current
-        );
-    }
-    if let (true, Some(caps)) = (use_buildkit, resource_caps) {
+        None => true,
+    };
+    // Only when the caps themselves are new: a change to concurrency alone
+    // must not repeat a warning about caps that did not move.
+    if let (true, true, Some(caps)) = (caps_changed, use_buildkit, resource_caps) {
         warn!(
             "Per-build caps of {} cores and {} MB are configured, but this host builds with \
              BuildKit, which ignores the memory and CPU options of the Docker image build \
@@ -2611,14 +2624,19 @@ impl DockerRuntime {
     /// accepts: as a warning on the legacy builder, which enforces the value,
     /// and only at debug level on BuildKit, which ignores it (the build runs
     /// uncapped either way, so a warning there would be noise on every build).
-    fn effective_build_memory(&self, requested_bytes: i64, image_name: &str) -> i32 {
+    fn effective_build_memory(
+        &self,
+        requested_bytes: i64,
+        caps_configured: bool,
+        image_name: &str,
+    ) -> i32 {
         let (memory, clamped) = clamp_build_memory(requested_bytes);
         if clamped {
             let message = describe_clamped_build_memory(
                 image_name,
                 requested_bytes,
                 memory,
-                self.build_limits.resource_caps().is_some(),
+                caps_configured,
                 self.use_buildkit,
             );
             if self.use_buildkit {
@@ -2847,9 +2865,16 @@ impl DockerRuntime {
     ///
     /// Always uses `cpu_period_us = 100_000` (100 ms) — Docker's standard
     /// period. CPU quota for N cores is `N * cpu_period_us`.
+    #[cfg(test)]
     fn resolve_build_resource_caps(&self) -> (i64, i32, i32) {
+        Self::resolve_build_resource_caps_for(self.build_limits.resource_caps())
+    }
+
+    /// [`Self::resolve_build_resource_caps`] for caps the caller already
+    /// read, so one build uses a single reading for every decision.
+    fn resolve_build_resource_caps_for(configured: Option<BuildResourceLimits>) -> (i64, i32, i32) {
         const CPU_PERIOD_US: i32 = 100_000;
-        if let Some(override_caps) = self.build_limits.resource_caps() {
+        if let Some(override_caps) = configured {
             let memory_bytes = (override_caps.memory_mb as i64) * 1024 * 1024;
             let cpu_quota_us = (override_caps.cpu_cores * CPU_PERIOD_US as f32).round() as i32;
             return (memory_bytes, cpu_quota_us, CPU_PERIOD_US);
@@ -3099,8 +3124,14 @@ impl ImageBuilder for DockerRuntime {
         // legacy 50%-of-host heuristic when no override is set). The memory
         // value is reduced to what the API accepts, with a warning, in
         // `effective_build_memory`.
-        let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        let configured_caps = self.build_limits.resource_caps();
+        let (memory_bytes, cpu_quota_us, cpu_period_us) =
+            Self::resolve_build_resource_caps_for(configured_caps);
+        let memory_i32 = self.effective_build_memory(
+            memory_bytes,
+            configured_caps.is_some(),
+            &request.image_name,
+        );
         info!(
             "{}",
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
@@ -3314,8 +3345,14 @@ impl ImageBuilder for DockerRuntime {
         // Prepare build options using Bollard
         let build_args = docker_build_args(&request, self.use_buildkit);
 
-        let (memory_bytes, cpu_quota_us, cpu_period_us) = self.resolve_build_resource_caps();
-        let memory_i32 = self.effective_build_memory(memory_bytes, &request.image_name);
+        let configured_caps = self.build_limits.resource_caps();
+        let (memory_bytes, cpu_quota_us, cpu_period_us) =
+            Self::resolve_build_resource_caps_for(configured_caps);
+        let memory_i32 = self.effective_build_memory(
+            memory_bytes,
+            configured_caps.is_some(),
+            &request.image_name,
+        );
         info!(
             "{}",
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
