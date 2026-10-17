@@ -14960,6 +14960,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-runtime-health"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "futures",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "temps-sandbox"
 version = "0.1.0-beta.57"
 dependencies = [

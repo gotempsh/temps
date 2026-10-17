@@ -1,6 +1,6 @@
 # ADR-053: Distributed Runtime Health and Worker Uptime
 
-**Status:** Proposed; no runtime probing is enabled by this document
+**Status:** In progress; engine foundations implemented, periodic monitoring not enabled
 **Date:** 2026-10-17
 **Builds on:** [ADR-052](./052-pluggable-health-probes-for-workers.md),
 [multi-node hardening](./020-multi-node-deployment-hardening.md),
@@ -34,15 +34,16 @@ is not the same thing as a process or a control-plane/agent role. Requiring a
 separate host, self-enrollment or a loopback management connection would be an
 unnecessary regression for the combined single-host install.
 
-There are two existing seams to preserve and improve:
+The initial implementation has two seams to preserve and improve:
 
 - `ContainerRuntimeResolver` in
   `crates/temps-monitoring/src/container_health.rs` already resolves remote
   runtimes by node and avoids falling back to local Docker on resolution
-  failure. However, `ContainerHealthMonitor` requires a local deployer in its
-  constructor, and its startup in
-  `crates/temps-cli/src/commands/serve/console.rs` is conditional on a
-  `ContainerDeployer` service being registered.
+  failure. Originally, `ContainerHealthMonitor` required a local deployer in
+  its constructor and its startup in
+  `crates/temps-cli/src/commands/serve/console.rs` depended on a
+  `ContainerDeployer` service being registered. The foundation change below
+  removes that dependency.
 - Phase 1's remote `/agent/containers/{id}/health-exec` endpoint stops a
   failed deployment candidate on timeout/cancellation. Its local equivalent
   also contains an unfinished command by stopping the candidate. This is
@@ -493,6 +494,41 @@ heartbeats and remediation need their own design and authorization review.
 
 ## Rollout and acceptance criteria
 
+### Implementation progress
+
+The first implementation adds `crates/temps-runtime-health`, a database-free
+library with a bounded node-local scheduler and a read-only runtime inspector
+interface. It supports process stability, HTTP and TCP checks, owner/container
+identity validation, explicit in-process lease renewal, project round-robin,
+four concurrent attempts, a 1,000-assignment bound, cancellation guards and
+sanitized observations. HTTP follows no redirects, reads at most a 128-byte
+status line and discards bodies. Exec is not representable in the probe
+contract; unknown kinds and address-bearing payloads are rejected.
+
+The existing lifecycle/resource monitor now requires a placement-aware
+resolver instead of a local deployer. It can process an initially empty
+cluster and later remote containers without constructing a local runtime.
+Local and remote placement failures remain explicit and never select another
+runtime as a fallback.
+
+The engine is not yet hosted by `temps agent` or embedded `temps serve`.
+Its inspector contract is an internal trusted-host interface, not an exposed
+agent API or a substitute for authentication. In-process lease/ownership state
+does not provide restart-safe fencing or co-located interprocess exclusion.
+Those durable controls, authorized effective-revision persistence,
+authenticated assignment/report transport, availability storage, UI and alarms
+remain required before periodic monitoring is enabled. No capability is
+advertised and no new probe endpoint is registered by this foundation.
+
+Tests cover the library's concurrency, cancellation, ownership, validation,
+process stability/restarts, lease expiry and HTTP/TCP failure paths. A real
+Docker fixture exercises process/HTTP/TCP checks and verifies the application
+stays running until the fixture driver stops it. Resolver tests cover an empty
+Docker-free monitor discovering a remote container. These are component tests,
+not evidence of completed multi-node runtime monitoring E2E.
+
+### Remaining rollout
+
 1. Correct the portless uptime presentation and expose safe effective probe
    metadata without claiming runtime coverage. Preserve historical HTTP data.
 2. Extract the shared node-local probe engine, embed it for combined
@@ -553,9 +589,9 @@ Required tests next to the implementing code include:
   unavailable capabilities and safe effective-probe display.
 
 Compose service healthchecks are unchanged by this ADR. Mapping them into
-runtime availability requires a separate compatibility decision. Writing
-this proposal does not extend the current Phase 1 implementation or establish
-that live multi-node verification has passed.
+runtime availability requires a separate compatibility decision. The engine
+foundation does not enable Phase 2 monitoring or establish that live multi-node
+runtime verification has passed.
 
 ## Open implementation decisions
 

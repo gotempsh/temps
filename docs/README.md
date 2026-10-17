@@ -20,4 +20,4 @@ The documentation uses MDX (Markdown + JSX) and is pulled into the
 ## Architecture proposals
 
 - [Distributed runtime health and worker uptime](adr/053-distributed-runtime-health-and-worker-uptime.md)
-  (proposed; includes control planes without local workloads or Docker)
+  (in progress; engine foundations, single-host and Docker-free control-plane design)

@@ -6458,17 +6458,17 @@ impl DeploymentService {
 impl temps_monitoring::ContainerRuntimeResolver for DeploymentService {
     async fn resolve_runtime(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
     ) -> Result<
         Arc<dyn temps_deployer::ContainerDeployer>,
         temps_monitoring::ContainerRuntimeResolutionError,
     > {
-        self.deployer_for_node(Some(node_id))
-            .await
-            .map_err(|error| temps_monitoring::ContainerRuntimeResolutionError {
+        self.deployer_for_node(node_id).await.map_err(|error| {
+            temps_monitoring::ContainerRuntimeResolutionError {
                 node_id,
                 reason: error.to_string(),
-            })
+            }
+        })
     }
 }
 
