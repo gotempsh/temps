@@ -40,6 +40,8 @@ pub type LogCallback =
 
 pub mod docker;
 pub mod image_scan;
+pub mod runtime_health;
+mod runtime_health_coordination;
 /// Host-level Docker socket grant (ADR 045).
 ///
 /// Re-exported from `temps-core`, where the type lives so the agent, the

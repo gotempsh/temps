@@ -545,6 +545,7 @@ pub struct RemoteNodeDeployer {
     platform: std::sync::Arc<std::sync::OnceLock<String>>,
     build_limits: crate::build_protocol::BuildLimits,
     build_limits_version: u64,
+    runtime_health_mtls: bool,
 }
 
 impl RemoteNodeDeployer {
@@ -571,6 +572,7 @@ impl RemoteNodeDeployer {
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
             build_limits: Default::default(),
             build_limits_version: 0,
+            runtime_health_mtls: false,
         })
     }
 
@@ -603,6 +605,7 @@ impl RemoteNodeDeployer {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(300))
             .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
             .identity(identity)
             .add_root_certificate(ca)
             .tls_built_in_root_certs(false)
@@ -622,7 +625,128 @@ impl RemoteNodeDeployer {
             platform: std::sync::Arc::new(std::sync::OnceLock::new()),
             build_limits: Default::default(),
             build_limits_version: 0,
+            runtime_health_mtls: true,
         })
+    }
+
+    /// Runtime probes require the pinned-CA mTLS constructor. Never inherit
+    /// the legacy agent client's installation-wide insecure TLS opt-in.
+    pub async fn runtime_health_request<T: serde::de::DeserializeOwned>(
+        &self,
+        action: &str,
+        body: Option<&impl serde::Serialize>,
+    ) -> Result<T, DeployerError> {
+        if !self.runtime_health_mtls
+            || !self.agent_url.starts_with("https://")
+            || !matches!(action, "" | "report")
+        {
+            return Err(DeployerError::NetworkError("Runtime health requires a mutually authenticated worker and a supported protocol action".into()));
+        }
+        let url = format!(
+            "{}/agent/runtime-health{}{}",
+            self.agent_url.trim_end_matches('/'),
+            if action.is_empty() { "" } else { "/" },
+            action
+        );
+        let builder = if let Some(body) = body {
+            self.client.post(url).json(body)
+        } else {
+            self.client.get(url)
+        };
+        let response = builder
+            .bearer_auth(&self.token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                DeployerError::NetworkError("Runtime health management request failed".into())
+            })?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|length| length > 65_536)
+        {
+            return Err(DeployerError::NetworkError(
+                "Worker runtime health protocol is unavailable or rejected the request".into(),
+            ));
+        }
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| {
+                DeployerError::NetworkError("Worker runtime health response was interrupted".into())
+            })?;
+            if bytes.len() + chunk.len() > 65_536 {
+                return Err(DeployerError::NetworkError(
+                    "Worker runtime health response exceeded its bound".into(),
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| {
+            DeployerError::NetworkError("Worker runtime health response is invalid".into())
+        })
+    }
+
+    pub async fn runtime_health_revoke(
+        &self,
+        request: &temps_runtime_health::host::RevokeRequest,
+    ) -> Result<(), DeployerError> {
+        if !self.runtime_health_mtls || !self.agent_url.starts_with("https://") {
+            return Err(DeployerError::NetworkError(
+                "Runtime health requires a mutually authenticated worker".into(),
+            ));
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/agent/runtime-health/revoke",
+                self.agent_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.token)
+            .json(request)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| DeployerError::NetworkError("Runtime health revocation failed".into()))?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(DeployerError::NetworkError(
+                "Worker did not acknowledge runtime health revocation".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn runtime_health_authorize(
+        &self,
+        request: &temps_runtime_health::host::LeaseRequest,
+    ) -> Result<(), DeployerError> {
+        if !self.runtime_health_mtls || !self.agent_url.starts_with("https://") {
+            return Err(DeployerError::NetworkError(
+                "Runtime health requires a mutually authenticated worker".into(),
+            ));
+        }
+        let response = self
+            .client
+            .post(format!(
+                "{}/agent/runtime-health/authorize",
+                self.agent_url.trim_end_matches('/')
+            ))
+            .bearer_auth(&self.token)
+            .json(request)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|_| {
+                DeployerError::NetworkError("Runtime health authorization failed".into())
+            })?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(DeployerError::NetworkError(
+                "Worker rejected runtime health authorization".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn with_build_limits_version(mut self, version: u64) -> Self {

@@ -605,6 +605,24 @@ impl MarkDeploymentCompleteJob {
             }
         }
 
+        // Compose intentionally has no runtime-probe revision in this phase.
+        if let Some(revision) = context
+            .get_output::<crate::services::runtime_health::EffectiveProbeRevision>(
+                "deploy_container",
+                "runtime_health_revision",
+            )?
+        {
+            crate::services::runtime_health::save_revision(
+                self.db.as_ref(),
+                deployment.project_id,
+                environment_id,
+                self.deployment_id,
+                revision,
+            )
+            .await
+            .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?;
+        }
+
         // Hold the Compose snapshot until every completion gate has passed.
         // A cancelled, superseded, or publicly unusable deployment must never
         // overwrite the settings-page view of the last usable stack.

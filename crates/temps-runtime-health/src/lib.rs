@@ -3,11 +3,12 @@
 
 //! Node-local runtime probe primitives shared by embedded and worker hosts.
 //!
-//! This library has no database, Docker, HTTP API or exec dependency. A host
-//! must authenticate and durably authorize assignments before installing them.
-//! Scheduling here is in-process only: persistent fencing, host-wide ownership
-//! and report ingestion must be implemented before enabling a remote endpoint.
+//! This library has no database, Docker, HTTP API or exec dependency. The host
+//! persists authorization fences, never restores execution leases after a
+//! restart, and requires node-issued admission windows and reporting epochs.
+//! Runtime adapters bind those assignments to host-owned creation receipts.
 
+pub mod host;
 mod probe;
 mod scheduler;
 
@@ -26,7 +27,7 @@ pub const MAX_LEASE: Duration = Duration::from_secs(120);
 pub const MAX_HTTP_PATH_BYTES: usize = 1_024;
 
 /// Opaque execution-role identity; physical co-location grants no authority.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "role", content = "id", rename_all = "snake_case")]
 pub enum ExecutionOwner {
     Embedded(Uuid),
@@ -35,7 +36,7 @@ pub enum ExecutionOwner {
 
 /// Only read-only probe mechanisms are representable. In particular, there is
 /// no command, user, mount, address or generic exec action in this contract.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Probe {
     Process { stable_for_secs: u64 },
@@ -43,7 +44,7 @@ pub enum Probe {
     Tcp {},
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Assignment {
     pub id: Uuid,
@@ -128,8 +129,24 @@ pub struct RuntimeSnapshot {
 }
 
 /// Deliberately excludes stop/start/restart and exec, including from cleanup.
+pub trait ProbePermit: Send + Sync {}
+impl<T: Send + Sync> ProbePermit for T {}
+
 #[async_trait]
 pub trait RuntimeInspector: Send + Sync {
+    /// Host admission holds this exclusive container claim for the entire lease.
+    fn claim(&self, _assignment: &Assignment) -> Result<Box<dyn ProbePermit>, InspectFailure> {
+        Ok(Box::new(()))
+    }
+
+    /// Held through inspection and the network probe, including cancellation.
+    /// Production adapters use host-wide slots shared by co-located processes.
+    async fn admit(
+        &self,
+        _assignment: &Assignment,
+    ) -> Result<Box<dyn ProbePermit>, InspectFailure> {
+        Ok(Box::new(()))
+    }
     async fn inspect(&self, assignment: &Assignment) -> Result<RuntimeSnapshot, InspectFailure>;
 }
 
@@ -141,7 +158,7 @@ pub enum InspectFailure {
     Unauthorized,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthState {
     Healthy,
@@ -150,7 +167,7 @@ pub enum HealthState {
 }
 
 /// Allowlisted diagnostics only; raw runtime or application output cannot fit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthReason {
     Passed,
@@ -170,7 +187,7 @@ pub enum HealthReason {
     Stale,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     pub assignment_id: Uuid,

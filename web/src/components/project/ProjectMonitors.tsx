@@ -3,6 +3,7 @@
 
 import {
   listMonitorsOptions,
+  getProjectRuntimeHealthOptions,
   createMonitorMutation,
   deleteMonitorMutation,
   getBucketedStatusOptions,
@@ -70,6 +71,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+
+import { RuntimeHealthPanel } from './RuntimeHealthPanel'
+import { visibleExternalMonitors } from './runtime-health-display'
 
 interface ProjectMonitorsProps {
   project: ProjectResponse
@@ -307,6 +311,9 @@ function MonitorCard({
 
 export function ProjectMonitors({ project }: ProjectMonitorsProps) {
   const queryClient = useQueryClient()
+  const [runtimeEnvironmentId, setRuntimeEnvironmentId] = useState<
+    number | null
+  >(null)
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [monitorToDelete, setMonitorToDelete] =
     useState<MonitorResponse | null>(null)
@@ -342,6 +349,29 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
       },
     }),
   })
+
+  const runtimeEnabled = project.preset !== 'docker-compose'
+  const runtimeHealth = useQuery({
+    ...getProjectRuntimeHealthOptions({ path: { project_id: project.id } }),
+    enabled: runtimeEnabled,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
+  const workerEnvironments = new Set(
+    runtimeHealth.data
+      ?.filter((workload) => workload.portless === true)
+      .map((workload) => workload.environment_id) ?? []
+  )
+  const runtimeEnvironment =
+    environments?.find(
+      (environment) => environment.id === runtimeEnvironmentId
+    ) ??
+    environments?.find((environment) => environment.name === 'production') ??
+    environments?.[0]
+  const externalMonitors = visibleExternalMonitors(
+    monitors ?? [],
+    workerEnvironments
+  )
 
   const createMutation = useMutation({
     ...createMonitorMutation(),
@@ -408,7 +438,9 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="text-2xl font-bold tracking-tight">Monitors</h2>
+          <h2 className="text-2xl font-bold tracking-tight">
+            {runtimeEnabled ? 'Uptime and health' : 'Monitors'}
+          </h2>
           <p className="text-muted-foreground">
             Monitor your service&apos;s uptime and performance
           </p>
@@ -420,7 +452,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
               <span className="max-sm:sr-only">Status pages</span>
             </Link>
           </Button>
-          {monitors && monitors.length > 0 && (
+          {externalMonitors.length > 0 && (
             <CreateActionButton
               onClick={() => setIsCreateDialogOpen(true)}
               label="Create Monitor"
@@ -562,6 +594,44 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
       </div>
 
       {/* Monitors List */}
+      {runtimeEnabled && runtimeEnvironment && (
+        <div className="space-y-4">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <label
+              htmlFor="runtime-health-environment"
+              className="text-sm font-medium"
+            >
+              Runtime environment
+            </label>
+            <Select
+              value={runtimeEnvironment.id.toString()}
+              onValueChange={(value) => setRuntimeEnvironmentId(Number(value))}
+            >
+              <SelectTrigger
+                id="runtime-health-environment"
+                className="w-full sm:w-56"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {environments?.map((environment) => (
+                  <SelectItem
+                    key={environment.id}
+                    value={environment.id.toString()}
+                  >
+                    {environment.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <RuntimeHealthPanel
+            project={project}
+            environment={runtimeEnvironment}
+          />
+        </div>
+      )}
+
       {isLoading ? (
         <div className="space-y-3">
           {Array.from({ length: 3 }).map((_, i) => (
@@ -582,9 +652,9 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             </Card>
           ))}
         </div>
-      ) : monitors && monitors.length > 0 ? (
+      ) : externalMonitors.length > 0 ? (
         <div className="space-y-3">
-          {monitors.map((monitor) => (
+          {externalMonitors.map((monitor) => (
             <MonitorCard
               key={monitor.id}
               monitor={monitor}
@@ -600,8 +670,12 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
         <EmptyState
           size="compact"
           icon={Activity}
-          title="No monitors yet"
-          description="Create a monitor to track this service's uptime and response time."
+          title={runtimeEnabled ? 'No external monitors' : 'No monitors yet'}
+          description={
+            runtimeEnabled
+              ? 'Runtime health is shown above. Add an independent HTTP or TCP monitor when the service exposes an endpoint.'
+              : "Create a monitor to track this service's uptime and response time."
+          }
           action={
             <Button onClick={() => setIsCreateDialogOpen(true)}>
               <Plus className="mr-2 size-4" />

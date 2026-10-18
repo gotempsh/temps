@@ -18,6 +18,7 @@ mod output_buffer;
 pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
+mod runtime_health;
 pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;

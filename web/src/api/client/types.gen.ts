@@ -16474,6 +16474,10 @@ export type MonitorResponse = {
     environment_id?: number | null;
     id: number;
     is_active: boolean;
+    /**
+     * Temps-managed HTTP monitor; independent monitors remain visible for workers.
+     */
+    is_managed: boolean;
     monitor_type: string;
     monitor_url: string;
     name: string;
@@ -23147,6 +23151,15 @@ export type RunnerWork = {
     token: string;
 };
 
+export type RuntimeCoverage = {
+    availability_percent?: number | null;
+    coverage_percent?: number | null;
+    excluded_seconds: number;
+    healthy_seconds: number;
+    unhealthy_seconds: number;
+    unknown_seconds: number;
+};
+
 /**
  * Live connection variables for a service in one environment.
  *
@@ -23161,6 +23174,60 @@ export type RuntimeCredentialsResponse = {
     variables: {
         [key: string]: string;
     };
+};
+
+export type RuntimeHealthBucket = {
+    bucket_at: string;
+    coverage: RuntimeCoverage;
+};
+
+export type RuntimeHealthPolicy = {
+    enabled: boolean;
+    paused: boolean;
+    required_healthy?: number | null;
+};
+
+export type RuntimeHealthSummary = {
+    configured: boolean;
+    coverage: RuntimeCoverage;
+    environment_id: number;
+    history: Array<RuntimeHealthBucket>;
+    policy: RuntimeHealthPolicy;
+    portless?: boolean | null;
+    probe?: RuntimeProbeDisplay | null;
+    reason: string;
+    replicas: Array<RuntimeReplicaHealth>;
+    state: string;
+};
+
+export type RuntimeProbeDisplay = {
+    description: string;
+    desired_replicas: number;
+    failure_threshold: number;
+    interval_seconds: number;
+    kind: string;
+    recovery_threshold: number;
+    required_healthy: number;
+    source: string;
+    timeout_seconds: number;
+    unavailable_reason?: string | null;
+};
+
+export type RuntimeReplicaHealth = {
+    checked_at?: string | null;
+    reason: string;
+    replica_id: number;
+    state: string;
+};
+
+/**
+ * Small project-wide classification feed. The console requests detailed
+ * history only for its selected environment, not for every preview at once.
+ */
+export type RuntimeWorkloadMetadata = {
+    configured: boolean;
+    environment_id: number;
+    portless?: boolean | null;
 };
 
 /**
@@ -63143,6 +63210,99 @@ export type TestEnvironmentIpAccessResponses = {
 
 export type TestEnvironmentIpAccessResponse = TestEnvironmentIpAccessResponses[keyof TestEnvironmentIpAccessResponses];
 
+export type GetRuntimeHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/runtime-health';
+};
+
+export type GetRuntimeHealthErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment read permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetRuntimeHealthError = GetRuntimeHealthErrors[keyof GetRuntimeHealthErrors];
+
+export type GetRuntimeHealthResponses = {
+    200: RuntimeHealthSummary;
+};
+
+export type GetRuntimeHealthResponse = GetRuntimeHealthResponses[keyof GetRuntimeHealthResponses];
+
+export type UpdateRuntimeHealthData = {
+    body: RuntimeHealthPolicy;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/runtime-health';
+};
+
+export type UpdateRuntimeHealthErrors = {
+    /**
+     * Invalid monitoring policy
+     */
+    400: ProblemDetails;
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment write permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateRuntimeHealthError = UpdateRuntimeHealthErrors[keyof UpdateRuntimeHealthErrors];
+
+export type UpdateRuntimeHealthResponses = {
+    /**
+     * Monitoring policy saved
+     */
+    204: void;
+};
+
+export type UpdateRuntimeHealthResponse = UpdateRuntimeHealthResponses[keyof UpdateRuntimeHealthResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -66773,6 +66933,45 @@ export type RevenueMetricsSummaryResponses = {
 };
 
 export type RevenueMetricsSummaryResponse = RevenueMetricsSummaryResponses[keyof RevenueMetricsSummaryResponses];
+
+export type GetProjectRuntimeHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/runtime-health';
+};
+
+export type GetProjectRuntimeHealthErrors = {
+    /**
+     * Authentication required
+     */
+    401: ProblemDetails;
+    /**
+     * Environment read permission required
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage unavailable
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectRuntimeHealthError = GetProjectRuntimeHealthErrors[keyof GetProjectRuntimeHealthErrors];
+
+export type GetProjectRuntimeHealthResponses = {
+    200: Array<RuntimeWorkloadMetadata>;
+};
+
+export type GetProjectRuntimeHealthResponse = GetProjectRuntimeHealthResponses[keyof GetProjectRuntimeHealthResponses];
 
 export type ListProjectSecretsData = {
     body?: never;

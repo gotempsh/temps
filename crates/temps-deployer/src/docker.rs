@@ -4365,6 +4365,26 @@ impl ContainerDeployer for DockerRuntime {
                 DeployerError::DeploymentFailed(format!("Failed to create container: {}", e))
             })?;
 
+        // Write the host-owned receipt before the candidate can be assigned a
+        // runtime probe. Failure must not leave an untracked application.
+        if let Err(error) = crate::runtime_health::record_creation(
+            &docker,
+            &crate::runtime_health::data_root(),
+            &container.id,
+            &request,
+        )
+        .await
+        {
+            return Err(self
+                .cleanup_created_container_after_error(
+                    &container.id,
+                    DeployerError::DeploymentFailed(format!(
+                        "Cannot persist runtime health ownership receipt: {error}"
+                    )),
+                )
+                .await);
+        }
+
         // Multi-host overlay: best-effort additional attach to `temps-overlay`
         // (or whatever the operator configured). Containers always boot with
         // their primary network interface (`temps-app-network`); the overlay
@@ -4512,13 +4532,17 @@ impl ContainerDeployer for DockerRuntime {
         // Look up the container name before removal so we can clean up its
         // per-container secrets host directory (if any). Inspect failures are
         // non-fatal: we still try to remove the container.
-        let container_name = docker
+        let inspected = docker
             .inspect_container(container_id, None::<InspectContainerOptions>)
             .await
-            .ok()
-            .and_then(|c| c.name)
-            // Docker prefixes inspect names with a leading '/'.
-            .map(|n| n.trim_start_matches('/').to_string());
+            .ok();
+        let immutable_id = inspected
+            .as_ref()
+            .and_then(|container| container.id.clone())
+            .unwrap_or_else(|| container_id.to_string());
+        let container_name = inspected
+            .and_then(|container| container.name)
+            .map(|name| name.trim_start_matches('/').to_string());
 
         let removal_result = docker
             .remove_container(
@@ -4542,6 +4566,10 @@ impl ContainerDeployer for DockerRuntime {
             Ok(()) | Err(DeployerError::ContainerNotFound(_))
         );
         if should_cleanup_secrets {
+            crate::runtime_health::forget_creation(
+                &crate::runtime_health::data_root(),
+                &immutable_id,
+            );
             if let Some(name) = container_name {
                 match self.secrets_host_dir(&name) {
                     Ok(dir) if dir.exists() => {

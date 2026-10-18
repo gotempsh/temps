@@ -16,6 +16,7 @@ mod m20261016_000001_builder_limits;
 pub mod m20261016_000002_ci_build_dispatch;
 mod m20261017_000001_deployment_health_probes;
 pub mod m20261017_000001_retain_ci_cancellation;
+pub mod m20261017_000002_runtime_health;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -765,6 +766,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261016_000002_ci_build_dispatch::Migration),
             Box::new(m20261017_000001_retain_ci_cancellation::Migration),
             Box::new(m20261017_000001_deployment_health_probes::Migration),
+            Box::new(m20261017_000002_runtime_health::Migration),
         ]
     }
 }

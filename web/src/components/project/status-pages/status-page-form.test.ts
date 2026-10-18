@@ -28,6 +28,7 @@ function monitor(id: number, name: string): MonitorResponse {
     monitor_url: `https://internal-${id}.example.test/health`,
     check_interval_seconds: 60,
     is_active: true,
+    is_managed: false,
     created_at: '2026-10-01T00:00:00Z',
     updated_at: '2026-10-01T00:00:00Z',
   }

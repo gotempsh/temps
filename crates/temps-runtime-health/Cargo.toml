@@ -11,16 +11,19 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+nix = { version = "0.31", features = ["fs", "user"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
 parking_lot = "0.12"
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+utoipa = { workspace = true, features = ["uuid"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 bollard = { workspace = true }
-serde_json = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

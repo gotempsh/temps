@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-runtime-health = { path = "../temps-runtime-health" }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # Adding servers over SSH (ADR 048 D2c).
 russh = "0.64"

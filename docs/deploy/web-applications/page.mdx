@@ -782,7 +782,7 @@ health:
   path: /health
 ```
 
-Choose the probe next to **Startup timeout** under **Settings → Build & deploy → Deployment**. Web applications with a declared port keep HTTP as the default. For TCP services or workers without an HTTP listener, see [background workers and health probes](/docs/docker-containers#background-workers), including process stability checks and exec commands. Probes run at deploy time; continuous runtime probing is deferred. Docker Compose healthchecks are unchanged.
+Choose the probe next to **Startup timeout** under **Settings → Build & deploy → Deployment**. Web applications with a declared port keep HTTP as the default. For TCP services or workers without an HTTP listener, see [background workers and health probes](/docs/docker-containers#background-workers), including process stability checks and exec commands. Process, HTTP and TCP probes also support continuous runtime health for newly deployed workloads; exec remains deployment-only. Monitoring → Uptime separates availability from observation coverage and shows the effective saved probe. Docker Compose healthchecks are unchanged.
 
 <Note>
   Adding a dedicated `/health` endpoint that returns a simple 200 response is recommended. This avoids issues where your root path (`/`) requires authentication or returns a redirect.

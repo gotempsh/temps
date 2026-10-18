@@ -89,6 +89,8 @@ pub enum AlarmType {
     /// A scheduled cron invocation failed: the endpoint answered with a
     /// non-2xx status or could not be reached.
     CronJobFailed,
+    RuntimeProbeFailed,
+    RuntimeMonitoringLost,
 }
 
 impl AlarmType {
@@ -121,6 +123,8 @@ impl AlarmType {
             Self::NodeResourcePressure => "node_resource_pressure",
             Self::TraefikContainerDrift => "traefik_container_drift",
             Self::CronJobFailed => "cron_job_failed",
+            Self::RuntimeProbeFailed => "runtime_probe_failed",
+            Self::RuntimeMonitoringLost => "runtime_monitoring_lost",
         }
     }
 
@@ -153,6 +157,8 @@ impl AlarmType {
             "node_resource_pressure" => Some(Self::NodeResourcePressure),
             "traefik_container_drift" => Some(Self::TraefikContainerDrift),
             "cron_job_failed" => Some(Self::CronJobFailed),
+            "runtime_probe_failed" => Some(Self::RuntimeProbeFailed),
+            "runtime_monitoring_lost" => Some(Self::RuntimeMonitoringLost),
             _ => None,
         }
     }
@@ -573,6 +579,86 @@ impl AlarmService {
         }
 
         Ok(Some(alarm_id))
+    }
+
+    /// Validate the live assignment and coordinator in the insertion itself;
+    /// a queued notification cannot create an alarm for a retired workload.
+    pub async fn fire_runtime_alarm(
+        &self,
+        request: FireAlarmRequest,
+        assignment_id: uuid::Uuid,
+        event_id: uuid::Uuid,
+        coordinator: uuid::Uuid,
+        term: i64,
+    ) -> Result<Option<i32>, AlarmError> {
+        if !matches!(
+            request.alarm_type,
+            AlarmType::RuntimeProbeFailed | AlarmType::RuntimeMonitoringLost
+        ) {
+            return Ok(None);
+        }
+        let row=self.db.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "INSERT INTO alarms(project_id,environment_id,deployment_id,container_id,alarm_type,severity,status,title,message,metadata,fired_at) SELECT r.project_id,r.environment_id,r.deployment_id,a.container_record_id,$1,$2,'firing',$3,$4,$5,clock_timestamp() FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN environments e ON e.id=r.environment_id JOIN deployments d ON d.id=r.deployment_id JOIN deployment_containers c ON c.id=a.container_record_id JOIN projects p ON p.id=r.project_id JOIN runtime_health_alarm_outbox o ON o.assignment_id=a.id AND o.id=$7 LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id=$6 AND a.retired_at IS NULL AND o.delivered_at IS NULL AND e.current_deployment_id=r.deployment_id AND d.state IN ('completed','deployed') AND c.deleted_at IS NULL AND c.node_id IS NOT DISTINCT FROM a.node_id AND NOT p.is_deleted AND NOT e.sleeping AND COALESCE(h.enabled,TRUE) AND NOT COALESCE(h.paused,FALSE) AND (($1='runtime_probe_failed' AND a.alarm_state='unhealthy' AND o.event_type='fire_probe') OR ($1='runtime_monitoring_lost' AND a.monitoring_lost AND o.event_type='fire_lost')) AND EXISTS(SELECT 1 FROM runtime_health_coordinator WHERE owner=$8 AND term=$9 AND expires_at>clock_timestamp()) AND NOT EXISTS(SELECT 1 FROM alarms existing WHERE existing.alarm_type=$1 AND existing.status IN ('firing','acknowledged') AND existing.metadata->>'runtime_health_assignment'=$10) ON CONFLICT DO NOTHING RETURNING id",
+            vec![request.alarm_type.as_str().into(),request.severity.as_str().into(),request.title.clone().into(),request.message.clone().into(),request.metadata.clone().into(),assignment_id.into(),event_id.into(),coordinator.into(),term.into(),assignment_id.to_string().into()])).await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let alarm_id: i32 = row.try_get("", "id")?;
+        info!(alarm_id,assignment_id=%assignment_id,alarm_type=request.alarm_type.as_str(),"Runtime health alarm fired");
+        self.send_alarm_notification(&request, alarm_id).await;
+        if let Err(error) = self
+            .job_queue
+            .send(Job::AlarmFired(AlarmFiredJob {
+                alarm_id,
+                project_id: request.project_id,
+                environment_id: request.environment_id,
+                deployment_id: request.deployment_id,
+                alarm_type: request.alarm_type.as_str().into(),
+                severity: request.severity.as_str().into(),
+                title: request.title,
+            }))
+            .await
+        {
+            error!(alarm_id,%error,"Failed to emit runtime AlarmFired event");
+        }
+        Ok(Some(alarm_id))
+    }
+
+    /// Resolve by immutable assignment identity even after container deletion
+    /// has cleared the alarm's nullable container FK.
+    pub async fn resolve_runtime_assignment(
+        &self,
+        assignment_id: &str,
+        alarm_type: AlarmType,
+    ) -> Result<(), AlarmError> {
+        if !matches!(
+            alarm_type,
+            AlarmType::RuntimeProbeFailed | AlarmType::RuntimeMonitoringLost
+        ) {
+            return Ok(());
+        }
+        use sea_orm::FromQueryResult;
+        let rows=alarms::Model::find_by_statement(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE alarms SET status='resolved',resolved_at=clock_timestamp() WHERE id IN (SELECT ar.id FROM alarms ar WHERE ar.alarm_type=$1 AND ar.status IN ('firing','acknowledged') AND ar.metadata->>'runtime_health_assignment'=$2 AND NOT EXISTS(SELECT 1 FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN environments e ON e.id=r.environment_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id::text=$2 AND a.retired_at IS NULL AND e.current_deployment_id=r.deployment_id AND NOT e.sleeping AND COALESCE(h.enabled,TRUE) AND NOT COALESCE(h.paused,FALSE) AND (($1='runtime_probe_failed' AND a.alarm_state='unhealthy') OR ($1='runtime_monitoring_lost' AND a.monitoring_lost))) ORDER BY ar.id LIMIT 100) RETURNING *",
+            vec![alarm_type.as_str().into(),assignment_id.into()])).all(self.db.as_ref()).await?;
+        for alarm in rows {
+            if let Err(error) = self
+                .job_queue
+                .send(Job::AlarmResolved(AlarmResolvedJob {
+                    alarm_id: alarm.id,
+                    project_id: alarm.project_id,
+                    environment_id: alarm.environment_id,
+                    deployment_id: alarm.deployment_id,
+                    alarm_type: alarm.alarm_type.clone(),
+                    title: alarm.title.clone(),
+                }))
+                .await
+            {
+                error!(alarm_id=alarm.id,%error,"Failed to emit runtime AlarmResolved event");
+            }
+            self.send_resolved_notification(&alarm).await;
+        }
+        Ok(())
     }
 
     /// Resolve an alarm by ID. `project_id: None` scopes to host/control-plane-wide
@@ -1775,6 +1861,8 @@ mod tests {
             AlarmType::NodeResourcePressure,
             AlarmType::TraefikContainerDrift,
             AlarmType::CronJobFailed,
+            AlarmType::RuntimeProbeFailed,
+            AlarmType::RuntimeMonitoringLost,
         ];
 
         for t in &types {

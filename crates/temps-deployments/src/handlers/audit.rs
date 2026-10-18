@@ -417,6 +417,16 @@ pub struct TraefikDiscoveredRouteCertDeauthorizedAudit {
     pub host: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimeHealthPolicyUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub enabled: bool,
+    pub paused: bool,
+    pub required_healthy: Option<i32>,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -446,6 +456,10 @@ macro_rules! impl_audit_operation {
     };
 }
 
+impl_audit_operation!(
+    RuntimeHealthPolicyUpdatedAudit,
+    "RUNTIME_HEALTH_POLICY_UPDATED"
+);
 impl_audit_operation!(DeploymentRollbackAudit, "DEPLOYMENT_ROLLBACK");
 impl_audit_operation!(DeploymentPausedAudit, "DEPLOYMENT_PAUSED");
 impl_audit_operation!(DeploymentResumedAudit, "DEPLOYMENT_RESUMED");

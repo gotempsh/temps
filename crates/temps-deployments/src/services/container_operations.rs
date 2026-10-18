@@ -34,6 +34,10 @@ pub struct ContainerExecResult {
 pub trait ContainerOperations: Send + Sync {
     fn deployer(&self) -> Arc<dyn temps_deployer::ContainerDeployer>;
 
+    fn runtime_health_remote(&self) -> Option<Arc<temps_deployer::remote::RemoteNodeDeployer>> {
+        None
+    }
+
     async fn stream_logs(
         &self,
         container_id: &str,
@@ -298,6 +302,10 @@ fn terminal_base(base: &str) -> Option<String> {
 
 #[async_trait]
 impl ContainerOperations for RemoteContainerOperations {
+    fn runtime_health_remote(&self) -> Option<Arc<temps_deployer::remote::RemoteNodeDeployer>> {
+        Some(self.deployer.clone())
+    }
+
     fn deployer(&self) -> Arc<dyn temps_deployer::ContainerDeployer> {
         self.deployer.clone()
     }

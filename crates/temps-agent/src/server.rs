@@ -84,6 +84,7 @@ pub fn build_router(
         sandbox_host,
         config.sandbox_work_root(),
     ));
+    let runtime_docker = docker.clone();
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
@@ -96,6 +97,8 @@ pub fn build_router(
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
+
+    let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
 
     // API routes — all protected by bearer token auth
     let api_routes = Router::new()
@@ -213,10 +216,14 @@ pub fn build_router(
     let sandbox_routes = sandbox_router(sandbox_state, auth);
 
     // Swagger UI — no auth required so it's accessible for documentation
-    let swagger_ui =
-        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", AgentApiDoc::openapi());
+    let mut api = AgentApiDoc::openapi();
+    api.merge(crate::runtime_health::RuntimeHealthApiDoc::openapi());
+    let swagger_ui = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
 
-    api_routes.merge(sandbox_routes).merge(swagger_ui)
+    api_routes
+        .merge(sandbox_routes)
+        .merge(runtime_health_routes)
+        .merge(swagger_ui)
 }
 
 /// ADR-048 sandbox host API — same auth as every other agent route. File

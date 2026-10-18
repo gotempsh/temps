@@ -107,6 +107,10 @@ interface ThresholdLineChartProps {
   height?: number
   /** Allow fractional Y-axis ticks. Pass `false` for counts. */
   allowDecimals?: boolean
+  /** Preserve missing-observation gaps when false (runtime availability). */
+  connectNulls?: boolean
+  /** Fixed semantic range, such as percentages from 0 to 100. */
+  yDomain?: [number, number]
   /**
    * Format the Y-axis ticks (e.g. "2.5s"). `ctx.decimals` is the precision
    * the chosen tick step needs; honour it instead of rounding to a fixed
@@ -221,6 +225,8 @@ export function ThresholdLineChart({
   bandSeries,
   height = 300,
   allowDecimals = true,
+  connectNulls = true,
+  yDomain,
   yTickFormatter,
   xTickFormatter,
   tooltipValueFormatter,
@@ -441,8 +447,8 @@ export function ThresholdLineChart({
       ? yTickFormatter(value, ctx)
       : formatAxisNumber(value, ctx.decimals)
   const yAxis = buildYAxisTicks(
-    Math.min(0, envMin),
-    envMax > 0 ? envMax * 1.05 : envMax,
+    yDomain?.[0] ?? Math.min(0, envMin),
+    yDomain?.[1] ?? (envMax > 0 ? envMax * 1.05 : envMax),
     { integer: !allowDecimals, format: formatYTick }
   )
   const yTickContext: AxisTickContext = {
@@ -657,7 +663,7 @@ export function ThresholdLineChart({
               !isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false
             }
             activeDot={{ r: 4, strokeWidth: 0 }}
-            connectNulls
+            connectNulls={connectNulls}
             isAnimationActive={false}
           />
         ))}

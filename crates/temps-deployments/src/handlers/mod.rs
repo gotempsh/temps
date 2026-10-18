@@ -20,3 +20,5 @@ pub mod types;
 pub mod wireguard_mesh;
 
 pub mod ci_dispatch;
+
+pub mod runtime_health;

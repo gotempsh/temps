@@ -363,12 +363,30 @@ health:
 Only a successful gate replaces the current deployment. When replacing a web deployment with a portless worker, Temps waits for route withdrawal before retiring the old containers. Portless workers receive no public route, domain, subdomain or screenshot job. Their container view shows **Background worker** and `healthy`, `unhealthy` or `unknown` **at deploy**, together with container metrics. Failed candidates retain a short failure reason; exec output is bounded to 4096 bytes and stays in authorized job logs, so commands should avoid printing credentials.
 
 <Note>
-  This release evaluates probes at deployment time, including image rollback and promotion. A recorded `healthy` state is not continuous uptime monitoring. Runtime probe evaluation and probe-driven alarms are deferred, as are automated remediation and heartbeat probes. Existing Docker crash, restart and resource monitoring continues. Docker Compose deployments keep their existing per-service healthcheck behavior.
+  Deployment readiness and runtime availability are separate signals. Process, HTTP and TCP probes also run continuously on the assigned workload node after a new deployment saves its effective probe revision. Exec remains a deployment-only gate: runtime exec is unavailable until its cleanup can terminate only the probe and preserve the application. Automated remediation and heartbeat probes remain deferred. Docker Compose keeps its existing per-service healthchecks.
 </Note>
 
 ### Converting an existing web deployment
 
 The upgrade preserves the implicit port of existing web applications, including images without `EXPOSE`. To convert a former dummy-port worker, remove `EXPOSE` from the final image, clear the saved project and environment port overrides, choose `process` or `exec`, and redeploy. Verify **Background worker** in the container view. The previous HTTP monitor becomes not applicable and stale HTTP outages are retired; Temps does not fabricate an HTTP success for the worker.
+
+### Runtime health and uptime
+
+Open **Monitoring → Uptime** to see the effective probe kind, source, timing, replica states and observation history. Editing deployment defaults changes future deployments; it does not replace the current deployment’s saved runtime probe. Redeploy an existing workload to create its first runtime revision. Old deployment-time `healthy` results do not seed uptime.
+
+Availability is `healthy / (healthy + unhealthy)` time. Coverage is `observed / eligible` time. Missing observations stay **unknown**, reducing coverage without becoming either success or outage. An environment with no observed time shows a dash for availability. Intentionally paused or sleeping time is excluded. Pause and resume controls are on the runtime health panel.
+
+A process probe confirms lifecycle stability, not useful application progress. Runtime exec is explicitly unavailable, with a link to choose process, HTTP or TCP. Exec argv and application output are not exposed in uptime details.
+
+The control plane coordinates policy and history; each worker runs its own bounded scheduler. A combined single-host installation embeds that scheduler in `temps serve`. A Docker-free control plane needs no local workloads or Docker socket. Separate worker agents require mTLS and current runtime-health support; legacy agents report unavailable rather than using plaintext or generic exec. A disconnected worker may finish its existing read-only execution lease for at most 120 seconds. Lease expiry never stops or restarts the application.
+
+Failures raise a runtime probe alarm after the saved threshold of consecutive accepted observations. Two successive accepted successes recover it. Nodes run checks at the configured interval; the control plane collects the latest result every five seconds, coalescing intermediate attempts. Missing monitoring raises a separate warning after two minutes; it never fabricates application recovery. These alarms do not restart containers or withdraw routes.
+
+Runtime samples are retained for seven days and one-minute coverage buckets for thirty days. The console shows the current deployment’s last 24 hours; a replacement starts its own coverage period, while previous revision buckets remain retained. Independent user-created HTTP monitors remain available; the automatic HTTP monitor is not presented as worker uptime.
+
+For an advanced replica quorum, `PUT /api/projects/{project_id}/environments/{environment_id}/runtime-health` accepts `enabled`, `paused` and an optional `required_healthy` count between 1 and the deployment’s desired replicas. Omitting the count requires every desired replica. The matching GET returns the safe effective probe and coverage; this policy endpoint cannot install commands or change the saved probe revision.
+
+Co-located `temps serve` and `temps agent` processes sharing one Docker daemon also share a protected runtime-health coordination directory. Native processes discover the existing directory through platform-owned Docker metadata. When they run in separate containers, mount that directory into both at the same path. When the agent runs its internal edge proxy on port 80, bind the control-plane listener to its public or underlay address rather than a wildcard address, so it can coexist with the agent’s bridge-address listener. An inaccessible or untrusted namespace disables monitoring with an explicit diagnostic; it never admits independent budgets or modifies the existing metadata volume.
 
 ### Configuring probes through the API
 

@@ -1,6 +1,6 @@
 # ADR-053: Distributed Runtime Health and Worker Uptime
 
-**Status:** In progress; engine foundations implemented, periodic monitoring not enabled
+**Status:** Implemented for process/HTTP/TCP; runtime exec remains gated
 **Date:** 2026-10-17
 **Builds on:** [ADR-052](./052-pluggable-health-probes-for-workers.md),
 [multi-node hardening](./020-multi-node-deployment-hardening.md),
@@ -428,8 +428,12 @@ unbounded work through record settings.
 
 Use indexed reconciliation/expiry queries of at most 100 records and local
 due-work structures bounded by assigned placements. Reports contain at most
-100 observations and 64 KiB per envelope, with a one-second maximum flush age
-while connected. Batch current-state/history writes to the same record bound.
+100 observations and 64 KiB per envelope. The coordinator collects each
+placement’s latest observation on a five-second indexed reconciliation cycle;
+intermediate attempts are coalesced rather than queued. Failure/recovery
+thresholds count accepted observations. Each response has a fresh challenge
+and bounded sample age; collection never backfills an offline interval. Batch
+current-state/history writes to the same record bound.
 Keep caches bounded and evict inactive placements; do not spawn a task or
 timer for every container or scan the entire deployment table every tick.
 Reuse existing reconciliation infrastructure, with change notifications plus
@@ -496,54 +500,84 @@ heartbeats and remediation need their own design and authorization review.
 
 ### Implementation progress
 
-The first implementation adds `crates/temps-runtime-health`, a database-free
-library with a bounded node-local scheduler and a read-only runtime inspector
-interface. It supports process stability, HTTP and TCP checks, owner/container
-identity validation, explicit in-process lease renewal, project round-robin,
-four concurrent attempts, a 1,000-assignment bound, cancellation guards and
-sanitized observations. HTTP follows no redirects and reads status lines of
-at most 128 bytes. It skips up to eight informational responses with a shared
-16 KiB status/header budget and the original attempt deadline; protocol
-upgrades fail closed. Response bodies are discarded. Exec is not representable
-in the probe contract; unknown kinds and address-bearing payloads are rejected.
+`temps serve` now starts the database-backed runtime-health coordinator even
+when its Docker handle is disabled and the cluster has no deployments.
+Combined installations lazily host the same `temps-runtime-health` engine for
+local placements. Agents host it behind their existing verified mTLS listener
+and node credential. Legacy/plaintext agents do not mount the protocol. No
+proxy-only process starts another coordinator or engine.
 
-The existing lifecycle/resource monitor now requires a placement-aware
-resolver instead of a local deployer. It can process an initially empty
-cluster and later remote containers without constructing a local runtime.
-Local and remote placement failures remain explicit and never select another
-runtime as a fallback.
+Successful image deployments persist an immutable safe effective revision and
+replica assignments. Existing deployments require redeployment; readiness data
+is never copied into runtime history. Process, HTTP and TCP are enabled. Exec
+remains explicitly unavailable at runtime and never falls back to deployment
+or interactive exec. Compose is unchanged.
 
-The engine is not yet hosted by `temps agent` or embedded `temps serve`.
-Its inspector contract is an internal trusted-host interface, not an exposed
-agent API or a substitute for authentication. In-process lease/ownership state
-does not provide restart-safe fencing or co-located interprocess exclusion.
-Those durable controls, authorized effective-revision persistence,
-authenticated assignment/report transport, availability storage, UI and alarms
-remain required before periodic monitoring is enabled. No capability is
-advertised and no new probe endpoint is registered by this foundation.
+The restricted protocol uses a fresh node session, a five-second node-issued
+authorization window, monotonically increasing database fencing epochs and
+renewal counters. The node durably writes authorization before admission and
+uses a monotonic 110-second execution lease, within the control plane's
+120-second maximum. It never restores an executable lease after restart.
+Reports bind the reporting epoch, session, random receipt challenge, assignment,
+revision, placement generation, sequence and bounded sample age. A new collector
+or a collection gap over 15 seconds establishes a new reporting epoch and
+requires a subsequent observation; cached success cannot fill an offline gap.
+The coordinator's database-time ownership lease is 30 seconds.
 
-Tests cover the library's concurrency, cancellation, ownership, validation,
-process stability/restarts, lease expiry and HTTP/TCP failure paths. A real
-Docker fixture exercises process/HTTP/TCP checks and verifies the application
-stays running until the fixture driver stops it. Resolver tests cover an empty
-Docker-free monitor discovering a remote container. These are component tests,
-not evidence of completed multi-node runtime monitoring E2E.
+Private creation receipts bind full Docker IDs to authorized project,
+environment, deployment, image ID and published ports. They come from trusted
+container creation, not inspected workload labels. Old/retained candidates,
+wrong placement and changed container identities cannot refresh serving health.
+
+Co-located execution uses per-container advisory locks and four daemon-wide
+probe slot locks. A metadata-only Docker volume identifies the protected
+coordination directory and its random identity plus filesystem identity. It is
+never mounted into applications. Native processes with different data roots
+can use that same existing directory. Containerized co-located processes must
+share the protected directory; distinct private filesystems fail closed rather
+than each admitting four probes. Network filesystems, untrusted permissions,
+symlinks and foreign coordination metadata are rejected without modifying the
+existing volume. One embedded owner and one agent owner receive two reserved
+slots each while both are active; a sole owner can borrow all four. Each engine
+role caps active assignments at 256, and container claims remain held until the old
+scheduler is quiescent. When the agent’s internal edge proxy listens on its
+bridge address at port 80, the co-located control plane binds its public or
+underlay address explicitly instead of a conflicting wildcard listener.
+
+The control plane admits at most 16 concurrent node-management operations and
+100 placement references in flight. Its indexed due query excludes nodes already
+being processed, so one failed node cannot block other workers. Nodes schedule
+checks locally with project fairness and four bounded attempts, rather than
+receiving a management RPC per check. There is no unbounded disconnected spool.
+
+Report validation precedes one atomic batched current-state/sample write of
+at most 100 observations; duplicate replica entries reject the envelope.
+Runtime state, immutable revisions, fenced leases, raw samples, minute buckets
+and an alarm outbox have separate database tables. Raw samples expire after
+seven days; minute coverage expires after 30 days. Unknown intervals are sparse:
+missing eligible duration is calculated as unknown, never as success. Dashboard
+reads use 24 hours plus the current minute. Known state expires on reads and
+indexed background work. Placement changes invalidate freshness atomically.
+Paused, disabled and sleeping periods are excluded from eligible time. Minute buckets include the immutable revision, so a new deployment cannot
+inherit old availability. The UI
+shows measured availability, coverage, unknown time, replica state and the safe
+effective probe configuration. It hides only managed HTTP monitors for explicitly
+portless environments and preserves independent monitors and historical checks.
+
+Sustained failures and monitoring loss use separate deduplicated alarms through
+the existing alarm pipeline. Failure uses the deployment's failure threshold;
+recovery requires two fresh successes. Missing monitoring has a 120-second grace
+period. An outbox retries alarm persistence and fences obsolete queued transitions;
+notification delivery retains the existing alarm pipeline behavior.
+Neither alarm performs application lifecycle actions or changes public routes.
 
 ### Remaining rollout
 
-1. Correct the portless uptime presentation and expose safe effective probe
-   metadata without claiming runtime coverage. Preserve historical HTTP data.
-2. Extract the shared node-local probe engine, embed it for combined
-   single-host workloads and host it in agents for assigned worker workloads.
-   Decouple control-plane monitoring startup from local deployments/Docker.
-   Add versioned capabilities, assignment validation, fenced reconciliation,
-   execution leases and separate runtime storage. Ship process/HTTP/TCP
-   monitoring and coverage reporting.
-3. Enable sustained-failure and monitoring-loss alerts after transition and
-   deduplication tests pass. Keep automatic remediation out of scope.
-4. Enable runtime exec only after the non-destructive execution mechanism has
-   its own concrete design, threat review and passing adversarial tests on
-   local and remote executors. Unsupported agents stay explicitly unavailable.
+Runtime exec remains gated on a separately designed, reviewed and tested
+non-destructive execution backend. Applying a new probe revision directly to an
+already-running deployment and public status-page mapping are separate follow-ups.
+The acceptance matrix below remains the verification contract: component tests
+alone do not establish completed topology E2E or measured production capacity.
 
 Required tests next to the implementing code include:
 
@@ -591,16 +625,15 @@ Required tests next to the implementing code include:
   unavailable capabilities and safe effective-probe display.
 
 Compose service healthchecks are unchanged by this ADR. Mapping them into
-runtime availability requires a separate compatibility decision. The engine
-foundation does not enable Phase 2 monitoring or establish that live multi-node
-runtime verification has passed.
+runtime availability requires a separate compatibility decision. Runtime monitoring does not establish that live multi-node verification has
+passed until the topology E2E suite has completed successfully.
 
 ## Open implementation decisions
 
 - The concrete contained-exec mechanism and supported runtime/platform matrix.
   This blocks runtime exec enablement, not process/HTTP/TCP monitoring.
-- Exact migration and history-store layout, retention defaults and public
-  status-page mapping for unknown and insufficient coverage. Preserve the
-  state/coverage semantics above regardless of storage choice.
-- Final policy bounds and default replica threshold, validated with the
-  resource benchmark and operational feedback before enabling alarms.
+- Public status-page mapping for unknown and insufficient runtime coverage.
+  Existing HTTP history remains separate from runtime availability.
+- Capacity measurements and operational feedback at the reference load; the
+  initial replica threshold is all desired replicas, with a validated per-
+  environment override.

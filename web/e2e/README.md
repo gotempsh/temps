@@ -237,3 +237,46 @@ will serve them -- the assets are compiled in, so restarting alone is not enough
   Playwright resolves a glob relative to it, so `waitForURL('**/projects')`
   never matches `http://host/projects` and fails with an opaque 30s timeout.
   Use the exported `URL_PROJECTS` / `URL_LOGIN` / `urlForProject()`.
+
+### Continuous runtime health
+
+`authenticated/runtime-health.spec.ts` uses the same disposable-instance and
+`HEALTH_PROBE_E2E_REGISTRY` setup as the deployment probe suite. It deploys a
+real HTTP workload, removes/restores its health file, verifies sustained-failure
+alarm delivery and recovery, then deploys a portless worker. It checks immutable
+effective configuration, honest coverage, pause/resume and the explicit runtime
+exec limitation. Every image, container and project is owned by that run.
+
+```sh
+bun run e2e -- runtime-health.spec.ts --workers=1
+```
+
+The distributed scenario is separate from browser tests. Build a Linux Temps
+binary from this checkout in the existing dev-cluster image with a dedicated
+Docker target volume, then run from the repository root:
+
+```sh
+python3 tools/dev-cluster/runtime-health-e2e.py \
+  --image temps-runtime-e2e:local \
+  --target-volume temps-runtime-e2e-target \
+  --binary /workspace/target/fast/temps
+```
+
+It starts an initially empty control plane with no Docker daemon, socket or
+privileged container, plus two distinct mTLS DinD workers. It checks late remote
+placement, process/HTTP/TCP probes, application-failure and recovery alarms,
+replica aggregation, node loss, monitoring-loss alarms, worker restart
+and control-plane restart. The current checkout and prebuilt target are mounted
+read-only. The generated bootstrap state stays in private temporary volumes.
+The random Compose project owns every mutable resource and removes only those
+resources on success or failure; the external target volume is preserved.
+`GeoLite2-City.mmdb` must already exist under `crates/temps-cli/`.
+
+The distributed scenario then moves the same control-plane identity onto one
+worker while that worker’s agent remains running. A three-replica deployment
+uses local embedded, co-located agent and separate remote placements together.
+
+The Rust Docker adapter tests additionally run a second OS process to verify
+cross-process container exclusion and exercise the shared four-slot budget for
+co-located embedded and agent roles. These are component checks; they do not
+replace testing separately hosted control-plane and agent processes together.

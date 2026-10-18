@@ -33,3 +33,5 @@ pub use migration::m20261002_000001_secret_checks_and_history::Migration as Secr
 pub use migration::m20261016_000002_ci_build_dispatch::Migration as CiBuildDispatchMigration;
 
 pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainCiCancellationMigration;
+
+pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;

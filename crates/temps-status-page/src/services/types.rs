@@ -273,6 +273,8 @@ pub fn normalize_check_interval_seconds(requested: i32) -> i32 {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct MonitorResponse {
+    /// Temps-managed HTTP monitor; independent monitors remain visible for workers.
+    pub is_managed: bool,
     pub id: i32,
     pub project_id: i32,
     pub environment_id: Option<i32>,
@@ -475,6 +477,7 @@ pub struct IncidentBucket {
 impl From<temps_entities::status_monitors::Model> for MonitorResponse {
     fn from(model: temps_entities::status_monitors::Model) -> Self {
         Self {
+            is_managed: model.is_managed,
             id: model.id,
             project_id: model.project_id,
             environment_id: model.environment_id,

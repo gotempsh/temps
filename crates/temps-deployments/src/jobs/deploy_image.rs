@@ -4570,6 +4570,29 @@ impl WorkflowTask for DeployImageJob {
             }
         };
 
+        let repository_probe = context.get_output::<temps_core::repo_config::HealthCheckConfig>(
+            &self.build_job_id,
+            "health",
+        )?;
+        let probe_source = if repository_probe.is_some() {
+            "repository"
+        } else if self.config.health.is_some() {
+            "deployment_settings"
+        } else {
+            "automatic"
+        };
+        let effective_probe = repository_probe
+            .or_else(|| self.config.health.clone())
+            .unwrap_or_default();
+        let runtime_revision = crate::services::runtime_health::EffectiveProbeRevision::resolve(
+            &effective_probe,
+            deployment_output.container_port,
+            effective_health_path.as_deref(),
+            probe_source,
+            self.config.replicas,
+        );
+        context.set_output(&self.job_id, "runtime_health_revision", runtime_revision)?;
+
         // Set typed job outputs
         context.set_output(
             &self.job_id,

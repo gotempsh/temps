@@ -12164,6 +12164,7 @@ dependencies = [
  "temps-dns-resolver",
  "temps-network",
  "temps-providers",
+ "temps-runtime-health",
  "temps-vulnerability-scanner",
  "temps-wireguard",
  "thiserror 2.0.21",
@@ -13136,6 +13137,7 @@ dependencies = [
  "http 1.5.0",
  "http-body-util",
  "mockall",
+ "nix 0.31.3",
  "num_cpus",
  "regex",
  "reqwest 0.12.28",
@@ -13155,6 +13157,7 @@ dependencies = [
  "temps-network",
  "temps-presets",
  "temps-routes",
+ "temps-runtime-health",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13234,6 +13237,7 @@ dependencies = [
  "temps-presets",
  "temps-providers",
  "temps-queue",
+ "temps-runtime-health",
  "temps-screenshots",
  "temps-vulnerability-scanner",
  "temps-wireguard",
@@ -14966,12 +14970,15 @@ dependencies = [
  "async-trait",
  "bollard",
  "futures",
+ "nix 0.31.3",
  "parking_lot",
  "serde",
  "serde_json",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
+ "utoipa",
  "uuid",
 ]
 
@@ -16285,6 +16292,7 @@ dependencies = [
  "quote",
  "regex",
  "syn 3.0.3",
+ "uuid",
 ]
 
 [[package]]

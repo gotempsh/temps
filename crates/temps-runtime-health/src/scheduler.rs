@@ -112,6 +112,16 @@ impl ProbeEngine {
         Ok(())
     }
 
+    pub(crate) fn checked_at(&self, id: Uuid) -> Option<Instant> {
+        self.state
+            .lock()
+            .entries
+            .get(&id)?
+            .last
+            .as_ref()
+            .map(|(at, _)| *at)
+    }
+
     /// Renewal cannot revive expired authority or change an installed revision.
     pub fn renew(&self, id: Uuid, epoch: u64, expires_at: Instant) -> Result<(), EngineError> {
         validate_lease(id, expires_at)?;
@@ -283,6 +293,19 @@ impl ProbeEngine {
         }
         let assignment = &attempt.assignment;
         let deadline = (now + Duration::from_secs(assignment.timeout_secs)).min(attempt.expires_at);
+        let _permit = match timeout_at(deadline, self.inspector.admit(assignment)).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(InspectFailure::Unauthorized)) => {
+                return attempt.finish(HealthState::Unknown, HealthReason::Unauthorized, None);
+            }
+            Ok(Err(InspectFailure::Unavailable)) | Err(_) => {
+                return attempt.finish(
+                    HealthState::Unknown,
+                    HealthReason::RuntimeUnavailable,
+                    None,
+                );
+            }
+        };
         let checked = timeout_at(deadline, self.inspector.inspect(assignment)).await;
         let mut stable = None;
         let (health, reason) = match checked {

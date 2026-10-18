@@ -653,6 +653,14 @@ impl TempsPlugin for DeploymentsPlugin {
             // Register WorkflowExecutionService for use in remote deployments
             context.register_service(workflow_execution_service);
 
+            context.register_service(Arc::new(
+                crate::services::runtime_health::RuntimeHealthService::new(
+                    context.require_service::<sea_orm::DatabaseConnection>(),
+                    context.require_service::<DeploymentService>(),
+                    context.require_service::<temps_core::DockerHandle>(),
+                ),
+            ));
+
             tracing::debug!("Deployments plugin services registered successfully");
             Ok(())
         })
@@ -663,6 +671,11 @@ impl TempsPlugin for DeploymentsPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            let runtime_health =
+                context.require_service::<crate::services::runtime_health::RuntimeHealthService>();
+            runtime_health
+                .set_alarm_service(context.require_service::<temps_monitoring::AlarmService>());
+            runtime_health.start();
             // Runs after every plugin has registered its services, so this
             // is the first point at which an optional DeploymentGate (e.g.
             // from a plugin implementing manual approvals) can actually be
@@ -1096,7 +1109,17 @@ impl TempsPlugin for DeploymentsPlugin {
             .with_state(app_state)
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
-            .merge(compose_check_routes);
+            .merge(compose_check_routes)
+            .merge(
+                handlers::runtime_health::routes()
+                    .with_state(Arc::new(handlers::runtime_health::RuntimeHealthAppState {
+                    service: context
+                        .require_service::<crate::services::runtime_health::RuntimeHealthService>(),
+                    project_access_checker: context
+                        .get_service::<dyn temps_core::ProjectAccessChecker>(),
+                    audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                })),
+            );
 
         Some(PluginRoutes::new(routes))
     }
@@ -1139,6 +1162,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_tokens_schema,
                 traefik_discovery_schema,
                 compose_check_schema,
+                <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
             ],
         ))
     }

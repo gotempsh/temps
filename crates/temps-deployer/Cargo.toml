@@ -11,6 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+nix = { version = "0.31", features = ["fs"] }
+temps-runtime-health = { path = "../temps-runtime-health" }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }

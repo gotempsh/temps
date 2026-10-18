@@ -11,6 +11,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-runtime-health = { path = "../temps-runtime-health" }
 arc-swap = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
