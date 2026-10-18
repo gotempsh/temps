@@ -439,6 +439,7 @@ impl ProbeHost {
         }
         state.installed.remove(&id);
         state.completed.remove(&id);
+        state.reporting_floor.remove(&id);
         Ok(())
     }
 
@@ -466,6 +467,7 @@ impl ProbeHost {
             if self.engine.remove(id, epoch).is_ok() {
                 state.installed.remove(&id);
                 state.completed.remove(&id);
+                state.reporting_floor.remove(&id);
             }
         }
         if state.installed.is_empty() && state.journal_owned {
@@ -836,6 +838,62 @@ mod tests {
                 .sequence
                 > sequence
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reauthorized_assignments_do_not_inherit_a_previous_epochs_reporting_floor() {
+        for revoke in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let owner = ExecutionOwner::Embedded(Uuid::new_v4());
+            let host = host(directory.path(), owner);
+            let mut assignment = assignment(owner);
+            host.authorize(request(&host, assignment.clone())).unwrap();
+            let report_request = |epoch| ReportRequest {
+                session: host.session(),
+                collection_epoch: epoch,
+                challenge: Uuid::new_v4(),
+                assignments: vec![assignment.id],
+            };
+            host.report(report_request(1)).unwrap();
+            for _ in 0..6 {
+                host.run_due().await;
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            assert_eq!(
+                host.report(report_request(1)).unwrap().observations[0]
+                    .observation
+                    .sequence,
+                6
+            );
+            assert!(host
+                .report(report_request(2))
+                .unwrap()
+                .observations
+                .is_empty());
+            if revoke {
+                host.revoke(host.session(), assignment.id, assignment.epoch)
+                    .unwrap();
+            } else {
+                tokio::time::advance(Duration::from_secs(5)).await;
+                host.run_due().await;
+            }
+            assignment.epoch += 1;
+            host.authorize(request(&host, assignment.clone())).unwrap();
+            assert!(host
+                .report(report_request(2))
+                .unwrap()
+                .observations
+                .is_empty());
+            host.run_due().await;
+            let batch = host.report(report_request(2)).unwrap();
+            assert_eq!(batch.observations.len(), 1, "revoked: {revoke}");
+            assert_eq!(batch.observations[0].observation.sequence, 1);
+            assert_eq!(batch.observations[0].observation.epoch, assignment.epoch);
+            assert!(matches!(
+                host.report(report_request(1)),
+                Err(HostError::Fenced)
+            ));
+        }
     }
 
     #[tokio::test]

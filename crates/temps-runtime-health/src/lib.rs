@@ -288,10 +288,16 @@ mod docker_tests {
             eprintln!("Docker unavailable; skipping runtime probe integration");
             return;
         }
+        // Separate Docker VMs can allocate a published port already occupied
+        // on the host. Select a host-free port for this owned fixture.
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let requested_port = listener.local_addr().unwrap().port();
+        drop(listener);
         let fixture = GenericImage::new("busybox", "1.37.0")
             .with_entrypoint("sh")
             .with_exposed_port(8080.tcp())
             .with_wait_for(WaitFor::message_on_stdout("runtime-probe-fixture-ready"))
+            .with_mapped_port(requested_port, 8080.tcp())
             .with_container_name(format!("temps-runtime-probe-{}", Uuid::new_v4()))
             .with_cmd(["-c", "mkdir -p /tmp/site; printf ready > /tmp/site/index.html; httpd -f -p 8080 -h /tmp/site & echo runtime-probe-fixture-ready; exec sleep 120"])
             .start().await.unwrap();
@@ -359,7 +365,8 @@ mod docker_tests {
             engine
                 .install(assignment.clone(), Instant::now() + MAX_LEASE)
                 .unwrap();
-            assert_eq!(engine.run_due().await[0].state, state);
+            let observation = engine.run_due().await.remove(0);
+            assert_eq!(observation.state, state, "{observation:?}");
             engine.remove(assignment.id, 1).unwrap();
         }
 

@@ -35,15 +35,17 @@ fn verify_local_filesystem(path: &Path) -> Result<(), HostError> {
     #[cfg(target_os = "linux")]
     {
         use nix::sys::statfs::{
-            statfs, BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC, TMPFS_MAGIC,
-            XFS_SUPER_MAGIC,
+            statfs, FsType, BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, OVERLAYFS_SUPER_MAGIC, TMPFS_MAGIC,
         };
+        // Linux's XFS magic is stable, but nix only exports its named constant
+        // on non-musl targets. Keep the same filesystem allowlist on musl.
+        const XFS: FsType = FsType(0x5846_5342);
         let filesystem = statfs(path)
             .map_err(|_| unavailable("cannot inspect coordination filesystem"))?
             .filesystem_type();
         if ![
             EXT4_SUPER_MAGIC,
-            XFS_SUPER_MAGIC,
+            XFS,
             BTRFS_SUPER_MAGIC,
             OVERLAYFS_SUPER_MAGIC,
             TMPFS_MAGIC,

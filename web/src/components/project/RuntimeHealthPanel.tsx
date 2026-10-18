@@ -67,6 +67,7 @@ export function RuntimeHealthPanel({ project, environment }: Props) {
   if (healthQuery.isPending)
     return (
       <div
+        role="status"
         className="space-y-3 rounded-lg border p-4"
         aria-label={`${environment.name} runtime health loading`}
       >
@@ -196,7 +197,10 @@ export function RuntimeHealthPanel({ project, environment }: Props) {
               </div>
             )}
             {data.length > 0 && (
-              <div aria-label="Current deployment runtime availability and coverage for the last 24 hours">
+              <div
+                role="region"
+                aria-label="Current deployment runtime availability and coverage for the last 24 hours"
+              >
                 <TimeChart
                   data={data}
                   xKey="at"

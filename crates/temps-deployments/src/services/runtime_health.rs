@@ -600,7 +600,20 @@ impl RuntimeHealthService {
                     .is_err()
                 {
                     // Do not keep an unacknowledged lease looking authorized.
-                    self.db.execute(sql("UPDATE runtime_health_assignments SET lease_until=clock_timestamp(),valid_until=clock_timestamp(),state='unknown',reason='authorization_failed' WHERE id=$1 AND epoch=$2 AND renewal=$3 AND EXISTS(SELECT 1 FROM runtime_health_coordinator WHERE owner=$4 AND term=$5 AND expires_at>clock_timestamp())",vec![row.id.into(),epoch.into(),renewal.into(),self.coordinator.into(),term.into()])).await.map_err(|e| db_error("expire rejected lease", e))?;
+                    let rejection = self
+                        .db
+                        .begin()
+                        .await
+                        .map_err(|e| db_error("begin rejected authorization", e))?;
+                    // Match policy updates' environment-before-assignment lock
+                    // order while ending the previous coverage atomically.
+                    rejection.query_one(sql("SELECT environment_id FROM runtime_health_environments WHERE environment_id=$1 FOR UPDATE",vec![row.environment_id.into()])).await.map_err(|e| db_error("lock rejected authorization coverage", e))?;
+                    rejection.execute(sql("WITH rejected AS (UPDATE runtime_health_assignments SET lease_until=clock_timestamp(),valid_until=clock_timestamp(),unknown_since=CASE WHEN state='unknown' AND reason='authorization_failed' THEN COALESCE(unknown_since,clock_timestamp()) ELSE clock_timestamp() END,state='unknown',reason='authorization_failed' WHERE id=$1 AND epoch=$2 AND renewal=$3 AND EXISTS(SELECT 1 FROM runtime_health_coordinator WHERE owner=$4 AND term=$5 AND expires_at>clock_timestamp()) RETURNING revision_id,valid_until) UPDATE runtime_health_environments h SET valid_until=LEAST(h.valid_until,rejected.valid_until) FROM rejected WHERE h.revision_id=rejected.revision_id",vec![row.id.into(),epoch.into(),renewal.into(),self.coordinator.into(),term.into()])).await.map_err(|e| db_error("expire rejected lease", e))?;
+                    rejection
+                        .commit()
+                        .await
+                        .map_err(|e| db_error("commit rejected authorization", e))?;
+                    changed.insert(row.environment_id);
                     continue;
                 }
             }
@@ -1869,6 +1882,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_authorization_rejection_preserves_loss_start_and_raises_one_alarm(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        struct RejectingInspector;
+        #[async_trait::async_trait]
+        impl temps_runtime_health::RuntimeInspector for RejectingInspector {
+            fn claim(
+                &self,
+                _assignment: &Assignment,
+            ) -> Result<
+                Box<dyn temps_runtime_health::ProbePermit>,
+                temps_runtime_health::InspectFailure,
+            > {
+                Err(temps_runtime_health::InspectFailure::Unauthorized)
+            }
+            async fn inspect(
+                &self,
+                _assignment: &Assignment,
+            ) -> Result<temps_runtime_health::RuntimeSnapshot, temps_runtime_health::InspectFailure>
+            {
+                Err(temps_runtime_health::InspectFailure::Unauthorized)
+            }
+        }
+        let (_database, service) = setup().await?;
+        save(&service).await;
+        let directory = tempfile::tempdir()?;
+        let host = Arc::new(ProbeHost::open(
+            ExecutionOwner::Embedded(Uuid::new_v4()),
+            directory.path().join("journal"),
+            Arc::new(RejectingInspector),
+        )?);
+        let row = placement(&service).await;
+        let session = Uuid::new_v4();
+        let term = grant(&service, &row, session).await;
+        service.accept(&row, session, sample(&row, 1), term).await?;
+        service.account_environment(2, term).await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(service.embedded.set(host).is_ok());
+        let mut changed = std::collections::BTreeSet::new();
+        service
+            .reconcile_node(None, vec![row.clone()], term, &mut changed)
+            .await?;
+        let rejected = service.summary(1, 2).await?;
+        assert_eq!(rejected.state, "unknown");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            (service.summary(1, 2).await?.coverage.healthy_seconds
+                - rejected.coverage.healthy_seconds)
+                .abs()
+                < 0.01
+        );
+        assert!(service
+            .db
+            .query_one(sql(
+                "SELECT unknown_since FROM runtime_health_assignments",
+                vec![]
+            ))
+            .await?
+            .unwrap()
+            .try_get::<Option<DateTime<Utc>>>("", "unknown_since")?
+            .is_some());
+        service.stage_alarms(vec![row.id], term).await?;
+        assert_eq!(count(&service, "runtime_health_alarm_outbox").await, 0);
+        service.db.execute_unprepared("UPDATE runtime_health_assignments SET unknown_since=clock_timestamp()-interval '121 seconds'").await?;
+        let since: DateTime<Utc> = service
+            .db
+            .query_one(sql(
+                "SELECT unknown_since FROM runtime_health_assignments",
+                vec![],
+            ))
+            .await?
+            .unwrap()
+            .try_get("", "unknown_since")?;
+        for _ in 0..3 {
+            service
+                .reconcile_node(None, vec![placement(&service).await], term, &mut changed)
+                .await?;
+            service.stage_alarms(vec![row.id], term).await?;
+            let state = service.db.query_one(sql("SELECT unknown_since,reason,lease_until<=clock_timestamp() AS expired FROM runtime_health_assignments", vec![])).await?.unwrap();
+            assert_eq!(state.try_get::<DateTime<Utc>>("", "unknown_since")?, since);
+            assert_eq!(
+                state.try_get::<String>("", "reason")?,
+                "authorization_failed"
+            );
+            assert!(state.try_get::<bool>("", "expired")?);
+            assert_eq!(count(&service, "runtime_health_alarm_outbox").await, 1);
+        }
+        let event = service
+            .db
+            .query_one(sql(
+                "SELECT event_type FROM runtime_health_alarm_outbox",
+                vec![],
+            ))
+            .await?
+            .unwrap();
+        assert_eq!(event.try_get::<String>("", "event_type")?, "fire_lost");
+        assert_eq!(changed, std::collections::BTreeSet::from([2]));
+        assert_eq!(count(&service, "runtime_health_samples").await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn alarm_thresholds_deduplicate_and_distinguish_monitoring_loss_from_failure(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let (_database, service) = setup().await?;
@@ -1956,7 +2070,7 @@ impl RuntimeHealthService {
         }
         let ids = serde_json::to_value(ids)
             .map_err(|_| RuntimeHealthError::Configuration { deployment_id: 0 })?;
-        let rows=AlarmCandidate::find_by_statement(sql("SELECT a.id,r.configuration,a.state,COALESCE(a.valid_until>clock_timestamp() AND a.lease_until>clock_timestamp(),FALSE) AS fresh,((a.state='unknown' AND a.reason IN ('runtime_unavailable','unauthorized','endpoint_unavailable','identity_mismatch','cancelled') AND a.unknown_since<clock_timestamp()-interval '120 seconds') OR COALESCE(LEAST(a.valid_until,a.lease_until),a.activated_at,a.created_at)<clock_timestamp()-interval '120 seconds') AS lost,(a.retired_at IS NOT NULL OR e.current_deployment_id IS DISTINCT FROM r.deployment_id OR d.state NOT IN ('completed','deployed') OR c.deleted_at IS NOT NULL OR p.is_deleted OR NOT COALESCE(h.enabled,TRUE) OR COALESCE(h.paused,FALSE) OR e.sleeping OR r.configuration->>'unavailable_reason' IS NOT NULL) AS inactive,a.failure_streak,a.recovery_streak,a.alarm_state,a.monitoring_lost FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN deployment_containers c ON c.id=a.container_record_id JOIN environments e ON e.id=r.environment_id JOIN deployments d ON d.id=r.deployment_id JOIN projects p ON p.id=r.project_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id IN (SELECT value::uuid FROM jsonb_array_elements_text($1)) ORDER BY a.id FOR UPDATE OF a",vec![ids.into()])).all(&transaction).await.map_err(|e| db_error("load runtime alarm transitions",e))?;
+        let rows=AlarmCandidate::find_by_statement(sql("SELECT a.id,r.configuration,a.state,COALESCE(a.valid_until>clock_timestamp() AND a.lease_until>clock_timestamp(),FALSE) AS fresh,((a.state='unknown' AND a.reason IN ('runtime_unavailable','unauthorized','endpoint_unavailable','identity_mismatch','cancelled','authorization_failed') AND a.unknown_since<clock_timestamp()-interval '120 seconds') OR COALESCE(LEAST(a.valid_until,a.lease_until),a.activated_at,a.created_at)<clock_timestamp()-interval '120 seconds') AS lost,(a.retired_at IS NOT NULL OR e.current_deployment_id IS DISTINCT FROM r.deployment_id OR d.state NOT IN ('completed','deployed') OR c.deleted_at IS NOT NULL OR p.is_deleted OR NOT COALESCE(h.enabled,TRUE) OR COALESCE(h.paused,FALSE) OR e.sleeping OR r.configuration->>'unavailable_reason' IS NOT NULL) AS inactive,a.failure_streak,a.recovery_streak,a.alarm_state,a.monitoring_lost FROM runtime_health_assignments a JOIN runtime_health_revisions r ON r.id=a.revision_id JOIN deployment_containers c ON c.id=a.container_record_id JOIN environments e ON e.id=r.environment_id JOIN deployments d ON d.id=r.deployment_id JOIN projects p ON p.id=r.project_id LEFT JOIN runtime_health_environments h ON h.environment_id=e.id WHERE a.id IN (SELECT value::uuid FROM jsonb_array_elements_text($1)) ORDER BY a.id FOR UPDATE OF a",vec![ids.into()])).all(&transaction).await.map_err(|e| db_error("load runtime alarm transitions",e))?;
         for row in rows {
             let config: EffectiveProbeRevision = serde_json::from_value(row.configuration)
                 .map_err(|_| RuntimeHealthError::Configuration { deployment_id: 0 })?;

@@ -337,7 +337,7 @@ jobs:
           path: ci-prebuilt
 
       - name: Build runtime topology image
-        run: docker build -t temps-runtime-e2e:ci tools/dev-cluster
+        run: docker build -t temps-runtime-e2e:ci -f tools/dev-cluster/Dockerfile.dind-temps tools/dev-cluster
 
       - name: Test Docker-free and co-located runtime monitoring
         run: |
