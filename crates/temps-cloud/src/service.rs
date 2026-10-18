@@ -19,7 +19,7 @@ use temps_cloud_protocol::{
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
 
-use crate::console_oidc_bootstrap::ConsoleAccessConsent;
+use crate::console_oidc_bootstrap::{ConsentTrace, ConsoleAccessConsent, ConsoleOidcApplyFailure};
 use temps_core::{
     ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleProvisioner,
     DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
@@ -1002,6 +1002,19 @@ impl CloudService {
         self.publish_cloud_switches(&updated)
     }
 
+    /// Last-resort, in-memory-only fail-closed: force the console-access
+    /// switch off in the link and the watch channel without touching the
+    /// database. Used only when the durable write that should have done it
+    /// has itself failed.
+    fn force_console_access_off_in_memory(&self) {
+        let mut switches = self.link.feature_switches();
+        switches.console_access = false;
+        if let Err(error) = self.link.set_feature_switches(switches) {
+            tracing::error!(%error, "could not clear the in-memory console-access switch");
+        }
+        self.console_access_tx.send_replace(false);
+    }
+
     /// Apply the managed console-access OIDC configuration found in the
     /// `cloud-oidc.json` first-boot bootstrap file (ADR-045 Amendment 1).
     ///
@@ -1015,39 +1028,82 @@ impl CloudService {
     /// It does not require the link to be established -- enrollment runs
     /// after the bootstrap and in the background.
     ///
-    /// All-or-nothing: if the provider upsert fails after consent was granted
-    /// here, the consent is rolled back, so a failed apply leaves the
-    /// instance exactly as it found it.
+    /// **Ordering is the safety property.** The provider is upserted *first*
+    /// and consent is written *second*, so the only states a failure can leave
+    /// behind are fail-closed ones: provider upsert fails -> consent was never
+    /// touched; consent write fails -> the provider is revoked again and
+    /// consent is forced back off (durably if the database allows, in memory
+    /// regardless). The reverse order would leave remote-console consent on
+    /// whenever the compensating write failed. The database cannot make the two
+    /// writes one transaction (they go through different services), so any
+    /// compensation that itself fails is reported in the returned
+    /// [`ConsentTrace`] and logged at `error`, never swallowed.
     pub async fn apply_bootstrap_console_oidc_config(
         &self,
         config: temps_auth::oidc_service::ManagedCloudOidcConfig,
-    ) -> Result<ConsoleAccessConsent, CloudServiceError> {
+    ) -> Result<ConsoleAccessConsent, ConsoleOidcApplyFailure> {
         let _update = self.feature_update_lock.lock().await;
         let Some(oidc) = self.oidc_provisioner.get() else {
             tracing::error!(
-                "the cloud-oidc.json bootstrap file was found but no OidcService is registered                  on this build; console access cannot be authenticated"
+                "the cloud-oidc.json bootstrap file was found but no OidcService is registered \
+                 on this build; console access cannot be authenticated"
             );
-            return Err(CloudServiceError::ConsoleOidcUnavailable);
-        };
-        let consent = if self.console_access_enabled() {
-            ConsoleAccessConsent::AlreadyEnabled
-        } else {
-            let previous = self.link.feature_switches();
-            let new = self.persist_console_access_locked(true).await?;
-            ConsoleAccessConsent::GrantedByBootstrap { previous, new }
+            return Err(ConsoleOidcApplyFailure::untouched(
+                CloudServiceError::ConsoleOidcUnavailable,
+            ));
         };
         if let Err(error) = oidc.upsert_managed_cloud_provider(config).await {
-            if consent.was_granted() {
-                if let Err(rollback_error) = self.persist_console_access_locked(false).await {
-                    tracing::error!(
-                        %rollback_error,
-                        "the cloud-oidc.json bootstrap enabled console access but could not                          undo it after the managed OIDC provider failed to apply;                          cloud.console_access_enabled is on without a provider -- disable it in                          Settings > Temps Cloud if that is not intended"
-                    );
-                }
-            }
-            return Err(CloudServiceError::ConsoleOidcProvisioning(error));
+            return Err(ConsoleOidcApplyFailure::untouched(
+                CloudServiceError::ConsoleOidcProvisioning(error),
+            ));
         }
-        Ok(consent)
+        if self.console_access_enabled() {
+            return Ok(ConsoleAccessConsent::AlreadyEnabled);
+        }
+
+        let previous = self.link.feature_switches();
+        match self.persist_console_access_locked(true).await {
+            Ok(new) => Ok(ConsoleAccessConsent::GrantedByBootstrap { previous, new }),
+            Err(error) => {
+                // The settings row may have committed before the failure
+                // surfaced (e.g. while publishing to the link), so do not
+                // assume nothing was written: undo both halves.
+                let restored = match self.persist_console_access_locked(false).await {
+                    Ok(_) => true,
+                    Err(restore_error) => {
+                        self.force_console_access_off_in_memory();
+                        tracing::error!(
+                            %restore_error,
+                            "the cloud-oidc.json bootstrap could not durably switch console \
+                             access back off after failing to switch it on; the settings row \
+                             may still say cloud.console_access_enabled=true -- check Settings > \
+                             Temps Cloud"
+                        );
+                        false
+                    }
+                };
+                let provider_revoked = match self.revoke_console_oidc_provider().await {
+                    Ok(_) => true,
+                    Err(revoke_error) => {
+                        tracing::error!(
+                            %revoke_error,
+                            "the cloud-oidc.json bootstrap created the managed OIDC provider but \
+                             could not remove it after the consent write failed; remove it by \
+                             disabling console access in Settings > Temps Cloud"
+                        );
+                        false
+                    }
+                };
+                Err(ConsoleOidcApplyFailure {
+                    error,
+                    consent: ConsentTrace::WriteFailed {
+                        previous,
+                        restored,
+                        provider_revoked,
+                    },
+                })
+            }
+        }
     }
 
     /// Upsert the managed console-access `oidc_providers` row from a
@@ -2325,6 +2381,86 @@ mod tests {
         )
     }
 
+    /// Every `cloud.console_access_enabled` value that was actually written
+    /// to the settings row, in order, read from the mock's statement log.
+    /// This is what "persisted" means: the in-memory switch and the watch
+    /// channel can say `true` while the row was never saved. The caller must
+    /// have dropped every other handle to `db`.
+    fn persisted_console_access_writes(db: Arc<sea_orm::DatabaseConnection>) -> Vec<bool> {
+        let db = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("a handle to the settings mock is still alive"));
+        let mut writes = Vec::new();
+        for transaction in db.into_transaction_log() {
+            for statement in transaction.statements() {
+                let Some(values) = &statement.values else {
+                    continue;
+                };
+                for value in &values.0 {
+                    if let sea_orm::Value::Json(Some(document)) = value {
+                        if let Some(enabled) = document
+                            .pointer("/cloud/console_access_enabled")
+                            .and_then(serde_json::Value::as_bool)
+                        {
+                            writes.push(enabled);
+                        }
+                    }
+                }
+            }
+        }
+        writes
+    }
+
+    fn failing_settings_db(
+        failures: usize,
+        then_succeeding_writes: usize,
+    ) -> Arc<sea_orm::DatabaseConnection> {
+        let row = bootstrap_settings_row();
+        let mut db =
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).append_query_errors(
+                (0..failures).map(|_| sea_orm::DbErr::Custom("settings store unavailable".into())),
+            );
+        for _ in 0..then_succeeding_writes {
+            db = db.append_query_results(vec![
+                vec![row.clone()],
+                vec![row.clone()],
+                vec![row.clone()],
+            ]);
+        }
+        Arc::new(
+            db.append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                };
+                then_succeeding_writes
+            ])
+            .into_connection(),
+        )
+    }
+
+    /// Mock DB for a successful first upsert followed by a revoke that finds
+    /// and deletes the row it just created.
+    fn oidc_db_upserting_then_revoking() -> Arc<sea_orm::DatabaseConnection> {
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![], vec![], vec![managed_provider_row()]]);
+        for mapping in bootstrap_role_mapping_rows() {
+            db = db.append_query_results(vec![mapping]);
+        }
+        Arc::new(
+            db.append_query_results(vec![vec![managed_provider_row()]])
+                // upsert: delete old mappings; revoke: login states, sessions,
+                // mappings, provider.
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    };
+                    5
+                ])
+                .into_connection(),
+        )
+    }
+
     fn attach_oidc(service: &CloudService, oidc_db: Arc<sea_orm::DatabaseConnection>) {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
@@ -2341,7 +2477,8 @@ mod tests {
     /// provider is created, the switch is persisted on, and the file goes.
     #[tokio::test]
     async fn bootstrap_file_grants_consent_and_provisions_without_a_link() {
-        let service = test_cloud_service(settings_db_accepting_consent_writes(1));
+        let settings_db = settings_db_accepting_consent_writes(1);
+        let service = test_cloud_service(settings_db.clone());
         attach_oidc(&service, oidc_db_accepting_a_first_upsert());
         assert!(!service.link.is_linked(), "precondition: not enrolled yet");
         assert!(
@@ -2374,12 +2511,19 @@ mod tests {
         );
         assert!(!path.exists(), "the file is consumed");
         assert!(!service.link.is_linked(), "the bootstrap does not enroll");
+        drop(service);
+        assert_eq!(
+            persisted_console_access_writes(settings_db),
+            vec![true],
+            "consent must be saved to the settings row, not only held in memory"
+        );
     }
 
     #[tokio::test]
     async fn bootstrap_file_on_an_instance_that_already_consented_leaves_consent_alone() {
         // No settings writes are queued: touching the settings row would fail.
-        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
         attach_oidc(&service, oidc_db_accepting_a_first_upsert());
         service.console_access_tx.send_replace(true);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2399,13 +2543,19 @@ mod tests {
             }
         ));
         assert!(!path.exists());
+        drop(service);
+        assert!(
+            persisted_console_access_writes(settings_db).is_empty(),
+            "an instance that already consented is not rewritten"
+        );
     }
 
     /// Self-hosted instances never have the file: nothing may change.
     #[tokio::test]
     async fn no_bootstrap_file_changes_nothing_and_leaves_consent_off() {
         // Neither database has queued results; any query would error.
-        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
         attach_oidc(
             &service,
             Arc::new(
@@ -2426,13 +2576,20 @@ mod tests {
         );
         assert!(!service.console_access_enabled());
         assert!(!service.feature_switches().console_access);
+        drop(service);
+        assert!(
+            persisted_console_access_writes(settings_db).is_empty(),
+            "no file means no settings write at all"
+        );
     }
 
-    /// A failed apply must change nothing: consent granted a moment ago is
-    /// rolled back and the file stays for the operator to inspect.
+    /// Provider first, consent second: when the provider cannot be created the
+    /// consent write is never even attempted, so nothing needs undoing and
+    /// nothing can be left on.
     #[tokio::test]
-    async fn failed_provider_upsert_rolls_consent_back_and_keeps_the_file() {
-        let service = test_cloud_service(settings_db_accepting_consent_writes(2));
+    async fn failed_provider_upsert_never_writes_consent_and_keeps_the_file() {
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
         attach_oidc(
             &service,
             Arc::new(
@@ -2456,9 +2613,102 @@ mod tests {
             error.to_string().contains("provider table unavailable"),
             "the error names the real cause: {error}"
         );
-        assert!(!service.console_access_enabled(), "consent rolled back");
+        assert!(matches!(
+            error,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply {
+                consent: ConsentTrace::Untouched,
+                ..
+            }
+        ));
+        assert!(!service.console_access_enabled());
         assert!(!service.feature_switches().console_access);
         assert!(path.exists(), "the file stays in place");
+        drop(service);
+        assert!(persisted_console_access_writes(settings_db).is_empty());
+    }
+
+    /// The consent write fails after the provider was created: the provider
+    /// is revoked again, consent is durably written back off, and the failed
+    /// attempt is reported so it can be audited.
+    #[tokio::test]
+    async fn failed_consent_write_revokes_the_provider_and_restores_consent() {
+        // First write (grant) fails; the compensating write succeeds.
+        let settings_db = failing_settings_db(1, 1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_upserting_then_revoking());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing consent write must fail the bootstrap");
+
+        assert!(
+            error.to_string().contains("settings store unavailable"),
+            "the error names the real cause: {error}"
+        );
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply { consent, .. } = error
+        else {
+            panic!("expected an Apply error");
+        };
+        assert!(
+            matches!(
+                consent,
+                ConsentTrace::WriteFailed {
+                    restored: true,
+                    provider_revoked: true,
+                    ..
+                }
+            ),
+            "the failed consent attempt must be reported: {consent:?}"
+        );
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists(), "the file stays for the next boot to retry");
+        drop(service);
+        assert_eq!(
+            persisted_console_access_writes(settings_db),
+            vec![false],
+            "the only row ever written says consent is off"
+        );
+    }
+
+    /// If even the compensating write fails, the in-memory switch is still
+    /// forced off (fail closed) and the trace says the row may be stale.
+    #[tokio::test]
+    async fn failed_consent_write_with_failed_restore_still_fails_closed_in_memory() {
+        let settings_db = failing_settings_db(2, 0);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_upserting_then_revoking());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing consent write must fail the bootstrap");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply { consent, .. } = error
+        else {
+            panic!("expected an Apply error");
+        };
+        assert!(
+            matches!(
+                consent,
+                ConsentTrace::WriteFailed {
+                    restored: false,
+                    provider_revoked: true,
+                    ..
+                }
+            ),
+            "an unconfirmed restore must be reported as such: {consent:?}"
+        );
+        assert!(!service.console_access_enabled(), "relay stays off");
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists());
     }
 
     #[tokio::test]
@@ -2475,7 +2725,10 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(CloudServiceError::ConsoleOidcUnavailable)
+            Err(ConsoleOidcApplyFailure {
+                error: CloudServiceError::ConsoleOidcUnavailable,
+                consent: ConsentTrace::Untouched,
+            })
         ));
         assert!(!service.console_access_enabled());
     }

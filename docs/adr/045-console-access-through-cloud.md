@@ -705,16 +705,25 @@ For the bootstrap-file path only:
    every console-proxy connect, still requires *enabled and linked*. A
    self-hosted instance, or a hosted one whose operator later turned the
    switch off, is never re-enabled by a frame.
-4. **Atomic from the operator's point of view.** If the upsert fails after the
-   consent was granted, the consent is rolled back and the file is left in
-   place, so a failed apply changes nothing and the error names the cause
-   (previously: a misleading "feature disabled").
-5. **Audited.** Granting consent writes `CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP`
-   (actor: unattended bootstrap, `user_id: null`) with the full before/after
-   feature switches, in addition to the existing
-   `CLOUD_CONSOLE_OIDC_BOOTSTRAPPED` record (which now also states whether
-   consent was granted). An instance that already had the switch on gets only
-   the latter.
+4. **Fail-closed ordering.** The provider is upserted *first* and consent is
+   written *second*. The two writes go through different services and cannot
+   share a database transaction, so the order decides what a failure can leave
+   behind: if the upsert fails, consent was never touched; if the consent write
+   fails, the provider is revoked again and consent is written back off (and, if
+   even that write fails, forced off in memory so the relay stays down). The
+   reverse order — consent first, undo on failure — would leave remote-console
+   consent *on* whenever the compensating write failed. In every case the file is
+   left in place, so the next boot retries, and the error names the cause.
+5. **Audited, including failures.** Granting consent writes
+   `CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP` (actor: unattended bootstrap,
+   `user_id: null`) with the full before/after feature switches, in addition to
+   the existing `CLOUD_CONSOLE_OIDC_BOOTSTRAPPED` record (which now also states
+   whether consent was granted). An instance that already had the switch on gets
+   only the latter. A bootstrap that fails *after attempting* to turn consent on
+   writes `CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED` stating whether consent was
+   confirmed restored and whether the provider was removed again, because the
+   settings row may have been written before the error surfaced. A failure
+   before the consent write changed no consent and is only logged.
 6. **No file, no change.** Self-hosted instances never have this file. Without
    it the switch stays off, as §5 specifies.
 

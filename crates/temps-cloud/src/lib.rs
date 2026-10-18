@@ -19,15 +19,16 @@ mod service;
 
 pub use console_oidc::ConsoleOidcAdapter;
 pub use console_oidc_bootstrap::{
-    parse_console_oidc_bootstrap_file, ConsoleAccessConsent, ConsoleOidcBootstrapError,
-    ConsoleOidcBootstrapOutcome, ConsoleOidcBootstrapParseError, CONSOLE_OIDC_BOOTSTRAP_FILENAME,
+    parse_console_oidc_bootstrap_file, ConsentTrace, ConsoleAccessConsent, ConsoleOidcApplyFailure,
+    ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ConsoleOidcBootstrapParseError,
+    CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 pub use handler::{
     cloud_routes, record_backend_url_bootstrapped_audit, record_backup_outcome_audit,
-    record_console_oidc_bootstrap_outcome_audit, record_enrollment_audit,
-    record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
-    CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP, CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
-    UNATTENDED_ENROLLMENT_USER_AGENT,
+    record_console_oidc_bootstrap_failure_audit, record_console_oidc_bootstrap_outcome_audit,
+    record_enrollment_audit, record_link_connected_audit, CloudApiDoc, CloudEnrollmentActor,
+    CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+    CLOUD_CONSOLE_OIDC_BOOTSTRAPPED, UNATTENDED_ENROLLMENT_USER_AGENT,
 };
 pub use plugin::CloudPlugin;
 pub use service::{

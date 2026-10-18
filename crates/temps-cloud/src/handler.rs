@@ -19,7 +19,7 @@ use temps_core::{
 use utoipa::{OpenApi, ToSchema};
 
 use crate::{
-    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
+    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus, ConsentTrace,
     ConsoleAccessConsent, ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction,
     ManagedBackupSetupStatus,
 };
@@ -834,6 +834,77 @@ pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPP
 pub const CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP: &str =
     "CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP";
 
+/// Audit action recorded when consuming `cloud-oidc.json` *failed after
+/// attempting to turn console access on*. The bootstrap as a whole failed, but
+/// the settings row may have been written and the compensating write may have
+/// failed too, so the attempt -- and whether it was undone -- is on record.
+pub const CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED: &str = "CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED";
+
+#[derive(Debug, Serialize)]
+struct CloudConsoleAccessBootstrapFailedAudit {
+    context: CloudAuditActor,
+    action: &'static str,
+    previous_features: CloudFeatureAuditValues,
+    /// `false` = the settings row may still say console access is on.
+    consent_restored: bool,
+    /// `false` = the managed OIDC provider may still exist.
+    provider_revoked: bool,
+    reason: String,
+}
+
+impl AuditOperation for CloudConsoleAccessBootstrapFailedAudit {
+    fn operation_type(&self) -> String {
+        self.action.to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        self.context.user_id
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self).map_err(Into::into)
+    }
+}
+
+/// Record a bootstrap that failed after it tried to switch console access on.
+/// A no-op for [`ConsentTrace::Untouched`]: a failure that never reached the
+/// consent write changed no consent, so there is nothing to audit beyond the
+/// error log. Audit write failures are logged, never propagated.
+pub async fn record_console_oidc_bootstrap_failure_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    consent: &ConsentTrace,
+    reason: &str,
+) {
+    let ConsentTrace::WriteFailed {
+        previous,
+        restored,
+        provider_revoked,
+    } = consent
+    else {
+        return;
+    };
+    let event = CloudConsoleAccessBootstrapFailedAudit {
+        context: actor.into(),
+        action: CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+        previous_features: (*previous).into(),
+        consent_restored: *restored,
+        provider_revoked: *provider_revoked,
+        reason: reason.to_string(),
+    };
+    if let Err(error) = audit.create_audit_log(&event).await {
+        tracing::error!(
+            %error,
+            action = CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+            "failed to record console-access bootstrap failure audit event"
+        );
+    }
+}
+
 /// The `cloud-oidc.json` bootstrap file's audit shape. A dedicated struct
 /// rather than reusing [`CloudLinkAudit`] because this event carries the
 /// issuer and client id it provisioned -- context an operator needs to
@@ -1538,6 +1609,74 @@ mod tests {
         assert_eq!(
             audit.recorded(),
             vec![CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_attempt_is_audited_with_what_was_and_was_not_undone() {
+        let audit = actor_recorder();
+        let consent = ConsentTrace::WriteFailed {
+            previous: CloudFeatureSwitches::default(),
+            restored: false,
+            provider_revoked: true,
+        };
+
+        record_console_oidc_bootstrap_failure_audit(
+            &audit,
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &consent,
+            "settings store unavailable",
+        )
+        .await;
+
+        assert_eq!(
+            rows(&audit),
+            vec![(
+                CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED.to_string(),
+                None,
+                None,
+                UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_the_consent_write_writes_no_audit_record() {
+        let audit = RecordingAudit::new(false);
+
+        record_console_oidc_bootstrap_failure_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            &ConsentTrace::Untouched,
+            "provider table unavailable",
+        )
+        .await;
+
+        assert!(audit.recorded().is_empty());
+    }
+
+    #[test]
+    fn the_failure_audit_says_whether_consent_and_provider_were_restored() {
+        let event = CloudConsoleAccessBootstrapFailedAudit {
+            context: CloudEnrollmentActor::UnattendedBootstrap.into(),
+            action: CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED,
+            previous_features: CloudFeatureSwitches::default().into(),
+            consent_restored: false,
+            provider_revoked: true,
+            reason: "settings store unavailable".to_string(),
+        };
+        let serialized = AuditOperation::serialize(&event).unwrap();
+        assert!(
+            serialized.contains("\"consent_restored\":false"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"provider_revoked\":true"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("settings store unavailable"),
+            "{serialized}"
         );
     }
 

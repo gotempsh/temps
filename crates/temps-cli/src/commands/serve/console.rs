@@ -28,7 +28,7 @@ use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
 use temps_cloud::{
     BootstrapBackendUrlOutcome, CloudEnrollmentActor, CloudPlugin, CloudService, CloudServiceError,
-    ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ManagedBackupOutcome,
+    ConsentTrace, ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ManagedBackupOutcome,
     CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
@@ -988,14 +988,53 @@ async fn bootstrap_console_oidc_from_file(
                      without the Cloud-managed SSO provider until this is fixed and the server is \
                      restarted."
                 ),
-                ConsoleOidcBootstrapError::Read { .. }
-                | ConsoleOidcBootstrapError::Apply { .. } => {
+                ConsoleOidcBootstrapError::Read { .. } => {
                     error!(
                         %error,
                         "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
                          console access will start without the Cloud-managed SSO provider until \
                          this is fixed and the server is restarted."
                     )
+                }
+                ConsoleOidcBootstrapError::Apply { consent, .. } => {
+                    error!(
+                        %error,
+                        "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                         console access will start without the Cloud-managed SSO provider until \
+                         this is fixed and the server is restarted."
+                    );
+                    // A failure that got as far as the consent write is a
+                    // consent event even though the apply failed: record it.
+                    if let ConsentTrace::WriteFailed {
+                        restored,
+                        provider_revoked,
+                        ..
+                    } = consent
+                    {
+                        error!(
+                            consent_restored = *restored,
+                            provider_revoked = *provider_revoked,
+                            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap tried to turn \
+                             cloud.console_access_enabled on and failed; verify its state in \
+                             Settings > Temps Cloud"
+                        );
+                        match service_context.get_service::<dyn temps_core::AuditLogger>() {
+                            Some(audit_logger) => {
+                                temps_cloud::record_console_oidc_bootstrap_failure_audit(
+                                    audit_logger.as_ref(),
+                                    CloudEnrollmentActor::UnattendedBootstrap,
+                                    consent,
+                                    &error.to_string(),
+                                )
+                                .await;
+                            }
+                            None => error!(
+                                "no audit logger is registered; the \
+                                 CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED audit record was not \
+                                 written"
+                            ),
+                        }
+                    }
                 }
             }
             return;
