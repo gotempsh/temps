@@ -28,8 +28,8 @@ use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
 use temps_cloud::{
     BootstrapBackendUrlOutcome, CloudEnrollmentActor, CloudPlugin, CloudService, CloudServiceError,
-    ConsentTrace, ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome, ManagedBackupOutcome,
-    CONSOLE_OIDC_BOOTSTRAP_FILENAME,
+    ConsentTrace, ConsoleAccessConsent, ConsoleOidcBootstrapError, ConsoleOidcBootstrapOutcome,
+    ManagedBackupOutcome, CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
@@ -977,111 +977,126 @@ async fn bootstrap_console_oidc_from_file(
         return;
     };
     let path = data_dir.join(CONSOLE_OIDC_BOOTSTRAP_FILENAME);
-    let outcome = match cloud_service.apply_console_oidc_bootstrap_file(&path).await {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            match &error {
-                ConsoleOidcBootstrapError::Parse { .. } => error!(
-                    %error,
-                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file exists but could not be \
-                     parsed; it has been left in place for inspection. Console access will start \
-                     without the Cloud-managed SSO provider until this is fixed and the server is \
-                     restarted."
-                ),
-                ConsoleOidcBootstrapError::Read { .. } => {
-                    error!(
-                        %error,
-                        "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
-                         console access will start without the Cloud-managed SSO provider until \
-                         this is fixed and the server is restarted."
-                    )
-                }
-                ConsoleOidcBootstrapError::Apply { consent, .. } => {
-                    error!(
-                        %error,
-                        "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
-                         console access will start without the Cloud-managed SSO provider until \
-                         this is fixed and the server is restarted."
-                    );
-                    // A failure that got as far as the consent write is a
-                    // consent event even though the apply failed: record it.
-                    if let ConsentTrace::WriteFailed {
-                        restored,
-                        provider_revoked,
-                        ..
-                    } = consent
-                    {
-                        error!(
-                            consent_restored = *restored,
-                            provider_revoked = *provider_revoked,
-                            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap tried to turn \
-                             cloud.console_access_enabled on and failed; verify its state in \
-                             Settings > Temps Cloud"
-                        );
-                        match service_context.get_service::<dyn temps_core::AuditLogger>() {
-                            Some(audit_logger) => {
-                                temps_cloud::record_console_oidc_bootstrap_failure_audit(
-                                    audit_logger.as_ref(),
-                                    CloudEnrollmentActor::UnattendedBootstrap,
-                                    consent,
-                                    &error.to_string(),
-                                )
-                                .await;
-                            }
-                            None => error!(
-                                "no audit logger is registered; the \
-                                 CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED audit record was not \
-                                 written"
-                            ),
-                        }
-                    }
-                }
-            }
-            return;
-        }
-    };
-
-    match outcome {
-        ConsoleOidcBootstrapOutcome::NotPresent => {}
-        ConsoleOidcBootstrapOutcome::Applied {
+    match cloud_service.apply_console_oidc_bootstrap_file(&path).await {
+        Ok(ConsoleOidcBootstrapOutcome::NotPresent) => {}
+        Ok(ConsoleOidcBootstrapOutcome::Applied {
             issuer,
             client_id,
             consent,
-        } => {
-            info!(
-                issuer = %issuer,
-                client_id = %client_id,
-                console_access_enabled_by_bootstrap = consent.was_granted(),
-                "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
-                 is now configured"
+        }) => {
+            report_console_oidc_bootstrap_applied(service_context, &issuer, &client_id, &consent)
+                .await;
+        }
+        Err(error) => report_console_oidc_bootstrap_error(service_context, &error).await,
+    }
+}
+
+/// Log, and where consent was involved audit, a bootstrap file that failed to
+/// apply. Split out of [`bootstrap_console_oidc_from_file`] so the audit
+/// dispatch -- finding the registered `AuditLogger` and handing it the
+/// consent trace -- can be tested against a real service context.
+async fn report_console_oidc_bootstrap_error(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    error: &ConsoleOidcBootstrapError,
+) {
+    match error {
+        ConsoleOidcBootstrapError::Parse { .. } => error!(
+            %error,
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file exists but could not be \
+             parsed; it has been left in place for inspection. Console access will start \
+             without the Cloud-managed SSO provider until this is fixed and the server is \
+             restarted."
+        ),
+        ConsoleOidcBootstrapError::Read { .. } => {
+            error!(
+                %error,
+                "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                 console access will start without the Cloud-managed SSO provider until \
+                 this is fixed and the server is restarted."
+            )
+        }
+        ConsoleOidcBootstrapError::Apply { consent, .. } => {
+            error!(
+                %error,
+                "failed to apply the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file; \
+                 console access will start without the Cloud-managed SSO provider until \
+                 this is fixed and the server is restarted."
             );
-            if consent.was_granted() {
-                warn!(
-                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
-                     cloud.console_access_enabled on (ADR-045 Amendment 1: on a Cloud-hosted \
-                     plane the file is the operator's consent); disable it in Settings > Temps \
-                     Cloud if that is not intended"
+            // A failure that got as far as the consent write is a consent
+            // event even though the apply failed: record it.
+            if let ConsentTrace::WriteFailed {
+                restored,
+                provider_revoked,
+                ..
+            } = consent
+            {
+                error!(
+                    consent_restored = *restored,
+                    provider_revoked = *provider_revoked,
+                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap tried to turn \
+                     cloud.console_access_enabled on and failed; verify its state in \
+                     Settings > Temps Cloud"
                 );
-            }
-            match service_context.get_service::<dyn temps_core::AuditLogger>() {
-                Some(audit_logger) => {
-                    temps_cloud::record_console_oidc_bootstrap_outcome_audit(
-                        audit_logger.as_ref(),
-                        CloudEnrollmentActor::UnattendedBootstrap,
-                        &issuer,
-                        &client_id,
-                        &consent,
-                    )
-                    .await;
+                match service_context.get_service::<dyn temps_core::AuditLogger>() {
+                    Some(audit_logger) => {
+                        temps_cloud::record_console_oidc_bootstrap_failure_audit(
+                            audit_logger.as_ref(),
+                            CloudEnrollmentActor::UnattendedBootstrap,
+                            consent,
+                            &error.to_string(),
+                        )
+                        .await;
+                    }
+                    None => error!(
+                        "no audit logger is registered; the \
+                         CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED audit record was not written"
+                    ),
                 }
-                None => error!(
-                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
-                     logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record \
-                     (and, if consent was granted, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP) \
-                     was not written"
-                ),
             }
         }
+    }
+}
+
+/// Log and audit a bootstrap file that applied. See
+/// [`report_console_oidc_bootstrap_error`] for why this is separate.
+async fn report_console_oidc_bootstrap_applied(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    issuer: &str,
+    client_id: &str,
+    consent: &ConsoleAccessConsent,
+) {
+    info!(
+        issuer = %issuer,
+        client_id = %client_id,
+        console_access_enabled_by_bootstrap = consent.was_granted(),
+        "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
+         is now configured"
+    );
+    if consent.was_granted() {
+        warn!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
+             cloud.console_access_enabled on (ADR-045 Amendment 1: on a Cloud-hosted \
+             plane the file is the operator's consent); disable it in Settings > Temps \
+             Cloud if that is not intended"
+        );
+    }
+    match service_context.get_service::<dyn temps_core::AuditLogger>() {
+        Some(audit_logger) => {
+            temps_cloud::record_console_oidc_bootstrap_outcome_audit(
+                audit_logger.as_ref(),
+                CloudEnrollmentActor::UnattendedBootstrap,
+                issuer,
+                client_id,
+                consent,
+            )
+            .await;
+        }
+        None => error!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
+             logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record \
+             (and, if consent was granted, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP) \
+             was not written"
+        ),
     }
 }
 
@@ -6595,6 +6610,181 @@ mod heartbeat_tests {
         assert_eq!(
             *reporter.sent.lock().unwrap(),
             vec!["instance_heartbeat".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
+mod console_oidc_bootstrap_audit_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use temps_cloud::ConsoleOidcBootstrapParseError;
+    use temps_cloud::{
+        CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+        CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
+    };
+    use temps_cloud_client::CloudFeatureSwitches;
+    use temps_core::plugin::ServiceRegistrationContext;
+    use temps_core::{AuditLogger, AuditOperation};
+
+    /// Records the operation type of every audit entry it is handed.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        operations: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    impl RecordingAuditLogger {
+        fn recorded(&self) -> Vec<String> {
+            self.operations.lock().unwrap().clone()
+        }
+    }
+
+    fn context_with_logger() -> (ServiceRegistrationContext, Arc<RecordingAuditLogger>) {
+        let recorder = Arc::new(RecordingAuditLogger::default());
+        let context = ServiceRegistrationContext::new();
+        context.register_service::<dyn AuditLogger>(recorder.clone());
+        (context, recorder)
+    }
+
+    fn path() -> PathBuf {
+        PathBuf::from("/data/cloud-oidc.json")
+    }
+
+    fn apply_error(consent: ConsentTrace) -> ConsoleOidcBootstrapError {
+        ConsoleOidcBootstrapError::Apply {
+            path: path(),
+            reason: "the settings write failed".to_string(),
+            consent,
+        }
+    }
+
+    fn failed_consent_write() -> ConsentTrace {
+        ConsentTrace::WriteFailed {
+            previous: CloudFeatureSwitches::default(),
+            restored: true,
+            provider_revoked: true,
+        }
+    }
+
+    fn granted() -> ConsoleAccessConsent {
+        ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_write_is_audited_through_the_registered_logger() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(failed_consent_write())).await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![CLOUD_CONSOLE_ACCESS_BOOTSTRAP_FAILED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_apply_failure_before_the_consent_write_is_not_audited() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(ConsentTrace::Untouched)).await;
+
+        assert!(recorder.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unreadable_and_unparseable_files_are_not_audited() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_error(
+            &context,
+            &ConsoleOidcBootstrapError::Read {
+                path: path(),
+                reason: "permission denied".to_string(),
+            },
+        )
+        .await;
+        report_console_oidc_bootstrap_error(
+            &context,
+            &ConsoleOidcBootstrapError::Parse {
+                path: path(),
+                source: ConsoleOidcBootstrapParseError::EmptyField { field: "issuer" },
+            },
+        )
+        .await;
+
+        assert!(recorder.recorded().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_consent_write_without_a_registered_logger_does_not_panic() {
+        let context = ServiceRegistrationContext::new();
+
+        report_console_oidc_bootstrap_error(&context, &apply_error(failed_consent_write())).await;
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &granted(),
+        )
+        .await;
+
+        assert!(context.get_service::<dyn AuditLogger>().is_none());
+    }
+
+    #[tokio::test]
+    async fn an_applied_bootstrap_that_granted_consent_records_both_events() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &granted(),
+        )
+        .await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![
+                CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string(),
+                CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_applied_bootstrap_that_found_consent_already_on_records_only_the_apply() {
+        let (context, recorder) = context_with_logger();
+
+        report_console_oidc_bootstrap_applied(
+            &context,
+            "https://issuer.example",
+            "client",
+            &ConsoleAccessConsent::AlreadyEnabled,
+        )
+        .await;
+
+        assert_eq!(
+            recorder.recorded(),
+            vec![CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string()]
         );
     }
 }
