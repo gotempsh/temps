@@ -18,6 +18,8 @@ use temps_cloud_protocol::{
 };
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
+
+use crate::console_oidc_bootstrap::ConsoleAccessConsent;
 use temps_core::{
     ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleProvisioner,
     DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
@@ -336,7 +338,7 @@ impl CloudService {
 
     /// Consume the `<TEMPS_DATA_DIR>/cloud-oidc.json` first-boot bootstrap
     /// file at `path`, if present: parse it, apply it via
-    /// [`Self::apply_console_oidc_config`], and delete it. A thin wrapper
+    /// [`Self::apply_bootstrap_console_oidc_config`], and delete it. A thin wrapper
     /// around [`crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with`]
     /// so that function stays testable without a real `CloudService`.
     pub async fn apply_console_oidc_bootstrap_file(
@@ -347,7 +349,7 @@ impl CloudService {
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapError,
     > {
         crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
-            self.apply_console_oidc_config(config)
+            self.apply_bootstrap_console_oidc_config(config)
         })
         .await
     }
@@ -937,6 +939,33 @@ impl CloudService {
             .config
             .update_cloud_features(telemetry, backups, notifications, console_access)
             .await?;
+        let switches = self.publish_cloud_switches(&updated)?;
+        if switches.backups {
+            self.reconcile_managed_backup_source().await?;
+        } else {
+            self.set_managed_backup_setup(default_managed_backup_setup(false));
+        }
+        // ADR-045 §5: "Toggling off does the reverse [of toggling on]:
+        // symmetric with disconnect" -- the managed OIDC provider row (and
+        // its sessions) must not survive an operator turning console access
+        // back off, even though the console-proxy connection itself is torn
+        // down asynchronously by the worker observing `console_access_tx`.
+        if console_access == Some(false) {
+            // Explicit retries must re-attempt revocation even after the
+            // persisted switch and relay have already been disabled.
+            self.revoke_console_oidc_provider().await?;
+        }
+        self.status().await
+    }
+
+    /// Push freshly persisted Cloud settings into the live link and the
+    /// console-access watch channel. The caller must hold
+    /// [`Self::feature_update_lock`] and must have just written `updated`
+    /// through [`ConfigService::update_cloud_features`].
+    fn publish_cloud_switches(
+        &self,
+        updated: &temps_core::AppSettings,
+    ) -> Result<CloudFeatureSwitches, CloudServiceError> {
         let switches = CloudFeatureSwitches {
             telemetry: updated.cloud.telemetry_enabled,
             backups: updated.cloud.backups_enabled,
@@ -957,22 +986,68 @@ impl CloudService {
                 true
             }
         });
-        if switches.backups {
-            self.reconcile_managed_backup_source().await?;
+        Ok(switches)
+    }
+
+    /// Persist `cloud.console_access_enabled` alone and publish it. The
+    /// caller must hold [`Self::feature_update_lock`].
+    async fn persist_console_access_locked(
+        &self,
+        enabled: bool,
+    ) -> Result<CloudFeatureSwitches, CloudServiceError> {
+        let updated = self
+            .config
+            .update_cloud_features(None, None, None, Some(enabled))
+            .await?;
+        self.publish_cloud_switches(&updated)
+    }
+
+    /// Apply the managed console-access OIDC configuration found in the
+    /// `cloud-oidc.json` first-boot bootstrap file (ADR-045 Amendment 1).
+    ///
+    /// Unlike [`Self::apply_console_oidc_config`], which handles the
+    /// per-connect `ConsoleOidcConfig` frame and demands *enabled and linked*,
+    /// this treats the file's presence on a Cloud-hosted plane as the
+    /// operator's consent: if `cloud.console_access_enabled` is off it is
+    /// persisted on through the normal settings path (so the watch channel,
+    /// link switches and Settings UI agree) and the change is returned in
+    /// [`ConsoleAccessConsent::GrantedByBootstrap`] for the caller to audit.
+    /// It does not require the link to be established -- enrollment runs
+    /// after the bootstrap and in the background.
+    ///
+    /// All-or-nothing: if the provider upsert fails after consent was granted
+    /// here, the consent is rolled back, so a failed apply leaves the
+    /// instance exactly as it found it.
+    pub async fn apply_bootstrap_console_oidc_config(
+        &self,
+        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
+    ) -> Result<ConsoleAccessConsent, CloudServiceError> {
+        let _update = self.feature_update_lock.lock().await;
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            tracing::error!(
+                "the cloud-oidc.json bootstrap file was found but no OidcService is registered                  on this build; console access cannot be authenticated"
+            );
+            return Err(CloudServiceError::ConsoleOidcUnavailable);
+        };
+        let consent = if self.console_access_enabled() {
+            ConsoleAccessConsent::AlreadyEnabled
         } else {
-            self.set_managed_backup_setup(default_managed_backup_setup(false));
+            let previous = self.link.feature_switches();
+            let new = self.persist_console_access_locked(true).await?;
+            ConsoleAccessConsent::GrantedByBootstrap { previous, new }
+        };
+        if let Err(error) = oidc.upsert_managed_cloud_provider(config).await {
+            if consent.was_granted() {
+                if let Err(rollback_error) = self.persist_console_access_locked(false).await {
+                    tracing::error!(
+                        %rollback_error,
+                        "the cloud-oidc.json bootstrap enabled console access but could not                          undo it after the managed OIDC provider failed to apply;                          cloud.console_access_enabled is on without a provider -- disable it in                          Settings > Temps Cloud if that is not intended"
+                    );
+                }
+            }
+            return Err(CloudServiceError::ConsoleOidcProvisioning(error));
         }
-        // ADR-045 §5: "Toggling off does the reverse [of toggling on]:
-        // symmetric with disconnect" -- the managed OIDC provider row (and
-        // its sessions) must not survive an operator turning console access
-        // back off, even though the console-proxy connection itself is torn
-        // down asynchronously by the worker observing `console_access_tx`.
-        if console_access == Some(false) {
-            // Explicit retries must re-attempt revocation even after the
-            // persisted switch and relay have already been disabled.
-            self.revoke_console_oidc_provider().await?;
-        }
-        self.status().await
+        Ok(consent)
     }
 
     /// Upsert the managed console-access `oidc_providers` row from a
@@ -2155,6 +2230,322 @@ mod tests {
                 "the relay stays disabled while revocation is retried"
             );
         }
+    }
+
+    fn bootstrap_settings_row() -> temps_entities::settings::Model {
+        temps_entities::settings::Model {
+            id: 1,
+            data: temps_core::AppSettings::default().to_json(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn managed_provider_row() -> temps_entities::oidc_providers::Model {
+        temps_entities::oidc_providers::Model {
+            id: 1,
+            name: "Temps Cloud".into(),
+            issuer_url: "https://cloud.example.com".into(),
+            client_id: "bootstrap-client".into(),
+            client_secret_encrypted: "encrypted".into(),
+            scopes: "openid email profile temps_cloud_instance_role".into(),
+            jit_provisioning: true,
+            enabled: true,
+            template: "temps_cloud".into(),
+            group_claim: "temps_cloud_instance_role".into(),
+            role_claim: "temps_cloud_instance_role".into(),
+            default_role: "user".into(),
+            trust_idp_email: true,
+            managed_by_cloud: true,
+            admin_only_role_required: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn bootstrap_role_mapping_rows() -> Vec<Vec<temps_entities::oidc_role_mappings::Model>> {
+        (0..3)
+            .map(|id| {
+                vec![temps_entities::oidc_role_mappings::Model {
+                    id: id + 1,
+                    provider_id: 1,
+                    priority: id,
+                    idp_group: "owner".into(),
+                    role: "admin".into(),
+                    created_at: chrono::Utc::now(),
+                }]
+            })
+            .collect()
+    }
+
+    /// Mock DB for the OIDC side of a successful managed-provider upsert
+    /// onto an empty `oidc_providers` table.
+    fn oidc_db_accepting_a_first_upsert() -> Arc<sea_orm::DatabaseConnection> {
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                // no existing managed row
+                vec![],
+                // no ordinary provider already using the issuer
+                vec![],
+                // the inserted managed row
+                vec![managed_provider_row()],
+            ])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }]);
+        let mappings = bootstrap_role_mapping_rows();
+        for mapping in mappings {
+            db = db.append_query_results(vec![mapping]);
+        }
+        Arc::new(db.into_connection())
+    }
+
+    fn settings_db_accepting_consent_writes(writes: usize) -> Arc<sea_orm::DatabaseConnection> {
+        let row = bootstrap_settings_row();
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres);
+        for _ in 0..writes {
+            // One consent write consumes three result sets: the locked read,
+            // the row Sea-ORM re-selects after UPDATE, and the cache reload.
+            db = db.append_query_results(vec![
+                vec![row.clone()],
+                vec![row.clone()],
+                vec![row.clone()],
+            ]);
+        }
+        Arc::new(
+            db.append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                };
+                writes
+            ])
+            .into_connection(),
+        )
+    }
+
+    fn attach_oidc(service: &CloudService, oidc_db: Arc<sea_orm::DatabaseConnection>) {
+        service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("bootstrap-oidc-test")),
+            Arc::new(temps_auth::UserService::new(oidc_db)),
+        )));
+    }
+
+    const BOOTSTRAP_FILE: &str = r#"{"issuer":"https://cloud.example.com","client_id":"bootstrap-client","client_secret":"shh"}"#;
+
+    /// ADR-045 Amendment 1: on a hosted plane the file is the consent. With
+    /// the switch off and the link not yet established -- the exact state
+    /// that used to fail with "feature 'console_access' is disabled" -- the
+    /// provider is created, the switch is persisted on, and the file goes.
+    #[tokio::test]
+    async fn bootstrap_file_grants_consent_and_provisions_without_a_link() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(1));
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        assert!(!service.link.is_linked(), "precondition: not enrolled yet");
+        assert!(
+            !service.console_access_enabled(),
+            "precondition: switch off"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed on an unlinked, switched-off instance");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied { consent, .. } =
+            outcome
+        else {
+            panic!("expected Applied");
+        };
+        let ConsoleAccessConsent::GrantedByBootstrap { previous, new } = consent else {
+            panic!("expected consent to be granted by the bootstrap");
+        };
+        assert!(!previous.console_access, "audit must show the prior state");
+        assert!(new.console_access, "audit must show the new state");
+        assert!(service.console_access_enabled(), "watch channel is on");
+        assert!(
+            service.feature_switches().console_access,
+            "link feature switch is consistent with the watch channel"
+        );
+        assert!(!path.exists(), "the file is consumed");
+        assert!(!service.link.is_linked(), "the bootstrap does not enroll");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_file_on_an_instance_that_already_consented_leaves_consent_alone() {
+        // No settings writes are queued: touching the settings row would fail.
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        service.console_access_tx.send_replace(true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("bootstrap on an already-enabled instance must succeed");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                consent: ConsoleAccessConsent::AlreadyEnabled,
+                ..
+            }
+        ));
+        assert!(!path.exists());
+    }
+
+    /// Self-hosted instances never have the file: nothing may change.
+    #[tokio::test]
+    async fn no_bootstrap_file_changes_nothing_and_leaves_consent_off() {
+        // Neither database has queued results; any query would error.
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        attach_oidc(
+            &service,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("a missing file is not an error");
+
+        assert_eq!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::NotPresent
+        );
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+    }
+
+    /// A failed apply must change nothing: consent granted a moment ago is
+    /// rolled back and the file stays for the operator to inspect.
+    #[tokio::test]
+    async fn failed_provider_upsert_rolls_consent_back_and_keeps_the_file() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(2));
+        attach_oidc(
+            &service,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_errors(vec![sea_orm::DbErr::Custom(
+                        "provider table unavailable".into(),
+                    )])
+                    .into_connection(),
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing upsert must fail the bootstrap");
+
+        assert!(
+            error.to_string().contains("provider table unavailable"),
+            "the error names the real cause: {error}"
+        );
+        assert!(!service.console_access_enabled(), "consent rolled back");
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists(), "the file stays in place");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_an_oidc_service_fails_closed_and_grants_nothing() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+
+        let result = service
+            .apply_bootstrap_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "client".into(),
+                client_secret: "test-secret".into(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CloudServiceError::ConsoleOidcUnavailable)
+        ));
+        assert!(!service.console_access_enabled());
+    }
+
+    /// The per-connect frame path keeps its guards: a bootstrap that turned
+    /// the switch on must not have loosened them.
+    #[tokio::test]
+    async fn frame_path_still_rejects_when_disabled_or_unlinked() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        let config = || temps_auth::oidc_service::ManagedCloudOidcConfig {
+            issuer: "https://cloud.example.com".into(),
+            client_id: "client".into(),
+            client_secret: "test-secret".into(),
+        };
+
+        // Disabled and unlinked.
+        assert!(matches!(
+            service.apply_console_oidc_config(config()).await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+        // Enabled but still unlinked (the state right after a bootstrap).
+        service.console_access_tx.send_replace(true);
+        assert!(matches!(
+            service.apply_console_oidc_config(config()).await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+    }
+
+    /// Turning console access off after a bootstrap still tears the managed
+    /// provider down (ADR-045 §5): delete role mappings and provider, and
+    /// invalidate its sessions and login states.
+    #[tokio::test]
+    async fn disabling_console_access_after_bootstrap_still_removes_the_provider() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(1));
+        service.console_access_tx.send_replace(true);
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![managed_provider_row()],
+                    // The provider is gone by the second look.
+                    vec![],
+                ])
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    };
+                    4
+                ])
+                .into_connection(),
+        );
+        attach_oidc(&service, oidc_db);
+
+        service
+            .patch_feature_switches(None, None, None, Some(false))
+            .await
+            .expect("disabling must succeed and revoke the provider");
+
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        // The first revoke deleted the row; a second finds nothing to do.
+        assert!(!service
+            .revoke_console_oidc_provider()
+            .await
+            .expect("a second revoke is a no-op, not an error"));
     }
 
     /// SECURITY: disconnecting must not report success while the managed

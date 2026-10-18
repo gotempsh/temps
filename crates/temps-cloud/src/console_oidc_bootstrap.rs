@@ -18,6 +18,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use temps_auth::oidc_service::ManagedCloudOidcConfig;
+use temps_cloud_client::CloudFeatureSwitches;
 
 /// Filename Temps Cloud writes under the instance's `TEMPS_DATA_DIR`.
 pub const CONSOLE_OIDC_BOOTSTRAP_FILENAME: &str = "cloud-oidc.json";
@@ -114,6 +115,28 @@ pub enum ConsoleOidcBootstrapError {
     Apply { path: PathBuf, reason: String },
 }
 
+/// Whether applying the bootstrap file changed remote-console consent
+/// (`cloud.console_access_enabled`). ADR-045 Amendment 1: on a Cloud-hosted
+/// plane the file's presence is the operator's consent, so applying it turns
+/// the switch on -- and that change must be reported so it can be audited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleAccessConsent {
+    /// The switch was already on; nothing about consent changed.
+    AlreadyEnabled,
+    /// The bootstrap turned the switch on. Carries the feature switches
+    /// before and after so the audit record shows exactly what changed.
+    GrantedByBootstrap {
+        previous: CloudFeatureSwitches,
+        new: CloudFeatureSwitches,
+    },
+}
+
+impl ConsoleAccessConsent {
+    pub fn was_granted(&self) -> bool {
+        matches!(self, Self::GrantedByBootstrap { .. })
+    }
+}
+
 /// Outcome of [`apply_console_oidc_bootstrap_file_with`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleOidcBootstrapOutcome {
@@ -121,8 +144,13 @@ pub enum ConsoleOidcBootstrapOutcome {
     /// every boot after the first, and on any non-Cloud-hosted instance.
     NotPresent,
     /// The file was parsed, applied, and removed. Carries the issuer and
-    /// client id — never the secret — so the caller can audit-log it.
-    Applied { issuer: String, client_id: String },
+    /// client id — never the secret — so the caller can audit-log it, and
+    /// whether applying it also granted console-access consent.
+    Applied {
+        issuer: String,
+        client_id: String,
+        consent: ConsoleAccessConsent,
+    },
 }
 
 /// Read, parse, apply, and delete the Cloud console-access OIDC bootstrap
@@ -131,7 +159,10 @@ pub enum ConsoleOidcBootstrapOutcome {
 /// `apply` is injected — rather than taking a concrete `CloudService` — so
 /// this can be unit-tested without a real database connection.
 /// [`crate::service::CloudService::apply_console_oidc_bootstrap_file`] is a
-/// thin wrapper passing `CloudService::apply_console_oidc_config`.
+/// thin wrapper passing `CloudService::apply_bootstrap_console_oidc_config`,
+/// which (unlike the per-connect `apply_console_oidc_config`) grants
+/// console-access consent and does not require the link to be established --
+/// see ADR-045 Amendment 1.
 ///
 /// A missing file is not an error: it degrades to
 /// [`ConsoleOidcBootstrapOutcome::NotPresent`] at debug-log noise, since that
@@ -149,7 +180,7 @@ pub async fn apply_console_oidc_bootstrap_file_with<Apply, ApplyFut, ApplyErr>(
 ) -> Result<ConsoleOidcBootstrapOutcome, ConsoleOidcBootstrapError>
 where
     Apply: FnOnce(ManagedCloudOidcConfig) -> ApplyFut,
-    ApplyFut: std::future::Future<Output = Result<(), ApplyErr>>,
+    ApplyFut: std::future::Future<Output = Result<ConsoleAccessConsent, ApplyErr>>,
     ApplyErr: std::fmt::Display,
 {
     let bytes = match tokio::fs::read(path).await {
@@ -179,7 +210,7 @@ where
     let issuer = config.issuer.clone();
     let client_id = config.client_id.clone();
 
-    apply(config)
+    let consent = apply(config)
         .await
         .map_err(|error| ConsoleOidcBootstrapError::Apply {
             path: path.to_path_buf(),
@@ -196,7 +227,11 @@ where
         );
     }
 
-    Ok(ConsoleOidcBootstrapOutcome::Applied { issuer, client_id })
+    Ok(ConsoleOidcBootstrapOutcome::Applied {
+        issuer,
+        client_id,
+        consent,
+    })
 }
 
 #[cfg(test)]
@@ -275,10 +310,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir must be creatable");
         let path = dir.path().join(CONSOLE_OIDC_BOOTSTRAP_FILENAME);
 
-        let outcome =
-            apply_console_oidc_bootstrap_file_with(&path, |_config| async { Ok::<_, String>(()) })
-                .await
-                .expect("a missing file must not be an error");
+        let outcome = apply_console_oidc_bootstrap_file_with(&path, |_config| async {
+            Ok::<_, String>(ConsoleAccessConsent::AlreadyEnabled)
+        })
+        .await
+        .expect("a missing file must not be an error");
 
         assert_eq!(outcome, ConsoleOidcBootstrapOutcome::NotPresent);
     }
@@ -299,7 +335,7 @@ mod tests {
             let recorder = recorder.clone();
             async move {
                 *recorder.lock().expect("mutex must not be poisoned") = Some(config);
-                Ok::<_, String>(())
+                Ok::<_, String>(ConsoleAccessConsent::AlreadyEnabled)
             }
         })
         .await
@@ -310,6 +346,7 @@ mod tests {
             ConsoleOidcBootstrapOutcome::Applied {
                 issuer: "https://cloud.example.com".to_string(),
                 client_id: "abc123".to_string(),
+                consent: ConsoleAccessConsent::AlreadyEnabled,
             }
         );
         assert!(
@@ -336,7 +373,7 @@ mod tests {
         let call_counter = calls.clone();
         let error = apply_console_oidc_bootstrap_file_with(&path, move |_config| {
             call_counter.fetch_add(1, Ordering::SeqCst);
-            async { Ok::<_, String>(()) }
+            async { Ok::<_, String>(ConsoleAccessConsent::AlreadyEnabled) }
         })
         .await
         .expect_err("malformed JSON must return an error");
@@ -363,7 +400,7 @@ mod tests {
             .expect("writing the fixture file must succeed");
 
         let error = apply_console_oidc_bootstrap_file_with(&path, |_config| async {
-            Err::<(), _>("upstream rejected the issuer".to_string())
+            Err::<ConsoleAccessConsent, _>("upstream rejected the issuer".to_string())
         })
         .await
         .expect_err("a failing apply must surface as an error");
@@ -373,5 +410,35 @@ mod tests {
             path.exists(),
             "the file must be left in place when apply fails"
         );
+    }
+
+    #[tokio::test]
+    async fn consent_granted_by_apply_is_reported_in_the_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir must be creatable");
+        let path = dir.path().join(CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        tokio::fs::write(&path, valid_json())
+            .await
+            .expect("writing the fixture file must succeed");
+        let granted = ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        };
+        let reported = granted.clone();
+
+        let outcome = apply_console_oidc_bootstrap_file_with(&path, move |_config| async move {
+            Ok::<_, String>(reported)
+        })
+        .await
+        .expect("a valid file must apply successfully");
+
+        let ConsoleOidcBootstrapOutcome::Applied { consent, .. } = outcome else {
+            panic!("expected Applied");
+        };
+        assert_eq!(consent, granted);
+        assert!(consent.was_granted());
+        assert!(!ConsoleAccessConsent::AlreadyEnabled.was_granted());
     }
 }

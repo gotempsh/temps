@@ -434,7 +434,9 @@ pub struct CloudFeatureSwitches { pub telemetry: bool, pub backups: bool, pub no
 **Default off for every enrollment path.** Neither unattended bootstrap nor
 operator enrollment changes remote-console consent. Enable access explicitly
 from Settings > Temps Cloud or `temps cloud console-access enable`, matching
-the rule that linking alone never enables export.
+the rule that linking alone never enables export. **One exception, and only
+one:** consuming the `cloud-oidc.json` bootstrap file on a Cloud-hosted
+control plane — see [Amendment 1](#amendment-1-cloud-oidcjson-is-the-hosted-planes-consent-signal).
 
 **Toggling on** negotiates `Capability::ConsoleProxy`, opens the
 console-proxy connection, provisions the managed OIDC row. **Toggling off**
@@ -659,6 +661,105 @@ here, closed, so a later implementer doesn't re-litigate them:
    { reason: GoingAway }` sent on every open stream before the console-proxy
    socket closes on shutdown, so Cloud surfaces a retry to the browser
    instead of a silent hard cut.
+
+---
+
+## Amendment 1: `cloud-oidc.json` is the hosted plane's consent signal
+
+**Date:** 2026-10-18 · **Amends:** §4 (bootstrap file), §5 (default off)
+
+### What was wrong
+
+§4 describes provisioning the managed OIDC provider from the
+`ConsoleOidcConfig` frame, and the implementation added a one-shot
+first-boot file, `<TEMPS_DATA_DIR>/cloud-oidc.json` (`issuer`, `client_id`,
+`client_secret`), so that a Cloud-*hosted* control plane has the managed
+provider before anyone can reach its console. That path never worked. It ran
+`CloudService::apply_console_oidc_config`, which (correctly, for the frame
+path) refuses unless `cloud.console_access_enabled` is on **and** the link is
+established. On a hosted plane neither is true at that point: the bootstrap
+runs before unattended enrollment, and §5 defaults the switch off for every
+enrollment path. The result was a plane whose only sign-in route was a
+provider that could never be created (`OIDC provider 0 was not found` on
+`/auth/oidc/cloud/login`, boot log `Managed Cloud feature 'console_access' is
+disabled in local settings`). §4's promise and §5's default contradicted each
+other for exactly the instances §4's file exists to serve.
+
+### Decision
+
+For the bootstrap-file path only:
+
+1. **File presence is the operator's consent.** Applying `cloud-oidc.json`
+   persists `cloud.console_access_enabled = true` through the same
+   `ConfigService::update_cloud_features` path the Settings toggle uses, so the
+   settings row, the `console_access_tx` watch channel, the link's feature
+   switches and the Settings UI stay consistent. It only ever turns the
+   switch **on**; it never turns anything off and never touches telemetry,
+   backups or notifications.
+2. **The provider is upserted without requiring the link.** The bootstrap path
+   skips the `is_linked()` check (enrollment runs after it and in the
+   background), but still requires a registered `OidcService` and still goes
+   through the same `upsert_managed_cloud_provider` validation (https issuer,
+   etc.).
+3. **The runtime frame path is unchanged.** `apply_console_oidc_config`, used on
+   every console-proxy connect, still requires *enabled and linked*. A
+   self-hosted instance, or a hosted one whose operator later turned the
+   switch off, is never re-enabled by a frame.
+4. **Atomic from the operator's point of view.** If the upsert fails after the
+   consent was granted, the consent is rolled back and the file is left in
+   place, so a failed apply changes nothing and the error names the cause
+   (previously: a misleading "feature disabled").
+5. **Audited.** Granting consent writes `CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP`
+   (actor: unattended bootstrap, `user_id: null`) with the full before/after
+   feature switches, in addition to the existing
+   `CLOUD_CONSOLE_OIDC_BOOTSTRAPPED` record (which now also states whether
+   consent was granted). An instance that already had the switch on gets only
+   the latter.
+6. **No file, no change.** Self-hosted instances never have this file. Without
+   it the switch stays off, as §5 specifies.
+
+### Why file presence is a valid consent signal
+
+§5's rule exists so that console access is "a distinct, out-of-band act
+performed for a named purpose", not a side effect of linking. The file is
+exactly that act, performed ahead of time: Cloud writes it into a data
+directory *it provisioned*, for the stated purpose of letting the customer
+sign in through Cloud, as part of standing the hosted plane up (the hosted-plane
+provisioning instruction that the Cloud side's own design records as the
+"initial-state instruction in the same bootstrap payload" that also carries
+the enrollment code). A customer who buys a *hosted* control plane is
+choosing Cloud-managed administration of it; there is no other way to sign in
+to a plane whose admin identity is Cloud's. Requiring a second click on a
+console they cannot yet open would make the hosted product unusable at
+first boot.
+
+**Security note — who can write the data directory.** Writing
+`cloud-oidc.json` requires write access to `TEMPS_DATA_DIR`. Anyone with that
+access can already run or replace the `temps` binary, read the database
+credentials and the Cloud link state, edit the settings row directly and
+create an admin user. The file therefore grants no capability to a principal
+that did not have it: it lets a *provisioner* express consent that the
+principal who controls the data directory could always have expressed. What
+the file does newly decide is *which IdP is trusted to mint admin sessions*;
+that exposure already existed since the file was introduced and is bounded
+the same way (https issuer validation, `admin_only_role_required`, the
+two-layer role gate in §4). The residual risks, accepted and documented:
+
+- If the file cannot be deleted after a successful apply, it is logged at
+  `error` and the next boot would grant consent again, overriding an operator
+  who turned the switch off in the meantime. The operator must delete the file
+  (the log line says so).
+- A self-hosted operator who deliberately creates the file is consenting in
+  the same way; that is by design, not a bypass.
+
+### Consequences
+
+- Hosted planes can sign in through Cloud at first boot, before and
+  independently of enrollment completing.
+- `console_oidc_bootstrap.rs` stays testable through its injected `apply`
+  closure, which now reports whether it granted consent.
+- Revoke/disable (`ConsoleOidcRevoke`, the Settings toggle off, disconnect) is
+  untouched: it still deletes the provider row and its sessions.
 
 ---
 

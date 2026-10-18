@@ -960,7 +960,11 @@ fn parse_cloud_backend_url_env(result: Result<String, std::env::VarError>) -> Op
 /// this file only ever exists on a Cloud-hosted instance. Applying it is an
 /// upsert, so it is safe to run on a boot where the instance is already
 /// enrolled (re-provision, image upgrade) -- it does not depend on
-/// enrollment having happened first.
+/// enrollment having happened first, and it does not need
+/// `cloud.console_access_enabled` to be on already: on a hosted plane the
+/// file is the operator's consent, so applying it turns that switch on and
+/// audits the change (ADR-045 Amendment 1). Without the file nothing here
+/// touches consent.
 async fn bootstrap_console_oidc_from_file(
     service_context: &temps_core::plugin::ServiceRegistrationContext,
     data_dir: &std::path::Path,
@@ -1000,27 +1004,42 @@ async fn bootstrap_console_oidc_from_file(
 
     match outcome {
         ConsoleOidcBootstrapOutcome::NotPresent => {}
-        ConsoleOidcBootstrapOutcome::Applied { issuer, client_id } => {
+        ConsoleOidcBootstrapOutcome::Applied {
+            issuer,
+            client_id,
+            consent,
+        } => {
             info!(
                 issuer = %issuer,
                 client_id = %client_id,
+                console_access_enabled_by_bootstrap = consent.was_granted(),
                 "applied the Cloud console-access OIDC bootstrap file; the managed SSO provider \
                  is now configured"
             );
+            if consent.was_granted() {
+                warn!(
+                    "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
+                     cloud.console_access_enabled on (ADR-045 Amendment 1: on a Cloud-hosted \
+                     plane the file is the operator's consent); disable it in Settings > Temps \
+                     Cloud if that is not intended"
+                );
+            }
             match service_context.get_service::<dyn temps_core::AuditLogger>() {
                 Some(audit_logger) => {
-                    temps_cloud::record_console_oidc_bootstrapped_audit(
+                    temps_cloud::record_console_oidc_bootstrap_outcome_audit(
                         audit_logger.as_ref(),
                         CloudEnrollmentActor::UnattendedBootstrap,
                         &issuer,
                         &client_id,
+                        &consent,
                     )
                     .await;
                 }
                 None => error!(
                     "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file was applied but no audit \
-                     logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record was \
-                     not written"
+                     logger is registered; the CLOUD_CONSOLE_OIDC_BOOTSTRAPPED audit record \
+                     (and, if consent was granted, CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP) \
+                     was not written"
                 ),
             }
         }

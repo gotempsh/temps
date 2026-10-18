@@ -20,7 +20,8 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::{
     CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
-    ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction, ManagedBackupSetupStatus,
+    ConsoleAccessConsent, ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction,
+    ManagedBackupSetupStatus,
 };
 use temps_cloud_client::CloudFeatureSwitches;
 
@@ -826,6 +827,13 @@ pub async fn record_backup_outcome_audit(
 /// `CLOUD_LINK_CONNECTED` for the managed console-access OIDC provider.
 pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPPED";
 
+/// Audit action recorded when consuming `cloud-oidc.json` turned
+/// `cloud.console_access_enabled` on (ADR-045 Amendment 1). It carries the
+/// full before/after feature switches, like `CLOUD_FEATURES_UPDATED`, so the
+/// consent change is attributable to the bootstrap and not to an operator.
+pub const CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP: &str =
+    "CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP";
+
 /// The `cloud-oidc.json` bootstrap file's audit shape. A dedicated struct
 /// rather than reusing [`CloudLinkAudit`] because this event carries the
 /// issuer and client id it provisioned -- context an operator needs to
@@ -838,6 +846,8 @@ struct CloudConsoleOidcBootstrapAudit {
     action: &'static str,
     issuer: String,
     client_id: String,
+    /// Whether applying the file also turned remote-console consent on.
+    console_access_enabled_by_bootstrap: bool,
 }
 
 impl AuditOperation for CloudConsoleOidcBootstrapAudit {
@@ -859,24 +869,29 @@ impl AuditOperation for CloudConsoleOidcBootstrapAudit {
 }
 
 /// Record that this boot consumed the `cloud-oidc.json` bootstrap file and
-/// applied the managed console-access OIDC provider it described. Called
-/// exactly once per successful application, from `temps-cli`'s startup
-/// sequence (mirroring [`record_link_connected_audit`] for
-/// `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
+/// applied the managed console-access OIDC provider it described, plus -- when
+/// applying it turned remote-console consent on -- a second
+/// [`CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP`] record with the before/after
+/// feature switches. Called exactly once per successful application, from
+/// `temps-cli`'s startup sequence (mirroring [`record_link_connected_audit`]
+/// for `TEMPS_CLOUD_ENROLLMENT_CODE`). `issuer` and `client_id` are recorded so
 /// an operator can confirm which IdP was applied; the client secret never
-/// is. Failures to write the audit row are logged, never propagated: the
-/// provider has already been persisted.
-pub async fn record_console_oidc_bootstrapped_audit(
+/// is. Failures to write an audit row are logged, never propagated: the
+/// provider and the consent have already been persisted.
+pub async fn record_console_oidc_bootstrap_outcome_audit(
     audit: &dyn AuditLogger,
     actor: CloudEnrollmentActor,
     issuer: &str,
     client_id: &str,
+    consent: &ConsoleAccessConsent,
 ) {
+    let actor_fields: CloudAuditActor = actor.clone().into();
     let event = CloudConsoleOidcBootstrapAudit {
-        context: actor.into(),
+        context: actor_fields,
         action: CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
         issuer: issuer.to_string(),
         client_id: client_id.to_string(),
+        console_access_enabled_by_bootstrap: consent.was_granted(),
     };
     if let Err(error) = audit.create_audit_log(&event).await {
         tracing::error!(
@@ -884,6 +899,16 @@ pub async fn record_console_oidc_bootstrapped_audit(
             action = CLOUD_CONSOLE_OIDC_BOOTSTRAPPED,
             "failed to record managed console-access OIDC bootstrap audit event"
         );
+    }
+    if let ConsoleAccessConsent::GrantedByBootstrap { previous, new } = consent {
+        write_cloud_link_audit(
+            audit,
+            actor,
+            CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            Some(*previous),
+            Some(*new),
+        )
+        .await;
     }
 }
 
@@ -1465,6 +1490,100 @@ mod tests {
                 None,
                 UNATTENDED_ENROLLMENT_USER_AGENT.to_string(),
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_that_granted_consent_audits_both_the_provider_and_the_consent() {
+        let audit = RecordingAudit::new(false);
+        let consent = ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        };
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &consent,
+        )
+        .await;
+
+        assert_eq!(
+            audit.recorded(),
+            vec![
+                CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string(),
+                CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP.to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_that_left_consent_alone_writes_no_consent_record() {
+        let audit = RecordingAudit::new(false);
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &ConsoleAccessConsent::AlreadyEnabled,
+        )
+        .await;
+
+        assert_eq!(
+            audit.recorded(),
+            vec![CLOUD_CONSOLE_OIDC_BOOTSTRAPPED.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_audit_store_does_not_stop_the_consent_record_being_attempted() {
+        let audit = RecordingAudit::new(true);
+        let consent = ConsoleAccessConsent::GrantedByBootstrap {
+            previous: CloudFeatureSwitches::default(),
+            new: CloudFeatureSwitches {
+                console_access: true,
+                ..CloudFeatureSwitches::default()
+            },
+        };
+
+        record_console_oidc_bootstrap_outcome_audit(
+            audit.as_ref(),
+            CloudEnrollmentActor::UnattendedBootstrap,
+            "https://cloud.example.com",
+            "client",
+            &consent,
+        )
+        .await;
+
+        assert_eq!(audit.recorded().len(), 2, "both writes were attempted");
+    }
+
+    #[test]
+    fn the_consent_audit_shows_before_and_after_and_no_secret() {
+        let audit = CloudLinkAudit {
+            context: CloudEnrollmentActor::UnattendedBootstrap.into(),
+            action: CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            previous_features: Some(CloudFeatureSwitches::default().into()),
+            new_features: Some(
+                CloudFeatureSwitches {
+                    console_access: true,
+                    ..CloudFeatureSwitches::default()
+                }
+                .into(),
+            ),
+        };
+        let serialized = AuditOperation::serialize(&audit).unwrap();
+        assert!(serialized.contains("\"user_id\":null"), "{serialized}");
+        assert!(
+            serialized.contains("\"console_access_enabled\":false")
+                && serialized.contains("\"console_access_enabled\":true"),
+            "{serialized}"
         );
     }
 
