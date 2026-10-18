@@ -2415,8 +2415,8 @@ mod tests {
         then_succeeding_writes: usize,
     ) -> Arc<sea_orm::DatabaseConnection> {
         let row = bootstrap_settings_row();
-        let mut db =
-            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).append_query_errors(
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(
                 (0..failures).map(|_| sea_orm::DbErr::Custom("settings store unavailable".into())),
             );
         for _ in 0..then_succeeding_writes {
@@ -2799,6 +2799,263 @@ mod tests {
             .revoke_console_oidc_provider()
             .await
             .expect("a second revoke is a no-op, not an error"));
+    }
+
+    // ---- Real-Postgres tests (skip when no container runtime is available) ----
+
+    async fn postgres_or_skip(name: &str) -> Option<temps_database::test_utils::TestDatabase> {
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping {name}: {error}");
+                None
+            }
+            Err(error) => panic!("failed to create the {name} test database: {error}"),
+        }
+    }
+
+    /// A service over a real database: real `ConfigService` settings row,
+    /// real `OidcService` tables, link not enrolled.
+    fn real_service(db: Arc<sea_orm::DatabaseConnection>) -> CloudService {
+        let service = test_cloud_service(db.clone());
+        attach_oidc(&service, db);
+        service
+    }
+
+    async fn persisted_console_access(db: &sea_orm::DatabaseConnection) -> bool {
+        match temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await
+            .expect("settings row query")
+        {
+            Some(row) => {
+                temps_core::AppSettings::from_json(row.data)
+                    .cloud
+                    .console_access_enabled
+            }
+            None => false,
+        }
+    }
+
+    async fn managed_provider_count(db: &sea_orm::DatabaseConnection) -> u64 {
+        temps_entities::oidc_providers::Entity::find()
+            .filter(temps_entities::oidc_providers::Column::ManagedByCloud.eq(true))
+            .count(db)
+            .await
+            .expect("provider count")
+    }
+
+    fn write_bootstrap_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+        path
+    }
+
+    /// End to end against real tables: the file creates an admin-gated,
+    /// Cloud-managed provider with its three role mappings, consent is saved
+    /// to the settings row, and the file is gone -- all before any enrollment.
+    #[tokio::test]
+    async fn postgres_bootstrap_provisions_an_admin_gated_provider_and_saves_consent() {
+        let Some(test_db) = postgres_or_skip("bootstrap provisioning").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_bootstrap_file(&dir);
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("bootstrap against a real database");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                consent: ConsoleAccessConsent::GrantedByBootstrap { .. },
+                ..
+            }
+        ));
+        assert!(persisted_console_access(&db).await, "consent is saved");
+        assert!(!path.exists());
+        let provider = temps_entities::oidc_providers::Entity::find()
+            .filter(temps_entities::oidc_providers::Column::ManagedByCloud.eq(true))
+            .one(db.as_ref())
+            .await
+            .expect("provider query")
+            .expect("the managed provider exists");
+        assert!(provider.enabled);
+        assert!(
+            provider.admin_only_role_required,
+            "only owners/admins may sign in through the managed provider"
+        );
+        assert!(provider.trust_idp_email);
+        assert_eq!(provider.issuer_url, "https://cloud.example.com");
+        let mappings = temps_entities::oidc_role_mappings::Entity::find()
+            .filter(temps_entities::oidc_role_mappings::Column::ProviderId.eq(provider.id))
+            .count(db.as_ref())
+            .await
+            .expect("mapping count");
+        assert_eq!(mappings, 3);
+        assert!(!service.link.is_linked());
+    }
+
+    /// The frame path keeps its guard after a real bootstrap: consent is on
+    /// but the link is not established, so a frame is still refused.
+    #[tokio::test]
+    async fn postgres_frame_path_still_requires_a_link_after_bootstrap() {
+        let Some(test_db) = postgres_or_skip("frame guard").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        service
+            .apply_console_oidc_bootstrap_file(&write_bootstrap_file(&dir))
+            .await
+            .expect("bootstrap");
+
+        let result = service
+            .apply_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "other".into(),
+                client_secret: "other".into(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CloudServiceError::Client(
+                CloudError::FeatureDisabled { .. }
+            ))
+        ));
+    }
+
+    /// A real failure: an ordinary provider already registered for the same
+    /// issuer makes the managed upsert refuse (it would bypass the admin
+    /// gate). Consent must never be written, and the file must survive.
+    #[tokio::test]
+    async fn postgres_conflicting_provider_fails_the_bootstrap_without_granting_consent() {
+        let Some(test_db) = postgres_or_skip("bootstrap conflict").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        use sea_orm::{ActiveModelTrait, Set};
+        temps_entities::oidc_providers::ActiveModel {
+            name: Set("Operator SSO".to_string()),
+            issuer_url: Set("https://cloud.example.com".to_string()),
+            client_id: Set("operator".to_string()),
+            client_secret_encrypted: Set("encrypted".to_string()),
+            scopes: Set("openid email profile".to_string()),
+            jit_provisioning: Set(false),
+            enabled: Set(true),
+            template: Set("generic".to_string()),
+            group_claim: Set("groups".to_string()),
+            role_claim: Set("groups".to_string()),
+            default_role: Set("user".to_string()),
+            trust_idp_email: Set(false),
+            managed_by_cloud: Set(false),
+            admin_only_role_required: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("ordinary provider");
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_bootstrap_file(&dir);
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a shadowing provider must fail the bootstrap");
+
+        assert!(matches!(
+            error,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply {
+                consent: ConsentTrace::Untouched,
+                ..
+            }
+        ));
+        assert!(!persisted_console_access(&db).await, "consent not saved");
+        assert!(!service.console_access_enabled());
+        assert_eq!(managed_provider_count(&db).await, 0);
+        assert!(path.exists());
+    }
+
+    /// Disabling console access after a bootstrap deletes the managed
+    /// provider and its role mappings from the real tables.
+    #[tokio::test]
+    async fn postgres_disable_after_bootstrap_deletes_the_provider_and_mappings() {
+        let Some(test_db) = postgres_or_skip("disable after bootstrap").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        service
+            .apply_console_oidc_bootstrap_file(&write_bootstrap_file(&dir))
+            .await
+            .expect("bootstrap");
+        assert_eq!(managed_provider_count(&db).await, 1);
+
+        service
+            .patch_feature_switches(None, None, None, Some(false))
+            .await
+            .expect("disable");
+
+        assert!(!persisted_console_access(&db).await);
+        assert_eq!(managed_provider_count(&db).await, 0);
+        let leftover_mappings = temps_entities::oidc_role_mappings::Entity::find()
+            .count(db.as_ref())
+            .await
+            .expect("mapping count");
+        assert_eq!(leftover_mappings, 0, "no orphaned role mappings");
+    }
+
+    /// The bootstrap races an operator disabling console access. The lifecycle
+    /// lock must serialize them, so whichever wins the persisted switch and the
+    /// provider row always agree: on with a provider, or off without one.
+    #[tokio::test]
+    async fn postgres_bootstrap_racing_a_disable_never_leaves_consent_and_provider_split() {
+        let Some(test_db) = postgres_or_skip("bootstrap race").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        for round in 0..6 {
+            let service = real_service(db.clone());
+            // Reset to a known state: off, no provider.
+            service
+                .patch_feature_switches(None, None, None, Some(false))
+                .await
+                .expect("reset");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_bootstrap_file(&dir);
+
+            let (bootstrap, disable) = tokio::join!(
+                service.apply_console_oidc_bootstrap_file(&path),
+                service.patch_feature_switches(None, None, None, Some(false)),
+            );
+            bootstrap.expect("the bootstrap itself must not fail in a race");
+            disable.expect("the disable itself must not fail in a race");
+
+            let persisted = persisted_console_access(&db).await;
+            let providers = managed_provider_count(&db).await;
+            assert_eq!(
+                persisted,
+                providers == 1,
+                "round {round}: consent saved={persisted} but managed providers={providers}"
+            );
+            assert_eq!(
+                service.console_access_enabled(),
+                persisted,
+                "round {round}: in-memory switch must match the saved one"
+            );
+        }
     }
 
     /// SECURITY: disconnecting must not report success while the managed
