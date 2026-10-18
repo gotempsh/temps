@@ -368,7 +368,9 @@ Only a successful gate replaces the current deployment. When replacing a web dep
 
 ### Converting an existing web deployment
 
-The upgrade preserves the implicit port of existing web applications, including images without `EXPOSE`. To convert a former dummy-port worker, remove `EXPOSE` from the final image, clear the saved project and environment port overrides, choose `process` or `exec`, and redeploy. Verify **Background worker** in the container view. The previous HTTP monitor becomes not applicable and stale HTTP outages are retired; Temps does not fabricate an HTTP success for the worker.
+The upgrade preserves the implicit port of existing web applications, including images without `EXPOSE`. Autopack-generated web images declare port 3000 to match the injected `PORT` default; project and environment port overrides still take precedence. For a portless worker, supply a Dockerfile whose final image has no `EXPOSE` and clear saved port overrides. Selecting a process or exec probe alone does not remove a declared port.
+
+To convert a former dummy-port worker, remove `EXPOSE` from the final image, clear the saved project and environment port overrides, choose `process` or `exec`, and redeploy. Verify **Background worker** in the container view. The previous HTTP monitor becomes not applicable and stale HTTP outages are retired; Temps does not fabricate an HTTP success for the worker.
 
 ### Runtime health and uptime
 
