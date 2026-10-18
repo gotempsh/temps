@@ -183,10 +183,14 @@ def main():
             completed = wait("remote-only portless deployment completes", lambda: api(f"/projects/{project_id}/deployments/{deployment['id']}"),
                              lambda row: row["status"] in ("completed", "failed", "cancelled"))
             assert completed["status"] == "completed", "remote worker deployment failed"
-            summary = wait("both remote replicas report fresh healthy process probes", lambda: api(path + "/runtime-health"),
-                           lambda row: row["state"] == "healthy" and len(row["replicas"]) == 2 and all(replica["state"] == "healthy" for replica in row["replicas"]))
+            # A fresh healthy sample can precede uptime accounting. Wait for
+            # observed time rather than treating an unmeasured period as 100%.
+            summary = wait("both remote replicas accumulate healthy process coverage", lambda: api(path + "/runtime-health"),
+                           lambda row: row["state"] == "healthy" and len(row["replicas"]) == 2
+                           and all(replica["state"] == "healthy" for replica in row["replicas"])
+                           and row["coverage"]["healthy_seconds"] > 0)
             assert summary["portless"] is True
-            assert summary["coverage"]["availability_percent"] == 100
+            assert summary["coverage"]["availability_percent"] == 100, json.dumps(summary["coverage"])
             execute("control-plane", "bash", "-c", "test ! -S /var/run/docker.sock && ! pgrep -x dockerd && ! command -v docker")
             if args.scenario == "all":
                 for number in (1, 2):

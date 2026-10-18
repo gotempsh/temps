@@ -841,8 +841,8 @@ impl RuntimeCoverage {
             unhealthy_seconds: unhealthy,
             unknown_seconds: unknown,
             excluded_seconds: excluded,
-            availability_percent: (observed > 0.0).then(|| 100.0 * healthy / observed),
-            coverage_percent: (eligible > 0.0).then(|| 100.0 * observed / eligible),
+            availability_percent: (observed > 0.0).then(|| (healthy / observed) * 100.0),
+            coverage_percent: (eligible > 0.0).then(|| (observed / eligible) * 100.0),
         }
     }
 }
@@ -1776,6 +1776,33 @@ mod tests {
         assert_eq!(summary.coverage.healthy_seconds, 0.0);
         assert_eq!(summary.coverage.availability_percent, None);
         assert!(count(&service, "runtime_health_buckets").await > 0);
+        Ok(())
+    }
+
+    #[test]
+    fn short_observed_intervals_keep_percentages_within_bounds() {
+        for milliseconds in 1..=10_000 {
+            let healthy = milliseconds as f64 / 1000.0;
+            let coverage = RuntimeCoverage::new(healthy, 0.0, 0.0, 0.0);
+            assert_eq!(coverage.availability_percent, Some(100.0));
+            assert_eq!(coverage.coverage_percent, Some(100.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_healthy_replicas_do_not_invent_uptime_before_accounting(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let (_database, service) = setup().await?;
+        save(&service).await;
+        let row = placement(&service).await;
+        let session = Uuid::new_v4();
+        let term = grant(&service, &row, session).await;
+        assert!(service.accept(&row, session, sample(&row, 1), term).await?);
+
+        let summary = service.summary(1, 2).await?;
+        assert_eq!(summary.state, "healthy");
+        assert_eq!(summary.coverage.healthy_seconds, 0.0);
+        assert_eq!(summary.coverage.availability_percent, None);
         Ok(())
     }
 
