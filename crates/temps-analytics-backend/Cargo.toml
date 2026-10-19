@@ -41,4 +41,7 @@ uuid = { workspace = true }
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 [dev-dependencies]
+temps-database = { path = "../temps-database" }
+testcontainers = { workspace = true, features = ["http_wait_plain"] }
+bollard = { workspace = true }
 tokio = { workspace = true }

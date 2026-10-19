@@ -1854,15 +1854,16 @@ pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
 /// record exists.
 ///
 /// `None` on an optional window means "keep" -- the behaviour before the
-/// setting existed -- so upgrading never starts deleting data on its own,
-/// except for the unreferenced-IP cleanup, which only drops cache rows that
-/// nothing points at.
+/// setting existed. Events have a required window (90 days by default),
+/// including the ClickHouse copy on upgrade. The unreferenced-IP cleanup
+/// defaults to 30 days and only drops cache rows that nothing points at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct AnalyticsRetentionSettings {
     /// Retain analytics events (page views, custom events) for this many
-    /// days. Applied as the TimescaleDB retention policy of the `events`
-    /// hypertable. ClickHouse-backed analytics keep their own storage TTL.
+    /// days. Applied to the TimescaleDB events policy and, when configured,
+    /// the ClickHouse events TTL. Reconciled hourly and after ClickHouse
+    /// migrations. ClickHouse expiry follows asynchronous background merges.
     #[schema(minimum = 1, maximum = 3650, example = 90)]
     pub events_days: u32,
 
@@ -1872,9 +1873,11 @@ pub struct AnalyticsRetentionSettings {
     pub error_events_days: Option<u32>,
 
     /// Delete visitors that have not been seen for this many days. Their
-    /// events, proxy logs and error events stay (until their own retention
-    /// ends) but are no longer linked to a visitor; session replays of the
-    /// visitor are deleted with it. `null` keeps visitors indefinitely.
+    /// session replays are deleted with them. With ClickHouse enabled, their
+    /// project-scoped events are deleted from both databases; failures leave
+    /// visitors for retry. With PostgreSQL only, events are detached and kept.
+    /// Proxy logs and error events keep their own retention. This is not
+    /// erasure of all visitor data. `null` keeps visitors indefinitely.
     #[schema(minimum = 1, maximum = 3650, nullable = true, example = 425)]
     pub visitor_days: Option<u32>,
 

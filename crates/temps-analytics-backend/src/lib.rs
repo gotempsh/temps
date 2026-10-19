@@ -19,6 +19,7 @@
 pub mod clickhouse;
 pub mod error;
 pub mod migrations;
+pub mod retention;
 pub mod timescale;
 pub mod traits;
 pub mod types;

@@ -159,9 +159,12 @@ container for the dev tier only.
 
 - Doubled storage for the ≤72h hot window in `events_hot`. Negligible at
   Temps Cloud scale (~1–3 GB).
-- ClickHouse retention policy is per-table TTL on `events`; no per-project
-  retention initially. If demanded, we add a column to `projects` and a
-  scheduled `ALTER TABLE … DELETE WHERE` job.
+- ClickHouse retention policy is a per-table TTL on `events`, reconciled to
+  the instance `analytics_retention.events_days` setting after migrations
+  and hourly. TTL expiry follows asynchronous ClickHouse merges. There is
+  no per-project event retention. Automatic visitor cleanup deletes
+  project-scoped event copies in both stores when ClickHouse is enabled;
+  see the ClickHouse analytics how-to for scope and failure behavior.
 
 ## References
 

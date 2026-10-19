@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::{
-    ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect,
+    ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use tracing::debug;
 
@@ -116,7 +116,11 @@ pub async fn backfill_events_window(
     let mut batches: u64 = 0;
 
     loop {
-        let batch = fetch_next_batch(db.as_ref(), from, to, project_id, cursor, batch_size).await?;
+        let delivery = db
+            .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
+            .await?;
+        temps_analytics_backend::retention::lock_event_delivery(&delivery, false).await?;
+        let batch = fetch_next_batch(&delivery, from, to, project_id, cursor, batch_size).await?;
 
         if batch.is_empty() {
             break;
@@ -129,8 +133,9 @@ pub async fn backfill_events_window(
             last_id: Some(last.id),
         };
 
-        let geo_map = resolve_geo(db.as_ref(), &batch).await?;
+        let geo_map = resolve_geo(&delivery, &batch).await?;
         push_batch(ch.as_ref(), &batch, &geo_map, first_id).await?;
+        delivery.commit().await?;
 
         let count = batch.len() as u64;
         total += count;
@@ -186,8 +191,8 @@ pub async fn count_events_window(
     Ok(n)
 }
 
-/// Apply the embedded ClickHouse schema migrations (`events`,
-/// `events_5m_mv`, `sessions`). Idempotent; safe to invoke on every
+/// Apply the embedded ClickHouse schema migrations (`events`, removal of
+/// the historical materialized view and sessions table). Idempotent on every
 /// backfill run. Surfaced here so the CLI doesn't have to take a direct
 /// dependency on `temps-analytics-backend`.
 pub async fn apply_clickhouse_schema(
@@ -203,7 +208,7 @@ pub async fn apply_clickhouse_schema(
 // ---------------------------------------------------------------------------
 
 async fn fetch_next_batch(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     from: DBDateTime,
     to: DBDateTime,
     project_id: Option<i32>,
@@ -243,7 +248,7 @@ async fn fetch_next_batch(
 }
 
 async fn resolve_geo(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     rows: &[events::Model],
 ) -> Result<HashMap<i32, ip_geolocations::Model>, ChBackfillError> {
     let geo_ids: HashSet<i32> = rows.iter().filter_map(|r| r.ip_geolocation_id).collect();
@@ -268,13 +273,24 @@ async fn push_batch(
     first_id: i64,
 ) -> Result<(), ChBackfillError> {
     let mut inserter =
-        ch.insert::<ChEventRow>("events")
+        tokio::time::timeout(Duration::from_secs(30), ch.insert::<ChEventRow>("events"))
             .await
+            .map_err(|_| ChBackfillError::ClickHouseInsert {
+                first_event_id: first_id,
+                reason: "inserter setup timed out after 30s".into(),
+            })?
             .map_err(|e| ChBackfillError::ClickHouseInsert {
                 first_event_id: first_id,
                 reason: format!("inserter setup failed: {e}"),
             })?;
 
+    // Keep the delivery fence until server-side async buffers have flushed.
+    inserter = inserter
+        .with_setting("wait_for_async_insert", "1")
+        .with_timeouts(
+            Some(Duration::from_secs(30)),
+            Some(Duration::from_secs(120)),
+        );
     for r in rows {
         let geo = r.ip_geolocation_id.and_then(|id| geo_map.get(&id));
         inserter.write(&row_to_ch(r, geo)).await.map_err(|e| {
@@ -304,7 +320,7 @@ pub use temps_analytics_backend::migrations::MigrationReport;
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use sea_orm::{DatabaseBackend, MockDatabase};
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use tracing::{instrument::WithSubscriber, Level};
     use tracing_subscriber::{layer::SubscriberExt, Layer};
 
@@ -336,6 +352,10 @@ mod tests {
     async fn test_backfill_events_window_empty_window_emits_only_debug_lifecycle_events() {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
                 .append_query_results::<events::Model, _, _>(vec![vec![]])
                 .into_connection(),
         );

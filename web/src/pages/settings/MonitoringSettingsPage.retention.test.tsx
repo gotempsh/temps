@@ -141,3 +141,17 @@ test('an invalid window is reported and nothing is sent', async () => {
   await view.findByText('A retention window is required')
   expect(recorded.puts).toHaveLength(0)
 })
+
+test('retention explains both event stores, asynchronous expiry and visitor cleanup scope', () => {
+  const view = mount()
+  expect(
+    view.getByText(/Applies to both PostgreSQL and ClickHouse/).textContent
+  ).toContain('asynchronous background merges')
+  expect(
+    view.getByText(/With ClickHouse enabled, their events are removed/)
+      .textContent
+  ).toContain('a ClickHouse failure leaves the visitor for retry')
+  expect(
+    view.getByText(/There is no manual visitor-delete action/).textContent
+  ).toContain('this is not erasure of all visitor data')
+})

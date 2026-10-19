@@ -176,8 +176,22 @@ impl TempsPlugin for AnalyticsPlugin {
             match context.get_service::<temps_config::ConfigService>() {
                 Some(config) => {
                     let db = context.require_service::<sea_orm::DatabaseConnection>();
+                    let mut retention = crate::retention::AnalyticsRetentionService::new(db);
+                    let server = config.get_server_config();
+                    if server.is_clickhouse_enabled() {
+                        let backend = temps_analytics_backend::clickhouse::ClickHouseBackend::new(
+                            temps_analytics_backend::clickhouse::ClickHouseConfig::new(
+                                server.clickhouse_url.as_deref().unwrap_or_default(),
+                                server.clickhouse_database.as_deref().unwrap_or_default(),
+                                server.clickhouse_user.as_deref().unwrap_or_default(),
+                                server.clickhouse_password.as_deref().unwrap_or_default(),
+                            )
+                            .with_compression(config.clickhouse_compression()),
+                        );
+                        retention = retention.with_clickhouse(backend.client_clone());
+                    }
                     crate::retention::spawn_retention_job(
-                        Arc::new(crate::retention::AnalyticsRetentionService::new(db)),
+                        Arc::new(retention),
                         config,
                         context.require_service::<dyn temps_core::AuditLogger>(),
                         // Present only when a plugin supplies its own

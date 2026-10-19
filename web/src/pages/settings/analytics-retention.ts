@@ -29,7 +29,7 @@ export const ANALYTICS_RETENTION_FIELDS: AnalyticsRetentionField[] = [
     label: 'Page views and events',
     stores: 'events',
     description:
-      'Raw page views and custom events, including the IP address each one was recorded from. Applies to the built-in database: when ClickHouse analytics is enabled, its copy of events keeps to the ClickHouse table TTL (5 years by default), which this window does not change.',
+      'Raw page views and custom events, including their location and IP address reference. Applies to both PostgreSQL and ClickHouse. Policies are reconciled hourly; ClickHouse removes expired rows during asynchronous background merges, so deletion can lag the selected window.',
     optional: false,
   },
   {
@@ -45,7 +45,7 @@ export const ANALYTICS_RETENTION_FIELDS: AnalyticsRetentionField[] = [
     label: 'Visitors',
     stores: 'visitor',
     description:
-      'Visitors not seen for this long are deleted and no longer appear in visitor lists. Deleting a visitor also deletes its session replays, and detaches it from the events, error events and request logs that are kept.',
+      'Visitors not seen for this long and their session replays are deleted automatically. With ClickHouse enabled, their events are removed from both databases; a ClickHouse failure leaves the visitor for retry. With PostgreSQL only, events are detached and kept until their own expiry. Error events and request logs keep their own retention; this is not erasure of all visitor data. There is no manual visitor-delete action.',
     optional: true,
   },
   {

@@ -1099,7 +1099,7 @@ export function MonitoringSettingsPage() {
       <SettingsSection
         title="Analytics Data Retention"
         icon={BarChart2}
-        description="Control how long page views, error events, visitors and the IP addresses stored with them are kept. Expired rows are deleted by an hourly background job."
+        description="Control how long page views, error events, visitors and stored IP addresses are kept. Policies are reconciled hourly; databases and background cleanup remove expired data asynchronously."
       >
         <div className="space-y-4">
           <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

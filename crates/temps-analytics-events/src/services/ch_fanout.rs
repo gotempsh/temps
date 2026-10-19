@@ -259,6 +259,15 @@ impl ChFanoutWorker {
 
         debug!(count = claimed.len(), "ch_fanout claimed batch");
 
+        use sea_orm::TransactionTrait;
+        // Read committed takes the source-row snapshot after the fence is
+        // acquired, even if the database has a stricter default isolation.
+        let delivery = self
+            .db
+            .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
+            .await?;
+        temps_analytics_backend::retention::lock_event_delivery(&delivery, false).await?;
+
         // 2. Load the actual event rows. If any are missing (retention
         //    drop or manual deletion), they're orphans — mark delivered
         //    without sending.
@@ -267,7 +276,7 @@ impl ChFanoutWorker {
 
         let rows = events::Entity::find()
             .filter(events::Column::Id.is_in(claimed.clone()))
-            .all(self.db.as_ref())
+            .all(&delivery)
             .await?;
 
         let found_ids: std::collections::HashSet<i64> = rows.iter().map(|r| r.id).collect();
@@ -281,10 +290,11 @@ impl ChFanoutWorker {
                 orphan_count = orphans.len(),
                 "ch_fanout skipping orphaned outbox rows"
             );
-            self.mark_delivered(&orphans).await?;
+            self.mark_delivered(&delivery, &orphans).await?;
         }
 
         if rows.is_empty() {
+            delivery.commit().await?;
             return Ok(());
         }
 
@@ -301,7 +311,7 @@ impl ChFanoutWorker {
         } else {
             ip_geolocations::Entity::find()
                 .filter(ip_geolocations::Column::Id.is_in(geo_ids))
-                .all(self.db.as_ref())
+                .all(&delivery)
                 .await?
                 .into_iter()
                 .map(|m| (m.id, m))
@@ -309,13 +319,28 @@ impl ChFanoutWorker {
         };
 
         // 4. Push to CH via the typed Inserter.
-        let mut inserter = self.ch.insert::<ChEventRow>("events").await.map_err(|e| {
-            ChFanoutError::ClickHouseInsert {
-                first_event_id: first_id,
-                reason: format!("inserter setup failed: {e}"),
-            }
+        let mut inserter = tokio::time::timeout(
+            Duration::from_secs(30),
+            self.ch.insert::<ChEventRow>("events"),
+        )
+        .await
+        .map_err(|_| ChFanoutError::ClickHouseInsert {
+            first_event_id: first_id,
+            reason: "inserter setup timed out after 30s".into(),
+        })?
+        .map_err(|e| ChFanoutError::ClickHouseInsert {
+            first_event_id: first_id,
+            reason: format!("inserter setup failed: {e}"),
         })?;
 
+        // An operator's async-insert profile must not acknowledge buffered
+        // rows before they are visible to a cleanup holding the same fence.
+        inserter = inserter
+            .with_setting("wait_for_async_insert", "1")
+            .with_timeouts(
+                Some(Duration::from_secs(30)),
+                Some(Duration::from_secs(120)),
+            );
         let row_count = rows.len();
         for r in rows {
             let geo = r.ip_geolocation_id.and_then(|id| geo_map.get(&id));
@@ -339,28 +364,32 @@ impl ChFanoutWorker {
         // 4. Mark delivered. If this fails after CH succeeded, the rows
         //    will be retried — CH dedupe via ReplacingMergeTree handles it.
         let delivered_ids: Vec<i64> = found_ids.into_iter().collect();
-        self.mark_delivered(&delivered_ids).await?;
+        self.mark_delivered(&delivery, &delivered_ids).await?;
+        delivery.commit().await?;
 
         Ok(())
     }
 
     /// Mark a list of event_ids delivered. Called for both successful
     /// pushes and orphan-skips.
-    async fn mark_delivered(&self, ids: &[i64]) -> Result<(), ChFanoutError> {
+    async fn mark_delivered(
+        &self,
+        txn: &impl sea_orm::ConnectionTrait,
+        ids: &[i64],
+    ) -> Result<(), ChFanoutError> {
         if ids.is_empty() {
             return Ok(());
         }
-        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+        use sea_orm::{DatabaseBackend, Statement};
 
         // ANY($1) is the libpq idiom for "id IN (list)".
         let sql = "UPDATE events_ch_outbox SET delivered_at = NOW() WHERE event_id = ANY($1)";
-        self.db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                vec![ids.to_vec().into()],
-            ))
-            .await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            sql,
+            vec![ids.to_vec().into()],
+        ))
+        .await?;
         Ok(())
     }
 }
@@ -530,5 +559,174 @@ pub(crate) fn row_to_ch(
         clicks: m.clicks,
         language: opt(&m.language),
         crawler_name: opt(&m.crawler_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[tokio::test]
+    async fn fanout_and_backfill_wait_for_async_flush_before_releasing_delivery() {
+        let event: temps_entities::events::Model = serde_json::from_value(serde_json::json!({
+            "id": 17, "project_id": 42, "timestamp": chrono::Utc::now(),
+            "hostname": "example.test", "pathname": "/", "page_path": "/",
+            "href": "https://example.test/", "event_type": "pageview",
+            "is_entry": false, "is_exit": false, "is_bounce": false, "is_crawler": false
+        }))
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (received, mut requests) = tokio::sync::mpsc::channel(2);
+        let flush = Arc::new(tokio::sync::Notify::new());
+        let router = axum::Router::new().route(
+            "/",
+            axum::routing::post({
+                let flush = flush.clone();
+                move |uri: axum::http::Uri, _body: axum::body::Bytes| {
+                    let received = received.clone();
+                    let flush = flush.clone();
+                    async move {
+                        received.send(uri.to_string()).await.unwrap();
+                        flush.notified().await;
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let client = Arc::new(
+            clickhouse::Client::default()
+                .with_url(format!("http://{address}"))
+                .with_compression(clickhouse::Compression::None)
+                .with_validation(false)
+                // Simulate an operator profile that otherwise acknowledges before flush.
+                .with_setting("wait_for_async_insert", "0"),
+        );
+        for backfill in [false, true] {
+            let mock = if backfill {
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results::<temps_entities::events::Model, _, _>([
+                        vec![event.clone()],
+                        vec![],
+                    ])
+            } else {
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![std::collections::BTreeMap::from([(
+                        "event_id",
+                        sea_orm::Value::BigInt(Some(event.id)),
+                    )])]])
+                    .append_query_results([vec![event.clone()]])
+            };
+            let db = Arc::new(
+                mock.append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+            );
+            let delivery = tokio::spawn({
+                let db = db.clone();
+                let client = client.clone();
+                let now = event.timestamp;
+                async move {
+                    if backfill {
+                        crate::services::ch_backfill::backfill_events_window(
+                            db,
+                            client,
+                            now - chrono::Duration::seconds(1),
+                            now + chrono::Duration::seconds(1),
+                            None,
+                            10,
+                            crate::services::ch_backfill::BackfillCursor::default(),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    } else {
+                        ChFanoutWorker::new(db, client, ChFanoutConfig::default())
+                            .process_one_batch()
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+            let uri = tokio::time::timeout(Duration::from_secs(30), requests.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(uri.contains("wait_for_async_insert=1"), "{uri}");
+            assert!(!uri.contains("wait_for_async_insert=0"), "{uri}");
+            assert!(
+                !delivery.is_finished(),
+                "delivery must wait for the server flush acknowledgement"
+            );
+            let DatabaseConnection::MockDatabaseConnection(mock) = db.as_ref() else {
+                unreachable!("test always supplies a mock connection");
+            };
+            let before_ack =
+                DatabaseConnection::MockDatabaseConnection(mock.clone()).into_transaction_log();
+            // MockDatabase publishes a transaction's log only on commit or
+            // rollback. The delivery transaction must still hold its fence.
+            assert!(before_ack.iter().all(|transaction| {
+                !format!("{transaction:?}").contains("pg_advisory_xact_lock_shared")
+            }));
+            flush.notify_one();
+            delivery.await.unwrap();
+            let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            assert!(log.iter().any(|transaction| {
+                let transaction = format!("{transaction:?}");
+                transaction.contains("pg_advisory_xact_lock_shared")
+                    && transaction.contains("COMMIT")
+            }));
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_queued_event_removed_by_cleanup_is_delivered_as_an_orphan_under_the_fence() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "event_id",
+                    sea_orm::Value::BigInt(Some(17)),
+                )])]])
+                .append_query_results::<temps_entities::events::Model, _, _>([vec![]])
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let worker = ChFanoutWorker::new(
+            db.clone(),
+            Arc::new(clickhouse::Client::default()),
+            ChFanoutConfig::default(),
+        );
+        // No ClickHouse server: this succeeds only if an orphan is never sent.
+        worker.process_one_batch().await.unwrap();
+        drop(worker);
+        let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        let transaction = format!("{:?}", log.last().unwrap());
+        let fence = transaction.find("pg_advisory_xact_lock_shared").unwrap();
+        let read = transaction.find("FROM").unwrap();
+        let delivered = transaction
+            .find("UPDATE events_ch_outbox SET delivered_at")
+            .unwrap();
+        assert!(fence < read && read < delivered, "{transaction}");
+        assert!(transaction.contains("COMMIT"), "{transaction}");
     }
 }

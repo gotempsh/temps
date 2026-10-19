@@ -12496,6 +12496,7 @@ dependencies = [
  "axum-macros",
  "bollard",
  "chrono",
+ "clickhouse",
  "hex",
  "moka",
  "rand 0.10.3",
@@ -12508,6 +12509,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "temps-ai",
+ "temps-analytics-backend",
  "temps-auth",
  "temps-config",
  "temps-core",
@@ -12532,6 +12534,7 @@ name = "temps-analytics-backend"
 version = "0.1.0-beta.57"
 dependencies = [
  "async-trait",
+ "bollard",
  "chrono",
  "clickhouse",
  "sea-orm 1.1.20",
@@ -12539,6 +12542,8 @@ dependencies = [
  "serde_json",
  "temps-clickhouse",
  "temps-core",
+ "temps-database",
+ "testcontainers",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

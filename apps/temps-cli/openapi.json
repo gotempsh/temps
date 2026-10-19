@@ -2948,7 +2948,7 @@
         "type": "object"
       },
       "AnalyticsRetentionSettings": {
-        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed -- so upgrading never starts deleting data on its own,\nexcept for the unreferenced-IP cleanup, which only drops cache rows that\nnothing points at.",
+        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed. Events have a required window (90 days by default),\nincluding the ClickHouse copy on upgrade. The unreferenced-IP cleanup\ndefaults to 30 days and only drops cache rows that nothing points at.",
         "properties": {
           "error_events_days": {
             "default": null,
@@ -2964,7 +2964,7 @@
           },
           "events_days": {
             "default": 90,
-            "description": "Retain analytics events (page views, custom events) for this many\ndays. Applied as the TimescaleDB retention policy of the `events`\nhypertable. ClickHouse-backed analytics keep their own storage TTL.",
+            "description": "Retain analytics events (page views, custom events) for this many\ndays. Applied to the TimescaleDB events policy and, when configured,\nthe ClickHouse events TTL. Reconciled hourly and after ClickHouse\nmigrations. ClickHouse expiry follows asynchronous background merges.",
             "example": 90,
             "format": "int32",
             "maximum": 3650,
@@ -2985,7 +2985,7 @@
           },
           "visitor_days": {
             "default": null,
-            "description": "Delete visitors that have not been seen for this many days. Their\nevents, proxy logs and error events stay (until their own retention\nends) but are no longer linked to a visitor; session replays of the\nvisitor are deleted with it. `null` keeps visitors indefinitely.",
+            "description": "Delete visitors that have not been seen for this many days. Their\nsession replays are deleted with them. With ClickHouse enabled, their\nproject-scoped events are deleted from both databases; failures leave\nvisitors for retry. With PostgreSQL only, events are detached and kept.\nProxy logs and error events keep their own retention. This is not\nerasure of all visitor data. `null` keeps visitors indefinitely.",
             "example": 425,
             "format": "int32",
             "maximum": 3650,
