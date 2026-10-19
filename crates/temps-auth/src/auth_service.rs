@@ -1847,9 +1847,15 @@ mod tests {
             .verify_mfa_challenge_with_origin(&pending, &next_code)
             .await
             .unwrap();
-        auth.create_oidc_session(user.id, provider.id)
-            .await
-            .unwrap();
+        // Another live session from this provider, as a completed SSO + MFA
+        // sign-in leaves it (an MFA user never gets a first-factor-only one).
+        auth.create_authenticated_session(
+            user.id,
+            Some(&format!("oidc:{}", provider.id)),
+            SecondFactor::Verified,
+        )
+        .await
+        .unwrap();
         auth.create_mfa_session(user.id, &format!("oidc:{}", provider.id))
             .await
             .unwrap();

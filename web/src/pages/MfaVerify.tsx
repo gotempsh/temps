@@ -23,7 +23,7 @@ import { useAuth } from '@/contexts/AuthContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { isMfaChallengeEnded } from '@/lib/mfaChallengeProblem'
 import { announceMutationFailure } from '@/lib/mutation-error-toast'
-import { consumeReturnTo } from '@/lib/return-to'
+import { consumeReturnTo, rememberReturnTo } from '@/lib/return-to'
 import * as z from 'zod'
 
 const formSchema = z.object({
@@ -70,6 +70,9 @@ export const MfaVerify = () => {
       // The sign-in attempt is over (too many wrong codes, or it expired):
       // no further code can succeed, so return to the password step.
       if (isMfaChallengeEnded(error)) {
+        // An SSO sign-in may carry its only destination in `?return_to=`;
+        // keep it for the next sign-in instead of dropping it here.
+        rememberReturnTo(queryReturnTo)
         form.reset()
         navigate('/', { replace: true })
       }

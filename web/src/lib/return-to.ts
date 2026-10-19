@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { safeReturnTo } from '@/lib/safe-return-to'
+
 const KEY = 'temps:returnTo'
 
 /**
@@ -36,6 +38,23 @@ export function captureReturnTo(): void {
   if (!current || current === '/' || isAuthPath(current)) return
   try {
     window.sessionStorage.setItem(KEY, current)
+  } catch {
+    /* storage disabled */
+  }
+}
+
+/**
+ * Remember `path` (rather than the current URL) as the post-login
+ * destination. Used when a sign-in has to restart and the only record of
+ * where the user was going is a `return_to` the server put in this page's
+ * query string. Unsafe or auth-only paths are ignored.
+ */
+export function rememberReturnTo(path: string | null | undefined): void {
+  if (typeof window === 'undefined') return
+  const safe = safeReturnTo(path)
+  if (!safe || safe === '/' || isAuthPath(safe)) return
+  try {
+    window.sessionStorage.setItem(KEY, safe)
   } catch {
     /* storage disabled */
   }
