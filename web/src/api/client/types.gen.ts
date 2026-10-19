@@ -1333,7 +1333,7 @@ export type AnalyticsProjectOption = {
  * record exists.
  *
  * `None` on an optional window means "keep" -- the behaviour before the
- * setting existed. Events have a required window (90 days by default),
+ * setting existed. Events have a required window (365 days by default),
  * including the ClickHouse copy on upgrade. The unreferenced-IP cleanup
  * defaults to 30 days and only drops cache rows that nothing points at.
  */

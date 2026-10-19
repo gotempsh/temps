@@ -2948,7 +2948,7 @@
         "type": "object"
       },
       "AnalyticsRetentionSettings": {
-        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed. Events have a required window (90 days by default),\nincluding the ClickHouse copy on upgrade. The unreferenced-IP cleanup\ndefaults to 30 days and only drops cache rows that nothing points at.",
+        "description": "How long product analytics data, and the identifiers attached to it, are\nkept.\n\n`ip_geolocations` holds the full client IP address and is referenced by\nevents, proxy logs, error events, visitors, performance metrics and audit\nlogs. Before these settings existed nothing ever removed an IP once stored,\nand nothing removed visitors, so the retention of the referencing tables\nsaid nothing about how long an address was kept.\n\nA job removes an IP row only when **no** table references it, so the\neffective retention of an address is the longest window among the data that\nstill points at it. Audit logs keep their IP for as long as the audit\nrecord exists.\n\n`None` on an optional window means \"keep\" -- the behaviour before the\nsetting existed. Events have a required window (365 days by default),\nincluding the ClickHouse copy on upgrade. The unreferenced-IP cleanup\ndefaults to 30 days and only drops cache rows that nothing points at.",
         "properties": {
           "error_events_days": {
             "default": null,
@@ -2963,9 +2963,9 @@
             ]
           },
           "events_days": {
-            "default": 90,
+            "default": 365,
             "description": "Retain analytics events (page views, custom events) for this many\ndays. Applied to the TimescaleDB events policy and, when configured,\nthe ClickHouse events TTL. Reconciled hourly and after ClickHouse\nmigrations. ClickHouse expiry follows asynchronous background merges.",
-            "example": 90,
+            "example": 365,
             "format": "int32",
             "maximum": 3650,
             "minimum": 1,
@@ -3621,7 +3621,7 @@
             "$ref": "#/components/schemas/AnalyticsRetentionSettings",
             "default": {
               "error_events_days": null,
-              "events_days": 90,
+              "events_days": 365,
               "unreferenced_ip_days": 30,
               "visitor_days": null
             },

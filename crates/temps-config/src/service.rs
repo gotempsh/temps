@@ -1515,7 +1515,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// The sweep removes data permanently, so it must never run on a policy
     /// that was invented rather than read. [`Self::get_settings`] returns the
     /// whole default document when any field fails to decode, which would
-    /// replace a saved 365-day policy with the 90-day default (and a saved
+    /// replace a saved 730-day policy with the 365-day default (and a saved
     /// "keep addresses" with the 30-day one) over an unrelated bad section.
     /// Here an unrelated malformed section is ignored, while a missing section
     /// is the default and a malformed retention section is an error, so the
@@ -4667,11 +4667,11 @@ mod tests {
     async fn retention_policy_survives_an_unrelated_malformed_section() {
         // `preview_domain: 42` makes the whole document undecodable, which
         // `get_settings` turns into the defaults. The sweep must still see the
-        // 365-day events window and "keep addresses" that were saved.
+        // 730-day events window and "keep addresses" that were saved.
         let row = retention_row(serde_json::json!({
             "preview_domain": 42,
             "analytics_retention": {
-                "events_days": 365,
+                "events_days": 730,
                 "unreferenced_ip_days": null,
             },
             "observability_retention": { "proxy_logs_days": 90 },
@@ -4683,7 +4683,7 @@ mod tests {
 
         let policy = service.get_retention_policy().await.expect("policy");
 
-        assert_eq!(policy.analytics.events_days, 365);
+        assert_eq!(policy.analytics.events_days, 730);
         assert_eq!(policy.analytics.unreferenced_ip_days, None);
         assert_eq!(policy.proxy_logs_days, 90);
     }

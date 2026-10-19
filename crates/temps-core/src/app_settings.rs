@@ -1825,9 +1825,9 @@ impl Default for ObservabilityRetentionSettings {
 /// Bounds every [`AnalyticsRetentionSettings`] window is validated against.
 pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
 pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
-/// Default for [`AnalyticsRetentionSettings::events_days`]: the window the
-/// initial schema installs on the `events` hypertable.
-pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 90;
+/// Default for [`AnalyticsRetentionSettings::events_days`]. Retention
+/// reconciliation also updates the historical schema's shorter policy.
+pub const DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS: u32 = 365;
 /// Default for [`AnalyticsRetentionSettings::unreferenced_ip_days`].
 pub const DEFAULT_UNREFERENCED_IP_RETENTION_DAYS: u32 = 30;
 
@@ -1854,7 +1854,7 @@ pub const IP_REFERENCE_SLACK_DAYS: u32 = 1;
 /// record exists.
 ///
 /// `None` on an optional window means "keep" -- the behaviour before the
-/// setting existed. Events have a required window (90 days by default),
+/// setting existed. Events have a required window (365 days by default),
 /// including the ClickHouse copy on upgrade. The unreferenced-IP cleanup
 /// defaults to 30 days and only drops cache rows that nothing points at.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -1864,7 +1864,7 @@ pub struct AnalyticsRetentionSettings {
     /// days. Applied to the TimescaleDB events policy and, when configured,
     /// the ClickHouse events TTL. Reconciled hourly and after ClickHouse
     /// migrations. ClickHouse expiry follows asynchronous background merges.
-    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    #[schema(minimum = 1, maximum = 3650, example = 365)]
     pub events_days: u32,
 
     /// Retain captured error events for this many days. `null` keeps them
@@ -3482,7 +3482,7 @@ mod tests {
             "external_url": "https://paas.example.com"
         }));
 
-        assert_eq!(parsed.analytics_retention.events_days, 90);
+        assert_eq!(parsed.analytics_retention.events_days, 365);
         // Upgrading must not start deleting visitors or error events.
         assert_eq!(parsed.analytics_retention.visitor_days, None);
         assert_eq!(parsed.analytics_retention.error_events_days, None);
@@ -3505,6 +3505,28 @@ mod tests {
 
         let again = AppSettings::from_json(parsed.to_json());
         assert_eq!(again.analytics_retention, parsed.analytics_retention);
+    }
+
+    #[test]
+    fn analytics_event_default_applies_only_when_the_window_is_missing() {
+        for data in [
+            serde_json::json!({}),
+            serde_json::json!({"visitor_days": 425}),
+        ] {
+            let settings: AnalyticsRetentionSettings = serde_json::from_value(data).unwrap();
+            assert_eq!(settings.events_days, 365);
+        }
+        for days in [1, 90, 365, 730, 3650] {
+            let saved: AnalyticsRetentionSettings =
+                serde_json::from_value(serde_json::json!({"events_days": days})).unwrap();
+            assert_eq!(
+                saved.events_days, days,
+                "saved windows must not be overwritten"
+            );
+            let reloaded: AnalyticsRetentionSettings =
+                serde_json::from_value(serde_json::to_value(saved).unwrap()).unwrap();
+            assert_eq!(reloaded.events_days, days);
+        }
     }
 
     #[test]

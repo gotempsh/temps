@@ -5929,7 +5929,7 @@ mod tests {
         let response = AppSettingsResponse::from(settings);
 
         assert_eq!(response.analytics_retention.visitor_days, Some(425));
-        assert_eq!(response.analytics_retention.events_days, 90);
+        assert_eq!(response.analytics_retention.events_days, 365);
     }
 
     #[test]

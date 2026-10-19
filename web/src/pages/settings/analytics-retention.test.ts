@@ -46,6 +46,12 @@ describe('validateRetentionWindow', () => {
 })
 
 describe('analytics retention fields', () => {
+  test('events default to one year while optional cleanup stays disabled', () => {
+    expect(ANALYTICS_RETENTION_DEFAULTS.events_days).toBe(365)
+    expect(ANALYTICS_RETENTION_DEFAULTS.error_events_days).toBeNull()
+    expect(ANALYTICS_RETENTION_DEFAULTS.visitor_days).toBeNull()
+  })
+
   test('every setting has a field and a default', () => {
     const names = ANALYTICS_RETENTION_FIELDS.map((field) => field.name).sort()
     expect(names as string[]).toEqual(

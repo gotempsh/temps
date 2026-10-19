@@ -7,7 +7,7 @@ export const ANALYTICS_RETENTION_MIN_DAYS = 1
 export const ANALYTICS_RETENTION_MAX_DAYS = 3650
 
 export const ANALYTICS_RETENTION_DEFAULTS: AnalyticsRetentionSettings = {
-  events_days: 90,
+  events_days: 365,
   error_events_days: null,
   visitor_days: null,
   unreferenced_ip_days: 30,
@@ -29,7 +29,7 @@ export const ANALYTICS_RETENTION_FIELDS: AnalyticsRetentionField[] = [
     label: 'Page views and events',
     stores: 'events',
     description:
-      'Raw page views and custom events, including their location and IP address reference. Applies to both PostgreSQL and ClickHouse. Policies are reconciled hourly; ClickHouse removes expired rows during asynchronous background merges, so deletion can lag the selected window.',
+      'Raw page views and custom events, including their location and IP address reference. Defaults to 365 days; adjust this window to suit your needs. Applies to both PostgreSQL and ClickHouse. Policies are reconciled hourly; ClickHouse removes expired rows during asynchronous background merges, so deletion can lag the selected window.',
     optional: false,
   },
   {

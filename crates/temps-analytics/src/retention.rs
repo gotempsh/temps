@@ -1703,7 +1703,7 @@ mod tests {
                     let mut response = Vec::new();
                     if query.contains("formatQuery") {
                         // One String column in RowBinary, with validation off.
-                        let ddl = "CREATE TABLE events\nTTL toDateTime(timestamp) + toIntervalDay(90)";
+                        let ddl = "CREATE TABLE events\nTTL toDateTime(timestamp) + toIntervalDay(365)";
                         response.push(ddl.len() as u8);
                         response.extend_from_slice(ddl.as_bytes());
                     }

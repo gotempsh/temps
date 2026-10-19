@@ -64,11 +64,11 @@ afterEach(() => {
   client.setConfig({ baseUrl: originalBaseUrl })
 })
 
-function mount() {
+function mount(settings: object = STORED) {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
-  queryClient.setQueryData(['platform-settings'], STORED)
+  queryClient.setQueryData(['platform-settings'], settings)
   return render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
@@ -102,6 +102,29 @@ function field(view: ReturnType<typeof mount>, name: string) {
     `#analytics-retention-${name}`
   ) as HTMLInputElement
 }
+
+test('missing analytics settings default to 365 days and can be adjusted', async () => {
+  const legacy = { ...STORED, analytics_retention: undefined }
+  globalThis.fetch = (async (input: Request | string | URL) => {
+    const request =
+      input instanceof Request ? input : new Request(String(input))
+    if (request.method === 'PUT') {
+      recorded.puts.push(JSON.parse(await request.text()))
+    }
+    return new Response(JSON.stringify(legacy), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }) as unknown as typeof fetch
+  const view = mount(legacy)
+  await waitFor(() => expect(field(view, 'events_days').value).toBe('365'))
+  expect(view.getByText(/Defaults to 365 days/)).toBeTruthy()
+
+  fireEvent.change(field(view, 'events_days'), { target: { value: '90' } })
+  fireEvent.click(await view.findByText('Save Changes'))
+  await waitFor(() => expect(recorded.puts).toHaveLength(1))
+  expect(recorded.puts[0].analytics_retention.events_days).toBe(90)
+})
 
 test('stored retention windows fill the form, and an empty optional one is saved as keep', async () => {
   const view = mount()

@@ -210,7 +210,7 @@ Telemetry data is the main thing that grows. Adjust retention under **Settings �
 | OpenTelemetry spans, logs and metrics | 90 days |
 | Container logs | 30 days |
 
-Some retention periods are fixed with the default TimescaleDB backend: analytics events and uptime check results are kept for 90 days, and session replays for 15 days.
+Analytics events default to 365 days in both TimescaleDB and ClickHouse. Adjust their retention in **Settings → Monitoring → Page views and events**; existing saved windows are preserved. Uptime check results are kept for 90 days, and session replays for 15 days.
 
 Docker-level growth is bounded too. Application container logs rotate at 50 MB × 3 files (managed services: 20 MB × 3). Every night at 02:00 UTC, Temps removes deployment images older than 14 days (always keeping the 5 most recent per project and environment; the age is configurable per project), dangling images and unused build cache.
 
