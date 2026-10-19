@@ -76675,6 +76675,9 @@
           "401": {
             "description": "Invalid MFA code"
           },
+          "429": {
+            "description": "Second factor locked after repeated wrong codes"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -135745,6 +135748,9 @@
           "403": {
             "description": "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"
           },
+          "429": {
+            "description": "Second factor locked after repeated wrong codes"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -135835,6 +135841,9 @@
           "403": {
             "description": "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"
           },
+          "409": {
+            "description": "MFA is already enabled for this account"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -135874,6 +135883,9 @@
           },
           "403": {
             "description": "Account has no password set (SSO only)"
+          },
+          "429": {
+            "description": "Second factor locked after repeated wrong codes"
           },
           "500": {
             "description": "Internal server error"
