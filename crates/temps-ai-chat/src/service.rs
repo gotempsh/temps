@@ -8900,6 +8900,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[key]])
             .append_query_results([[user]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
             .into_connection();
         let service = service_with_db(ai, db);
@@ -8985,8 +8987,12 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[key.clone()]])
             .append_query_results([[user.clone()]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .append_query_results([[key]])
             .append_query_results([[user]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .into_connection();
         let service = service_with_db(ai, db);
         let provider: Arc<dyn ConversationContextProvider> = Arc::new(StubProvider {
@@ -9077,8 +9083,12 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[active_key]])
             .append_query_results([[user.clone()]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .append_query_results([[downgraded_key]])
             .append_query_results([[user]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .into_connection();
         let service = service_with_db(ai, db);
         let mut conversation = test_conversation();
@@ -9187,10 +9197,14 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[key.clone()]])
             .append_query_results([[user.clone()]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .append_query_results([[application.clone()]])
             .append_query_results([[project_seven.clone()]])
             .append_query_results([[key]])
             .append_query_results([[user]])
+            .append_query_results([[owner_admin_role()]])
+            .append_query_results([[owner_admin_grant()]])
             .append_query_results([[application]])
             .append_query_results([[project_seven, project_eight]])
             .into_connection();
@@ -9288,6 +9302,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([[key]])
             .append_query_results([[user]])
+            // Owner's current role: no `admin` role row, so a plain user.
+            .append_query_results([Vec::<temps_entities::roles::Model>::new()])
             .into_connection();
 
         let refreshed = refresh_tool_authorization(&db, &captured)
@@ -9295,6 +9311,53 @@ mod tests {
             .expect("current API-key authorization");
         assert!(refreshed.has_permission(&Permission::ProjectsRead));
         assert!(!refreshed.has_permission(&Permission::ProjectsWrite));
+    }
+
+    #[tokio::test]
+    async fn tool_authorization_caps_an_admin_key_whose_owner_was_demoted() {
+        let now = Utc::now();
+        let user = test_auth().user.expect("test user");
+        let key = temps_entities::api_keys::Model {
+            id: 73,
+            name: "former-admin".to_string(),
+            key_hash: "hash".to_string(),
+            key_prefix: "tk_test_".to_string(),
+            user_id: user.id,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+            last_used_at: None,
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+        };
+        let captured = AuthContext::new_api_key(
+            user.clone(),
+            Some(Role::Admin),
+            None,
+            key.name.clone(),
+            key.id,
+        );
+        let admin_role = temps_entities::roles::Model {
+            id: 1,
+            name: "admin".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[key]])
+            .append_query_results([[user]])
+            .append_query_results([[admin_role]])
+            // The owner no longer holds the admin role.
+            .append_query_results([Vec::<temps_entities::user_roles::Model>::new()])
+            .into_connection();
+
+        let refreshed = refresh_tool_authorization(&db, &captured)
+            .await
+            .expect("the key still authorizes as its owner");
+        assert_ne!(refreshed.effective_role, Role::Admin);
+        assert!(!refreshed.has_permission(&Permission::UsersWrite));
     }
 
     fn test_request_metadata() -> RequestMetadata {
@@ -9471,6 +9534,31 @@ mod tests {
     /// Tool-loop tests use the same durable API-key identity as production.
     /// The mock rows prove authorization is refreshed before the dispatch; a
     /// request-only test session would now (correctly) fail closed.
+    /// The `admin` role row `current_user_role` looks up when a refresh
+    /// re-checks the key owner's role.
+    fn owner_admin_role() -> temps_entities::roles::Model {
+        let now = Utc::now();
+        temps_entities::roles::Model {
+            id: 1,
+            name: "admin".to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The test user's grant of [`owner_admin_role`]: the key owner is still
+    /// an admin, so the key keeps its full grant.
+    fn owner_admin_grant() -> temps_entities::user_roles::Model {
+        let now = Utc::now();
+        temps_entities::user_roles::Model {
+            id: 1,
+            user_id: test_auth().user.expect("test user").id,
+            role_id: 1,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     fn service_with_current_tool_auth(
         ai: Arc<dyn AiService>,
     ) -> (ConversationService, Vec<ChatTool>, AuthContext) {
@@ -9511,7 +9599,9 @@ mod tests {
         for index in 0..500 {
             db = db
                 .append_query_results([[key.clone()]])
-                .append_query_results([[user.clone()]]);
+                .append_query_results([[user.clone()]])
+                .append_query_results([[owner_admin_role()]])
+                .append_query_results([[owner_admin_grant()]]);
             if index == 0 {
                 if let Some(conversation) = missing_session_conversation.as_ref() {
                     db = db.append_query_results([[conversation.clone()]]);
