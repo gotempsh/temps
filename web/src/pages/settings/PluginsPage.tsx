@@ -36,7 +36,6 @@ import {
   canManageExternalPlugins,
   pluginReloadFailures,
 } from '@/lib/plugin-registry'
-import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
   AlertCircle,
   Plus,
@@ -112,10 +111,8 @@ export function PluginsPage() {
       }
     } catch (error) {
       if (handleSensitiveActionError(error, () => void handleReload())) return
+      // The toast comes from the app-wide mutation error handler.
       setReloadFailures(pluginReloadFailures(error))
-      toast.error(
-        sensitiveActionErrorMessage(error, 'Failed to reload plugins.')
-      )
     }
   }
 
@@ -129,9 +126,6 @@ export function PluginsPage() {
         setUninstallName(null)
         return
       }
-      toast.error(
-        sensitiveActionErrorMessage(error, `Failed to uninstall ${name}.`)
-      )
     }
   }
 

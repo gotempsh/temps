@@ -11,7 +11,6 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { repositoryInstallSchema } from '@/lib/plugin-repository'
 import { Button } from '@/components/ui/button'
 import { PLUGINS_QUERY_KEY } from '@/hooks/usePlugins'
-import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import { toast } from 'sonner'
 import {
   GitBranch,
@@ -106,13 +105,8 @@ export function RepositoryUpdate({
     try {
       await update.mutateAsync(ref)
     } catch (error) {
-      if (onSensitiveError(error, () => void runUpdate(ref))) return
-      toast.error(
-        sensitiveActionErrorMessage(
-          error,
-          'Update failed. The previous plugin remains installed.'
-        )
-      )
+      // Failures are toasted by the app-wide mutation error handler.
+      onSensitiveError(error, () => void runUpdate(ref))
     }
   }
   if (status.isError)

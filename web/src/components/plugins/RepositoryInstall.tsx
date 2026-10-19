@@ -137,12 +137,14 @@ export function RepositoryInstall({
       await install.mutateAsync({ values, id })
     } catch (error) {
       if (onSensitiveError(error, () => void submit(values))) return
-      const message = sensitiveActionErrorMessage(
-        error,
-        'GitHub installation failed. Check host Git credentials and Docker availability.'
+      // The app-wide mutation error handler already toasts the problem title
+      // and detail; toasting here as well shows the failure twice.
+      setFailure(
+        sensitiveActionErrorMessage(
+          error,
+          'GitHub installation failed. Check host Git credentials and Docker availability.'
+        )
       )
-      setFailure(message)
-      toast.error(message)
     }
   }
   return (
