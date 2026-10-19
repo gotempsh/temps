@@ -139,13 +139,71 @@ class SeedSelectionTests(unittest.TestCase):
                 "GITHUB_OUTPUT": str(output_path),
             }
             with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE, "current_fingerprint", return_value="0123456789abcdef"
+            ), mock.patch.object(
                 MODULE, "github_seed_data", side_effect=OSError("offline")
             ):
                 self.assertEqual(MODULE.find_seed(MODULE.SEED_NAME), 0)
             self.assertEqual(
                 output_path.read_text(encoding="utf-8").splitlines(),
-                ["artifact-name=", "run-id=", "publish-current=false"],
+                ["seed-name=", "artifact-name=", "run-id=", "publish-current=false"],
             )
+
+    def test_fingerprint_failure_builds_cold_without_publishing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "outputs"
+            environment = {
+                "GITHUB_REPOSITORY": "gotempsh/temps",
+                "GH_TOKEN": "test-token",
+                "GITHUB_OUTPUT": str(output_path),
+            }
+            with mock.patch.dict(os.environ, environment, clear=False):
+                self.assertEqual(
+                    MODULE.find_seed(MODULE.SEED_NAME, Path(temp_dir) / "missing.lock"), 0
+                )
+            self.assertEqual(
+                output_path.read_text(encoding="utf-8").splitlines(),
+                ["seed-name=", "artifact-name=", "run-id=", "publish-current=false"],
+            )
+
+    def test_fingerprint_tracks_lockfile_and_compiler(self) -> None:
+        base = MODULE.build_fingerprint(b"lock-a", "rustc 1.90.0")
+        self.assertEqual(base, MODULE.build_fingerprint(b"lock-a", "rustc 1.90.0"))
+        self.assertEqual(len(base), MODULE.FINGERPRINT_LENGTH)
+        self.assertNotEqual(base, MODULE.build_fingerprint(b"lock-b", "rustc 1.90.0"))
+        self.assertNotEqual(base, MODULE.build_fingerprint(b"lock-a", "rustc 1.91.0"))
+
+    def test_dependency_bump_ignores_other_lockfile_seeds_and_republishes(self) -> None:
+        # A seed built against another Cargo.lock made PR #1574 rebuild every
+        # dependency next to the unpacked stale target and run out of disk.
+        now = datetime(2026, 8, 15, tzinfo=timezone.utc)
+        old_name = MODULE.seed_artifact_name(MODULE.SEED_NAME, "aaaaaaaaaaaaaaaa")
+        new_name = MODULE.seed_artifact_name(MODULE.SEED_NAME, "bbbbbbbbbbbbbbbb")
+        stale = artifact(old_name, 7, "2026-08-14T00:00:00Z", expires_at="2026-08-25T00:00:00Z")
+        self.assertEqual(MODULE.eligible_artifacts([stale], new_name, {7}), [])
+        self.assertTrue(MODULE.should_publish([stale], new_name, {7}, now))
+        self.assertFalse(MODULE.should_publish([stale], old_name, {7}, now))
+
+    def test_outputs_fingerprinted_seed_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "outputs"
+            environment = {
+                "GITHUB_REPOSITORY": "gotempsh/temps",
+                "GH_TOKEN": "test-token",
+                "GITHUB_OUTPUT": str(output_path),
+            }
+            name = MODULE.seed_artifact_name(MODULE.SEED_NAME, "0123456789abcdef")
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE, "current_fingerprint", return_value="0123456789abcdef"
+            ), mock.patch.object(
+                MODULE,
+                "github_seed_data",
+                return_value=([artifact(name, 10, "2026-08-01T00:00:00Z")], {10}),
+            ) as seed_data:
+                self.assertEqual(MODULE.find_seed(MODULE.SEED_NAME), 0)
+            self.assertEqual(seed_data.call_args.args[2], name)
+            outputs = output_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(outputs[:3], [f"seed-name={name}", f"artifact-name={name}", "run-id=10"])
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -184,6 +242,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertEqual(self.steps["Publish nextest target seed"]["if"], publish_if)
         self.assertEqual(
             self.steps["Publish nextest target seed"]["with"]["compression-level"], 0
+        )
+        self.assertEqual(
+            self.steps["Publish nextest target seed"]["with"]["name"],
+            "${{ steps.nextest-seed.outputs.seed-name }}",
         )
         self.assertNotIn("actions: write", self.raw)
 

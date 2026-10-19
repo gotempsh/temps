@@ -7,9 +7,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -24,7 +26,36 @@ from typing import Any
 # v2: a v1 seed (main run 35353352026) made the docker-tests archive step fail
 # with `E0463: can't find crate for mongodb` once the 2026-09-21 dependency
 # bumps landed, while cold builds of the same tree passed.
+#
+# Each published seed is additionally suffixed with a fingerprint of Cargo.lock
+# and the rustc version (see seed_artifact_name). A seed built against another
+# lockfile or compiler shares almost no artifacts with the current tree: cargo
+# then rebuilds the whole dependency graph next to ~19GB of unpacked stale
+# output, and the runner runs out of disk (PR #1574 died in the linker with
+# SIGBUS). Keying on the fingerprint makes such a build go cold instead, and
+# makes main publish a matching seed on its first run after the change.
 SEED_NAME = "temps-nextest-target-seed-v2"
+FINGERPRINT_LENGTH = 16
+
+
+def build_fingerprint(lockfile: bytes, rustc_version: str) -> str:
+    """Identify the dependency graph and compiler a target directory was built with."""
+    digest = hashlib.sha256()
+    digest.update(lockfile)
+    digest.update(b"\0")
+    digest.update(rustc_version.encode("utf-8"))
+    return digest.hexdigest()[:FINGERPRINT_LENGTH]
+
+
+def seed_artifact_name(prefix: str, fingerprint: str) -> str:
+    return f"{prefix}-{fingerprint}"
+
+
+def current_fingerprint(lockfile_path: Path) -> str:
+    rustc_version = subprocess.run(
+        ["rustc", "-vV"], check=True, capture_output=True, text=True
+    ).stdout
+    return build_fingerprint(lockfile_path.read_bytes(), rustc_version)
 
 
 def parse_timestamp(value: str) -> datetime:
@@ -128,8 +159,8 @@ def append_outputs(output_path: Path, values: dict[str, str]) -> None:
             output.write(f"{key}={value}\n")
 
 
-def find_seed(current_name: str) -> int:
-    if current_name != SEED_NAME:
+def find_seed(seed_prefix: str, lockfile_path: Path = Path("Cargo.lock")) -> int:
+    if seed_prefix != SEED_NAME:
         print("invalid nextest cache seed artifact name", file=sys.stderr)
         return 2
 
@@ -141,12 +172,14 @@ def find_seed(current_name: str) -> int:
         return 2
 
     try:
+        current_name = seed_artifact_name(seed_prefix, current_fingerprint(lockfile_path))
         artifacts, trusted_run_ids = github_seed_data(repository, token, current_name)
         candidates = eligible_artifacts(artifacts, current_name, trusted_run_ids)
         selected = candidates[0] if candidates else None
         append_outputs(
             Path(output_path),
             {
+                "seed-name": current_name,
                 "artifact-name": selected["name"] if selected else "",
                 "run-id": str(selected["workflow_run"]["id"]) if selected else "",
                 "publish-current": str(
@@ -159,11 +192,17 @@ def find_seed(current_name: str) -> int:
                 ).lower(),
             },
         )
-    except (OSError, ValueError, KeyError, urllib.error.URLError) as error:
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        subprocess.CalledProcessError,
+        urllib.error.URLError,
+    ) as error:
         print(f"warning: could not resolve nextest cache seed: {error}", file=sys.stderr)
         append_outputs(
             Path(output_path),
-            {"artifact-name": "", "run-id": "", "publish-current": "false"},
+            {"seed-name": "", "artifact-name": "", "run-id": "", "publish-current": "false"},
         )
         return 0
 
@@ -173,7 +212,7 @@ def find_seed(current_name: str) -> int:
             f"{selected['workflow_run']['id']}"
         )
     else:
-        print("No trusted main-branch nextest cache seed found; building cold")
+        print(f"No trusted main-branch {current_name} found; building cold")
     return 0
 
 
