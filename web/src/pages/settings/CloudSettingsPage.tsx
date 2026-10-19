@@ -75,14 +75,30 @@ export function CloudSettingsPage() {
     retry: false,
   })
   const [confirmDisconnectOpen, setConfirmDisconnectOpen] = useState(false)
-  const enroll = useMutation(enrollCloudMutation())
-  const disconnect = useMutation(disconnectCloudMutation())
-  const updateFeatures = useMutation(updateCloudFeaturesMutation())
-  const reconcileBackupSource = useMutation(
-    reconcileCloudBackupSourceMutation()
-  )
-  const ensureBackupSchedule = useMutation(ensureCloudBackupScheduleMutation())
-  const repointArchive = useMutation(repointContinuousArchiveSourceMutation())
+  const enroll = useMutation({
+    ...enrollCloudMutation(),
+    meta: { errorTitle: 'Could not connect this instance' },
+  })
+  const disconnect = useMutation({
+    ...disconnectCloudMutation(),
+    meta: { errorTitle: 'Could not disconnect this instance' },
+  })
+  const updateFeatures = useMutation({
+    ...updateCloudFeaturesMutation(),
+    meta: { errorTitle: 'Could not update this Temps Cloud setting' },
+  })
+  const reconcileBackupSource = useMutation({
+    ...reconcileCloudBackupSourceMutation(),
+    meta: { errorTitle: 'Could not retry managed backup setup' },
+  })
+  const ensureBackupSchedule = useMutation({
+    ...ensureCloudBackupScheduleMutation(),
+    meta: { errorTitle: 'Could not create the nightly backup schedule' },
+  })
+  const repointArchive = useMutation({
+    ...repointContinuousArchiveSourceMutation(),
+    meta: { errorTitle: 'Could not move the archive to Temps Cloud' },
+  })
   const form = useForm<EnrollmentForm>({
     resolver: zodResolver(enrollmentSchema),
     defaultValues: { enrollmentCode: '' },
@@ -118,8 +134,8 @@ export function CloudSettingsPage() {
       form.reset()
       await refresh()
       toast.success('Instance connected to Temps Cloud')
-    } catch (error) {
-      toast.error(getErrorMessage(error, 'Could not connect this instance'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   })
 
@@ -128,8 +144,8 @@ export function CloudSettingsPage() {
       await disconnect.mutateAsync({})
       await refresh()
       toast.success('Temps Cloud disconnected')
-    } catch (error) {
-      toast.error(getErrorMessage(error, 'Could not disconnect this instance'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -144,10 +160,8 @@ export function CloudSettingsPage() {
       } else {
         toast.error(managedBackupSetup.message)
       }
-    } catch (error) {
-      toast.error(
-        getErrorMessage(error, 'Could not create the nightly backup schedule')
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -165,10 +179,8 @@ export function CloudSettingsPage() {
       })
       await refresh()
       toast.success(`${conflict.service_name} now archives to Temps Cloud`)
-    } catch (error) {
-      toast.error(
-        getErrorMessage(error, `Could not repoint ${conflict.service_name}`)
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -188,10 +200,8 @@ export function CloudSettingsPage() {
       })
       queryClient.setQueryData(getCloudStatusOptions().queryKey, updatedStatus)
       toast.success(`${label} ${enabled ? 'enabled' : 'disabled'}`)
-    } catch (error) {
-      toast.error(
-        getErrorMessage(error, `Could not update ${label.toLowerCase()}`)
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -218,10 +228,8 @@ export function CloudSettingsPage() {
       } else {
         toast.error(managedBackupSetup.message)
       }
-    } catch (error) {
-      toast.error(
-        getErrorMessage(error, 'Could not retry managed backup setup')
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

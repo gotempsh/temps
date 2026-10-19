@@ -480,7 +480,6 @@ export function DomainDetail() {
     toast.promise(cancelOrder.mutateAsync({ path: { domain_id: domain.id } }), {
       loading: 'Cancelling ACME order...',
       success: 'ACME order cancelled successfully',
-      error: 'Failed to cancel ACME order',
     })
   }
 

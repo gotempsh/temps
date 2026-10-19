@@ -83,8 +83,14 @@ export function ApplicationDataServicesPanel({ application }: Props) {
     enabled: projectId !== null,
     staleTime: 15_000,
   })
-  const linkMutation = useMutation(linkServiceToProjectMutation())
-  const unlinkMutation = useMutation(unlinkServiceFromProjectMutation())
+  const linkMutation = useMutation({
+    ...linkServiceToProjectMutation(),
+    meta: { errorTitle: 'Could not link the database' },
+  })
+  const unlinkMutation = useMutation({
+    ...unlinkServiceFromProjectMutation(),
+    meta: { errorTitle: 'Could not unlink the database' },
+  })
 
   const linkedIds = new Set(
     (linkedQuery.data ?? []).map((link) => link.service.id)
@@ -127,8 +133,8 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       await linkedQuery.refetch()
       setServiceId(null)
       toast.success('Database linked and sandbox network updated')
-    } catch (cause) {
-      toast.error(errorMessage(cause, 'Could not link the database.'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -140,8 +146,8 @@ export function ApplicationDataServicesPanel({ application }: Props) {
       })
       await linkedQuery.refetch()
       toast.success('Database unlinked from the service and sandbox')
-    } catch (cause) {
-      toast.error(errorMessage(cause, 'Could not unlink the database.'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       setUnlinkTarget(null)
     }
@@ -505,10 +511,4 @@ function serviceTypeLabel(serviceType: string): string {
     default:
       return serviceType
   }
-}
-
-function errorMessage(cause: unknown, fallback: string): string {
-  return cause instanceof Error && cause.message.trim()
-    ? cause.message
-    : fallback
 }

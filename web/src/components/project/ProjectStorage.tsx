@@ -392,7 +392,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     toast.promise(promise, {
       loading: 'Linking service...',
       success: 'Service linked',
-      error: 'Failed to link service',
     })
     await promise
     setLinkChange({ kind: 'linked', serviceName: serviceName(serviceId) })
@@ -406,7 +405,6 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     toast.promise(promise, {
       loading: 'Unlinking service...',
       success: 'Service unlinked',
-      error: 'Failed to unlink service',
     })
     await promise.then(
       () =>

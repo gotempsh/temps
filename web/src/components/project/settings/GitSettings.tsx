@@ -610,7 +610,10 @@ function GitSettingsInline({
   // GitLab webhook reinstall
   const reinstallWebhook = useMutation({
     ...reinstallGitlabWebhookMutation(),
-    meta: { errorTitle: 'Failed to reinstall webhook' },
+    meta: {
+      errorTitle:
+        'Failed to reinstall webhook — check your GitLab user has Maintainer role on the repo',
+    },
   })
   const isGitlab = currentProvider?.provider_type === 'gitlab'
   const hasWebhook = !!project.gitlab_webhook_id
@@ -621,9 +624,7 @@ function GitSettingsInline({
       await refetch()
       toast.success('Webhook reinstalled')
     } catch {
-      toast.error(
-        'Failed to reinstall webhook — check your GitLab user has Maintainer role on the repo.'
-      )
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -637,7 +638,7 @@ function GitSettingsInline({
       await refetch()
       toast.success(enabled ? 'Auto-deploy enabled' : 'Auto-deploy disabled')
     } catch {
-      toast.error('Failed to update')
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -2681,7 +2682,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     Number.isInteger(routeRepositoryId) && routeRepositoryId > 0
       ? routeRepositoryId
       : null
-  const updateGit = useMutation({ ...updateGitSettingsMutation() })
+  const updateGit = useMutation({
+    ...updateGitSettingsMutation(),
+    meta: { errorTitle: 'Failed to connect repository' },
+  })
   const { data: connectionsData } = useQuery({ ...listConnectionsOptions() })
   const { data: providersData } = useQuery({ ...listGitProvidersOptions() })
   const providers = providersData || []
@@ -2958,7 +2962,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       refetch()
       back()
     } catch {
-      toast.error('Failed to connect repository')
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

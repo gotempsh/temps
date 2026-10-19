@@ -107,7 +107,7 @@ export function RequestTimeoutsPage() {
       reset(data)
       toast.success('Request timeouts saved — applies to the next request')
     } catch {
-      toast.error('Failed to save request timeouts')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

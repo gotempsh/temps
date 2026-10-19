@@ -64,7 +64,7 @@ export function BuildLimitsPage() {
       reset(data)
       toast.success('Build limits saved and applied')
     } catch {
-      toast.error('Failed to save build limits')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

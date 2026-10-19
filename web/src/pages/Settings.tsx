@@ -228,12 +228,8 @@ export function Settings() {
         queryKey: getPublicIngressStatusQueryKey(),
       })
       toast.success('Settings saved successfully')
-    } catch (err: any) {
-      const detail =
-        err?.body?.detail ||
-        err?.message ||
-        'Failed to save settings. Please try again.'
-      toast.error(detail)
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

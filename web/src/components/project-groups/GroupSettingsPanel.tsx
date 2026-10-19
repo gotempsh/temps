@@ -91,8 +91,14 @@ export function GroupSettingsPanel({
   })
   const varCount = vars.data?.length ?? 0
 
-  const remove = useMutation({ ...removeProjectFromGroupMutation() })
-  const destroy = useMutation({ ...deleteProjectGroupMutation() })
+  const remove = useMutation({
+    ...removeProjectFromGroupMutation(),
+    meta: { errorTitle: 'Could not remove the service from the project' },
+  })
+  const destroy = useMutation({
+    ...deleteProjectGroupMutation(),
+    meta: { errorTitle: 'The project could not be deleted' },
+  })
 
   const removeService = async () => {
     if (!removing) return
@@ -102,8 +108,8 @@ export function GroupSettingsPanel({
       })
       await invalidate()
       toast.success(`${removing.name} is now a standalone service`)
-    } catch (err) {
-      toast.error(getErrorMessage(err, `Could not remove ${removing.name}`))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       setRemoving(null)
     }
@@ -117,8 +123,8 @@ export function GroupSettingsPanel({
         `Project “${group.name}” deleted; its services are standalone now`
       )
       navigate('/projects')
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'The project could not be deleted.'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
       setConfirmDelete(false)
     }
   }

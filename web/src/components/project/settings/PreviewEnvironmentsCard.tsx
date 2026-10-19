@@ -114,7 +114,6 @@ export function PreviewEnvironmentsCard({
       {
         loading: 'Updating preview environment settings...',
         success: 'Preview environment settings updated successfully',
-        error: 'Failed to update preview environment settings',
       }
     )
     refetch()

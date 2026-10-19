@@ -365,12 +365,8 @@ export function MonitoringSettingsPage() {
       // save (and keep it in memory for as long as the page is open).
       reset({ ...data, geo: { ...data.geo, maxmind_license_key: '' } })
       toast.success('Monitoring settings saved')
-    } catch (err: unknown) {
-      const detail =
-        err instanceof Error
-          ? err.message
-          : 'Failed to save monitoring settings'
-      toast.error(detail)
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 
@@ -406,10 +402,8 @@ export function MonitoringSettingsPage() {
       toast.success(
         'MaxMind license key removed; refreshes now use the bundled database'
       )
-    } catch (err: unknown) {
-      toast.error(
-        err instanceof Error ? err.message : 'Failed to remove the license key'
-      )
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

@@ -52,7 +52,10 @@ export function ServiceGroupControl({
   const [creating, setCreating] = useState(false)
   const { groups } = useProjectGroups()
   const invalidate = useInvalidateGroups()
-  const add = useMutation({ ...addProjectToGroupMutation() })
+  const add = useMutation({
+    ...addProjectToGroupMutation(),
+    meta: { errorTitle: 'Could not add the service to the project' },
+  })
 
   if (membership.isLoading) return null
   if (membership.isError) {
@@ -108,10 +111,8 @@ export function ServiceGroupControl({
       await invalidate()
       toast.success(`${project.name} is now part of ${groupName}`)
       setOpen(false)
-    } catch (err) {
-      toast.error(
-        getErrorMessage(err, `Could not add ${project.name} to ${groupName}`)
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

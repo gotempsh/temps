@@ -71,7 +71,10 @@ export function GroupRoutesSettings({
   const path = { group_id: group.id }
   const routes = useQuery(listGroupRoutesOptions({ path }))
   const create = useMutation(createGroupRouteMutation())
-  const remove = useMutation(deleteGroupRouteMutation())
+  const remove = useMutation({
+    ...deleteGroupRouteMutation(),
+    meta: { errorTitle: 'The route could not be removed' },
+  })
 
   const services = group.projects
   const environments = useServiceEnvironments(services.map((p) => p.id))
@@ -131,8 +134,8 @@ export function GroupRoutesSettings({
       toast.success(
         `${route.source_project_name} serves ${route.path_prefix} itself again`
       )
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'The route could not be removed.'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

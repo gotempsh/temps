@@ -646,10 +646,6 @@ export function ServiceDetail() {
       toast.promise(startService.mutateAsync({ path: { id: parseInt(id!) } }), {
         loading: `Starting ${service.service.name}…`,
         success: `${service.service.name} started`,
-        error: (err: Error) =>
-          err?.message
-            ? `Failed to start ${service.service.name}: ${err.message}`
-            : `Failed to start ${service.service.name}`,
       })
     }
   }

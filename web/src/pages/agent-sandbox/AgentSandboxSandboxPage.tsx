@@ -289,10 +289,8 @@ export function AgentSandboxSandboxPage() {
       })
       setIsDirty(false)
       toast.success('Workflow sandbox settings saved')
-    } catch (cause) {
-      toast.error(
-        cause instanceof Error ? cause.message : 'Failed to save settings'
-      )
+    } catch {
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

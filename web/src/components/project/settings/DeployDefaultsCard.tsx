@@ -166,7 +166,6 @@ export function DeployDefaultsCard({
       {
         loading: 'Updating deployment configuration...',
         success: 'Deployment configuration updated successfully',
-        error: 'Failed to update deployment configuration',
       }
     )
     refetch()

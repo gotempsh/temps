@@ -71,7 +71,7 @@ export function DiskMonitoringPage() {
       reset(data)
       toast.success('Disk monitoring settings saved')
     } catch {
-      toast.error('Failed to save settings')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

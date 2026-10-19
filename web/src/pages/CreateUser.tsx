@@ -171,8 +171,15 @@ export function CreateUser() {
   const selectedTeamRole = useWatch({ control: form.control, name: 'teamRole' })
   const requirementResults = passwordRequirementResults(password)
 
+  // Used right after the account is created and again on retry; either way the
+  // account already exists, which is what the operator needs to know. The
+  // banner below the form keeps the retry guidance on screen.
   const addTeamMember = useMutation({
     ...addTeamMemberMutation(),
+    meta: {
+      errorTitle:
+        'Team assignment failed. The account exists, so retrying is safe',
+    },
   })
 
   const createUser = useMutation({
@@ -196,9 +203,6 @@ export function CreateUser() {
             teamId: teamAssignment.teamId,
             role: teamAssignment.role,
           })
-          toast.error(
-            'User created, but team assignment failed. Retry it before leaving this page.'
-          )
           await queryClient.invalidateQueries({ queryKey: ['listUsers'] })
           return
         }
@@ -248,9 +252,7 @@ export function CreateUser() {
       toast.success('User added to the team')
       navigate('/settings/users')
     } catch {
-      toast.error(
-        'Team assignment still failed. The account was not created again; you can retry safely.'
-      )
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

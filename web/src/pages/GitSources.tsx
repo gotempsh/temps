@@ -41,6 +41,7 @@ import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 
 // Helper function to check if provider is GitHub App
 const isGitHubApp = (provider: ProviderResponse) =>
@@ -135,23 +136,21 @@ export function GitSources() {
       const deletion = deleteProviderMut.mutateAsync({
         path: { provider_id: providerToDelete.id },
       })
+      // No `error` message here: the app-wide mutation handler announces the
+      // failure, and toast.promise dismisses its loading toast without one.
       toast.promise(deletion, {
         loading: 'Removing Git provider...',
         success: 'Git provider removed successfully',
-        error: 'Failed to remove provider',
       })
       await deletion
 
       // Refresh the provider list after successful deletion
       queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
     } catch (error) {
-      // Handle any errors that occur during the check
-      toast.error('Failed to check provider', {
-        description:
-          error instanceof Error
-            ? error.message
-            : 'An unexpected error occurred',
-      })
+      // A failed deletion is already toasted by the app-wide mutation handler;
+      // this adds one for a failure of the safety check, which is not a
+      // mutation.
+      reportSubmitFailure(error)
     } finally {
       setProviderToDelete(null)
     }

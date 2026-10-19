@@ -89,7 +89,6 @@ export function ImageRetentionCard({
       {
         loading: 'Updating image retention...',
         success: 'Image retention updated successfully',
-        error: 'Failed to update image retention',
       }
     )
     refetch()

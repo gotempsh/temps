@@ -89,7 +89,7 @@ export function DockerRegistryPage() {
       reset(data)
       toast.success('Docker registry settings saved')
     } catch {
-      toast.error('Failed to save settings')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

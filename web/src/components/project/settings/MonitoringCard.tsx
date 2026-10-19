@@ -72,7 +72,6 @@ export function MonitoringCard({
       {
         loading: 'Updating monitoring settings...',
         success: 'Monitoring settings updated successfully',
-        error: 'Failed to update monitoring settings',
       }
     )
     refetch()

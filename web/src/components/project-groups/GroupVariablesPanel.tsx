@@ -123,7 +123,10 @@ export function GroupVariablesPanel({
     return [...slugs].sort()
   }, [environments])
 
-  const remove = useMutation({ ...deleteGroupEnvVarMutation() })
+  const remove = useMutation({
+    ...deleteGroupEnvVarMutation(),
+    meta: { errorTitle: 'Could not remove the variable' },
+  })
 
   const confirmDelete = async () => {
     if (!deleting) return
@@ -135,8 +138,8 @@ export function GroupVariablesPanel({
       toast.success(
         `Removed ${deleting.key}; services drop it on their next deployment`
       )
-    } catch (err) {
-      toast.error(getErrorMessage(err, `Could not remove ${deleting.key}`))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     } finally {
       setDeleting(null)
     }

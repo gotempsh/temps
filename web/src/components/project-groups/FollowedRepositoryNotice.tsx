@@ -9,7 +9,6 @@ import { setRepositoryInheritanceMutation } from '@/api/client/@tanstack/react-q
 import type { ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { groupHref } from '@/lib/terminology'
-import { getErrorMessage } from '@/utils/errorHandling'
 import { useServiceGroup } from './ServiceGroupControl'
 import { useInvalidateGroups } from './useProjectGroups'
 
@@ -27,7 +26,10 @@ export function FollowedRepositoryNotice({
 }) {
   const membership = useServiceGroup(project.id)
   const invalidate = useInvalidateGroups()
-  const stop = useMutation({ ...setRepositoryInheritanceMutation() })
+  const stop = useMutation({
+    ...setRepositoryInheritanceMutation(),
+    meta: { errorTitle: 'Could not stop following the project' },
+  })
   const group = membership.data?.group
   const self = group?.projects.find((p) => p.id === project.id)
   if (!group?.repository || !self?.inherits_repository) return null
@@ -42,8 +44,8 @@ export function FollowedRepositoryNotice({
       await invalidate()
       onChanged?.()
       toast.success(`${project.name} now manages its own repository and branch`)
-    } catch (err) {
-      toast.error(getErrorMessage(err, 'Could not stop following the project'))
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

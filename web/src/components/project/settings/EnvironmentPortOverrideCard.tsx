@@ -92,7 +92,6 @@ export function EnvironmentPortOverrideCard({
       {
         loading: 'Updating port override...',
         success: 'Port override updated successfully',
-        error: 'Failed to update port override',
       }
     )
     queryClient.invalidateQueries({ queryKey: ['environments'] })

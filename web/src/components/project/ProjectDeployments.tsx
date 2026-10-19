@@ -71,6 +71,7 @@ import {
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 import { projectDeploymentsRefetchInterval } from '@/lib/recent-deployments'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 import {
   AUTO_REFRESH_MAX_POLLS,
   defaultDeployEnvironment,
@@ -601,10 +602,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       setImageDialogOpen(false)
       setImageEnv('')
       refetch()
-    } catch (e) {
-      toast.error(
-        (e as { detail?: string })?.detail || 'Failed to deploy image'
-      )
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -625,7 +624,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         const d = (await uploadRes.json().catch(() => null)) as {
           detail?: string
         } | null
-        throw new Error(d?.detail || 'Upload failed')
+        // Not a mutation, so the app-wide handler never sees this failure.
+        toast.error('Failed to upload static files', {
+          description: d?.detail || `Upload failed (HTTP ${uploadRes.status})`,
+        })
+        return
       }
       const bundle = (await uploadRes.json()) as { id: number }
       await deployFromStaticMut.mutateAsync({
@@ -637,12 +640,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       setStaticFile(null)
       setStaticEnv('')
       refetch()
-    } catch (e) {
-      toast.error(
-        (e as { message?: string; detail?: string })?.message ||
-          (e as { detail?: string })?.detail ||
-          'Failed to deploy static files'
-      )
+    } catch (error) {
+      // A mutation failure is toasted by the app-wide handler; this only adds
+      // one for a network failure of the raw upload above.
+      reportSubmitFailure(error)
     } finally {
       setStaticUploading(false)
     }

@@ -157,7 +157,6 @@ export function DomainsManagement({
           reloadDomains()
           return `${domainName} renewed successfully`
         },
-        error: `Failed to renew ${domainName}`,
       }
     )
   }

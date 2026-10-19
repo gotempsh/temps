@@ -233,7 +233,13 @@ function DefaultModelSetting({ provider }: { provider: ProviderCatalogDto }) {
       (initialModel !== '' && !provider.models.includes(initialModel))
   )
   const [savingModel, setSavingModel] = useState(false)
-  const refreshModelsMutation = useMutation(refreshAiProviderModelsMutation())
+  const refreshModelsMutation = useMutation({
+    ...refreshAiProviderModelsMutation(),
+    meta: {
+      errorTitle:
+        'Could not refresh the provider models. Check its credential and try again',
+    },
+  })
 
   useEffect(() => {
     const fresh = provider.default_model ?? ''
@@ -296,13 +302,8 @@ function DefaultModelSetting({ provider }: { provider: ProviderCatalogDto }) {
             'Temps kept the last known model list because live discovery did not complete.',
         })
       }
-    } catch (cause) {
-      toast.error(`Could not refresh ${provider.name} models`, {
-        description: problemDetail(
-          cause,
-          'The provider did not return a model catalog. Check its credential and try again.'
-        ),
-      })
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

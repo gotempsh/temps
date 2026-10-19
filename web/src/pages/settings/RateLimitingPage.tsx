@@ -84,7 +84,7 @@ export function RateLimitingPage() {
       reset(data)
       toast.success('Rate limiting settings saved')
     } catch {
-      toast.error('Failed to save settings')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 

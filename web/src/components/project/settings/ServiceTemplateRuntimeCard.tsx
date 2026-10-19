@@ -60,7 +60,6 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
-import { getErrorMessage } from '@/utils/errorHandling'
 
 export function ServiceTemplateRuntimeCard({
   project,
@@ -77,6 +76,7 @@ export function ServiceTemplateRuntimeCard({
   })
   const updateRuntime = useMutation({
     ...updateServiceTemplateRuntimeMutation(),
+    meta: { errorTitle: 'Failed to save service runtime' },
   })
   const form = useForm<TemplateRuntimeDefaults>({
     resolver: zodResolver(templateRuntimeDefaultsSchema),
@@ -162,8 +162,6 @@ export function ServiceTemplateRuntimeCard({
       {
         loading: 'Saving service runtime…',
         success: 'Service runtime saved for the next deployment',
-        error: (error) =>
-          getErrorMessage(error, 'Failed to save service runtime'),
       }
     )
   }
@@ -496,6 +494,7 @@ export function ServiceTemplateUpgradeCard({
 }) {
   const upgrade = useMutation({
     ...upgradeProjectServiceTemplateMutation(),
+    meta: { errorTitle: 'Failed to update service template' },
   })
   const latest = instance.latest
   const requiredConfiguration = instance.required_configuration
@@ -564,8 +563,6 @@ export function ServiceTemplateUpgradeCard({
       {
         loading: `Applying ${latest.slug} ${latest.version}…`,
         success: 'Template update saved for the next deployment',
-        error: (error) =>
-          getErrorMessage(error, 'Failed to update service template'),
       }
     )
   }

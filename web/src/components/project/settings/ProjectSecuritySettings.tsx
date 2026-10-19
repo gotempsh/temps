@@ -252,7 +252,6 @@ export function ProjectSecuritySettings({
           {
             loading: 'Updating service settings...',
             success: 'Service settings updated successfully',
-            error: 'Failed to update service settings',
           }
         )
       }
@@ -268,7 +267,6 @@ export function ProjectSecuritySettings({
         {
           loading: 'Updating security configuration...',
           success: 'Security configuration updated successfully',
-          error: 'Failed to update security configuration',
         }
       )
 

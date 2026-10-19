@@ -327,6 +327,7 @@ function JoinTokenSection() {
   })
   const generateToken = useMutation({
     ...generateJoinTokenMutation(),
+    meta: { errorTitle: 'Failed to generate join token' },
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: getJoinTokenStatusOptions().queryKey,
@@ -338,6 +339,7 @@ function JoinTokenSection() {
   })
   const revokeToken = useMutation({
     ...revokeJoinTokenMutation(),
+    meta: { errorTitle: 'Failed to revoke join token' },
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: getJoinTokenStatusOptions().queryKey,
@@ -355,7 +357,7 @@ function JoinTokenSection() {
       setGeneratedToken(result.token)
       toast.success('Join token generated')
     } catch {
-      toast.error('Failed to generate join token')
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 
@@ -365,7 +367,7 @@ function JoinTokenSection() {
       setGeneratedToken(null)
       toast.success('Join token revoked')
     } catch {
-      toast.error('Failed to revoke join token')
+      // The app-wide mutation handler already toasts this failure.
     }
   }
 

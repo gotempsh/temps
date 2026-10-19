@@ -129,10 +129,7 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       ) {
         return
       }
-      const problem = error as { detail?: string; message?: string }
-      toast.error(
-        problem.detail || problem.message || 'Failed to update service'
-      )
+      // Any other failure is toasted by the app-wide mutation handler.
       return
     }
     toast.success('Service updated successfully', { id: toastId })
@@ -156,7 +153,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       {
         loading: 'Updating cross-service trace sharing...',
         success: 'Cross-service trace sharing updated',
-        error: 'Failed to update cross-service trace sharing',
       }
     )
     refetch()
@@ -175,7 +171,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       {
         loading: 'Updating source context setting...',
         success: 'Error tracking source context updated',
-        error: 'Failed to update source context setting',
       }
     )
     refetch()
@@ -202,7 +197,6 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
             navigate('/projects')
             return 'Service deleted'
           },
-          error: 'Failed to delete service',
         }
       )
     } catch (error) {
