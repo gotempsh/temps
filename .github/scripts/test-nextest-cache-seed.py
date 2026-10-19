@@ -149,22 +149,39 @@ class SeedSelectionTests(unittest.TestCase):
                 ["seed-name=", "artifact-name=", "run-id=", "publish-current=false"],
             )
 
-    def test_fingerprint_failure_builds_cold_without_publishing(self) -> None:
+    def assert_fingerprint_failure_builds_cold(
+        self, rustc: mock.Mock, lockfile_name: str
+    ) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = Path(temp_dir) / "outputs"
+            lockfile = Path(temp_dir) / lockfile_name
+            if lockfile_name == "Cargo.lock":
+                lockfile.write_text("lock", encoding="utf-8")
             environment = {
                 "GITHUB_REPOSITORY": "gotempsh/temps",
                 "GH_TOKEN": "test-token",
                 "GITHUB_OUTPUT": str(output_path),
             }
-            with mock.patch.dict(os.environ, environment, clear=False):
-                self.assertEqual(
-                    MODULE.find_seed(MODULE.SEED_NAME, Path(temp_dir) / "missing.lock"), 0
-                )
+            with mock.patch.dict(os.environ, environment, clear=False), mock.patch.object(
+                MODULE.subprocess, "run", rustc
+            ), mock.patch.object(MODULE, "github_seed_data") as seed_data:
+                self.assertEqual(MODULE.find_seed(MODULE.SEED_NAME, lockfile), 0)
+            rustc.assert_called_once()
+            seed_data.assert_not_called()
             self.assertEqual(
                 output_path.read_text(encoding="utf-8").splitlines(),
                 ["seed-name=", "artifact-name=", "run-id=", "publish-current=false"],
             )
+
+    def test_missing_lockfile_builds_cold_without_publishing(self) -> None:
+        rustc = mock.Mock(
+            return_value=subprocess.CompletedProcess(["rustc", "-vV"], 0, stdout="rustc 1.90.0\n")
+        )
+        self.assert_fingerprint_failure_builds_cold(rustc, "missing.lock")
+
+    def test_rustc_failure_builds_cold_without_publishing(self) -> None:
+        rustc = mock.Mock(side_effect=subprocess.CalledProcessError(1, ["rustc", "-vV"]))
+        self.assert_fingerprint_failure_builds_cold(rustc, "Cargo.lock")
 
     def test_fingerprint_tracks_lockfile_and_compiler(self) -> None:
         base = MODULE.build_fingerprint(b"lock-a", "rustc 1.90.0")
