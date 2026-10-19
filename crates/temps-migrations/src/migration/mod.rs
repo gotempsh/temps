@@ -17,6 +17,7 @@ pub mod m20261016_000002_ci_build_dispatch;
 mod m20261017_000001_deployment_health_probes;
 pub mod m20261017_000001_retain_ci_cancellation;
 pub mod m20261017_000002_runtime_health;
+mod m20261019_000001_mfa_verification_guards;
 
 pub use sea_orm_migration::prelude::*;
 
@@ -767,6 +768,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261017_000001_retain_ci_cancellation::Migration),
             Box::new(m20261017_000001_deployment_health_probes::Migration),
             Box::new(m20261017_000002_runtime_health::Migration),
+            Box::new(m20261019_000001_mfa_verification_guards::Migration),
         ]
     }
 }

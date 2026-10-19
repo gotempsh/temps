@@ -173,16 +173,15 @@ impl AuthMiddleware {
                     .await
                 {
                     let session_user = verified.user;
-                    let user_role = if self
+                    // Resolved from the database on every request (never
+                    // cached on the session), so a role removal applies to
+                    // this session's very next request. A lookup failure
+                    // degrades to the least-privileged session role.
+                    let user_role = self
                         .user_service
-                        .is_admin(session_user.id)
+                        .current_session_role(session_user.id)
                         .await
-                        .unwrap_or(false)
-                    {
-                        crate::permissions::Role::Admin
-                    } else {
-                        crate::permissions::Role::User
-                    };
+                        .unwrap_or(crate::permissions::Role::User);
                     user = Some(session_user.clone());
 
                     Some(crate::context::AuthContext::new_persisted_session(

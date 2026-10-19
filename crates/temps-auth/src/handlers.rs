@@ -154,6 +154,22 @@ async fn record_pending_login(
     }
 }
 
+/// Response for a second-factor attempt refused because the account is in a
+/// lockout window. Deliberately says nothing about whether the code was
+/// right: it was not evaluated.
+fn mfa_locked_problem(retry_after_seconds: i64) -> Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+        .type_("https://temps.sh/probs/mfa-locked")
+        .title("Too Many Verification Attempts")
+        .detail(format!(
+            "Too many incorrect verification codes. Try again in {} seconds.",
+            retry_after_seconds
+        ))
+        .value("error_code", "MFA_LOCKED")
+        .value("retry_after_seconds", retry_after_seconds)
+        .build()
+}
+
 fn invalid_mfa_problem() -> Problem {
     problem_new(StatusCode::UNAUTHORIZED)
         .with_title("MFA Verification Failed")
@@ -290,6 +306,7 @@ pub async fn logout(
         (status = 204, description = "MFA verification successful"),
         (status = 401, description = "Invalid MFA code"),
         (status = 400, description = "Invalid request"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Authentication"
@@ -507,6 +524,13 @@ pub async fn verify_mfa_challenge(
             .await;
             Err(invalid_mfa_problem())
         }
+        Err(crate::auth_service::MfaChallengeError::LockedOut {
+            user_id,
+            retry_after_seconds,
+        }) => {
+            record_mfa_rejection(auth_state.as_ref(), &metadata, Some(user_id), "locked_out").await;
+            Err(mfa_locked_problem(retry_after_seconds))
+        }
         Err(error) => {
             error!("MFA verification infrastructure failed: {}", error);
             Err(problem_new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -590,6 +614,7 @@ pub async fn verify_step_up(
         Err(crate::StepUpError::SessionRequired) => (false, Some("session_required")),
         Err(crate::StepUpError::MfaNotConfigured { .. }) => (false, Some("mfa_not_configured")),
         Err(crate::StepUpError::InvalidCode { .. }) => (false, Some("invalid_code")),
+        Err(crate::StepUpError::LockedOut { .. }) => (false, Some("locked_out")),
         Err(crate::StepUpError::UserNotFound { .. }) => (false, Some("user_not_found")),
         Err(crate::StepUpError::SessionNotFound { .. }) => (false, Some("session_not_found")),
         Err(crate::StepUpError::Verification { .. }) => (false, Some("verification_failed")),
@@ -622,6 +647,10 @@ pub async fn verify_step_up(
                 .value("error_code", "STEP_UP_CODE_INVALID")
                 .build())
         }
+        Err(crate::StepUpError::LockedOut {
+            retry_after_seconds,
+            ..
+        }) => Err(mfa_locked_problem(retry_after_seconds)),
         Err(crate::StepUpError::SessionNotFound { .. })
         | Err(crate::StepUpError::UserNotFound { .. }) => {
             Err(temps_core::error_builder::unauthorized()
@@ -1858,6 +1887,10 @@ impl From<UserServiceError> for Problem {
                     .with_title("Invalid Current Password")
                     .with_detail("The current password you entered is incorrect.")
             }
+            UserServiceError::MfaLocked {
+                retry_after_seconds,
+                ..
+            } => mfa_locked_problem(retry_after_seconds),
             UserServiceError::PasswordResetOnDeletedUser { user_id } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_title("User Deleted")
@@ -2758,6 +2791,7 @@ async fn setup_mfa(
         (status = 400, description = "Validation error (weak password, same as current, MFA missing)"),
         (status = 401, description = "Current password incorrect or MFA code invalid"),
         (status = 403, description = "Account has no password set (SSO only)"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -2834,6 +2868,10 @@ async fn change_password_self(
             crate::auth_service::AuthError::InvalidMfaCode => problem_new(StatusCode::UNAUTHORIZED)
                 .with_title("Invalid MFA Code")
                 .with_detail("The MFA code you entered is incorrect or expired."),
+            crate::auth_service::AuthError::MfaLockedOut {
+                retry_after_seconds,
+                ..
+            } => mfa_locked_problem(retry_after_seconds),
             crate::auth_service::AuthError::SamePassword => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Same Password")
                 .with_detail("The new password must be different from the current one."),
@@ -2883,7 +2921,7 @@ async fn verify_and_enable_mfa(
 
     app_state
         .user_service
-        .verify_and_enable_mfa(user.id, &req.code)
+        .verify_and_enable_mfa(user.id, &req.code, auth.session_id())
         .await?;
     // Create audit log
     let audit_context = AuditContext {
@@ -2914,6 +2952,7 @@ async fn verify_and_enable_mfa(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid verification code"),
+        (status = 429, description = "Second factor locked after repeated wrong codes"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -3867,8 +3906,22 @@ mod tests {
             pending.mfa_secret = Some(SECRET_BASE32.to_string());
             let mut enabled = pending.clone();
             enabled.mfa_enabled = true;
+            // Lock the user, read the (empty) guard, upsert it, persist
+            // `mfa_enabled`, then revoke the user's other sessions.
             let db = MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![pending], vec![enabled]])
+                .append_query_results([vec![pending]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+                .append_query_results([vec![enabled]])
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                ])
                 .into_connection();
             let state = auth_state_with_audit(db, audit.clone());
 
@@ -3898,6 +3951,7 @@ mod tests {
             pending.mfa_secret = Some(SECRET_BASE32.to_string());
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
                 .into_connection();
             let state = auth_state_with_audit(db, Arc::new(NoopAuditLogger));
 
@@ -4283,5 +4337,241 @@ mod tests {
         assert!(!summary.slug.is_empty());
         // Slug must carry the hash suffix (separated by '-')
         assert!(summary.slug.contains('-'));
+    }
+
+    /// Second-factor hardening driven through the real routes and the
+    /// production session middleware.
+    mod mfa_http {
+        use crate::http_test_support::{
+            auth_state, insert_user, mfa_challenge_cookie, router, send, send_with_headers,
+            session_cookie,
+        };
+        use crate::mfa_guard::test_support::{code_at, new_secret};
+        use argon2::PasswordHasher;
+        use axum::http::StatusCode;
+        use chrono::Utc;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::users;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error) => {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+            }
+        }
+
+        /// A user with a stored TOTP secret and, optionally, recovery codes.
+        async fn mfa_user(
+            db: &DatabaseConnection,
+            mfa_enabled: bool,
+            recovery_codes: &[&str],
+        ) -> (users::Model, String) {
+            let user = insert_user(db, &format!("mfa-{}@example.com", uuid::Uuid::new_v4())).await;
+            let secret = new_secret();
+            let hashes: Vec<String> = recovery_codes
+                .iter()
+                .map(|code| {
+                    argon2::Argon2::default()
+                        .hash_password(code.as_bytes())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect();
+            let mut update: users::ActiveModel = user.into();
+            update.mfa_secret = Set(Some(secret.clone()));
+            update.mfa_enabled = Set(mfa_enabled);
+            update.mfa_recovery_codes = Set(Some(serde_json::to_string(&hashes).unwrap()));
+            (update.update(db).await.unwrap(), secret)
+        }
+
+        /// A six-digit code that is not valid anywhere in the current window.
+        fn wrong_code(secret: &str) -> String {
+            let now = Utc::now();
+            let valid: Vec<String> = [-30, 0, 30]
+                .iter()
+                .map(|offset| code_at(secret, now + chrono::Duration::seconds(*offset)))
+                .collect();
+            (0..1_000_000)
+                .map(|n| format!("{n:06}"))
+                .find(|candidate| !valid.contains(candidate))
+                .unwrap()
+        }
+
+        #[tokio::test]
+        async fn enabling_mfa_signs_out_every_other_session() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, false, &[]).await;
+            let enrolling = session_cookie(&state, user.id).await;
+            let other = session_cookie(&state, user.id).await;
+            for cookie in [&enrolling, &other] {
+                let (status, body) =
+                    send(&app, "GET", "/user/me", Some(("cookie", cookie)), None).await;
+                assert_eq!(status, StatusCode::OK, "before enrolment: {body}");
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/users/me/mfa/verify",
+                Some(("cookie", &enrolling)),
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "enable MFA: {body}");
+
+            let (status, _) = send(&app, "GET", "/user/me", Some(("cookie", &other)), None).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a session that predates MFA must be signed out"
+            );
+            let (status, body) =
+                send(&app, "GET", "/user/me", Some(("cookie", &enrolling)), None).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the enrolling session stays: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn recovery_code_completes_sign_in_exactly_once() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, _) = mfa_user(&db, true, &["482915", "730264"]).await;
+            let code = serde_json::json!({ "code": "482915" });
+
+            let first = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &first)),
+                Some(code.clone()),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "first use: {body}");
+
+            let second = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &second)),
+                Some(code),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a recovery code is single use: {body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn totp_code_cannot_complete_two_sign_ins() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let code = serde_json::json!({ "code": code_at(&secret, Utc::now()) });
+
+            let mut statuses = Vec::new();
+            for _ in 0..2 {
+                let challenge = mfa_challenge_cookie(&state, user.id).await;
+                let (status, _) = send(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    Some(("cookie", &challenge)),
+                    Some(code.clone()),
+                )
+                .await;
+                statuses.push(status);
+            }
+            assert_eq!(statuses, [StatusCode::NO_CONTENT, StatusCode::UNAUTHORIZED]);
+        }
+
+        #[tokio::test]
+        async fn rotating_client_addresses_does_not_escape_the_per_user_lockout() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let wrong = serde_json::json!({ "code": wrong_code(&secret) });
+
+            // Every request comes from a new address, so the per-IP limiter
+            // never engages; a fresh challenge replaces each discarded one.
+            let mut address = 0;
+            let mut challenge = mfa_challenge_cookie(&state, user.id).await;
+            for attempt in 1..=crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+                address += 1;
+                let forwarded = format!("198.51.100.{address}");
+                let (status, body) = send_with_headers(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    &[("cookie", &challenge), ("x-forwarded-for", &forwarded)],
+                    Some(wrong.clone()),
+                )
+                .await;
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "attempt {attempt}: {body}"
+                );
+                if attempt % crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE == 0 {
+                    let (status, _) = send_with_headers(
+                        &app,
+                        "POST",
+                        "/auth/verify-mfa",
+                        &[
+                            ("cookie", &challenge),
+                            ("x-forwarded-for", "198.51.100.250"),
+                        ],
+                        Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        StatusCode::UNAUTHORIZED,
+                        "an exhausted challenge must not accept even the right code"
+                    );
+                    challenge = mfa_challenge_cookie(&state, user.id).await;
+                }
+            }
+
+            let fresh = mfa_challenge_cookie(&state, user.id).await;
+            let (status, body) = send_with_headers(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                &[("cookie", &fresh), ("x-forwarded-for", "203.0.113.7")],
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+            assert_eq!(body["error_code"], "MFA_LOCKED");
+            assert!(body["retry_after_seconds"].as_i64().unwrap() > 0);
+        }
     }
 }

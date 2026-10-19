@@ -69,6 +69,13 @@ pub enum AuthError {
     MfaCodeRequired,
     #[error("MFA code is invalid")]
     InvalidMfaCode,
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    MfaLockedOut {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
     #[error("New password must differ from the current password")]
     SamePassword,
     #[error("Password complexity check failed: {0}")]
@@ -87,6 +94,13 @@ pub enum MfaChallengeError {
     UserNotFound { user_id: i32 },
     #[error("MFA code is invalid for user {user_id}")]
     InvalidCode { user_id: i32 },
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    LockedOut {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
     #[error("MFA verifier configuration is invalid for user {user_id}: {reason}")]
     VerifierConfiguration { user_id: i32, reason: String },
     #[error("MFA verification clock failed for user {user_id}: {reason}")]
@@ -97,6 +111,40 @@ pub enum MfaChallengeError {
         user_id: Option<i32>,
         #[source]
         source: sea_orm::DbErr,
+    },
+}
+
+impl MfaChallengeError {
+    fn from_guard(error: crate::mfa_guard::MfaGuardError) -> Self {
+        match error {
+            crate::mfa_guard::MfaGuardError::InvalidSecret { user_id, reason }
+            | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { user_id, reason } => {
+                MfaChallengeError::VerifierConfiguration { user_id, reason }
+            }
+            crate::mfa_guard::MfaGuardError::Database {
+                operation,
+                user_id,
+                source,
+            } => MfaChallengeError::Database {
+                operation,
+                user_id: Some(user_id),
+                source,
+            },
+        }
+    }
+}
+
+/// Result of one sign-in challenge transaction. Rejections are `Ok` values so
+/// the transaction commits the failure counters before the caller reports
+/// the rejection as an error.
+enum ChallengeOutcome {
+    Verified(Box<temps_entities::users::Model>, Option<String>),
+    Rejected {
+        user_id: i32,
+    },
+    Locked {
+        user_id: i32,
+        retry_after_seconds: i64,
     },
 }
 
@@ -432,6 +480,20 @@ impl AuthService {
         Ok(token)
     }
 
+    /// Spend a pending sign-in challenge with a TOTP code or, once MFA is
+    /// enrolled, a recovery code.
+    ///
+    /// Everything happens under the user's exclusive row lock:
+    /// - a TOTP code is accepted only if its step is newer than the last
+    ///   accepted one, so a code cannot sign in twice;
+    /// - a recovery code is burned in the same transaction that accepts it;
+    /// - a wrong code is counted against the challenge (discarded after
+    ///   [`crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE`] misses) and
+    ///   against the user (locked out past
+    ///   [`crate::mfa_guard::USER_LOCKOUT_THRESHOLD`]), and those counters are
+    ///   committed before the rejection is returned;
+    /// - completing a first-time enrolment here revokes every other session,
+    ///   matching self-service enrolment.
     pub(crate) async fn verify_mfa_challenge_with_origin(
         &self,
         session_token: &str,
@@ -439,83 +501,182 @@ impl AuthService {
     ) -> Result<(temps_entities::users::Model, Option<String>), MfaChallengeError> {
         let session_token = session_token.to_owned();
         let code = code.to_owned();
-        self.db
-            .transaction::<_, (temps_entities::users::Model, Option<String>), MfaChallengeError>(
-                |transaction| {
-                    Box::pin(async move {
-                        // Get the user from the temporary session. Require mfa_pending so a
-                        // real (fully authenticated) session token can never be spent as an
-                        // MFA challenge -- the discriminator cuts both ways.
-                        let session = temps_entities::sessions::Entity::find()
-                            .filter(
-                                temps_entities::sessions::Column::SessionToken.eq(&session_token),
-                            )
-                            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
-                            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-                            .one(transaction)
+        let outcome = self
+            .db
+            .transaction::<_, ChallengeOutcome, MfaChallengeError>(|transaction| {
+                Box::pin(async move {
+                    // Get the user from the temporary session. Require mfa_pending so a
+                    // real (fully authenticated) session token can never be spent as an
+                    // MFA challenge -- the discriminator cuts both ways.
+                    let pending = temps_entities::sessions::Entity::find()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the pending session",
+                            user_id: None,
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
+
+                    let user = temps_entities::users::Entity::find_by_id(pending.user_id)
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the challenge user",
+                            user_id: Some(pending.user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::UserNotFound {
+                            user_id: pending.user_id,
+                        })?;
+                    let user_id = user.id;
+
+                    // Re-read the challenge now that the user lock serializes every
+                    // writer: its failure count is current, and a challenge a
+                    // concurrent request already spent or discarded is gone.
+                    let session = temps_entities::sessions::Entity::find_by_id(pending.id)
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "lock the pending session",
+                            user_id: Some(user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
+                    if session.mfa_failed_attempts
+                        >= crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE
+                    {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    let now = Utc::now();
+                    let guard = crate::mfa_guard::load_guard(transaction, user_id)
+                        .await
+                        .map_err(MfaChallengeError::from_guard)?;
+                    if let Some(retry_after_seconds) = guard.lockout_remaining_seconds(now) {
+                        return Ok(ChallengeOutcome::Locked {
+                            user_id,
+                            retry_after_seconds,
+                        });
+                    }
+
+                    // Recovery codes stand in for an enrolled authenticator; they can
+                    // never confirm a first-time enrolment.
+                    let allow_recovery_codes = user.mfa_enabled;
+                    let factor = crate::mfa_guard::check_factor(
+                        &user,
+                        guard.last_totp_step,
+                        &code,
+                        allow_recovery_codes,
+                        now,
+                    )
+                    .map_err(MfaChallengeError::from_guard)?;
+
+                    let Some(factor) = factor else {
+                        crate::mfa_guard::record_failure(transaction, user_id, &guard, now)
                             .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "load the pending session",
-                                user_id: None,
-                                source,
-                            })?
-                            .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
-
-                        let user = temps_entities::users::Entity::find_by_id(session.user_id)
-                            .lock_exclusive()
-                            .one(transaction)
-                            .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "load the challenge user",
-                                user_id: Some(session.user_id),
-                                source,
-                            })?
-                            .ok_or(MfaChallengeError::UserNotFound {
-                                user_id: session.user_id,
-                            })?;
-
-                        // Verify the MFA code
-                        if !Self::verify_totp_code(&user, &code)? {
-                            return Err(MfaChallengeError::InvalidCode { user_id: user.id });
-                        }
-
-                        let mut verified_user = user;
-                        if !verified_user.mfa_enabled {
-                            let mut user_update: temps_entities::users::ActiveModel =
-                                verified_user.into();
-                            user_update.mfa_enabled = Set(true);
-                            verified_user =
-                                user_update.update(transaction).await.map_err(|source| {
-                                    MfaChallengeError::Database {
-                                        operation: "enable MFA for the challenge user",
-                                        user_id: Some(session.user_id),
-                                        source,
-                                    }
+                            .map_err(MfaChallengeError::from_guard)?;
+                        let attempts = session.mfa_failed_attempts.saturating_add(1);
+                        if attempts >= crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                            temps_entities::sessions::Entity::delete_by_id(session.id)
+                                .exec(transaction)
+                                .await
+                                .map_err(|source| MfaChallengeError::Database {
+                                    operation: "discard the exhausted pending session",
+                                    user_id: Some(user_id),
+                                    source,
                                 })?;
-                        }
-
-                        // Consume the challenge in the same transaction as enrollment so a
-                        // failed update never strands the user without a retryable challenge.
-                        let deletion = temps_entities::sessions::Entity::delete_many()
-                            .filter(
-                                temps_entities::sessions::Column::SessionToken.eq(&session_token),
-                            )
-                            .filter(temps_entities::sessions::Column::MfaPending.eq(true))
-                            .exec(transaction)
-                            .await
-                            .map_err(|source| MfaChallengeError::Database {
-                                operation: "consume the verified pending session",
-                                user_id: Some(verified_user.id),
-                                source,
+                            warn!(
+                                user_id,
+                                attempts, "MFA challenge discarded after repeated wrong codes"
+                            );
+                        } else {
+                            let mut challenge: temps_entities::sessions::ActiveModel =
+                                session.into();
+                            challenge.mfa_failed_attempts = Set(attempts);
+                            challenge.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "count a wrong code on the pending session",
+                                    user_id: Some(user_id),
+                                    source,
+                                }
                             })?;
-                        if deletion.rows_affected != 1 {
-                            return Err(MfaChallengeError::InvalidOrExpiredSession);
                         }
+                        return Ok(ChallengeOutcome::Rejected { user_id });
+                    };
 
-                        Ok((verified_user, session.mfa_pending_origin))
-                    })
-                },
-            )
+                    let mut verified_user =
+                        crate::mfa_guard::record_success(transaction, user, &guard, &factor, now)
+                            .await
+                            .map_err(MfaChallengeError::from_guard)?;
+                    if matches!(
+                        factor,
+                        crate::mfa_guard::AcceptedFactor::RecoveryCode { .. }
+                    ) {
+                        info!(user_id, "MFA challenge satisfied with a recovery code");
+                    }
+
+                    if !verified_user.mfa_enabled {
+                        let mut user_update: temps_entities::users::ActiveModel =
+                            verified_user.into();
+                        user_update.mfa_enabled = Set(true);
+                        verified_user =
+                            user_update.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "enable MFA for the challenge user",
+                                    user_id: Some(user_id),
+                                    source,
+                                }
+                            })?;
+                        // Sessions created before the second factor existed must not
+                        // outlive its enrolment. The challenge itself is consumed below.
+                        let revoked = crate::user_service::revoke_sessions_except(
+                            transaction,
+                            user_id,
+                            Some(session.id),
+                        )
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "revoke sessions that predate MFA enrolment",
+                            user_id: Some(user_id),
+                            source,
+                        })?;
+                        info!(
+                            user_id,
+                            revoked_sessions = revoked,
+                            "MFA enabled at sign-in; other sessions revoked"
+                        );
+                    }
+
+                    // Consume the challenge in the same transaction as enrollment so a
+                    // failed update never strands the user without a retryable challenge.
+                    let deletion = temps_entities::sessions::Entity::delete_many()
+                        .filter(temps_entities::sessions::Column::Id.eq(session.id))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .exec(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "consume the verified pending session",
+                            user_id: Some(user_id),
+                            source,
+                        })?;
+                    if deletion.rows_affected != 1 {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    Ok(ChallengeOutcome::Verified(
+                        Box::new(verified_user),
+                        session.mfa_pending_origin,
+                    ))
+                })
+            })
             .await
             .map_err(|error| match error {
                 sea_orm::TransactionError::Transaction(error) => error,
@@ -524,51 +685,23 @@ impl AuthService {
                     user_id: None,
                     source,
                 },
-            })
-    }
+            })?;
 
-    fn verify_totp_code(
-        user: &temps_entities::users::Model,
-        code: &str,
-    ) -> Result<bool, MfaChallengeError> {
-        match &user.mfa_secret {
-            Some(secret) => {
-                use totp_rs::{Algorithm, Builder};
-
-                let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
-                    .ok_or(MfaChallengeError::VerifierConfiguration {
-                    user_id: user.id,
-                    reason: "stored secret is not valid base32".to_string(),
-                })?;
-
-                // Algorithm::SHA1, 6 digits, skew 1, step 30 — these are the
-                // parameters that were used when the secret was enrolled (see
-                // `generate_mfa_setup_candidate`). They must not silently change.
-                // `build()` (not `build_noncompliant()`) so a malformed stored
-                // secret still fails loudly instead of constructing a Totp that
-                // silently never validates.
-                let totp = Builder::new()
-                    .with_algorithm(Algorithm::SHA1)
-                    .with_digits(6)
-                    .with_skew(1)
-                    .with_step_duration(30)
-                    .with_secret(decoded)
-                    .build()
-                    .map_err(|error| MfaChallengeError::VerifierConfiguration {
-                        user_id: user.id,
-                        reason: format!("TOTP verifier cannot be initialized: {error}"),
-                    })?;
-
-                // check_current now returns Option<u64>: Some(step) = valid,
-                // None = invalid. There is no longer a fallible clock path.
-                Ok(totp.check_current(code).is_some())
+        match outcome {
+            ChallengeOutcome::Verified(user, origin) => Ok((*user, origin)),
+            ChallengeOutcome::Rejected { user_id } => {
+                Err(MfaChallengeError::InvalidCode { user_id })
             }
-            None => Err(MfaChallengeError::VerifierConfiguration {
-                user_id: user.id,
-                reason: "stored MFA secret is missing".to_string(),
+            ChallengeOutcome::Locked {
+                user_id,
+                retry_after_seconds,
+            } => Err(MfaChallengeError::LockedOut {
+                user_id,
+                retry_after_seconds,
             }),
         }
     }
+
     // Register a new user with email/password
     pub async fn register_user(
         &self,
@@ -1044,13 +1177,23 @@ impl AuthService {
             // Reuse the user_service verifier so behavior matches login
             // exactly (TOTP skew window, recovery code burn-on-use).
             let user_service = crate::user_service::UserService::new(self.db.clone());
-            let mfa_ok = user_service
-                .verify_mfa_code(user_id, code)
-                .await
-                .map_err(|e| {
-                    error!("MFA verification error during password change: {}", e);
-                    AuthError::InvalidMfaCode
-                })?;
+            let mfa_ok =
+                user_service
+                    .verify_mfa_code(user_id, code)
+                    .await
+                    .map_err(|e| match e {
+                        crate::user_service::UserServiceError::MfaLocked {
+                            user_id,
+                            retry_after_seconds,
+                        } => AuthError::MfaLockedOut {
+                            user_id,
+                            retry_after_seconds,
+                        },
+                        other => {
+                            error!("MFA verification error during password change: {}", other);
+                            AuthError::InvalidMfaCode
+                        }
+                    })?;
             if !mfa_ok {
                 return Err(AuthError::InvalidMfaCode);
             }
@@ -1581,12 +1724,17 @@ mod tests {
 
         // Consume another valid challenge before revocation, then finish the
         // delayed MFA request after teardown has deleted every visible session.
+        // The first code's step is spent, so this one comes from the next step.
+        let next_code = crate::mfa_guard::test_support::code_at(
+            user.mfa_secret.as_deref().unwrap(),
+            Utc::now() + Duration::seconds(30),
+        );
         let pending = auth
             .create_mfa_session(user.id, &format!("oidc:{}", provider.id))
             .await
             .unwrap();
         let (verified, origin) = auth
-            .verify_mfa_challenge_with_origin(&pending, &code)
+            .verify_mfa_challenge_with_origin(&pending, &next_code)
             .await
             .unwrap();
         auth.create_oidc_session(user.id, provider.id)
@@ -2845,10 +2993,20 @@ mod tests {
             mfa_pending: true,
             step_up_expires_at: None,
             mfa_pending_origin: Some("password".to_string()),
+            mfa_failed_attempts: 0,
         };
+        // Query order: pending challenge, user (locked), challenge re-read
+        // under the user lock, guard row (absent). Exec order: guard upsert
+        // recording the accepted step, then the failing challenge delete.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![session]])
+            .append_query_results([vec![session.clone()]])
             .append_query_results([vec![user]])
+            .append_query_results([vec![session]])
+            .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 7,
+                rows_affected: 1,
+            }])
             .append_exec_errors([sea_orm::DbErr::Custom("session delete failed".to_string())])
             .into_connection();
         let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
@@ -3403,6 +3561,291 @@ mod tests {
         assert!(
             result.is_ok(),
             "a settings-lookup failure must not block a correct-password login"
+        );
+    }
+
+    // ---- Second-factor hardening: replay, throttling, recovery, enrolment ----
+
+    const HARDENING_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+    /// A six-digit code that is not valid anywhere in the current skew window.
+    fn code_outside_window() -> String {
+        let totp = crate::mfa_guard::build_totp(0, HARDENING_SECRET).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        (0..1_000_000)
+            .map(|n| format!("{:06}", n))
+            .find(|candidate| totp.check(candidate, now).is_none())
+            .unwrap()
+    }
+
+    async fn mfa_user_with_recovery(
+        db: &Arc<DatabaseConnection>,
+        email: &str,
+        mfa_enabled: bool,
+        recovery_codes: &[&str],
+    ) -> users::Model {
+        let hashes: Vec<String> = recovery_codes
+            .iter()
+            .map(|code| {
+                argon2::Argon2::default()
+                    .hash_password(code.as_bytes())
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set("Second Factor".to_string()),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            mfa_enabled: Set(mfa_enabled),
+            mfa_secret: Set(Some(HARDENING_SECRET.to_string())),
+            mfa_recovery_codes: Set(Some(serde_json::to_string(&hashes).unwrap())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+    }
+
+    async fn guard_row(
+        db: &Arc<DatabaseConnection>,
+        user_id: i32,
+    ) -> Option<temps_entities::user_mfa_guards::Model> {
+        temps_entities::user_mfa_guards::Entity::find_by_id(user_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn totp_code_is_rejected_for_a_second_challenge_in_the_same_step() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "replay@example.com", true, &[]).await;
+        let code = current_totp_code(HARDENING_SECRET);
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        auth_service
+            .verify_mfa_challenge(&first, &code)
+            .await
+            .expect("a fresh code signs in");
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let replay = auth_service.verify_mfa_challenge(&second, &code).await;
+        assert!(
+            matches!(replay, Err(MfaChallengeError::InvalidCode { user_id }) if user_id == user.id),
+            "the same TOTP code must not complete a second sign-in: {replay:?}"
+        );
+        assert!(guard_row(&db.db, user.id)
+            .await
+            .unwrap()
+            .last_totp_step
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn wrong_codes_discard_the_challenge_and_the_correct_code_is_then_rejected() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "exhaust@example.com", true, &[]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let wrong = code_outside_window();
+
+        for attempt in 1..=crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+            let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+            assert!(
+                matches!(result, Err(MfaChallengeError::InvalidCode { .. })),
+                "attempt {attempt} must be a plain rejection: {result:?}"
+            );
+        }
+
+        let pending = sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&challenge))
+            .one(db.db.as_ref())
+            .await
+            .unwrap();
+        assert!(pending.is_none(), "an exhausted challenge must be deleted");
+
+        let late = auth_service
+            .verify_mfa_challenge(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await;
+        assert!(
+            matches!(late, Err(MfaChallengeError::InvalidOrExpiredSession)),
+            "the correct code must not revive a discarded challenge: {late:?}"
+        );
+        assert_eq!(
+            guard_row(&db.db, user.id).await.unwrap().failed_attempts,
+            crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE,
+            "failures must survive the rejected transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_user_lockout_applies_across_fresh_challenges() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "lockout@example.com", true, &[]).await;
+        let wrong = code_outside_window();
+
+        let mut failures = 0;
+        while failures < crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+            // Each new challenge is what an attacker gets by re-sending the
+            // password, possibly from a different address.
+            let challenge = auth_service
+                .create_mfa_session(user.id, "password")
+                .await
+                .unwrap();
+            for _ in 0..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                if failures == crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+                    break;
+                }
+                let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+                assert!(matches!(result, Err(MfaChallengeError::InvalidCode { .. })));
+                failures += 1;
+            }
+        }
+
+        let fresh = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let locked = auth_service
+            .verify_mfa_challenge(&fresh, &current_totp_code(HARDENING_SECRET))
+            .await;
+        assert!(
+            matches!(
+                locked,
+                Err(MfaChallengeError::LockedOut { user_id, retry_after_seconds })
+                    if user_id == user.id && retry_after_seconds > 0
+            ),
+            "a correct code must be refused while locked: {locked:?}"
+        );
+        let guard = guard_row(&db.db, user.id).await.unwrap();
+        assert!(guard.locked_until.is_some_and(|until| until > Utc::now()));
+        assert_eq!(
+            guard.last_totp_step, None,
+            "a locked attempt accepts nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_verification_resets_failure_counters() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "reset@example.com", true, &[]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let wrong = code_outside_window();
+        for _ in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+            assert!(auth_service
+                .verify_mfa_challenge(&challenge, &wrong)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            guard_row(&db.db, user.id).await.unwrap().failed_attempts,
+            crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE - 1
+        );
+
+        auth_service
+            .verify_mfa_challenge(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await
+            .expect("the correct code still works below the limit");
+
+        let guard = guard_row(&db.db, user.id).await.unwrap();
+        assert_eq!(guard.failed_attempts, 0);
+        assert_eq!(guard.locked_until, None);
+    }
+
+    #[tokio::test]
+    async fn recovery_code_signs_in_once() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user =
+            mfa_user_with_recovery(&db.db, "recovery@example.com", true, &["482915", "730264"])
+                .await;
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (signed_in, _) = auth_service
+            .verify_mfa_challenge_with_origin(&first, "482915")
+            .await
+            .expect("an unused recovery code completes sign-in");
+        let remaining: Vec<String> =
+            serde_json::from_str(signed_in.mfa_recovery_codes.as_deref().unwrap()).unwrap();
+        assert_eq!(remaining.len(), 1, "the used code is burned");
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let reuse = auth_service.verify_mfa_challenge(&second, "482915").await;
+        assert!(
+            matches!(reuse, Err(MfaChallengeError::InvalidCode { .. })),
+            "a recovery code is single use: {reuse:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_code_cannot_confirm_a_first_time_enrolment() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "enrol-rc@example.com", false, &["193746"]).await;
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let result = auth_service
+            .verify_mfa_challenge(&challenge, "193746")
+            .await;
+        assert!(matches!(result, Err(MfaChallengeError::InvalidCode { .. })));
+    }
+
+    #[tokio::test]
+    async fn enrolment_at_sign_in_revokes_sessions_that_predate_it() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = mfa_user_with_recovery(&db.db, "enrol@example.com", false, &[]).await;
+        let pre_mfa_session = auth_service.create_session(user.id).await.unwrap();
+        assert!(auth_service.verify_session(&pre_mfa_session).await.is_ok());
+
+        let challenge = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (enrolled, _) = auth_service
+            .verify_mfa_challenge_with_origin(&challenge, &current_totp_code(HARDENING_SECRET))
+            .await
+            .expect("the enrolment code is accepted");
+        assert!(enrolled.mfa_enabled);
+
+        assert!(
+            matches!(
+                auth_service.verify_session(&pre_mfa_session).await,
+                Err(AuthError::NotFound(_))
+            ),
+            "a session established before MFA existed must stop authenticating"
         );
     }
 }

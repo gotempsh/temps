@@ -16,8 +16,11 @@ mod decorators;
 mod deployment_token_service;
 mod email_templates;
 pub mod handlers;
+#[cfg(test)]
+mod http_test_support;
 mod last_used_throttle;
 mod macros;
+mod mfa_guard;
 mod middleware;
 /// Public so other plugins (e.g. `temps-cloud`'s managed console-access
 /// provider, ADR-045 §4) can hold an `Arc<OidcService>` and reuse the same

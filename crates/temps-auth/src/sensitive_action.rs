@@ -215,6 +215,13 @@ pub enum StepUpError {
     MfaNotConfigured { user_id: i32 },
     #[error("MFA code is invalid for user {user_id}")]
     InvalidCode { user_id: i32 },
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    LockedOut {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
     #[error("User {user_id} was not found while verifying a sensitive action")]
     UserNotFound { user_id: i32 },
     #[error("Session {session_id} for user {user_id} is invalid or expired")]
@@ -270,6 +277,13 @@ impl StepUpService {
                 crate::user_service::UserServiceError::NotFound(_) => {
                     StepUpError::UserNotFound { user_id }
                 }
+                crate::user_service::UserServiceError::MfaLocked {
+                    retry_after_seconds,
+                    ..
+                } => StepUpError::LockedOut {
+                    user_id,
+                    retry_after_seconds,
+                },
                 crate::user_service::UserServiceError::Database { reason } => {
                     StepUpError::Database {
                         operation: "verify MFA",
@@ -284,6 +298,18 @@ impl StepUpService {
                 },
             })?;
         if !valid {
+            // The rejection was recorded against the user's failure counter
+            // inside this transaction; commit it so the per-user throttle
+            // sees it. Rolling back here would make every guess free.
+            transaction
+                .commit()
+                .await
+                .map_err(|error| StepUpError::Database {
+                    operation: "commit the rejected verification",
+                    user_id,
+                    session_id: Some(session_id),
+                    reason: error.to_string(),
+                })?;
             return Err(StepUpError::InvalidCode { user_id });
         }
 
@@ -434,6 +460,7 @@ mod tests {
             mfa_pending: false,
             step_up_expires_at,
             mfa_pending_origin: None,
+            mfa_failed_attempts: 0,
         }
     }
 
@@ -458,6 +485,13 @@ mod tests {
             oidc_provider_id: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    fn guard_upsert() -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 7,
+            rows_affected: 1,
         }
     }
 
@@ -675,10 +709,12 @@ mod tests {
         let active_session = session(None);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![test_user]])
+            .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
             .append_query_results([vec![active_session]])
             .append_query_results([vec![session(Some(
                 Utc::now() + Duration::minutes(STEP_UP_TTL_MINUTES),
             ))]])
+            .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
         let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db.clone())));
@@ -728,22 +764,45 @@ mod tests {
         let test_user = user(true);
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![test_user]])
+            .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+            .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
+        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db.clone())));
 
         let result = service.verify_and_elevate(7, 11, "not-a-code").await;
         assert!(matches!(
             result,
             Err(StepUpError::InvalidCode { user_id: 7 })
         ));
+
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service released the database")
+            .into_transaction_log();
+        let statements = log[0].statements();
+        assert!(
+            statements
+                .iter()
+                .any(|statement| statement.sql.contains("\"user_mfa_guards\"")
+                    && statement.sql.contains("failed_attempts")),
+            "a wrong code must be recorded against the per-user throttle"
+        );
+        assert!(
+            !statements
+                .iter()
+                .any(|statement| statement.sql.starts_with("UPDATE \"sessions\"")),
+            "a wrong code must not elevate"
+        );
     }
 
     #[tokio::test]
     async fn expired_session_is_rejected_without_committing_elevation() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![user(true)]])
+            .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
             .append_query_results([Vec::<temps_entities::sessions::Model>::new()])
+            .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
         let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
@@ -758,5 +817,107 @@ mod tests {
                 session_id: 11
             })
         ));
+    }
+
+    // ---- DB-backed: replay and per-user throttling on step-up ----
+
+    const STEP_UP_SECRET: &str = "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP";
+
+    async fn step_up_env() -> Option<(
+        temps_database::test_utils::TestDatabase,
+        StepUpService,
+        i32,
+        i32,
+    )> {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Docker not available, skipping test: {error}");
+                return None;
+            }
+        };
+        let user = temps_entities::users::ActiveModel {
+            email: Set("step-up@example.com".to_string()),
+            name: Set("Step Up".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(STEP_UP_SECRET.to_string())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let session = temps_entities::sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("step-up-session".to_string()),
+            expires_at: Set(Utc::now() + Duration::days(1)),
+            mfa_pending: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let service = StepUpService::new(db.db.clone(), Arc::new(UserService::new(db.db.clone())));
+        Some((db, service, user.id, session.id))
+    }
+
+    fn step_up_wrong_code() -> String {
+        let totp = crate::mfa_guard::build_totp(0, STEP_UP_SECRET).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        (0..1_000_000)
+            .map(|n| format!("{n:06}"))
+            .find(|candidate| totp.check(candidate, now).is_none())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn step_up_code_cannot_be_replayed() {
+        let Some((_db, service, user_id, session_id)) = step_up_env().await else {
+            return;
+        };
+        let code = current_totp_code();
+        service
+            .verify_and_elevate(user_id, session_id, &code)
+            .await
+            .expect("a fresh code elevates");
+        let replay = service.verify_and_elevate(user_id, session_id, &code).await;
+        assert!(
+            matches!(replay, Err(StepUpError::InvalidCode { .. })),
+            "the same TOTP code must not elevate twice: {replay:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn step_up_failures_are_persisted_and_lock_the_user() {
+        let Some((db, service, user_id, session_id)) = step_up_env().await else {
+            return;
+        };
+        let wrong = step_up_wrong_code();
+        for attempt in 1..=crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
+            let result = service
+                .verify_and_elevate(user_id, session_id, &wrong)
+                .await;
+            assert!(
+                matches!(result, Err(StepUpError::InvalidCode { .. })),
+                "attempt {attempt}: {result:?}"
+            );
+        }
+        let guard = temps_entities::user_mfa_guards::Entity::find_by_id(user_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .expect("failures must be committed, not rolled back");
+        assert_eq!(
+            guard.failed_attempts,
+            crate::mfa_guard::USER_LOCKOUT_THRESHOLD
+        );
+
+        let locked = service
+            .verify_and_elevate(user_id, session_id, &current_totp_code())
+            .await;
+        assert!(
+            matches!(locked, Err(StepUpError::LockedOut { retry_after_seconds, .. }) if retry_after_seconds > 0),
+            "a correct code must be refused while locked: {locked:?}"
+        );
     }
 }

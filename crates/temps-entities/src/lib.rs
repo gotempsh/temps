@@ -148,6 +148,7 @@ pub mod traefik_discovered_routes;
 pub mod traefik_route_certificates;
 pub mod types;
 pub mod upstream_config;
+pub mod user_mfa_guards;
 pub mod user_roles;
 pub mod users;
 

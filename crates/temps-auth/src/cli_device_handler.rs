@@ -1267,139 +1267,9 @@ mod tests {
     /// never exceeded the owner keeps working and CLI logout still revokes.
     mod owner_demotion_http {
         use super::*;
-        use axum::extract::connect_info::MockConnectInfo;
-        use temps_core::plugin::TempsMiddleware;
+        use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
         use temps_database::test_utils::TestDatabase;
         use temps_entities::types::RoleType;
-        use tower::ServiceExt;
-
-        struct NoopAudit;
-
-        #[async_trait::async_trait]
-        impl temps_core::AuditLogger for NoopAudit {
-            async fn create_audit_log(
-                &self,
-                _operation: &dyn temps_core::audit::AuditOperation,
-            ) -> anyhow::Result<()> {
-                Ok(())
-            }
-        }
-
-        struct NoopNotifications;
-
-        #[async_trait::async_trait]
-        impl temps_core::notifications::NotificationService for NoopNotifications {
-            async fn send_email(
-                &self,
-                _message: temps_core::notifications::EmailMessage,
-            ) -> Result<(), temps_core::notifications::NotificationError> {
-                Ok(())
-            }
-
-            async fn send_notification(
-                &self,
-                _notification: temps_core::notifications::NotificationData,
-            ) -> Result<(), temps_core::notifications::NotificationError> {
-                Ok(())
-            }
-
-            async fn is_configured(
-                &self,
-            ) -> Result<bool, temps_core::notifications::NotificationError> {
-                Ok(false)
-            }
-        }
-
-        async fn insert_request_metadata(mut request: Request<Body>, next: Next) -> Response {
-            let headers = request.headers().clone();
-            request.extensions_mut().insert(RequestMetadata {
-                ip_address: "127.0.0.1".to_string(),
-                user_agent: "temps-auth-test".to_string(),
-                headers,
-                visitor_id_cookie: None,
-                session_id_cookie: None,
-                base_url: "http://temps.test".to_string(),
-                scheme: "http".to_string(),
-                host: "temps.test".to_string(),
-                is_secure: false,
-            });
-            next.run(request).await
-        }
-
-        fn router(state: Arc<AuthState>, db: Arc<DatabaseConnection>) -> axum::Router {
-            let middleware = Arc::new(crate::temps_middleware::AuthMiddleware::new(
-                state.api_key_service.clone(),
-                state.auth_service.clone(),
-                state.user_service.clone(),
-                state.cookie_crypto.clone(),
-                db,
-                crate::permission_denial_recorder::PermissionDenialRecorder::new(Arc::new(
-                    NoopAudit,
-                )),
-            ));
-            crate::handlers::configure_routes()
-                .layer(axum::middleware::from_fn(
-                    move |request: Request<Body>, next: Next| {
-                        let middleware = middleware.clone();
-                        async move { middleware.execute(request, next).await }
-                    },
-                ))
-                .layer(axum::middleware::from_fn(insert_request_metadata))
-                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
-                .with_state(state)
-        }
-
-        async fn insert_user(db: &DatabaseConnection, email: &str) -> users::Model {
-            users::ActiveModel {
-                email: Set(email.to_string()),
-                name: Set(email.to_string()),
-                email_verified: Set(true),
-                mfa_enabled: Set(false),
-                created_at: Set(Utc::now()),
-                updated_at: Set(Utc::now()),
-                ..Default::default()
-            }
-            .insert(db)
-            .await
-            .expect("insert test user")
-        }
-
-        async fn session_cookie(state: &AuthState, user_id: i32) -> String {
-            let token = state
-                .auth_service
-                .create_session(user_id)
-                .await
-                .expect("create session");
-            let encrypted = state.cookie_crypto.encrypt(&token).expect("encrypt");
-            format!("session={encrypted}")
-        }
-
-        async fn send(
-            router: &axum::Router,
-            method: &str,
-            uri: &str,
-            auth: Option<(&str, &str)>,
-            body: Option<serde_json::Value>,
-        ) -> (StatusCode, serde_json::Value) {
-            let mut builder = Request::builder().method(method).uri(uri);
-            if let Some((header, value)) = auth {
-                builder = builder.header(header, value);
-            }
-            let request = match body {
-                Some(body) => builder
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string())),
-                None => builder.body(Body::empty()),
-            }
-            .expect("build request");
-            let response = router.clone().oneshot(request).await.expect("route");
-            let status = response.status();
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-                .await
-                .expect("read body");
-            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
-            (status, json)
-        }
 
         #[tokio::test]
         async fn admin_and_cli_device_keys_lose_admin_access_after_demotion() {
@@ -1411,16 +1281,7 @@ mod tests {
                 }
             };
             let db = test_db.db.clone();
-            let state = Arc::new(AuthState::new(
-                db.clone(),
-                Arc::new(NoopAudit),
-                Arc::new(temps_core::EncryptionService::new_from_password(
-                    "owner-demotion-http-test",
-                )),
-                Arc::new(temps_core::CookieCrypto::from_bytes(&[9; 32])),
-                Arc::new(NoopNotifications),
-                Arc::new(temps_core::telemetry::NoopTelemetryReporter),
-            ));
+            let state = auth_state(db.clone());
             let app = router(state.clone(), db.clone());
 
             state.user_service.initialize_roles().await.unwrap();

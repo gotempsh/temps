@@ -561,6 +561,7 @@ mod tests {
             mfa_pending: false,
             step_up_expires_at: None,
             mfa_pending_origin: None,
+            mfa_failed_attempts: 0,
         }
     }
 

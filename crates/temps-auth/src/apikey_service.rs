@@ -629,30 +629,16 @@ impl ApiKeyService {
 /// The role a user holds *right now*, resolved from `user_roles` on every
 /// call and never cached on a credential.
 ///
-/// Mirrors the mapping the session middleware applies to browser sessions
-/// (`admin` row present → [`Role::Admin`], otherwise [`Role::User`]), so an
-/// API key is bounded by exactly what its owner would get by signing in.
-/// Public so crates that re-resolve a key outside this service (plugin host
-/// bridge, AI tool refresh) apply the same ceiling.
+/// Delegates to `user_service::current_session_role`, the mapping the
+/// session middleware applies to browser sessions, so an API key is bounded by
+/// exactly what its owner would get by signing in. Public so crates that
+/// re-resolve a key outside this service (plugin host bridge, AI tool
+/// refresh) apply the same ceiling.
 pub async fn current_owner_role<C: sea_orm::ConnectionTrait>(
     db: &C,
     user_id: i32,
 ) -> Result<Role, sea_orm::DbErr> {
-    use sea_orm::{JoinType, QuerySelect, RelationTrait};
-    let admin_grants = temps_entities::user_roles::Entity::find()
-        .join(
-            JoinType::InnerJoin,
-            temps_entities::user_roles::Relation::Role.def(),
-        )
-        .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
-        .filter(temps_entities::roles::Column::Name.eq(Role::Admin.to_string()))
-        .count(db)
-        .await?;
-    Ok(if admin_grants > 0 {
-        Role::Admin
-    } else {
-        Role::User
-    })
+    crate::user_service::current_session_role(db, user_id).await
 }
 
 /// Narrow an API key's stored grant to what its owner's current role still

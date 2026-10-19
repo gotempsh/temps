@@ -126,6 +126,14 @@ pub enum UserServiceError {
     #[error("Cannot reset the password of deleted user {user_id}")]
     PasswordResetOnDeletedUser { user_id: i32 },
 
+    #[error(
+        "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
+    )]
+    MfaLocked {
+        user_id: i32,
+        retry_after_seconds: i64,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -141,6 +149,50 @@ impl From<sea_orm::DbErr> for UserServiceError {
             },
         }
     }
+}
+
+impl From<crate::mfa_guard::MfaGuardError> for UserServiceError {
+    fn from(error: crate::mfa_guard::MfaGuardError) -> Self {
+        match error {
+            crate::mfa_guard::MfaGuardError::Database { .. } => UserServiceError::Database {
+                reason: error.to_string(),
+            },
+            crate::mfa_guard::MfaGuardError::InvalidSecret { .. }
+            | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { .. } => {
+                UserServiceError::Mfa(error.to_string())
+            }
+        }
+    }
+}
+
+/// The role a browser session for `user_id` is granted right now: `Admin`
+/// while the user holds the `admin` role, `User` otherwise.
+///
+/// This is the single definition of "what the owner currently holds". The
+/// session middleware uses it on every request, and API-key validation uses
+/// it as the ceiling a key's stored scope is intersected with, so a key can
+/// never grant more than a fresh sign-in by its owner would. Read from the
+/// database on every call; nothing caches it, so a role removal takes effect
+/// on the very next request.
+pub(crate) async fn current_session_role<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> Result<crate::permissions::Role, sea_orm::DbErr> {
+    use sea_orm::{JoinType, PaginatorTrait, RelationTrait};
+    let admin_grants = temps_entities::user_roles::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            temps_entities::user_roles::Relation::Role.def(),
+        )
+        .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
+        .filter(temps_entities::roles::Column::Name.eq(RoleType::Admin.as_str()))
+        .count(conn)
+        .await?;
+    Ok(if admin_grants > 0 {
+        crate::permissions::Role::Admin
+    } else {
+        crate::permissions::Role::User
+    })
 }
 
 // Add a new struct for MFA setup data
@@ -343,6 +395,21 @@ where
     Ok((permit, result?))
 }
 
+/// Delete every session (full or pending) for `user_id` except `keep`.
+/// Returns how many rows were removed.
+pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+    keep: Option<i32>,
+) -> Result<u64, sea_orm::DbErr> {
+    let mut query = temps_entities::sessions::Entity::delete_many()
+        .filter(temps_entities::sessions::Column::UserId.eq(user_id));
+    if let Some(keep) = keep {
+        query = query.filter(temps_entities::sessions::Column::Id.ne(keep));
+    }
+    Ok(query.exec(conn).await?.rows_affected)
+}
+
 impl UserService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self {
@@ -446,6 +513,14 @@ impl UserService {
 
     pub async fn is_admin(&self, user_id: i32) -> Result<bool, UserServiceError> {
         self.has_role(user_id, RoleType::Admin).await
+    }
+
+    /// See [`current_session_role`].
+    pub async fn current_session_role(
+        &self,
+        user_id: i32,
+    ) -> Result<crate::permissions::Role, UserServiceError> {
+        Ok(current_session_role(self.db.as_ref(), user_id).await?)
     }
 
     pub async fn get_user_with_roles(
@@ -1039,46 +1114,60 @@ impl UserService {
         })
     }
 
+    /// Confirm a pending enrolment with a TOTP code and turn MFA on.
+    ///
+    /// Every other session for the user is revoked in the same transaction:
+    /// a session established before the second factor existed must not keep
+    /// working as if it had passed it. `current_session_id` (the caller's
+    /// own session) is kept so the enrolling tab stays signed in; `None`
+    /// revokes everything.
+    ///
+    /// The confirming code is subject to the same single-use rule as every
+    /// other TOTP check. Wrong codes here are not counted towards the
+    /// per-user lockout: the caller is choosing their own secret, so there is
+    /// nothing to brute-force, and counting would only let a typo lock the
+    /// user out of the factor they are setting up.
     pub async fn verify_and_enable_mfa(
         &self,
         user_id: i32,
         code: &str,
+        current_session_id: Option<i32>,
     ) -> Result<(), UserServiceError> {
+        let transaction = self.db.begin().await?;
         let user = temps_entities::users::Entity::find_by_id(user_id)
-            .one(self.db.as_ref())
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
+            .lock_exclusive()
+            .one(&transaction)
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
-        let secret = user
-            .mfa_secret
-            .clone()
-            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
-
-        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
-        // Builder replaces TOTP::new, and check_current returns Option<u64> not
-        // Result<bool, _>. The enrolled params (SHA1 / 6 digits / skew 1 / 30s) must
-        // match what generate_mfa_setup_candidate used.
-        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
-            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
-        let totp = Builder::new()
-            .with_algorithm(Algorithm::SHA1)
-            .with_digits(6)
-            .with_skew(1)
-            .with_step_duration(30)
-            .with_secret(decoded)
-            .build()
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
-
-        if totp.check_current(code).is_some() {
-            // Enable MFA
-            let mut user_update: temps_entities::users::ActiveModel = user.into();
-            user_update.mfa_enabled = Set(true);
-            user_update.update(self.db.as_ref()).await?;
-
-            Ok(())
-        } else {
-            Err(UserServiceError::InvalidMfaCode)
+        if user.mfa_secret.is_none() {
+            return Err(UserServiceError::MfaNotSetup(user_id));
         }
+
+        let now = Utc::now();
+        let guard = crate::mfa_guard::load_guard(&transaction, user_id).await?;
+        let Some(factor) =
+            crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, false, now)?
+        else {
+            return Err(UserServiceError::InvalidMfaCode);
+        };
+        let user =
+            crate::mfa_guard::record_success(&transaction, user, &guard, &factor, now).await?;
+
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.mfa_enabled = Set(true);
+        user_update.update(&transaction).await?;
+
+        let revoked = revoke_sessions_except(&transaction, user_id, current_session_id).await?;
+        transaction.commit().await?;
+
+        info!(
+            user_id,
+            revoked_sessions = revoked,
+            "MFA enabled; other sessions revoked"
+        );
+        Ok(())
     }
 
     pub async fn verify_mfa_code(
@@ -1097,14 +1186,22 @@ impl UserService {
     /// Verify MFA while keeping the user row locked in the caller's
     /// transaction. Step-up authorization uses this to make recovery-code
     /// consumption and session elevation one atomic state transition.
+    ///
+    /// Accepts a TOTP code whose step is newer than any accepted before, or
+    /// an unused recovery code (consumed here). Returns `Ok(false)` for a
+    /// wrong code **after recording the failure in `transaction`**: callers
+    /// must commit on `Ok(false)` too, or the failure is rolled back and the
+    /// per-user throttle never engages. Returns
+    /// [`UserServiceError::MfaLocked`] without evaluating the code while the
+    /// user is locked out.
     pub(crate) async fn verify_mfa_code_in_transaction(
         &self,
         transaction: &DatabaseTransaction,
         user_id: i32,
         code: &str,
     ) -> Result<bool, UserServiceError> {
-        // Recovery codes are single-use credentials, so checking and
-        // consuming one must remain under this exclusive row lock.
+        // Every check-and-write below (TOTP step, recovery-code burn,
+        // failure counter) relies on this exclusive row lock.
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_exclusive()
@@ -1112,69 +1209,29 @@ impl UserService {
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
-        if !user.mfa_enabled {
+        if !user.mfa_enabled || user.mfa_secret.is_none() {
             return Err(UserServiceError::MfaNotSetup(user_id));
         }
 
-        let secret = user
-            .mfa_secret
-            .clone()
-            .ok_or(UserServiceError::MfaNotSetup(user_id))?;
-
-        // Check if it's a recovery code
-        if let Some(recovery_codes) = user.mfa_recovery_codes.clone() {
-            let hashed_codes: Vec<String> =
-                serde_json::from_str(&recovery_codes).map_err(UserServiceError::Serialization)?;
-
-            // Clone hashed_codes for later use
-            let hashed_codes_clone = hashed_codes.clone();
-
-            // First check if the code matches any recovery code using Argon2id
-            use argon2::{Argon2, PasswordHash, PasswordVerifier};
-
-            let argon2 = Argon2::default();
-            for hashed_code in hashed_codes {
-                let parsed_hash = PasswordHash::new(&hashed_code).map_err(|e| {
-                    UserServiceError::Encryption(format!(
-                        "Failed to parse recovery code hash: {}",
-                        e
-                    ))
-                })?;
-
-                if argon2
-                    .verify_password(code.as_bytes(), &parsed_hash)
-                    .is_ok()
-                {
-                    // Remove used recovery code using the cloned vector
-                    let new_codes: Vec<String> = hashed_codes_clone
-                        .into_iter()
-                        .filter(|c| c != &hashed_code)
-                        .collect();
-
-                    let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
-                    user_update.mfa_recovery_codes = Set(Some(serde_json::to_string(&new_codes)?));
-                    user_update.update(transaction).await?;
-
-                    return Ok(true);
-                }
-            }
+        let now = Utc::now();
+        let guard = crate::mfa_guard::load_guard(transaction, user_id).await?;
+        if let Some(retry_after_seconds) = guard.lockout_remaining_seconds(now) {
+            return Err(UserServiceError::MfaLocked {
+                user_id,
+                retry_after_seconds,
+            });
         }
 
-        // Verify TOTP code. In totp-rs 6.0.0: Secret is a struct (From<Vec<u8>>),
-        // Builder replaces TOTP::new, and check_current returns Option<u64> not
-        // Result<bool, _>. The enrolled params must match generate_mfa_setup_candidate.
-        let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, &secret)
-            .ok_or_else(|| UserServiceError::Mfa("Invalid MFA secret encoding".to_string()))?;
-        let totp = Builder::new()
-            .with_algorithm(Algorithm::SHA1)
-            .with_digits(6)
-            .with_skew(1)
-            .with_step_duration(30)
-            .with_secret(decoded)
-            .build()
-            .map_err(|e| UserServiceError::Mfa(format!("Failed to create TOTP: {}", e)))?;
-
-        Ok(totp.check_current(code).is_some())
+        match crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, true, now)? {
+            Some(factor) => {
+                crate::mfa_guard::record_success(transaction, user, &guard, &factor, now).await?;
+                Ok(true)
+            }
+            None => {
+                crate::mfa_guard::record_failure(transaction, user_id, &guard, now).await?;
+                Ok(false)
+            }
+        }
     }
 
     async fn disable_mfa(&self, user_id: i32) -> Result<(), UserServiceError> {
@@ -1686,7 +1743,13 @@ mod tests {
         let consumed = user(true, Some("[]".to_string()));
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([vec![original], vec![consumed]])
+                .append_query_results([vec![original]])
+                .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
+                .append_query_results([vec![consumed]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 7,
+                    rows_affected: 1,
+                }])
                 .into_connection(),
         );
         let service = UserService::new(db.clone());
@@ -1795,5 +1858,70 @@ mod tests {
             statement.sql.starts_with("UPDATE \"sessions\"")
                 && statement.sql.contains("step_up_expires_at")
         }));
+    }
+
+    #[tokio::test]
+    async fn enabling_mfa_revokes_every_other_session_and_keeps_the_current_one() {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+        };
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("enable@example.com".to_string()),
+            name: Set("Enable".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for token in ["enrolling-tab", "other-device"] {
+            let session = temps_entities::sessions::ActiveModel {
+                user_id: Set(user.id),
+                session_token: Set(token.to_string()),
+                expires_at: Set(Utc::now() + chrono::Duration::days(1)),
+                mfa_pending: Set(false),
+                ..Default::default()
+            }
+            .insert(db.db.as_ref())
+            .await
+            .unwrap();
+            ids.push(session.id);
+        }
+
+        let service = UserService::new(db.db.clone());
+        let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
+        service
+            .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
+            .await
+            .expect("valid enrolment code enables MFA");
+
+        let remaining: Vec<i32> = temps_entities::sessions::Entity::find()
+            .filter(temps_entities::sessions::Column::UserId.eq(user.id))
+            .all(db.db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|session| session.id)
+            .collect();
+        assert_eq!(
+            remaining,
+            vec![ids[0]],
+            "only the enrolling session survives"
+        );
+
+        // The confirming code is now spent: it cannot also pass step-up.
+        let transaction = db.db.begin().await.unwrap();
+        assert!(!service
+            .verify_mfa_code_in_transaction(&transaction, user.id, &code)
+            .await
+            .unwrap());
     }
 }

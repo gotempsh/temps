@@ -321,18 +321,16 @@ pub fn extract_session_id_cookie(req: &Request, crypto: &CookieCrypto) -> Option
     None
 }
 
+/// Fresh per request (see [`crate::user_service::current_session_role`]);
+/// a lookup failure degrades to the least-privileged session role.
 async fn determine_user_role(
     user: &temps_entities::users::Model,
     user_service: &UserService,
 ) -> Result<Role, AuthError> {
-    // Check if user is admin
-    if user_service.is_admin(user.id).await.unwrap_or(false) {
-        return Ok(Role::Admin);
-    }
-
-    // For now, return User as default
-    // In the future, you might want to check the user_roles table
-    Ok(Role::User)
+    Ok(user_service
+        .current_session_role(user.id)
+        .await
+        .unwrap_or(Role::User))
 }
 
 #[derive(Debug)]
