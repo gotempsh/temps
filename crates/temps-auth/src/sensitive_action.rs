@@ -831,10 +831,15 @@ mod tests {
     )> {
         let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(error) => {
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
                 println!("Docker not available, skipping test: {error}");
                 return None;
             }
+            Err(error) => panic!("test database setup failed: {error}"),
         };
         let user = temps_entities::users::ActiveModel {
             email: Set("step-up@example.com".to_string()),

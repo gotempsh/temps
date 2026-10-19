@@ -1689,10 +1689,13 @@ mod tests {
     ) -> Option<(TestDatabase, AuthService)> {
         let db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(e) => {
-                println!("Docker not available, skipping test: {}", e);
+            Err(e)
+                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {e}");
                 return None;
             }
+            Err(e) => panic!("test database setup failed: {e}"),
         };
 
         let settings_row = settings::ActiveModel {

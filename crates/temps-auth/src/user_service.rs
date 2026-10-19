@@ -1105,6 +1105,9 @@ impl UserService {
                 .map_err(UserServiceError::Serialization)?,
         ));
         user_update.update(&transaction).await?;
+        // The accepted-step watermark belongs to the secret being replaced;
+        // carried over, it would reject the new authenticator's first codes.
+        crate::mfa_guard::forget_totp_step(&transaction, user_id).await?;
         transaction.commit().await?;
 
         Ok(MfaSetupData {
@@ -1126,7 +1129,10 @@ impl UserService {
     /// other TOTP check. Wrong codes here are not counted towards the
     /// per-user lockout: the caller is choosing their own secret, so there is
     /// nothing to brute-force, and counting would only let a typo lock the
-    /// user out of the factor they are setting up.
+    /// user out of the factor they are setting up. That exemption only holds
+    /// while the secret is still pending, so an account whose factor is
+    /// already enabled is refused here: its codes go through the counted,
+    /// lockout-aware paths instead.
     pub async fn verify_and_enable_mfa(
         &self,
         user_id: i32,
@@ -1141,6 +1147,9 @@ impl UserService {
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
+        if user.mfa_enabled {
+            return Err(UserServiceError::MfaAlreadyEnabled(user_id));
+        }
         if user.mfa_secret.is_none() {
             return Err(UserServiceError::MfaNotSetup(user_id));
         }
@@ -1662,6 +1671,10 @@ mod tests {
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending.clone()], vec![pending], vec![updated]])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
                 .into_connection(),
         );
         let service = UserService::new(db.clone());
@@ -1864,10 +1877,15 @@ mod tests {
     async fn enabling_mfa_revokes_every_other_session_and_keeps_the_current_one() {
         let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(error) => {
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
                 println!("Docker not available, skipping test: {error}");
                 return;
             }
+            Err(error) => panic!("test database setup failed: {error}"),
         };
         let secret = crate::mfa_guard::test_support::new_secret();
         let user = temps_entities::users::ActiveModel {
@@ -1923,5 +1941,127 @@ mod tests {
             .verify_mfa_code_in_transaction(&transaction, user.id, &code)
             .await
             .unwrap());
+    }
+
+    async fn mfa_db() -> Option<temps_database::test_utils::TestDatabase> {
+        match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => Some(db),
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                None
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enrolment_confirmation_refuses_an_already_enabled_factor() {
+        let Some(db) = mfa_db().await else {
+            return;
+        };
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("enrolled@example.com".to_string()),
+            name: Set("Enrolled".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let locked_until = Utc::now() + chrono::Duration::minutes(5);
+        temps_entities::user_mfa_guards::ActiveModel {
+            user_id: Set(user.id),
+            last_totp_step: Set(None),
+            failed_attempts: Set(crate::mfa_guard::USER_LOCKOUT_THRESHOLD),
+            locked_until: Set(Some(locked_until)),
+            updated_at: Set(Utc::now()),
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let other = temps_entities::sessions::ActiveModel {
+            user_id: Set(user.id),
+            session_token: Set("other-device".to_string()),
+            expires_at: Set(Utc::now() + chrono::Duration::days(1)),
+            mfa_pending: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let service = UserService::new(db.db.clone());
+        let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
+        let result = service.verify_and_enable_mfa(user.id, &code, None).await;
+        assert!(
+            matches!(result, Err(UserServiceError::MfaAlreadyEnabled(id)) if id == user.id),
+            "an enabled factor must not be re-confirmed through enrolment: {result:?}"
+        );
+
+        let guard = temps_entities::user_mfa_guards::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            guard.failed_attempts,
+            crate::mfa_guard::USER_LOCKOUT_THRESHOLD,
+            "the lockout must not be cleared"
+        );
+        assert!(guard.locked_until.is_some_and(|until| until > Utc::now()));
+        assert_eq!(guard.last_totp_step, None, "the code must not be spent");
+        assert!(temps_entities::sessions::Entity::find_by_id(other.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn re_enrolment_accepts_the_new_secret_right_after_disabling() {
+        let Some(db) = mfa_db().await else {
+            return;
+        };
+        let old_secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("re-enrol@example.com".to_string()),
+            name: Set("Re-enrol".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(old_secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let service = UserService::new(db.db.clone());
+
+        // Disabling spends the old authenticator's code one step ahead, the
+        // furthest the skew window accepts.
+        let ahead = crate::mfa_guard::test_support::code_at(
+            &old_secret,
+            Utc::now() + chrono::Duration::seconds(30),
+        );
+        service
+            .verify_and_disable_mfa(user.id, &ahead)
+            .await
+            .expect("disable with a valid code");
+
+        let setup = service
+            .setup_mfa(user.id, None)
+            .await
+            .expect("start a new enrolment");
+        let code = crate::mfa_guard::test_support::code_at(&setup.secret_key, Utc::now());
+        service
+            .verify_and_enable_mfa(user.id, &code, None)
+            .await
+            .expect("the new secret's current code must be accepted");
     }
 }

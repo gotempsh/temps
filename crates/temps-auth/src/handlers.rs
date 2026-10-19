@@ -2903,6 +2903,7 @@ async fn change_password_self(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Caller is not a signed-in user session (API keys, CLI tokens and deployment tokens cannot manage MFA)"),
         (status = 400, description = "Invalid code"),
+        (status = 409, description = "MFA is already enabled for this account"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -3870,6 +3871,11 @@ mod tests {
                 let db = MockDatabase::new(DatabaseBackend::Postgres)
                     // initial lookup, locked re-read, then the UPDATE ... RETURNING
                     .append_query_results([vec![row.clone()], vec![row.clone()], vec![row]])
+                    // reset of the replaced secret's accepted TOTP step
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    }])
                     .into_connection();
                 let state = auth_state_with_audit(db, audit.clone());
 
@@ -4357,10 +4363,15 @@ mod tests {
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
-                Err(error) => {
+                Err(error)
+                    if temps_database::test_utils::is_container_runtime_unavailable(
+                        &error.to_string(),
+                    ) =>
+                {
                     println!("Docker not available, skipping test: {error}");
                     None
                 }
+                Err(error) => panic!("test database setup failed: {error}"),
             }
         }
 

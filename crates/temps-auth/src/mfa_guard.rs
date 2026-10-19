@@ -298,6 +298,34 @@ pub(crate) async fn record_success<C: ConnectionTrait>(
     }
 }
 
+/// Forget the last accepted TOTP step because a new secret is being
+/// installed. Steps counted against the old secret say nothing about the new
+/// one, and keeping them would reject the new authenticator's codes until
+/// the clock passes the old watermark. Failure counters and any lockout are
+/// kept. Caller holds the `users` row lock.
+pub(crate) async fn forget_totp_step<C: ConnectionTrait>(
+    conn: &C,
+    user_id: i32,
+) -> Result<(), MfaGuardError> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, QueryFilter};
+    user_mfa_guards::Entity::update_many()
+        .col_expr(
+            user_mfa_guards::Column::LastTotpStep,
+            Expr::value(Option::<i64>::None),
+        )
+        .col_expr(user_mfa_guards::Column::UpdatedAt, Expr::value(Utc::now()))
+        .filter(user_mfa_guards::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await
+        .map_err(|source| MfaGuardError::Database {
+            operation: "reset the accepted TOTP step for a replaced secret",
+            user_id,
+            source,
+        })?;
+    Ok(())
+}
+
 /// Length of the lockout imposed after `failed_attempts` consecutive
 /// failures, or `None` while still under the threshold.
 pub(crate) fn lockout_duration(failed_attempts: i32) -> Option<Duration> {
