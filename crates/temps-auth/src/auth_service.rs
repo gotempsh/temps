@@ -774,47 +774,59 @@ impl AuthService {
         &self,
         request: LoginRequest,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find user by email, excluding soft-deleted users
-        let user = temps_entities::users::Entity::find()
+        // Every rejection below costs one Argon2 verification, the same as a
+        // wrong password for a real account, so response time does not
+        // reveal whether the email exists or has a password.
+        let user = match temps_entities::users::Entity::find()
             .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| {
+        {
+            Some(user) => user,
+            None => {
+                verify_against_dummy_hash(&request.password);
                 warn!(
                     "Login attempt for non-existent or deleted email: {}",
                     request.email
                 );
-                UserAuthError::InvalidCredentials
-            })?;
+                return Err(UserAuthError::InvalidCredentials);
+            }
+        };
 
         // Check if user has a password (might be GitHub-only user)
-        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
+        let Some(password_hash) = user.password_hash.as_ref() else {
+            verify_against_dummy_hash(&request.password);
             warn!("Login attempt for user {} with no password hash", user.id);
-            UserAuthError::InvalidCredentials
-        })?;
+            return Err(UserAuthError::InvalidCredentials);
+        };
 
         // Verify password - only Argon2 is supported
-        let password_valid = if password_hash.starts_with("$argon2") {
-            // Argon2 hash (only supported format)
-            debug!("Verifying Argon2 password for user {}", user.id);
-            let parsed_hash = argon2::PasswordHash::new(password_hash).map_err(|e| {
+        let password_valid = match password_hash
+            .starts_with("$argon2")
+            .then(|| argon2::PasswordHash::new(password_hash))
+        {
+            Some(Ok(parsed_hash)) => {
+                debug!("Verifying Argon2 password for user {}", user.id);
+                argon2::Argon2::default()
+                    .verify_password(request.password.as_bytes(), &parsed_hash)
+                    .is_ok()
+            }
+            Some(Err(e)) => {
                 error!("Failed to parse Argon2 hash for user {}: {}", user.id, e);
-                UserAuthError::InvalidCredentials
-            })?;
-
-            let argon2 = argon2::Argon2::default();
-            argon2
-                .verify_password(request.password.as_bytes(), &parsed_hash)
-                .is_ok()
-        } else {
-            // Only Argon2 is supported - all other hash formats are rejected
-            error!(
-                "User {} has unsupported password hash format (only Argon2 is supported): {}",
-                user.id,
-                &password_hash[..std::cmp::min(20, password_hash.len())]
-            );
-            false
+                verify_against_dummy_hash(&request.password);
+                false
+            }
+            None => {
+                // Only Argon2 is supported - all other hash formats are rejected
+                error!(
+                    "User {} has unsupported password hash format (only Argon2 is supported): {}",
+                    user.id,
+                    &password_hash[..std::cmp::min(20, password_hash.len())]
+                );
+                verify_against_dummy_hash(&request.password);
+                false
+            }
         };
 
         if !password_valid {
@@ -1308,6 +1320,47 @@ impl AuthService {
             .map(|r| temps_core::AppSettings::from_json(r.data))
             .unwrap_or_default())
     }
+}
+
+/// An Argon2 hash of a random secret nobody knows, produced with the same
+/// parameters as real password hashes (`Argon2::default()`). Computed once.
+fn dummy_password_hash() -> &'static str {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DUMMY.get_or_init(|| {
+        let secret: [u8; 32] = rand::rng().random();
+        argon2::Argon2::default()
+            .hash_password(&secret)
+            .map(|hash| hash.to_string())
+            // Hashing fixed-size input with default params cannot fail in
+            // practice; an empty string makes the verification below a no-op
+            // rather than a panic, and is logged.
+            .unwrap_or_else(|error| {
+                error!("Failed to compute the login timing-equalization hash: {error}");
+                String::new()
+            })
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static DUMMY_VERIFICATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Spend the same Argon2 work a real wrong-password check costs, so the
+/// "no such account" / "no password" paths are not measurably faster.
+/// Always rejects.
+fn verify_against_dummy_hash(password: &str) -> bool {
+    #[cfg(test)]
+    DUMMY_VERIFICATIONS.with(|count| count.set(count.get() + 1));
+    match argon2::PasswordHash::new(dummy_password_hash()) {
+        Ok(parsed) => {
+            let _ = argon2::Argon2::default().verify_password(password.as_bytes(), &parsed);
+        }
+        Err(error) => {
+            error!("Login timing-equalization hash is unusable: {error}");
+        }
+    }
+    false
 }
 
 /// Validate password meets minimum complexity requirements.
@@ -3846,6 +3899,76 @@ mod tests {
                 Err(AuthError::NotFound(_))
             ),
             "a session established before MFA existed must stop authenticating"
+        );
+    }
+
+    fn dummy_verifications() -> u32 {
+        DUMMY_VERIFICATIONS.with(|count| count.get())
+    }
+
+    #[test]
+    fn dummy_password_hash_uses_the_real_hash_parameters() {
+        let parsed = argon2::PasswordHash::new(dummy_password_hash()).unwrap();
+        assert_eq!(parsed.algorithm, argon2::Algorithm::default().ident());
+        // Compare the cost parameters only: a parsed hash records its output
+        // length, the default leaves it unset, and neither changes the cost.
+        let params = argon2::Params::try_from(&parsed).unwrap();
+        let default = argon2::Params::default();
+        assert_eq!(
+            (params.m_cost(), params.t_cost(), params.p_cost()),
+            (default.m_cost(), default.t_cost(), default.p_cost()),
+            "the dummy must cost exactly what a real verification costs"
+        );
+        assert!(!verify_against_dummy_hash("anything"));
+    }
+
+    #[tokio::test]
+    async fn login_runs_a_password_verification_on_every_rejection_path() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        create_test_user(&db.db, "has-password@example.com", "Correct-Horse-9!").await;
+        users::ActiveModel {
+            email: Set("sso-only@example.com".to_string()),
+            name: Set("SSO".to_string()),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let attempt = |email: &str| LoginRequest {
+            email: email.to_string(),
+            password: "Wrong-Password-1!".to_string(),
+        };
+
+        let before = dummy_verifications();
+        let unknown = auth_service.login(attempt("nobody@example.com")).await;
+        assert!(matches!(unknown, Err(UserAuthError::InvalidCredentials)));
+        assert_eq!(dummy_verifications(), before + 1, "unknown email must hash");
+
+        let no_password = auth_service.login(attempt("sso-only@example.com")).await;
+        assert!(matches!(
+            no_password,
+            Err(UserAuthError::InvalidCredentials)
+        ));
+        assert_eq!(
+            dummy_verifications(),
+            before + 2,
+            "no-password user must hash"
+        );
+
+        let wrong = auth_service
+            .login(attempt("has-password@example.com"))
+            .await;
+        assert!(matches!(wrong, Err(UserAuthError::InvalidCredentials)));
+        assert_eq!(
+            dummy_verifications(),
+            before + 2,
+            "a real account verifies against its own hash, not the dummy"
         );
     }
 }
