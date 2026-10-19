@@ -264,6 +264,23 @@ impl RouterHostApi {
                     (Some(role), None)
                 };
 
+                // Same owner ceiling `ApiKeyService::validate_api_key` applies:
+                // a key never exceeds what its owner holds right now.
+                let owner_role = temps_auth::current_owner_role(self.db.as_ref(), user_id)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::new(
+                            ChannelErrorCode::Internal,
+                            format!(
+                                "Failed to resolve the current role of user {user_id} while \
+                                 redeeming an actor token for API key {key_id} for plugin \
+                                 '{plugin}': {e}"
+                            ),
+                        )
+                    })?;
+                let (role, permissions) =
+                    temps_auth::cap_api_key_grant(role, permissions, &owner_role);
+
                 Ok(AuthContext::new_api_key(
                     user,
                     role,

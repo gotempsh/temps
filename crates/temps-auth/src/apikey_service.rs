@@ -451,6 +451,11 @@ impl ApiKeyService {
             (Some(role), None)
         };
 
+        // Bound the stored grant by what the owner holds now, not what they
+        // held when the key was minted.
+        let owner_role = current_owner_role(self.db.as_ref(), user.id).await?;
+        let (role, permissions) = cap_api_key_grant(role, permissions, &owner_role);
+
         // Update last_used_at, throttled so repeated validations of the
         // same key within LAST_USED_UPDATE_INTERVAL skip the DB write.
         if self.last_used_throttle.should_update(api_key_model.id) {
@@ -621,6 +626,89 @@ impl ApiKeyService {
     }
 }
 
+/// The role a user holds *right now*, resolved from `user_roles` on every
+/// call and never cached on a credential.
+///
+/// Mirrors the mapping the session middleware applies to browser sessions
+/// (`admin` row present → [`Role::Admin`], otherwise [`Role::User`]), so an
+/// API key is bounded by exactly what its owner would get by signing in.
+/// Public so crates that re-resolve a key outside this service (plugin host
+/// bridge, AI tool refresh) apply the same ceiling.
+pub async fn current_owner_role<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    user_id: i32,
+) -> Result<Role, sea_orm::DbErr> {
+    use sea_orm::{JoinType, QuerySelect, RelationTrait};
+    let admin_grants = temps_entities::user_roles::Entity::find()
+        .join(
+            JoinType::InnerJoin,
+            temps_entities::user_roles::Relation::Role.def(),
+        )
+        .filter(temps_entities::user_roles::Column::UserId.eq(user_id))
+        .filter(temps_entities::roles::Column::Name.eq(Role::Admin.to_string()))
+        .count(db)
+        .await?;
+    Ok(if admin_grants > 0 {
+        Role::Admin
+    } else {
+        Role::User
+    })
+}
+
+/// Narrow an API key's stored grant to what its owner's current role still
+/// grants, so a key can never exceed the user who owns it.
+///
+/// The role/permission set is copied onto the key row when it is minted and
+/// is not rewritten when the owner is later demoted. Without this cap an
+/// `admin` key (including the one `temps login` mints) keeps admin access
+/// for its whole lifetime after `DELETE /users/{id}/roles/admin`.
+///
+/// - Predefined role whose permissions are all still held by the owner: the
+///   role is kept as-is, so role checks such as `is_admin()` keep working.
+/// - Predefined role that now exceeds the owner: the key degrades to a
+///   custom grant of the intersection. `effective_role` becomes `Custom`, so
+///   role-based checks (`is_admin`, `is_instance_admin`) no longer pass.
+/// - Custom permission list: filtered to the permissions the owner holds.
+///
+/// Service ingest keys (`metrics_ingest`) carry an empty permission set, so
+/// they are always a subset of any owner and pass through unchanged; they
+/// authenticate only on the OTel `si_` path, which is bound to a service
+/// row, not to user permissions. Deployment tokens (`dt_`) are not owned by
+/// a user and never reach this function.
+pub fn cap_api_key_grant(
+    role: Option<Role>,
+    permissions: Option<Vec<Permission>>,
+    owner_role: &Role,
+) -> (Option<Role>, Option<Vec<Permission>>) {
+    let owner_permissions = owner_role.permissions();
+    match role {
+        Some(role) => {
+            let role_permissions = role.permissions();
+            if role_permissions
+                .iter()
+                .all(|permission| owner_permissions.contains(permission))
+            {
+                (Some(role), permissions)
+            } else {
+                let capped = role_permissions
+                    .iter()
+                    .filter(|permission| owner_permissions.contains(permission))
+                    .copied()
+                    .collect();
+                (None, Some(capped))
+            }
+        }
+        None => {
+            let capped = permissions
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|permission| owner_permissions.contains(permission))
+                .collect();
+            (None, Some(capped))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -647,6 +735,15 @@ mod tests {
             ..Default::default()
         };
         let user = user.insert(db.db.as_ref()).await.unwrap();
+
+        // Keys are capped by their owner's current role, so the fixture owner
+        // must actually hold the admin role the tests mint keys for.
+        let user_service = crate::user_service::UserService::new(db.db.clone());
+        user_service.initialize_roles().await.unwrap();
+        user_service
+            .assign_role_by_type(user.id, temps_entities::types::RoleType::Admin)
+            .await
+            .unwrap();
 
         let api_key_service = ApiKeyService::new(db.db.clone());
         (db, api_key_service, user)
@@ -1480,6 +1577,152 @@ mod tests {
             perms.is_empty(),
             "MetricsIngest role should have no UI permissions"
         );
+    }
+
+    // Owner-role ceiling tests
+
+    #[test]
+    fn admin_role_holds_every_other_predefined_role_permission() {
+        // The cap keeps a predefined role intact only while the owner's role
+        // covers it. Admin-owned keys of any predefined role must therefore
+        // survive the cap unchanged, or every admin's restricted keys would
+        // silently degrade to custom grants.
+        for role in Role::all() {
+            for permission in role.permissions() {
+                assert!(
+                    Role::Admin.has_permission(permission),
+                    "Admin must hold {permission:?} (granted by {role:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cap_keeps_a_role_the_owner_still_covers() {
+        let (role, permissions) = cap_api_key_grant(Some(Role::Admin), None, &Role::Admin);
+        assert_eq!(role, Some(Role::Admin));
+        assert!(permissions.is_none());
+
+        let (role, permissions) = cap_api_key_grant(Some(Role::PlatformAdmin), None, &Role::Admin);
+        assert_eq!(role, Some(Role::PlatformAdmin));
+        assert!(permissions.is_none());
+    }
+
+    #[test]
+    fn cap_degrades_an_admin_key_owned_by_a_demoted_user() {
+        let (role, permissions) = cap_api_key_grant(Some(Role::Admin), None, &Role::User);
+        assert_eq!(role, None, "an admin key must lose its admin role");
+        let permissions = permissions.expect("a capped key carries an explicit grant");
+        for permission in &permissions {
+            assert!(Role::User.has_permission(permission));
+        }
+        assert!(!permissions.contains(&Permission::UsersManage));
+        assert!(!permissions.contains(&Permission::SettingsWrite));
+
+        let ctx = crate::context::AuthContext::new_api_key(
+            users::Model {
+                id: 1,
+                name: "demoted".into(),
+                email: "demoted@example.com".into(),
+                password_hash: None,
+                email_verified: true,
+                email_verification_token: None,
+                email_verification_expires: None,
+                password_reset_token: None,
+                password_reset_expires: None,
+                must_change_password: false,
+                deleted_at: None,
+                mfa_secret: None,
+                mfa_enabled: false,
+                mfa_recovery_codes: None,
+                oidc_subject: None,
+                oidc_provider_id: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            },
+            role,
+            Some(permissions),
+            "demoted-key".into(),
+            1,
+        );
+        assert!(!ctx.is_admin());
+        assert!(!ctx.is_instance_admin());
+        assert!(!ctx.has_permission(&Permission::UsersManage));
+    }
+
+    #[test]
+    fn cap_filters_custom_permissions_to_the_owner() {
+        let (role, permissions) = cap_api_key_grant(
+            None,
+            Some(vec![Permission::ProjectsRead, Permission::UsersManage]),
+            &Role::User,
+        );
+        assert_eq!(role, None);
+        assert_eq!(permissions, Some(vec![Permission::ProjectsRead]));
+    }
+
+    #[test]
+    fn cap_leaves_service_ingest_keys_unchanged() {
+        // metrics_ingest keys carry no permission set; any owner covers them.
+        let (role, permissions) = cap_api_key_grant(Some(Role::MetricsIngest), None, &Role::User);
+        assert_eq!(role, Some(Role::MetricsIngest));
+        assert!(permissions.is_none());
+    }
+
+    async fn mint_key(service: &ApiKeyService, user_id: i32, name: &str, role: &str) -> String {
+        service
+            .create_api_key(
+                user_id,
+                CreateApiKeyRequest {
+                    name: name.to_string(),
+                    role_type: role.to_string(),
+                    permissions: None,
+                    expires_at: Some(Utc::now() + Duration::days(30)),
+                },
+            )
+            .await
+            .unwrap()
+            .api_key
+    }
+
+    #[tokio::test]
+    async fn admin_key_loses_admin_grant_when_owner_is_demoted() {
+        let (db, api_key_service, user) = setup_test_env().await;
+        let admin_key = mint_key(&api_key_service, user.id, "admin-key", "admin").await;
+        let user_key = mint_key(&api_key_service, user.id, "user-key", "user").await;
+
+        let (_, role, permissions, _, _) =
+            api_key_service.validate_api_key(&admin_key).await.unwrap();
+        assert_eq!(role, Some(Role::Admin));
+        assert!(permissions.is_none());
+
+        crate::user_service::UserService::new(db.db.clone())
+            .remove_role_from_user(user.id, temps_entities::types::RoleType::Admin)
+            .await
+            .unwrap();
+
+        let (_, role, permissions, _, _) =
+            api_key_service.validate_api_key(&admin_key).await.unwrap();
+        assert_eq!(role, None, "the demoted owner's admin key keeps no role");
+        let permissions = permissions.unwrap();
+        assert!(!permissions.contains(&Permission::UsersManage));
+        assert!(permissions
+            .iter()
+            .all(|permission| Role::User.has_permission(permission)));
+
+        // A key that never exceeded the owner keeps working unchanged.
+        let (_, role, permissions, _, _) =
+            api_key_service.validate_api_key(&user_key).await.unwrap();
+        assert_eq!(role, Some(Role::User));
+        assert!(permissions.is_none());
+
+        // Re-promotion restores the stored grant: nothing was rewritten.
+        crate::user_service::UserService::new(db.db.clone())
+            .assign_role_by_type(user.id, temps_entities::types::RoleType::Admin)
+            .await
+            .unwrap();
+        let (_, role, _, _, _) = api_key_service.validate_api_key(&admin_key).await.unwrap();
+        assert_eq!(role, Some(Role::Admin));
     }
 
     // Error Conversion Tests

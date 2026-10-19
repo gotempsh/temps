@@ -1260,4 +1260,303 @@ mod tests {
             result.ok()
         );
     }
+
+    /// End-to-end over the production auth middleware and routes: an admin's
+    /// `temps login` (device flow) key and a hand-minted admin key must both
+    /// stop working as admin once the owner is demoted, while a key that
+    /// never exceeded the owner keeps working and CLI logout still revokes.
+    mod owner_demotion_http {
+        use super::*;
+        use axum::extract::connect_info::MockConnectInfo;
+        use temps_core::plugin::TempsMiddleware;
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::types::RoleType;
+        use tower::ServiceExt;
+
+        struct NoopAudit;
+
+        #[async_trait::async_trait]
+        impl temps_core::AuditLogger for NoopAudit {
+            async fn create_audit_log(
+                &self,
+                _operation: &dyn temps_core::audit::AuditOperation,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct NoopNotifications;
+
+        #[async_trait::async_trait]
+        impl temps_core::notifications::NotificationService for NoopNotifications {
+            async fn send_email(
+                &self,
+                _message: temps_core::notifications::EmailMessage,
+            ) -> Result<(), temps_core::notifications::NotificationError> {
+                Ok(())
+            }
+
+            async fn send_notification(
+                &self,
+                _notification: temps_core::notifications::NotificationData,
+            ) -> Result<(), temps_core::notifications::NotificationError> {
+                Ok(())
+            }
+
+            async fn is_configured(
+                &self,
+            ) -> Result<bool, temps_core::notifications::NotificationError> {
+                Ok(false)
+            }
+        }
+
+        async fn insert_request_metadata(mut request: Request<Body>, next: Next) -> Response {
+            let headers = request.headers().clone();
+            request.extensions_mut().insert(RequestMetadata {
+                ip_address: "127.0.0.1".to_string(),
+                user_agent: "temps-auth-test".to_string(),
+                headers,
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "http://temps.test".to_string(),
+                scheme: "http".to_string(),
+                host: "temps.test".to_string(),
+                is_secure: false,
+            });
+            next.run(request).await
+        }
+
+        fn router(state: Arc<AuthState>, db: Arc<DatabaseConnection>) -> axum::Router {
+            let middleware = Arc::new(crate::temps_middleware::AuthMiddleware::new(
+                state.api_key_service.clone(),
+                state.auth_service.clone(),
+                state.user_service.clone(),
+                state.cookie_crypto.clone(),
+                db,
+                crate::permission_denial_recorder::PermissionDenialRecorder::new(Arc::new(
+                    NoopAudit,
+                )),
+            ));
+            crate::handlers::configure_routes()
+                .layer(axum::middleware::from_fn(
+                    move |request: Request<Body>, next: Next| {
+                        let middleware = middleware.clone();
+                        async move { middleware.execute(request, next).await }
+                    },
+                ))
+                .layer(axum::middleware::from_fn(insert_request_metadata))
+                .layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 40000))))
+                .with_state(state)
+        }
+
+        async fn insert_user(db: &DatabaseConnection, email: &str) -> users::Model {
+            users::ActiveModel {
+                email: Set(email.to_string()),
+                name: Set(email.to_string()),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                created_at: Set(Utc::now()),
+                updated_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert test user")
+        }
+
+        async fn session_cookie(state: &AuthState, user_id: i32) -> String {
+            let token = state
+                .auth_service
+                .create_session(user_id)
+                .await
+                .expect("create session");
+            let encrypted = state.cookie_crypto.encrypt(&token).expect("encrypt");
+            format!("session={encrypted}")
+        }
+
+        async fn send(
+            router: &axum::Router,
+            method: &str,
+            uri: &str,
+            auth: Option<(&str, &str)>,
+            body: Option<serde_json::Value>,
+        ) -> (StatusCode, serde_json::Value) {
+            let mut builder = Request::builder().method(method).uri(uri);
+            if let Some((header, value)) = auth {
+                builder = builder.header(header, value);
+            }
+            let request = match body {
+                Some(body) => builder
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string())),
+                None => builder.body(Body::empty()),
+            }
+            .expect("build request");
+            let response = router.clone().oneshot(request).await.expect("route");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .expect("read body");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        #[tokio::test]
+        async fn admin_and_cli_device_keys_lose_admin_access_after_demotion() {
+            let test_db = match TestDatabase::with_migrations().await {
+                Ok(db) => db,
+                Err(error) => {
+                    println!("Docker not available, skipping test: {error}");
+                    return;
+                }
+            };
+            let db = test_db.db.clone();
+            let state = Arc::new(AuthState::new(
+                db.clone(),
+                Arc::new(NoopAudit),
+                Arc::new(temps_core::EncryptionService::new_from_password(
+                    "owner-demotion-http-test",
+                )),
+                Arc::new(temps_core::CookieCrypto::from_bytes(&[9; 32])),
+                Arc::new(NoopNotifications),
+                Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            ));
+            let app = router(state.clone(), db.clone());
+
+            state.user_service.initialize_roles().await.unwrap();
+            let actor =
+                insert_user(&db, &format!("actor-{}@example.com", uuid::Uuid::new_v4())).await;
+            let owner =
+                insert_user(&db, &format!("owner-{}@example.com", uuid::Uuid::new_v4())).await;
+            for (user_id, role) in [
+                (actor.id, RoleType::Admin),
+                (owner.id, RoleType::Admin),
+                (owner.id, RoleType::User),
+            ] {
+                state
+                    .user_service
+                    .assign_role_by_type(user_id, role)
+                    .await
+                    .unwrap();
+            }
+            let actor_cookie = session_cookie(&state, actor.id).await;
+            let owner_cookie = session_cookie(&state, owner.id).await;
+
+            // `temps login`: start, approve in the browser session, poll.
+            let (status, started) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/start",
+                None,
+                Some(serde_json::json!({ "client_name": "test-host" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device start: {started}");
+            let (status, approved) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/approve",
+                Some(("cookie", &owner_cookie)),
+                Some(serde_json::json!({ "user_code": started["user_code"] })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device approve: {approved}");
+            let (status, polled) = send(
+                &app,
+                "POST",
+                "/auth/cli/device/poll",
+                None,
+                Some(serde_json::json!({ "device_code": started["device_code"] })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "device poll: {polled}");
+            assert_eq!(polled["status"], "approved");
+            assert_eq!(polled["role"], "admin");
+            let cli_key = format!("Bearer {}", polled["api_key"].as_str().unwrap());
+
+            let mint = |name: &str, role: &str| CreateApiKeyRequest {
+                name: name.to_string(),
+                role_type: role.to_string(),
+                permissions: None,
+                expires_at: None,
+            };
+            let admin_key = format!(
+                "Bearer {}",
+                state
+                    .api_key_service
+                    .create_api_key(owner.id, mint("admin-key", "admin"))
+                    .await
+                    .unwrap()
+                    .api_key
+            );
+            let user_key = format!(
+                "Bearer {}",
+                state
+                    .api_key_service
+                    .create_api_key(owner.id, mint("user-key", "user"))
+                    .await
+                    .unwrap()
+                    .api_key
+            );
+
+            // Admin-only listing works for both admin-role keys before demotion.
+            for key in [&cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/users", Some(("authorization", key)), None).await;
+                assert_eq!(status, StatusCode::OK, "before demotion: {body}");
+            }
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/roles/admin", owner.id),
+                Some(("cookie", &actor_cookie)),
+                None,
+            )
+            .await;
+            assert!(status.is_success(), "demotion failed: {status} {body}");
+
+            for key in [&cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/users", Some(("authorization", key)), None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "a demoted owner's admin key must lose admin access: {body}"
+                );
+            }
+
+            // The key that never exceeded the owner is unaffected, and every
+            // key still authenticates as the owner.
+            for key in [&user_key, &cli_key, &admin_key] {
+                let (status, body) =
+                    send(&app, "GET", "/user/me", Some(("authorization", key)), None).await;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "key must still authenticate: {body}"
+                );
+            }
+
+            // `temps logout` still revokes the (now capped) CLI key.
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/cli/logout",
+                Some(("authorization", &cli_key)),
+                None,
+            )
+            .await;
+            assert!(status.is_success(), "cli logout: {status} {body}");
+            let (status, _) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("authorization", &cli_key)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+    }
 }

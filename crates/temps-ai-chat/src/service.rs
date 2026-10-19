@@ -236,6 +236,10 @@ async fn refresh_tool_authorization(
                 })?;
                 (Some(role), None)
             };
+            // A key never exceeds what its owner holds right now; a demoted
+            // owner's admin key must not drive tools with admin authority.
+            let owner_role = current_user_role(db, user.id).await?;
+            let (role, permissions) = temps_auth::cap_api_key_grant(role, permissions, &owner_role);
             Ok(AuthContext::new_api_key(
                 user,
                 role,
