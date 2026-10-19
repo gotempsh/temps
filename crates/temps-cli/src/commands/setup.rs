@@ -1375,10 +1375,14 @@ async fn update_app_settings(
     app_settings.setup_complete = true;
 
     let now = Utc::now();
-    let settings_json = existing
+    let mut settings_json = existing
         .as_ref()
         .map(|r| app_settings.to_json_merged(&r.data))
         .unwrap_or_else(|| app_settings.to_json());
+    // Bootstrap-owned metadata is kept outside the mutable AppSettings API.
+    // Its merged writes preserve this decision; both proxy entry points load
+    // it once at startup, so external TLS adds no request-time settings reads.
+    settings_json["external_tls"] = serde_json::json!(tls_mode == TlsMode::External);
 
     if let Some(existing_model) = existing {
         // Update existing settings. Merge, don't replace — re-running `temps
@@ -1493,11 +1497,6 @@ fn configure_on_demand_tls(
 
     app_settings.on_demand_tls.enabled = can_issue;
     app_settings.on_demand_tls.zone = can_issue.then(|| zone.to_ascii_lowercase());
-    if tls_mode == TlsMode::External {
-        // A previously provisioned certificate must not make the HTTP origin
-        // redirect the tunnel back to its own public HTTPS endpoint.
-        app_settings.console_force_https = Some(false);
-    }
 }
 
 /// Extract preview domain (base domain) from wildcard domain
@@ -1592,7 +1591,7 @@ impl SetupCommand {
                 )
             })?;
             let password = password.trim_end_matches(['\r', '\n']);
-            if password.len() < 8 || password.chars().any(char::is_control) {
+            if password.chars().count() < 8 || password.chars().any(char::is_control) {
                 anyhow::bail!(
                     "Admin password file must contain one password of at least 8 characters without control characters"
                 );
@@ -1606,9 +1605,12 @@ impl SetupCommand {
             if self.wildcard_domain_cert.is_some() || self.wildcard_domain_key.is_some() {
                 anyhow::bail!("--tls-mode external cannot import a certificate; TLS is managed by the reverse proxy");
             }
-            self.skip_ssl = true;
             let domain = self.wildcard_domain.as_deref().unwrap_or_default();
-            let domain = domain.strip_prefix("*.").unwrap_or(domain);
+            let domain = domain.strip_prefix("*.").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--wildcard-domain must start with *. (for example *.apps.example.com)"
+                )
+            })?;
             if domain.is_empty()
                 || domain.len() > 253
                 || !domain.split('.').all(|label| {
@@ -1634,6 +1636,7 @@ impl SetupCommand {
             {
                 anyhow::bail!("--external-url must be an HTTP or HTTPS origin URL with a hostname and no credentials, path, query or fragment");
             }
+            self.skip_ssl = true;
         }
         Ok(())
     }
@@ -3540,14 +3543,19 @@ mod tests {
 
     #[test]
     fn external_tls_clears_existing_on_demand_issuance() {
-        let mut settings = AppSettings::default();
+        let mut settings = AppSettings {
+            console_force_https: Some(true),
+            ..Default::default()
+        };
         configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::Auto);
         assert!(settings.on_demand_tls.enabled);
         configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::External);
         let stored = AppSettings::from_json(settings.to_json());
         assert!(!stored.on_demand_tls.enabled);
         assert_eq!(stored.on_demand_tls.zone, None);
-        assert_eq!(stored.console_force_https, Some(false));
+        // The installation-wide origin gate suppresses redirects in external
+        // mode without erasing the operator's preference for a later auto run.
+        assert_eq!(stored.console_force_https, Some(true));
     }
 
     #[test]
@@ -3607,6 +3615,82 @@ mod tests {
         );
         fs::write(&path, "").unwrap();
         assert!(command.resolve_installation_inputs().is_err());
+    }
+
+    #[test]
+    fn external_tls_rejects_domains_without_a_wildcard_prefix() {
+        for domain in ["apps.example.com", "*apps.example.com", "*."] {
+            let mut command = parse_setup(&[
+                "--tls-mode",
+                "external",
+                "--wildcard-domain",
+                domain,
+                "--external-url",
+                "https://manager.example.com",
+            ]);
+            assert!(command.resolve_installation_inputs().is_err(), "{domain}");
+            assert!(!command.skip_ssl);
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_persists_external_tls_and_clears_it_when_returning_to_auto() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (mode, enabled) in [(TlsMode::External, true), (TlsMode::Auto, false)] {
+            let now = chrono::Utc::now();
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_tls": !enabled,
+                    "admin_gate": {"enabled": true},
+                }),
+                created_at: now,
+                updated_at: now,
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row.clone()], [row]])
+                .into_connection();
+            update_app_settings(
+                &db,
+                "apps.example.com",
+                Some("https://manager.example.com"),
+                None,
+                mode,
+            )
+            .await
+            .expect("save TLS settings");
+            let writes = db.into_transaction_log();
+            let update = writes
+                .iter()
+                .flat_map(|transaction| transaction.statements())
+                .find(|statement| statement.sql.starts_with("UPDATE "))
+                .expect("settings update");
+            let saved = update
+                .values
+                .as_ref()
+                .expect("bound settings values")
+                .0
+                .iter()
+                .find_map(|value| match value {
+                    sea_orm::sea_query::Value::Json(Some(data)) => Some(data.as_ref()),
+                    _ => None,
+                })
+                .expect("bound settings JSON");
+            assert_eq!(saved["external_tls"], serde_json::json!(enabled));
+            assert_eq!(saved["admin_gate"]["enabled"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn admin_password_file_requires_eight_unicode_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        for (password, accepted) in [("éééé", false), ("🐙🐙", false), ("éééééééé", true)]
+        {
+            fs::write(&path, password).unwrap();
+            let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+            assert_eq!(command.resolve_installation_inputs().is_ok(), accepted);
+        }
     }
 
     #[test]

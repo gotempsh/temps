@@ -138,6 +138,12 @@ pub enum ConfigServiceError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to read external TLS policy from settings row 1: {source}")]
+    ExternalTlsSettingDatabase {
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("Failed to determine persisted installation mode while {operation}: {source}")]
     InstallationModeDatabase {
         operation: &'static str,
@@ -1450,6 +1456,23 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             )));
         }
         Ok(None)
+    }
+
+    /// Read setup's installation-wide TLS owner at proxy startup. This key is
+    /// independent of AppSettings so older API clients cannot reset it when
+    /// saving console settings. AppSettings::to_json_merged preserves it.
+    pub async fn external_tls_enabled(&self) -> Result<bool, ConfigServiceError> {
+        let row = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| ConfigServiceError::ExternalTlsSettingDatabase { source })?;
+        match row.as_ref().and_then(|row| row.data.get("external_tls")) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(enabled)) => Ok(*enabled),
+            Some(_) => Err(ConfigServiceError::InvalidConfiguration {
+                details: "settings row 1 external_tls must be a boolean".to_string(),
+            }),
+        }
     }
 
     /// Get the application settings
@@ -5230,6 +5253,51 @@ mod tests {
             second.preview_domain, "cached.example.com",
             "second call must be served from cache, not a fresh (empty) DB read"
         );
+    }
+
+    #[tokio::test]
+    async fn external_tls_policy_reads_persisted_installation_metadata() {
+        for (value, expected) in [
+            (None, false),
+            (Some(serde_json::json!(false)), false),
+            (Some(serde_json::json!(true)), true),
+        ] {
+            let mut row = settings_row("apps.example.com");
+            // Unrelated corrupt settings must not erase setup's TLS owner.
+            row.data["rate_limiting"] = serde_json::json!("malformed");
+            if let Some(value) = value {
+                row.data["external_tls"] = value;
+            }
+            let rewritten = AppSettings::from_json(row.data.clone()).to_json_merged(&row.data);
+            assert_eq!(rewritten.get("external_tls"), row.data.get("external_tls"));
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = ConfigService::new(test_config(), Arc::new(db));
+            assert_eq!(service.external_tls_enabled().await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tls_policy_rejects_corrupt_metadata_and_database_errors() {
+        let mut row = settings_row("apps.example.com");
+        row.data["external_tls"] = serde_json::json!("true");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[row]])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            service.external_tls_enabled().await,
+            Err(ConfigServiceError::InvalidConfiguration { .. })
+        ));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".to_string())])
+            .into_connection();
+        let service = ConfigService::new(test_config(), Arc::new(db));
+        assert!(matches!(
+            service.external_tls_enabled().await,
+            Err(ConfigServiceError::ExternalTlsSettingDatabase { .. })
+        ));
     }
 
     // Admin updates must take effect immediately (write-through), not after TTL.

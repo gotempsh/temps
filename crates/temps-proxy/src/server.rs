@@ -38,6 +38,23 @@ use std::pin::Pin;
 /// two seconds bounds the delay after an admin save without querying on traffic.
 const FORWARDED_IP_TRUST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Apply setup's TLS ownership before accepting requests. External proxies
+/// reach the origin over HTTP even when the public origin is HTTPS. Reuse the
+/// global redirect gate so project overrides and cached certificates cannot
+/// send those requests back to the external proxy in a redirect loop.
+async fn load_https_redirect_policy(
+    config_service: &temps_config::ConfigService,
+    explicitly_disabled: bool,
+) -> Result<bool> {
+    let external_tls = config_service
+        .external_tls_enabled()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("Cannot start proxy: failed to load external TLS policy: {error}")
+        })?;
+    Ok(explicitly_disabled || external_tls)
+}
+
 /// `None` means the settings read failed. Keep the last known value until a
 /// successful read, so a transient database outage cannot change IP policy.
 /// Returns the new value only when it changed.
@@ -587,6 +604,9 @@ pub fn setup_proxy_server(
 
     // Create the main load balancer
     let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let mut lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -599,7 +619,7 @@ pub fn setup_proxy_server(
         project_ip_gate,
         challenge_service,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
     .with_proxy_metrics(proxy_metrics.clone())
@@ -946,6 +966,9 @@ pub fn create_proxy_service(
 
     // Create the main load balancer
     let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let disable_https_redirect = security_refresh_runtime()?.block_on(
+        load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
+    )?;
     let lb = LoadBalancer::new(
         upstream_resolver,
         proxy_log_handle,
@@ -958,7 +981,7 @@ pub fn create_proxy_service(
         project_ip_gate,
         challenge_service,
         cert_host_cache,
-        proxy_config.disable_https_redirect,
+        disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
     .with_proxy_metrics(proxy_metrics);
@@ -984,6 +1007,50 @@ mod preflight_bind_tests {
             )
             .expect("create test server config"),
         )
+    }
+
+    #[tokio::test]
+    async fn external_tls_disables_origin_redirects_even_with_a_public_https_url() {
+        for (external_tls, explicit_disable, expected) in [
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_url": "https://console.apps.example.com",
+                    "external_tls": external_tls,
+                }),
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row]])
+                .into_connection();
+            let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+            assert_eq!(
+                load_https_redirect_policy(&service, explicit_disable)
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn external_tls_policy_must_be_loaded_before_the_proxy_starts() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([DbErr::Custom("settings unavailable".to_string())])
+            .into_connection();
+        let service = temps_config::ConfigService::new(test_config(), Arc::new(db));
+        let error = load_https_redirect_policy(&service, false)
+            .await
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Cannot start proxy: failed to load external TLS policy"));
     }
 
     #[test]
