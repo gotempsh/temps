@@ -63,9 +63,13 @@ test('existing databases can be searched and linked, while creation keeps projec
   )
   await page.getByRole('button', { name: 'Link', exact: true }).click()
   await page.getByRole('button', { name: 'Link database', exact: true }).click()
-  await expect(
-    page.getByText('Failed to link service', { exact: true }).first()
-  ).toBeVisible()
+  // The shared mutation handler announces the failure once, with the
+  // mutation's title and the server's detail.
+  const failureToast = page.locator('[data-sonner-toast]', {
+    hasText: 'Failed to link database to service',
+  })
+  await expect(failureToast).toHaveCount(1)
+  await expect(failureToast).toContainText('Database link failed')
   await expect(
     page.getByRole('button', { name: 'Link database', exact: true })
   ).toBeEnabled()
