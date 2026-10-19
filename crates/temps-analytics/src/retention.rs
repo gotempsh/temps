@@ -36,7 +36,7 @@ use sea_orm::{
 use serde::Serialize;
 use temps_core::{
     AnalyticsRetentionSettings, AuditLogger, AuditOperation, RetentionResolver, RetentionTable,
-    IP_REFERENCE_SLACK_DAYS,
+    IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -239,15 +239,46 @@ impl AnalyticsRetentionService {
     /// others: its error is logged and the pass continues, so one broken
     /// table cannot hold up the rest of the cleanup.
     pub async fn enforce(&self, settings: &AnalyticsRetentionSettings) -> RetentionReport {
+        if !stored_windows_valid(settings) {
+            return RetentionReport::default();
+        }
+        self.enforce_windows(settings).await
+    }
+
+    /// Validate the persisted policy before applying the IP reference floor.
+    /// Return the derived windows with the report so audits use the same inputs.
+    async fn enforce_for_logs(
+        &self,
+        policy: &temps_config::RetentionPolicy,
+        plugin_bound: ResolverBound,
+    ) -> Option<(RetentionReport, AnalyticsRetentionSettings)> {
+        if !stored_windows_valid(&policy.analytics) {
+            return None;
+        }
+        if !(MIN_ANALYTICS_RETENTION_DAYS..=MAX_ANALYTICS_RETENTION_DAYS)
+            .contains(&policy.proxy_logs_days)
+        {
+            warn!(
+                days = policy.proxy_logs_days,
+                "skipping analytics retention: invalid stored proxy-log window"
+            );
+            return None;
+        }
+        let windows = effective_windows(
+            &policy.analytics,
+            policy.proxy_logs_days,
+            plugin_bound,
+            Utc::now(),
+        );
+        let report = self.enforce_windows(&windows).await;
+        Some((report, windows))
+    }
+
+    /// The caller validates stored settings before deriving these windows.
+    /// The IP reference floor may legitimately exceed the settings maximum.
+    async fn enforce_windows(&self, settings: &AnalyticsRetentionSettings) -> RetentionReport {
         let mut report = RetentionReport::default();
         let now = Utc::now();
-        if let Some((field, days)) = settings.out_of_range() {
-            warn!(
-                field,
-                days, "skipping analytics retention: invalid stored window"
-            );
-            return report;
-        }
         if let Some(client) = &self.clickhouse {
             match self.sync_clickhouse_ttl(client, settings.events_days).await {
                 Ok(action) => report.clickhouse_events_policy = Some(action),
@@ -880,6 +911,17 @@ pub fn effective_windows(
     }
 }
 
+fn stored_windows_valid(settings: &AnalyticsRetentionSettings) -> bool {
+    if let Some((field, days)) = settings.out_of_range() {
+        warn!(
+            field,
+            days, "skipping analytics retention: invalid stored window"
+        );
+        return false;
+    }
+    true
+}
+
 /// What is known about the longest window a plugin-provided
 /// [`RetentionResolver`] stamps on proxy logs, beyond the instance setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -997,13 +1039,12 @@ pub fn spawn_retention_job(
             // so a policy that could not be read skips the pass.
             match config.get_retention_policy().await {
                 Ok(policy) => {
-                    let windows = effective_windows(
-                        &policy.analytics,
-                        policy.proxy_logs_days,
-                        ResolverBound::of(plugin_resolver.as_ref()),
-                        Utc::now(),
-                    );
-                    let report = service.enforce(&windows).await;
+                    let Some((report, windows)) = service
+                        .enforce_for_logs(&policy, ResolverBound::of(plugin_resolver.as_ref()))
+                        .await
+                    else {
+                        continue;
+                    };
                     if let Some(entry) = RetentionSweepAudit::from_report(&report, &windows) {
                         // The data is already gone; a failed audit write is
                         // logged, not retried, and does not stop the job.
@@ -1604,6 +1645,127 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(service.enforce(&settings).await, RetentionReport::default());
+        assert!(service
+            .enforce_for_logs(
+                &temps_config::RetentionPolicy {
+                    analytics: settings,
+                    proxy_logs_days: 3650,
+                },
+                ResolverBound::Instance,
+            )
+            .await
+            .is_none());
+        // Invalid saved IP windows must still be rejected, even though a
+        // *derived* window may exceed the settings maximum.
+        assert!(service
+            .enforce_for_logs(
+                &temps_config::RetentionPolicy {
+                    analytics: AnalyticsRetentionSettings {
+                        unreferenced_ip_days: Some(3651),
+                        ..Default::default()
+                    },
+                    proxy_logs_days: 3650,
+                },
+                ResolverBound::Instance,
+            )
+            .await
+            .is_none());
+        // Validate the saved log window too, before it is used to derive a
+        // cutoff. A corrupt value must not become an overflowing date.
+        for proxy_logs_days in [0, 3651, u32::MAX] {
+            assert!(service
+                .enforce_for_logs(
+                    &temps_config::RetentionPolicy {
+                        analytics: AnalyticsRetentionSettings::default(),
+                        proxy_logs_days,
+                    },
+                    ResolverBound::Instance,
+                )
+                .await
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn large_derived_ip_floor_does_not_skip_clickhouse_or_visitor_retention() {
+        use sea_orm::Value;
+        use std::collections::BTreeMap;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let router = axum::Router::new().route("/", axum::routing::any({
+            let calls = calls.clone();
+            move |uri: axum::http::Uri, body: String| {
+                let calls = calls.clone();
+                async move {
+                    let query = format!("{uri} {body}");
+                    let mut response = Vec::new();
+                    if query.contains("formatQuery") {
+                        // One String column in RowBinary, with validation off.
+                        let ddl = "CREATE TABLE events\nTTL toDateTime(timestamp) + toIntervalDay(90)";
+                        response.push(ddl.len() as u8);
+                        response.extend_from_slice(ddl.as_bytes());
+                    }
+                    calls.lock().await.push(query);
+                    response
+                }
+            }
+        }));
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        for (proxy_logs_days, bound, expected_ip_days) in [
+            (3650, ResolverBound::Instance, 3651),
+            (
+                30,
+                ResolverBound::AtMost(u16::MAX.into()),
+                u32::from(u16::MAX) + 1,
+            ),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([
+                    vec![BTreeMap::from([("present", Value::Bool(Some(false)))])],
+                    vec![BTreeMap::from([("present", Value::Bool(Some(false)))])],
+                    vec![BTreeMap::from([
+                        ("id", Value::Int(Some(7))),
+                        ("project_id", Value::Int(Some(42))),
+                    ])],
+                    vec![], // no IP reference columns in this fixture
+                    vec![], // no IPs older than the derived floor
+                ])
+                // TTL coordinator, then visitor config/fence/source/visitor.
+                .append_exec_results([exec_ok(0), exec_ok(0), exec_ok(0), exec_ok(3), exec_ok(1)])
+                .into_connection();
+            let client = clickhouse::Client::default()
+                .with_url(format!("http://{address}"))
+                .with_compression(clickhouse::Compression::None)
+                .with_validation(false);
+            let service = mock_service(db).with_clickhouse(client);
+            let (report, windows) = service
+                .enforce_for_logs(
+                    &temps_config::RetentionPolicy {
+                        analytics: AnalyticsRetentionSettings {
+                            error_events_days: Some(30),
+                            visitor_days: Some(425),
+                            ..Default::default()
+                        },
+                        proxy_logs_days,
+                    },
+                    bound,
+                )
+                .await
+                .expect("valid stored policy is enforced");
+
+            assert_eq!(windows.unreferenced_ip_days, Some(expected_ip_days));
+            assert_eq!(report.clickhouse_events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.error_events_policy, Some(PolicyAction::Keep));
+            assert_eq!(report.visitors_deleted, 1);
+        }
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 4, "one TTL read and visitor deletion per pass");
+        assert_eq!(calls.iter().filter(|q| q.contains("ALTER")).count(), 2);
+        server.abort();
     }
 
     #[test]
