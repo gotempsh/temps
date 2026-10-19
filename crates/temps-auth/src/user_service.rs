@@ -161,6 +161,9 @@ impl From<crate::mfa_guard::MfaGuardError> for UserServiceError {
             | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { .. } => {
                 UserServiceError::Mfa(error.to_string())
             }
+            crate::mfa_guard::MfaGuardError::VerifierUnavailable { .. } => {
+                UserServiceError::Internal(error.to_string())
+            }
         }
     }
 }
@@ -1157,7 +1160,7 @@ impl UserService {
         let now = Utc::now();
         let guard = crate::mfa_guard::load_guard(&transaction, user_id).await?;
         let Some(factor) =
-            crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, false, now)?
+            crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, false, now).await?
         else {
             return Err(UserServiceError::InvalidMfaCode);
         };
@@ -1231,7 +1234,7 @@ impl UserService {
             });
         }
 
-        match crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, true, now)? {
+        match crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, true, now).await? {
             Some(factor) => {
                 crate::mfa_guard::record_success(transaction, user, &guard, &factor, now).await?;
                 Ok(true)

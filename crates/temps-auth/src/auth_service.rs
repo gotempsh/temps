@@ -84,6 +84,21 @@ pub enum AuthError {
     NoPasswordSet,
     #[error("User {user_id} must change their password before a session can be created")]
     PasswordChangeRequired { user_id: i32 },
+    #[error(
+        "User {user_id} enabled MFA after the first factor was checked; a session needs the second factor"
+    )]
+    MfaRequired { user_id: i32 },
+}
+
+/// Whether the caller of [`AuthService::create_session_in_transaction`] has
+/// already verified the user's second factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondFactor {
+    /// Only the first factor (password or IdP) was checked. Refused if the
+    /// user has MFA enabled by the time the session row is written.
+    NotPresented,
+    /// An MFA challenge was completed for this sign-in.
+    Verified,
 }
 
 #[derive(Error, Debug)]
@@ -95,6 +110,10 @@ pub enum MfaChallengeError {
     #[error("MFA code is invalid for user {user_id}")]
     InvalidCode { user_id: i32 },
     #[error(
+        "MFA challenge for user {user_id} was discarded after too many wrong codes; the user must sign in again"
+    )]
+    ChallengeExhausted { user_id: i32 },
+    #[error(
         "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
     )]
     LockedOut {
@@ -105,6 +124,8 @@ pub enum MfaChallengeError {
     VerifierConfiguration { user_id: i32, reason: String },
     #[error("MFA verification clock failed for user {user_id}: {reason}")]
     VerificationClock { user_id: i32, reason: String },
+    #[error("MFA verifier could not run for user {user_id}: {reason}")]
+    VerifierUnavailable { user_id: i32, reason: String },
     #[error("Failed to {operation} for MFA challenge (user {user_id:?}): {source}")]
     Database {
         operation: &'static str,
@@ -120,6 +141,9 @@ impl MfaChallengeError {
             crate::mfa_guard::MfaGuardError::InvalidSecret { user_id, reason }
             | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { user_id, reason } => {
                 MfaChallengeError::VerifierConfiguration { user_id, reason }
+            }
+            crate::mfa_guard::MfaGuardError::VerifierUnavailable { user_id, reason } => {
+                MfaChallengeError::VerifierUnavailable { user_id, reason }
             }
             crate::mfa_guard::MfaGuardError::Database {
                 operation,
@@ -140,6 +164,11 @@ impl MfaChallengeError {
 enum ChallengeOutcome {
     Verified(Box<temps_entities::users::Model>, Option<String>),
     Rejected {
+        user_id: i32,
+    },
+    /// The wrong code used up the challenge's attempts and the challenge was
+    /// discarded; only a fresh sign-in can continue.
+    Exhausted {
         user_id: i32,
     },
     Locked {
@@ -175,7 +204,7 @@ impl AuthService {
     pub async fn create_session(&self, user_id: i32) -> Result<String, AuthError> {
         let transaction = self.db.begin().await?;
         let token = self
-            .create_session_in_transaction(user_id, None, &transaction)
+            .create_session_in_transaction(user_id, None, SecondFactor::NotPresented, &transaction)
             .await?;
         transaction.commit().await?;
         Ok(token)
@@ -185,8 +214,13 @@ impl AuthService {
         &self,
         user_id: i32,
         issuer: Option<&str>,
+        second_factor: SecondFactor,
         transaction: &sea_orm::DatabaseTransaction,
     ) -> Result<String, AuthError> {
+        // The shared lock waits for any in-flight writer holding the row
+        // exclusively (password reset, MFA enrolment) and then reads its
+        // committed result, so the checks below see the user as it is now,
+        // not as the caller saw it before verifying the first factor.
         let user = temps_entities::users::Entity::find_by_id(user_id)
             .filter(temps_entities::users::Column::DeletedAt.is_null())
             .lock_shared()
@@ -195,6 +229,12 @@ impl AuthService {
             .ok_or_else(|| AuthError::NotFound(format!("User {user_id} not found or deleted")))?;
         if user.must_change_password {
             return Err(AuthError::PasswordChangeRequired { user_id });
+        }
+        // MFA enrolment revokes every other session under the exclusive lock.
+        // A first-factor sign-in that decided "no MFA" before that enrolment
+        // committed must not write a full session after it.
+        if second_factor == SecondFactor::NotPresented && user.mfa_enabled {
+            return Err(AuthError::MfaRequired { user_id });
         }
 
         let session_token = self.generate_session_token();
@@ -425,22 +465,29 @@ impl AuthService {
         user: &temps_entities::users::Model,
         origin: Option<&str>,
     ) -> Result<String, AuthError> {
-        self.create_authenticated_session(user.id, origin).await
+        self.create_authenticated_session(user.id, origin, SecondFactor::Verified)
+            .await
     }
 
+    /// Session for an SSO sign-in that did not need an MFA challenge.
     pub(crate) async fn create_oidc_session(
         &self,
         user_id: i32,
         provider_id: i32,
     ) -> Result<String, AuthError> {
-        self.create_authenticated_session(user_id, Some(&format!("oidc:{provider_id}")))
-            .await
+        self.create_authenticated_session(
+            user_id,
+            Some(&format!("oidc:{provider_id}")),
+            SecondFactor::NotPresented,
+        )
+        .await
     }
 
     async fn create_authenticated_session(
         &self,
         user_id: i32,
         origin: Option<&str>,
+        second_factor: SecondFactor,
     ) -> Result<String, AuthError> {
         let transaction = self.db.begin().await?;
         if let Some(origin) = origin.filter(|origin| origin.starts_with("oidc")) {
@@ -473,6 +520,7 @@ impl AuthService {
             .create_session_in_transaction(
                 user_id,
                 origin.filter(|origin| origin.starts_with("oidc:")),
+                second_factor,
                 &transaction,
             )
             .await?;
@@ -577,6 +625,7 @@ impl AuthService {
                         allow_recovery_codes,
                         now,
                     )
+                    .await
                     .map_err(MfaChallengeError::from_guard)?;
 
                     let Some(factor) = factor else {
@@ -597,6 +646,7 @@ impl AuthService {
                                 user_id,
                                 attempts, "MFA challenge discarded after repeated wrong codes"
                             );
+                            return Ok(ChallengeOutcome::Exhausted { user_id });
                         } else {
                             let mut challenge: temps_entities::sessions::ActiveModel =
                                 session.into();
@@ -691,6 +741,9 @@ impl AuthService {
             ChallengeOutcome::Verified(user, origin) => Ok((*user, origin)),
             ChallengeOutcome::Rejected { user_id } => {
                 Err(MfaChallengeError::InvalidCode { user_id })
+            }
+            ChallengeOutcome::Exhausted { user_id } => {
+                Err(MfaChallengeError::ChallengeExhausted { user_id })
             }
             ChallengeOutcome::Locked {
                 user_id,
@@ -1724,11 +1777,12 @@ mod tests {
         );
         let auth = AuthService::new(db.clone(), Arc::new(MockEmailService::new()));
         assert!(auth
-            .create_authenticated_session(7, Some("oidc:5"))
+            .create_authenticated_session(7, Some("oidc:5"), SecondFactor::Verified)
             .await
             .is_err());
         assert!(matches!(
-            auth.create_authenticated_session(7, Some("oidc")).await,
+            auth.create_authenticated_session(7, Some("oidc"), SecondFactor::Verified)
+                .await,
             Err(AuthError::Unauthorized(_))
         ));
         drop(auth);
@@ -2522,6 +2576,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(surviving, 0);
+    }
+
+    /// MFA enrolment holds the user row exclusively while it enables MFA and
+    /// revokes other sessions. A password sign-in that checked the password
+    /// before the enrolment committed waits on that lock, then must refuse to
+    /// write a first-factor-only session.
+    #[tokio::test]
+    async fn create_session_refuses_a_first_factor_session_once_mfa_is_enabled() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "raced-enrolment@example.com", "Original123!").await;
+        let auth_service = Arc::new(auth_service);
+
+        let enrolment = db.db.begin().await.unwrap();
+        let locked = users::Entity::find_by_id(user.id)
+            .lock_exclusive()
+            .one(&enrolment)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let racing_login = {
+            let auth_service = auth_service.clone();
+            tokio::spawn(async move { auth_service.create_session(user.id).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !racing_login.is_finished(),
+            "create_session must block on the enrolment's row lock"
+        );
+
+        let mut enrolled: users::ActiveModel = locked.into();
+        enrolled.mfa_enabled = Set(true);
+        enrolled.mfa_secret = Set(Some(HARDENING_SECRET.to_string()));
+        enrolled.update(&enrolment).await.unwrap();
+        sessions::Entity::delete_many()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .exec(&enrolment)
+            .await
+            .unwrap();
+        enrolment.commit().await.unwrap();
+
+        let result = racing_login.await.unwrap();
+        assert!(
+            matches!(result, Err(AuthError::MfaRequired { user_id }) if user_id == user.id),
+            "a password-only session must not outlive the enrolment: {result:?}"
+        );
+        let surviving = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(surviving, 0);
+
+        let enrolled = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        auth_service
+            .create_session_after_mfa(&enrolled, Some("password"))
+            .await
+            .expect("a session after a completed MFA challenge is still issued");
     }
 
     #[tokio::test]
@@ -3719,13 +3835,18 @@ mod tests {
             .unwrap();
         let wrong = code_outside_window();
 
-        for attempt in 1..=crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+        for attempt in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
             let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
             assert!(
                 matches!(result, Err(MfaChallengeError::InvalidCode { .. })),
                 "attempt {attempt} must be a plain rejection: {result:?}"
             );
         }
+        let last = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
+        assert!(
+            matches!(last, Err(MfaChallengeError::ChallengeExhausted { user_id }) if user_id == user.id),
+            "the wrong code that uses up the challenge must say so: {last:?}"
+        );
 
         let pending = sessions::Entity::find()
             .filter(sessions::Column::SessionToken.eq(&challenge))
@@ -3764,12 +3885,22 @@ mod tests {
                 .create_mfa_session(user.id, "password")
                 .await
                 .unwrap();
-            for _ in 0..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+            for attempt in 1..=crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
                 if failures == crate::mfa_guard::USER_LOCKOUT_THRESHOLD {
                     break;
                 }
                 let result = auth_service.verify_mfa_challenge(&challenge, &wrong).await;
-                assert!(matches!(result, Err(MfaChallengeError::InvalidCode { .. })));
+                if attempt == crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                    assert!(
+                        matches!(result, Err(MfaChallengeError::ChallengeExhausted { .. })),
+                        "the code that uses up a challenge ends it: {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(MfaChallengeError::InvalidCode { .. })),
+                        "attempt {attempt} is a plain rejection: {result:?}"
+                    );
+                }
                 failures += 1;
             }
         }
@@ -3858,6 +3989,44 @@ mod tests {
         assert!(
             matches!(reuse, Err(MfaChallengeError::InvalidCode { .. })),
             "a recovery code is single use: {reuse:?}"
+        );
+    }
+
+    /// Recovery codes are six digits like TOTP codes, so one value can be
+    /// both. It must complete exactly one sign-in, not one per factor.
+    #[tokio::test]
+    async fn a_value_that_is_both_factors_signs_in_once() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let both = current_totp_code(HARDENING_SECRET);
+        let user = mfa_user_with_recovery(&db.db, "both-factors@example.com", true, &[&both]).await;
+
+        let first = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let (signed_in, _) = auth_service
+            .verify_mfa_challenge_with_origin(&first, &both)
+            .await
+            .expect("the value signs in once");
+        let remaining: Vec<String> =
+            serde_json::from_str(signed_in.mfa_recovery_codes.as_deref().unwrap()).unwrap();
+        assert!(remaining.is_empty(), "the matching recovery code is burned");
+        assert!(guard_row(&db.db, user.id)
+            .await
+            .unwrap()
+            .last_totp_step
+            .is_some());
+
+        let second = auth_service
+            .create_mfa_session(user.id, "password")
+            .await
+            .unwrap();
+        let again = auth_service.verify_mfa_challenge(&second, &both).await;
+        assert!(
+            matches!(again, Err(MfaChallengeError::InvalidCode { .. })),
+            "the same value must not sign in a second time: {again:?}"
         );
     }
 

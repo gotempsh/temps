@@ -170,6 +170,19 @@ fn mfa_locked_problem(retry_after_seconds: i64) -> Problem {
         .build()
 }
 
+/// Response for a sign-in challenge that can no longer be completed: it is
+/// missing, expired, or was discarded after too many wrong codes. Unlike
+/// [`invalid_mfa_problem`] it is not retryable with another code, so the
+/// `MFA_CHALLENGE_ENDED` code tells the client to restart sign-in.
+fn mfa_challenge_ended_problem(title: &str, detail: &str) -> Problem {
+    temps_core::error_builder::ErrorBuilder::new(StatusCode::UNAUTHORIZED)
+        .type_("https://temps.sh/probs/mfa-challenge-ended")
+        .title(title)
+        .detail(detail)
+        .value("error_code", "MFA_CHALLENGE_ENDED")
+        .build()
+}
+
 fn invalid_mfa_problem() -> Problem {
     problem_new(StatusCode::UNAUTHORIZED)
         .with_title("MFA Verification Failed")
@@ -340,11 +353,10 @@ pub async fn verify_mfa_challenge(
                 "missing_session_cookie",
             )
             .await;
-            return Err(problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("MFA Session Required")
-                .with_detail(
-                    "No MFA session found. Please log in first to start the MFA verification flow.",
-                ));
+            return Err(mfa_challenge_ended_problem(
+                "MFA Session Required",
+                "No MFA session found. Please log in first to start the MFA verification flow.",
+            ));
         }
     };
 
@@ -360,9 +372,10 @@ pub async fn verify_mfa_challenge(
             )
             .await;
             tracing::error!("Failed to decrypt MFA session cookie: {}", error);
-            return Err(problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("MFA Session Expired")
-                .with_detail("Your MFA session has expired or is invalid. Please log in again."));
+            return Err(mfa_challenge_ended_problem(
+                "MFA Session Expired",
+                "Your MFA session has expired or is invalid. Please log in again.",
+            ));
         }
     };
 
@@ -512,7 +525,23 @@ pub async fn verify_mfa_challenge(
                 "invalid_or_expired_session",
             )
             .await;
-            Err(invalid_mfa_problem())
+            Err(mfa_challenge_ended_problem(
+                "MFA Session Expired",
+                "Your MFA session has expired or is invalid. Please log in again.",
+            ))
+        }
+        Err(crate::auth_service::MfaChallengeError::ChallengeExhausted { user_id }) => {
+            record_mfa_rejection(
+                auth_state.as_ref(),
+                &metadata,
+                Some(user_id),
+                "challenge_exhausted",
+            )
+            .await;
+            Err(mfa_challenge_ended_problem(
+                "Too Many Incorrect Codes",
+                "Too many incorrect verification codes for this sign-in attempt. Sign in again with your password to get a new verification step.",
+            ))
         }
         Err(crate::auth_service::MfaChallengeError::InvalidCode { user_id }) => {
             record_mfa_rejection(
@@ -1352,6 +1381,24 @@ pub async fn login(
                                 password_change_required: false,
                             }),
                         ))
+                    }
+                    Err(crate::auth_service::AuthError::MfaRequired { .. }) => {
+                        // MFA was enabled after this request checked the
+                        // password; the next sign-in gets the MFA challenge.
+                        record_login_failure(
+                            state.as_ref(),
+                            &metadata,
+                            Some(user.id),
+                            &login_email,
+                            "password",
+                            "mfa_enabled_during_login",
+                        )
+                        .await;
+                        Err(problem_new(StatusCode::UNAUTHORIZED)
+                            .with_title("Sign In Again")
+                            .with_detail(
+                                "Two-factor authentication was just enabled for this account. Sign in again to complete the verification step.",
+                            ))
                     }
                     Err(crate::auth_service::AuthError::PasswordChangeRequired { .. }) => {
                         // An admin reset flagged the account after this
@@ -4517,6 +4564,60 @@ mod tests {
                 statuses.push(status);
             }
             assert_eq!(statuses, [StatusCode::NO_CONTENT, StatusCode::UNAUTHORIZED]);
+        }
+
+        #[tokio::test]
+        async fn exhausted_challenge_tells_the_client_to_sign_in_again() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+            let (user, secret) = mfa_user(&db, true, &[]).await;
+            let challenge = mfa_challenge_cookie(&state, user.id).await;
+            let wrong = serde_json::json!({ "code": wrong_code(&secret) });
+
+            for attempt in 1..crate::mfa_guard::MAX_FAILED_ATTEMPTS_PER_CHALLENGE {
+                let (status, body) = send(
+                    &app,
+                    "POST",
+                    "/auth/verify-mfa",
+                    Some(("cookie", &challenge)),
+                    Some(wrong.clone()),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
+                assert!(
+                    body.get("error_code").is_none(),
+                    "attempt {attempt} can still be retried with another code: {body}"
+                );
+            }
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &challenge)),
+                Some(wrong),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["error_code"], "MFA_CHALLENGE_ENDED", "{body}");
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/verify-mfa",
+                Some(("cookie", &challenge)),
+                Some(serde_json::json!({ "code": code_at(&secret, Utc::now()) })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(
+                body["error_code"], "MFA_CHALLENGE_ENDED",
+                "a discarded challenge must send the user back to sign in: {body}"
+            );
         }
 
         #[tokio::test]

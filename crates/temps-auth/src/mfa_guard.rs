@@ -12,7 +12,10 @@
 //!    must be strictly greater than the last one accepted for the user
 //!    (RFC 6238 §5.2), and the new step is stored on success.
 //! 2. **Recovery codes are single use.** A matching hash is removed from the
-//!    stored list in the same transaction that accepts it.
+//!    stored list in the same transaction that accepts it. A value that is
+//!    both a fresh TOTP code and an unused recovery code is accepted as the
+//!    recovery code *and* records the TOTP step, so it cannot pass again
+//!    through either route.
 //! 3. **Wrong codes are throttled per user, not per address.** Consecutive
 //!    failures are persisted in `user_mfa_guards`; past
 //!    [`USER_LOCKOUT_THRESHOLD`] every attempt is refused without evaluation
@@ -32,12 +35,15 @@
 //! rejection afterwards, rather than returning an error from inside the
 //! transaction (which would roll the counter back and make every guess free).
 
+use std::sync::LazyLock;
+
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, EntityTrait, Set};
 use temps_entities::{user_mfa_guards, users};
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use totp_rs::{Algorithm, Builder, Totp};
 
 /// Wrong codes allowed against one pending sign-in challenge before it is
@@ -55,12 +61,22 @@ const USER_LOCKOUT_BASE_SECONDS: i64 = 5 * 60;
 /// Upper bound for a single lockout window.
 const USER_LOCKOUT_MAX_SECONDS: i64 = 60 * 60;
 
+/// Recovery-code checks allowed to hash at once across the process. Each one
+/// runs up to one Argon2 verification per stored code, so they run on the
+/// blocking pool and queue (without holding a worker) beyond this limit.
+const MAX_CONCURRENT_RECOVERY_CHECKS: usize = 2;
+
+static RECOVERY_CHECK_SLOTS: LazyLock<Semaphore> =
+    LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_RECOVERY_CHECKS));
+
 #[derive(Debug, Error)]
 pub(crate) enum MfaGuardError {
     #[error("Stored MFA secret for user {user_id} is unusable: {reason}")]
     InvalidSecret { user_id: i32, reason: String },
     #[error("Stored MFA recovery codes for user {user_id} are unusable: {reason}")]
     InvalidRecoveryCodes { user_id: i32, reason: String },
+    #[error("Recovery-code check for user {user_id} could not run: {reason}")]
+    VerifierUnavailable { user_id: i32, reason: String },
     #[error("Failed to {operation} for user {user_id}: {source}")]
     Database {
         operation: &'static str,
@@ -76,7 +92,12 @@ pub(crate) enum AcceptedFactor {
     /// A TOTP code matching this time-step counter.
     Totp { step: u64 },
     /// A recovery code; `remaining` is the stored hash list without it.
-    RecoveryCode { remaining: Vec<String> },
+    /// `totp_step` is set when the same value was also a fresh TOTP code, so
+    /// that step is recorded too.
+    RecoveryCode {
+        remaining: Vec<String>,
+        totp_step: Option<u64>,
+    },
 }
 
 /// Snapshot of a user's `user_mfa_guards` row (defaults when absent).
@@ -124,16 +145,18 @@ fn unix_seconds(now: DateTime<Utc>) -> u64 {
 
 /// Decide whether `code` is an acceptable second factor for `user` right now.
 ///
-/// TOTP is checked first and only counts when its step is newer than
-/// `last_totp_step`; a replayed code falls through to the recovery-code
-/// check and is otherwise rejected exactly like a wrong code, so the response
-/// never distinguishes "reused" from "wrong". Recovery codes are only
-/// considered when `allow_recovery_codes` is set (they are never valid for
-/// confirming a fresh enrolment).
+/// A TOTP code only counts when its step is newer than `last_totp_step`; a
+/// replayed code is rejected exactly like a wrong one, so the response never
+/// distinguishes "reused" from "wrong". Recovery codes are only considered
+/// when `allow_recovery_codes` is set (they are never valid for confirming a
+/// fresh enrolment), and are always checked, even when the TOTP check
+/// passed: recovery codes are six digits too, and a value matching both must
+/// burn the recovery code rather than leave it usable for a second sign-in.
 ///
-/// Pure: performs no writes. Persist the outcome with [`record_success`] or
-/// [`record_failure`].
-pub(crate) fn check_factor(
+/// Performs no writes. Persist the outcome with [`record_success`] or
+/// [`record_failure`]. The recovery-code hashing runs on the blocking pool;
+/// the caller's transaction and row lock stay held across the await.
+pub(crate) async fn check_factor(
     user: &users::Model,
     last_totp_step: Option<i64>,
     code: &str,
@@ -149,42 +172,80 @@ pub(crate) fn check_factor(
         })?;
     let totp = build_totp(user.id, secret)?;
 
-    if let Some(step) = totp.check(code, unix_seconds(now)) {
-        let fresh = match (last_totp_step, i64::try_from(step)) {
+    let fresh_totp_step = totp.check(code, unix_seconds(now)).filter(|step| {
+        match (last_totp_step, i64::try_from(*step)) {
             (_, Err(_)) => false,
             (None, Ok(_)) => true,
             (Some(last), Ok(step)) => step > last,
-        };
-        if fresh {
-            return Ok(Some(AcceptedFactor::Totp { step }));
         }
-    }
+    });
 
-    if !allow_recovery_codes {
-        return Ok(None);
-    }
+    let recovery = if allow_recovery_codes {
+        match_recovery_code(user, code).await?
+    } else {
+        None
+    };
+
+    Ok(match (recovery, fresh_totp_step) {
+        (Some(remaining), totp_step) => Some(AcceptedFactor::RecoveryCode {
+            remaining,
+            totp_step,
+        }),
+        (None, Some(step)) => Some(AcceptedFactor::Totp { step }),
+        (None, None) => None,
+    })
+}
+
+/// The stored recovery-code hashes without the one `code` matches, or `None`
+/// when it matches none of them.
+async fn match_recovery_code(
+    user: &users::Model,
+    code: &str,
+) -> Result<Option<Vec<String>>, MfaGuardError> {
+    let user_id = user.id;
     let Some(stored) = user.mfa_recovery_codes.as_deref() else {
         return Ok(None);
     };
     let hashes: Vec<String> =
         serde_json::from_str(stored).map_err(|error| MfaGuardError::InvalidRecoveryCodes {
-            user_id: user.id,
+            user_id,
             reason: error.to_string(),
         })?;
-    let argon2 = Argon2::default();
-    for (index, hash) in hashes.iter().enumerate() {
-        let parsed =
-            PasswordHash::new(hash).map_err(|error| MfaGuardError::InvalidRecoveryCodes {
-                user_id: user.id,
-                reason: format!("recovery code hash {index} cannot be parsed: {error}"),
-            })?;
-        if argon2.verify_password(code.as_bytes(), &parsed).is_ok() {
-            let mut remaining = hashes.clone();
-            remaining.remove(index);
-            return Ok(Some(AcceptedFactor::RecoveryCode { remaining }));
-        }
+    if hashes.is_empty() {
+        return Ok(None);
     }
-    Ok(None)
+
+    let slot =
+        RECOVERY_CHECK_SLOTS
+            .acquire()
+            .await
+            .map_err(|_| MfaGuardError::VerifierUnavailable {
+                user_id,
+                reason: "the recovery-code check limiter is closed".to_string(),
+            })?;
+    let code = code.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _slot = slot;
+        let argon2 = Argon2::default();
+        for (index, hash) in hashes.iter().enumerate() {
+            let parsed =
+                PasswordHash::new(hash).map_err(|error| MfaGuardError::InvalidRecoveryCodes {
+                    user_id,
+                    reason: format!("recovery code hash {index} cannot be parsed: {error}"),
+                })?;
+            if argon2.verify_password(code.as_bytes(), &parsed).is_ok() {
+                let mut remaining = hashes.clone();
+                remaining.remove(index);
+                return Ok(Some(remaining));
+            }
+        }
+        Ok(None)
+    })
+    .await
+    .map_err(|error| MfaGuardError::VerifierUnavailable {
+        user_id,
+        reason: format!("the recovery-code check worker failed: {error}"),
+    })?
 }
 
 /// Load the guard row for `user_id`. Caller holds the `users` row lock.
@@ -255,12 +316,16 @@ pub(crate) async fn record_success<C: ConnectionTrait>(
     now: DateTime<Utc>,
 ) -> Result<users::Model, MfaGuardError> {
     let user_id = user.id;
-    let last_totp_step = match factor {
-        AcceptedFactor::Totp { step } => {
-            let step = i64::try_from(*step).unwrap_or(i64::MAX);
+    let accepted_step = match factor {
+        AcceptedFactor::Totp { step } => Some(*step),
+        AcceptedFactor::RecoveryCode { totp_step, .. } => *totp_step,
+    };
+    let last_totp_step = match accepted_step {
+        Some(step) => {
+            let step = i64::try_from(step).unwrap_or(i64::MAX);
             Some(guard.last_totp_step.map_or(step, |last| last.max(step)))
         }
-        AcceptedFactor::RecoveryCode { .. } => guard.last_totp_step,
+        None => guard.last_totp_step,
     };
     store_guard(
         conn,
@@ -277,7 +342,7 @@ pub(crate) async fn record_success<C: ConnectionTrait>(
 
     match factor {
         AcceptedFactor::Totp { .. } => Ok(user),
-        AcceptedFactor::RecoveryCode { remaining } => {
+        AcceptedFactor::RecoveryCode { remaining, .. } => {
             let encoded = serde_json::to_string(remaining).map_err(|error| {
                 MfaGuardError::InvalidRecoveryCodes {
                     user_id,
@@ -428,38 +493,43 @@ mod tests {
         }
     }
 
-    #[test]
-    fn totp_is_accepted_once_per_step() {
+    #[tokio::test]
+    async fn totp_is_accepted_once_per_step() {
         let secret = new_secret();
         let user = user(&secret, None);
         let now = Utc::now();
         let code = code_at(&secret, now);
 
         let Some(AcceptedFactor::Totp { step }) =
-            check_factor(&user, None, &code, true, now).unwrap()
+            check_factor(&user, None, &code, true, now).await.unwrap()
         else {
             panic!("a fresh current code must be accepted");
         };
         let accepted = i64::try_from(step).unwrap();
 
         assert_eq!(
-            check_factor(&user, Some(accepted), &code, true, now).unwrap(),
+            check_factor(&user, Some(accepted), &code, true, now)
+                .await
+                .unwrap(),
             None,
             "the same code must be rejected once its step was accepted"
         );
         assert_eq!(
-            check_factor(&user, Some(accepted + 5), &code, true, now).unwrap(),
+            check_factor(&user, Some(accepted + 5), &code, true, now)
+                .await
+                .unwrap(),
             None,
             "a code older than the last accepted step must be rejected"
         );
     }
 
-    #[test]
-    fn next_step_is_accepted_after_previous_one() {
+    #[tokio::test]
+    async fn next_step_is_accepted_after_previous_one() {
         let secret = new_secret();
         let user = user(&secret, None);
         let now = Utc::now();
         let first = check_factor(&user, None, &code_at(&secret, now), false, now)
+            .await
             .unwrap()
             .expect("current code accepted");
         let AcceptedFactor::Totp { step } = first else {
@@ -474,17 +544,24 @@ mod tests {
                 false,
                 later
             )
+            .await
             .unwrap(),
             Some(AcceptedFactor::Totp { .. })
         ));
     }
 
-    #[test]
-    fn recovery_code_is_matched_and_removed_from_remaining() {
+    #[tokio::test]
+    async fn recovery_code_is_matched_and_removed_from_remaining() {
         let secret = new_secret();
         let user = user(&secret, Some(vec!["111111", "222222"]));
-        let accepted = check_factor(&user, None, "222222", true, Utc::now()).unwrap();
-        let Some(AcceptedFactor::RecoveryCode { remaining }) = accepted else {
+        let accepted = check_factor(&user, None, "222222", true, Utc::now())
+            .await
+            .unwrap();
+        let Some(AcceptedFactor::RecoveryCode {
+            remaining,
+            totp_step: None,
+        }) = accepted
+        else {
             panic!("recovery code must be accepted");
         };
         assert_eq!(remaining.len(), 1);
@@ -494,22 +571,53 @@ mod tests {
             .is_ok());
     }
 
-    #[test]
-    fn recovery_codes_are_ignored_when_not_allowed() {
+    #[tokio::test]
+    async fn a_value_that_is_both_factors_burns_the_recovery_code_and_the_step() {
+        let secret = new_secret();
+        let now = Utc::now();
+        let code = code_at(&secret, now);
+        let user = user(&secret, Some(vec![code.as_str(), "555555"]));
+
+        let Some(AcceptedFactor::RecoveryCode {
+            remaining,
+            totp_step: Some(step),
+        }) = check_factor(&user, None, &code, true, now).await.unwrap()
+        else {
+            panic!("a value matching both factors must be taken as the recovery code");
+        };
+        assert_eq!(remaining.len(), 1, "the matching recovery code is burned");
+
+        // As the stored state stands after `record_success`: the code is gone
+        // from the list and its step is recorded.
+        let mut after = user.clone();
+        after.mfa_recovery_codes = Some(serde_json::to_string(&remaining).unwrap());
+        assert_eq!(
+            check_factor(&after, Some(step as i64), &code, true, now)
+                .await
+                .unwrap(),
+            None,
+            "the same value must not pass again as either factor"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_codes_are_ignored_when_not_allowed() {
         let secret = new_secret();
         let user = user(&secret, Some(vec!["333333"]));
         assert_eq!(
-            check_factor(&user, None, "333333", false, Utc::now()).unwrap(),
+            check_factor(&user, None, "333333", false, Utc::now())
+                .await
+                .unwrap(),
             None
         );
     }
 
-    #[test]
-    fn missing_secret_is_a_configuration_error() {
+    #[tokio::test]
+    async fn missing_secret_is_a_configuration_error() {
         let mut user = user(&new_secret(), None);
         user.mfa_secret = None;
         assert!(matches!(
-            check_factor(&user, None, "123456", true, Utc::now()),
+            check_factor(&user, None, "123456", true, Utc::now()).await,
             Err(MfaGuardError::InvalidSecret { user_id: 42, .. })
         ));
     }
