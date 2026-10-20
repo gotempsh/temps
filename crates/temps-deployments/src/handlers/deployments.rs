@@ -2255,6 +2255,7 @@ pub async fn get_container_environment_variable(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     require_container_environment_reveal(&auth)?;
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let variables = state
@@ -2348,6 +2349,7 @@ fn mask_container_environment_variables(variables: Vec<(String, String)>) -> Vec
     ),
     responses(
         (status = 200, description = "Container stopped successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2359,8 +2361,16 @@ pub async fn stop_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2405,6 +2415,7 @@ pub async fn stop_container(
     ),
     responses(
         (status = 200, description = "Container started successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2416,8 +2427,16 @@ pub async fn start_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2462,6 +2481,7 @@ pub async fn start_container(
     ),
     responses(
         (status = 200, description = "Container restarted successfully", body = ContainerActionResponse),
+        (status = 403, description = "Insufficient permissions or cross-project credential"),
         (status = 404, description = "Container not found"),
         (status = 409, description = "The container is placed on this process, which has no local Docker daemon"),
         (status = 500, description = "Internal server error")
@@ -2473,8 +2493,16 @@ pub async fn restart_container(
     RequireAuth(auth): RequireAuth,
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, EnvironmentsWrite);
-    project_access_guard!(auth, project_id, state.project_access_checker);
+    // Container lifecycle is deployment runtime control, not env-var
+    // editing: gate it on the deployment write permission (with per-project
+    // narrowing) and confine deployment tokens to their own project.
+    project_permission_guard!(
+        auth,
+        DeploymentsWrite,
+        project_id,
+        state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     state
         .deployment_service
@@ -2530,6 +2558,7 @@ pub async fn get_container_metrics(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let stats = state
@@ -2587,6 +2616,7 @@ pub async fn get_container_metrics_history(
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let store = state.metrics_store.as_ref().ok_or_else(|| {
@@ -2734,6 +2764,7 @@ pub async fn stream_container_metrics(
     Problem,
 > {
     permission_guard!(auth, EnvironmentsRead);
+    project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let interval_ms = params
@@ -3164,6 +3195,70 @@ mod tests {
                 "{handler_name} must reject credentials scoped to another project"
             );
         }
+    }
+
+    /// Extract the body of `pub async fn {handler_name}` up to the next
+    /// `pub async fn` in `source`.
+    fn handler_source<'a>(source: &'a str, handler_name: &str) -> &'a str {
+        let fn_start = source
+            .find(&format!("pub async fn {handler_name}("))
+            .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+        let after_start = &source[fn_start + 1..];
+        let next_fn_offset = after_start
+            .find("pub async fn")
+            .unwrap_or(after_start.len());
+        &source[fn_start..fn_start + 1 + next_fn_offset]
+    }
+
+    #[test]
+    fn container_env_and_metrics_handlers_enforce_credential_project_scope() {
+        let source = include_str!("deployments.rs");
+        for handler_name in [
+            "get_container_environment_variable",
+            "get_container_metrics",
+            "get_container_metrics_history",
+            "stream_container_metrics",
+            "stop_container",
+            "start_container",
+            "restart_container",
+        ] {
+            assert!(
+                handler_source(source, handler_name)
+                    .contains("project_scope_guard!(auth, project_id)"),
+                "{handler_name} must reject credentials scoped to another project"
+            );
+        }
+    }
+
+    #[test]
+    fn container_lifecycle_handlers_require_deployment_write_permission() {
+        let source = include_str!("deployments.rs");
+        for handler_name in ["stop_container", "start_container", "restart_container"] {
+            let body = handler_source(source, handler_name);
+            assert!(
+                body.contains("DeploymentsWrite"),
+                "{handler_name} must be gated on DeploymentsWrite"
+            );
+            assert!(
+                !body.contains("EnvironmentsWrite"),
+                "{handler_name} must not be gated on the env-var permission EnvironmentsWrite"
+            );
+        }
+    }
+
+    #[test]
+    fn send_failure_report_requires_deployment_write_permission() {
+        let source = include_str!("failure_report.rs");
+        let body = handler_source(source, "send_failure_report");
+        assert!(
+            body.contains("permission_guard!(auth, DeploymentsWrite)"),
+            "send_failure_report triggers an outbound report and must require DeploymentsWrite"
+        );
+        assert!(
+            !body.contains("DeploymentsRead"),
+            "send_failure_report must not be reachable with DeploymentsRead alone"
+        );
+        assert!(body.contains("project_scope_guard!(auth, project_id)"));
     }
 
     #[test]

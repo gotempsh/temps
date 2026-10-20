@@ -753,6 +753,7 @@ async fn retrieve_file(
     responses(
         (status = 200, description = "File deleted", body = FileDeletedResponse),
         (status = 401, description = "Unauthorized", body = OpenAiErrorResponse),
+        (status = 403, description = "Insufficient permissions (requires ai_gateway:write)"),
         (status = 404, description = "No such file created by the caller", body = OpenAiErrorResponse)
     ),
     security(("bearer_auth" = []))
@@ -764,7 +765,10 @@ async fn delete_file(
     headers: HeaderMap,
     Path(file_id): Path<String>,
 ) -> Result<Response, Problem> {
-    permission_guard!(auth, AiGatewayExecute);
+    // Deleting a stored provider file is destructive, so it needs the write
+    // tier rather than the run-inference (Execute) tier that uploads and
+    // reads use.
+    permission_guard!(auth, AiGatewayWrite);
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),

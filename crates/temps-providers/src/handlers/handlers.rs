@@ -2306,6 +2306,7 @@ async fn start_service(
     responses(
         (status = 200, description = "Cluster retry initiated", body = ExternalServiceInfo),
         (status = 400, description = "Service is not a failed cluster"),
+        (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2319,6 +2320,10 @@ async fn retry_cluster(
     Json(request): Json<RetryClusterRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    // Cluster topology changes are operator actions on shared infrastructure;
+    // a project-scoped deployment token never needs them, even for a service
+    // linked to its own project.
+    deny_deployment_token!(auth);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let members: Vec<crate::services::ClusterMemberRequest> = request
@@ -2389,6 +2394,7 @@ async fn retry_cluster(
     responses(
         (status = 202, description = "Cluster member provisioning started", body = ServiceMemberInfo),
         (status = 400, description = "Validation failed (wrong topology, status, or role)"),
+        (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2403,6 +2409,10 @@ async fn add_cluster_member(
     Json(request): Json<AddClusterMemberRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    // Cluster topology changes are operator actions on shared infrastructure;
+    // a project-scoped deployment token never needs them, even for a service
+    // linked to its own project.
+    deny_deployment_token!(auth);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
@@ -2529,6 +2539,7 @@ async fn get_cluster_member(
     responses(
         (status = 204, description = "Cluster member removed"),
         (status = 400, description = "Validation failed (monitor, primary, or quorum violation)"),
+        (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2545,6 +2556,10 @@ async fn remove_cluster_member(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    // Cluster topology changes are operator actions on shared infrastructure;
+    // a project-scoped deployment token never needs them, even for a service
+    // linked to its own project.
+    deny_deployment_token!(auth);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
@@ -2620,6 +2635,7 @@ async fn remove_cluster_member(
     responses(
         (status = 202, description = "Promotion initiated"),
         (status = 400, description = "Validation failed (monitor, already primary, not running, etc.)"),
+        (status = 403, description = "Insufficient permissions or deployment-token caller"),
         (status = 404, description = "Service or member not found"),
         (status = 500, description = "pg_autoctl perform promotion failed")
     ),
@@ -2636,6 +2652,10 @@ async fn promote_cluster_member(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    // Cluster topology changes are operator actions on shared infrastructure;
+    // a project-scoped deployment token never needs them, even for a service
+    // linked to its own project.
+    deny_deployment_token!(auth);
     super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     match app_state
@@ -4886,5 +4906,31 @@ mod tests {
             }),
             OperationFailureCode::ImagePull
         );
+    }
+
+    #[test]
+    fn cluster_member_mutations_reject_deployment_tokens_and_check_ownership() {
+        let source = include_str!("handlers.rs");
+        for handler_name in [
+            "retry_cluster",
+            "add_cluster_member",
+            "remove_cluster_member",
+            "promote_cluster_member",
+        ] {
+            let fn_start = source
+                .find(&format!("async fn {handler_name}("))
+                .unwrap_or_else(|| panic!("{handler_name} handler not found in source"));
+            let after_start = &source[fn_start + 1..];
+            let next_fn_offset = after_start.find("async fn ").unwrap_or(after_start.len());
+            let body = &source[fn_start..fn_start + 1 + next_fn_offset];
+            assert!(
+                body.contains("deny_deployment_token!(auth)"),
+                "{handler_name} must reject deployment tokens"
+            );
+            assert!(
+                body.contains("assert_service_owned_by_caller(id, &auth, &app_state)"),
+                "{handler_name} must verify the caller can access service {{id}}"
+            );
+        }
     }
 }

@@ -61,17 +61,13 @@ pub(crate) fn enforce_permission_ceiling_for_role(
     role_type: &str,
     permissions: Option<&[String]>,
 ) -> Result<(), Problem> {
+    // Explicitly requested permissions are checked for every role type, not
+    // only `custom`: a predefined-role request that also lists permissions
+    // above the requester's ceiling is rejected (403) rather than having the
+    // list silently dropped by the service.
+    enforce_explicit_permission_ceiling(auth, permissions)?;
+
     if role_type == "custom" {
-        let Some(permissions) = permissions else {
-            return Ok(());
-        };
-        for perm_str in permissions {
-            if let Some(perm) = crate::permissions::Permission::from_str(perm_str) {
-                if !auth.has_permission(&perm) {
-                    return Err(permission_ceiling_exceeded(perm_str));
-                }
-            }
-        }
         return Ok(());
     }
 
@@ -82,6 +78,28 @@ pub(crate) fn enforce_permission_ceiling_for_role(
         for perm in role.permissions() {
             if !auth.has_permission(perm) {
                 return Err(permission_ceiling_exceeded(&perm.to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reject any explicitly requested permission the requester does not hold.
+///
+/// Shared by key creation/rotation (via
+/// [`enforce_permission_ceiling_for_role`]) and key update, so a permission
+/// list can never widen a key beyond its owner's own permissions on any
+/// write path — including update, whose service layer does not currently
+/// persist `permissions` but must not become an escalation path if it ever
+/// does. Unparsable strings are left to the service layer's validation.
+fn enforce_explicit_permission_ceiling(
+    auth: &crate::context::AuthContext,
+    permissions: Option<&[String]>,
+) -> Result<(), Problem> {
+    for perm_str in permissions.unwrap_or_default() {
+        if let Some(perm) = crate::permissions::Permission::from_str(perm_str) {
+            if !auth.has_permission(&perm) {
+                return Err(permission_ceiling_exceeded(perm_str));
             }
         }
     }
@@ -277,6 +295,8 @@ pub async fn update_api_key(
     Json(request): Json<UpdateApiKeyRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
+
+    enforce_explicit_permission_ceiling(&auth, request.permissions.as_deref())?;
 
     match state
         .api_key_service
@@ -773,5 +793,101 @@ mod tests {
         let auth = user_auth(Role::User);
         let req = custom_request(vec!["not-a-real-permission"]);
         assert!(enforce_permission_ceiling(&auth, &req).is_ok());
+    }
+
+    fn predefined_request_with_permissions(
+        role_type: &str,
+        permissions: Vec<&str>,
+    ) -> CreateApiKeyRequest {
+        CreateApiKeyRequest {
+            permissions: Some(permissions.into_iter().map(String::from).collect()),
+            ..predefined_request(role_type)
+        }
+    }
+
+    /// A predefined role whose own permission set fits the ceiling must
+    /// still be rejected when the request also lists explicit permissions
+    /// the requester does not hold — previously the list was silently
+    /// dropped and the key created (201).
+    #[test]
+    fn predefined_role_with_explicit_permissions_above_ceiling_is_rejected() {
+        let auth = user_auth(Role::User);
+        let req = predefined_request_with_permissions("user", vec!["users:manage", "secrets:read"]);
+        let err = enforce_permission_ceiling(&auth, &req).unwrap_err();
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+    }
+
+    #[test]
+    fn predefined_role_with_explicit_permissions_within_ceiling_is_allowed() {
+        let auth = user_auth(Role::User);
+        let req = predefined_request_with_permissions("user", vec!["projects:read"]);
+        assert!(enforce_permission_ceiling(&auth, &req).is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_handler_rejects_explicit_permissions_above_ceiling() {
+        let result = create_api_key(
+            RequireAuth(user_auth(Role::User)),
+            State(guarded_state()),
+            Extension(request_metadata()),
+            Json(predefined_request_with_permissions(
+                "user",
+                vec!["users:manage", "secrets:read"],
+            )),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("over-ceiling API key creation must be rejected"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+    }
+
+    fn update_request(permissions: Option<Vec<&str>>) -> UpdateApiKeyRequest {
+        UpdateApiKeyRequest {
+            name: None,
+            is_active: None,
+            permissions: permissions.map(|p| p.into_iter().map(String::from).collect()),
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn update_handler_rejects_permissions_above_ceiling() {
+        let result = update_api_key(
+            RequireAuth(user_auth(Role::User)),
+            State(guarded_state()),
+            Path(123),
+            Json(update_request(Some(vec!["system:admin"]))),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("over-ceiling API key update must be rejected"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+    }
+
+    #[test]
+    fn update_permissions_within_ceiling_or_absent_pass_the_check() {
+        let auth = user_auth(Role::User);
+        let within = update_request(Some(vec!["projects:read"]));
+        assert!(enforce_explicit_permission_ceiling(&auth, within.permissions.as_deref()).is_ok());
+        let absent = update_request(None);
+        assert!(enforce_explicit_permission_ceiling(&auth, absent.permissions.as_deref()).is_ok());
     }
 }

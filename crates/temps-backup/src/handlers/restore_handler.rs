@@ -852,7 +852,7 @@ fn require_ownerless_restore_admin(
         (status = 200, description = "Preview of what the restore will do", body = RestorePlan),
         (status = 400, description = "Validation error", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
-        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions (requires backups:write)", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -863,10 +863,13 @@ async fn plan_restore(
     Path(id): Path<i32>,
     Json(request): Json<StartRestoreRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Planning is read-only: only needs BackupsRead. Don't gate behind
-    // ExternalServices* — users should be able to preview a restore before
-    // deciding whether to escalate to someone with write perms.
-    permission_guard!(auth, BackupsRead);
+    // Planning mutates nothing, but it is a POST that drives the restore
+    // orchestrator against a target service and an arbitrary backup source,
+    // so it needs the backup write tier (BackupsWrite, the same baseline the
+    // restore itself requires) rather than read. It is deliberately NOT gated
+    // behind ExternalServices* -- a backup operator should be able to preview
+    // a restore before escalating to someone who may execute it.
+    permission_guard!(auth, BackupsWrite);
 
     let selector = match (request.backup_id, request.backup_location.as_ref()) {
         (Some(backup_id), _) => crate::services::BackupSelector::Id(backup_id),
@@ -901,12 +904,12 @@ async fn plan_restore(
         &app_state,
         &auth,
         id,
-        Permission::BackupsRead,
+        Permission::BackupsWrite,
         "target service",
         "restore plan",
     )
     .await?;
-    require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsRead).await?;
+    require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsWrite).await?;
 
     let plan = app_state
         .restore_service

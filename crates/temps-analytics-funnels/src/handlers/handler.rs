@@ -393,6 +393,13 @@ pub async fn get_unique_events(
 }
 
 /// Preview funnel metrics without creating the funnel
+///
+/// Requires `FunnelWrite`, the same as creating a funnel: although nothing is
+/// persisted, the request carries an arbitrary caller-defined step list that
+/// is run as an ad-hoc multi-step query over the project's analytics events.
+/// The console only calls it from the create/edit funnel form, whose save
+/// already needs `FunnelWrite`; read-only callers use the saved-funnel
+/// `GET .../funnels/{funnel_id}/metrics` endpoint instead.
 #[utoipa::path(
     post,
     path = "/projects/{project_id}/funnels/preview",
@@ -404,6 +411,7 @@ pub async fn get_unique_events(
         (status = 200, description = "Funnel metrics preview", body = FunnelMetricsResponse),
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions (requires funnel:write)"),
         (status = 500, description = "Internal server error")
     ),
     tag = "Funnels",
@@ -418,7 +426,7 @@ pub async fn preview_funnel_metrics(
     Query(query): Query<GetFunnelMetricsQuery>,
     Json(request): Json<CreateFunnelRequest>,
 ) -> Result<Json<FunnelMetricsResponse>, Problem> {
-    permission_guard!(auth, FunnelRead);
+    permission_guard!(auth, FunnelWrite);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
     let filter = FunnelFilter {

@@ -1067,7 +1067,11 @@ async fn test_provider_key_by_id(
     State(app_state): State<Arc<AiGatewayAppState>>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayRead);
+    // Write, not Read: this decrypts a stored provider credential and spends
+    // it on an outbound call. A read-only principal must not be able to drive
+    // use of secret credentials -- the same bar as the inline test and
+    // discover endpoints, which also exercise a key against a provider.
+    permission_guard!(auth, AiGatewayWrite);
 
     // get_by_id already returns Err(ProviderKeyNotFound) if not found
     let key_record = app_state.provider_key_service.get_by_id(id).await?;
