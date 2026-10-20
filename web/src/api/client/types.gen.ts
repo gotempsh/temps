@@ -34328,6 +34328,10 @@ export type DeleteFileErrors = {
      */
     401: OpenAiErrorResponse;
     /**
+     * Insufficient permissions (requires ai_gateway:write)
+     */
+    403: unknown;
+    /**
      * No such file created by the caller
      */
     404: OpenAiErrorResponse;
@@ -42179,6 +42183,10 @@ export type GetGlobalEventsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type GetGlobalEventsResponses = {
@@ -42202,6 +42210,10 @@ export type GetGlobalEventStatsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type GetGlobalEventStatsResponses = {
@@ -43521,6 +43533,10 @@ export type AddClusterMemberErrors = {
      */
     400: unknown;
     /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -43560,6 +43576,10 @@ export type RemoveClusterMemberErrors = {
      * Validation failed (monitor, primary, or quorum violation)
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service or member not found
      */
@@ -43636,6 +43656,10 @@ export type PromoteClusterMemberErrors = {
      * Validation failed (monitor, already primary, not running, etc.)
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service or member not found
      */
@@ -44595,7 +44619,7 @@ export type PlanRestoreErrors = {
      */
     401: ProblemDetails;
     /**
-     * Insufficient permissions
+     * Insufficient permissions (requires backups:write)
      */
     403: ProblemDetails;
     /**
@@ -44667,6 +44691,10 @@ export type RetryClusterErrors = {
      * Service is not a failed cluster
      */
     400: unknown;
+    /**
+     * Insufficient permissions or deployment-token caller
+     */
+    403: unknown;
     /**
      * Service not found
      */
@@ -60379,6 +60407,10 @@ export type SendFailureReportData = {
 
 export type SendFailureReportErrors = {
     /**
+     * Insufficient permissions, cross-project credential, or reporting disabled
+     */
+    403: unknown;
+    /**
      * Job not found
      */
     404: unknown;
@@ -62667,6 +62699,10 @@ export type RestartContainerData = {
 
 export type RestartContainerErrors = {
     /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
+    /**
      * Container not found
      */
     404: unknown;
@@ -62711,6 +62747,10 @@ export type StartContainerData = {
 
 export type StartContainerErrors = {
     /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
+    /**
      * Container not found
      */
     404: unknown;
@@ -62754,6 +62794,10 @@ export type StopContainerData = {
 };
 
 export type StopContainerErrors = {
+    /**
+     * Insufficient permissions or cross-project credential
+     */
+    403: unknown;
     /**
      * Container not found
      */
@@ -64778,6 +64822,10 @@ export type PreviewFunnelMetricsErrors = {
      * Unauthorized
      */
     401: unknown;
+    /**
+     * Insufficient permissions (requires funnel:write)
+     */
+    403: unknown;
     /**
      * Internal server error
      */
@@ -70387,6 +70435,13 @@ export type RevenueGlobalEventsData = {
     url: '/revenue/events';
 };
 
+export type RevenueGlobalEventsErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
+};
+
 export type RevenueGlobalEventsResponses = {
     200: Array<GlobalRecentEventResponse>;
 };
@@ -70398,6 +70453,13 @@ export type RevenueMetricsGlobalMrrData = {
     path?: never;
     query?: never;
     url: '/revenue/metrics/global-mrr';
+};
+
+export type RevenueMetricsGlobalMrrErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type RevenueMetricsGlobalMrrResponses = {
@@ -70416,6 +70478,13 @@ export type RevenueMetricsGlobalSummaryData = {
         currency?: string;
     };
     url: '/revenue/metrics/global-summary';
+};
+
+export type RevenueMetricsGlobalSummaryErrors = {
+    /**
+     * Caller is not an instance administrator
+     */
+    403: unknown;
 };
 
 export type RevenueMetricsGlobalSummaryResponses = {

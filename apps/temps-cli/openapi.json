@@ -72057,6 +72057,9 @@
             },
             "description": "Unauthorized"
           },
+          "403": {
+            "description": "Insufficient permissions (requires ai_gateway:write)"
+          },
           "404": {
             "content": {
               "application/json": {
@@ -84837,6 +84840,7 @@
     },
     "/emails/events": {
       "get": {
+        "description": "Instance administrators only: the feed spans every email sent through this\ninstallation, including recipient IPs, user agents and clicked URLs.",
         "operationId": "get_global_events",
         "parameters": [
           {
@@ -84884,6 +84888,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Caller is not an instance administrator"
           }
         },
         "security": [
@@ -84900,6 +84907,7 @@
     },
     "/emails/events/stats": {
       "get": {
+        "description": "Instance administrators only: the statistics span every email sent through\nthis installation.",
         "operationId": "get_global_event_stats",
         "responses": {
           "200": {
@@ -84914,6 +84922,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Caller is not an instance administrator"
           }
         },
         "security": [
@@ -86916,6 +86927,9 @@
           "400": {
             "description": "Validation failed (wrong topology, status, or role)"
           },
+          "403": {
+            "description": "Insufficient permissions or deployment-token caller"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -86966,6 +86980,9 @@
           },
           "400": {
             "description": "Validation failed (monitor, primary, or quorum violation)"
+          },
+          "403": {
+            "description": "Insufficient permissions or deployment-token caller"
           },
           "404": {
             "description": "Service or member not found"
@@ -87069,6 +87086,9 @@
           },
           "400": {
             "description": "Validation failed (monitor, already primary, not running, etc.)"
+          },
+          "403": {
+            "description": "Insufficient permissions or deployment-token caller"
           },
           "404": {
             "description": "Service or member not found"
@@ -88502,7 +88522,7 @@
                 }
               }
             },
-            "description": "Insufficient permissions"
+            "description": "Insufficient permissions (requires backups:write)"
           },
           "404": {
             "content": {
@@ -88633,6 +88653,9 @@
           },
           "400": {
             "description": "Service is not a failed cluster"
+          },
+          "403": {
+            "description": "Insufficient permissions or deployment-token caller"
           },
           "404": {
             "description": "Service not found"
@@ -114049,6 +114072,9 @@
           "204": {
             "description": "Report sent"
           },
+          "403": {
+            "description": "Insufficient permissions, cross-project credential, or reporting disabled"
+          },
           "404": {
             "description": "Job not found"
           },
@@ -117604,6 +117630,9 @@
             },
             "description": "Container restarted successfully"
           },
+          "403": {
+            "description": "Insufficient permissions or cross-project credential"
+          },
           "404": {
             "description": "Container not found"
           },
@@ -117665,6 +117694,9 @@
             },
             "description": "Container started successfully"
           },
+          "403": {
+            "description": "Insufficient permissions or cross-project credential"
+          },
           "404": {
             "description": "Container not found"
           },
@@ -117725,6 +117757,9 @@
               }
             },
             "description": "Container stopped successfully"
+          },
+          "403": {
+            "description": "Insufficient permissions or cross-project credential"
           },
           "404": {
             "description": "Container not found"
@@ -121054,6 +121089,7 @@
     },
     "/projects/{project_id}/funnels/preview": {
       "post": {
+        "description": "Requires `FunnelWrite`, the same as creating a funnel: although nothing is\npersisted, the request carries an arbitrary caller-defined step list that\nis run as an ad-hoc multi-step query over the project's analytics events.\nThe console only calls it from the create/edit funnel form, whose save\nalready needs `FunnelWrite`; read-only callers use the saved-funnel\n`GET .../funnels/{funnel_id}/metrics` endpoint instead.",
         "operationId": "preview_funnel_metrics",
         "parameters": [
           {
@@ -121093,6 +121129,9 @@
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions (requires funnel:write)"
           },
           "500": {
             "description": "Internal server error"
@@ -130539,6 +130578,7 @@
     },
     "/revenue/events": {
       "get": {
+        "description": "Instance administrators only: the feed spans every project (the optional\n`project_id` filter narrows the result, not the authorization).",
         "operationId": "revenue_global_events",
         "parameters": [
           {
@@ -130601,6 +130641,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Caller is not an instance administrator"
           }
         },
         "security": [
@@ -130617,6 +130660,7 @@
     },
     "/revenue/metrics/global-mrr": {
       "get": {
+        "description": "Instance administrators only: the figure spans every project.",
         "operationId": "revenue_metrics_global_mrr",
         "responses": {
           "200": {
@@ -130627,6 +130671,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Caller is not an instance administrator"
           }
         },
         "security": [
@@ -130643,6 +130690,7 @@
     },
     "/revenue/metrics/global-summary": {
       "get": {
+        "description": "Instance administrators only: the figures span every project.",
         "operationId": "revenue_metrics_global_summary",
         "parameters": [
           {
@@ -130664,6 +130712,9 @@
                 }
               }
             }
+          },
+          "403": {
+            "description": "Caller is not an instance administrator"
           }
         },
         "security": [

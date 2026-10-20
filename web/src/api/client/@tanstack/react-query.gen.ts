@@ -6274,6 +6274,9 @@ export const getGlobalEventsQueryKey = (options?: Options<GetGlobalEventsData>) 
 
 /**
  * GET /emails/events
+ *
+ * Instance administrators only: the feed spans every email sent through this
+ * installation, including recipient IPs, user agents and clicked URLs.
  */
 export const getGlobalEventsOptions = (options?: Options<GetGlobalEventsData>) => queryOptions<GetGlobalEventsResponse, DefaultError, GetGlobalEventsResponse, ReturnType<typeof getGlobalEventsQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -6292,6 +6295,9 @@ export const getGlobalEventsInfiniteQueryKey = (options?: Options<GetGlobalEvent
 
 /**
  * GET /emails/events
+ *
+ * Instance administrators only: the feed spans every email sent through this
+ * installation, including recipient IPs, user agents and clicked URLs.
  */
 export const getGlobalEventsInfiniteOptions = (options?: Options<GetGlobalEventsData>) => {
     const opts = infiniteQueryOptions<GetGlobalEventsResponse, DefaultError, InfiniteData<GetGlobalEventsResponse>, QueryKey<Options<GetGlobalEventsData>>, number | Pick<QueryKey<Options<GetGlobalEventsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
@@ -6322,6 +6328,9 @@ export const getGlobalEventStatsQueryKey = (options?: Options<GetGlobalEventStat
 
 /**
  * GET /emails/events/stats
+ *
+ * Instance administrators only: the statistics span every email sent through
+ * this installation.
  */
 export const getGlobalEventStatsOptions = (options?: Options<GetGlobalEventStatsData>) => queryOptions<GetGlobalEventStatsResponse, DefaultError, GetGlobalEventStatsResponse, ReturnType<typeof getGlobalEventStatsQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -17622,6 +17631,13 @@ export const createFunnelMutation = (options?: Partial<Options<CreateFunnelData>
 
 /**
  * Preview funnel metrics without creating the funnel
+ *
+ * Requires `FunnelWrite`, the same as creating a funnel: although nothing is
+ * persisted, the request carries an arbitrary caller-defined step list that
+ * is run as an ad-hoc multi-step query over the project's analytics events.
+ * The console only calls it from the create/edit funnel form, whose save
+ * already needs `FunnelWrite`; read-only callers use the saved-funnel
+ * `GET .../funnels/{funnel_id}/metrics` endpoint instead.
  */
 export const previewFunnelMetricsMutation = (options?: Partial<Options<PreviewFunnelMetricsData>>): UseMutationOptions<PreviewFunnelMetricsResponse, DefaultError, Options<PreviewFunnelMetricsData>> => {
     const mutationOptions: UseMutationOptions<PreviewFunnelMetricsResponse, DefaultError, Options<PreviewFunnelMetricsData>> = {
@@ -20138,6 +20154,9 @@ export const revenueGlobalEventsQueryKey = (options?: Options<RevenueGlobalEvent
  * Org-wide revenue events across every project. Powers the revenue
  * transactions page. Supports filtering by project, date range, and
  * event type.
+ *
+ * Instance administrators only: the feed spans every project (the optional
+ * `project_id` filter narrows the result, not the authorization).
  */
 export const revenueGlobalEventsOptions = (options?: Options<RevenueGlobalEventsData>) => queryOptions<RevenueGlobalEventsResponse, DefaultError, RevenueGlobalEventsResponse, ReturnType<typeof revenueGlobalEventsQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -20157,6 +20176,8 @@ export const revenueMetricsGlobalMrrQueryKey = (options?: Options<RevenueMetrics
 /**
  * Org-wide MRR total, summed across every project in the install.
  * Powers the single-number MRR card on the main dashboard.
+ *
+ * Instance administrators only: the figure spans every project.
  */
 export const revenueMetricsGlobalMrrOptions = (options?: Options<RevenueMetricsGlobalMrrData>) => queryOptions<RevenueMetricsGlobalMrrResponse, DefaultError, RevenueMetricsGlobalMrrResponse, ReturnType<typeof revenueMetricsGlobalMrrQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -20177,6 +20198,8 @@ export const revenueMetricsGlobalSummaryQueryKey = (options?: Options<RevenueMet
  * Org-wide revenue summary: MRR, paid cash (30d + all-time), refunds,
  * active subscriptions/customers, and transaction count. Powers the
  * header on the Revenue transactions page.
+ *
+ * Instance administrators only: the figures span every project.
  */
 export const revenueMetricsGlobalSummaryOptions = (options?: Options<RevenueMetricsGlobalSummaryData>) => queryOptions<RevenueMetricsGlobalSummaryResponse, DefaultError, RevenueMetricsGlobalSummaryResponse, ReturnType<typeof revenueMetricsGlobalSummaryQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
