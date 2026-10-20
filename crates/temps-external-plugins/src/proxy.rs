@@ -106,11 +106,113 @@ pub fn create_plugin_proxy_router(proxy: PluginProxy) -> Router {
         .with_state(proxy)
 }
 
+/// Why a request path was refused before any routing decision was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathRejection {
+    /// A `..` segment would climb above the plugin's root.
+    EscapesRoot,
+    /// A backslash, raw or percent-encoded. WHATWG URL parsing (what a
+    /// JavaScript plugin's `new URL(req.url)` uses) treats `\` as a path
+    /// separator for `http:` URLs, so it could re-split segments after our
+    /// checks ran.
+    AmbiguousSeparator,
+}
+
+/// Resolve dot-segments in a request path the way the plugin will, so every
+/// decision this proxy makes is about the path the plugin actually routes.
+///
+/// This exists because of a real bypass: `is_public` used to match the raw
+/// path, so `/public/../api/subscribers` passed as a public route while the
+/// plugin's URL parser collapsed it to `/api/subscribers` — its admin API,
+/// reached unauthenticated. The same trick walked past the reserved
+/// transport-path guard (`/public/../_events`).
+///
+/// Segments that are `.`/`..` *after* decoding `%2e` are resolved (RFC 3986
+/// §5.2.4, WHATWG treats `%2e` as a dot in this position too); every other
+/// segment is kept byte-for-byte. A path that climbs above the root, or that
+/// contains a backslash a downstream parser might read as `/`, is rejected
+/// outright — no legitimate client sends either.
+fn normalize_request_path(path: &str) -> Result<String, PathRejection> {
+    if path.contains('\\') || path.to_ascii_lowercase().contains("%5c") {
+        return Err(PathRejection::AmbiguousSeparator);
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    let raw_segments: Vec<&str> = path.split('/').skip(1).collect();
+    let last_index = raw_segments.len().saturating_sub(1);
+    // A trailing dot-segment leaves a directory-shaped path behind
+    // (`/a/b/..` -> `/a/`), matching both RFC 3986 and WHATWG.
+    let mut trailing_slash = false;
+
+    for (index, segment) in raw_segments.iter().enumerate() {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        match decoded.as_str() {
+            "." => {
+                trailing_slash = index == last_index;
+            }
+            ".." => {
+                if segments.pop().is_none() {
+                    return Err(PathRejection::EscapesRoot);
+                }
+                trailing_slash = index == last_index;
+            }
+            _ => {
+                segments.push(segment);
+                trailing_slash = false;
+            }
+        }
+    }
+
+    let mut normalized = String::with_capacity(path.len());
+    for segment in &segments {
+        normalized.push('/');
+        normalized.push_str(segment);
+    }
+    if trailing_slash || normalized.is_empty() {
+        normalized.push('/');
+    }
+    Ok(normalized)
+}
+
 /// The actual proxy handler — forwards requests to the plugin over Unix socket.
 async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let path = uri.path();
+    let raw_path = uri.path();
+
+    // Normalize before *any* decision below. Every check — reserved
+    // transport paths, the public-route exemption — and the forwarded
+    // request itself must all see the same path, or a dot-segment can make
+    // the proxy authorize one route while the plugin serves another.
+    let normalized_path = match normalize_request_path(raw_path) {
+        Ok(normalized) => normalized,
+        Err(rejection) => {
+            warn!(
+                plugin = %proxy.plugin_name,
+                method = %method,
+                path = %raw_path,
+                reason = ?rejection,
+                "Rejecting plugin request with an unresolvable path"
+            );
+            return problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Plugin Path")
+                .with_detail(format!(
+                    "Request path '{}' for plugin '{}' contains dot-segments that escape \
+                     the plugin root or an ambiguous path separator",
+                    raw_path, proxy.plugin_name
+                ))
+                .into_response();
+        }
+    };
+    let path = normalized_path.as_str();
+    if path != raw_path {
+        debug!(
+            plugin = %proxy.plugin_name,
+            raw_path = %raw_path,
+            normalized_path = %path,
+            "Normalized dot-segments in plugin request path"
+        );
+    }
 
     // These endpoints accept assertions that only the platform may make.
     // They remain reachable over the plugin's private Unix socket for event
@@ -138,6 +240,13 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
     // through for the public ingest endpoints to handle themselves. So
     // without this check every `/api/x/<plugin>/…` path is reachable
     // unauthenticated, whatever the plugin behind it does.
+    //
+    // TODO(defense-in-depth): plugins should not rely on this routing
+    // decision alone. The plugin SDKs should refuse any non-`public_paths`
+    // route that arrives without the proxy-injected `x-temps-*` identity
+    // headers (and a valid `x-temps-auth-signature`), so a future proxy
+    // parsing gap fails closed inside the plugin instead of exposing its
+    // admin API.
     let auth = request.extensions().get::<AuthContext>().cloned();
     if auth.is_none() && !proxy.is_public(path) {
         warn!(
@@ -164,9 +273,14 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
         "Proxying request to external plugin"
     );
 
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path);
+    // Forward the normalized path — exactly the one the checks above
+    // approved — never the raw one.
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{}?{}", path, query),
+        None => path.to_string(),
+    };
 
-    match forward_to_unix_socket(&proxy, auth.as_ref(), request, path_and_query).await {
+    match forward_to_unix_socket(&proxy, auth.as_ref(), request, &path_and_query).await {
         Ok(response) => response,
         Err(e) => {
             error!(
@@ -746,6 +860,101 @@ mod tests {
         assert!(proxy.is_public("/hooks/incoming"));
         assert!(proxy.is_public("/hooks/incoming/jobs"));
         assert!(!proxy.is_public("/hooks/incoming-admin"));
+    }
+
+    #[test]
+    fn normalize_resolves_dot_segments_including_percent_encoded_ones() {
+        for (raw, expected) in [
+            ("/public/../api/subscribers", "/api/subscribers"),
+            ("/public/%2e%2e/api/subscribers", "/api/subscribers"),
+            ("/public/%2E%2e/api/subscribers", "/api/subscribers"),
+            ("/public/.%2e/api/subscribers", "/api/subscribers"),
+            ("/public/./../api/subscribers", "/api/subscribers"),
+            ("/public/%2e/form", "/public/form"),
+            ("/public/../_events", "/_events"),
+            ("/public/../_temps/channel", "/_temps/channel"),
+            ("/a/b/..", "/a/"),
+            ("/a/.", "/a/"),
+            ("/", "/"),
+            ("/public/form/", "/public/form/"),
+            // Not a dot-segment: dots inside a name and double-encoding are
+            // left exactly as sent.
+            ("/public/file.v2..json", "/public/file.v2..json"),
+            ("/public/%252e%252e/x", "/public/%252e%252e/x"),
+        ] {
+            assert_eq!(
+                normalize_request_path(raw).as_deref(),
+                Ok(expected),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_root_escape_and_backslashes() {
+        assert_eq!(
+            normalize_request_path("/../api"),
+            Err(PathRejection::EscapesRoot)
+        );
+        assert_eq!(
+            normalize_request_path("/public/../../api"),
+            Err(PathRejection::EscapesRoot)
+        );
+        assert_eq!(
+            normalize_request_path("/public\\..\\api"),
+            Err(PathRejection::AmbiguousSeparator)
+        );
+        assert_eq!(
+            normalize_request_path("/public/..%5Capi"),
+            Err(PathRejection::AmbiguousSeparator)
+        );
+    }
+
+    /// The live-confirmed bypass: a dot-segment after a public prefix must
+    /// not borrow that prefix's exemption.
+    #[test]
+    fn dot_segment_traversal_does_not_pass_is_public() {
+        let proxy = test_proxy().with_public_paths(vec!["/public".into()]);
+        for raw in [
+            "/public/../api/subscribers",
+            "/public/%2e%2e/api/subscribers",
+            "/public/./../api/settings",
+        ] {
+            let normalized = normalize_request_path(raw).expect("resolvable path");
+            assert!(!proxy.is_public(&normalized), "{raw} -> {normalized}");
+        }
+        // Genuine public routes keep working.
+        let normalized = normalize_request_path("/public/./subscribe").expect("resolvable path");
+        assert!(proxy.is_public(&normalized));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_traversal_out_of_a_public_prefix_is_rejected() {
+        // The socket does not exist, so a 401/404/400 proves the handler
+        // refused before forwarding; reaching the forwarder would be a 502.
+        let router =
+            create_plugin_proxy_router(test_proxy().with_public_paths(vec!["/public".into()]));
+
+        for (uri, expected) in [
+            ("/public/../api/subscribers", StatusCode::UNAUTHORIZED),
+            ("/public/%2e%2e/api/settings", StatusCode::UNAUTHORIZED),
+            ("/public/./../api/subscribers", StatusCode::UNAUTHORIZED),
+            ("/public/../_events", StatusCode::NOT_FOUND),
+            ("/public/%2e%2e/_temps/channel", StatusCode::NOT_FOUND),
+            ("/public/../../api/subscribers", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("traversal request should build"),
+                )
+                .await
+                .expect("proxy router should respond");
+            assert_eq!(response.status(), expected, "{uri}");
+        }
     }
 
     #[test]
