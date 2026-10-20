@@ -13,9 +13,11 @@
 //! Each hit that passed HMAC verification now goes through three checks, in
 //! order, before any work is spawned:
 //!
-//! 1. **Replay dedupe** per `(email_id, event kind, client ip)`: a repeat
-//!    inside [`DEDUPE_WINDOW_SECS`] is a replay (or a mail client prefetching
-//!    the same image twice) and is not recorded again.
+//! 1. **Replay dedupe** per `(email_id, event kind, client ip, target)`: a
+//!    repeat inside [`DEDUPE_WINDOW_SECS`] is a replay (or a mail client
+//!    prefetching the same image twice) and is not recorded again. For clicks
+//!    the target is the destination URL, so a recipient following two
+//!    *different* links in one email within the window records both.
 //! 2. **Per-email cap** per `(email_id, event kind)`: at most
 //!    [`PER_EMAIL_MAX_EVENTS_PER_WINDOW`] events in a [`PER_EMAIL_WINDOW_SECS`]
 //!    window, whatever the client IP. This is what holds when the caller
@@ -48,8 +50,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::warn;
 use uuid::Uuid;
 
-/// A repeat of the same `(email, kind, ip)` within this many seconds is not
-/// recorded again.
+/// A repeat of the same `(email, kind, ip, target)` within this many seconds
+/// is not recorded again.
 pub const DEDUPE_WINDOW_SECS: u64 = 60;
 
 /// Length of the per-email counting window.
@@ -99,7 +101,7 @@ impl TrackingHitKind {
 /// Why a hit was not admitted for recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackingHitRejection {
-    /// Same `(email, kind, ip)` seen within [`DEDUPE_WINDOW_SECS`].
+    /// Same `(email, kind, ip, target)` seen within [`DEDUPE_WINDOW_SECS`].
     Duplicate,
     /// The email exceeded [`PER_EMAIL_MAX_EVENTS_PER_WINDOW`] for this kind.
     RateLimited,
@@ -150,14 +152,20 @@ impl TrackingHitGuard {
     ///
     /// `client_ip` is whatever the handler resolved; an unparseable or absent
     /// value shares one "unknown" dedupe identity per email.
+    ///
+    /// `target` distinguishes hits that are legitimately different events for
+    /// the same email: the destination URL of a click. It only narrows the
+    /// replay dedupe key; the per-email cap stays shared across targets, so
+    /// replaying many signed links of one email is still bounded.
     pub fn admit(
         &self,
         email_id: Uuid,
         kind: TrackingHitKind,
         client_ip: Option<&str>,
+        target: Option<&str>,
     ) -> Result<OwnedSemaphorePermit, TrackingHitRejection> {
         let now = self.started.elapsed().as_secs();
-        self.admit_at(email_id, kind, client_ip, now)
+        self.admit_at(email_id, kind, client_ip, target, now)
     }
 
     fn admit_at(
@@ -165,13 +173,14 @@ impl TrackingHitGuard {
         email_id: Uuid,
         kind: TrackingHitKind,
         client_ip: Option<&str>,
+        target: Option<&str>,
         now_secs: u64,
     ) -> Result<OwnedSemaphorePermit, TrackingHitRejection> {
         // Normalise so "1.2.3.4" and " 1.2.3.4" (or IPv6 spellings) dedupe
         // together; anything unparseable collapses to `None`.
         let ip: Option<IpAddr> = client_ip.and_then(|s| s.trim().parse().ok());
 
-        let (reason, counter) = if self.is_duplicate(email_id, kind, ip, now_secs) {
+        let (reason, counter) = if self.is_duplicate(email_id, kind, ip, target, now_secs) {
             (TrackingHitRejection::Duplicate, &self.dropped_duplicate)
         } else if !self.within_per_email_cap(email_id, kind, now_secs) {
             (
@@ -200,17 +209,19 @@ impl TrackingHitGuard {
         Err(reason)
     }
 
-    /// Records the `(email, kind, ip)` hit and reports whether the same key
-    /// was already seen within [`DEDUPE_WINDOW_SECS`]. A duplicate refreshes
-    /// the slot, so a steady replay every < window seconds stays suppressed.
+    /// Records the `(email, kind, ip, target)` hit and reports whether the
+    /// same key was already seen within [`DEDUPE_WINDOW_SECS`]. A duplicate
+    /// refreshes the slot, so a steady replay every < window seconds stays
+    /// suppressed.
     fn is_duplicate(
         &self,
         email_id: Uuid,
         kind: TrackingHitKind,
         ip: Option<IpAddr>,
+        target: Option<&str>,
         now_secs: u64,
     ) -> bool {
-        let hash = self.hasher.hash_one((email_id, kind, ip));
+        let hash = self.hasher.hash_one((email_id, kind, ip, target));
         let slot = &self.dedupe[(hash as usize) % DEDUPE_SLOTS];
         // Non-zero fingerprint so an empty slot (0) never matches.
         let fingerprint = ((hash >> 32) as u32 | 1) as u64;
@@ -276,7 +287,7 @@ mod tests {
     async fn first_hit_is_admitted() {
         let guard = TrackingHitGuard::new();
         assert!(guard
-            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0)
+            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0)
             .is_ok());
     }
 
@@ -285,15 +296,19 @@ mod tests {
         let guard = TrackingHitGuard::new();
         let id = email();
         let ip = Some("192.0.2.1");
-        assert!(guard.admit_at(id, TrackingHitKind::Open, ip, 10).is_ok());
+        assert!(guard
+            .admit_at(id, TrackingHitKind::Open, ip, None, 10)
+            .is_ok());
         assert_eq!(
-            guard.admit_at(id, TrackingHitKind::Open, ip, 11).err(),
+            guard
+                .admit_at(id, TrackingHitKind::Open, ip, None, 11)
+                .err(),
             Some(TrackingHitRejection::Duplicate)
         );
         // Whitespace / formatting differences are the same client.
         assert_eq!(
             guard
-                .admit_at(id, TrackingHitKind::Open, Some(" 192.0.2.1 "), 12)
+                .admit_at(id, TrackingHitKind::Open, Some(" 192.0.2.1 "), None, 12)
                 .err(),
             Some(TrackingHitRejection::Duplicate)
         );
@@ -305,9 +320,11 @@ mod tests {
         let guard = TrackingHitGuard::new();
         let id = email();
         let ip = Some("192.0.2.1");
-        assert!(guard.admit_at(id, TrackingHitKind::Open, ip, 0).is_ok());
         assert!(guard
-            .admit_at(id, TrackingHitKind::Open, ip, DEDUPE_WINDOW_SECS + 1)
+            .admit_at(id, TrackingHitKind::Open, ip, None, 0)
+            .is_ok());
+        assert!(guard
+            .admit_at(id, TrackingHitKind::Open, ip, None, DEDUPE_WINDOW_SECS + 1)
             .is_ok());
     }
 
@@ -316,17 +333,65 @@ mod tests {
         let guard = TrackingHitGuard::new();
         let id = email();
         assert!(guard
-            .admit_at(id, TrackingHitKind::Open, Some("192.0.2.1"), 0)
+            .admit_at(id, TrackingHitKind::Open, Some("192.0.2.1"), None, 0)
             .is_ok());
         assert!(guard
-            .admit_at(id, TrackingHitKind::Click, Some("192.0.2.1"), 0)
+            .admit_at(id, TrackingHitKind::Click, Some("192.0.2.1"), None, 0)
             .is_ok());
         assert!(guard
-            .admit_at(id, TrackingHitKind::Open, Some("192.0.2.2"), 0)
+            .admit_at(id, TrackingHitKind::Open, Some("192.0.2.2"), None, 0)
             .is_ok());
         assert!(guard
-            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0)
+            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn different_click_targets_are_recorded_but_replays_are_not() {
+        let guard = TrackingHitGuard::new();
+        let id = email();
+        let ip = Some("192.0.2.1");
+        let pricing = Some("https://example.com/pricing");
+        let docs = Some("https://example.com/docs");
+
+        // A recipient following two different links in one email.
+        assert!(guard
+            .admit_at(id, TrackingHitKind::Click, ip, pricing, 0)
+            .is_ok());
+        assert!(guard
+            .admit_at(id, TrackingHitKind::Click, ip, docs, 1)
+            .is_ok());
+
+        // Replaying either one inside the window is still deduped.
+        assert_eq!(
+            guard
+                .admit_at(id, TrackingHitKind::Click, ip, pricing, 2)
+                .err(),
+            Some(TrackingHitRejection::Duplicate)
+        );
+    }
+
+    #[tokio::test]
+    async fn per_email_cap_is_shared_across_click_targets() {
+        let guard = TrackingHitGuard::new();
+        let id = email();
+        let mut admitted = 0;
+        for i in 0..100u32 {
+            let target = format!("https://example.com/link/{i}");
+            if guard
+                .admit_at(
+                    id,
+                    TrackingHitKind::Click,
+                    Some("192.0.2.1"),
+                    Some(&target),
+                    0,
+                )
+                .is_ok()
+            {
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted, PER_EMAIL_MAX_EVENTS_PER_WINDOW);
     }
 
     #[tokio::test]
@@ -337,7 +402,7 @@ mod tests {
         let mut rate_limited = 0;
         for i in 0..200u32 {
             let ip = format!("10.0.{}.{}", i / 256, i % 256);
-            match guard.admit_at(id, TrackingHitKind::Click, Some(&ip), 5) {
+            match guard.admit_at(id, TrackingHitKind::Click, Some(&ip), None, 5) {
                 Ok(_) => admitted += 1,
                 Err(TrackingHitRejection::RateLimited) => rate_limited += 1,
                 Err(other) => panic!("unexpected rejection {:?}", other),
@@ -352,6 +417,7 @@ mod tests {
                 id,
                 TrackingHitKind::Click,
                 Some("10.9.9.9"),
+                None,
                 5 + PER_EMAIL_WINDOW_SECS
             )
             .is_ok());
@@ -360,19 +426,19 @@ mod tests {
     #[tokio::test]
     async fn saturated_pool_drops_instead_of_spawning() {
         let guard = TrackingHitGuard::with_capacity(2);
-        let p1 = guard.admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0);
-        let p2 = guard.admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0);
+        let p1 = guard.admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0);
+        let p2 = guard.admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0);
         assert!(p1.is_ok() && p2.is_ok());
         assert_eq!(
             guard
-                .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0)
+                .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0)
                 .err(),
             Some(TrackingHitRejection::Saturated)
         );
         // Finishing a task (dropping its permit) frees a slot.
         drop(p1);
         assert!(guard
-            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), 0)
+            .admit_at(email(), TrackingHitKind::Open, Some("192.0.2.1"), None, 0)
             .is_ok());
         assert_eq!(guard.dropped_counts().2, 1);
     }
@@ -381,10 +447,12 @@ mod tests {
     async fn missing_or_garbage_ip_shares_one_identity() {
         let guard = TrackingHitGuard::new();
         let id = email();
-        assert!(guard.admit_at(id, TrackingHitKind::Open, None, 0).is_ok());
+        assert!(guard
+            .admit_at(id, TrackingHitKind::Open, None, None, 0)
+            .is_ok());
         assert_eq!(
             guard
-                .admit_at(id, TrackingHitKind::Open, Some("not-an-ip"), 1)
+                .admit_at(id, TrackingHitKind::Open, Some("not-an-ip"), None, 1)
                 .err(),
             Some(TrackingHitRejection::Duplicate)
         );

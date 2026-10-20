@@ -128,7 +128,7 @@ async fn pixel_handler(
     let ip = extract_ip(&headers);
     let Ok(permit) = state
         .hit_guard
-        .admit(email_id, TrackingHitKind::Open, ip.as_deref())
+        .admit(email_id, TrackingHitKind::Open, ip.as_deref(), None)
     else {
         return gif_response();
     };
@@ -194,9 +194,10 @@ async fn click_handler(
     // redirect is the user-visible part and is served even when the event is
     // dropped (replay, per-email cap, or saturated record pool).
     let ip = extract_ip(&headers);
-    let Ok(permit) = state
-        .hit_guard
-        .admit(email_id, TrackingHitKind::Click, ip.as_deref())
+    let Ok(permit) =
+        state
+            .hit_guard
+            .admit(email_id, TrackingHitKind::Click, ip.as_deref(), Some(&url))
     else {
         return Redirect::temporary(&url).into_response();
     };
