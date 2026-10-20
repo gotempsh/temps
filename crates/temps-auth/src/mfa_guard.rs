@@ -902,7 +902,7 @@ mod tests {
             assert_eq!(normalize_recovery_code(&display), canonical);
         }
         assert_eq!(RECOVERY_CODE_ALPHABET.len(), 32);
-        for ambiguous in [b'0', b'O', b'1', b'I'] {
+        for ambiguous in *b"0O1I" {
             assert!(!RECOVERY_CODE_ALPHABET.contains(&ambiguous));
         }
     }
