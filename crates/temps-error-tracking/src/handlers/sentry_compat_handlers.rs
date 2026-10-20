@@ -8,8 +8,18 @@
 //!
 //! ## Authentication
 //!
-//! These endpoints accept `Authorization: Bearer <dsn_public_key>` where the Bearer token
-//! is the DSN public key from a project DSN. This matches how sentry-cli sends auth tokens.
+//! These endpoints accept `Authorization: Bearer <deployment_token>` (a `dt_…`
+//! project deployment token), which is how sentry-cli sends `SENTRY_AUTH_TOKEN`.
+//! Temps injects a deployment token as `SENTRY_AUTH_TOKEN` into builds, so
+//! uploads from a Temps build work without configuration; for uploads from
+//! elsewhere (CI, a laptop), create a deployment token for the project and set
+//! it as `SENTRY_AUTH_TOKEN`.
+//!
+//! The DSN public key is **not** accepted here. It is embedded in client-side
+//! bundles by design (it only authorises event ingest), so anyone who reads a
+//! site's JavaScript has it; accepting it for writes would let them overwrite
+//! the project's source maps and releases. Event ingest (`/api/{id}/envelope/`
+//! and friends) still authenticates with the DSN key and is unaffected.
 //!
 //! ## Endpoint mapping
 //!
@@ -32,7 +42,7 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::RequestMetadata;
-use temps_entities::{deployment_tokens, project_dsns, projects};
+use temps_entities::{deployment_tokens, projects};
 use tracing::{debug, error, warn};
 use utoipa::{OpenApi, ToSchema};
 
@@ -128,10 +138,10 @@ pub struct SentryChunkUploadResponse {
 
 /// Maximum body size for the sentry-compat source map upload routes (50 MiB).
 ///
-/// DSN public keys are semi-public (embedded in browser bundles), so we cannot
-/// rely on authentication alone to prevent abuse. The outer body limit rejects
-/// oversized uploads before they reach the multipart reader. A per-field inline
-/// check (`MAX_SOURCE_MAP_BYTES`) provides additional defense-in-depth.
+/// Uploads require a secret deployment token (see [`authenticate_bearer`]),
+/// but the outer body limit still rejects oversized uploads before they reach
+/// the multipart reader. A per-field inline check (`MAX_SOURCE_MAP_BYTES`)
+/// provides additional defense-in-depth.
 pub const SENTRY_UPLOAD_BODY_LIMIT: usize =
     crate::services::source_map_service::MAX_SOURCE_MAP_BYTES;
 
@@ -218,17 +228,62 @@ async fn record_release_audit(
     }
 }
 
+/// Prefix every Temps deployment token carries.
+const DEPLOYMENT_TOKEN_PREFIX: &str = "dt_";
+
+/// Pull the credential out of the `Authorization` header and require it to be
+/// a deployment token.
+///
+/// Pure (no DB) so the credential policy is unit-testable. Anything that is
+/// not a `dt_…` token — notably a DSN public key, which ships in client JS and
+/// is therefore not a secret — is rejected here, before any lookup.
+fn extract_deployment_token(auth_header: &str) -> Result<&str, (StatusCode, String)> {
+    let token = if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        token.trim()
+    } else if auth_header.starts_with("DSN ") {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "DSN public keys cannot authorize release or source map uploads: they are \
+             embedded in client bundles and are not secret. Use a project deployment token \
+             (dt_...) as SENTRY_AUTH_TOKEN, sent as 'Authorization: Bearer <token>'."
+                .to_string(),
+        ));
+    } else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Invalid Authorization format. Expected 'Bearer <deployment token>'".to_string(),
+        ));
+    };
+
+    if !token.starts_with(DEPLOYMENT_TOKEN_PREFIX) || token.len() <= DEPLOYMENT_TOKEN_PREFIX.len() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Release and source map uploads require a project deployment token (dt_...) as \
+             SENTRY_AUTH_TOKEN. DSN public keys are not accepted for uploads because they are \
+             embedded in client bundles and are not secret."
+                .to_string(),
+        ));
+    }
+
+    Ok(token)
+}
+
 /// Extract project_id from Bearer token authentication.
 ///
-/// sentry-cli sends `Authorization: Bearer <auth_token>`.
-/// We accept:
-///   1. DSN public key → resolves to project via `project_dsns` table
-///   2. Deployment token (`dt_*`) → resolves to project via `deployment_tokens` table
-///      (used when Temps injects SENTRY_AUTH_TOKEN during builds)
+/// sentry-cli sends `Authorization: Bearer <auth_token>`. The only accepted
+/// credential is an active, unexpired project deployment token (`dt_*`),
+/// resolved via the `deployment_tokens` table — this is what Temps injects as
+/// `SENTRY_AUTH_TOKEN` during builds.
+///
+/// The DSN public key is deliberately NOT accepted: it is a write-only ingest
+/// credential that is public by design (embedded in browser bundles), so it
+/// must not authorize source map / release writes.
 async fn authenticate_bearer(
     headers: &HeaderMap,
     db: &DatabaseConnection,
 ) -> Result<BearerPrincipal, (StatusCode, String)> {
+    use sea_orm::Condition;
+
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -237,65 +292,45 @@ async fn authenticate_bearer(
             "Missing Authorization header".to_string(),
         ))?;
 
-    let token = if let Some(token) = auth_header.strip_prefix("Bearer ") {
-        token.trim()
-    } else if let Some(token) = auth_header.strip_prefix("DSN ") {
-        token.trim()
-    } else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            "Invalid Authorization format. Expected 'Bearer <token>'".to_string(),
-        ));
-    };
+    let token = extract_deployment_token(auth_header)?;
 
-    // Deployment tokens start with "dt_" — validate via hash lookup
-    if token.starts_with("dt_") {
-        use sha2::{Digest, Sha256};
-        let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
-        let token_prefix: String = token.chars().take(8).collect();
+    use sha2::{Digest, Sha256};
+    let token_hash = hex::encode(Sha256::digest(token.as_bytes()));
+    let token_prefix: String = token.chars().take(8).collect();
 
-        let dt = deployment_tokens::Entity::find()
-            .filter(deployment_tokens::Column::TokenHash.eq(&token_hash))
-            .filter(deployment_tokens::Column::TokenPrefix.eq(&token_prefix))
-            .filter(deployment_tokens::Column::IsActive.eq(true))
-            .one(db)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Database error: {}", e),
-                )
-            })?
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    "Invalid deployment token".to_string(),
-                )
-            })?;
-
-        return Ok(BearerPrincipal {
-            project_id: dt.project_id,
-            credential: SentryCliCredential::DeploymentToken(dt.id),
-        });
-    }
-
-    // Otherwise try DSN public key lookup
-    let dsn = project_dsns::Entity::find()
-        .filter(project_dsns::Column::PublicKey.eq(token))
-        .filter(project_dsns::Column::IsActive.eq(true))
+    let dt = deployment_tokens::Entity::find()
+        .filter(deployment_tokens::Column::TokenHash.eq(&token_hash))
+        .filter(deployment_tokens::Column::TokenPrefix.eq(&token_prefix))
+        .filter(deployment_tokens::Column::IsActive.eq(true))
+        .filter(
+            Condition::any()
+                .add(deployment_tokens::Column::ExpiresAt.is_null())
+                .add(deployment_tokens::Column::ExpiresAt.gt(Utc::now())),
+        )
         .one(db)
         .await
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Database error: {}", e),
+                format!(
+                    "Database error while authenticating deployment token {}...: {}",
+                    token_prefix, e
+                ),
             )
         })?
-        .ok_or_else(|| (StatusCode::UNAUTHORIZED, "Invalid auth token".to_string()))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::UNAUTHORIZED,
+                format!(
+                    "Invalid, inactive, or expired deployment token {}...",
+                    token_prefix
+                ),
+            )
+        })?;
 
     Ok(BearerPrincipal {
-        project_id: dsn.project_id,
-        credential: SentryCliCredential::Dsn(dsn.id),
+        project_id: dt.project_id,
+        credential: SentryCliCredential::DeploymentToken(dt.id),
     })
 }
 
@@ -899,18 +934,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_bearer_token_extraction() {
-        // Test that auth header parsing logic is correct
-        let auth = "Bearer abc123def456";
-        let token = auth.strip_prefix("Bearer ").unwrap();
-        assert_eq!(token, "abc123def456");
+    fn test_bearer_deployment_token_is_accepted() {
+        assert_eq!(
+            extract_deployment_token("Bearer dt_abc123def456"),
+            Ok("dt_abc123def456")
+        );
+        assert_eq!(
+            extract_deployment_token("Bearer   dt_abc123  "),
+            Ok("dt_abc123")
+        );
+    }
+
+    /// F-010: a DSN public key (any non-`dt_` bearer) must never authorize an
+    /// upload — it is embedded in client bundles.
+    #[test]
+    fn test_dsn_public_key_is_rejected_as_bearer() {
+        let (status, detail) = extract_deployment_token("Bearer 0123456789abcdef0123456789abcdef")
+            .expect_err("a DSN public key must not authenticate uploads");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(detail.contains("deployment token"), "{detail}");
     }
 
     #[test]
-    fn test_dsn_token_extraction() {
-        let auth = "DSN abc123def456";
-        let token = auth.strip_prefix("DSN ").unwrap();
-        assert_eq!(token, "abc123def456");
+    fn test_dsn_scheme_is_rejected() {
+        let (status, detail) = extract_deployment_token("DSN abc123def456")
+            .expect_err("the DSN auth scheme must not authenticate uploads");
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(detail.contains("DSN public keys"), "{detail}");
+        // Even if it carries something token-shaped.
+        assert!(extract_deployment_token("DSN dt_abc").is_err());
+    }
+
+    #[test]
+    fn test_malformed_authorization_is_rejected() {
+        for header in [
+            "",
+            "Bearer ",
+            "Bearer dt_",
+            "Basic dt_abc",
+            "dt_abc",
+            "bearer dt_abc",
+        ] {
+            let (status, _) = extract_deployment_token(header)
+                .expect_err("malformed Authorization must be rejected");
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{header:?}");
+        }
     }
 
     #[test]
