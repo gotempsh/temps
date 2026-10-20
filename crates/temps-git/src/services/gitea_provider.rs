@@ -49,7 +49,7 @@ impl GiteaProvider {
 
     /// Standard API client: 30-second timeout, no redirects (SSRF defense).
     fn get_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects automatically.
@@ -63,7 +63,7 @@ impl GiteaProvider {
     /// The generous total timeout allows large archives to stream fully while
     /// the connect/read timeouts bound stalled connections.
     fn get_archive_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
             .connect_timeout(std::time::Duration::from_secs(30))

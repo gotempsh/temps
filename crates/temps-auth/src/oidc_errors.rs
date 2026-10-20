@@ -131,6 +131,32 @@ pub enum OidcError {
     Database(#[from] sea_orm::DbErr),
 }
 
+/// Detail returned to API clients when discovery fails. The specifics
+/// (upstream HTTP status, transport error, response-parse error) are logged
+/// server-side only: reflecting them let a caller use discovery as an
+/// oracle for what listens on an arbitrary host, port and path.
+fn discovery_failed_detail(issuer: &str) -> String {
+    format!(
+        "OIDC discovery failed for issuer {issuer}. Check that the issuer URL is correct, \
+         publicly reachable (or inside a trusted private network), and serves \
+         /.well-known/openid-configuration. The server log has the details."
+    )
+}
+
+impl OidcError {
+    /// Message that is safe to return to an API client.
+    ///
+    /// Identical to the `Display` text except for `DiscoveryFailed`, whose
+    /// `reason` carries text produced by a server the caller pointed us at;
+    /// that is replaced by a generic detail and must be logged by the caller.
+    pub fn client_message(&self) -> String {
+        match self {
+            OidcError::DiscoveryFailed { issuer, .. } => discovery_failed_detail(issuer),
+            other => other.to_string(),
+        }
+    }
+}
+
 impl From<OidcError> for Problem {
     fn from(err: OidcError) -> Self {
         match err {
@@ -145,11 +171,17 @@ impl From<OidcError> for Problem {
             OidcError::ProviderNotFound { provider_id } => problem_new(StatusCode::NOT_FOUND)
                 .with_title("OIDC Provider Not Found")
                 .with_detail(format!("OIDC provider {provider_id} was not found")),
-            OidcError::DiscoveryFailed { issuer, reason } => problem_new(StatusCode::SERVICE_UNAVAILABLE)
-                .with_title("OIDC Provider Unreachable")
-                .with_detail(format!(
-                    "Could not reach OIDC provider at {issuer}: {reason}. Try again or use password login."
-                )),
+            OidcError::DiscoveryFailed { issuer, reason } => {
+                tracing::warn!(
+                    target: "temps_auth::oidc",
+                    %issuer,
+                    %reason,
+                    "OIDC discovery failed"
+                );
+                problem_new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("OIDC Provider Unreachable")
+                    .with_detail(discovery_failed_detail(&issuer))
+            }
             OidcError::StateNotFound { state } => problem_new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid OIDC State")
                 .with_detail(format!(
@@ -271,5 +303,30 @@ mod tests {
         }
         .into();
         assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The upstream status / transport text must never reach the caller:
+    /// it turned discovery into a port/path oracle.
+    #[test]
+    fn discovery_failed_does_not_reflect_upstream_reason() {
+        let reason = "Server returned invalid response: HTTP status code 404 Not Found";
+        let err = OidcError::DiscoveryFailed {
+            issuer: "https://auth.example.com".into(),
+            reason: reason.into(),
+        };
+        let message = err.client_message();
+        assert!(!message.contains("404"), "{message}");
+        assert!(message.contains("https://auth.example.com"), "{message}");
+
+        let problem: Problem = err.into();
+        let body = serde_json::to_string(&problem.body).unwrap_or_default();
+        assert!(!body.contains("404"), "{body}");
+        assert!(!body.contains("Not Found"), "{body}");
+    }
+
+    #[test]
+    fn client_message_passes_through_other_variants() {
+        let err = OidcError::ProviderNotFound { provider_id: 7 };
+        assert_eq!(err.client_message(), err.to_string());
     }
 }

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,9 +14,9 @@ use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
 };
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
-    EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-    RequestTokenError, Scope, TokenResponse,
+    AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, HttpClientError, HttpRequest, HttpResponse, IssuerUrl, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
@@ -90,9 +92,15 @@ struct CachedClient {
 /// made. Installing this resolver on the OIDC `reqwest::Client` means the IP
 /// is re-validated at connect time, eliminating the window.
 ///
-/// Loopback addresses (`127.x`, `::1`) are **not** blocked here for parity
-/// with `assert_issuer_host_allowed`, which explicitly allows loopback so
-/// local Keycloak / Authentik dev continues to work.
+/// Loopback addresses (`127.x`, `::1`) are blocked like every other
+/// internal range: an issuer on loopback turned discovery into an
+/// authenticated port/path oracle against services bound to the Temps host.
+/// An operator running a local Keycloak / Authentik for development lifts
+/// that explicitly by adding the loopback address under Settings > Security >
+/// Trusted private networks, which `is_trusted_private_destination` honours.
+///
+/// A resolver is only consulted for host *names*; IP-literal URLs never reach
+/// it. Those are checked by [`OidcHttpClient`] before the request is sent.
 struct BlocklistResolver;
 
 impl reqwest::dns::Resolve for BlocklistResolver {
@@ -130,6 +138,60 @@ impl reqwest::dns::Resolve for BlocklistResolver {
     }
 }
 
+/// The HTTP client used for every IdP round-trip (discovery, JWKS, token
+/// exchange).
+///
+/// Wraps the `reqwest::Client` (which carries [`BlocklistResolver`]) and
+/// rejects requests whose target is an IP *literal* in a blocked range before
+/// they are sent. The resolver alone cannot do that: reqwest never consults a
+/// resolver for an IP-literal host, so a discovery document pointing its
+/// `jwks_uri` or `token_endpoint` at `http://127.0.0.1:6379/` would otherwise
+/// be fetched no matter what the issuer pre-check decided.
+struct OidcHttpClient {
+    inner: reqwest::Client,
+}
+
+impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
+    type Error = HttpClientError<reqwest::Error>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + Sync + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        if let Err(reason) = check_request_target(request.uri()) {
+            tracing::warn!(
+                target: "temps_auth::oidc::abuse",
+                uri = %request.uri(),
+                %reason,
+                "Refusing OIDC request to a blocked address"
+            );
+            return Box::pin(std::future::ready(Err(HttpClientError::Other(reason))));
+        }
+        self.inner.call(request)
+    }
+}
+
+/// Reject an outbound IdP request whose host is a literal IP in a blocked
+/// range (see [`is_blocked_ip`]) that the operator has not trusted. Host
+/// names are left to [`BlocklistResolver`], which validates them at connect
+/// time.
+fn check_request_target(uri: &openidconnect::http::Uri) -> Result<(), String> {
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("OIDC request URI '{uri}' has no host"))?;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        if is_blocked_ip(&ip) && !temps_core::url_validation::is_trusted_private_destination(ip) {
+            return Err(format!(
+                "OIDC request to blocked private/internal address {ip} refused"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct OidcService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -141,7 +203,7 @@ pub struct OidcService {
     /// `request_async`, so timeout, redirect policy, and any future
     /// custom DNS resolution apply uniformly to every IdP
     /// round-trip. Built once at service init in `new()`.
-    http_client: reqwest::Client,
+    http_client: OidcHttpClient,
 }
 
 pub struct OidcLoginStart {
@@ -234,6 +296,7 @@ impl OidcService {
             .dns_resolver(Arc::new(BlocklistResolver))
             .build()
             .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
+        let http_client = OidcHttpClient { inner: http_client };
 
         Self {
             db,
@@ -1500,13 +1563,10 @@ impl OidcService {
         let issuer_str = normalize_issuer_url(&provider.issuer_url)?;
 
         // SSRF defense — refuse to talk to issuers whose hostname
-        // resolves to RFC 1918 / link-local / CGNAT IPs. Runs *before*
-        // we hand the URL to openidconnect so a malicious admin
-        // can't point the server at e.g. the cloud metadata service.
-        // Loopback hostnames (localhost / 127.0.0.1 / ::1) are
-        // intentionally allowed for local Keycloak / Authentik dev —
-        // they're physically incapable of reaching the public
-        // internet, so they don't widen the SSRF surface. See
+        // resolves to loopback / RFC 1918 / link-local / CGNAT IPs. Runs
+        // *before* we hand the URL to openidconnect so a malicious admin
+        // can't point the server at e.g. the cloud metadata service or a
+        // service bound to the Temps host's loopback. See
         // `assert_issuer_host_allowed` for the full policy.
         assert_issuer_host_allowed(&issuer_str).await?;
 
@@ -1616,8 +1676,9 @@ fn normalize_issuer_url(issuer: &str) -> Result<String, OidcError> {
 
 /// True for hostnames that are guaranteed to resolve to the local
 /// machine and never to a public address. Used to suppress the
-/// `http://` warning (loopback over plaintext is fine for dev) and
-/// to fast-path past the SSRF guard.
+/// `http://` warning (loopback over plaintext is fine for dev). It is
+/// *not* an SSRF bypass: `assert_issuer_host_allowed` blocks loopback
+/// unless the operator has trusted it.
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
@@ -1630,15 +1691,15 @@ fn is_loopback_url(url: &str) -> bool {
 }
 
 /// SSRF guard for OIDC discovery. Refuses to talk to issuers whose
-/// hostname resolves to RFC 1918 / link-local / CGNAT / multicast IPs.
+/// hostname resolves to loopback / RFC 1918 / link-local / CGNAT /
+/// multicast IPs.
 ///
-/// Loopback (127/8, ::1) is the one private range we *do* allow,
-/// because it's the only way to talk to a local Keycloak / Authentik
-/// instance during dev and it can't reach anything the temps process
-/// couldn't already touch directly. Every other private range —
-/// 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10 — is blocked
-/// outright: those are the addresses that point at the AWS metadata
-/// service, the cluster-internal mesh, the office VPN, etc.
+/// Loopback (127/8, ::1) is blocked too: an issuer on loopback let an
+/// admin probe services bound to the Temps host itself (each discovery
+/// attempt is a GET to an attacker-chosen port and path). Operators who
+/// run a local Keycloak / Authentik for development opt in explicitly by
+/// trusting the address under Settings > Security > Trusted private
+/// networks; that list is honoured here and in the connect-time resolver.
 ///
 /// This function acts as defense-in-depth at the admin-save / test-connection
 /// call site — it runs synchronously before any HTTP is attempted and produces
@@ -1655,38 +1716,40 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
         reason: "issuer URL has no host".into(),
     })?;
 
-    // Fast path: a literal loopback hostname is always OK. Saves a
-    // DNS round-trip and keeps the local-dev path zero-latency.
-    if is_loopback_host(host) {
-        return Ok(());
-    }
-
-    let port = url.port_or_known_default().unwrap_or(443);
-    // `(host, port)` is `(&str, u16)`; `lookup_host` is generic over
-    // `ToSocketAddrs`, so we need to nudge the inference with an
-    // explicit type to disambiguate.
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| OidcError::DiscoveryFailed {
-            issuer: issuer.to_string(),
-            reason: format!("DNS lookup failed: {e}"),
-        })?
-        .collect();
-    for addr in addrs {
-        if is_blocked_ip(&addr.ip())
-            && !temps_core::url_validation::is_trusted_private_destination(addr.ip())
-        {
+    // IP literals are classified directly: `host_str()` keeps the brackets
+    // of an IPv6 literal (`[::1]`), which `lookup_host` cannot resolve.
+    let ips: Vec<IpAddr> = match url.host() {
+        Some(openidconnect::url::Host::Ipv4(v4)) => vec![IpAddr::V4(v4)],
+        Some(openidconnect::url::Host::Ipv6(v6)) => vec![IpAddr::V6(v6)],
+        Some(openidconnect::url::Host::Domain(domain)) => {
+            let port = url.port_or_known_default().unwrap_or(443);
+            tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|e| OidcError::DiscoveryFailed {
+                    issuer: issuer.to_string(),
+                    reason: format!("DNS lookup failed: {e}"),
+                })?
+                .map(|addr| addr.ip())
+                .collect()
+        }
+        None => {
+            return Err(OidcError::InvalidIssuer {
+                reason: "issuer URL has no host".into(),
+            })
+        }
+    };
+    for ip in ips {
+        if is_blocked_ip(&ip) && !temps_core::url_validation::is_trusted_private_destination(ip) {
             tracing::warn!(
                 target: "temps_auth::oidc::abuse",
                 issuer = %issuer,
                 host = %host,
-                ip = %addr.ip(),
+                ip = %ip,
                 "Refusing to contact OIDC issuer that resolves to a private/internal IP"
             );
             return Err(OidcError::InvalidIssuer {
                 reason: format!(
-                    "issuer {host} resolves to non-public IP {} (use a public DNS name, run the IdP on localhost, or add its network under Settings > Security > Trusted private networks)",
-                    addr.ip()
+                    "issuer {host} resolves to non-public IP {ip} (use a public DNS name, or add its network under Settings > Security > Trusted private networks)"
                 ),
             });
         }
@@ -1700,15 +1763,18 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
 /// benchmarking ranges (which can mask metadata services in some
 /// clouds), and IPv6 unique-local + unspecified.
 ///
-/// Loopback (127/8, ::1) is intentionally *not* in this list —
-/// loopback can't reach anything outside the temps process and is
-/// useful for local Keycloak / Authentik dev. The early-return in
-/// `assert_issuer_host_allowed` short-circuits literal loopback
-/// hostnames before we even hit this function.
+/// Loopback (127/8, ::1) and `0.0.0.0/8` (which Linux routes to the
+/// local host) are blocked as well, so discovery cannot be used as a port
+/// probe against services bound to the Temps host. IPv4-mapped IPv6
+/// (`::ffff:127.0.0.1`) is classified by its IPv4 form. Callers still honour
+/// the operator's trusted private networks on top of this classifier.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_private()
+            v4.is_loopback()
+                // 0.0.0.0/8 — "this network"; connects to the local host.
+                || v4.octets()[0] == 0
+                || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_multicast()
@@ -1720,7 +1786,11 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
         }
         IpAddr::V6(v6) => {
-            v6.is_unspecified()
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&IpAddr::V4(mapped));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
                 || v6.is_multicast()
                 // fe80::/10 — link-local
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -2065,10 +2135,25 @@ mod tests {
         use std::net::Ipv4Addr;
         use std::net::Ipv6Addr;
 
-        // Loopback is INTENTIONALLY allowed — local Keycloak /
-        // Authentik dev needs it and it can't reach anything else.
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // Loopback is blocked: an issuer on loopback was a port/path
+        // oracle against services bound to the Temps host. Local IdP dev
+        // opts in through the trusted private networks setting instead.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3))));
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // 0.0.0.0/8 connects to the local host on Linux.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
+        // IPv4-mapped IPv6 must not smuggle loopback / RFC 1918 past the check.
+        assert!(is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()
+        )));
+        assert!(is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped()
+        )));
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped()
+        )));
 
         // RFC 1918 — blocked because it usually points at office
         // network / on-prem service mesh.
@@ -2110,16 +2195,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assert_issuer_host_allowed_permits_loopback_host() {
-        // Loopback is explicitly allowed so local Keycloak / Authentik
-        // dev works without an env-var escape hatch. The early-return
-        // in `assert_issuer_host_allowed` also avoids a DNS round-trip.
-        assert_issuer_host_allowed("http://localhost:8080/")
+    async fn assert_issuer_host_allowed_rejects_loopback_issuer() {
+        // A loopback issuer made `/test` GET an attacker-chosen port and
+        // path on the Temps host and reflect the answer. It is refused
+        // unless the operator trusts loopback explicitly.
+        for issuer in [
+            "http://127.0.0.1:19999/probe",
+            "http://127.0.0.1:8080/realms/temps",
+            "http://[::1]:8080/",
+            "http://[::ffff:127.0.0.1]:8080/",
+            "http://0.0.0.0:8080/",
+        ] {
+            let err = assert_issuer_host_allowed(issuer)
+                .await
+                .expect_err("loopback issuer must be blocked");
+            assert!(
+                matches!(err, OidcError::InvalidIssuer { .. }),
+                "{issuer}: {err}"
+            );
+        }
+        // `localhost` resolves to loopback and must be refused too (DNS
+        // failure would also be a refusal, never a pass).
+        assert!(assert_issuer_host_allowed("http://localhost:8080/")
             .await
-            .expect("localhost must be allowed");
-        assert_issuer_host_allowed("http://127.0.0.1:8080/realms/temps")
-            .await
-            .expect("127.0.0.1 must be allowed");
+            .is_err());
+    }
+
+    #[test]
+    fn check_request_target_rejects_literal_internal_ips() {
+        // reqwest never consults the resolver for IP literals, so a
+        // discovery document pointing `jwks_uri` / `token_endpoint` at an
+        // internal literal must be refused by the client wrapper.
+        for uri in [
+            "http://127.0.0.1:6379/",
+            "http://[::1]/jwks",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/token",
+        ] {
+            let parsed: openidconnect::http::Uri = uri.parse().expect("test URI parses");
+            assert!(
+                check_request_target(&parsed).is_err(),
+                "{uri} must be refused"
+            );
+        }
+        for uri in ["https://auth.example.com/jwks", "https://8.8.8.8/jwks"] {
+            let parsed: openidconnect::http::Uri = uri.parse().expect("test URI parses");
+            assert!(check_request_target(&parsed).is_ok(), "{uri} must pass");
+        }
     }
 
     #[test]
@@ -2514,19 +2636,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocklist_resolver_allows_loopback() {
+    async fn blocklist_resolver_rejects_loopback() {
         use reqwest::dns::Resolve;
         use std::str::FromStr;
 
         // `localhost` resolves to 127.0.0.1 / ::1 on virtually all systems.
-        // is_blocked_ip deliberately allows loopback so local Keycloak works.
+        // Loopback is blocked at connect time too, so a rebinding host
+        // cannot reach services bound to the Temps host.
         let resolver = BlocklistResolver;
         let name = reqwest::dns::Name::from_str("localhost").unwrap();
         let result = resolver.resolve(name).await;
         assert!(
-            result.is_ok(),
-            "BlocklistResolver must allow localhost (loopback): {}",
-            result.err().map(|e| e.to_string()).unwrap_or_default()
+            result.is_err(),
+            "BlocklistResolver must reject localhost (loopback)"
         );
     }
 

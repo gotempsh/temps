@@ -41,24 +41,43 @@ use utoipa::ToSchema;
 /// (loopback, RFC1918 private ranges, link-local, cloud metadata 169.254.169.254).
 ///
 /// `GitProvidersCreate` is granted to ordinary users, and the create handlers
-/// synchronously probe `{base_url}/api/v4/user` (GitLab) with the supplied
-/// token. Without this check a user could point `base_url`/`api_url` at an
-/// internal service and use the create call as an SSRF oracle (SEC-07). The
-/// validation is synchronous (it blocks literal private/loopback/link-local/
-/// metadata IPs and `localhost`); the provider HTTP clients additionally
-/// disable redirect following so a public host can't 302 to an internal one.
+/// synchronously probe `{base_url}/api/.../user` with the supplied token.
+/// Without this check a user could point `base_url`/`api_url` at an internal
+/// service and use the create call as an SSRF oracle (SEC-07).
 ///
-/// Residual gap: this synchronous validator does NOT resolve domains, so a
-/// public hostname that resolves to a private IP (DNS rebinding) is not caught
-/// here. Closing that needs a connect-time blocklisting DNS resolver on the
-/// provider clients (tracked separately).
-fn reject_ssrf_url(label: &str, url: Option<&String>) -> Result<(), Problem> {
-    if let Some(url) = url {
-        if let Err(e) = temps_core::url_validation::validate_external_url(url) {
-            return Err(problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid Provider URL")
-                .with_detail(format!("{} '{}' is not allowed: {}", label, url, e)));
-        }
+/// Two layers:
+/// - here, at create time: literal IPs are checked by `validate_external_url`
+///   and a hostname is resolved with `resolve_and_validate_domain`, so a name
+///   that resolves to an internal address is refused with a clear 400;
+/// - at connect time, every provider client uses
+///   `git_provider::guarded_client_builder`, whose DNS resolver re-validates
+///   and pins each lookup, so a name that *rebinds* after this check (or
+///   later, when a stored connection is used) still cannot reach an internal
+///   address. Redirects are never followed.
+///
+/// Both honour the operator's trusted private networks, which is how a Gitea
+/// or GitLab on the LAN is allowed.
+async fn reject_ssrf_url(label: &str, url: Option<&String>) -> Result<(), Problem> {
+    let Some(url) = url else {
+        return Ok(());
+    };
+    let refuse = |reason: String| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Provider URL")
+            .with_detail(format!(
+                "{} '{}' is not allowed: {}",
+                label,
+                temps_core::url_validation::redact_url_password(url),
+                reason
+            ))
+    };
+    let parsed = temps_core::url_validation::validate_external_url(url)
+        .map_err(|e| refuse(e.to_string()))?;
+    if let Some(url::Host::Domain(domain)) = parsed.host() {
+        let port = parsed.port_or_known_default().unwrap_or(443);
+        temps_core::url_validation::resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|e| refuse(e.to_string()))?;
     }
     Ok(())
 }
@@ -690,8 +709,8 @@ pub async fn create_git_provider(
     permission_check!(auth, Permission::GitProvidersCreate);
 
     // SSRF guard: a self-hosted base_url/api_url must not point at internal infra.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
-    reject_ssrf_url("api_url", request.api_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
+    reject_ssrf_url("api_url", request.api_url.as_ref()).await?;
 
     // Parse provider type
     let provider_type = GitProviderType::try_from(request.provider_type.as_str()).map_err(|e| {
@@ -2247,7 +2266,7 @@ pub async fn create_gitlab_pat_provider(
 
     // SSRF guard: this handler synchronously probes {base_url}/api/v4/user with
     // the supplied token, so a malicious base_url is a live SSRF vector.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let user_id = auth.user_id();
 
@@ -2301,6 +2320,9 @@ pub async fn create_gitlab_oauth_provider(
     Json(request): Json<CreateGitLabOAuthRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersCreate);
+
+    // SSRF guard: the OAuth token exchange later POSTs to {base_url}/oauth/token.
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let provider = state
         .git_provider_manager
@@ -2367,7 +2389,7 @@ pub async fn create_gitea_pat_provider(
             )));
     }
     // SSRF guard: also reject RFC1918 / loopback / metadata addresses.
-    reject_ssrf_url("base_url", Some(&request.base_url))?;
+    reject_ssrf_url("base_url", Some(&request.base_url)).await?;
 
     let user_id = auth.user_id();
 
@@ -2508,7 +2530,7 @@ pub async fn create_generic_provider(
     }
     // SSRF guard: also reject RFC1918 / loopback / metadata addresses for
     // the optional base_url.
-    reject_ssrf_url("base_url", request.base_url.as_ref())?;
+    reject_ssrf_url("base_url", request.base_url.as_ref()).await?;
 
     let user_id = auth.user_id();
 

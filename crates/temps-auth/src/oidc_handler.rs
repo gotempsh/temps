@@ -837,10 +837,20 @@ pub async fn test_oidc_provider(
             success: true,
             message,
         })),
-        Err(err) => Ok(Json(OidcTestConnectionResponse {
-            success: false,
-            message: err.to_string(),
-        })),
+        Err(err) => {
+            // Full error (incl. upstream status / transport text) goes to the
+            // server log only; the response carries `client_message`, which
+            // does not reflect what the target host answered.
+            warn!(
+                provider_id,
+                error = %err,
+                "OIDC provider connection test failed"
+            );
+            Ok(Json(OidcTestConnectionResponse {
+                success: false,
+                message: err.client_message(),
+            }))
+        }
     }
 }
 

@@ -1022,6 +1022,86 @@ pub trait GitProviderRepositoryService: Send + Sync {
     ) -> Result<Vec<GitProviderTag>, GitProviderError>;
 }
 
+/// Connect-time SSRF guard for every Git provider API client.
+///
+/// Self-hosted providers (Gitea/Forgejo, self-managed GitLab, GitHub
+/// Enterprise) take a user-supplied `base_url`/`api_url`, and creating or
+/// re-validating a connection synchronously calls it with the supplied token.
+/// The handlers reject internal IP literals up front, but a public hostname
+/// can resolve -- or later rebind -- to `127.0.0.1`, an RFC 1918 address or
+/// `169.254.169.254`. Installed as the client's DNS resolver, this validates
+/// every address of each lookup with the shared outbound policy
+/// (`resolve_and_validate_domain`: public, or inside the operator's trusted
+/// private networks, never cloud metadata) and hands exactly those addresses
+/// to the connector, so what was checked is what gets dialled -- the same
+/// guarantee as `resolve_to_addrs` pinning on the webhook and monitor
+/// clients, but for every host a provider talks to (API and archive hops).
+///
+/// IP-literal URLs never reach a resolver; those are rejected by
+/// `validate_external_url` when the provider is created.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutboundGuardResolver;
+
+impl reqwest::dns::Resolve for OutboundGuardResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            // Port is irrelevant to the address check; reqwest overwrites it.
+            let addresses = temps_core::url_validation::resolve_and_validate_domain(&host, 0)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    tracing::warn!(
+                        host = %host,
+                        error = %e,
+                        "Refusing Git provider connection to a blocked address"
+                    );
+                    format!("Git provider host '{host}' is not an allowed destination: {e}").into()
+                })?;
+            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// `reqwest::ClientBuilder` preconfigured for talking to a Git provider:
+/// [`OutboundGuardResolver`] for DNS and no automatic redirects (a public
+/// host could otherwise 302 to an internal address). Callers add timeouts and
+/// the user agent.
+pub fn guarded_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(OutboundGuardResolver))
+}
+
+#[cfg(test)]
+mod outbound_guard_tests {
+    use super::*;
+    use reqwest::dns::Resolve;
+    use std::str::FromStr;
+
+    #[tokio::test]
+    async fn resolver_rejects_internal_literals_and_loopback_names() {
+        for host in ["127.0.0.1", "10.0.0.1", "169.254.169.254", "localhost"] {
+            let name = reqwest::dns::Name::from_str(host).expect("valid DNS name");
+            let result = OutboundGuardResolver.resolve(name).await;
+            assert!(result.is_err(), "{host} must be refused");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_passes_public_literal() {
+        let name = reqwest::dns::Name::from_str("8.8.8.8").expect("valid DNS name");
+        let result = OutboundGuardResolver.resolve(name).await;
+        let addresses: Vec<_> = match result {
+            Ok(addrs) => addrs.collect(),
+            Err(e) => panic!("public literal must pass: {e}"),
+        };
+        assert!(addresses
+            .iter()
+            .all(|a| a.ip() == std::net::IpAddr::from([8, 8, 8, 8])));
+    }
+}
+
 #[cfg(test)]
 mod file_not_found_tests {
     use super::*;

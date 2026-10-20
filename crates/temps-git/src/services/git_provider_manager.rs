@@ -2930,8 +2930,20 @@ impl GitProviderManager {
                     "https://gitlab.com".to_string()
                 };
 
-                // Exchange code for access token
-                let client = reqwest::Client::new();
+                // Exchange code for access token. `gitlab_url` is the
+                // operator/user-supplied self-hosted URL, so the client is
+                // SSRF-guarded (validated + pinned DNS, no redirects).
+                let client = super::git_provider::guarded_client_builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .map_err(|e| {
+                        GitProviderManagerError::ProviderError(GitProviderError::ApiError(
+                            format!(
+                                "Failed to build HTTP client for GitLab OAuth token exchange with {}: {}",
+                                gitlab_url, e
+                            ),
+                        ))
+                    })?;
                 let token_url = format!("{}/oauth/token", gitlab_url);
 
                 info!(
@@ -3969,7 +3981,19 @@ impl GitProviderManager {
         // Validate the new access token as a PAT. GitHub's `/rate_limit`
         // authenticates repository-scoped and Actions credentials without
         // requiring user-profile access; GitLab still uses `/user`.
-        let client = reqwest::Client::new();
+        //
+        // `api_url` may be a self-hosted instance the user configured, so
+        // this probe uses the SSRF-guarded client (validated + pinned DNS,
+        // no redirects) like the provider services do.
+        let client = super::git_provider::guarded_client_builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| {
+                GitProviderManagerError::ProviderError(GitProviderError::ApiError(format!(
+                    "Failed to build HTTP client to validate the token for connection {}: {}",
+                    connection_id, e
+                )))
+            })?;
         let api_url = provider
             .api_url
             .as_deref()

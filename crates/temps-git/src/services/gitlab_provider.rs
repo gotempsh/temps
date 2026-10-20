@@ -61,7 +61,7 @@ impl GitLabProvider {
     }
 
     fn get_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects — a public host
@@ -78,7 +78,7 @@ impl GitLabProvider {
     /// hard backstop guaranteeing the request can never hang forever, covering
     /// every phase (connect, response headers, body) — ample for large repos.
     fn get_archive_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
             .connect_timeout(std::time::Duration::from_secs(30))

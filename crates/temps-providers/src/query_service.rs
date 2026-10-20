@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
+use temps_core::url_validation::{resolve_and_validate_domain, validate_outbound_ip};
 use temps_query::{
     ContainerInfo, ContainerPath, DataError, DataSource, EntityInfo, QueryOptions, QueryResult,
     Result,
@@ -65,6 +67,104 @@ fn postgres_connection_target(
             PostgresConnectionPolicy::Standard,
         ),
     }
+}
+
+/// Parse a stored port string, refusing anything that is not a plain `u16`.
+///
+/// The port is interpolated into Redis / MongoDB / S3 / MariaDB connection
+/// strings, so a value such as `6379/evil?x=y` must never reach them.
+fn parse_query_port(service_id: i32, raw: &str) -> Result<u16> {
+    raw.trim().parse::<u16>().map_err(|e| {
+        DataError::InvalidConfiguration(format!("Service {service_id}: invalid port '{raw}': {e}"))
+    })
+}
+
+/// `host` in the form a URL authority needs: IPv6 literals bracketed.
+fn url_host(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => format!("[{v6}]"),
+    }
+}
+
+/// SSRF guard for data-browser connections, mirroring the data-import guard
+/// (`data_import::source::pin_source_hosts`).
+///
+/// The host and port of an external service come from the user who created
+/// it, so without this check the query path was a way to make the control
+/// plane open TCP connections to any internal address. Returns the host to
+/// put in the connection string:
+///
+/// * an explicit loopback host (`localhost`, `127.0.0.0/8`, `::1`) is
+///   returned unchanged: Temps-managed service containers publish their port
+///   on the Temps host, so this is the default and only way the control plane
+///   reaches a standalone managed service;
+/// * any other IP literal must pass [`validate_outbound_ip`] (public, or
+///   inside the operator's trusted private networks; cloud metadata never);
+/// * a name is resolved with [`resolve_and_validate_domain`] -- every address
+///   must pass the same policy -- and one validated address is returned so the
+///   caller dials exactly what was checked (DNS pinning). A name that merely
+///   *resolves* to loopback is refused like any other internal address.
+async fn vet_query_target(service_id: i32, host: &str, port: u16) -> Result<String> {
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let refused = |reason: String| {
+        DataError::InvalidConfiguration(format!(
+            "Service {service_id}: host '{bare}' cannot be queried: {reason} -- the host must be \
+             this server (localhost), a publicly reachable address, or inside a trusted private \
+             network (Settings > Security > Trusted private networks)"
+        ))
+    };
+    if bare.is_empty() {
+        return Err(refused("the host is empty".to_string()));
+    }
+
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        let canonical = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            IpAddr::V4(_) => ip,
+        };
+        if !canonical.is_loopback() {
+            validate_outbound_ip(canonical).map_err(|e| refused(e.to_string()))?;
+        }
+        return Ok(url_host(canonical));
+    }
+
+    let lower = bare.to_ascii_lowercase();
+    if lower == "localhost" {
+        return Ok(bare.to_string());
+    }
+
+    // Names are spliced into connection strings; anything outside DNS
+    // label syntax could smuggle userinfo, extra hosts or options.
+    let valid_name = bare.split('.').all(|label| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    });
+    if !valid_name {
+        return Err(refused("it is not a valid host name".to_string()));
+    }
+    if lower.ends_with(".localhost") {
+        return Err(refused("it is a loopback name".to_string()));
+    }
+
+    let addresses = resolve_and_validate_domain(bare, port)
+        .await
+        .map_err(|e| refused(e.to_string()))?;
+    // Prefer IPv4, like the data-import guard; every address was validated.
+    let ip = addresses
+        .iter()
+        .map(|a| a.ip())
+        .find(IpAddr::is_ipv4)
+        .or_else(|| addresses.first().map(|a| a.ip()))
+        .ok_or_else(|| refused("it resolves to no address".to_string()))?;
+    Ok(url_host(ip))
 }
 
 /// Wall-clock ceiling applied to a data-browser query when the caller does not
@@ -251,22 +351,18 @@ impl QueryService {
                         DataError::InvalidConfiguration(format!("Invalid port number: {}", e))
                     })?;
                 let password = config.password.unwrap_or_default();
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
 
-                let source = MariaDbSource::connect(
-                    &config.host,
-                    port,
-                    &config.username,
-                    &password,
-                    database,
-                )
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to connect to MariaDB service {} database {}: {}",
-                        service_id, database, e
-                    );
-                    e
-                })?;
+                let source =
+                    MariaDbSource::connect(&dial_host, port, &config.username, &password, database)
+                        .await
+                        .map_err(|e| {
+                            error!(
+                                "Failed to connect to MariaDB service {} database {}: {}",
+                                service_id, database, e
+                            );
+                            e
+                        })?;
 
                 Arc::new(source)
             }
@@ -327,6 +423,11 @@ impl QueryService {
                                     e
                                 ))
                             })?;
+                        // SSRF guard. The name (not the vetted address) is
+                        // passed on: the Postgres TLS ladder needs it for
+                        // certificate verification and pins the addresses
+                        // it resolves itself (`resolve_host_once`).
+                        vet_query_target(service_id, &config.host, port).await?;
                         postgres_connection_target(None, config.host.clone(), port)
                     }
                     Err(e) => {
@@ -386,7 +487,9 @@ impl QueryService {
                         ))
                     })?;
 
-                let endpoint = format!("http://{}:{}", config.host, config.port);
+                let port = parse_query_port(service_id, &config.port)?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
                     &config.region,
@@ -413,19 +516,20 @@ impl QueryService {
                     })?;
 
                 // Build connection string with URL-encoded credentials
-                let port = config.port.unwrap_or_else(|| "27017".to_string());
+                let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("27017"))?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
                 let password = config.password.unwrap_or_default();
 
                 // URL-encode username and password to handle special characters
                 let encoded_username = urlencoding::encode(&config.username);
 
                 let connection_string = if password.is_empty() {
-                    format!("mongodb://{}@{}:{}", encoded_username, config.host, port)
+                    format!("mongodb://{}@{}:{}", encoded_username, dial_host, port)
                 } else {
                     let encoded_password = urlencoding::encode(&password);
                     format!(
                         "mongodb://{}:{}@{}:{}",
-                        encoded_username, encoded_password, config.host, port
+                        encoded_username, encoded_password, dial_host, port
                     )
                 };
 
@@ -459,15 +563,16 @@ impl QueryService {
                 })?;
 
                 // Build connection string with URL-encoded password
-                let port = config.port.unwrap_or_else(|| "6379".to_string());
+                let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
-                    format!("redis://{}:{}", config.host, port)
+                    format!("redis://{}:{}", dial_host, port)
                 } else {
                     // URL-encode password to handle special characters
                     let encoded_password = urlencoding::encode(&password);
-                    format!("redis://:{}@{}:{}", encoded_password, config.host, port)
+                    format!("redis://:{}@{}:{}", encoded_password, dial_host, port)
                 };
 
                 // Create Redis source
@@ -488,14 +593,15 @@ impl QueryService {
                     ))
                 })?;
 
-                let port = config.port.unwrap_or_else(|| "6379".to_string());
+                let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
-                    format!("redis://{}:{}", config.host, port)
+                    format!("redis://{}:{}", dial_host, port)
                 } else {
                     let encoded_password = urlencoding::encode(&password);
-                    format!("redis://:{}@{}:{}", encoded_password, config.host, port)
+                    format!("redis://:{}@{}:{}", encoded_password, dial_host, port)
                 };
 
                 let redis_source = RedisSource::new(&connection_string).await.map_err(|e| {
@@ -516,7 +622,9 @@ impl QueryService {
                         ))
                     })?;
 
-                let endpoint = format!("http://{}:{}", config.host, config.port);
+                let port = parse_query_port(service_id, &config.port)?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
                     &config.region,
@@ -542,7 +650,9 @@ impl QueryService {
                         ))
                     })?;
 
-                let endpoint = format!("http://{}:{}", config.host, config.port);
+                let port = parse_query_port(service_id, &config.port)?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
                     &config.region,
@@ -569,11 +679,9 @@ impl QueryService {
                         ))
                     })?;
 
-                let endpoint = format!(
-                    "http://{}:{}",
-                    config.host,
-                    config.port.unwrap_or_else(|| "9000".to_string())
-                );
+                let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("9000"))?;
+                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let access_key = config.access_key.ok_or_else(|| {
                     DataError::InvalidConfiguration("MinIO access_key is required".to_string())
@@ -1153,6 +1261,85 @@ impl QueryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn vet_query_target_allows_explicit_loopback_for_managed_services() {
+        assert_eq!(
+            vet_query_target(1, "localhost", 6379).await.unwrap(),
+            "localhost"
+        );
+        assert_eq!(
+            vet_query_target(1, "127.0.0.1", 6379).await.unwrap(),
+            "127.0.0.1"
+        );
+        assert_eq!(vet_query_target(1, "::1", 6379).await.unwrap(), "[::1]");
+        assert_eq!(
+            vet_query_target(1, "::ffff:127.0.0.1", 6379).await.unwrap(),
+            "127.0.0.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn vet_query_target_rejects_internal_literals() {
+        for host in [
+            "10.0.0.5",
+            "192.168.1.10",
+            "172.16.0.1",
+            "169.254.169.254",
+            "0.0.0.0",
+            "::ffff:10.0.0.5",
+            "fd00:ec2::254",
+        ] {
+            let err = vet_query_target(42, host, 6379)
+                .await
+                .expect_err("internal address must be refused");
+            assert!(
+                matches!(err, DataError::InvalidConfiguration(ref m) if m.contains("Service 42")),
+                "{host}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vet_query_target_accepts_public_literals() {
+        assert_eq!(
+            vet_query_target(1, "8.8.8.8", 6379).await.unwrap(),
+            "8.8.8.8"
+        );
+        assert_eq!(
+            vet_query_target(1, "2001:4860:4860::8888", 27017)
+                .await
+                .unwrap(),
+            "[2001:4860:4860::8888]"
+        );
+    }
+
+    /// Refused before any DNS lookup: these would otherwise be spliced into
+    /// a connection string as extra hosts, userinfo or options.
+    #[tokio::test]
+    async fn vet_query_target_rejects_malformed_and_loopback_names() {
+        for host in [
+            "",
+            "user@10.0.0.1",
+            "a.example,10.0.0.1",
+            "host/path",
+            "host?directConnection=false",
+            "-bad.example",
+            "redis.localhost",
+        ] {
+            assert!(
+                vet_query_target(1, host, 6379).await.is_err(),
+                "'{host}' must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_query_port_rejects_injection() {
+        assert_eq!(parse_query_port(1, "6379").unwrap(), 6379);
+        assert!(parse_query_port(1, "6379/evil?x=y").is_err());
+        assert!(parse_query_port(1, "70000").is_err());
+    }
 
     #[test]
     fn test_postgres_connection_target_selects_policy_from_cluster_primary() {

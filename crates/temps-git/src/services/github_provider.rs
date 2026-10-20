@@ -418,7 +418,7 @@ impl GitHubProvider {
     }
 
     fn get_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects (see gitlab_provider).
@@ -438,7 +438,7 @@ impl GitHubProvider {
     /// still never followed automatically (we validate + follow the one archive
     /// hop manually).
     fn get_archive_client(&self) -> reqwest::Client {
-        reqwest::Client::builder()
+        super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
             .connect_timeout(std::time::Duration::from_secs(30))

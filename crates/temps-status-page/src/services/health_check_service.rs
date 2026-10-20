@@ -12,6 +12,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
+use temps_core::url_validation::{
+    resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
+};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
     deployment_containers, deployments, environments, projects, status_checks, status_monitors,
@@ -175,6 +178,72 @@ fn local_proxy_client_with_roots(
     }
     builder
         .build()
+        .map_err(|source| StatusPageError::HttpClientBuild { source })
+}
+
+/// Where a non-local (public URL) probe may connect, decided at probe time.
+enum PublicProbeTarget {
+    /// Every resolved address passed the outbound policy; the client is pinned
+    /// to exactly those addresses.
+    Pinned(reqwest::Client),
+    /// The host is (or resolves to) an address outside the outbound policy:
+    /// loopback, RFC 1918, link-local/metadata, etc., and not trusted.
+    NonPublic(String),
+    /// The host did not resolve.
+    Unresolved(String),
+}
+
+/// Re-resolve and validate the probe host at probe time, and build a client
+/// pinned to the validated addresses.
+///
+/// The probed hostname is validated nowhere else: a domain whose DNS later
+/// points at `127.0.0.1`, an RFC 1918 address or `169.254.169.254` would
+/// otherwise turn every periodic probe into a request to that internal
+/// address. Resolving once, validating every address with the shared outbound
+/// policy (which honours the operator's trusted private networks), and
+/// pinning the client to those addresses means a rebinding answer cannot slip
+/// in between the check and the connect. Inherited proxy settings are
+/// disabled for the same reason (a proxy would do its own resolution), and
+/// redirects stay unfollowed.
+async fn public_probe_target(url: &str) -> Result<PublicProbeTarget, StatusPageError> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| {
+        StatusPageError::InvalidRequest(format!("Health URL '{url}' is invalid: {error}"))
+    })?;
+    let port = parsed.port_or_known_default().ok_or_else(|| {
+        StatusPageError::InvalidRequest(format!("Health URL '{url}' has no usable port"))
+    })?;
+    let mut builder = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("Temps-Status-Monitor/1.0")
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    match parsed.host() {
+        Some(url::Host::Ipv4(ip)) => {
+            if let Err(e) = validate_outbound_ip(IpAddr::V4(ip)) {
+                return Ok(PublicProbeTarget::NonPublic(e.to_string()));
+            }
+        }
+        Some(url::Host::Ipv6(ip)) => {
+            if let Err(e) = validate_outbound_ip(IpAddr::V6(ip)) {
+                return Ok(PublicProbeTarget::NonPublic(e.to_string()));
+            }
+        }
+        Some(url::Host::Domain(domain)) => match resolve_and_validate_domain(domain, port).await {
+            Ok(addresses) => builder = builder.resolve_to_addrs(domain, &addresses),
+            Err(UrlValidationError::DnsResolutionFailed(reason)) => {
+                return Ok(PublicProbeTarget::Unresolved(reason));
+            }
+            Err(e) => return Ok(PublicProbeTarget::NonPublic(e.to_string())),
+        },
+        None => {
+            return Err(StatusPageError::InvalidRequest(format!(
+                "Health URL '{url}' has no host"
+            )));
+        }
+    }
+    builder
+        .build()
+        .map(PublicProbeTarget::Pinned)
         .map_err(|source| StatusPageError::HttpClientBuild { source })
 }
 
@@ -593,7 +662,6 @@ impl HealthCheckService {
 
         for monitor in filtered_monitors {
             let db = self.db.clone();
-            let http_client = self.http_client.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
             let permit = match semaphore.clone().acquire_owned().await {
@@ -610,8 +678,7 @@ impl HealthCheckService {
             let monitor_id = monitor.id;
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                match Self::check_monitor(db, http_client, config_service, monitor, job_queue).await
-                {
+                match Self::check_monitor(db, config_service, monitor, job_queue).await {
                     Ok(()) => {
                         if MONITOR_CHECK_ERRORS.record_success(&monitor_id).is_some() {
                             info!(monitor_id, "Monitor can be checked again");
@@ -664,7 +731,6 @@ impl HealthCheckService {
             Self::schedule_next_check(self.db.as_ref(), &monitor).await;
             Self::check_monitor(
                 self.db.clone(),
-                self.http_client.clone(),
                 self.config_service.clone(),
                 monitor,
                 self.job_queue.clone(),
@@ -678,7 +744,6 @@ impl HealthCheckService {
     /// Check a single monitor
     async fn check_monitor(
         db: Arc<DatabaseConnection>,
-        http_client: reqwest::Client,
         config_service: Arc<ConfigService>,
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
@@ -837,10 +902,57 @@ impl HealthCheckService {
             }
         };
 
-        let (probe_client, is_local_probe, local_tls_listener) = if should_route_probe_locally(
-            monitor.is_managed,
-            uses_external_url,
-        ) {
+        // Probes that do not go through the local proxy dial the public URL.
+        // Its host is re-resolved and validated here, and the client pinned
+        // to the validated addresses, so it cannot be steered at an internal
+        // address. A deployment hostname that resolves to a non-public address
+        // (a LAN or local install whose wildcard DNS points at this server) is
+        // served by the Temps proxy anyway, so it is probed through the local
+        // listener -- never by dialing the resolved internal address.
+        let mut pinned_public_client = None;
+        if !should_route_probe_locally(monitor.is_managed, uses_external_url) {
+            match public_probe_target(&health_url).await {
+                Ok(PublicProbeTarget::Pinned(client)) => pinned_public_client = Some(client),
+                Ok(PublicProbeTarget::NonPublic(reason)) => {
+                    debug!(
+                        monitor_id = monitor.id,
+                        logical_url = %health_url,
+                        %reason,
+                        "Health URL does not resolve to an allowed public address; probing through the local proxy"
+                    );
+                }
+                Ok(PublicProbeTarget::Unresolved(reason)) => {
+                    Self::record_check(
+                        &db,
+                        probe.clone(),
+                        "major_outage".to_string(),
+                        None,
+                        Some(format!("DNS resolution failed: {reason}")),
+                        &job_queue,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    Self::record_check(
+                        &db,
+                        probe.clone(),
+                        "degraded".to_string(),
+                        None,
+                        Some(format!("Failed to configure health probe: {error}")),
+                        &job_queue,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let (probe_client, is_local_probe, local_tls_listener) = if let Some(client) =
+            pinned_public_client
+        {
+            (client, false, None)
+        } else {
             let server_config = config_service.get_server_config();
             let Some(listener) = local_listener_for_url(
                 &health_url,
@@ -891,8 +1003,6 @@ impl HealthCheckService {
                     return Ok(());
                 }
             }
-        } else {
-            (http_client, false, None)
         };
 
         debug!("Checking URL: {}", health_url);
@@ -1494,7 +1604,6 @@ impl HealthCheckService {
                                 Self::schedule_next_check(service.db.as_ref(), &monitor).await;
                                 if let Err(e) = Self::check_monitor(
                                     service.db.clone(),
-                                    service.http_client.clone(),
                                     service.config_service.clone(),
                                     monitor,
                                     service.job_queue.clone(),
@@ -1734,6 +1843,40 @@ mod tests {
             address,
             reqwest::Certificate::from_pem(cert_pem.as_bytes()).expect("parse reqwest test root"),
         )
+    }
+
+    /// The probe host is re-validated at probe time: a hostname or literal
+    /// that is (or resolves to) an internal address must never get a direct
+    /// client, while a public literal gets a pinned one.
+    #[tokio::test]
+    async fn public_probe_target_refuses_internal_destinations() {
+        for url in [
+            "http://127.0.0.1:8080/health",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/",
+            "http://[::1]:8080/",
+            "http://localhost:8080/health",
+        ] {
+            match public_probe_target(url).await {
+                Ok(PublicProbeTarget::NonPublic(_)) => {}
+                Ok(PublicProbeTarget::Pinned(_)) => panic!("{url} must not get a direct client"),
+                Ok(PublicProbeTarget::Unresolved(reason)) => {
+                    // Only acceptable for the name, on a host without a
+                    // resolver entry for it; still never a direct client.
+                    assert!(url.contains("localhost"), "{url}: {reason}");
+                }
+                Err(error) => panic!("{url}: {error}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_probe_target_pins_public_literal() {
+        assert!(matches!(
+            public_probe_target("https://8.8.8.8/health").await,
+            Ok(PublicProbeTarget::Pinned(_))
+        ));
+        assert!(public_probe_target("not a url").await.is_err());
     }
 
     #[test]
@@ -2118,18 +2261,9 @@ mod tests {
                 .expect("send proxy-owned redirect");
         });
         let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
-        let service =
-            HealthCheckService::new(db.clone(), config_service.clone(), job_queue.clone())
-                .expect("build health check service");
-        HealthCheckService::check_monitor(
-            db.clone(),
-            service.http_client.clone(),
-            config_service,
-            monitor.clone(),
-            job_queue,
-        )
-        .await
-        .expect("record failed TLS verification");
+        HealthCheckService::check_monitor(db.clone(), config_service, monitor.clone(), job_queue)
+            .await
+            .expect("record failed TLS verification");
         http_server.await.expect("proxy redirect was served");
 
         let checks = status_checks::Entity::find()
@@ -2486,15 +2620,9 @@ mod tests {
             let mut monitor = make_monitor(1, Some(1));
             monitor.is_managed = managed;
             let queue: Arc<dyn JobQueue> = Arc::new(RejectHealthProbeJobs);
-            HealthCheckService::check_monitor(
-                db.clone(),
-                reqwest::Client::new(),
-                config,
-                monitor,
-                queue,
-            )
-            .await
-            .unwrap();
+            HealthCheckService::check_monitor(db.clone(), config, monitor, queue)
+                .await
+                .unwrap();
             let log = Arc::try_unwrap(db).unwrap().into_transaction_log();
             assert_eq!(log.len(), 4);
             let log = format!("{log:?}");
@@ -2540,7 +2668,6 @@ mod tests {
         );
         HealthCheckService::check_monitor(
             db.clone(),
-            reqwest::Client::new(),
             test_config_service(&db, "postgres://localhost/test"),
             make_monitor(1, Some(1)),
             Arc::new(NoJobs),
