@@ -195,7 +195,7 @@ pub use app_settings::{
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
-pub use encryption::EncryptionService;
+pub use encryption::{EncryptionService, PasswordEncryptionError};
 pub use preview_grant::{
     encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
     validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
