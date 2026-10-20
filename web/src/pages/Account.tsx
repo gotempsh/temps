@@ -98,8 +98,15 @@ const mfaVerifySchema = z.object({
 
 type MfaVerifyValues = z.infer<typeof mfaVerifySchema>
 
+// Disabling MFA accepts a recovery code too: someone who lost their
+// authenticator must be able to turn MFA off with one. Current recovery
+// codes are `XXXXX-XXXXX`; codes issued by older versions are 6 digits.
 const mfaDisableSchema = z.object({
-  code: z.string().length(6, 'Code must be 6 digits'),
+  code: z
+    .string()
+    .trim()
+    .min(6, 'Enter a 6-digit code or a recovery code')
+    .max(32, 'Enter a 6-digit code or a recovery code'),
 })
 
 type MfaDisableValues = z.infer<typeof mfaDisableSchema>
@@ -737,7 +744,8 @@ export function Account() {
           <DialogHeader>
             <DialogTitle>Disable Two-Factor Authentication</DialogTitle>
             <DialogDescription>
-              Please enter your 2FA code to confirm disabling two-factor
+              Enter a code from your authenticator app, or one of your
+              recovery codes, to confirm disabling two-factor
               authentication. This will make your account less secure.
             </DialogDescription>
           </DialogHeader>
@@ -753,7 +761,14 @@ export function Account() {
                   <FormItem>
                     <FormLabel>Verification Code</FormLabel>
                     <FormControl>
-                      <Input {...field} placeholder="Enter 6-digit code" />
+                      <Input
+                        {...field}
+                        placeholder="6-digit code or recovery code"
+                        maxLength={32}
+                        autoCapitalize="characters"
+                        autoComplete="one-time-code"
+                        spellCheck={false}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
