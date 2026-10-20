@@ -96,6 +96,7 @@ impl temps_core::plugin::TempsPlugin for EmailTrackingPlugin {
                 hmac_key,
                 suppression_service,
                 provider_service,
+                hit_guard: Arc::new(crate::hit_guard::TrackingHitGuard::new()),
             });
             context.register_service(tracking_state);
 

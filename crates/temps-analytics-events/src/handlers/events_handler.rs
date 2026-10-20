@@ -64,6 +64,48 @@ pub struct AppState {
     pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
 }
 
+/// Per-project ceiling applied to the Host-resolved (keyless) ingest branch
+/// of `POST /_temps/event`.
+///
+/// The keyed branch is limited per ingest key (default
+/// [`temps_analytics::ingest_keys::DEFAULT_RATE_LIMIT_PER_MINUTE`] = 600/min,
+/// operator-configurable on the key row). The Host-resolved branch has no key
+/// row to carry a limit, and is just as unauthenticated: anyone can set `Host`
+/// to a tracked project's hostname. It shares the same limiter, bucketed per
+/// project, with a deliberately higher ceiling (100 events/s sustained) so a
+/// busy deployed site — pageviews plus periodic heartbeats from every open tab
+/// — is not throttled, while a flood is still bounded to a fixed DB write rate
+/// per project. Cardinality is bounded by the number of projects.
+pub const HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE: i32 = 6_000;
+
+/// Request-body cap for `POST /_temps/event`.
+///
+/// One analytics event is a page path/query, title, referrer, a few numeric
+/// dimensions and a small `event_data` object — typically well under 2 KiB.
+/// 64 KiB matches the browser ceiling for the transports the SDK uses for
+/// page-unload events (`navigator.sendBeacon` and `fetch(.., {keepalive})`
+/// both cap in-flight bodies at 64 KiB), so no SDK-originated event can exceed
+/// it, while an unauthenticated caller can no longer push axum's 2 MiB default
+/// per request. Session replay (4 MiB) and Sentry envelopes (2 MiB) carry
+/// genuinely larger payloads and keep their own caps.
+pub const EVENT_INGEST_BODY_LIMIT: usize = 64 * 1024;
+
+/// Limiter bucket for Host-resolved ingest of `project_id`.
+///
+/// `AnalyticsIngestRateLimiter` buckets are `i32`s shared with the keyed path:
+/// positive values are `analytics_ingest_keys.id` (SERIAL, from 1) and `0` is
+/// the reserved unresolved-key bucket. Project buckets are mapped to the
+/// negative range so a project can never share (and burn) a key's budget.
+/// Project ids are SERIAL and therefore positive; a non-positive id cannot
+/// occur, but is folded into a single dedicated bucket rather than colliding.
+fn host_resolved_rate_limit_bucket(project_id: i32) -> i32 {
+    if project_id > 0 {
+        -project_id
+    } else {
+        i32::MIN
+    }
+}
+
 /// Get event counts with filtering
 #[utoipa::path(
     get,
@@ -823,6 +865,35 @@ pub async fn record_event_metrics(
                     host, project_id, environment_id, deployment_id
                 );
 
+                // Same limiter as the keyed branch (F-011): without it, anyone
+                // who sets `Host` to a tracked hostname could inject events at
+                // an unbounded rate. Checked before the geolocation lookup and
+                // the insert, so a rejected request costs no DB work.
+                if !state
+                    .ingest_rate_limiter
+                    .check(
+                        host_resolved_rate_limit_bucket(project_id),
+                        Some(HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        project_id,
+                        host = %host,
+                        limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
+                        "Host-resolved analytics ingest rate limit exceeded; dropping event"
+                    );
+                    return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                        .title("Analytics ingest rate limit exceeded")
+                        .detail(format!(
+                            "Analytics ingest for project {} via host '{}' exceeded {} events \
+                             per minute.",
+                            project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
+                        ))
+                        .build()
+                        .into_response();
+                }
+
                 // Unchanged: on this branch the Host header *is* the tracked
                 // site, so it stays the site hostname exactly as before.
                 (
@@ -1341,7 +1412,12 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 /// [`temps_analytics::ingest_keys::cors`].
 pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
     Router::new()
-        .route("/_temps/event", post(record_event_metrics))
+        .route(
+            "/_temps/event",
+            post(record_event_metrics).layer(axum::extract::DefaultBodyLimit::max(
+                EVENT_INGEST_BODY_LIMIT,
+            )),
+        )
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
@@ -2736,6 +2812,110 @@ mod tests {
         test_db.cleanup().await;
     }
 
+    #[test]
+    fn host_resolved_bucket_never_collides_with_key_or_unresolved_buckets() {
+        // Key ids are positive and 0 is the unresolved-key bucket.
+        assert_eq!(host_resolved_rate_limit_bucket(1), -1);
+        assert_eq!(host_resolved_rate_limit_bucket(42), -42);
+        assert_eq!(host_resolved_rate_limit_bucket(i32::MAX), -i32::MAX);
+        assert_eq!(host_resolved_rate_limit_bucket(0), i32::MIN);
+        assert_eq!(host_resolved_rate_limit_bucket(-5), i32::MIN);
+        for id in [1, 2, 1000, i32::MAX] {
+            assert!(host_resolved_rate_limit_bucket(id) < 0);
+        }
+    }
+
+    /// F-011: the Host-resolved branch is rate limited per project by the same
+    /// limiter as the keyed branch, and a rejected event is never stored.
+    #[tokio::test]
+    async fn host_resolved_ingest_over_its_rate_limit_returns_429() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        // Exhaust the project's budget directly (in memory) rather than
+        // inserting thousands of rows.
+        let bucket = host_resolved_rate_limit_bucket(project.id);
+        for _ in 0..HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE {
+            assert!(
+                state
+                    .ingest_rate_limiter
+                    .check(bucket, Some(HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE))
+                    .await
+            );
+        }
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            response.headers().contains_key(header::RETRY_AFTER),
+            "the public route's Retry-After stamping must cover this branch too"
+        );
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    /// F-020: the unkeyed branch is subject to the explicit body cap.
+    #[tokio::test]
+    async fn host_resolved_ingest_over_the_body_limit_is_a_413() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(&state.route_table, "app.example.test", Some(project));
+
+        let mut payload = event_payload();
+        payload["page_title"] = serde_json::json!("a".repeat(EVENT_INGEST_BODY_LIMIT + 1));
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
     /// Regression: the three no-key rejection shapes are unchanged — empty Host
     /// is 400, an unknown host is 404, and a sandbox/orphan route silently
     /// drops with 204.
@@ -3172,10 +3352,11 @@ mod tests {
         let (_app, state, _crypto) = setup_test_app(db.clone()).await;
         let key = mint_key(&state, project.id, None).await;
 
-        // axum's default body limit (2 MiB) applies to this route, exactly as
-        // it does to an `application/json` body.
+        // The route's explicit cap (`EVENT_INGEST_BODY_LIMIT`) applies to
+        // this route, exactly as it does to an `application/json` body — and
+        // it is well below axum's 2 MiB default.
         let mut payload = event_payload();
-        payload["page_title"] = serde_json::json!("a".repeat(3 * 1024 * 1024));
+        payload["page_title"] = serde_json::json!("a".repeat(EVENT_INGEST_BODY_LIMIT + 1));
         for content_type in ["text/plain", "application/json"] {
             let response = setup_public_app(state.clone())
                 .oneshot(beacon(&key, content_type, SITE_ORIGIN, payload.to_string()))

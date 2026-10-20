@@ -9,6 +9,7 @@
 pub mod errors;
 pub mod event_service;
 pub mod handlers;
+pub mod hit_guard;
 pub mod hmac;
 pub mod html_rewriter;
 pub mod plugin;

@@ -31,6 +31,7 @@ use uuid::Uuid;
 use crate::event_service::{
     EmailEventService, EmailEventStats, ListEmailEventsOptions, SnsProcessingOutcome,
 };
+use crate::hit_guard::{TrackingHitGuard, TrackingHitKind};
 use crate::hmac::verify_tracking_hmac;
 use crate::sns::SnsVerifier;
 use temps_email::{ProviderService, SuppressionService};
@@ -42,6 +43,9 @@ pub struct TrackingState {
     pub hmac_key: Vec<u8>,
     pub suppression_service: Arc<SuppressionService>,
     pub provider_service: Arc<ProviderService>,
+    /// Replay dedupe + per-email cap + concurrency bound for the public
+    /// pixel/click endpoints (see [`crate::hit_guard`]).
+    pub hit_guard: Arc<TrackingHitGuard>,
 }
 
 /// OpenAPI documentation
@@ -98,7 +102,8 @@ fn extract_ip(headers: &HeaderMap) -> Option<String> {
 
 /// GET /t/pixel/{email_id}/{hmac_with_ext}
 ///
-/// Always returns a 1x1 transparent GIF. Records an "opened" event via fire-and-forget.
+/// Always returns a 1x1 transparent GIF. Records an "opened" event via fire-and-forget,
+/// subject to the replay/rate/concurrency guard in [`crate::hit_guard`].
 /// Never returns an error response — prevents email_id enumeration.
 async fn pixel_handler(
     Path((email_id_str, hmac_with_ext)): Path<(String, String)>,
@@ -117,15 +122,25 @@ async fn pixel_handler(
         return gif_response();
     }
 
-    // Fire-and-forget: record open event
-    let event_service = state.event_service.clone();
+    // Fire-and-forget: record open event — but only if the hit guard admits
+    // it (not a replay, within the per-email cap, and a record-task slot is
+    // free). The GIF is served either way.
     let ip = extract_ip(&headers);
+    let Ok(permit) = state
+        .hit_guard
+        .admit(email_id, TrackingHitKind::Open, ip.as_deref())
+    else {
+        return gif_response();
+    };
+    let event_service = state.event_service.clone();
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(String::from);
 
     tokio::spawn(async move {
+        // Held for the task's lifetime: bounds concurrent record work.
+        let _permit = permit;
         if let Err(e) = event_service
             .record_event(email_id, "opened", None, None, None, ip, ua)
             .await
@@ -175,9 +190,17 @@ async fn click_handler(
         return Redirect::temporary("/").into_response();
     }
 
-    // Fire-and-forget: record click event
-    let event_service = state.event_service.clone();
+    // Fire-and-forget: record click event if the hit guard admits it. The
+    // redirect is the user-visible part and is served even when the event is
+    // dropped (replay, per-email cap, or saturated record pool).
     let ip = extract_ip(&headers);
+    let Ok(permit) = state
+        .hit_guard
+        .admit(email_id, TrackingHitKind::Click, ip.as_deref())
+    else {
+        return Redirect::temporary(&url).into_response();
+    };
+    let event_service = state.event_service.clone();
     let ua = headers
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
@@ -185,6 +208,8 @@ async fn click_handler(
     let url_clone = url.clone();
 
     tokio::spawn(async move {
+        // Held for the task's lifetime: bounds concurrent record work.
+        let _permit = permit;
         let metadata = serde_json::json!({ "url": url_clone });
         if let Err(e) = event_service
             .record_event(email_id, "clicked", None, None, Some(metadata), ip, ua)
