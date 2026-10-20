@@ -589,7 +589,13 @@ mod tests {
         crypto: Arc<CookieCrypto>,
     ) -> (RouterHostApi, Arc<DatabaseConnection>) {
         let db = Arc::new(db);
-        let users = Arc::new(UserService::new(db.clone()));
+        let users = Arc::new(UserService::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(&"7a".repeat(32))
+                    .expect("fixed test key must be valid"),
+            ),
+        ));
         (
             RouterHostApi::new(Router::new(), db.clone(), crypto, users),
             db,

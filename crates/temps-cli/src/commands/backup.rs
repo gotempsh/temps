@@ -10,6 +10,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
 
+/// `server_config_encryption` written by servers before F-009: AES-256-GCM keyed by
+/// an unsalted SHA-256 of the S3 secret. Still accepted so old recovery sets restore.
+const SERVER_CONFIG_ENCRYPTION_LEGACY_SHA256: &str = "aes-256-gcm+s3-secret-sha256";
+/// Current `server_config_encryption`: AES-256-GCM keyed by Argon2id(S3 secret, random salt).
+const SERVER_CONFIG_ENCRYPTION_ARGON2ID: &str = "aes-256-gcm+s3-secret-argon2id";
+
 #[derive(Deserialize, Serialize, Debug)]
 struct BackupIndex {
     backups: Vec<BackupEntry>,
@@ -1152,16 +1158,18 @@ impl BackupCommand {
             .ok_or_else(|| anyhow::anyhow!("Recovery metadata must be a JSON object"))?
             .remove("manifest_authentication");
         let expected_payload = serde_json::to_string(&unsigned)?;
-        let authenticated_payload =
-            temps_core::EncryptionService::new_from_password(s3_secret_access_key)
-                .decrypt_string(authentication)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Recovery manifest authentication failed for '{}': {}",
-                        expected_backup_id,
-                        error
-                    )
-                })?;
+        // Accepts both the Argon2id format and the legacy SHA-256-keyed format.
+        let authenticated_payload = temps_core::EncryptionService::decrypt_string_with_password(
+            s3_secret_access_key,
+            authentication,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Recovery manifest authentication failed for '{}': {}",
+                expected_backup_id,
+                error
+            )
+        })?;
         if authenticated_payload != expected_payload {
             return Err(anyhow::anyhow!(
                 "Recovery manifest authentication failed for '{}': content mismatch",
@@ -1179,23 +1187,29 @@ impl BackupCommand {
             let method = metadata
                 .server_config_encryption
                 .as_deref()
-                .unwrap_or("aes-256-gcm+s3-secret-sha256");
-            if method != "aes-256-gcm+s3-secret-sha256" {
+                .unwrap_or(SERVER_CONFIG_ENCRYPTION_LEGACY_SHA256);
+            if method != SERVER_CONFIG_ENCRYPTION_LEGACY_SHA256
+                && method != SERVER_CONFIG_ENCRYPTION_ARGON2ID
+            {
                 return Err(anyhow::anyhow!(
                     "Recovery set '{}' uses unsupported server-config encryption '{}'",
                     metadata.backup_id,
                     method
                 ));
             }
-            return temps_core::EncryptionService::new_from_password(s3_secret_access_key)
-                .decrypt_string(ciphertext)
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "Failed to decrypt server configuration for recovery set '{}': {}",
-                        metadata.backup_id,
-                        error
-                    )
-                });
+            // The ciphertext is self-describing (versioned prefix), so the same call
+            // handles recovery sets written before and after the Argon2id switch.
+            return temps_core::EncryptionService::decrypt_string_with_password(
+                s3_secret_access_key,
+                ciphertext,
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to decrypt server configuration for recovery set '{}': {}",
+                    metadata.backup_id,
+                    error
+                )
+            });
         }
 
         if metadata.recovery_set_version == Some(2) {
@@ -2265,6 +2279,57 @@ mod tests {
     }
 
     #[test]
+    fn encrypted_server_config_argon2id_format_round_trips() {
+        let secret = "s3-secret-for-test";
+        let config = "encryption_key: 01234567890123456789012345678901\n";
+        let ciphertext =
+            temps_core::EncryptionService::encrypt_string_with_password(secret, config)
+                .expect("test config should encrypt");
+        let mut value = metadata();
+        value.server_config_encrypted = Some(ciphertext);
+        value.server_config_encryption = Some(SERVER_CONFIG_ENCRYPTION_ARGON2ID.to_string());
+
+        let restored = BackupCommand::resolve_server_config(&value, secret)
+            .expect("matching S3 secret should decrypt the config");
+
+        assert_eq!(restored, config);
+        assert!(BackupCommand::resolve_server_config(&value, "wrong-secret").is_err());
+
+        value.server_config_encryption = Some("aes-256-gcm+unknown-kdf".to_string());
+        assert!(BackupCommand::resolve_server_config(&value, secret)
+            .expect_err("unknown methods must be refused")
+            .to_string()
+            .contains("unsupported server-config encryption"));
+    }
+
+    #[test]
+    fn authenticated_manifest_accepts_argon2id_format_and_rejects_tampering() {
+        let secret = "manifest-test-secret";
+        let mut value = serde_json::to_value(metadata()).expect("metadata should serialize");
+        value
+            .as_object_mut()
+            .expect("metadata should be an object")
+            .remove("manifest_authentication");
+        let payload = serde_json::to_string(&value).expect("metadata should serialize");
+        let authentication =
+            temps_core::EncryptionService::encrypt_string_with_password(secret, &payload)
+                .expect("manifest should authenticate");
+        value["manifest_authentication"] = serde_json::json!(authentication);
+
+        BackupCommand::verify_manifest_authentication(&value, "recovery-uuid", secret)
+            .expect("untouched manifest should authenticate");
+        assert!(
+            BackupCommand::verify_manifest_authentication(&value, "recovery-uuid", "wrong")
+                .is_err()
+        );
+        value["name"] = serde_json::json!("tampered");
+        assert!(
+            BackupCommand::verify_manifest_authentication(&value, "recovery-uuid", secret).is_err()
+        );
+    }
+
+    /// Recovery sets written before F-009 (legacy SHA-256 key) must still restore.
+    #[test]
     fn encrypted_server_config_uses_s3_secret() {
         let secret = "s3-secret-for-test";
         let config = "encryption_key: 01234567890123456789012345678901\n";
@@ -2273,7 +2338,7 @@ mod tests {
             .expect("test config should encrypt");
         let mut value = metadata();
         value.server_config_encrypted = Some(ciphertext);
-        value.server_config_encryption = Some("aes-256-gcm+s3-secret-sha256".to_string());
+        value.server_config_encryption = Some(SERVER_CONFIG_ENCRYPTION_LEGACY_SHA256.to_string());
 
         let restored = BackupCommand::resolve_server_config(&value, secret)
             .expect("matching S3 secret should decrypt the config");

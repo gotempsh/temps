@@ -161,7 +161,8 @@ impl From<crate::mfa_guard::MfaGuardError> for UserServiceError {
             | crate::mfa_guard::MfaGuardError::InvalidRecoveryCodes { .. } => {
                 UserServiceError::Mfa(error.to_string())
             }
-            crate::mfa_guard::MfaGuardError::VerifierUnavailable { .. } => {
+            crate::mfa_guard::MfaGuardError::VerifierUnavailable { .. }
+            | crate::mfa_guard::MfaGuardError::SecretEncryption { .. } => {
                 UserServiceError::Internal(error.to_string())
             }
         }
@@ -255,16 +256,15 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
 
     let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
     let secret_key = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
-    let recovery_codes: Vec<String> = (0..8)
-        .map(|_| {
-            (0..6)
-                .map(|_| rand::rng().random_range(0..10).to_string())
-                .collect()
-        })
-        .collect();
+    // Each code is shown grouped (`XXXXX-XXXXX`) but hashed in canonical
+    // form, which is what `mfa_guard::normalize_recovery_code` reduces the
+    // typed code to before comparing.
+    let (recovery_codes, canonical_codes): (Vec<String>, Vec<String>) = (0..8)
+        .map(|_| crate::mfa_guard::generate_recovery_code())
+        .unzip();
 
     let argon2 = Argon2::default();
-    let hashed_recovery_codes = recovery_codes
+    let hashed_recovery_codes = canonical_codes
         .iter()
         .map(|code| {
             argon2
@@ -373,6 +373,7 @@ impl From<temps_entities::roles::Model> for ServiceRole {
 
 pub struct UserService {
     db: Arc<DatabaseConnection>,
+    encryption_service: Arc<temps_core::EncryptionService>,
     mfa_setup_global: Arc<Semaphore>,
     mfa_setup_users: Arc<Mutex<HashMap<i32, Arc<Mutex<()>>>>>,
 }
@@ -414,9 +415,13 @@ pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
 }
 
 impl UserService {
-    pub fn new(db: Arc<DatabaseConnection>) -> Self {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        encryption_service: Arc<temps_core::EncryptionService>,
+    ) -> Self {
         Self {
             db,
+            encryption_service,
             mfa_setup_global: Arc::new(Semaphore::new(MAX_CONCURRENT_MFA_SETUPS)),
             mfa_setup_users: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -1100,8 +1105,15 @@ impl UserService {
             return Err(UserServiceError::MfaAlreadyEnabled(user_id));
         }
 
+        // Only the encrypted seed is persisted; the plaintext goes back to the
+        // caller once, for the authenticator QR code / manual entry.
+        let sealed_secret = crate::mfa_guard::seal_mfa_secret(
+            &self.encryption_service,
+            user_id,
+            &candidate.secret_key,
+        )?;
         let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.mfa_secret = Set(Some(candidate.secret_key.clone()));
+        user_update.mfa_secret = Set(Some(sealed_secret));
         user_update.mfa_enabled = Set(false);
         user_update.mfa_recovery_codes = Set(Some(
             serde_json::to_string(&candidate.hashed_recovery_codes)
@@ -1159,13 +1171,27 @@ impl UserService {
 
         let now = Utc::now();
         let guard = crate::mfa_guard::load_guard(&transaction, user_id).await?;
-        let Some(factor) =
-            crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, false, now).await?
+        let Some(factor) = crate::mfa_guard::check_factor(
+            &self.encryption_service,
+            &user,
+            guard.last_totp_step,
+            code,
+            false,
+            now,
+        )
+        .await?
         else {
             return Err(UserServiceError::InvalidMfaCode);
         };
-        let user =
-            crate::mfa_guard::record_success(&transaction, user, &guard, &factor, now).await?;
+        let user = crate::mfa_guard::record_success(
+            &transaction,
+            &self.encryption_service,
+            user,
+            &guard,
+            &factor,
+            now,
+        )
+        .await?;
 
         let mut user_update: temps_entities::users::ActiveModel = user.into();
         user_update.mfa_enabled = Set(true);
@@ -1234,9 +1260,26 @@ impl UserService {
             });
         }
 
-        match crate::mfa_guard::check_factor(&user, guard.last_totp_step, code, true, now).await? {
+        match crate::mfa_guard::check_factor(
+            &self.encryption_service,
+            &user,
+            guard.last_totp_step,
+            code,
+            true,
+            now,
+        )
+        .await?
+        {
             Some(factor) => {
-                crate::mfa_guard::record_success(transaction, user, &guard, &factor, now).await?;
+                crate::mfa_guard::record_success(
+                    transaction,
+                    &self.encryption_service,
+                    user,
+                    &guard,
+                    &factor,
+                    now,
+                )
+                .await?;
                 Ok(true)
             }
             None => {
@@ -1347,9 +1390,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_rejects_invalid_identity_before_database_writes() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let blank_name = service
             .create_user(
@@ -1379,9 +1423,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_requires_at_least_one_role() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = service
             .create_user(
@@ -1398,9 +1443,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_user_rejects_duplicate_roles() {
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
 
         let result = service
             .create_user(
@@ -1422,7 +1468,7 @@ mod tests {
                 .append_query_results([Vec::<temps_entities::roles::Model>::new()])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service
             .create_user(
@@ -1463,7 +1509,7 @@ mod tests {
                 )])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service
             .create_user(
@@ -1510,7 +1556,7 @@ mod tests {
                 }]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let created = service
             .create_user(
@@ -1551,7 +1597,7 @@ mod tests {
                 .append_query_results([vec![user(false, None)]])
                 .into_connection(),
         );
-        let service = UserService::new(db);
+        let service = UserService::new(db, crate::mfa_guard::test_support::encryption());
 
         let result = service.verify_mfa_code(7, "anything").await;
         assert!(matches!(result, Err(UserServiceError::MfaNotSetup(7))));
@@ -1561,9 +1607,10 @@ mod tests {
     async fn mfa_setup_limits_parallel_work_globally_and_per_user() {
         use std::time::Duration;
 
-        let service = UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        ));
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
         let first_user = service
             .acquire_mfa_setup_permit(7)
             .await
@@ -1606,9 +1653,10 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        let service = Arc::new(UserService::new(Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
-        )));
+        let service = Arc::new(UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        ));
         let first = service
             .acquire_mfa_setup_permit(7)
             .await
@@ -1680,7 +1728,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let setup = service
             .setup_mfa(7, None)
@@ -1689,9 +1737,15 @@ mod tests {
 
         assert_ne!(setup.secret_key, "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
         assert_eq!(setup.recovery_codes.len(), 8);
-        assert!(setup.recovery_codes.iter().all(
-            |code| code.len() == 6 && code.chars().all(|character| character.is_ascii_digit())
-        ));
+        // F-012: ten symbols from the unambiguous alphabet, shown grouped.
+        assert!(setup.recovery_codes.iter().all(|code| {
+            let canonical = crate::mfa_guard::normalize_recovery_code(code);
+            code.len() == crate::mfa_guard::RECOVERY_CODE_LENGTH + 1
+                && canonical.len() == crate::mfa_guard::RECOVERY_CODE_LENGTH
+                && canonical
+                    .bytes()
+                    .all(|b| crate::mfa_guard::RECOVERY_CODE_ALPHABET.contains(&b))
+        }));
         assert!(setup.qr_code.starts_with("data:image/png;base64,"));
 
         drop(service);
@@ -1705,9 +1759,15 @@ mod tests {
         assert!(statements
             .iter()
             .any(|statement| statement.sql.contains("FOR UPDATE")));
-        assert!(statements
+        let user_update = statements
             .iter()
-            .any(|statement| statement.sql.starts_with("UPDATE \"users\"")));
+            .find(|statement| statement.sql.starts_with("UPDATE \"users\""))
+            .expect("setup must write the new credential bundle");
+        // F-008: the seed is persisted encrypted, never as the plaintext
+        // value handed back for the QR code.
+        let written = format!("{:?}", user_update.values);
+        assert!(written.contains(crate::mfa_guard::MFA_SECRET_ENCRYPTED_PREFIX));
+        assert!(!written.contains(&setup.secret_key));
     }
 
     #[tokio::test]
@@ -1720,7 +1780,7 @@ mod tests {
                 .append_query_results([vec![pending], vec![enabled]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service.setup_mfa(7, None).await;
 
@@ -1747,9 +1807,10 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_code_is_consumed_under_an_exclusive_row_lock() {
-        let recovery_code = "RECOVERY-CODE";
+        // Typed with a separator and in lower case; stored in canonical form.
+        let recovery_code = "abcde-fgh23";
         let hash = argon2::Argon2::default()
-            .hash_password(recovery_code.as_bytes())
+            .hash_password(b"ABCDEFGH23")
             .expect("test recovery code hashes")
             .to_string();
         let original = user(
@@ -1768,7 +1829,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         assert!(service
             .verify_mfa_code(7, recovery_code)
@@ -1823,7 +1884,7 @@ mod tests {
                 .append_query_results([vec![deleted]])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         let result = service.admin_reset_password(7).await;
         assert!(matches!(
@@ -1855,7 +1916,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let service = UserService::new(db.clone());
+        let service = UserService::new(db.clone(), crate::mfa_guard::test_support::encryption());
 
         service
             .disable_mfa(7)
@@ -1917,7 +1978,7 @@ mod tests {
             ids.push(session.id);
         }
 
-        let service = UserService::new(db.db.clone());
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
         let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
         service
             .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
@@ -2000,7 +2061,7 @@ mod tests {
         .await
         .unwrap();
 
-        let service = UserService::new(db.db.clone());
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
         let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
         let result = service.verify_and_enable_mfa(user.id, &code, None).await;
         assert!(
@@ -2044,7 +2105,7 @@ mod tests {
         .insert(db.db.as_ref())
         .await
         .unwrap();
-        let service = UserService::new(db.db.clone());
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
 
         // Disabling spends the old authenticator's code one step ahead, the
         // furthest the skew window accepts.
@@ -2066,5 +2127,69 @@ mod tests {
             .verify_and_enable_mfa(user.id, &code, None)
             .await
             .expect("the new secret's current code must be accepted");
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_mfa_secret_is_encrypted_after_a_successful_verification() {
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        // A row enrolled before at-rest encryption: the bare base32 seed.
+        let secret = crate::mfa_guard::test_support::new_secret();
+        let user = temps_entities::users::ActiveModel {
+            email: Set("legacy-seed@example.com".to_string()),
+            name: Set("Legacy Seed".to_string()),
+            email_verified: Set(true),
+            mfa_enabled: Set(true),
+            mfa_secret: Set(Some(secret.clone())),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let encryption = crate::mfa_guard::test_support::encryption();
+        let service = UserService::new(db.db.clone(), encryption.clone());
+
+        let now = Utc::now();
+        assert!(service
+            .verify_mfa_code(
+                user.id,
+                &crate::mfa_guard::test_support::code_at(&secret, now)
+            )
+            .await
+            .expect("legacy plaintext seed must keep verifying"));
+
+        let stored = temps_entities::users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .mfa_secret
+            .expect("seed must still be present");
+        assert!(stored.starts_with(crate::mfa_guard::MFA_SECRET_ENCRYPTED_PREFIX));
+        assert!(!stored.contains(&secret));
+        assert_eq!(
+            crate::mfa_guard::open_mfa_secret(&encryption, user.id, &stored).unwrap(),
+            secret
+        );
+
+        // The authenticator keeps working against the re-encrypted row.
+        let later = now + chrono::Duration::seconds(30);
+        assert!(service
+            .verify_mfa_code(
+                user.id,
+                &crate::mfa_guard::test_support::code_at(&secret, later)
+            )
+            .await
+            .expect("encrypted seed must verify"));
     }
 }

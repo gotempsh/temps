@@ -478,7 +478,11 @@ mod tests {
             password_reset_expires: None,
             must_change_password: false,
             deleted_at: None,
-            mfa_secret: mfa_enabled.then(|| "JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            // Stored as a current enrolment stores it, so a successful
+            // verification does not also re-encrypt a legacy plaintext seed.
+            mfa_secret: mfa_enabled.then(|| {
+                crate::mfa_guard::test_support::sealed("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP")
+            }),
             mfa_enabled,
             mfa_recovery_codes: None,
             oidc_subject: None,
@@ -717,7 +721,13 @@ mod tests {
             .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db.clone())));
+        let service = StepUpService::new(
+            db.clone(),
+            Arc::new(UserService::new(
+                db.clone(),
+                crate::mfa_guard::test_support::encryption(),
+            )),
+        );
 
         let expires_at = service
             .verify_and_elevate(7, 11, &current_totp_code())
@@ -750,7 +760,13 @@ mod tests {
             .append_query_results([vec![user(false)]])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
+        let service = StepUpService::new(
+            db.clone(),
+            Arc::new(UserService::new(
+                db,
+                crate::mfa_guard::test_support::encryption(),
+            )),
+        );
 
         let result = service.verify_and_elevate(7, 11, "123456").await;
         assert!(matches!(
@@ -768,7 +784,13 @@ mod tests {
             .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db.clone())));
+        let service = StepUpService::new(
+            db.clone(),
+            Arc::new(UserService::new(
+                db.clone(),
+                crate::mfa_guard::test_support::encryption(),
+            )),
+        );
 
         let result = service.verify_and_elevate(7, 11, "not-a-code").await;
         assert!(matches!(
@@ -805,7 +827,13 @@ mod tests {
             .append_exec_results([guard_upsert()])
             .into_connection();
         let db = Arc::new(db);
-        let service = StepUpService::new(db.clone(), Arc::new(UserService::new(db)));
+        let service = StepUpService::new(
+            db.clone(),
+            Arc::new(UserService::new(
+                db,
+                crate::mfa_guard::test_support::encryption(),
+            )),
+        );
 
         let result = service
             .verify_and_elevate(7, 11, &current_totp_code())
@@ -862,7 +890,13 @@ mod tests {
         .insert(db.db.as_ref())
         .await
         .unwrap();
-        let service = StepUpService::new(db.db.clone(), Arc::new(UserService::new(db.db.clone())));
+        let service = StepUpService::new(
+            db.db.clone(),
+            Arc::new(UserService::new(
+                db.db.clone(),
+                crate::mfa_guard::test_support::encryption(),
+            )),
+        );
         Some((db, service, user.id, session.id))
     }
 

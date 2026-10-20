@@ -32,6 +32,137 @@ pub struct RequestMetadata {
 const SESSION_ID_COOKIE_NAME: &str = "_temps_sid";
 const VISITOR_ID_COOKIE_NAME: &str = "_temps_visitor_id";
 
+/// Scheme the operator declared for the console's public URL
+/// (`AppSettings.external_url`). Trusted server-side configuration, unlike
+/// anything a request carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclaredConsoleScheme {
+    /// No external URL configured (or settings not loaded yet).
+    Unset,
+    /// External URL is `https://...`.
+    Https,
+    /// External URL is `http://...` — the operator runs the console over
+    /// plain HTTP (local development, HTTP-only installs).
+    Http,
+}
+
+const DECLARED_SCHEME_UNSET: u8 = 0;
+const DECLARED_SCHEME_HTTPS: u8 = 1;
+const DECLARED_SCHEME_HTTP: u8 = 2;
+
+/// Process-wide copy of the declared console scheme, published by the config
+/// service whenever settings are (re)loaded — the same pattern as
+/// `tls::set_insecure_tls`. Read lock-free on every request.
+static DECLARED_CONSOLE_SCHEME: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(DECLARED_SCHEME_UNSET);
+
+impl DeclaredConsoleScheme {
+    /// Classify a configured external URL.
+    pub fn from_external_url(external_url: Option<&str>) -> Self {
+        match external_url.map(|url| url.trim().to_ascii_lowercase()) {
+            Some(url) if url.starts_with("https://") => Self::Https,
+            Some(url) if url.starts_with("http://") => Self::Http,
+            _ => Self::Unset,
+        }
+    }
+}
+
+/// Publish the operator-declared console scheme (called by the config service).
+pub fn set_declared_console_scheme(scheme: DeclaredConsoleScheme) {
+    let value = match scheme {
+        DeclaredConsoleScheme::Unset => DECLARED_SCHEME_UNSET,
+        DeclaredConsoleScheme::Https => DECLARED_SCHEME_HTTPS,
+        DeclaredConsoleScheme::Http => DECLARED_SCHEME_HTTP,
+    };
+    DECLARED_CONSOLE_SCHEME.store(value, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The currently published operator-declared console scheme.
+pub fn declared_console_scheme() -> DeclaredConsoleScheme {
+    match DECLARED_CONSOLE_SCHEME.load(std::sync::atomic::Ordering::Relaxed) {
+        DECLARED_SCHEME_HTTPS => DeclaredConsoleScheme::Https,
+        DECLARED_SCHEME_HTTP => DeclaredConsoleScheme::Http,
+        _ => DeclaredConsoleScheme::Unset,
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "localho.st"
+        || host.ends_with(".localho.st")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Whether auth cookies issued for this request must carry `Secure`.
+///
+/// The decision never lets a client *remove* `Secure` from a cookie that
+/// travels over a network:
+///
+/// 1. **Operator-declared scheme wins.** An `https://` external URL always
+///    yields `Secure`. An `http://` one (the operator runs the console over
+///    plain HTTP, e.g. `http://localhost:3000` or an HTTP-only sslip.io
+///    install) yields `Secure` only when the request reports HTTPS.
+/// 2. **No external URL configured**: default to `Secure`, except
+///    - a direct (non-loopback) connection to the console listener that does
+///      not report HTTPS — that socket *is* plain HTTP, so a `Secure` cookie
+///      would only be dropped by the browser and lock the user out;
+///    - our own proxy (loopback peer) explicitly reporting `http`. The Temps
+///      proxy overwrites `X-Forwarded-Proto` with the real TLS state, so from
+///      a loopback peer the header is server-controlled;
+///    - a loopback peer with no header for a loopback Host (a browser hitting
+///      the console directly on `localhost`): the traffic never leaves the
+///      machine, and some browsers drop `Secure` cookies on `http://localhost`.
+///
+/// `X-Forwarded-Proto: https` can only *add* `Secure`, which is always safe.
+/// To run a non-local install over plain HTTP behind a proxy, set the external
+/// URL to its `http://` address in Settings.
+pub fn secure_cookie_for_request(
+    declared: DeclaredConsoleScheme,
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+) -> bool {
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|value| value.trim().to_ascii_lowercase());
+    let reports_https = forwarded_proto.as_deref() == Some("https");
+
+    match declared {
+        DeclaredConsoleScheme::Https => true,
+        DeclaredConsoleScheme::Http => reports_https,
+        DeclaredConsoleScheme::Unset => {
+            if reports_https {
+                return true;
+            }
+            let peer_is_local_proxy = peer.is_some_and(|addr| addr.ip().is_loopback());
+            if !peer_is_local_proxy {
+                // Direct plain-HTTP connection to the console listener.
+                return false;
+            }
+            match forwarded_proto.as_deref() {
+                Some("http") => false,
+                Some(_) => true,
+                None => {
+                    let host = headers
+                        .get("host")
+                        .and_then(|value| value.to_str().ok())
+                        .map(host_without_port)
+                        .unwrap_or("");
+                    !is_loopback_host(host)
+                }
+            }
+        }
+    }
+}
+
 /// Strip any `:port` suffix from a raw Host header.
 ///
 /// The proxy's route table is keyed on the hostname only, so requests that
@@ -127,7 +258,9 @@ pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetada
     } else {
         "http"
     };
-    let is_secure = scheme == "https";
+    // Cookie `Secure` comes from trusted server-side state, never from a
+    // client-controllable header alone (see `secure_cookie_for_request`).
+    let is_secure = secure_cookie_for_request(declared_console_scheme(), headers, peer);
     let base_url = format!("{}://{}", scheme, raw_host);
     let host = host_without_port(&raw_host).to_string();
 
@@ -402,5 +535,138 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn cookie_headers(host: &str, forwarded_proto: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", host.parse().unwrap());
+        if let Some(proto) = forwarded_proto {
+            headers.insert("x-forwarded-proto", proto.parse().unwrap());
+        }
+        headers
+    }
+
+    fn loopback_peer() -> Option<std::net::SocketAddr> {
+        Some("127.0.0.1:50000".parse().unwrap())
+    }
+
+    fn remote_peer() -> Option<std::net::SocketAddr> {
+        Some("203.0.113.9:50000".parse().unwrap())
+    }
+
+    #[test]
+    fn declared_https_external_url_forces_secure_whatever_the_headers_say() {
+        for (headers, peer) in [
+            (
+                cookie_headers("console.example.com", Some("http")),
+                loopback_peer(),
+            ),
+            (
+                cookie_headers("console.example.com", Some("http")),
+                remote_peer(),
+            ),
+            (cookie_headers("console.example.com", None), remote_peer()),
+            (cookie_headers("localhost:3000", None), loopback_peer()),
+        ] {
+            assert!(secure_cookie_for_request(
+                DeclaredConsoleScheme::Https,
+                &headers,
+                peer
+            ));
+        }
+    }
+
+    #[test]
+    fn declared_http_external_url_keeps_plain_http_installs_working() {
+        let headers = cookie_headers("10.0.0.5.sslip.io", Some("http"));
+        assert!(!secure_cookie_for_request(
+            DeclaredConsoleScheme::Http,
+            &headers,
+            loopback_peer()
+        ));
+        let headers = cookie_headers("localhost:3000", None);
+        assert!(!secure_cookie_for_request(
+            DeclaredConsoleScheme::Http,
+            &headers,
+            loopback_peer()
+        ));
+        // A request that does arrive over HTTPS still gets Secure.
+        let headers = cookie_headers("console.example.com", Some("https"));
+        assert!(secure_cookie_for_request(
+            DeclaredConsoleScheme::Http,
+            &headers,
+            loopback_peer()
+        ));
+    }
+
+    #[test]
+    fn unset_external_url_defaults_to_secure_behind_the_local_proxy() {
+        // Proxy omitted the header for a public host: default to Secure.
+        let headers = cookie_headers("console.example.com", None);
+        assert!(secure_cookie_for_request(
+            DeclaredConsoleScheme::Unset,
+            &headers,
+            loopback_peer()
+        ));
+        // Our proxy reporting TLS.
+        let headers = cookie_headers("console.example.com", Some("https"));
+        assert!(secure_cookie_for_request(
+            DeclaredConsoleScheme::Unset,
+            &headers,
+            loopback_peer()
+        ));
+        // Our proxy (which overwrites the header) reporting plain HTTP.
+        let headers = cookie_headers("console.example.com", Some("http"));
+        assert!(!secure_cookie_for_request(
+            DeclaredConsoleScheme::Unset,
+            &headers,
+            loopback_peer()
+        ));
+    }
+
+    #[test]
+    fn unset_external_url_never_lets_a_remote_client_strip_secure_from_proxied_traffic() {
+        // A client talking to the console listener directly over plain HTTP
+        // cannot obtain Secure (the browser would drop it), and its header is
+        // ignored unless it asks for *more* security.
+        let headers = cookie_headers("192.168.1.10:3000", None);
+        assert!(!secure_cookie_for_request(
+            DeclaredConsoleScheme::Unset,
+            &headers,
+            remote_peer()
+        ));
+        let headers = cookie_headers("console.example.com", Some("https"));
+        assert!(secure_cookie_for_request(
+            DeclaredConsoleScheme::Unset,
+            &headers,
+            remote_peer()
+        ));
+    }
+
+    #[test]
+    fn unset_external_url_keeps_direct_localhost_development_usable() {
+        for host in ["localhost:3000", "127.0.0.1:3000", "app.localho.st:8080"] {
+            let headers = cookie_headers(host, None);
+            assert!(
+                !secure_cookie_for_request(DeclaredConsoleScheme::Unset, &headers, loopback_peer()),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_scheme_is_classified_from_the_external_url() {
+        assert_eq!(
+            DeclaredConsoleScheme::from_external_url(Some("https://console.example.com")),
+            DeclaredConsoleScheme::Https
+        );
+        assert_eq!(
+            DeclaredConsoleScheme::from_external_url(Some("HTTP://localhost:3000")),
+            DeclaredConsoleScheme::Http
+        );
+        assert_eq!(
+            DeclaredConsoleScheme::from_external_url(None),
+            DeclaredConsoleScheme::Unset
+        );
     }
 }

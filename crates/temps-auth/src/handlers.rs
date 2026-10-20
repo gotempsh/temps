@@ -3956,7 +3956,16 @@ mod tests {
         async fn user_role_session_can_confirm_enrollment_with_a_valid_code() {
             let audit = Arc::new(RecordingAuditLogger::default());
             let mut pending = user_row(5);
-            pending.mfa_secret = Some(SECRET_BASE32.to_string());
+            // Encrypted as `setup_mfa` stores it, under the state's key below,
+            // so confirming does not also re-encrypt a legacy plaintext seed.
+            pending.mfa_secret = Some(
+                crate::mfa_guard::seal_mfa_secret(
+                    &temps_core::EncryptionService::new_from_password("handler-regression-test"),
+                    5,
+                    SECRET_BASE32,
+                )
+                .expect("test secret must seal"),
+            );
             let mut enabled = pending.clone();
             enabled.mfa_enabled = true;
             // Lock the user, read the (empty) guard, upsert it, persist

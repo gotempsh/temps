@@ -30,8 +30,34 @@ impl From<CryptoError> for crate::problemdetails::Problem {
     }
 }
 
+/// Domain-separation salt for deriving the cookie AES key from the instance auth
+/// secret (HKDF-SHA256 extract). Changing it invalidates every value encrypted
+/// under the derived key, so bump the suffix only together with a new fallback.
+const COOKIE_KEY_DERIVATION_SALT: &[u8] = b"temps-cookie-crypto-v1";
+
+/// Derive the AES-256 key actually used for new ciphertexts.
+///
+/// The auth secret is a high-entropy value (auto-generated installs use 32 random
+/// bytes), so a fast PRF is the right tool: HKDF-SHA256 extract keyed with a
+/// domain-separation salt. This stops the raw secret bytes from doubling as an AES
+/// key, and keeps this key independent of any other key derived from the same secret.
+fn derive_cookie_key(secret_key: &[u8; 32]) -> [u8; 32] {
+    let (prk, _) =
+        hkdf::Hkdf::<sha2::Sha256>::extract(Some(COOKIE_KEY_DERIVATION_SALT), secret_key);
+    let mut key = [0u8; 32];
+    key.copy_from_slice(prk.as_slice());
+    key
+}
+
 pub struct CookieCrypto {
+    /// Cipher keyed with the HKDF-derived key. Every new ciphertext uses it.
     cipher: Aes256Gcm,
+    /// Cipher keyed with the raw secret bytes, as every build before the key
+    /// derivation was introduced did. Decrypt-only: it keeps long-lived values
+    /// minted by an older build (session/visitor cookies, preview grants, actor
+    /// tokens) readable across the upgrade. Values re-encrypted after the upgrade
+    /// move to the derived key on their own.
+    legacy_cipher: Aes256Gcm,
 }
 
 impl std::fmt::Debug for CookieCrypto {
@@ -59,22 +85,22 @@ impl CookieCrypto {
             ));
         };
 
-        if key_bytes.len() != 32 {
-            return Err(CryptoError::InvalidKey(
-                "Key must be exactly 32 bytes".to_string(),
-            ));
-        }
-
-        let cipher = Aes256Gcm::new_from_slice(&key_bytes)
-            .map_err(|error| CryptoError::InvalidKey(error.to_string()))?;
-        Ok(Self { cipher })
+        let key: [u8; 32] = key_bytes.as_slice().try_into().map_err(|_| {
+            CryptoError::InvalidKey(format!(
+                "Key must be exactly 32 bytes, got {} after decoding",
+                key_bytes.len()
+            ))
+        })?;
+        Ok(Self::from_bytes(&key))
     }
 
     /// Creates a new CookieCrypto from a raw 32-byte array (for backward compatibility)
     pub fn from_bytes(secret_key: &[u8; 32]) -> Self {
-        let key = Key::<Aes256Gcm>::from(*secret_key);
-        let cipher = Aes256Gcm::new(&key);
-        Self { cipher }
+        let derived = derive_cookie_key(secret_key);
+        Self {
+            cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(derived)),
+            legacy_cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(*secret_key)),
+        }
     }
 
     /// Encrypt a string value for use in cookies
@@ -95,7 +121,10 @@ impl CookieCrypto {
         Ok(general_purpose::URL_SAFE_NO_PAD.encode(&combined))
     }
 
-    /// Decrypt a cookie value back to the original string
+    /// Decrypt a cookie value back to the original string.
+    ///
+    /// Tries the derived key first, then the legacy raw key so values minted before
+    /// the key-derivation change keep working.
     pub fn decrypt(&self, encrypted: &str) -> Result<String, CryptoError> {
         // Decode from base64
         let combined = general_purpose::URL_SAFE_NO_PAD
@@ -110,10 +139,13 @@ impl CookieCrypto {
         let (nonce_bytes, ciphertext) = combined.split_at(12);
         let nonce = Nonce::try_from(nonce_bytes).map_err(|_| CryptoError::InvalidFormat)?;
 
-        let plaintext = self
-            .cipher
-            .decrypt(&nonce, ciphertext)
-            .map_err(|e| CryptoError::DecryptionError(e.to_string()))?;
+        let plaintext = match self.cipher.decrypt(&nonce, ciphertext) {
+            Ok(plaintext) => plaintext,
+            Err(_) => self
+                .legacy_cipher
+                .decrypt(&nonce, ciphertext)
+                .map_err(|e| CryptoError::DecryptionError(e.to_string()))?,
+        };
 
         String::from_utf8(plaintext).map_err(|_| CryptoError::InvalidFormat)
     }
@@ -204,6 +236,72 @@ mod tests {
         let result = CookieCrypto::new(invalid_hex);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid hex key"));
+    }
+
+    /// Encrypt the way every build before the key derivation did: AES-256-GCM
+    /// keyed directly with the raw secret bytes.
+    fn legacy_encrypt(raw_key: &[u8; 32], plaintext: &str) -> String {
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(*raw_key));
+        let nonce = Nonce::from([7u8; 12]);
+        let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).unwrap();
+        let mut combined = nonce.to_vec();
+        combined.extend_from_slice(&ciphertext);
+        general_purpose::URL_SAFE_NO_PAD.encode(&combined)
+    }
+
+    fn open_with_raw_key(raw_key: &[u8; 32], encrypted: &str) -> Result<Vec<u8>, ()> {
+        let combined = general_purpose::URL_SAFE_NO_PAD.decode(encrypted).unwrap();
+        let (nonce, ciphertext) = combined.split_at(12);
+        let nonce = Nonce::try_from(nonce).unwrap();
+        Aes256Gcm::new(&Key::<Aes256Gcm>::from(*raw_key))
+            .decrypt(&nonce, ciphertext)
+            .map_err(|_| ())
+    }
+
+    #[test]
+    fn test_new_ciphertexts_do_not_use_the_raw_secret_as_key() {
+        let raw = *b"test_key_32_bytes_long_for_tests";
+        let crypto = CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+
+        let encrypted = crypto.encrypt("session-token").unwrap();
+
+        assert!(
+            open_with_raw_key(&raw, &encrypted).is_err(),
+            "new values must be keyed by the derived key, not the raw secret"
+        );
+        assert_eq!(crypto.decrypt(&encrypted).unwrap(), "session-token");
+    }
+
+    #[test]
+    fn test_decrypts_values_minted_under_the_legacy_raw_key() {
+        // Raw 32-byte form.
+        let raw = *b"test_key_32_bytes_long_for_tests";
+        let crypto = CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        assert_eq!(
+            crypto
+                .decrypt(&legacy_encrypt(&raw, "legacy-session"))
+                .unwrap(),
+            "legacy-session"
+        );
+
+        // Hex form (the auto-generated installation secret format).
+        let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let decoded: [u8; 32] = hex::decode(hex_key).unwrap().try_into().unwrap();
+        let crypto = CookieCrypto::new(hex_key).unwrap();
+        assert_eq!(
+            crypto.decrypt_id(&legacy_encrypt(&decoded, "42")).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn test_legacy_fallback_does_not_accept_other_keys() {
+        let crypto = CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap();
+        let other_raw = *b"another_key_32_bytes_long_test!!";
+        let other = CookieCrypto::from_bytes(&other_raw);
+
+        assert!(crypto.decrypt(&legacy_encrypt(&other_raw, "x")).is_err());
+        assert!(crypto.decrypt(&other.encrypt("x").unwrap()).is_err());
     }
 
     #[test]

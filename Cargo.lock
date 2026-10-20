@@ -13130,6 +13130,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "arc-swap",
+ "argon2",
  "async-trait",
  "axum",
  "base64 0.23.1",

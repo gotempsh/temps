@@ -2012,10 +2012,10 @@ impl BackupService {
                     control_plane.backup_id, error
                 ))
             })?;
-        let manifest_encryption = temps_core::EncryptionService::new_from_password(&s3_secret);
+        // Argon2id with a fresh salt per ciphertext (F-009); the CLI still accepts
+        // legacy SHA-256-keyed manifests written by older servers.
         let encrypted_server_config =
-            manifest_encryption
-                .encrypt_string(&server_config)
+            temps_core::EncryptionService::encrypt_string_with_password(&s3_secret, &server_config)
                 .map_err(|error| BackupError::Internal {
                     message: format!(
                         "Failed to encrypt server config for recovery set {}: {}",
@@ -2046,19 +2046,21 @@ impl BackupService {
             "checksum": control_plane.checksum,
             "artifact_sha256": control_plane_sha256,
             "server_config_encrypted": encrypted_server_config,
-            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "server_config_encryption": "aes-256-gcm+s3-secret-argon2id",
             "external_service_backups": external_service_backups,
             "metadata": control_plane_metadata,
         });
         let authenticated_payload = serde_json::to_string(&metadata)?;
-        let manifest_authentication = manifest_encryption
-            .encrypt_string(&authenticated_payload)
-            .map_err(|error| BackupError::Internal {
-                message: format!(
-                    "Failed to authenticate recovery manifest {}: {}",
-                    control_plane.backup_id, error
-                ),
-            })?;
+        let manifest_authentication = temps_core::EncryptionService::encrypt_string_with_password(
+            &s3_secret,
+            &authenticated_payload,
+        )
+        .map_err(|error| BackupError::Internal {
+            message: format!(
+                "Failed to authenticate recovery manifest {}: {}",
+                control_plane.backup_id, error
+            ),
+        })?;
         metadata["manifest_authentication"] = json!(manifest_authentication);
         let metadata_key =
             crate::engines::v2_common::derive_metadata_key(&control_plane.s3_location);
@@ -8210,9 +8212,9 @@ RETURNING id
                     backup.backup_id, error
                 ))
             })?;
-        let encrypted_server_config = temps_core::EncryptionService::new_from_password(&s3_secret)
-            .encrypt_string(&config_yaml)
-            .map_err(|error| BackupError::Internal {
+        let encrypted_server_config =
+            temps_core::EncryptionService::encrypt_string_with_password(&s3_secret, &config_yaml)
+                .map_err(|error| BackupError::Internal {
                 message: format!(
                     "Failed to encrypt server config for backup {}: {}",
                     backup.backup_id, error
@@ -8257,7 +8259,7 @@ RETURNING id
             "tags": serde_json::from_str::<Vec<String>>(&backup.tags).unwrap_or_default(),
             "checksum": backup.checksum,
             "server_config_encrypted": encrypted_server_config,
-            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "server_config_encryption": "aes-256-gcm+s3-secret-argon2id",
             "external_service_backups": external_backups,
             "metadata": serde_json::from_str::<serde_json::Value>(&backup.metadata).unwrap_or_default()
         }))

@@ -75,7 +75,6 @@ pub async fn auth_middleware(
     } else {
         "http"
     };
-    let is_secure = scheme == "https";
     // `base_url` keeps the port so generated links point back at the same
     // listener the client reached us on. `host` is port-stripped so it can be
     // used directly as a route-table key (the proxy normalizes the same way).
@@ -89,6 +88,13 @@ pub async fn auth_middleware(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
+    // Cookie `Secure` must come from trusted server-side state, never from the
+    // client-controllable `X-Forwarded-Proto` alone (F-013).
+    let is_secure = temps_core::secure_cookie_for_request(
+        temps_core::declared_console_scheme(),
+        req.headers(),
+        peer,
+    );
 
     // Create RequestMetadata
     let metadata = RequestMetadata {

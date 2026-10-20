@@ -954,6 +954,11 @@ pub struct ConfigService {
 /// a DB lookup. Always called under the settings-cache generation guard.
 fn publish_process_wide_settings(settings: &AppSettings) {
     temps_core::tls::set_insecure_tls(settings.insecure_tls);
+    // Auth cookies take `Secure` from this trusted value rather than from
+    // client-supplied headers (see `temps_core::secure_cookie_for_request`).
+    temps_core::set_declared_console_scheme(temps_core::DeclaredConsoleScheme::from_external_url(
+        settings.external_url.as_deref(),
+    ));
     temps_core::url_validation::set_trusted_private_networks(trusted_networks_from_settings(
         settings,
     ));

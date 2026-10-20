@@ -223,12 +223,63 @@ fn write_new_secret(path: &Path, value: &str) -> Result<bool, ConfigServiceError
     }
 }
 
+/// Fewer distinct characters than this marks an injected auth secret as weak.
+/// A uniformly random 64-hex secret (the auto-generated format) has ~16 distinct
+/// characters; falling below 10 by chance is astronomically unlikely.
+const AUTH_SECRET_MIN_DISTINCT_CHARS: usize = 10;
+
+/// Why an auth secret looks low-entropy, or `None` when it passes the heuristic.
+///
+/// Heuristic only: it catches obviously weak values (repeated characters, short
+/// alphabets, a single-class passphrase) without pretending to measure entropy.
+fn auth_secret_weakness(value: &str) -> Option<String> {
+    let distinct = value
+        .chars()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if distinct < AUTH_SECRET_MIN_DISTINCT_CHARS {
+        return Some(format!(
+            "only {distinct} distinct characters (expected at least {AUTH_SECRET_MIN_DISTINCT_CHARS})"
+        ));
+    }
+    let is_hex = value.chars().all(|c| c.is_ascii_hexdigit());
+    let classes = [
+        value.chars().any(|c| c.is_ascii_lowercase()),
+        value.chars().any(|c| c.is_ascii_uppercase()),
+        value.chars().any(|c| c.is_ascii_digit()),
+        value.chars().any(|c| !c.is_ascii_alphanumeric()),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    // Hex output of a CSPRNG is fine even though it only spans two classes.
+    if !is_hex && classes < 2 {
+        return Some("uses a single character class (looks like a passphrase)".to_string());
+    }
+    None
+}
+
 fn validate_auth_secret(value: &str, origin: &'static str) -> Result<(), ConfigServiceError> {
     if value.len() < 32 {
         return Err(ConfigServiceError::InvalidInjectedSecret {
             origin,
             details: "auth secret must contain at least 32 bytes".to_string(),
         });
+    }
+    // This validator runs on every boot for injected secrets, so it cannot tell a
+    // freshly chosen value from the one an existing installation has always used.
+    // Refusing to start would lock existing operators out (and invalidate nothing:
+    // the secret is still what their sessions are keyed by), so a weak value is
+    // reported loudly instead. Generate a replacement with `openssl rand -hex 32`.
+    if let Some(reason) = auth_secret_weakness(value) {
+        tracing::warn!(
+            origin,
+            reason = %reason,
+            "Injected auth secret looks low-entropy: {}. It keys session cookies, \
+             preview grants and plugin actor tokens; replace it with a random value \
+             (e.g. `openssl rand -hex 32`). Rotating it signs every user out.",
+            reason
+        );
     }
     Ok(())
 }
@@ -334,6 +385,42 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(first.auth_secret.len(), 64);
         assert_eq!(first.encryption_key.len(), 64);
+    }
+
+    #[test]
+    fn auth_secret_weakness_flags_obviously_low_entropy_values() {
+        assert!(auth_secret_weakness(&"a".repeat(64)).is_some());
+        assert!(auth_secret_weakness(&"ab".repeat(32)).is_some());
+        assert!(auth_secret_weakness("correcthorsebatterystaplecorrecthorse").is_some());
+        assert!(auth_secret_weakness("ONLYUPPERCASELETTERSFORMSAPASSPHRASE").is_some());
+    }
+
+    #[test]
+    fn auth_secret_weakness_accepts_random_secrets() {
+        // The auto-generated format must never be flagged.
+        for _ in 0..64 {
+            let mut bytes = [0_u8; 32];
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut bytes)
+                .expect("system randomness");
+            let generated = hex::encode(bytes);
+            assert_eq!(auth_secret_weakness(&generated), None, "{generated}");
+        }
+        assert_eq!(
+            auth_secret_weakness("Zq7#pL2v!Rk9@xW4mN8$tB6^hJ3&yC5*"),
+            None
+        );
+    }
+
+    #[test]
+    fn weak_injected_auth_secret_still_boots() {
+        // Existing installations may already run with a weak injected value; the
+        // check warns rather than refusing to start (no lockout on upgrade).
+        assert!(validate_auth_secret(&"a".repeat(64), AUTH_SECRET_ENV).is_ok());
+        assert!(matches!(
+            validate_auth_secret("short", AUTH_SECRET_ENV),
+            Err(ConfigServiceError::InvalidInjectedSecret { .. })
+        ));
     }
 
     #[test]

@@ -12,6 +12,42 @@ use std::sync::Arc;
 
 const NONCE_LENGTH: usize = 12;
 
+/// Version prefix for password-derived ciphertexts (Argon2id KDF, random salt).
+pub const PASSWORD_CIPHERTEXT_V1_PREFIX: &str = "argon2id-v1:";
+
+/// Per-ciphertext salt length for password-derived keys.
+const PASSWORD_SALT_LENGTH: usize = 16;
+
+/// Argon2id parameters for `argon2id-v1`. They are part of the format: changing
+/// them requires a new prefix, otherwise existing ciphertexts become undecryptable.
+/// Values follow the OWASP baseline (19 MiB, 2 passes, 1 lane).
+const PASSWORD_KDF_V1_M_COST_KIB: u32 = 19 * 1024;
+const PASSWORD_KDF_V1_T_COST: u32 = 2;
+const PASSWORD_KDF_V1_P_COST: u32 = 1;
+
+/// Derive the AES-256 key for an `argon2id-v1` ciphertext.
+fn derive_password_key_v1(password: &str, salt: &[u8]) -> Result<[u8; 32]> {
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    let params = Params::new(
+        PASSWORD_KDF_V1_M_COST_KIB,
+        PASSWORD_KDF_V1_T_COST,
+        PASSWORD_KDF_V1_P_COST,
+        Some(32),
+    )
+    .map_err(|e| anyhow!("Invalid Argon2id parameters for password encryption: {}", e))?;
+    let mut key = [0u8; 32];
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .map_err(|e| {
+            anyhow!(
+                "Argon2id key derivation failed for password encryption: {}",
+                e
+            )
+        })?;
+    Ok(key)
+}
+
 /// Service for handling encryption and decryption operations
 #[derive(Debug)]
 pub struct EncryptionService {
@@ -46,7 +82,15 @@ impl EncryptionService {
         })
     }
 
-    /// Creates a new EncryptionService by deriving a key from the given password using SHA-256
+    /// Creates a new EncryptionService by deriving a key from the given password using a
+    /// single unsalted SHA-256 pass.
+    ///
+    /// **Legacy derivation.** This is *not* a password KDF: it has no salt and no work
+    /// factor. It is kept only (a) so ciphertexts written before password-based
+    /// encryption moved to Argon2id stay decryptable (see
+    /// [`EncryptionService::decrypt_with_password`], which falls back to it), and
+    /// (b) as a cheap deterministic key for tests. New at-rest data that is keyed by a
+    /// password/secret must use [`EncryptionService::encrypt_with_password`].
     pub fn new_from_password(password: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(password.as_bytes());
@@ -60,9 +104,75 @@ impl EncryptionService {
         }
     }
 
+    /// Encrypts `data` under a key derived from `password` with Argon2id and a fresh
+    /// random per-ciphertext salt.
+    ///
+    /// Output format (versioned so the KDF can evolve without ambiguity):
+    /// `argon2id-v1:` + base64(salt[16] || nonce[12] || AES-256-GCM ciphertext+tag).
+    /// The `:` can never occur in the legacy format (plain standard base64), so
+    /// [`EncryptionService::decrypt_with_password`] can tell the two apart.
+    pub fn encrypt_with_password(password: &str, data: &[u8]) -> Result<String> {
+        let mut salt = [0u8; PASSWORD_SALT_LENGTH];
+        crate::ecies::fill_secure_random_bytes("generating a password-encryption salt", &mut salt)
+            .map_err(|error| anyhow!(error))?;
+        let key = derive_password_key_v1(password, &salt)?;
+        let service = Self {
+            master_key: Arc::new(key),
+        };
+        let inner = service.seal(data)?;
+
+        let mut combined = Vec::with_capacity(PASSWORD_SALT_LENGTH + inner.len());
+        combined.extend_from_slice(&salt);
+        combined.extend(inner);
+        Ok(format!(
+            "{}{}",
+            PASSWORD_CIPHERTEXT_V1_PREFIX,
+            BASE64.encode(combined)
+        ))
+    }
+
+    /// String convenience wrapper around [`EncryptionService::encrypt_with_password`].
+    pub fn encrypt_string_with_password(password: &str, data: &str) -> Result<String> {
+        Self::encrypt_with_password(password, data.as_bytes())
+    }
+
+    /// Decrypts a value produced by [`EncryptionService::encrypt_with_password`].
+    ///
+    /// Values without the versioned prefix are treated as legacy ciphertexts produced by
+    /// [`EncryptionService::new_from_password`] (unsalted SHA-256 key) and are decrypted
+    /// that way, so data written before the Argon2id switch remains readable.
+    pub fn decrypt_with_password(password: &str, encoded_data: &str) -> Result<Vec<u8>> {
+        let Some(body) = encoded_data.strip_prefix(PASSWORD_CIPHERTEXT_V1_PREFIX) else {
+            return Self::new_from_password(password).decrypt(encoded_data);
+        };
+        let data = BASE64
+            .decode(body)
+            .map_err(|e| anyhow!("Base64 decode error: {}", e))?;
+        if data.len() < PASSWORD_SALT_LENGTH + NONCE_LENGTH {
+            return Err(anyhow!("Invalid encrypted data"));
+        }
+        let (salt, rest) = data.split_at(PASSWORD_SALT_LENGTH);
+        let key = derive_password_key_v1(password, salt)?;
+        let service = Self {
+            master_key: Arc::new(key),
+        };
+        service.open(rest)
+    }
+
+    /// String convenience wrapper around [`EncryptionService::decrypt_with_password`].
+    pub fn decrypt_string_with_password(password: &str, encoded_data: &str) -> Result<String> {
+        let decrypted = Self::decrypt_with_password(password, encoded_data)?;
+        String::from_utf8(decrypted).map_err(|e| anyhow!("UTF-8 decode failed: {}", e))
+    }
+
     /// Encrypts data using AES-256-GCM
     /// Returns base64 encoded string containing nonce + ciphertext
     pub fn encrypt(&self, data: &[u8]) -> Result<String> {
+        Ok(BASE64.encode(self.seal(data)?))
+    }
+
+    /// AES-256-GCM encrypt under the master key; returns `nonce || ciphertext+tag`.
+    fn seal(&self, data: &[u8]) -> Result<Vec<u8>> {
         let key = Key::<Aes256Gcm>::from(*self.master_key.as_ref());
         let cipher = Aes256Gcm::new(&key);
         let mut nonce_bytes = [0u8; NONCE_LENGTH];
@@ -76,7 +186,7 @@ impl EncryptionService {
 
         let mut combined = nonce.to_vec();
         combined.extend(ciphertext);
-        Ok(BASE64.encode(combined))
+        Ok(combined)
     }
 
     /// Decrypts base64 encoded data that was encrypted with encrypt()
@@ -84,7 +194,11 @@ impl EncryptionService {
         let data = BASE64
             .decode(encoded_data)
             .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+        self.open(&data)
+    }
 
+    /// Inverse of [`EncryptionService::seal`]: `data` is `nonce || ciphertext+tag`.
+    fn open(&self, data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < NONCE_LENGTH {
             return Err(anyhow::anyhow!("Invalid encrypted data"));
         }
@@ -377,6 +491,94 @@ mod tests {
         let decrypted2 = service2.decrypt_string(&encrypted1).unwrap();
 
         assert_eq!(original, decrypted2);
+    }
+
+    #[test]
+    fn test_password_encryption_round_trip_uses_versioned_salted_format() {
+        let password = "s3-secret-for-password-encryption-test";
+        let original = "encryption_key: abc\nauth_secret: def\n";
+
+        let first = EncryptionService::encrypt_string_with_password(password, original).unwrap();
+        let second = EncryptionService::encrypt_string_with_password(password, original).unwrap();
+
+        assert!(first.starts_with(PASSWORD_CIPHERTEXT_V1_PREFIX));
+        // Fresh salt (and nonce) per ciphertext: same input never yields the same output,
+        // and the salt bytes differ.
+        assert_ne!(first, second);
+        let salt_of = |value: &str| {
+            BASE64
+                .decode(value.strip_prefix(PASSWORD_CIPHERTEXT_V1_PREFIX).unwrap())
+                .unwrap()[..PASSWORD_SALT_LENGTH]
+                .to_vec()
+        };
+        assert_ne!(salt_of(&first), salt_of(&second));
+
+        assert_eq!(
+            EncryptionService::decrypt_string_with_password(password, &first).unwrap(),
+            original
+        );
+        assert_eq!(
+            EncryptionService::decrypt_string_with_password(password, &second).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn test_password_encryption_key_is_not_the_legacy_sha256_key() {
+        let password = "kdf-separation-test";
+        let encrypted = EncryptionService::encrypt_with_password(password, b"payload").unwrap();
+        let body = encrypted
+            .strip_prefix(PASSWORD_CIPHERTEXT_V1_PREFIX)
+            .unwrap();
+        let rest = &BASE64.decode(body).unwrap()[PASSWORD_SALT_LENGTH..];
+
+        // The inner AES-GCM blob must not open under SHA-256(password).
+        assert!(EncryptionService::new_from_password(password)
+            .decrypt(&BASE64.encode(rest))
+            .is_err());
+    }
+
+    #[test]
+    fn test_password_decryption_accepts_legacy_sha256_ciphertext() {
+        let password = "legacy-manifest-secret";
+        let legacy = EncryptionService::new_from_password(password)
+            .encrypt_string("legacy payload")
+            .unwrap();
+        assert!(!legacy.starts_with(PASSWORD_CIPHERTEXT_V1_PREFIX));
+
+        assert_eq!(
+            EncryptionService::decrypt_string_with_password(password, &legacy).unwrap(),
+            "legacy payload"
+        );
+        assert!(EncryptionService::decrypt_string_with_password("wrong", &legacy).is_err());
+    }
+
+    #[test]
+    fn test_password_decryption_rejects_wrong_password_and_tampering() {
+        let encrypted =
+            EncryptionService::encrypt_string_with_password("right-password", "secret").unwrap();
+        assert!(
+            EncryptionService::decrypt_string_with_password("wrong-password", &encrypted).is_err()
+        );
+
+        let mut tampered = encrypted.clone();
+        tampered.pop();
+        tampered.push(if encrypted.ends_with('A') { 'B' } else { 'A' });
+        assert!(
+            EncryptionService::decrypt_string_with_password("right-password", &tampered).is_err()
+        );
+
+        let truncated = format!(
+            "{}{}",
+            PASSWORD_CIPHERTEXT_V1_PREFIX,
+            BASE64.encode([0u8; 20])
+        );
+        assert!(
+            EncryptionService::decrypt_with_password("right-password", &truncated)
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid encrypted data")
+        );
     }
 
     #[test]

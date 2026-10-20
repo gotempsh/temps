@@ -724,7 +724,10 @@ mod tests {
 
         // Keys are capped by their owner's current role, so the fixture owner
         // must actually hold the admin role the tests mint keys for.
-        let user_service = crate::user_service::UserService::new(db.db.clone());
+        let user_service = crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
         user_service.initialize_roles().await.unwrap();
         user_service
             .assign_role_by_type(user.id, temps_entities::types::RoleType::Admin)
@@ -1682,10 +1685,13 @@ mod tests {
         assert_eq!(role, Some(Role::Admin));
         assert!(permissions.is_none());
 
-        crate::user_service::UserService::new(db.db.clone())
-            .remove_role_from_user(user.id, temps_entities::types::RoleType::Admin)
-            .await
-            .unwrap();
+        crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        )
+        .remove_role_from_user(user.id, temps_entities::types::RoleType::Admin)
+        .await
+        .unwrap();
 
         let (_, role, permissions, _, _) =
             api_key_service.validate_api_key(&admin_key).await.unwrap();
@@ -1703,10 +1709,13 @@ mod tests {
         assert!(permissions.is_none());
 
         // Re-promotion restores the stored grant: nothing was rewritten.
-        crate::user_service::UserService::new(db.db.clone())
-            .assign_role_by_type(user.id, temps_entities::types::RoleType::Admin)
-            .await
-            .unwrap();
+        crate::user_service::UserService::new(
+            db.db.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        )
+        .assign_role_by_type(user.id, temps_entities::types::RoleType::Admin)
+        .await
+        .unwrap();
         let (_, role, _, _, _) = api_key_service.validate_api_key(&admin_key).await.unwrap();
         assert_eq!(role, Some(Role::Admin));
     }

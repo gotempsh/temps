@@ -22,6 +22,15 @@
 //!    for an exponentially growing window, so rotating client addresses buys
 //!    an attacker nothing.
 //!
+//! # Secret storage
+//!
+//! The TOTP seed in `users.mfa_secret` is encrypted at rest with the instance
+//! [`temps_core::EncryptionService`] and stored as
+//! [`MFA_SECRET_ENCRYPTED_PREFIX`]`<ciphertext>`. Rows written before that
+//! change hold the bare base32 seed; they are still accepted (base32 never
+//! contains `:`, so the two forms cannot be confused) and are re-encrypted in
+//! place the next time the factor is accepted ([`record_success`]).
+//!
 //! # Locking contract
 //!
 //! Callers must hold the owning `users` row lock (`SELECT ... FOR UPDATE`) in
@@ -41,6 +50,7 @@ use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{ActiveModelTrait, ConnectionTrait, DbErr, EntityTrait, Set};
+use temps_core::EncryptionService;
 use temps_entities::{user_mfa_guards, users};
 use thiserror::Error;
 use tokio::sync::Semaphore;
@@ -69,10 +79,16 @@ const MAX_CONCURRENT_RECOVERY_CHECKS: usize = 2;
 static RECOVERY_CHECK_SLOTS: LazyLock<Semaphore> =
     LazyLock::new(|| Semaphore::new(MAX_CONCURRENT_RECOVERY_CHECKS));
 
+/// Marks an encrypted `users.mfa_secret` value. A legacy plaintext seed is
+/// RFC 4648 base32 (`A-Z2-7=`) and can never start with this.
+pub(crate) const MFA_SECRET_ENCRYPTED_PREFIX: &str = "enc:v1:";
+
 #[derive(Debug, Error)]
 pub(crate) enum MfaGuardError {
     #[error("Stored MFA secret for user {user_id} is unusable: {reason}")]
     InvalidSecret { user_id: i32, reason: String },
+    #[error("Failed to encrypt the MFA secret for user {user_id}: {reason}")]
+    SecretEncryption { user_id: i32, reason: String },
     #[error("Stored MFA recovery codes for user {user_id} are unusable: {reason}")]
     InvalidRecoveryCodes { user_id: i32, reason: String },
     #[error("Recovery-code check for user {user_id} could not run: {reason}")]
@@ -139,6 +155,49 @@ pub(crate) fn build_totp(user_id: i32, secret: &str) -> Result<Totp, MfaGuardErr
         })
 }
 
+/// Encrypt a base32 TOTP seed for storage in `users.mfa_secret`.
+pub(crate) fn seal_mfa_secret(
+    encryption: &EncryptionService,
+    user_id: i32,
+    secret: &str,
+) -> Result<String, MfaGuardError> {
+    let ciphertext =
+        encryption
+            .encrypt_string(secret)
+            .map_err(|error| MfaGuardError::SecretEncryption {
+                user_id,
+                reason: error.to_string(),
+            })?;
+    Ok(format!("{MFA_SECRET_ENCRYPTED_PREFIX}{ciphertext}"))
+}
+
+/// Whether a stored `users.mfa_secret` value predates at-rest encryption.
+pub(crate) fn is_legacy_plaintext_secret(stored: &str) -> bool {
+    !stored.starts_with(MFA_SECRET_ENCRYPTED_PREFIX)
+}
+
+/// Recover the base32 TOTP seed from a stored `users.mfa_secret` value,
+/// accepting both the encrypted form and a legacy plaintext seed.
+pub(crate) fn open_mfa_secret(
+    encryption: &EncryptionService,
+    user_id: i32,
+    stored: &str,
+) -> Result<String, MfaGuardError> {
+    match stored.strip_prefix(MFA_SECRET_ENCRYPTED_PREFIX) {
+        Some(ciphertext) => {
+            encryption
+                .decrypt_string(ciphertext)
+                .map_err(|error| MfaGuardError::InvalidSecret {
+                    user_id,
+                    reason: format!(
+                    "stored secret cannot be decrypted with the instance encryption key: {error}"
+                ),
+                })
+        }
+        None => Ok(stored.to_string()),
+    }
+}
+
 fn unix_seconds(now: DateTime<Utc>) -> u64 {
     u64::try_from(now.timestamp()).unwrap_or(0)
 }
@@ -150,13 +209,16 @@ fn unix_seconds(now: DateTime<Utc>) -> u64 {
 /// distinguishes "reused" from "wrong". Recovery codes are only considered
 /// when `allow_recovery_codes` is set (they are never valid for confirming a
 /// fresh enrolment), and are always checked, even when the TOTP check
-/// passed: recovery codes are six digits too, and a value matching both must
-/// burn the recovery code rather than leave it usable for a second sign-in.
+/// passed: legacy recovery codes are six digits too, and a value matching
+/// both must burn the recovery code rather than leave it usable for a second
+/// sign-in. Recovery codes are compared in [`normalize_recovery_code`] form;
+/// the TOTP check uses the code exactly as typed.
 ///
 /// Performs no writes. Persist the outcome with [`record_success`] or
 /// [`record_failure`]. The recovery-code hashing runs on the blocking pool;
 /// the caller's transaction and row lock stay held across the await.
 pub(crate) async fn check_factor(
+    encryption: &EncryptionService,
     user: &users::Model,
     last_totp_step: Option<i64>,
     code: &str,
@@ -170,7 +232,8 @@ pub(crate) async fn check_factor(
             user_id: user.id,
             reason: "stored MFA secret is missing".to_string(),
         })?;
-    let totp = build_totp(user.id, secret)?;
+    let secret = open_mfa_secret(encryption, user.id, secret)?;
+    let totp = build_totp(user.id, &secret)?;
 
     let fresh_totp_step = totp.check(code, unix_seconds(now)).filter(|step| {
         match (last_totp_step, i64::try_from(*step)) {
@@ -194,6 +257,43 @@ pub(crate) async fn check_factor(
         (None, Some(step)) => Some(AcceptedFactor::Totp { step }),
         (None, None) => None,
     })
+}
+
+/// Canonical form of a typed recovery code: separators (`-`, spaces) removed
+/// and letters upper-cased, matching what [`generate_recovery_code`] hashes.
+/// Legacy six-digit codes are unchanged by this, so their stored hashes keep
+/// verifying.
+pub(crate) fn normalize_recovery_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .map(|c| c.to_ascii_uppercase())
+        .collect()
+}
+
+/// Characters a recovery code is drawn from: upper-case letters and digits
+/// without the visually ambiguous `0/O` and `1/I`. 32 symbols = 5 bits each.
+pub(crate) const RECOVERY_CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Symbols per recovery code (50 bits of entropy with the alphabet above).
+pub(crate) const RECOVERY_CODE_LENGTH: usize = 10;
+
+/// Longest normalized input that is compared against stored recovery codes.
+const MAX_RECOVERY_CODE_INPUT_LENGTH: usize = 64;
+
+/// A new recovery code as `(display, canonical)`: the display form is grouped
+/// as `XXXXX-XXXXX` for reading off a screen; the canonical form (what gets
+/// hashed and what [`normalize_recovery_code`] yields for the typed code) has
+/// no separator.
+pub(crate) fn generate_recovery_code() -> (String, String) {
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    let canonical: String = (0..RECOVERY_CODE_LENGTH)
+        .map(|_| {
+            char::from(RECOVERY_CODE_ALPHABET[rng.random_range(0..RECOVERY_CODE_ALPHABET.len())])
+        })
+        .collect();
+    let (head, tail) = canonical.split_at(RECOVERY_CODE_LENGTH / 2);
+    (format!("{head}-{tail}"), canonical)
 }
 
 /// The stored recovery-code hashes without the one `code` matches, or `None`
@@ -223,7 +323,12 @@ async fn match_recovery_code(
                 user_id,
                 reason: "the recovery-code check limiter is closed".to_string(),
             })?;
-    let code = code.to_owned();
+    let code = normalize_recovery_code(code);
+    // No issued code (legacy six digits, current ten symbols) is anywhere
+    // near this long; refusing early keeps oversized input away from Argon2.
+    if code.is_empty() || code.len() > MAX_RECOVERY_CODE_INPUT_LENGTH {
+        return Ok(None);
+    }
     tokio::task::spawn_blocking(move || {
         let _slot = slot;
         let argon2 = Argon2::default();
@@ -310,6 +415,7 @@ async fn store_guard<C: ConnectionTrait>(
 /// Returns the user row as it now stands.
 pub(crate) async fn record_success<C: ConnectionTrait>(
     conn: &C,
+    encryption: &EncryptionService,
     user: users::Model,
     guard: &GuardState,
     factor: &AcceptedFactor,
@@ -340,25 +446,69 @@ pub(crate) async fn record_success<C: ConnectionTrait>(
     )
     .await?;
 
-    match factor {
-        AcceptedFactor::Totp { .. } => Ok(user),
+    let remaining_codes = match factor {
+        AcceptedFactor::Totp { .. } => None,
         AcceptedFactor::RecoveryCode { remaining, .. } => {
-            let encoded = serde_json::to_string(remaining).map_err(|error| {
+            Some(serde_json::to_string(remaining).map_err(|error| {
                 MfaGuardError::InvalidRecoveryCodes {
                     user_id,
                     reason: format!("remaining recovery codes cannot be encoded: {error}"),
                 }
-            })?;
-            let mut update: users::ActiveModel = user.into();
-            update.mfa_recovery_codes = Set(Some(encoded));
-            update
-                .update(conn)
-                .await
-                .map_err(|source| MfaGuardError::Database {
-                    operation: "consume the used recovery code",
-                    user_id,
-                    source,
-                })
+            })?)
+        }
+    };
+    let upgraded_secret = upgrade_legacy_secret(encryption, &user);
+    if remaining_codes.is_none() && upgraded_secret.is_none() {
+        return Ok(user);
+    }
+
+    let operation = if remaining_codes.is_some() {
+        "consume the used recovery code"
+    } else {
+        "encrypt the legacy plaintext MFA secret"
+    };
+    let mut update: users::ActiveModel = user.into();
+    if let Some(encoded) = remaining_codes {
+        update.mfa_recovery_codes = Set(Some(encoded));
+    }
+    if let Some(sealed) = upgraded_secret {
+        update.mfa_secret = Set(Some(sealed));
+    }
+    update
+        .update(conn)
+        .await
+        .map_err(|source| MfaGuardError::Database {
+            operation,
+            user_id,
+            source,
+        })
+}
+
+/// The encrypted replacement for a legacy plaintext seed, or `None` when the
+/// stored value is already encrypted (or absent). Runs only after the factor
+/// was accepted, so the seed is known-good. An encryption failure is logged
+/// and leaves the row as it was: the verification itself succeeded and must
+/// not be failed by an opportunistic upgrade.
+fn upgrade_legacy_secret(encryption: &EncryptionService, user: &users::Model) -> Option<String> {
+    let stored = user.mfa_secret.as_deref()?;
+    if !is_legacy_plaintext_secret(stored) {
+        return None;
+    }
+    match seal_mfa_secret(encryption, user.id, stored) {
+        Ok(sealed) => {
+            tracing::info!(
+                user_id = user.id,
+                "Encrypting legacy plaintext MFA secret after a successful verification"
+            );
+            Some(sealed)
+        }
+        Err(error) => {
+            tracing::warn!(
+                user_id = user.id,
+                %error,
+                "Leaving legacy plaintext MFA secret in place"
+            );
+            None
         }
     }
 }
@@ -443,6 +593,19 @@ pub(crate) mod test_support {
             .to_string()
     }
 
+    /// An instance encryption service with a fixed test key.
+    pub(crate) fn encryption() -> std::sync::Arc<EncryptionService> {
+        std::sync::Arc::new(
+            EncryptionService::new(&"7a".repeat(32)).expect("fixed test key must be valid"),
+        )
+    }
+
+    /// `secret` as `users.mfa_secret` stores it for a current enrolment
+    /// (encrypted under [`encryption`]'s key).
+    pub(crate) fn sealed(secret: &str) -> String {
+        seal_mfa_secret(&encryption(), 0, secret).expect("test secret must seal")
+    }
+
     /// A fresh base32 secret of the size enrolment generates.
     pub(crate) fn new_secret() -> String {
         use rand::RngExt;
@@ -453,9 +616,13 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{code_at, new_secret};
+    use super::test_support::{code_at, encryption, new_secret};
     use super::*;
     use argon2::PasswordHasher;
+
+    fn enc() -> std::sync::Arc<EncryptionService> {
+        encryption()
+    }
 
     fn user(secret: &str, recovery: Option<Vec<&str>>) -> users::Model {
         let now = Utc::now();
@@ -501,21 +668,23 @@ mod tests {
         let code = code_at(&secret, now);
 
         let Some(AcceptedFactor::Totp { step }) =
-            check_factor(&user, None, &code, true, now).await.unwrap()
+            check_factor(&enc(), &user, None, &code, true, now)
+                .await
+                .unwrap()
         else {
             panic!("a fresh current code must be accepted");
         };
         let accepted = i64::try_from(step).unwrap();
 
         assert_eq!(
-            check_factor(&user, Some(accepted), &code, true, now)
+            check_factor(&enc(), &user, Some(accepted), &code, true, now)
                 .await
                 .unwrap(),
             None,
             "the same code must be rejected once its step was accepted"
         );
         assert_eq!(
-            check_factor(&user, Some(accepted + 5), &code, true, now)
+            check_factor(&enc(), &user, Some(accepted + 5), &code, true, now)
                 .await
                 .unwrap(),
             None,
@@ -528,7 +697,7 @@ mod tests {
         let secret = new_secret();
         let user = user(&secret, None);
         let now = Utc::now();
-        let first = check_factor(&user, None, &code_at(&secret, now), false, now)
+        let first = check_factor(&enc(), &user, None, &code_at(&secret, now), false, now)
             .await
             .unwrap()
             .expect("current code accepted");
@@ -538,6 +707,7 @@ mod tests {
         let later = now + Duration::seconds(30);
         assert!(matches!(
             check_factor(
+                &enc(),
                 &user,
                 Some(step as i64),
                 &code_at(&secret, later),
@@ -554,7 +724,7 @@ mod tests {
     async fn recovery_code_is_matched_and_removed_from_remaining() {
         let secret = new_secret();
         let user = user(&secret, Some(vec!["111111", "222222"]));
-        let accepted = check_factor(&user, None, "222222", true, Utc::now())
+        let accepted = check_factor(&enc(), &user, None, "222222", true, Utc::now())
             .await
             .unwrap();
         let Some(AcceptedFactor::RecoveryCode {
@@ -581,7 +751,9 @@ mod tests {
         let Some(AcceptedFactor::RecoveryCode {
             remaining,
             totp_step: Some(step),
-        }) = check_factor(&user, None, &code, true, now).await.unwrap()
+        }) = check_factor(&enc(), &user, None, &code, true, now)
+            .await
+            .unwrap()
         else {
             panic!("a value matching both factors must be taken as the recovery code");
         };
@@ -592,7 +764,7 @@ mod tests {
         let mut after = user.clone();
         after.mfa_recovery_codes = Some(serde_json::to_string(&remaining).unwrap());
         assert_eq!(
-            check_factor(&after, Some(step as i64), &code, true, now)
+            check_factor(&enc(), &after, Some(step as i64), &code, true, now)
                 .await
                 .unwrap(),
             None,
@@ -605,7 +777,7 @@ mod tests {
         let secret = new_secret();
         let user = user(&secret, Some(vec!["333333"]));
         assert_eq!(
-            check_factor(&user, None, "333333", false, Utc::now())
+            check_factor(&enc(), &user, None, "333333", false, Utc::now())
                 .await
                 .unwrap(),
             None
@@ -617,7 +789,7 @@ mod tests {
         let mut user = user(&new_secret(), None);
         user.mfa_secret = None;
         assert!(matches!(
-            check_factor(&user, None, "123456", true, Utc::now()).await,
+            check_factor(&enc(), &user, None, "123456", true, Utc::now()).await,
             Err(MfaGuardError::InvalidSecret { user_id: 42, .. })
         ));
     }
@@ -652,5 +824,132 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(expired.lockout_remaining_seconds(now), None);
+    }
+
+    #[tokio::test]
+    async fn encrypted_secret_round_trips_and_verifies_totp() {
+        let secret = new_secret();
+        let sealed = seal_mfa_secret(&enc(), 42, &secret).unwrap();
+        assert!(sealed.starts_with(MFA_SECRET_ENCRYPTED_PREFIX));
+        assert!(
+            !sealed.contains(&secret),
+            "the stored value must not contain the plaintext seed"
+        );
+        assert!(!is_legacy_plaintext_secret(&sealed));
+        assert_eq!(open_mfa_secret(&enc(), 42, &sealed).unwrap(), secret);
+
+        let user = user(&sealed, None);
+        let now = Utc::now();
+        assert!(matches!(
+            check_factor(&enc(), &user, None, &code_at(&secret, now), false, now)
+                .await
+                .unwrap(),
+            Some(AcceptedFactor::Totp { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_plaintext_secret_is_still_accepted() {
+        let secret = new_secret();
+        assert!(is_legacy_plaintext_secret(&secret));
+        assert_eq!(open_mfa_secret(&enc(), 42, &secret).unwrap(), secret);
+        let user = user(&secret, None);
+        let now = Utc::now();
+        assert!(
+            check_factor(&enc(), &user, None, &code_at(&secret, now), false, now)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_sealed_under_another_key_is_a_configuration_error() {
+        let other = EncryptionService::new(&"5c".repeat(32)).unwrap();
+        let sealed = seal_mfa_secret(&other, 42, &new_secret()).unwrap();
+        let user = user(&sealed, None);
+        assert!(matches!(
+            check_factor(&enc(), &user, None, "123456", true, Utc::now()).await,
+            Err(MfaGuardError::InvalidSecret { user_id: 42, .. })
+        ));
+    }
+
+    #[test]
+    fn only_legacy_plaintext_secrets_are_upgraded() {
+        let secret = new_secret();
+        let legacy = user(&secret, None);
+        let upgraded = upgrade_legacy_secret(&enc(), &legacy).expect("plaintext must be sealed");
+        assert_eq!(open_mfa_secret(&enc(), 42, &upgraded).unwrap(), secret);
+
+        let already = user(&upgraded, None);
+        assert_eq!(upgrade_legacy_secret(&enc(), &already), None);
+
+        let mut absent = legacy.clone();
+        absent.mfa_secret = None;
+        assert_eq!(upgrade_legacy_secret(&enc(), &absent), None);
+    }
+
+    #[test]
+    fn generated_recovery_codes_are_long_and_unambiguous() {
+        for _ in 0..64 {
+            let (display, canonical) = generate_recovery_code();
+            assert_eq!(canonical.len(), RECOVERY_CODE_LENGTH);
+            assert!(canonical
+                .bytes()
+                .all(|b| RECOVERY_CODE_ALPHABET.contains(&b)));
+            assert_eq!(display.len(), RECOVERY_CODE_LENGTH + 1);
+            assert_eq!(display.as_bytes()[RECOVERY_CODE_LENGTH / 2], b'-');
+            assert_eq!(normalize_recovery_code(&display), canonical);
+        }
+        assert_eq!(RECOVERY_CODE_ALPHABET.len(), 32);
+        for ambiguous in [b'0', b'O', b'1', b'I'] {
+            assert!(!RECOVERY_CODE_ALPHABET.contains(&ambiguous));
+        }
+    }
+
+    #[test]
+    fn recovery_code_normalization_keeps_legacy_codes_unchanged() {
+        assert_eq!(normalize_recovery_code("123456"), "123456");
+        assert_eq!(normalize_recovery_code(" abcde-fgh23 "), "ABCDEFGH23");
+        assert_eq!(normalize_recovery_code(" - "), "");
+    }
+
+    #[tokio::test]
+    async fn new_format_recovery_code_matches_typed_variants() {
+        let (display, canonical) = generate_recovery_code();
+        let user = user(&new_secret(), Some(vec![canonical.as_str(), "777777"]));
+        for typed in [
+            display.clone(),
+            canonical.clone(),
+            display.to_ascii_lowercase(),
+            format!(" {} ", display.replace('-', " ")),
+        ] {
+            assert!(
+                matches!(
+                    check_factor(&enc(), &user, None, &typed, true, Utc::now())
+                        .await
+                        .unwrap(),
+                    Some(AcceptedFactor::RecoveryCode { .. })
+                ),
+                "typed form {typed:?} must match the stored code"
+            );
+        }
+        assert_eq!(
+            check_factor(&enc(), &user, None, "ABCDE-FGHJK", true, Utc::now())
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_six_digit_recovery_code_still_verifies() {
+        let user = user(&new_secret(), Some(vec!["482913"]));
+        assert!(matches!(
+            check_factor(&enc(), &user, None, "482913", true, Utc::now())
+                .await
+                .unwrap(),
+            Some(AcceptedFactor::RecoveryCode { .. })
+        ));
     }
 }

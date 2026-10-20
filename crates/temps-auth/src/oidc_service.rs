@@ -2577,7 +2577,7 @@ mod tests {
         let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
             "oidc-service-managed-cloud-tests",
         ));
-        let user_service = Arc::new(UserService::new(db.db.clone()));
+        let user_service = Arc::new(UserService::new(db.db.clone(), encryption.clone()));
         let service = OidcService::new(db.db.clone(), encryption, user_service);
         Some((db, service))
     }

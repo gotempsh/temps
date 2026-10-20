@@ -2168,7 +2168,13 @@ mod tests {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             db.clone(),
             Arc::new(EncryptionService::new_from_password("consent-race-test")),
-            Arc::new(temps_auth::UserService::new(db)),
+            Arc::new(temps_auth::UserService::new(
+                db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         )));
         service.console_access_tx.send_replace(true);
         let guard = service.feature_update_lock.lock().await;
@@ -2271,7 +2277,13 @@ mod tests {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
             Arc::new(EncryptionService::new_from_password("oidc-retry-test")),
-            Arc::new(temps_auth::UserService::new(oidc_db)),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         )));
         for _ in 0..2 {
             let result = service
@@ -2465,7 +2477,13 @@ mod tests {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
             Arc::new(EncryptionService::new_from_password("bootstrap-oidc-test")),
-            Arc::new(temps_auth::UserService::new(oidc_db)),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         )));
     }
 
@@ -3085,7 +3103,13 @@ mod tests {
         let oidc = Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
             Arc::new(EncryptionService::new_from_password("oidc-revocation-test")),
-            Arc::new(temps_auth::UserService::new(oidc_db)),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         ));
         service.set_oidc_service(oidc);
 

@@ -27,10 +27,13 @@ import { consumeReturnTo, rememberReturnTo } from '@/lib/return-to'
 import * as z from 'zod'
 
 const formSchema = z.object({
+  // A 6-digit authenticator code, or a recovery code (current codes are
+  // `XXXXX-XXXXX`; codes issued by older versions are 6 digits).
   code: z
     .string()
-    .min(6, 'Code must be 6 digits')
-    .max(6, 'Code must be 6 digits'),
+    .trim()
+    .min(6, 'Enter a 6-digit code or a recovery code')
+    .max(32, 'Enter a 6-digit code or a recovery code'),
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -113,7 +116,8 @@ export const MfaVerify = () => {
             Two-factor authentication
           </h1>
           <p className="text-sm text-muted-foreground">
-            Enter the 6-digit code from your authenticator app
+            Enter the 6-digit code from your authenticator app, or one of
+            your recovery codes
           </p>
         </div>
 
@@ -129,7 +133,9 @@ export const MfaVerify = () => {
                       {...field}
                       placeholder="000000"
                       type="text"
-                      maxLength={6}
+                      maxLength={32}
+                      autoCapitalize="characters"
+                      spellCheck={false}
                       className="text-center text-lg tracking-widest"
                       autoComplete="one-time-code"
                     />

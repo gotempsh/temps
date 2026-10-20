@@ -1733,8 +1733,10 @@ impl SetupCommand {
 
         // Setup encryption key
         let encryption_key = setup_encryption_key(&data_dir)?;
-        let encryption_service = EncryptionService::new(&encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
+        let encryption_service = std::sync::Arc::new(
+            EncryptionService::new(&encryption_key)
+                .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?,
+        );
 
         print_success("Encryption key configured");
 
@@ -1906,7 +1908,7 @@ impl SetupCommand {
 
         // Initialize roles (admin, user)
         print_section("Initializing Roles");
-        let user_service = UserService::new(db.clone());
+        let user_service = UserService::new(db.clone(), encryption_service.clone());
         rt.block_on(user_service.initialize_roles())
             .map_err(|e| anyhow::anyhow!("Failed to initialize roles: {}", e))?;
         print_success("Default roles initialized (admin, user)");
@@ -2554,7 +2556,7 @@ impl SetupCommand {
             ));
         }
 
-        let encryption_service_arc = std::sync::Arc::new(encryption_service);
+        let encryption_service_arc = encryption_service.clone();
         let repository: std::sync::Arc<dyn temps_domains::tls::CertificateRepository> =
             std::sync::Arc::new(DefaultCertificateRepository::new(
                 db.clone(),
