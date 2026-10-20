@@ -42,8 +42,8 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 
 // ── Token verification helpers ─────────────────────────────────────────────
 
-/// Pure guard: returns `false` (reject) when a project has no stored signing
-/// token, `true` when one is present and signature verification should proceed.
+/// Pure guard: returns the stored (encrypted) signing token when one is
+/// present, `None` (reject) when it is absent.
 ///
 /// Extracted as a pure sync function so the security decision is directly
 /// unit-testable without needing a live `AppState`.
@@ -55,20 +55,29 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 /// erased. Accepting unsigned payloads would let any internet actor forge
 /// GitLab push events and trigger arbitrary deployments. Operators must
 /// re-enroll by recreating the webhook in GitLab, which issues a fresh token.
+///
+/// An empty or whitespace-only stored value is treated exactly like `NULL`:
+/// it can never be a real `whsec_` secret, and letting it through would
+/// leave the decision to an HMAC computed under whatever key an empty value
+/// decrypts/derives to.
+pub(crate) fn stored_signing_token(stored_token: Option<&str>) -> Option<&str> {
+    stored_token.filter(|t| !t.trim().is_empty())
+}
+
 #[cfg(test)]
 pub(crate) fn project_has_signing_token(stored_token: Option<&str>) -> bool {
-    // SECURITY: projects with no stored signing token are rejected — do not
-    // accept unsigned payloads. Operators must re-enroll legacy projects by
-    // recreating the GitLab webhook so a fresh token is issued.
-    stored_token.is_some()
+    stored_signing_token(stored_token).is_some()
 }
 
 /// Verify that an incoming GitLab webhook request is signed with the token
 /// stored for `project`.
 ///
-/// Returns `false` immediately when no signing token is stored (see
-/// `project_has_signing_token` in the test module), then decrypts and
-/// HMAC-validates for the `Some` branch.
+/// Returns `false` immediately when no usable signing token is stored (see
+/// [`stored_signing_token`]), then decrypts and HMAC-validates. A token that
+/// decrypts to an empty / whitespace-only plaintext is rejected as absent.
+///
+/// Timestamp freshness (replay protection) is checked by the caller once per
+/// delivery, before any per-project work.
 pub(crate) async fn verify_gitlab_webhook_token(
     project: &temps_entities::projects::Model,
     body: &[u8],
@@ -77,50 +86,65 @@ pub(crate) async fn verify_gitlab_webhook_token(
     webhook_timestamp: &str,
     state: &AppState,
 ) -> bool {
-    match project.gitlab_webhook_signing_token.as_deref() {
-        Some(encrypted) => {
-            match state.git_provider_manager.decrypt_token(encrypted).await {
-                Ok(plaintext) => {
-                    if let Some(sig) = webhook_signature {
-                        // Standard-Webhooks HMAC: signs
-                        // "{webhook-id}.{timestamp}.{body}" with the
-                        // 32-byte key derived from the whsec_ token.
-                        crate::services::gitlab_webhook::verify_gitlab_signature(
-                            body,
-                            sig,
-                            webhook_id,
-                            webhook_timestamp,
-                            &plaintext,
-                        )
-                    } else {
-                        // No webhook-signature header — reject. Legacy
-                        // X-Gitlab-Token is intentionally not supported.
-                        false
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to decrypt signing token for project {}: {}",
-                        project.id, e
-                    );
-                    false
-                }
-            }
-        }
-        None => {
-            // SECURITY: reject webhooks for projects with no stored signing
-            // token. Operators must re-enroll legacy projects by recreating
-            // the GitLab webhook (which will trigger token issuance) before
-            // automatic deployments will resume. We will NOT accept unsigned
-            // payloads — anyone on the internet could forge push events.
+    let Some(encrypted) = stored_signing_token(project.gitlab_webhook_signing_token.as_deref())
+    else {
+        // SECURITY: reject webhooks for projects with no stored signing
+        // token. Operators must re-enroll legacy projects by recreating
+        // the GitLab webhook (which will trigger token issuance) before
+        // automatic deployments will resume. We will NOT accept unsigned
+        // payloads — anyone on the internet could forge push events.
+        warn!(
+            "GitLab project {} has no stored signing token — webhook rejected. \
+             Re-enroll the webhook in GitLab to issue a signing token.",
+            project.id
+        );
+        return false;
+    };
+
+    let plaintext = match state.git_provider_manager.decrypt_token(encrypted).await {
+        Ok(plaintext) => plaintext,
+        Err(e) => {
             warn!(
-                "GitLab project {} has no stored signing token — webhook rejected. \
-                 Re-enroll the webhook in GitLab to issue a signing token.",
-                project.id
+                "Failed to decrypt signing token for project {}: {}",
+                project.id, e
             );
-            false
+            return false;
         }
+    };
+
+    if plaintext.trim().is_empty() {
+        warn!(
+            "GitLab project {} has an empty signing token — webhook rejected. \
+             Re-enroll the webhook in GitLab to issue a signing token.",
+            project.id
+        );
+        return false;
     }
+
+    match webhook_signature {
+        // Standard-Webhooks HMAC: signs "{webhook-id}.{timestamp}.{body}"
+        // with the 32-byte key derived from the whsec_ token.
+        Some(sig) => crate::services::gitlab_webhook::verify_gitlab_signature(
+            body,
+            sig,
+            webhook_id,
+            webhook_timestamp,
+            &plaintext,
+        ),
+        // No webhook-signature header — reject. Legacy X-Gitlab-Token is
+        // intentionally not supported.
+        None => false,
+    }
+}
+
+/// Current Unix time in seconds, or `None` if the system clock is before the
+/// epoch (in which case freshness cannot be established and the delivery is
+/// rejected).
+fn unix_now_secs() -> Option<i64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
 // ── GitLab webhook event receiver ─────────────────────────────────────────
@@ -175,6 +199,30 @@ async fn gitlab_webhook_events(
         .unwrap_or("");
 
     info!("Received GitLab webhook event: {}", event_type);
+
+    // Replay protection: the timestamp is part of the signed message, so a
+    // fresh timestamp plus a valid signature proves the delivery was signed
+    // recently. Reject stale/missing/malformed values before any DB or HMAC
+    // work — a captured delivery must not be replayable to re-trigger deploys.
+    let timestamp_fresh = unix_now_secs().is_some_and(|now| {
+        crate::services::gitlab_webhook::webhook_timestamp_within_tolerance(
+            webhook_timestamp_header,
+            now,
+        )
+    });
+    if !timestamp_fresh {
+        warn!(
+            "GitLab webhook rejected: webhook-timestamp {:?} is missing, malformed, \
+             or more than {}s from the server clock (event: {}, webhook-id: {:?})",
+            webhook_timestamp_header,
+            crate::services::gitlab_webhook::GITLAB_WEBHOOK_TIMESTAMP_TOLERANCE_SECS,
+            event_type,
+            webhook_id_header
+        );
+        return Ok(axum::Json(GitLabWebhookResponse {
+            message: "Stale or missing webhook timestamp".to_string(),
+        }));
+    }
 
     // Parse the payload to get project owner / name and the pushed ref.
     let payload: serde_json::Value = match serde_json::from_slice(&body) {
@@ -260,16 +308,17 @@ async fn gitlab_webhook_events(
         }));
     }
 
-    // Validate the signing token against each project.  We need at least one
-    // project to authenticate the request before dispatching the push event.
-    // `handle_push_event` internally re-queries all matching projects, so we
-    // call it only once (not per project) to avoid duplicate queue entries.
-    let mut any_valid = false;
+    // Validate the signing token against EACH project and keep only those
+    // whose own token validated. A project's signing token authorises
+    // deliveries for that project alone: several Temps projects may point at
+    // the same GitLab path (each with its own webhook + token), and a valid
+    // signature under one project's token must not trigger deployments of
+    // the others.
+    let mut authorized_projects: Vec<projects::Model> = Vec::new();
 
-    for project in &matching_projects {
-        // Verify the signing token for this project.
+    for project in matching_projects {
         let token_valid = verify_gitlab_webhook_token(
-            project,
+            &project,
             &body,
             webhook_signature_header,
             webhook_id_header,
@@ -279,8 +328,7 @@ async fn gitlab_webhook_events(
         .await;
 
         if token_valid {
-            any_valid = true;
-            break;
+            authorized_projects.push(project);
         } else {
             warn!(
                 "GitLab webhook signature mismatch for project {}, skipping",
@@ -289,7 +337,7 @@ async fn gitlab_webhook_events(
         }
     }
 
-    if !any_valid {
+    if authorized_projects.is_empty() {
         warn!(
             "No matching GitLab project with valid signature for {}/{}, ignoring",
             repo_owner, repo_name
@@ -299,31 +347,34 @@ async fn gitlab_webhook_events(
         }));
     }
 
-    // Dispatch through the existing push-event machinery (handles all projects
-    // for this repo in a single call).
-    let triggered = if let Err(e) = state
+    let authorized_ids: Vec<i32> = authorized_projects.iter().map(|p| p.id).collect();
+
+    // Dispatch only to the projects that authenticated this delivery. Do NOT
+    // use `handle_push_event(owner, repo, ..)`, which re-queries and deploys
+    // every project sharing the repository path.
+    let triggered = match state
         .git_provider_manager
-        .handle_push_event(
-            repo_owner.to_string(),
-            repo_name.to_string(),
+        .handle_push_event_for_projects(
             branch.clone(),
             tag.clone(),
             commit.clone(),
+            authorized_projects,
         )
         .await
     {
-        error!(
-            "Failed to handle GitLab push event for {}/{}: {:?}",
-            repo_owner, repo_name, e
-        );
-        0
-    } else {
-        matching_projects.len()
+        Ok(n) => n,
+        Err(e) => {
+            error!(
+                "Failed to handle GitLab push event for {}/{} (projects {:?}): {:?}",
+                repo_owner, repo_name, authorized_ids, e
+            );
+            0
+        }
     };
 
     info!(
-        "GitLab webhook event processed: {} project(s) queued for {}/{}",
-        triggered, repo_owner, repo_name
+        "GitLab webhook event processed: {} project(s) queued for {}/{} (authorized projects {:?})",
+        triggered, repo_owner, repo_name, authorized_ids
     );
 
     Ok(axum::Json(GitLabWebhookResponse {
@@ -408,7 +459,7 @@ mod tests {
     //! Smoke-tests for the helpers from the handler perspective. Detailed
     //! crypto edge-cases live in `services::gitlab_webhook::tests`.
 
-    use super::project_has_signing_token;
+    use super::{project_has_signing_token, stored_signing_token};
 
     /// Build a valid `v1,{base64}` Standard-Webhooks signature for a given
     /// payload + headers + signing token.
@@ -459,15 +510,24 @@ mod tests {
         );
     }
 
-    /// Empty string token value also passes the guard — the HMAC step
-    /// (not this guard) is responsible for rejecting malformed tokens.
+    /// An empty or whitespace-only stored token is treated as absent: it can
+    /// never be a real `whsec_` secret, so it must not reach the HMAC step.
     #[test]
-    fn test_empty_string_token_passes_guard() {
-        assert!(
-            project_has_signing_token(Some("")),
-            "empty string is Some, so the presence guard passes; \
-             the subsequent HMAC step rejects it"
-        );
+    fn test_empty_or_whitespace_token_is_rejected() {
+        for blank in ["", " ", "\t", "\n  \r"] {
+            assert!(
+                !project_has_signing_token(Some(blank)),
+                "blank stored token {:?} must be treated as absent",
+                blank
+            );
+            assert_eq!(stored_signing_token(Some(blank)), None);
+        }
+    }
+
+    #[test]
+    fn test_stored_signing_token_returns_real_value_unchanged() {
+        assert_eq!(stored_signing_token(Some("enc:abc")), Some("enc:abc"));
+        assert_eq!(stored_signing_token(None), None);
     }
 
     // ── HMAC verification (existing tests, unchanged) ─────────────────────
