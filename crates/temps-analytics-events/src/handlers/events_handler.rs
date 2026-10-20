@@ -62,6 +62,9 @@ pub struct AppState {
     pub ingest_key_service: Arc<AnalyticsIngestKeyService>,
     /// Per-key sliding-window limiter for the keyed ingest path.
     pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
+    /// Lock-free per-project limiter for the Host-resolved ingest path, which
+    /// is the per-event hot path for every deployed site.
+    pub host_ingest_rate_limiter: Arc<super::HostIngestRateLimiter>,
 }
 
 /// Per-project ceiling applied to the Host-resolved (keyless) ingest branch
@@ -71,12 +74,14 @@ pub struct AppState {
 /// [`temps_analytics::ingest_keys::DEFAULT_RATE_LIMIT_PER_MINUTE`] = 600/min,
 /// operator-configurable on the key row). The Host-resolved branch has no key
 /// row to carry a limit, and is just as unauthenticated: anyone can set `Host`
-/// to a tracked project's hostname. It shares the same limiter, bucketed per
-/// project, with a deliberately higher ceiling (100 events/s sustained) so a
+/// to a tracked project's hostname. It is limited per project by the
+/// lock-free [`super::HostIngestRateLimiter`] (this branch is the per-event
+/// hot path, so it must not take the keyed limiter's mutex), with a
+/// deliberately higher ceiling (100 events/s sustained) so a
 /// busy deployed site — pageviews plus periodic heartbeats from every open tab
 /// — is not throttled, while a flood is still bounded to a fixed DB write rate
 /// per project. Cardinality is bounded by the number of projects.
-pub const HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE: i32 = 6_000;
+pub const HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE: u32 = 6_000;
 
 /// Request-body cap for `POST /_temps/event`.
 ///
@@ -89,22 +94,6 @@ pub const HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE: i32 = 6_000;
 /// per request. Session replay (4 MiB) and Sentry envelopes (2 MiB) carry
 /// genuinely larger payloads and keep their own caps.
 pub const EVENT_INGEST_BODY_LIMIT: usize = 64 * 1024;
-
-/// Limiter bucket for Host-resolved ingest of `project_id`.
-///
-/// `AnalyticsIngestRateLimiter` buckets are `i32`s shared with the keyed path:
-/// positive values are `analytics_ingest_keys.id` (SERIAL, from 1) and `0` is
-/// the reserved unresolved-key bucket. Project buckets are mapped to the
-/// negative range so a project can never share (and burn) a key's budget.
-/// Project ids are SERIAL and therefore positive; a non-positive id cannot
-/// occur, but is folded into a single dedicated bucket rather than colliding.
-fn host_resolved_rate_limit_bucket(project_id: i32) -> i32 {
-    if project_id > 0 {
-        -project_id
-    } else {
-        i32::MIN
-    }
-}
 
 /// Get event counts with filtering
 #[utoipa::path(
@@ -865,17 +854,14 @@ pub async fn record_event_metrics(
                     host, project_id, environment_id, deployment_id
                 );
 
-                // Same limiter as the keyed branch (F-011): without it, anyone
-                // who sets `Host` to a tracked hostname could inject events at
-                // an unbounded rate. Checked before the geolocation lookup and
-                // the insert, so a rejected request costs no DB work.
+                // Without a limit here, anyone who sets `Host` to a tracked
+                // hostname could inject events at an unbounded rate. Checked
+                // before the geolocation lookup and the insert, so a rejected
+                // request costs no DB work; lock-free, so it never serializes
+                // ingest across projects.
                 if !state
-                    .ingest_rate_limiter
-                    .check(
-                        host_resolved_rate_limit_bucket(project_id),
-                        Some(HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE),
-                    )
-                    .await
+                    .host_ingest_rate_limiter
+                    .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
                 {
                     tracing::warn!(
                         project_id,
@@ -1597,6 +1583,7 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -2098,6 +2085,7 @@ mod tests {
             project_access_checker: None,
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         // No auth middleware — should return 401
@@ -2812,21 +2800,8 @@ mod tests {
         test_db.cleanup().await;
     }
 
-    #[test]
-    fn host_resolved_bucket_never_collides_with_key_or_unresolved_buckets() {
-        // Key ids are positive and 0 is the unresolved-key bucket.
-        assert_eq!(host_resolved_rate_limit_bucket(1), -1);
-        assert_eq!(host_resolved_rate_limit_bucket(42), -42);
-        assert_eq!(host_resolved_rate_limit_bucket(i32::MAX), -i32::MAX);
-        assert_eq!(host_resolved_rate_limit_bucket(0), i32::MIN);
-        assert_eq!(host_resolved_rate_limit_bucket(-5), i32::MIN);
-        for id in [1, 2, 1000, i32::MAX] {
-            assert!(host_resolved_rate_limit_bucket(id) < 0);
-        }
-    }
-
-    /// F-011: the Host-resolved branch is rate limited per project by the same
-    /// limiter as the keyed branch, and a rejected event is never stored.
+    /// F-011: the Host-resolved branch is rate limited per project, and a
+    /// rejected event is never stored.
     #[tokio::test]
     async fn host_resolved_ingest_over_its_rate_limit_returns_429() {
         let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
@@ -2847,14 +2822,10 @@ mod tests {
 
         // Exhaust the project's budget directly (in memory) rather than
         // inserting thousands of rows.
-        let bucket = host_resolved_rate_limit_bucket(project.id);
         for _ in 0..HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE {
-            assert!(
-                state
-                    .ingest_rate_limiter
-                    .check(bucket, Some(HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE))
-                    .await
-            );
+            assert!(state
+                .host_ingest_rate_limiter
+                .check(project.id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE));
         }
 
         let response = setup_public_app(state.clone())

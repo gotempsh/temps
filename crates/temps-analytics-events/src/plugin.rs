@@ -92,6 +92,7 @@ impl TempsPlugin for EventsPlugin {
                 .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         let routes = crate::handlers::configure_routes().with_state(state);
@@ -127,6 +128,7 @@ impl TempsPlugin for EventsPlugin {
                 .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
+            host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
         });
 
         // The CORS layer resolves keys through the very same service and
