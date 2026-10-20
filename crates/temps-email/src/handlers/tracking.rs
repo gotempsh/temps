@@ -15,7 +15,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
-    error_builder::{bad_request, internal_server_error, not_found},
+    error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
     RequestMetadata,
 };
@@ -204,7 +204,35 @@ pub struct GlobalEventsQuery {
     pub page_size: Option<u64>,
 }
 
+/// Refuse the instance-wide tracking views to anyone who does not run the
+/// instance.
+///
+/// `/emails/events` and `/emails/events/stats` aggregate opens and clicks for
+/// every email sent through this installation -- including recipient IPs,
+/// user agents and clicked URLs -- and carry no project to scope against.
+/// `EmailsRead` is held by the ordinary user role, so on its own it would hand
+/// every low-privilege user that instance-wide PII.
+fn require_instance_admin_for_global_tracking(
+    auth: &temps_auth::AuthContext,
+    operation: &str,
+) -> Result<(), Problem> {
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(forbidden()
+        .title("Insufficient Permissions")
+        .detail(format!(
+            "Only an instance administrator may read instance-wide email tracking ({})",
+            operation
+        ))
+        .value("user_role", auth.effective_role.to_string())
+        .build())
+}
+
 /// GET /emails/events/stats
+///
+/// Instance administrators only: the statistics span every email sent through
+/// this installation.
 #[utoipa::path(
     tag = "Email Tracking",
     get,
@@ -212,6 +240,7 @@ pub struct GlobalEventsQuery {
     responses(
         (status = 200, description = "Global tracking statistics", body = GlobalEventStatsResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not an instance administrator"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -220,6 +249,7 @@ pub async fn get_global_event_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsRead);
+    require_instance_admin_for_global_tracking(&auth, "event statistics")?;
 
     let stats = state
         .tracking_service
@@ -245,6 +275,9 @@ pub async fn get_global_event_stats(
 }
 
 /// GET /emails/events
+///
+/// Instance administrators only: the feed spans every email sent through this
+/// installation, including recipient IPs, user agents and clicked URLs.
 #[utoipa::path(
     tag = "Email Tracking",
     get,
@@ -257,6 +290,7 @@ pub async fn get_global_event_stats(
     responses(
         (status = 200, description = "Paginated tracking events", body = PaginatedEventsResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Caller is not an instance administrator"),
     ),
     security(("bearer_auth" = []))
 )]
@@ -275,6 +309,7 @@ pub async fn get_global_events(
     // states the requirement at the endpoint instead of relying on that
     // allowlist never gaining an `EmailsRead` entry.
     deny_deployment_token!(auth);
+    require_instance_admin_for_global_tracking(&auth, "event feed")?;
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);
@@ -551,4 +586,52 @@ pub async fn get_email_links(
 #[derive(Debug, Deserialize)]
 pub struct EventsQuery {
     pub event_type: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_auth::{AuthContext, Permission, Role};
+    use temps_entities::users;
+
+    fn test_user(id: i32) -> users::Model {
+        let now = chrono::Utc::now();
+        users::Model {
+            id,
+            name: "Test User".to_string(),
+            email: format!("user{}@example.com", id),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn global_tracking_gate_allows_instance_admin() {
+        let auth = AuthContext::new_session(test_user(1), Role::Admin);
+        assert!(require_instance_admin_for_global_tracking(&auth, "event feed").is_ok());
+    }
+
+    #[test]
+    fn global_tracking_gate_rejects_regular_user_with_403() {
+        let auth = AuthContext::new_session(test_user(2), Role::User);
+        // The user role holds EmailsRead, which is why that guard alone
+        // exposed instance-wide tracking PII.
+        assert!(auth.has_permission(&Permission::EmailsRead));
+        let problem = require_instance_admin_for_global_tracking(&auth, "event feed")
+            .expect_err("a regular user must not read instance-wide tracking");
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
 }
