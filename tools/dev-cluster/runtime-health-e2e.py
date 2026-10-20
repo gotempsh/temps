@@ -20,8 +20,24 @@ import socket
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+
+
+class LoopbackSecureCookiePolicy(http.cookiejar.DefaultCookiePolicy):
+    """Send `Secure` cookies to a loopback host over plain HTTP.
+
+    The control plane declares an `https://` external URL, so its session
+    cookie is always `Secure`, but this harness reaches it through a published
+    loopback port over plain HTTP. Browsers and curl treat loopback as a secure
+    context and send the cookie, while the stdlib jar never does. Without this
+    policy every authenticated call would silently go out without the session.
+    """
+
+    def return_ok_secure(self, cookie, request):
+        host = urllib.parse.urlsplit(request.get_full_url()).hostname
+        return super().return_ok_secure(cookie, request) or host in ("127.0.0.1", "::1", "localhost")
 
 
 def main():
@@ -129,7 +145,7 @@ def main():
         def execute(service, *command, **options):
             return compose("exec", "-T", service, *command, **options)
 
-        jar = http.cookiejar.CookieJar()
+        jar = http.cookiejar.CookieJar(policy=LoopbackSecureCookiePolicy())
         client = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         base = None
 
