@@ -1580,13 +1580,51 @@ fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Route
 
 /// Static file handler for embedded website
 async fn serve_static_file(req: Request) -> Response {
-    serve_static_from(website(), req)
+    with_console_security_headers(serve_static_from(website(), req))
 }
 
 /// Same, but always the ORIGINAL console bundle (for the platform-console
 /// listener when the root bundle has been overridden by an embedding binary).
 async fn serve_original_console(req: Request) -> Response {
-    serve_static_from(&WEBSITE, req)
+    with_console_security_headers(serve_static_from(&WEBSITE, req))
+}
+
+/// Security headers every console UI (SPA fallback) response carries,
+/// independent of the per-project `SecurityHeadersSettings` (which govern
+/// *deployed apps* behind the proxy and default to off).
+///
+/// Scoped to the SPA/static fallback on purpose, not to `/api`: the console
+/// frames plugin UIs served same-origin from `/api/x/{plugin}/ui/`, so a
+/// blanket `X-Frame-Options: DENY` on the API would break them.
+///
+/// The CSP is deliberately non-restrictive about script/style/connect/img
+/// sources so the SPA keeps working unchanged; it only forbids framing of the
+/// console (clickjacking), `<base>` hijacking, and plugin content.
+///
+/// HSTS is intentionally not sent here: whether the console is reached over
+/// TLS is only known from `X-Forwarded-Proto`, which a client can influence,
+/// and pinning HTTPS on a plain-HTTP install would lock operators out.
+const CONSOLE_SECURITY_HEADERS: &[(&str, &str)] = &[
+    ("x-frame-options", "DENY"),
+    ("x-content-type-options", "nosniff"),
+    ("referrer-policy", "strict-origin-when-cross-origin"),
+    (
+        "content-security-policy",
+        "frame-ancestors 'none'; base-uri 'self'; object-src 'none'",
+    ),
+];
+
+/// Add [`CONSOLE_SECURITY_HEADERS`] to `response`, never overriding a value
+/// the handler already set.
+fn with_console_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    for (name, value) in CONSOLE_SECURITY_HEADERS {
+        let name = header::HeaderName::from_static(name);
+        if !headers.contains_key(&name) {
+            headers.insert(name, header::HeaderValue::from_static(value));
+        }
+    }
+    response
 }
 
 /// Detail text for a request path that must never fall through to the SPA,
@@ -7109,6 +7147,81 @@ mod spa_fallback_tests {
                 "{path} is a console route and must keep the SPA fallback"
             );
         }
+    }
+
+    /// F-002: console UI responses carry anti-clickjacking / nosniff /
+    /// referrer / CSP headers regardless of per-project header settings.
+    #[tokio::test]
+    async fn console_spa_responses_carry_security_headers() {
+        for path in ["/", "/projects/1", "/does/not/exist.js"] {
+            let request = axum::http::Request::builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("request builds");
+            let response = serve_original_console(request).await;
+            let get = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+            };
+            assert_eq!(get("x-frame-options").as_deref(), Some("DENY"), "{path}");
+            assert_eq!(
+                get("x-content-type-options").as_deref(),
+                Some("nosniff"),
+                "{path}"
+            );
+            assert_eq!(
+                get("referrer-policy").as_deref(),
+                Some("strict-origin-when-cross-origin"),
+                "{path}"
+            );
+            let csp = get("content-security-policy").unwrap_or_default();
+            assert!(csp.contains("frame-ancestors 'none'"), "{path}: {csp}");
+            // Must not restrict what the SPA itself loads.
+            assert!(!csp.contains("script-src"), "{path}: {csp}");
+            assert!(!csp.contains("default-src"), "{path}: {csp}");
+            assert!(response
+                .headers()
+                .get("strict-transport-security")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn console_security_headers_never_override_handler_values() {
+        let response = Response::builder()
+            .header("x-frame-options", "SAMEORIGIN")
+            .header("content-security-policy", "default-src 'self'")
+            .body(Body::empty())
+            .expect("response builds");
+        let response = with_console_security_headers(response);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-frame-options")
+                .map(|v| v.as_bytes()),
+            Some(b"SAMEORIGIN".as_slice())
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .map(|v| v.as_bytes()),
+            Some(b"default-src 'self'".as_slice())
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-content-type-options")
+                .map(|v| v.as_bytes()),
+            Some(b"nosniff".as_slice())
+        );
+        assert_eq!(
+            response.headers().get_all("x-frame-options").iter().count(),
+            1
+        );
     }
 
     #[test]
