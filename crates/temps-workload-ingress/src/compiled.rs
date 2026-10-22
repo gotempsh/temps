@@ -4,12 +4,13 @@
 //! The compiled route table and access evaluator.
 //!
 //! Built on the control plane from admitted endpoints, then shared
-//! read-only (behind the proxy's `ArcSwap`). [`CompiledRoutes::route`] and
-//! [`CompiledRoutes::evaluate`] take no locks, do no I/O and allocate
-//! nothing: hosts are lowercased into a stack buffer, policies are
-//! pre-parsed, and everything a decision needs is either in the table or
-//! asked of the caller through [`RequestContext`] (grant cookies verified
-//! against keys in the same snapshot, the atomic rate-limit counters).
+//! read-only (behind the proxy's `ArcSwap`). [`CompiledRoutes::route`],
+//! [`CompiledRoutes::for_owner`] and [`CompiledEndpoint::evaluate`] take no
+//! locks, do no I/O and allocate nothing: hosts are lowercased into a stack
+//! buffer, policies are pre-parsed, and everything a decision needs is
+//! either in the table or asked of the caller through [`RequestContext`]
+//! (grant cookies verified against keys in the same snapshot, the atomic
+//! rate-limit counters).
 //!
 //! **Claims.** Several endpoints may share a host when one product owns it
 //! and they differ by path prefix (ADR-050 path routes). A host claimed by
@@ -21,19 +22,20 @@ use std::net::IpAddr;
 
 use crate::admission::AdmissionError;
 use crate::endpoint::{
-    AccessPolicy, Endpoint, EndpointProtocol, EndpointTarget, ProductRef, RateLimit,
+    AccessPolicy, Endpoint, EndpointProtocol, EndpointTarget, PolicyKind, ProductRef, RateLimit,
+    RateLimitScope, UnresolvedClient,
 };
 
 /// An address block, pre-parsed. IPv4 blocks never match IPv6 addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Cidr {
+pub struct Cidr {
     bits: u128,
     mask: u128,
     v4: bool,
 }
 
 impl Cidr {
-    fn matches(&self, ip: IpAddr) -> bool {
+    pub fn matches(&self, ip: IpAddr) -> bool {
         let (bits, v4) = match ip {
             IpAddr::V4(v4) => (u128::from(u32::from(v4)), true),
             IpAddr::V6(v6) => (u128::from(v6), false),
@@ -43,10 +45,19 @@ impl Cidr {
 }
 
 /// Parses `<address>/<prefix>` with no host bits set.
-pub(crate) fn parse_cidr(value: &str) -> Option<Cidr> {
+pub fn parse_cidr(value: &str) -> Option<Cidr> {
     let (addr, prefix) = value.split_once('/')?;
     let addr: IpAddr = addr.parse().ok()?;
     let prefix: u32 = prefix.parse().ok()?;
+    let (bits, mask) = mask_for(addr, prefix)?;
+    (bits & mask == bits).then_some(Cidr {
+        bits,
+        mask,
+        v4: addr.is_ipv4(),
+    })
+}
+
+fn mask_for(addr: IpAddr, prefix: u32) -> Option<(u128, u128)> {
     let (bits, width, v4) = match addr {
         IpAddr::V4(v4) => (u128::from(u32::from(v4)), 32, true),
         IpAddr::V6(v6) => (u128::from(v6), 128, false),
@@ -64,7 +75,76 @@ pub(crate) fn parse_cidr(value: &str) -> Option<Cidr> {
     } else {
         ones
     };
-    (bits & mask == bits).then_some(Cidr { bits, mask, v4 })
+    Some((bits, mask))
+}
+
+/// Canonicalises a hand-written address list entry into a strict
+/// `<network>/<prefix>`, the form [`parse_cidr`] accepts:
+///
+/// - a bare address becomes a single-address block; an IPv4-mapped IPv6
+///   address is read as the IPv4 address it maps;
+/// - `<address>/<prefix>` with host bits set keeps its network (the bits
+///   under the mask), the way `ipnetwork`-style containment reads it.
+///
+/// `None` for anything else. Used to translate address lists stored by
+/// earlier features, which accepted both forms, into typed policies.
+pub fn canonical_cidr(entry: &str) -> Option<String> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    let (addr, prefix) = match entry.split_once('/') {
+        Some((addr, prefix)) => {
+            let addr: IpAddr = addr.trim().parse().ok()?;
+            (addr, prefix.trim().parse::<u32>().ok()?)
+        }
+        None => {
+            let addr: IpAddr = entry.parse().ok()?;
+            let addr = match addr {
+                IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(addr),
+                v4 => v4,
+            };
+            (addr, if addr.is_ipv4() { 32 } else { 128 })
+        }
+    };
+    let (bits, mask) = mask_for(addr, prefix)?;
+    let network = bits & mask;
+    let network = match addr {
+        IpAddr::V4(_) => IpAddr::V4(std::net::Ipv4Addr::from(network as u32)),
+        IpAddr::V6(_) => IpAddr::V6(std::net::Ipv6Addr::from(network)),
+    };
+    Some(format!("{network}/{prefix}"))
+}
+
+/// A rate limit, pre-parsed. The caller owns the counters; this tells it
+/// which windows to apply and against which budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompiledRateLimit {
+    limits: Box<[RateLimit]>,
+    exempt: Box<[Cidr]>,
+    scope: RateLimitScope,
+}
+
+impl CompiledRateLimit {
+    pub fn limits(&self) -> &[RateLimit] {
+        &self.limits
+    }
+
+    pub fn scope(&self) -> RateLimitScope {
+        self.scope
+    }
+
+    /// The budget of the window `per_secs` long, if this limit has one.
+    pub fn window(&self, per_secs: u32) -> Option<u32> {
+        self.limits
+            .iter()
+            .find(|limit| limit.per_secs == per_secs)
+            .map(|limit| limit.requests)
+    }
+
+    fn exempts(&self, ip: IpAddr) -> bool {
+        self.exempt.iter().any(|cidr| cidr.matches(ip))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,8 +160,9 @@ enum Policy {
     IpRules {
         rules: Box<[(Cidr, bool)]>,
         any_allow: bool,
+        unresolved: UnresolvedClient,
     },
-    RateLimit(RateLimit),
+    RateLimit(CompiledRateLimit),
     Geo {
         allow: Box<[[u8; 2]]>,
         deny: Box<[[u8; 2]]>,
@@ -89,9 +170,13 @@ enum Policy {
     Captcha,
 }
 
-fn country(code: &str) -> [u8; 2] {
-    let b = code.as_bytes();
-    [b[0].to_ascii_uppercase(), b[1].to_ascii_uppercase()]
+fn country(code: &str) -> Option<[u8; 2]> {
+    match code.as_bytes() {
+        [a, b] if a.is_ascii_alphabetic() && b.is_ascii_alphabetic() => {
+            Some([a.to_ascii_uppercase(), b.to_ascii_uppercase()])
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,9 +187,121 @@ pub struct CompiledEndpoint {
     pub protocol: EndpointProtocol,
     prefix: Box<str>,
     policies: Box<[Policy]>,
+    kinds: u16,
 }
 
 impl CompiledEndpoint {
+    /// Compiles one endpoint's policies. Fails on what admission refuses:
+    /// an unparsable address block or country code.
+    pub fn compile(e: &Endpoint) -> Result<Self, AdmissionError> {
+        let mut policies = Vec::with_capacity(e.access.len());
+        let mut kinds = 0u16;
+        for policy in &e.access {
+            kinds |= policy.kind().bit();
+            policies.push(match policy {
+                AccessPolicy::Public => Policy::Public,
+                AccessPolicy::Password { password_ref } => Policy::Password {
+                    password_ref: *password_ref,
+                },
+                AccessPolicy::TempsLogin { permission } => Policy::TempsLogin {
+                    permission: permission.as_str().into(),
+                },
+                AccessPolicy::SignedLink => Policy::SignedLink,
+                AccessPolicy::IpRules { rules, unresolved } => {
+                    let mut parsed = Vec::with_capacity(rules.len());
+                    for rule in rules {
+                        let cidr = parse_cidr(&rule.cidr).ok_or_else(|| {
+                            AdmissionError::InvalidIpRule {
+                                endpoint_id: e.id,
+                                cidr: rule.cidr.clone(),
+                            }
+                        })?;
+                        parsed.push((cidr, rule.allow));
+                    }
+                    Policy::IpRules {
+                        any_allow: rules.iter().any(|r| r.allow),
+                        rules: parsed.into(),
+                        unresolved: *unresolved,
+                    }
+                }
+                AccessPolicy::RateLimit {
+                    limits,
+                    exempt,
+                    scope,
+                } => {
+                    let mut parsed = Vec::with_capacity(exempt.len());
+                    for cidr in exempt {
+                        parsed.push(parse_cidr(cidr).ok_or_else(|| {
+                            AdmissionError::InvalidIpRule {
+                                endpoint_id: e.id,
+                                cidr: cidr.clone(),
+                            }
+                        })?);
+                    }
+                    Policy::RateLimit(CompiledRateLimit {
+                        limits: limits.as_slice().into(),
+                        exempt: parsed.into(),
+                        scope: *scope,
+                    })
+                }
+                AccessPolicy::Geo { allow, deny } => {
+                    let parse = |codes: &[String]| -> Result<Box<[[u8; 2]]>, AdmissionError> {
+                        codes
+                            .iter()
+                            .map(|c| {
+                                country(c).ok_or_else(|| AdmissionError::InvalidCountry {
+                                    endpoint_id: e.id,
+                                    code: c.clone(),
+                                })
+                            })
+                            .collect()
+                    };
+                    Policy::Geo {
+                        allow: parse(allow)?,
+                        deny: parse(deny)?,
+                    }
+                }
+                AccessPolicy::Captcha => Policy::Captcha,
+            });
+        }
+        Ok(CompiledEndpoint {
+            id: e.id,
+            owner: e.owner,
+            target: e.target.clone(),
+            protocol: e.protocol,
+            prefix: e.path_prefix.as_deref().unwrap_or("/").into(),
+            policies: policies.into(),
+            kinds,
+        })
+    }
+
+    pub fn path_prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Whether any of the endpoint's policies is of `kind`. Lets a caller
+    /// prepare a fact (an asynchronous cache read) only when a policy will
+    /// ask for it.
+    pub fn has(&self, kind: PolicyKind) -> bool {
+        self.kinds & kind.bit() != 0
+    }
+
+    /// The password the endpoint's wall checks, if it has one.
+    pub fn password_ref(&self) -> Option<i64> {
+        self.policies.iter().find_map(|p| match p {
+            Policy::Password { password_ref } => Some(*password_ref),
+            _ => None,
+        })
+    }
+
+    /// The permission the endpoint's `TempsLogin` policy requires.
+    pub fn login_permission(&self) -> Option<&str> {
+        self.policies.iter().find_map(|p| match p {
+            Policy::TempsLogin { permission } => Some(&**permission),
+            _ => None,
+        })
+    }
+
     fn matches_path(&self, path: &str) -> bool {
         let prefix = &*self.prefix;
         if prefix == "/" {
@@ -114,6 +311,76 @@ impl CompiledEndpoint {
             Some(rest) => rest.is_empty() || rest.starts_with('/') || rest.starts_with('?'),
             None => false,
         }
+    }
+
+    /// Runs the policies in order; the first that does not pass decides.
+    pub fn evaluate(&self, ctx: &impl RequestContext) -> Decision<'_> {
+        for policy in self.policies.iter() {
+            match policy {
+                Policy::Public => {}
+                Policy::Password { password_ref } => {
+                    if !ctx.has_password_grant(self, *password_ref) {
+                        return Decision::Challenge(Challenge::Password {
+                            password_ref: *password_ref,
+                        });
+                    }
+                }
+                Policy::TempsLogin { permission } => {
+                    if !ctx.has_login_grant(self, permission) {
+                        return Decision::Challenge(Challenge::TempsLogin { permission });
+                    }
+                }
+                Policy::SignedLink => {
+                    if !ctx.has_signed_link(self) {
+                        return Decision::Deny(DenyReason::SignedLinkRequired);
+                    }
+                }
+                Policy::IpRules {
+                    rules,
+                    any_allow,
+                    unresolved,
+                } => {
+                    let Some(ip) = ctx.client_ip() else {
+                        match unresolved {
+                            UnresolvedClient::Deny => {
+                                return Decision::Deny(DenyReason::IpNotAllowed)
+                            }
+                            UnresolvedClient::Admit => continue,
+                        }
+                    };
+                    match rules.iter().find(|(cidr, _)| cidr.matches(ip)) {
+                        Some((_, true)) => {}
+                        Some((_, false)) => return Decision::Deny(DenyReason::IpNotAllowed),
+                        None if *any_allow => return Decision::Deny(DenyReason::IpNotAllowed),
+                        None => {}
+                    }
+                }
+                Policy::RateLimit(limit) => {
+                    // An unknown client is not counted; an exempt one never is.
+                    let Some(ip) = ctx.client_ip() else { continue };
+                    if !limit.exempts(ip) && !ctx.within_rate_limit(self, limit) {
+                        return Decision::TooManyRequests;
+                    }
+                }
+                Policy::Geo { allow, deny } => {
+                    let code = ctx
+                        .country()
+                        .map(|[a, b]| [a.to_ascii_uppercase(), b.to_ascii_uppercase()]);
+                    let denied = code.is_some_and(|c| deny.contains(&c));
+                    let not_allowed =
+                        !allow.is_empty() && !code.is_some_and(|c| allow.contains(&c));
+                    if denied || not_allowed {
+                        return Decision::Deny(DenyReason::CountryNotAllowed);
+                    }
+                }
+                Policy::Captcha => {
+                    if !ctx.captcha_passed(self) {
+                        return Decision::Challenge(Challenge::Captcha);
+                    }
+                }
+            }
+        }
+        Decision::Allow
     }
 }
 
@@ -131,14 +398,17 @@ pub struct ClaimConflict {
 /// method must answer from memory: the snapshot's keys, the atomic
 /// counters, the parsed cookies.
 pub trait RequestContext {
-    fn client_ip(&self) -> IpAddr;
+    /// `None` when the client's address could not be resolved.
+    fn client_ip(&self) -> Option<IpAddr>;
     /// ISO 3166-1 alpha-2, any case.
     fn country(&self) -> Option<[u8; 2]>;
-    fn has_password_grant(&self, endpoint_id: i64) -> bool;
-    fn has_login_grant(&self, endpoint_id: i64, permission: &str) -> bool;
-    fn has_signed_link(&self, endpoint_id: i64) -> bool;
-    fn captcha_passed(&self, endpoint_id: i64) -> bool;
-    fn within_rate_limit(&self, endpoint_id: i64, limit: &RateLimit) -> bool;
+    fn has_password_grant(&self, endpoint: &CompiledEndpoint, password_ref: i64) -> bool;
+    fn has_login_grant(&self, endpoint: &CompiledEndpoint, permission: &str) -> bool;
+    fn has_signed_link(&self, endpoint: &CompiledEndpoint) -> bool;
+    fn captcha_passed(&self, endpoint: &CompiledEndpoint) -> bool;
+    /// Counts the request against `limit` and says whether it fits. Only
+    /// asked for a resolved, non-exempt client.
+    fn within_rate_limit(&self, endpoint: &CompiledEndpoint, limit: &CompiledRateLimit) -> bool;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +438,22 @@ pub enum Decision<'a> {
     TooManyRequests,
 }
 
+impl Decision<'_> {
+    /// A stable label for logs and metrics.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Decision::Allow => "allow",
+            Decision::Challenge(Challenge::Password { .. }) => "challenge_password",
+            Decision::Challenge(Challenge::TempsLogin { .. }) => "challenge_temps_login",
+            Decision::Challenge(Challenge::Captcha) => "challenge_captcha",
+            Decision::Deny(DenyReason::IpNotAllowed) => "deny_ip",
+            Decision::Deny(DenyReason::CountryNotAllowed) => "deny_country",
+            Decision::Deny(DenyReason::SignedLinkRequired) => "deny_signed_link",
+            Decision::TooManyRequests => "too_many_requests",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CompiledRoutes {
     endpoints: Box<[CompiledEndpoint]>,
@@ -175,6 +461,8 @@ pub struct CompiledRoutes {
     exact: HashMap<Box<str>, Box<[u32]>>,
     /// Parent domain of a `*.` claim → endpoint indices.
     wildcard: HashMap<Box<str>, Box<[u32]>>,
+    /// Owner → endpoint indices, longest prefix first.
+    owners: HashMap<ProductRef, Box<[u32]>>,
     conflicts: Vec<ClaimConflict>,
 }
 
@@ -186,49 +474,7 @@ impl CompiledRoutes {
     pub fn compile(endpoints: &[Endpoint]) -> Result<Self, AdmissionError> {
         let mut compiled = Vec::with_capacity(endpoints.len());
         for e in endpoints {
-            let mut policies = Vec::with_capacity(e.access.len());
-            for policy in &e.access {
-                policies.push(match policy {
-                    AccessPolicy::Public => Policy::Public,
-                    AccessPolicy::Password { password_ref } => Policy::Password {
-                        password_ref: *password_ref,
-                    },
-                    AccessPolicy::TempsLogin { permission } => Policy::TempsLogin {
-                        permission: permission.as_str().into(),
-                    },
-                    AccessPolicy::SignedLink => Policy::SignedLink,
-                    AccessPolicy::IpRules { rules } => {
-                        let mut parsed = Vec::with_capacity(rules.len());
-                        for rule in rules {
-                            let cidr = parse_cidr(&rule.cidr).ok_or_else(|| {
-                                AdmissionError::InvalidIpRule {
-                                    endpoint_id: e.id,
-                                    cidr: rule.cidr.clone(),
-                                }
-                            })?;
-                            parsed.push((cidr, rule.allow));
-                        }
-                        Policy::IpRules {
-                            any_allow: rules.iter().any(|r| r.allow),
-                            rules: parsed.into(),
-                        }
-                    }
-                    AccessPolicy::RateLimit { limit } => Policy::RateLimit(*limit),
-                    AccessPolicy::Geo { allow, deny } => Policy::Geo {
-                        allow: allow.iter().map(|c| country(c)).collect(),
-                        deny: deny.iter().map(|c| country(c)).collect(),
-                    },
-                    AccessPolicy::Captcha => Policy::Captcha,
-                });
-            }
-            compiled.push(CompiledEndpoint {
-                id: e.id,
-                owner: e.owner,
-                target: e.target.clone(),
-                protocol: e.protocol,
-                prefix: e.path_prefix.as_deref().unwrap_or("/").into(),
-                policies: policies.into(),
-            });
+            compiled.push(CompiledEndpoint::compile(e)?);
         }
 
         // host → (claim id, endpoint index), every claim of every endpoint.
@@ -295,10 +541,28 @@ impl CompiledRoutes {
         }
         conflicts.sort_by(|a, b| (&a.host, a.loser_endpoint).cmp(&(&b.host, b.loser_endpoint)));
         conflicts.dedup();
+
+        let mut owners: HashMap<ProductRef, Vec<u32>> = HashMap::new();
+        for (index, e) in compiled.iter().enumerate() {
+            owners.entry(e.owner).or_default().push(index as u32);
+        }
+        let owners = owners
+            .into_iter()
+            .map(|(owner, mut indices)| {
+                indices.sort_by_key(|&i| {
+                    (
+                        std::cmp::Reverse(compiled[i as usize].prefix.len()),
+                        compiled[i as usize].id,
+                    )
+                });
+                (owner, indices.into_boxed_slice())
+            })
+            .collect();
         Ok(Self {
             endpoints: compiled.into(),
             exact,
             wildcard,
+            owners,
             conflicts,
         })
     }
@@ -315,6 +579,10 @@ impl CompiledRoutes {
         self.endpoints.is_empty()
     }
 
+    pub fn endpoints(&self) -> &[CompiledEndpoint] {
+        &self.endpoints
+    }
+
     /// The endpoint serving `host` (a `Host` header: any case, an optional
     /// port and trailing dot) and `path`. Exact hosts beat a wildcard; the
     /// longest matching prefix wins.
@@ -328,6 +596,13 @@ impl CompiledRoutes {
         self.pick(self.wildcard.get(parent).map(|b| &**b), path)
     }
 
+    /// The owner's endpoint for `path`, when the product's own router has
+    /// already resolved the request to that owner. The longest matching
+    /// prefix wins.
+    pub fn for_owner(&self, owner: ProductRef, path: &str) -> Option<&CompiledEndpoint> {
+        self.pick(self.owners.get(&owner).map(|b| &**b), path)
+    }
+
     fn pick(&self, indices: Option<&[u32]>, path: &str) -> Option<&CompiledEndpoint> {
         indices?
             .iter()
@@ -336,65 +611,13 @@ impl CompiledRoutes {
     }
 
     /// Runs the endpoint's policies in order; the first that does not pass
-    /// decides.
+    /// decides. Same as [`CompiledEndpoint::evaluate`].
     pub fn evaluate<'a>(
         &self,
         endpoint: &'a CompiledEndpoint,
         ctx: &impl RequestContext,
     ) -> Decision<'a> {
-        for policy in endpoint.policies.iter() {
-            match policy {
-                Policy::Public => {}
-                Policy::Password { password_ref } => {
-                    if !ctx.has_password_grant(endpoint.id) {
-                        return Decision::Challenge(Challenge::Password {
-                            password_ref: *password_ref,
-                        });
-                    }
-                }
-                Policy::TempsLogin { permission } => {
-                    if !ctx.has_login_grant(endpoint.id, permission) {
-                        return Decision::Challenge(Challenge::TempsLogin { permission });
-                    }
-                }
-                Policy::SignedLink => {
-                    if !ctx.has_signed_link(endpoint.id) {
-                        return Decision::Deny(DenyReason::SignedLinkRequired);
-                    }
-                }
-                Policy::IpRules { rules, any_allow } => {
-                    let ip = ctx.client_ip();
-                    match rules.iter().find(|(cidr, _)| cidr.matches(ip)) {
-                        Some((_, true)) => {}
-                        Some((_, false)) => return Decision::Deny(DenyReason::IpNotAllowed),
-                        None if *any_allow => return Decision::Deny(DenyReason::IpNotAllowed),
-                        None => {}
-                    }
-                }
-                Policy::RateLimit(limit) => {
-                    if !ctx.within_rate_limit(endpoint.id, limit) {
-                        return Decision::TooManyRequests;
-                    }
-                }
-                Policy::Geo { allow, deny } => {
-                    let code = ctx
-                        .country()
-                        .map(|[a, b]| [a.to_ascii_uppercase(), b.to_ascii_uppercase()]);
-                    let denied = code.is_some_and(|c| deny.contains(&c));
-                    let not_allowed =
-                        !allow.is_empty() && !code.is_some_and(|c| allow.contains(&c));
-                    if denied || not_allowed {
-                        return Decision::Deny(DenyReason::CountryNotAllowed);
-                    }
-                }
-                Policy::Captcha => {
-                    if !ctx.captcha_passed(endpoint.id) {
-                        return Decision::Challenge(Challenge::Captcha);
-                    }
-                }
-            }
-        }
-        Decision::Allow
+        endpoint.evaluate(ctx)
     }
 }
 
@@ -426,7 +649,7 @@ mod tests {
     use crate::endpoint::{HostClaim, HostClaimKind, IpRule, ProductKind};
 
     pub(crate) struct Ctx {
-        pub ip: IpAddr,
+        pub ip: Option<IpAddr>,
         pub country: Option<[u8; 2]>,
         pub password: bool,
         pub login: Option<&'static str>,
@@ -438,7 +661,7 @@ mod tests {
     impl Default for Ctx {
         fn default() -> Self {
             Self {
-                ip: "192.0.2.10".parse().unwrap(),
+                ip: Some("192.0.2.10".parse().unwrap()),
                 country: Some(*b"es"),
                 password: false,
                 login: None,
@@ -450,25 +673,25 @@ mod tests {
     }
 
     impl RequestContext for Ctx {
-        fn client_ip(&self) -> IpAddr {
+        fn client_ip(&self) -> Option<IpAddr> {
             self.ip
         }
         fn country(&self) -> Option<[u8; 2]> {
             self.country
         }
-        fn has_password_grant(&self, _: i64) -> bool {
+        fn has_password_grant(&self, _: &CompiledEndpoint, _: i64) -> bool {
             self.password
         }
-        fn has_login_grant(&self, _: i64, permission: &str) -> bool {
+        fn has_login_grant(&self, _: &CompiledEndpoint, permission: &str) -> bool {
             self.login == Some(permission)
         }
-        fn has_signed_link(&self, _: i64) -> bool {
+        fn has_signed_link(&self, _: &CompiledEndpoint) -> bool {
             self.signed
         }
-        fn captcha_passed(&self, _: i64) -> bool {
+        fn captcha_passed(&self, _: &CompiledEndpoint) -> bool {
             self.captcha
         }
-        fn within_rate_limit(&self, _: i64, _: &RateLimit) -> bool {
+        fn within_rate_limit(&self, _: &CompiledEndpoint, _: &CompiledRateLimit) -> bool {
             self.within_rate
         }
     }
@@ -501,6 +724,30 @@ mod tests {
             protocol: EndpointProtocol::Http,
             server_requires_tls: false,
             access,
+        }
+    }
+
+    fn ip_rules(rules: Vec<(&str, bool)>, unresolved: UnresolvedClient) -> AccessPolicy {
+        AccessPolicy::IpRules {
+            rules: rules
+                .into_iter()
+                .map(|(c, allow)| IpRule {
+                    cidr: c.to_string(),
+                    allow,
+                })
+                .collect(),
+            unresolved,
+        }
+    }
+
+    fn rate_limit(exempt: Vec<&str>) -> AccessPolicy {
+        AccessPolicy::RateLimit {
+            limits: vec![RateLimit {
+                requests: 10,
+                per_secs: 1,
+            }],
+            exempt: exempt.into_iter().map(str::to_string).collect(),
+            scope: RateLimitScope::Endpoint,
         }
     }
 
@@ -547,6 +794,26 @@ mod tests {
         assert_eq!(id("other.example.test", "/"), None);
         assert_eq!(id("[::1]:443", "/"), None);
         assert!(routes.conflicts().is_empty());
+
+        let owner = ProductRef {
+            kind: ProductKind::Environment,
+            id: 10,
+        };
+        let by_owner = |path| routes.for_owner(owner, path).map(|e| e.id);
+        assert_eq!(by_owner("/api/v2/x"), Some(3));
+        assert_eq!(by_owner("/api"), Some(2));
+        assert_eq!(by_owner("/"), Some(1));
+        assert_eq!(
+            routes.for_owner(
+                ProductRef {
+                    kind: ProductKind::Sandbox,
+                    id: 10
+                },
+                "/"
+            ),
+            None,
+            "owners are keyed by kind and id"
+        );
     }
 
     #[test]
@@ -692,12 +959,7 @@ mod tests {
     #[test]
     fn policies_run_in_order_and_all_must_pass() {
         let access = vec![
-            AccessPolicy::RateLimit {
-                limit: RateLimit {
-                    requests: 10,
-                    per_secs: 1,
-                },
-            },
+            rate_limit(vec![]),
             AccessPolicy::Password { password_ref: 4 },
             AccessPolicy::Captcha,
         ];
@@ -722,6 +984,58 @@ mod tests {
         );
         ctx.captcha = true;
         assert_eq!(decide(access, &ctx), Decision::Allow);
+    }
+
+    #[test]
+    fn exempt_and_unresolved_clients_are_not_counted() {
+        let over = Ctx {
+            within_rate: false,
+            ..Ctx::default()
+        };
+        assert_eq!(
+            decide(vec![rate_limit(vec!["192.0.2.0/24"])], &over),
+            Decision::Allow,
+            "an exempt client is never limited"
+        );
+        assert_eq!(
+            decide(vec![rate_limit(vec!["198.51.100.0/24"])], &over),
+            Decision::TooManyRequests
+        );
+        let unresolved = Ctx {
+            ip: None,
+            within_rate: false,
+            ..Ctx::default()
+        };
+        assert_eq!(
+            decide(vec![rate_limit(vec![])], &unresolved),
+            Decision::Allow,
+            "nothing to attribute an unknown client to"
+        );
+    }
+
+    #[test]
+    fn the_endpoint_reports_its_policy_kinds() {
+        let routes = CompiledRoutes::compile(&[endpoint(
+            1,
+            10,
+            "shop.example.test",
+            1,
+            None,
+            vec![
+                AccessPolicy::Password { password_ref: 4 },
+                AccessPolicy::TempsLogin {
+                    permission: "projects:read".into(),
+                },
+            ],
+        )])
+        .unwrap();
+        let e = &routes.endpoints()[0];
+        assert!(e.has(PolicyKind::Password));
+        assert!(e.has(PolicyKind::TempsLogin));
+        assert!(!e.has(PolicyKind::Captcha));
+        assert_eq!(e.password_ref(), Some(4));
+        assert_eq!(e.login_permission(), Some("projects:read"));
+        assert_eq!(e.path_prefix(), "/");
     }
 
     #[test]
@@ -765,49 +1079,70 @@ mod tests {
 
     #[test]
     fn ip_rules_match_first_and_an_allow_list_refuses_the_rest() {
-        let rules = |rules: Vec<(&str, bool)>| {
-            vec![AccessPolicy::IpRules {
-                rules: rules
-                    .into_iter()
-                    .map(|(c, allow)| IpRule {
-                        cidr: c.to_string(),
-                        allow,
-                    })
-                    .collect(),
-            }]
-        };
+        let deny = UnresolvedClient::Deny;
         let ctx = Ctx::default(); // 192.0.2.10
         assert_eq!(
-            decide(rules(vec![("192.0.2.0/24", true)]), &ctx),
+            decide(vec![ip_rules(vec![("192.0.2.0/24", true)], deny)], &ctx),
             Decision::Allow
         );
         assert_eq!(
-            decide(rules(vec![("198.51.100.0/24", true)]), &ctx),
+            decide(vec![ip_rules(vec![("198.51.100.0/24", true)], deny)], &ctx),
             Decision::Deny(DenyReason::IpNotAllowed)
         );
         assert_eq!(
             decide(
-                rules(vec![("192.0.2.10/32", false), ("0.0.0.0/0", true)]),
+                vec![ip_rules(
+                    vec![("192.0.2.10/32", false), ("0.0.0.0/0", true)],
+                    deny
+                )],
                 &ctx
             ),
             Decision::Deny(DenyReason::IpNotAllowed)
         );
         assert_eq!(
-            decide(rules(vec![("198.51.100.0/24", false)]), &ctx),
+            decide(vec![ip_rules(vec![("198.51.100.0/24", false)], deny)], &ctx),
             Decision::Allow,
             "a deny list admits the rest"
         );
         let v6 = Ctx {
-            ip: "2001:db8::1".parse().unwrap(),
+            ip: Some("2001:db8::1".parse().unwrap()),
             ..Ctx::default()
         };
         assert_eq!(
-            decide(rules(vec![("0.0.0.0/0", true)]), &v6),
+            decide(vec![ip_rules(vec![("0.0.0.0/0", true)], deny)], &v6),
             Decision::Deny(DenyReason::IpNotAllowed),
             "v4 blocks never match v6"
         );
         assert_eq!(
-            decide(rules(vec![("2001:db8::/32", true)]), &v6),
+            decide(vec![ip_rules(vec![("2001:db8::/32", true)], deny)], &v6),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn an_unresolved_client_fails_closed_unless_the_policy_admits_it() {
+        let unresolved = Ctx {
+            ip: None,
+            ..Ctx::default()
+        };
+        assert_eq!(
+            decide(
+                vec![ip_rules(
+                    vec![("198.51.100.0/24", false)],
+                    UnresolvedClient::Deny
+                )],
+                &unresolved
+            ),
+            Decision::Deny(DenyReason::IpNotAllowed)
+        );
+        assert_eq!(
+            decide(
+                vec![ip_rules(
+                    vec![("198.51.100.0/24", false)],
+                    UnresolvedClient::Admit
+                )],
+                &unresolved
+            ),
             Decision::Allow
         );
     }
@@ -844,6 +1179,11 @@ mod tests {
             Decision::Deny(DenyReason::CountryNotAllowed),
             "unknown is not in an allow list"
         );
+        let bad = endpoint(1, 1, "shop.example.test", 1, None, geo(&["E"], &[]));
+        assert!(matches!(
+            CompiledEndpoint::compile(&bad),
+            Err(AdmissionError::InvalidCountry { .. })
+        ));
     }
 
     #[test]
@@ -856,5 +1196,34 @@ mod tests {
         let all_v4 = parse_cidr("0.0.0.0/0").unwrap();
         assert!(all_v4.matches("203.0.113.9".parse().unwrap()));
         assert!(!all_v4.matches("::ffff:203.0.113.9".parse().unwrap()));
+    }
+
+    #[test]
+    fn hand_written_entries_canonicalise_to_strict_blocks() {
+        assert_eq!(
+            canonical_cidr(" 203.0.113.9 ").as_deref(),
+            Some("203.0.113.9/32")
+        );
+        assert_eq!(
+            canonical_cidr("::ffff:203.0.113.9").as_deref(),
+            Some("203.0.113.9/32"),
+            "a bare mapped address is the IPv4 address"
+        );
+        assert_eq!(
+            canonical_cidr("10.1.2.3/8").as_deref(),
+            Some("10.0.0.0/8"),
+            "host bits are masked off"
+        );
+        assert_eq!(
+            canonical_cidr("2001:db8::1/32").as_deref(),
+            Some("2001:db8::/32")
+        );
+        for bad in ["", "nope", "10.0.0.0/33", "10.0.0.0/x"] {
+            assert_eq!(canonical_cidr(bad), None, "{bad}");
+        }
+        for entry in ["10.1.2.3/8", "203.0.113.9", "2001:db8::1/32"] {
+            let canonical = canonical_cidr(entry).unwrap();
+            assert!(parse_cidr(&canonical).is_some(), "{canonical}");
+        }
     }
 }

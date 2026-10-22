@@ -62,6 +62,8 @@ pub enum AdmissionError {
         "endpoint {endpoint_id} combines `public` with other policies; `public` only stands alone"
     )]
     PublicWithOthers { endpoint_id: i64 },
+    #[error("endpoint {endpoint_id} has a rate limit with no window; give it at least one")]
+    EmptyRateLimit { endpoint_id: i64 },
 }
 
 /// Checks an endpoint and returns it with its hosts normalised.
@@ -118,7 +120,7 @@ pub fn admit(mut endpoint: Endpoint, reserved: &ReservedHosts) -> Result<Endpoin
             });
         }
         match policy {
-            AccessPolicy::IpRules { rules } => {
+            AccessPolicy::IpRules { rules, .. } => {
                 for rule in rules {
                     if parse_cidr(&rule.cidr).is_none() {
                         return Err(AdmissionError::InvalidIpRule {
@@ -138,13 +140,26 @@ pub fn admit(mut endpoint: Endpoint, reserved: &ReservedHosts) -> Result<Endpoin
                     }
                 }
             }
-            AccessPolicy::RateLimit { limit } => {
-                if limit.requests == 0 || limit.per_secs == 0 {
-                    return Err(AdmissionError::InvalidRateLimit {
-                        endpoint_id: id,
-                        requests: limit.requests,
-                        per_secs: limit.per_secs,
-                    });
+            AccessPolicy::RateLimit { limits, exempt, .. } => {
+                if limits.is_empty() {
+                    return Err(AdmissionError::EmptyRateLimit { endpoint_id: id });
+                }
+                for limit in limits {
+                    if limit.requests == 0 || limit.per_secs == 0 {
+                        return Err(AdmissionError::InvalidRateLimit {
+                            endpoint_id: id,
+                            requests: limit.requests,
+                            per_secs: limit.per_secs,
+                        });
+                    }
+                }
+                for cidr in exempt {
+                    if parse_cidr(cidr).is_none() {
+                        return Err(AdmissionError::InvalidIpRule {
+                            endpoint_id: id,
+                            cidr: cidr.clone(),
+                        });
+                    }
                 }
             }
             AccessPolicy::Public
@@ -182,7 +197,7 @@ pub fn admit(mut endpoint: Endpoint, reserved: &ReservedHosts) -> Result<Endpoin
         let ip_rules = endpoint
             .access
             .iter()
-            .any(|p| matches!(p, AccessPolicy::IpRules { rules } if !rules.is_empty()));
+            .any(|p| matches!(p, AccessPolicy::IpRules { rules, .. } if !rules.is_empty()));
         let missing = match (tls, ip_rules) {
             (true, true) => None,
             (false, true) => Some("TLS"),
@@ -239,6 +254,7 @@ mod tests {
                 cidr: "192.0.2.0/24".into(),
                 allow: true,
             }],
+            unresolved: Default::default(),
         }
     }
 
@@ -363,11 +379,37 @@ mod tests {
                     rules: vec![IpRule {
                         cidr: "10.0.0.1/8".into(),
                         allow: true
-                    }]
+                    }],
+                    unresolved: Default::default(),
                 }],
                 None
             ),
             Err(AdmissionError::InvalidIpRule { .. })
+        ));
+        assert!(matches!(
+            check(
+                vec![AccessPolicy::RateLimit {
+                    limits: vec![RateLimit {
+                        requests: 5,
+                        per_secs: 60
+                    }],
+                    exempt: vec!["not-a-cidr".into()],
+                    scope: Default::default(),
+                }],
+                None
+            ),
+            Err(AdmissionError::InvalidIpRule { .. })
+        ));
+        assert!(matches!(
+            check(
+                vec![AccessPolicy::RateLimit {
+                    limits: vec![],
+                    exempt: vec![],
+                    scope: Default::default(),
+                }],
+                None
+            ),
+            Err(AdmissionError::EmptyRateLimit { endpoint_id: 7 })
         ));
         assert!(matches!(
             check(
@@ -382,10 +424,12 @@ mod tests {
         assert!(matches!(
             check(
                 vec![AccessPolicy::RateLimit {
-                    limit: RateLimit {
+                    limits: vec![RateLimit {
                         requests: 0,
                         per_secs: 1
-                    }
+                    }],
+                    exempt: vec![],
+                    scope: Default::default(),
                 }],
                 None
             ),

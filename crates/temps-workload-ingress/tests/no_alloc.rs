@@ -2,17 +2,19 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! The request path allocates nothing (ADR-055 §11, Scalability): routing
-//! and evaluating a request against a compiled table is measured with a
-//! counting allocator. One test per binary, so nothing else allocates on
-//! the measured thread.
+//! and evaluating a request against a compiled table, and verifying a
+//! `TempsLogin` grant, are measured with a counting allocator. One test per
+//! binary, so nothing else allocates on the measured thread.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::net::IpAddr;
 
+use temps_workload_ingress::grant::{self, GrantClaims, GrantExpectation, GrantKey, GrantUse};
 use temps_workload_ingress::{
-    AccessPolicy, CompiledRoutes, Decision, Endpoint, EndpointProtocol, EndpointTarget, HostClaim,
-    HostClaimKind, IpRule, ProductKind, ProductRef, RateLimit, RequestContext,
+    AccessPolicy, CompiledEndpoint, CompiledRateLimit, CompiledRoutes, Decision, Endpoint,
+    EndpointProtocol, EndpointTarget, HostClaim, HostClaimKind, IpRule, ProductKind, ProductRef,
+    RateLimit, RateLimitScope, RequestContext, Revocations, UnresolvedClient,
 };
 
 struct Counting;
@@ -41,41 +43,60 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
 
-struct Ctx;
+/// Answers the login question by actually verifying a grant, as the proxy
+/// does.
+struct Ctx<'a> {
+    key: &'a GrantKey,
+    token: &'a str,
+    host: &'a str,
+    revocations: &'a Revocations,
+}
 
-impl RequestContext for Ctx {
-    fn client_ip(&self) -> IpAddr {
-        IpAddr::V4([192, 0, 2, 10].into())
+impl RequestContext for Ctx<'_> {
+    fn client_ip(&self) -> Option<IpAddr> {
+        Some(IpAddr::V4([192, 0, 2, 10].into()))
     }
     fn country(&self) -> Option<[u8; 2]> {
         Some(*b"es")
     }
-    fn has_password_grant(&self, _: i64) -> bool {
+    fn has_password_grant(&self, _: &CompiledEndpoint, _: i64) -> bool {
         true
     }
-    fn has_login_grant(&self, _: i64, _: &str) -> bool {
+    fn has_login_grant(&self, endpoint: &CompiledEndpoint, permission: &str) -> bool {
+        grant::admits(
+            self.key,
+            self.token,
+            &GrantExpectation {
+                owner: endpoint.owner,
+                host: self.host,
+                permission,
+                usage: GrantUse::Session,
+                now: 1_000,
+            },
+            self.revocations,
+        )
+    }
+    fn has_signed_link(&self, _: &CompiledEndpoint) -> bool {
         true
     }
-    fn has_signed_link(&self, _: i64) -> bool {
+    fn captcha_passed(&self, _: &CompiledEndpoint) -> bool {
         true
     }
-    fn captcha_passed(&self, _: i64) -> bool {
-        true
-    }
-    fn within_rate_limit(&self, _: i64, _: &RateLimit) -> bool {
+    fn within_rate_limit(&self, _: &CompiledEndpoint, _: &CompiledRateLimit) -> bool {
         true
     }
 }
 
 #[test]
-fn routing_and_evaluating_a_request_does_not_allocate() {
+fn routing_evaluating_and_verifying_a_grant_does_not_allocate() {
+    let owner = ProductRef {
+        kind: ProductKind::Environment,
+        id: 7,
+    };
     let endpoints: Vec<Endpoint> = (0..200)
         .map(|i| Endpoint {
             id: i,
-            owner: ProductRef {
-                kind: ProductKind::Environment,
-                id: i,
-            },
+            owner,
             target: EndpointTarget::Workload {
                 workload_id: i,
                 revision: 1,
@@ -98,16 +119,25 @@ fn routing_and_evaluating_a_request_does_not_allocate() {
             server_requires_tls: false,
             access: vec![
                 AccessPolicy::RateLimit {
-                    limit: RateLimit {
-                        requests: 100,
-                        per_secs: 1,
-                    },
+                    limits: vec![
+                        RateLimit {
+                            requests: 100,
+                            per_secs: 60,
+                        },
+                        RateLimit {
+                            requests: 1000,
+                            per_secs: 3600,
+                        },
+                    ],
+                    exempt: vec!["198.51.100.0/24".into()],
+                    scope: RateLimitScope::Endpoint,
                 },
                 AccessPolicy::IpRules {
                     rules: vec![IpRule {
                         cidr: "192.0.2.0/24".into(),
                         allow: true,
                     }],
+                    unresolved: UnresolvedClient::Deny,
                 },
                 AccessPolicy::Geo {
                     allow: vec!["ES".into()],
@@ -122,9 +152,30 @@ fn routing_and_evaluating_a_request_does_not_allocate() {
         })
         .collect();
     let routes = CompiledRoutes::compile(&endpoints).unwrap();
+    let key = GrantKey::derive(&[3u8; 32], owner);
+    let host = "app-150.example.test";
+    let token = grant::mint(
+        &key,
+        &GrantClaims {
+            grant_id: 5,
+            usage: GrantUse::Session,
+            owner,
+            host,
+            permission: "projects:read",
+            user_id: 2,
+            expires_at: 5_000,
+        },
+    )
+    .unwrap();
+    let revocations = Revocations::new([99]);
+    let ctx = Ctx {
+        key: &key,
+        token: &token,
+        host,
+        revocations: &revocations,
+    };
     let requests = [
         ("App-150.Example.TEST:443", "/api/users"),
-        ("x.tenant-7.example.test.", "/"),
         ("missing.example.test", "/"),
     ];
 
@@ -133,10 +184,13 @@ fn routing_and_evaluating_a_request_does_not_allocate() {
     for _ in 0..1000 {
         for (host, path) in requests {
             if let Some(endpoint) = routes.route(host, path) {
-                if routes.evaluate(endpoint, &Ctx) == Decision::Allow {
+                if routes.evaluate(endpoint, &ctx) == Decision::Allow {
                     allowed += 1;
                 }
             }
+        }
+        if routes.for_owner(owner, "/api").is_some() {
+            allowed += 1;
         }
     }
     COUNTING.with(|on| on.set(false));
