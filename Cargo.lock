@@ -12410,6 +12410,7 @@ dependencies = [
  "temps-core",
  "temps-deployer",
  "temps-dns-resolver",
+ "temps-docker-capture",
  "temps-network",
  "temps-providers",
  "temps-runtime-health",
@@ -12481,6 +12482,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployments",
+ "temps-docker-capture",
  "temps-entities",
  "temps-error-tracking",
  "temps-git",
@@ -13417,6 +13419,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-dns",
+ "temps-docker-capture",
  "temps-entities",
  "temps-file-store",
  "temps-network",
@@ -13545,6 +13548,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rsa 0.9.10",
  "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
  "serde",
  "serde_json",
  "serial_test",
@@ -13589,6 +13593,16 @@ dependencies = [
  "tokio-test",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "temps-docker-capture"
+version = "0.1.0-beta.57"
+dependencies = [
+ "axum",
+ "bollard",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -14942,6 +14956,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-dns",
+ "temps-docker-capture",
  "temps-entities",
  "temps-logs",
  "temps-metrics",

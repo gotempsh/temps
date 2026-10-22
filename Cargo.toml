@@ -23,6 +23,7 @@ members = [
     "crates/temps-presets",
     "crates/temps-logs",
     "crates/temps-deployer",
+    "crates/temps-docker-capture",
     "crates/temps-projects",
     "crates/temps-domains",
     "crates/temps-proxy",

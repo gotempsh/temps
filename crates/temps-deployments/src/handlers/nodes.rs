@@ -484,6 +484,43 @@ pub struct NodeDnsStatusEntry {
     pub dns_resolver_record_count: Option<i32>,
 }
 
+/// An internal DNS name two owners publish (ADR-055 §10). The holder's
+/// records are served; the other owner's publishes are refused, and any
+/// records it had before the conflict was found stay in the zone untouched.
+/// Part of `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DnsNameConflictEntry {
+    /// The contested name, normalised (lower case, no trailing dot).
+    pub fqdn: String,
+    /// Owner whose publish is refused: `environment`, `service_role`,
+    /// `service_member`, `node` or `static`.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    /// Owner that holds the name.
+    pub holder_kind: String,
+    pub holder_id: i64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+}
+
+impl From<temps_entities::dns_name_conflicts::Model> for DnsNameConflictEntry {
+    fn from(c: temps_entities::dns_name_conflicts::Model) -> Self {
+        Self {
+            fqdn: c.fqdn,
+            owner_kind: c.owner_kind,
+            owner_id: c.owner_id,
+            holder_kind: c.holder_kind,
+            holder_id: c.holder_id,
+            first_seen_at: c
+                .first_seen_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            last_seen_at: c
+                .last_seen_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }
+    }
+}
+
 /// Response from `GET /api/cluster/dns/status`.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ClusterDnsStatusResponse {
@@ -497,6 +534,9 @@ pub struct ClusterDnsStatusResponse {
     /// node's resolver health.
     pub total_record_count: i64,
     pub nodes: Vec<NodeDnsStatusEntry>,
+    /// Names refused because another owner holds them. Empty on a healthy
+    /// cluster; each entry needs one side renamed or removed.
+    pub name_conflicts: Vec<DnsNameConflictEntry>,
 }
 
 #[derive(OpenApi)]
@@ -559,6 +599,7 @@ pub struct ClusterDnsStatusResponse {
         NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
+        DnsNameConflictEntry,
         ClusterDnsStatusResponse,
         DockerDiskUsage,
         DockerDiskUsageCategory,
@@ -2554,10 +2595,20 @@ async fn cluster_dns_status(
         })
         .collect();
 
+    let name_conflicts = app_state
+        .node_service
+        .dns_name_conflicts()
+        .await
+        .map_err(Problem::from)?
+        .into_iter()
+        .map(DnsNameConflictEntry::from)
+        .collect();
+
     Ok(Json(ClusterDnsStatusResponse {
         cluster_dns_enabled,
         total_record_count,
         nodes: node_entries,
+        name_conflicts,
     }))
 }
 
@@ -3985,6 +4036,19 @@ impl From<NodeError> for Problem {
                 .with_value("node_name", node_name.clone())
                 .with_value("containers_confirmed_gone", confirmed_gone)
                 .with_value("containers_unconfirmed", unremoved_count),
+            NodeError::HostsManagedServices {
+                node_id,
+                ref node_name,
+                ref services,
+            } => {
+                let services = serde_json::to_value(services).unwrap_or_default();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Node Hosts Managed Services")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+                    .with_value("node_name", node_name.clone())
+                    .with_value("services", services)
+            }
             NodeError::StillServing {
                 node_id,
                 ref node_name,

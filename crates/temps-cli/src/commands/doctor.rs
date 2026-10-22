@@ -207,6 +207,12 @@ impl DoctorCommand {
             report.checks.clear();
 
             println!();
+            println!("{}", "  Internal DNS".bright_yellow().bold());
+            self.check_dns_name_conflicts(db, &mut report).await;
+            report.print();
+            report.checks.clear();
+
+            println!();
             println!("{}", "  WireGuard mesh".bright_yellow().bold());
             let checks = mesh::control_plane_checks(db, &self.resolve_data_dir()).await;
             mesh::add_to_report(&checks, &mut report);
@@ -1153,6 +1159,51 @@ impl DoctorCommand {
         );
     }
 
+    /// Internal DNS names two owners publish (ADR-055 §10). The holder's
+    /// records are served and the other owner's publishes are refused, so a
+    /// conflict never breaks resolution by itself, but the refused owner
+    /// stops updating its records until one side is renamed or removed.
+    async fn check_dns_name_conflicts(
+        &self,
+        db: &sea_orm::DatabaseConnection,
+        report: &mut DiagnosticReport,
+    ) {
+        let query = "SELECT fqdn, owner_kind, owner_id, holder_kind, holder_id \
+            FROM dns_name_conflicts ORDER BY first_seen_at, id LIMIT 21";
+        let rows = match db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                query.to_string(),
+            ))
+            .await
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                report.add(
+                    "Name conflicts",
+                    CheckResult::Warn(format!(
+                        "Could not read dns_name_conflicts: {error}. Run `temps migrate` first."
+                    )),
+                );
+                return;
+            }
+        };
+        use sea_orm::TryGetable;
+        let conflicts: Vec<DnsNameConflict> = rows
+            .iter()
+            .filter_map(|row| {
+                Some(DnsNameConflict {
+                    fqdn: String::try_get_by(row, "fqdn").ok()?,
+                    owner_kind: String::try_get_by(row, "owner_kind").ok()?,
+                    owner_id: i64::try_get_by(row, "owner_id").ok()?,
+                    holder_kind: String::try_get_by(row, "holder_kind").ok()?,
+                    holder_id: i64::try_get_by(row, "holder_id").ok()?,
+                })
+            })
+            .collect();
+        report.add("Name conflicts", dns_name_conflicts_result(&conflicts, 20));
+    }
+
     // ── Git provider checks ─────────────────────────────────────────
 
     async fn check_git_providers(
@@ -1311,6 +1362,41 @@ fn describe_age(days: i64) -> String {
 }
 
 /// Check if a URL is reachable via HTTPS.
+/// One row of `dns_name_conflicts`, as `temps doctor` reports it.
+struct DnsNameConflict {
+    fqdn: String,
+    owner_kind: String,
+    owner_id: i64,
+    holder_kind: String,
+    holder_id: i64,
+}
+
+/// `conflicts` holds at most `shown + 1` rows; the extra one only says
+/// there are more.
+fn dns_name_conflicts_result(conflicts: &[DnsNameConflict], shown: usize) -> CheckResult {
+    if conflicts.is_empty() {
+        return CheckResult::Pass("Every internal name has a single owner".to_string());
+    }
+    let mut lines: Vec<String> = conflicts
+        .iter()
+        .take(shown)
+        .map(|c| {
+            format!(
+                "'{}' is held by {} {}; {} {} cannot publish it",
+                c.fqdn, c.holder_kind, c.holder_id, c.owner_kind, c.owner_id
+            )
+        })
+        .collect();
+    if conflicts.len() > shown {
+        lines.push("... and more: see GET /api/cluster/dns/status".to_string());
+    }
+    CheckResult::Warn(format!(
+        "{}. Rename one owner of each name or remove the other; the refused owner's \
+         records stop updating until then.",
+        lines.join("; ")
+    ))
+}
+
 async fn check_url_reachable(label: &'static str, url: &str, report: &mut DiagnosticReport) {
     let client = reqwest::Client::builder()
         .timeout(CHECK_TIMEOUT)
@@ -1428,6 +1514,51 @@ fn update_check_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conflict(fqdn: &str, owner_id: i64) -> DnsNameConflict {
+        DnsNameConflict {
+            fqdn: fqdn.to_string(),
+            owner_kind: "environment".to_string(),
+            owner_id,
+            holder_kind: "service_role".to_string(),
+            holder_id: 4,
+        }
+    }
+
+    #[test]
+    fn dns_name_conflicts_pass_when_none() {
+        assert!(matches!(
+            dns_name_conflicts_result(&[], 20),
+            CheckResult::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn dns_name_conflicts_warn_names_both_owners() {
+        let CheckResult::Warn(message) =
+            dns_name_conflicts_result(&[conflict("primary.foo.temps.local", 12)], 20)
+        else {
+            panic!("a conflict must warn");
+        };
+        assert!(
+            message.contains("'primary.foo.temps.local' is held by service_role 4")
+                && message.contains("environment 12 cannot publish it"),
+            "{message}"
+        );
+        assert!(!message.contains("and more"), "{message}");
+    }
+
+    #[test]
+    fn dns_name_conflicts_truncate_past_the_limit() {
+        let rows: Vec<_> = (0..3)
+            .map(|i| conflict(&format!("n{i}.temps.local"), i))
+            .collect();
+        let CheckResult::Warn(message) = dns_name_conflicts_result(&rows, 2) else {
+            panic!("conflicts must warn");
+        };
+        assert!(message.contains("n1.temps.local") && !message.contains("n2.temps.local"));
+        assert!(message.contains("and more"), "{message}");
+    }
 
     #[test]
     fn test_update_check_nightly_is_not_offered_an_older_beta() {

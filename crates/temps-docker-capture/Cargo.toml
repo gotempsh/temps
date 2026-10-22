@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-docker-capture"
+description = "Test support: a fake Docker Engine API that records container-create requests (ADR-055 golden tests)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+bollard = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }

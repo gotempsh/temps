@@ -22,7 +22,10 @@
 //! - **Source of truth:** `environments.current_deployment_id` joined
 //!   with `projects.slug` + `environments.slug` and `nodes.compute_cidr`.
 //! - **Sink:** [`crate::services::DnsRegistry::replace_endpoints_for_owner`]
-//!   under [`OwnerKind::Deployment`], with `owner_id = deployment.id`.
+//!   under [`OwnerKind::Environment`], with `owner_id = environment.id`.
+//!   The environment owns the name (ADR-055 §10): before, the owner was the
+//!   deployment, a new id on every redeploy, which made every redeploy
+//!   collide with the previous one on the same `(fqdn, A, bridge IP)`.
 //! - **Trigger:** called from the same path that reloads the L7 route
 //!   table after `current_deployment_id` changes (PG NOTIFY → listener).
 //!   Keeps DNS and route-table in lockstep with one source of truth.
@@ -37,7 +40,7 @@
 //!
 //! ## Multi-A semantics
 //!
-//! For one deployment, we emit N records (one per node) with the same
+//! For one environment, we emit N records (one per node) with the same
 //! FQDN, all `record_type=A`. The registry's unique index on
 //! `(fqdn, record_type, target_ip)` accepts this — DNS clients receive
 //! all N answers and pick one per RFC 1035. Hickory's resolver
@@ -45,7 +48,9 @@
 
 use std::sync::Arc;
 
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use std::collections::HashSet;
+
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, info, warn};
 
@@ -80,11 +85,17 @@ impl DeploymentDnsPublisher {
     /// Publish the full deployment-FQDN set. Walks every environment
     /// with a current deployment, computes the multi-A record set
     /// (one record per node bridge gateway), and replaces the
-    /// per-deployment owner's records atomically.
+    /// environment owner's records atomically.
     ///
-    /// Returns the number of deployments whose records were
-    /// reconciled. Failures for individual deployments are logged
-    /// and skipped — one bad row doesn't poison the rest.
+    /// The records are owned by the **environment**, not the deployment
+    /// (ADR-055 §10): the name outlives every redeploy, so its owner must
+    /// too, or the registry could not tell a redeploy from another owner
+    /// taking the name.
+    ///
+    /// Returns the number of environments whose records were
+    /// reconciled. Failures for individual environments are logged
+    /// and skipped — one bad row (or a name another owner holds) doesn't
+    /// poison the rest.
     pub async fn reconcile_all(&self) -> Result<usize, DnsRegistryError> {
         let bridge_ips = self.collect_bridge_gateway_ips().await?;
         if bridge_ips.is_empty() {
@@ -96,15 +107,40 @@ impl DeploymentDnsPublisher {
             return Ok(0);
         }
 
+        // One query: live environments with a current deployment, and
+        // their project.
         let active_envs = environments::Entity::find()
+            .find_also_related(projects::Entity)
             .filter(environments::Column::CurrentDeploymentId.is_not_null())
             .filter(environments::Column::DeletedAt.is_null())
             .all(self.db.as_ref())
             .await?;
 
+        // One query: which of those current deployments still exist.
+        // current_deployment_id can briefly point at a deleted row;
+        // advertising a name that has no proxy backing is worse than
+        // briefly NXDOMAIN'ing.
+        let current_ids: Vec<i32> = active_envs
+            .iter()
+            .filter_map(|(env, _)| env.current_deployment_id)
+            .collect();
+        let present: HashSet<i32> = if current_ids.is_empty() {
+            HashSet::new()
+        } else {
+            deployments::Entity::find()
+                .select_only()
+                .column(deployments::Column::Id)
+                .filter(deployments::Column::Id.is_in(current_ids))
+                .into_tuple::<i32>()
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .collect()
+        };
+
         let mut reconciled = 0;
 
-        for env in active_envs {
+        for (env, project) in active_envs {
             let Some(deployment_id) = env.current_deployment_id else {
                 continue;
             };
@@ -123,19 +159,13 @@ impl DeploymentDnsPublisher {
                 continue;
             }
 
-            let project = match projects::Entity::find_by_id(env.project_id)
-                .one(self.db.as_ref())
-                .await?
-            {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        environment_id = env.id,
-                        project_id = env.project_id,
-                        "environment references missing project; skipping DNS publish"
-                    );
-                    continue;
-                }
+            let Some(project) = project else {
+                warn!(
+                    environment_id = env.id,
+                    project_id = env.project_id,
+                    "environment references missing project; skipping DNS publish"
+                );
+                continue;
             };
 
             let proj_slug = project.slug.trim().to_string();
@@ -143,36 +173,16 @@ impl DeploymentDnsPublisher {
                 continue;
             }
 
-            // Confirm the referenced deployment still exists.
-            // current_deployment_id can briefly point at a
-            // soft-deleted row; advertising a name that has no proxy
-            // backing is worse than briefly NXDOMAIN'ing.
-            let deployment_present = deployments::Entity::find_by_id(deployment_id)
-                .one(self.db.as_ref())
-                .await?
-                .is_some();
-            if !deployment_present {
+            if !present.contains(&deployment_id) {
                 continue;
             }
 
             let fqdn = format!("{}.{}.temps.local", env_slug, proj_slug);
-            let drafts: Vec<EndpointDraft> = bridge_ips
-                .iter()
-                .map(|(node_id, ip)| EndpointDraft {
-                    fqdn: fqdn.clone(),
-                    record_type: RecordType::A,
-                    target_ip: Some(ip.clone()),
-                    target_port: Some(INTERNAL_PROXY_PORT),
-                    ttl: DEPLOYMENT_TTL_SECS,
-                    owner_kind: OwnerKind::Deployment,
-                    owner_id: deployment_id as i64,
-                    node_id: Some(*node_id),
-                })
-                .collect();
+            let drafts = environment_drafts(env.id, &fqdn, &bridge_ips);
 
             match self
                 .registry
-                .replace_endpoints_for_owner(OwnerKind::Deployment, deployment_id as i64, &drafts)
+                .replace_endpoints_for_owner(OwnerKind::Environment, env.id as i64, &drafts)
                 .await
             {
                 Ok(_generation) => {
@@ -183,6 +193,16 @@ impl DeploymentDnsPublisher {
                         fqdn = %fqdn,
                         nodes = drafts.len(),
                         "published deployment DNS"
+                    );
+                }
+                // Already recorded and logged by the registry, at `warn`
+                // the first time only; repeating it on every route reload
+                // would flood the log.
+                Err(DnsRegistryError::NameClaimed { .. }) => {
+                    debug!(
+                        environment_id = env.id,
+                        fqdn = %fqdn,
+                        "deployment DNS name is held by another owner; publish refused"
                     );
                 }
                 Err(e) => {
@@ -199,7 +219,7 @@ impl DeploymentDnsPublisher {
 
         if reconciled > 0 {
             info!(
-                deployments = reconciled,
+                environments = reconciled,
                 nodes = bridge_ips.len(),
                 "reconciled internal deployment DNS"
             );
@@ -207,11 +227,15 @@ impl DeploymentDnsPublisher {
         Ok(reconciled)
     }
 
-    /// Drop all DNS records for a specific deployment. Called on
-    /// teardown so a destroyed deployment's hostname stops resolving.
-    pub async fn delete_for_deployment(&self, deployment_id: i32) -> Result<(), DnsRegistryError> {
+    /// Drop all DNS records of an environment's stable name, and release the
+    /// name. Called when the environment is torn down, so its hostname stops
+    /// resolving and another owner may claim it.
+    pub async fn delete_for_environment(
+        &self,
+        environment_id: i32,
+    ) -> Result<(), DnsRegistryError> {
         self.registry
-            .delete_by_owner(OwnerKind::Deployment, deployment_id as i64)
+            .delete_by_owner(OwnerKind::Environment, environment_id as i64)
             .await?;
         Ok(())
     }
@@ -240,6 +264,28 @@ impl DeploymentDnsPublisher {
         }
         Ok(out)
     }
+}
+
+/// The multi-A record set for one environment's stable name: one record
+/// per node bridge gateway, owned by the environment.
+fn environment_drafts(
+    environment_id: i32,
+    fqdn: &str,
+    bridge_ips: &[(i32, String)],
+) -> Vec<EndpointDraft> {
+    bridge_ips
+        .iter()
+        .map(|(node_id, ip)| EndpointDraft {
+            fqdn: fqdn.to_string(),
+            record_type: RecordType::A,
+            target_ip: Some(ip.clone()),
+            target_port: Some(INTERNAL_PROXY_PORT),
+            ttl: DEPLOYMENT_TTL_SECS,
+            owner_kind: OwnerKind::Environment,
+            owner_id: environment_id as i64,
+            node_id: Some(*node_id),
+        })
+        .collect()
 }
 
 /// Parse a CIDR string like `172.20.1.0/24` and return the first

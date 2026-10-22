@@ -320,6 +320,9 @@ impl From<DnsRegistryError> for Problem {
                     .with_title("Validation Error")
                     .with_detail(error.to_string())
             }
+            DnsRegistryError::NameClaimed { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("DNS Name Held By Another Owner")
+                .with_detail(error.to_string()),
             DnsRegistryError::AckTooHigh { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("ACK Generation Out Of Range")
                 .with_detail(error.to_string()),

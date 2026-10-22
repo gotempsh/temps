@@ -1,0 +1,39 @@
+[
+  {
+    "body": {
+      "Env": [
+        "POSTGRES_PASSWORD=testpass123",
+        "POSTGRES_USER=postgres"
+      ],
+      "ExposedPorts": {
+        "5432/tcp": {}
+      },
+      "HostConfig": {
+        "Binds": [
+          "postgres-golden_data:/var/lib/postgresql/data"
+        ],
+        "NetworkMode": "temps-app-network",
+        "PortBindings": {
+          "5432/tcp": [
+            {
+              "HostIp": "10.100.0.2",
+              "HostPort": "15432"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "unless-stopped"
+        }
+      },
+      "Image": "gotempsh/postgres-walg:18-bookworm",
+      "Labels": {
+        "sh.temps.managed": "true",
+        "sh.temps.service": "true",
+        "sh.temps.service.name": "postgres-golden",
+        "sh.temps.service.type": "postgres"
+      }
+    },
+    "name": "postgres-golden",
+    "platform": null
+  }
+]

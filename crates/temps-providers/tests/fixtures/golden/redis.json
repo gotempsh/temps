@@ -1,0 +1,73 @@
+[
+  {
+    "body": {
+      "Cmd": [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--requirepass",
+        "testpass123"
+      ],
+      "Env": [
+        "REDIS_PASSWORD=testpass123"
+      ],
+      "ExposedPorts": {
+        "6379/tcp": {}
+      },
+      "Healthcheck": {
+        "Interval": 1000000000,
+        "Retries": 3,
+        "StartInterval": 1000000000,
+        "StartPeriod": 5000000000,
+        "Test": [
+          "CMD-SHELL",
+          "redis-cli ping"
+        ],
+        "Timeout": 3000000000
+      },
+      "HostConfig": {
+        "LogConfig": {
+          "Config": {
+            "max-file": "3",
+            "max-size": "20m"
+          },
+          "Type": "json-file"
+        },
+        "Mounts": [
+          {
+            "Source": "redis_data_golden",
+            "Target": "/data",
+            "Type": "volume"
+          }
+        ],
+        "PidsLimit": 512,
+        "PortBindings": {
+          "6379/tcp": [
+            {
+              "HostIp": "127.0.0.1",
+              "HostPort": "16379"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "always"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ]
+      },
+      "Image": "gotempsh/redis-walg:8-bookworm",
+      "Labels": {
+        "temps.service_name": "golden",
+        "temps.service_type": "redis"
+      },
+      "NetworkingConfig": {
+        "EndpointsConfig": {
+          "temps-app-network": {}
+        }
+      }
+    },
+    "name": "redis-golden",
+    "platform": null
+  }
+]

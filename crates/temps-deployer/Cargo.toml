@@ -59,6 +59,8 @@ urlencoding = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 http = { workspace = true }
 tempfile = { workspace = true }
 env_logger = "0.11"

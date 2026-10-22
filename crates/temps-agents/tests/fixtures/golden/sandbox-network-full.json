@@ -1,0 +1,113 @@
+[
+  {
+    "body": {
+      "Cmd": [
+        "-e",
+        "\nconst http = require(\"http\");\nconst https = require(\"https\");\nconst net = require(\"net\");\nconst dns = require(\"dns\").promises;\n\nconst proxyAuthority = \"temps-sandbox-egress-proxy:3128\";\nconst controlPlane = new URL(process.env.TEMPS_CONTROL_PLANE_URL);\nif (!['http:', 'https:'].includes(controlPlane.protocol) ||\n    controlPlane.username || controlPlane.password) {\n  throw new Error(\"TEMPS_CONTROL_PLANE_URL must be an HTTP(S) origin without credentials\");\n}\n\nfunction isPrivateAddress(address) {\n  if (address.startsWith(\"::ffff:\")) address = address.slice(7);\n  if (net.isIPv4(address)) {\n    const octets = address.split(\".\").map(Number);\n    return octets[0] === 0 || octets[0] === 10 || octets[0] === 127 ||\n      (octets[0] === 100 && octets[1] >= 64 && octets[1] <= 127) ||\n      (octets[0] === 169 && octets[1] === 254) ||\n      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||\n      (octets[0] === 192 && octets[1] === 0 && octets[2] === 0) ||\n      (octets[0] === 192 && octets[1] === 0 && octets[2] === 2) ||\n      (octets[0] === 192 && octets[1] === 88 && octets[2] === 99) ||\n      (octets[0] === 192 && octets[1] === 168) ||\n      (octets[0] === 198 && (octets[1] === 18 || octets[1] === 19)) ||\n      (octets[0] === 198 && octets[1] === 51 && octets[2] === 100) ||\n      (octets[0] === 203 && octets[1] === 0 && octets[2] === 113) ||\n      octets[0] >= 224;\n  }\n  const normalized = address.toLowerCase();\n  // Only the global-unicast 2000::/3 range is eligible. This conservative\n  // rule also rejects IPv4-mapped, loopback, link-local, ULA, multicast,\n  // documentation, and transition ranges.\n  return (!normalized.startsWith(\"2\") && !normalized.startsWith(\"3\")) ||\n    normalized.startsWith(\"2001:2:\") || normalized.startsWith(\"2001:db8:\");\n}\n\nasync function resolvePublic(hostname) {\n  const answers = await dns.lookup(hostname, { all: true, verbatim: true });\n  if (answers.length === 0 || answers.some(({ address }) => isPrivateAddress(address))) {\n    throw new Error(\"destination is private or non-routable\");\n  }\n  return answers.find(({ family }) => family === 4) || answers[0];\n}\n\nfunction parseAuthority(value, defaultPort) {\n  const parsed = new URL(`http://${value}`);\n  const port = Number(parsed.port || defaultPort);\n  if (parsed.username || parsed.password || ![80, 443].includes(port)) {\n    throw new Error(\"destination port is not allowed\");\n  }\n  return { hostname: parsed.hostname, port };\n}\n\nfunction modelRelayTarget(request) {\n  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);\n  if (incoming.host !== proxyAuthority) return null;\n  let match;\n  if (request.method === \"POST\") {\n    match = incoming.pathname.match(\n      /^\\/\\.temps\\/model-relay\\/([a-f0-9]{32})\\/(v1\\/messages(?:\\/count_tokens)?|responses|chat\\/completions)$/\n    );\n    const isAnthropicMessages = match && match[2].startsWith(\"v1/messages\");\n    if (incoming.search && (!isAnthropicMessages || incoming.search !== \"?beta=true\")) {\n      return null;\n    }\n  } else if (request.method === \"GET\") {\n    match = incoming.pathname.match(\n      /^\\/\\.temps\\/model-relay\\/([a-f0-9]{32})\\/(models)$/\n    );\n    const queryKeys = [...incoming.searchParams.keys()];\n    const clientVersion = incoming.searchParams.get(\"client_version\");\n    if (queryKeys.some((key) => key !== \"client_version\") ||\n        queryKeys.filter((key) => key === \"client_version\").length > 1 ||\n        (clientVersion !== null && !/^[A-Za-z0-9._+-]{1,64}$/.test(clientVersion))) {\n      return null;\n    }\n  } else {\n    return null;\n  }\n  if (!match) return null;\n  const basePath = controlPlane.pathname.replace(/\\/$/, \"\");\n  const target = new URL(controlPlane.toString());\n  target.pathname = `${basePath}/api/ai/sandbox-models/${match[1]}/${match[2]}`;\n  target.search = incoming.search;\n  return target;\n}\n\nfunction mcpTarget(request) {\n  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);\n  if (request.method !== \"POST\" || incoming.host !== proxyAuthority) return null;\n  const match = incoming.pathname.match(/^\\/\\.temps\\/mcp\\/([a-f0-9]{32})$/);\n  if (!match) return null;\n  const basePath = controlPlane.pathname.replace(/\\/$/, \"\");\n  const target = new URL(controlPlane.toString());\n  target.pathname = `${basePath}/api/ai/sandbox-tools/${match[1]}/mcp`;\n  target.search = \"\";\n  return target;\n}\n\nfunction gitRelayTarget(request) {\n  const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);\n  if (incoming.host !== proxyAuthority) return null;\n  let match;\n  if (request.method === \"GET\") {\n    match = incoming.pathname.match(\n      /^\\/\\.temps\\/git\\/([a-f0-9]{32})\\/([1-9][0-9]*)\\/(info\\/refs)$/\n    );\n    if (!match ||\n        ![\"?service=git-upload-pack\", \"?service=git-receive-pack\"].includes(incoming.search)) {\n      return null;\n    }\n  } else if (request.method === \"POST\") {\n    match = incoming.pathname.match(\n      /^\\/\\.temps\\/git\\/([a-f0-9]{32})\\/([1-9][0-9]*)\\/(git-upload-pack|git-receive-pack)$/\n    );\n    if (!match || incoming.search) return null;\n  } else {\n    return null;\n  }\n  const basePath = controlPlane.pathname.replace(/\\/$/, \"\");\n  const target = new URL(controlPlane.toString());\n  target.pathname = `${basePath}/api/git/sandbox-relay/${match[1]}/${match[2]}/${match[3]}`;\n  target.search = incoming.search;\n  return target;\n}\n\nfunction gitRelayAuthorized(_request) {\n  // Fail closed until the control plane issues and the sidecar verifies a\n  // credential that is independent of the relay URL and Host header.\n  return false;\n}\n\nasync function forwardGitRelay(request, response) {\n  const target = gitRelayTarget(request);\n  if (!target || !gitRelayAuthorized(request)) {\n    throw new Error(\"Git relay target is not authorized\");\n  }\n  await forward(request, response, target, true);\n}\n\nasync function forward(request, response, target, allowPrivate) {\n  const answer = allowPrivate\n    ? (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0]\n    : await resolvePublic(target.hostname);\n  if (!answer) throw new Error(\"destination did not resolve\");\n  const port = Number(target.port || (target.protocol === \"http:\" ? 80 : 443));\n  const headers = { ...request.headers, host: target.host };\n  delete headers[\"proxy-authorization\"];\n  delete headers[\"proxy-connection\"];\n  const transport = target.protocol === \"https:\" ? https : http;\n  const upstream = transport.request({\n    host: answer.address,\n    port,\n    servername: target.hostname,\n    method: request.method,\n    path: `${target.pathname}${target.search}`,\n    headers,\n  }, (upstreamResponse) => {\n    response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);\n    upstreamResponse.pipe(response);\n  });\n  upstream.on(\"error\", () => {\n    if (!response.headersSent) response.writeHead(502);\n    response.end();\n  });\n  request.pipe(upstream);\n}\n\nasync function handleRequest(request, response) {\n  try {\n    const incoming = new URL(request.url, `http://${request.headers.host || proxyAuthority}`);\n    const relayTarget = modelRelayTarget(request);\n    if (incoming.host === proxyAuthority &&\n        incoming.pathname.startsWith(\"/.temps/model-relay/\")) {\n      if (!relayTarget) throw new Error(\"model relay target is not allowed\");\n      await forward(request, response, relayTarget, true);\n      return;\n    }\n    if (incoming.host === proxyAuthority && incoming.pathname.startsWith(\"/.temps/mcp/\")) {\n      const target = mcpTarget(request);\n      if (!target) throw new Error(\"MCP target is not allowed\");\n      await forward(request, response, target, true);\n      return;\n    }\n    if (incoming.host === proxyAuthority && incoming.pathname.startsWith(\"/.temps/git/\")) {\n      await forwardGitRelay(request, response);\n      return;\n    }\n    const target = new URL(request.url);\n    const port = Number(target.port || (target.protocol === \"http:\" ? 80 : 443));\n    if (target.protocol !== \"http:\" || target.username || target.password ||\n        ![80, 443].includes(port)) {\n      throw new Error(\"request target is not allowed\");\n    }\n    await forward(request, response, target, false);\n  } catch (_) {\n    response.writeHead(403, { \"content-type\": \"text/plain\" });\n    response.end(\"destination denied\\n\");\n  }\n}\n\nconst server = http.createServer(handleRequest);\n\nserver.on(\"connect\", async (request, client, head) => {\n  try {\n    const { hostname, port } = parseAuthority(request.url, 443);\n    const { address } = await resolvePublic(hostname);\n    const upstream = net.connect({ host: address, port }, () => {\n      client.write(\"HTTP/1.1 200 Connection Established\\r\\n\\r\\n\");\n      if (head.length) upstream.write(head);\n      client.pipe(upstream);\n      upstream.pipe(client);\n    });\n    client.setTimeout(60_000, () => client.destroy());\n    upstream.setTimeout(60_000, () => upstream.destroy());\n    client.on(\"error\", () => upstream.destroy());\n    upstream.on(\"error\", () => client.destroy());\n  } catch (_) {\n    client.end(\"HTTP/1.1 403 Forbidden\\r\\nConnection: close\\r\\n\\r\\n\");\n  }\n});\n\nserver.headersTimeout = 10_000;\nserver.requestTimeout = 30_000;\nserver.keepAliveTimeout = 5_000;\nserver.on(\"clientError\", (_, socket) => socket.destroy());\nserver.listen(3128, \"0.0.0.0\");\n"
+      ],
+      "Entrypoint": [
+        "node"
+      ],
+      "Env": [
+        "TEMPS_CONTROL_PLANE_URL=http://host.docker.internal:8080"
+      ],
+      "HostConfig": {
+        "CapDrop": [
+          "ALL"
+        ],
+        "ExtraHosts": [
+          "host.docker.internal:host-gateway"
+        ],
+        "Init": true,
+        "Memory": 134217728,
+        "MemorySwap": 134217728,
+        "NanoCpus": 250000000,
+        "NetworkMode": "temps-sandbox-egress-v1",
+        "PidsLimit": 64,
+        "ReadonlyRootfs": true,
+        "RestartPolicy": {
+          "Name": "unless-stopped"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ],
+        "Tmpfs": {
+          "/tmp": "size=16m,mode=1777"
+        },
+        "Ulimits": [
+          {
+            "Hard": 256,
+            "Name": "nofile",
+            "Soft": 256
+          }
+        ]
+      },
+      "Image": "ghcr.io/gotempsh/temps-sandbox-node:0.1.0",
+      "Labels": {
+        "sh.temps.sandbox-egress-policy": "1",
+        "sh.temps.sandbox-network-for": "temps-sandbox-902"
+      },
+      "User": "1000:1000"
+    },
+    "name": "temps-sandbox-egress-proxy-v2-temps-sandbox-902",
+    "platform": null
+  },
+  {
+    "body": {
+      "Cmd": [
+        "sleep",
+        "infinity"
+      ],
+      "Env": [
+        "HTTPS_PROXY=http://temps-sandbox-egress-proxy:3128",
+        "HTTP_PROXY=http://temps-sandbox-egress-proxy:3128",
+        "NO_PROXY=localhost,127.0.0.1,::1,temps-sandbox-egress-proxy",
+        "TASK=golden",
+        "http_proxy=http://temps-sandbox-egress-proxy:3128",
+        "https_proxy=http://temps-sandbox-egress-proxy:3128",
+        "no_proxy=localhost,127.0.0.1,::1,temps-sandbox-egress-proxy"
+      ],
+      "HostConfig": {
+        "Binds": [
+          "/tmp/temps-golden-sandbox:/home/temps/workspace",
+          "temps-sandbox-home-v2-902:/home/temps"
+        ],
+        "CapAdd": [
+          "CHOWN",
+          "FOWNER",
+          "DAC_OVERRIDE",
+          "SETUID",
+          "SETGID"
+        ],
+        "CapDrop": [
+          "ALL"
+        ],
+        "Init": true,
+        "Memory": 1073741824,
+        "MemorySwap": 1073741824,
+        "NanoCpus": 1000000000,
+        "NetworkMode": "temps-sandbox-net-v3-temps-sandbox-902",
+        "PidsLimit": 512,
+        "RestartPolicy": {
+          "Name": "unless-stopped"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ],
+        "Tmpfs": {
+          "/run/secrets": "size=1m,mode=0710,gid=1000",
+          "/run/temps-runtime": "size=8m,mode=0700,uid=1000,gid=1000",
+          "/run/temps-source-import": "size=256m,nr_inodes=5001,mode=0700,uid=1000,gid=1000"
+        }
+      },
+      "Image": "alpine:3.20",
+      "Labels": {
+        "sh.temps.sandbox": "true",
+        "sh.temps.sandbox.run_id": "902"
+      },
+      "WorkingDir": "/home/temps/workspace"
+    },
+    "name": "temps-sandbox-902",
+    "platform": null
+  }
+]

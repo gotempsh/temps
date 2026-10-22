@@ -44,9 +44,9 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use temps_core::DBDateTime;
-use temps_entities::{node_dns_state, service_endpoints};
+use temps_entities::{dns_name_claims, dns_name_conflicts, node_dns_state, service_endpoints};
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Allowed DNS record types in the internal zone.
 ///
@@ -99,12 +99,18 @@ pub enum OwnerKind {
     Node,
     /// Opaque static configuration (cluster-wide constants, hand-edited).
     Static,
-    /// `owner_id` is `deployments.id` — the stable per-deployment FQDN
-    /// (`<env-slug>.<project-slug>.temps.local`) that the edge proxy
-    /// resolves to a live container set. Decouples client-side DNS from
-    /// container churn: the record points at the proxy, the proxy
-    /// fans out to whatever is currently running.
+    /// Legacy: `owner_id` is `deployments.id`. Written by binaries older
+    /// than ADR-055 phase 0, which owned an environment's stable name by its
+    /// current deployment, a new owner on every redeploy. Still accepted for
+    /// one release so a rolled-back binary can publish; nothing in this
+    /// release writes it. See [`OwnerKind::Environment`].
     Deployment,
+    /// `owner_id` is `environments.id` — the stable FQDN
+    /// (`<env-slug>.<project-slug>.temps.local`) that the edge proxy
+    /// resolves to a live container set. Owned by the environment, not by
+    /// a deployment, so the name and its claim survive every redeploy
+    /// (ADR-055 §10).
+    Environment,
 }
 
 impl OwnerKind {
@@ -115,6 +121,7 @@ impl OwnerKind {
             OwnerKind::Node => "node",
             OwnerKind::Static => "static",
             OwnerKind::Deployment => "deployment",
+            OwnerKind::Environment => "environment",
         }
     }
 }
@@ -128,6 +135,7 @@ impl FromStr for OwnerKind {
             "node" => Ok(OwnerKind::Node),
             "static" => Ok(OwnerKind::Static),
             "deployment" => Ok(OwnerKind::Deployment),
+            "environment" => Ok(OwnerKind::Environment),
             other => Err(DnsRegistryError::Validation {
                 message: format!("unknown owner_kind {:?}", other),
             }),
@@ -274,6 +282,21 @@ pub enum DnsRegistryError {
     #[error("Invalid IP literal {value:?} for {fqdn}")]
     InvalidIp { fqdn: String, value: String },
 
+    /// A publish for a name another owner holds (ADR-055 §10). Nothing was
+    /// written; the publisher's existing records are unchanged.
+    #[error(
+        "DNS name '{fqdn}' is held by {holder_kind} {holder_id}; {owner_kind} {owner_id} \
+         cannot publish it. Its publish was refused and recorded as a name conflict \
+         (see `temps doctor`); rename one of the two or remove the other to resolve it"
+    )]
+    NameClaimed {
+        fqdn: String,
+        owner_kind: String,
+        owner_id: i64,
+        holder_kind: String,
+        holder_id: i64,
+    },
+
     #[error("ACK rejected: node {node_id} tried to ACK generation {acked} but only {current} has been issued")]
     AckTooHigh {
         node_id: i32,
@@ -317,12 +340,18 @@ impl DnsRegistry {
     /// atomically. **This is the lifecycle hook's primary entry point.**
     ///
     /// Behaviour:
-    /// 1. Open a transaction.
-    /// 2. Compute the next generation (`MAX(generation) + 1` over the
-    ///    whole table — cluster-wide monotonic).
-    /// 3. Delete every existing row with `(owner_kind, owner_id) = (k, id)`.
-    /// 4. Insert each new draft with the new generation.
-    /// 5. Commit.
+    /// 1. Open a transaction and take the generation lock (bumping it).
+    /// 2. Claim every name in `drafts` (ADR-055 §10). A name another owner
+    ///    holds refuses the whole publish with
+    ///    [`DnsRegistryError::NameClaimed`]: the transaction rolls back, the
+    ///    caller's existing records stay as they were, and the refusal is
+    ///    recorded in `dns_name_conflicts`.
+    /// 3. Release the owner's claims on names it no longer publishes.
+    /// 4. Delete every existing row of the owner, and every leftover row of
+    ///    another owner under a name the caller now holds (written by a
+    ///    rolled-back binary or before claims existed), except rows of an
+    ///    owner recorded as a conflict, which are reported, never removed.
+    /// 5. Insert each new draft with the new generation, and commit.
     ///
     /// A container restart that produces a different IP becomes a
     /// delete-old + insert-new in one generation bump. Resolvers see
@@ -347,19 +376,63 @@ impl DnsRegistry {
                 });
             }
         }
+        let mut names: Vec<String> = drafts.iter().map(|d| normalize_fqdn(&d.fqdn)).collect();
+        names.sort();
+        names.dedup();
 
         let txn = self.db.begin().await?;
         let generation = next_generation(&txn).await?;
+
+        if let Some(refusal) = claim_names(&txn, owner_kind, owner_id, &names).await? {
+            txn.rollback().await?;
+            self.record_conflict(&refusal).await;
+            return Err(refusal.into_error());
+        }
+
+        // The publish holds every name it writes, so whatever this owner was
+        // refused before is over, and names it stopped publishing are free.
+        let names_json = serde_json::Value::from(names.clone());
+        txn.execute(Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "DELETE FROM dns_name_claims WHERE owner_kind = $1 AND owner_id = $2 \
+             AND fqdn NOT IN (SELECT jsonb_array_elements_text($3::jsonb))",
+            [
+                owner_kind.as_str().into(),
+                owner_id.into(),
+                names_json.clone().into(),
+            ],
+        ))
+        .await?;
+        dns_name_conflicts::Entity::delete_many()
+            .filter(dns_name_conflicts::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(dns_name_conflicts::Column::OwnerId.eq(owner_id))
+            .exec(&txn)
+            .await?;
 
         let deleted = service_endpoints::Entity::delete_many()
             .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
             .filter(service_endpoints::Column::OwnerId.eq(owner_id))
             .exec(&txn)
             .await?;
+        let leftovers = txn
+            .execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM service_endpoints se \
+                 WHERE lower(rtrim(se.fqdn, '.')) IN (SELECT jsonb_array_elements_text($1::jsonb)) \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM dns_name_conflicts c \
+                     WHERE c.fqdn = lower(rtrim(se.fqdn, '.')) \
+                       AND c.owner_kind = se.owner_kind AND c.owner_id = se.owner_id \
+                 )",
+                [names_json.into()],
+            ))
+            .await?
+            .rows_affected();
         debug!(
             owner_kind = owner_kind.as_str(),
             owner_id,
             deleted = deleted.rows_affected,
+            leftovers_replaced = leftovers,
             new_generation = generation,
             new_records = drafts.len(),
             "replacing DNS endpoints for owner"
@@ -381,13 +454,11 @@ impl DnsRegistry {
                 updated_at: Set(now),
                 ..Default::default()
             };
-            // Idempotent publish: the delete above clears our own prior records,
-            // but a re-deploy can reuse a node's deterministic container IP, so the
-            // (fqdn, record_type, target_ip) tuple may still collide with a row left
-            // by an earlier deployment generation (different owner_id). Upsert so the
-            // newest generation/owner wins instead of aborting the whole publish on a
-            // unique-constraint violation (which previously stalled DNS on re-deploy,
-            // leaving the zone pinned to dead container IPs).
+            // The caller holds this name, so a row still colliding on
+            // (fqdn, record_type, target_ip) belongs to a recorded conflict
+            // owner and gives the same answer. Taking it over keeps the
+            // answer and the publish atomic; it can never move a name to an
+            // owner that does not hold it, because the claim was checked above.
             service_endpoints::Entity::insert(am)
                 .on_conflict(
                     sea_orm::sea_query::OnConflict::columns([
@@ -421,6 +492,85 @@ impl DnsRegistry {
         Ok(generation)
     }
 
+    /// Record a refused publish in `dns_name_conflicts`. Logged at `warn`
+    /// the first time a conflict is seen and at `debug` afterwards, so a
+    /// publisher that retries on every route reload does not flood the log.
+    /// Best effort: the refusal is returned to the caller either way.
+    async fn record_conflict(&self, refusal: &ClaimRefusal) {
+        let result = self
+            .db
+            .as_ref()
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO dns_name_conflicts \
+                     (fqdn, owner_kind, owner_id, holder_kind, holder_id, first_seen_at, last_seen_at) \
+                 VALUES ($1, $2, $3, $4, $5, now(), now()) \
+                 ON CONFLICT (fqdn, owner_kind, owner_id) DO UPDATE \
+                 SET holder_kind = EXCLUDED.holder_kind, holder_id = EXCLUDED.holder_id, \
+                     last_seen_at = now() \
+                 RETURNING (xmax = 0) AS inserted",
+                [
+                    refusal.fqdn.clone().into(),
+                    refusal.owner_kind.as_str().into(),
+                    refusal.owner_id.into(),
+                    refusal.holder_kind.clone().into(),
+                    refusal.holder_id.into(),
+                ],
+            ))
+            .await;
+        match result {
+            Ok(Some(row)) if row.try_get::<bool>("", "inserted").unwrap_or(false) => {
+                warn!(
+                    fqdn = %refusal.fqdn,
+                    owner_kind = refusal.owner_kind.as_str(),
+                    owner_id = refusal.owner_id,
+                    holder_kind = %refusal.holder_kind,
+                    holder_id = refusal.holder_id,
+                    "internal DNS name conflict: publish refused because another owner holds the name"
+                );
+            }
+            Ok(_) => {
+                debug!(
+                    fqdn = %refusal.fqdn,
+                    owner_kind = refusal.owner_kind.as_str(),
+                    owner_id = refusal.owner_id,
+                    "internal DNS name conflict seen again; publish refused"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    fqdn = %refusal.fqdn,
+                    owner_kind = refusal.owner_kind.as_str(),
+                    owner_id = refusal.owner_id,
+                    error = %e,
+                    "failed to record internal DNS name conflict"
+                );
+            }
+        }
+    }
+
+    /// Every recorded name conflict, oldest first. Read by `temps doctor`
+    /// and the cluster DNS status endpoint.
+    pub async fn list_name_conflicts(
+        &self,
+    ) -> Result<Vec<dns_name_conflicts::Model>, DnsRegistryError> {
+        Ok(dns_name_conflicts::Entity::find()
+            .order_by_asc(dns_name_conflicts::Column::FirstSeenAt)
+            .order_by_asc(dns_name_conflicts::Column::Id)
+            .all(self.db.as_ref())
+            .await?)
+    }
+
+    /// The claim on one name, if any. `fqdn` is normalised first.
+    pub async fn claim_for(
+        &self,
+        fqdn: &str,
+    ) -> Result<Option<dns_name_claims::Model>, DnsRegistryError> {
+        Ok(dns_name_claims::Entity::find_by_id(normalize_fqdn(fqdn))
+            .one(self.db.as_ref())
+            .await?)
+    }
+
     /// Delete every record for an owner. Used by the container-stop hook
     /// and by the GC reconciler. No-op if no records exist (returns 0).
     pub async fn delete_by_owner(
@@ -433,6 +583,18 @@ impl DnsRegistry {
         let res = service_endpoints::Entity::delete_many()
             .filter(service_endpoints::Column::OwnerKind.eq(owner_kind.as_str()))
             .filter(service_endpoints::Column::OwnerId.eq(owner_id))
+            .exec(&txn)
+            .await?;
+        // The owner is gone from the zone: its names are free for the next
+        // publisher, and it is no longer in conflict with anyone.
+        dns_name_claims::Entity::delete_many()
+            .filter(dns_name_claims::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(dns_name_claims::Column::OwnerId.eq(owner_id))
+            .exec(&txn)
+            .await?;
+        dns_name_conflicts::Entity::delete_many()
+            .filter(dns_name_conflicts::Column::OwnerKind.eq(owner_kind.as_str()))
+            .filter(dns_name_conflicts::Column::OwnerId.eq(owner_id))
             .exec(&txn)
             .await?;
 
@@ -501,8 +663,9 @@ impl DnsRegistry {
     }
 
     /// Hourly janitor: delete `service_endpoints` rows whose owner has
-    /// vanished from `service_members` (Tier 2 GC) or `external_services`
-    /// (Tier 3 GC). Returns the number of orphan records deleted.
+    /// vanished from `service_members` (Tier 2 GC), `external_services`
+    /// (Tier 3 GC) or `environments`, and the claims and conflicts of
+    /// vanished owners. Returns the number of orphan records deleted.
     ///
     /// Catches edge cases the live lifecycle hooks miss:
     /// - A `delete_service` whose `delete_by_owner` call failed mid-flight
@@ -546,7 +709,44 @@ impl DnsRegistry {
             ))
             .await?;
 
-        let total = tier2.rows_affected() + tier3.rows_affected();
+        // Environment records (ADR-055 §10) whose environment was deleted.
+        let environments = txn
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM service_endpoints \
+                 WHERE owner_kind = 'environment' \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM environments \
+                     WHERE id = service_endpoints.owner_id AND deleted_at IS NULL \
+                 )"
+                .to_string(),
+            ))
+            .await?;
+
+        // Claims and conflicts of owners that are gone: a vanished holder's
+        // names become free, and a vanished loser stops being reported.
+        for table_owner in [
+            ("dns_name_claims", "owner_kind", "owner_id"),
+            ("dns_name_conflicts", "owner_kind", "owner_id"),
+            ("dns_name_conflicts", "holder_kind", "holder_id"),
+        ] {
+            let (table, kind, id) = table_owner;
+            txn.execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "DELETE FROM {table} t WHERE \
+                     (t.{kind} = 'service_member' AND NOT EXISTS \
+                         (SELECT 1 FROM service_members WHERE id = t.{id})) \
+                     OR (t.{kind} = 'service_role' AND NOT EXISTS \
+                         (SELECT 1 FROM external_services WHERE id = t.{id})) \
+                     OR (t.{kind} = 'environment' AND NOT EXISTS \
+                         (SELECT 1 FROM environments WHERE id = t.{id} AND deleted_at IS NULL))"
+                ),
+            ))
+            .await?;
+        }
+
+        let total = tier2.rows_affected() + tier3.rows_affected() + environments.rows_affected();
         if total > 0 {
             let _ = next_generation(&txn).await?;
         }
@@ -823,6 +1023,84 @@ async fn current_generation<C: ConnectionTrait>(db: &C) -> Result<i64, DnsRegist
     Ok(g)
 }
 
+/// Normalise an internal DNS name for ownership: lower case, no trailing
+/// dot. DNS names are case-insensitive, so `Foo.temps.local` and
+/// `foo.temps.local.` are one name and can have only one owner. Must match
+/// `lower(rtrim(fqdn, '.'))` in the claims migration and queries.
+pub fn normalize_fqdn(fqdn: &str) -> String {
+    fqdn.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// A publish refused because another owner holds one of its names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClaimRefusal {
+    fqdn: String,
+    owner_kind: OwnerKind,
+    owner_id: i64,
+    holder_kind: String,
+    holder_id: i64,
+}
+
+impl ClaimRefusal {
+    fn into_error(self) -> DnsRegistryError {
+        DnsRegistryError::NameClaimed {
+            fqdn: self.fqdn,
+            owner_kind: self.owner_kind.as_str().to_string(),
+            owner_id: self.owner_id,
+            holder_kind: self.holder_kind,
+            holder_id: self.holder_id,
+        }
+    }
+}
+
+/// Claim `names` for the owner inside `txn`: insert the free ones, then read
+/// every claim back. Returns the first name held by someone else, in name
+/// order, so a refusal is reproducible. Two statements whatever the number
+/// of names.
+async fn claim_names(
+    txn: &DatabaseTransaction,
+    owner_kind: OwnerKind,
+    owner_id: i64,
+    names: &[String],
+) -> Result<Option<ClaimRefusal>, DnsRegistryError> {
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let now = chrono::Utc::now();
+    let rows = names.iter().map(|fqdn| dns_name_claims::ActiveModel {
+        fqdn: Set(fqdn.clone()),
+        owner_kind: Set(owner_kind.as_str().to_string()),
+        owner_id: Set(owner_id),
+        target_workload_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    });
+    dns_name_claims::Entity::insert_many(rows)
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(dns_name_claims::Column::Fqdn)
+                .do_nothing()
+                .to_owned(),
+        )
+        .do_nothing()
+        .exec(txn)
+        .await?;
+    let claims = dns_name_claims::Entity::find()
+        .filter(dns_name_claims::Column::Fqdn.is_in(names.iter().cloned()))
+        .order_by_asc(dns_name_claims::Column::Fqdn)
+        .all(txn)
+        .await?;
+    Ok(claims
+        .into_iter()
+        .find(|claim| claim.owner_kind != owner_kind.as_str() || claim.owner_id != owner_id)
+        .map(|claim| ClaimRefusal {
+            fqdn: claim.fqdn,
+            owner_kind,
+            owner_id,
+            holder_kind: claim.owner_kind,
+            holder_id: claim.owner_id,
+        }))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_string()
@@ -853,10 +1131,45 @@ mod tests {
 
     #[test]
     fn owner_kind_round_trip() {
-        for s in ["service_member", "service_role", "node", "static"] {
+        for s in [
+            "service_member",
+            "service_role",
+            "node",
+            "static",
+            "deployment",
+            "environment",
+        ] {
             assert_eq!(OwnerKind::from_str(s).unwrap().as_str(), s);
         }
         assert!(OwnerKind::from_str("hammer").is_err());
+    }
+
+    #[test]
+    fn normalize_fqdn_folds_case_and_trailing_dot() {
+        assert_eq!(
+            normalize_fqdn("Primary.Foo.temps.local."),
+            "primary.foo.temps.local"
+        );
+        assert_eq!(normalize_fqdn(" a.temps.local "), "a.temps.local");
+        assert_eq!(normalize_fqdn("a.temps.local"), "a.temps.local");
+    }
+
+    #[test]
+    fn name_claimed_error_names_both_owners() {
+        let refusal = ClaimRefusal {
+            fqdn: "primary.foo.temps.local".into(),
+            owner_kind: OwnerKind::Environment,
+            owner_id: 12,
+            holder_kind: "service_role".into(),
+            holder_id: 4,
+        };
+        let message = refusal.into_error().to_string();
+        assert!(message.contains("'primary.foo.temps.local'"), "{message}");
+        assert!(message.contains("held by service_role 4"), "{message}");
+        assert!(
+            message.contains("environment 12 cannot publish it"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -983,16 +1296,190 @@ mod tests {
         ));
     }
 
+    fn env_draft(owner_id: i64, fqdn: &str, ip: &str) -> EndpointDraft {
+        EndpointDraft {
+            fqdn: fqdn.into(),
+            record_type: RecordType::A,
+            target_ip: Some(ip.into()),
+            target_port: Some(80),
+            ttl: 10,
+            owner_kind: OwnerKind::Environment,
+            owner_id,
+            // node_id left NULL to avoid the FK to `nodes`; ownership is
+            // decided by name, independent of node_id.
+            node_id: None,
+        }
+    }
+
+    async fn rows_named(db: &DatabaseConnection, fqdn: &str) -> Vec<service_endpoints::Model> {
+        service_endpoints::Entity::find()
+            .filter(service_endpoints::Column::Fqdn.eq(fqdn))
+            .order_by_asc(service_endpoints::Column::Id)
+            .all(db)
+            .await
+            .expect("query endpoints")
+    }
+
     #[tokio::test]
-    async fn test_replace_endpoints_idempotent_upsert() {
-        // A re-deploy reuses a node's deterministic container IP, so a new
-        // deployment (a different owner_id) re-publishes the same
-        // (fqdn, record_type, target_ip) tuple that is still owned by the
-        // previous deployment. delete-by-owner clears only the new owner's rows
-        // (none yet), so the insert collides with the old row on
-        // service_endpoints_uniq. Before the ON CONFLICT upsert this aborted the
-        // whole publish and stalled DNS on dead container IPs. Verify the publish
-        // now succeeds and the newest owner/generation wins.
+    async fn test_redeploy_republishes_the_same_name_without_refusal() {
+        // A redeploy re-publishes the same (fqdn, record_type, target_ip):
+        // every deployment of an environment points at the same node bridge
+        // IPs. Before the upsert this aborted the publish and stalled DNS on
+        // dead container IPs; with per-deployment owners the second
+        // deployment had to take the first one's row over. The environment
+        // now owns the name (ADR-055 §10), so a redeploy is the same owner
+        // publishing again: it must succeed, keep one row, and carry the
+        // newest generation.
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+        let fqdn = "production.echo.temps.local";
+
+        let g1 = registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                41,
+                &[env_draft(41, fqdn, "172.20.0.1")],
+            )
+            .await
+            .expect("first publish should succeed");
+        // The redeploy: same environment, same bridge IP.
+        let g2 = registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                41,
+                &[env_draft(41, fqdn, "172.20.0.1")],
+            )
+            .await
+            .expect("a redeploy must publish its name again without a refusal");
+
+        assert!(g2 > g1, "each publish bumps the generation");
+        let rows = rows_named(db.as_ref(), fqdn).await;
+        assert_eq!(rows.len(), 1, "one row per (fqdn, type, ip)");
+        assert_eq!(rows[0].owner_kind, "environment");
+        assert_eq!(rows[0].owner_id, 41);
+        assert_eq!(rows[0].generation, g2, "row carries the newest generation");
+        let claim = registry
+            .claim_for(fqdn)
+            .await
+            .unwrap()
+            .expect("name is claimed");
+        assert_eq!(
+            (claim.owner_kind.as_str(), claim.owner_id),
+            ("environment", 41)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_owner_publish_is_refused_and_recorded() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+        let fqdn = "primary.foo.temps.local";
+
+        // A clustered database `foo` holds its primary name.
+        let role = EndpointDraft {
+            owner_kind: OwnerKind::ServiceRole,
+            owner_id: 4,
+            ..env_draft(0, fqdn, "10.0.0.9")
+        };
+        registry
+            .replace_endpoints_for_owner(OwnerKind::ServiceRole, 4, &[role])
+            .await
+            .unwrap();
+        let before = registry.get_full_zone().await.unwrap();
+
+        // An environment `primary` of project `foo` tries the same name, with
+        // the same address (the old upsert would have taken the row over)
+        // and with another one (it would have merged the answers).
+        for ip in ["10.0.0.9", "172.20.0.1"] {
+            let err = registry
+                .replace_endpoints_for_owner(
+                    OwnerKind::Environment,
+                    12,
+                    &[env_draft(12, "Primary.foo.temps.local.", ip)],
+                )
+                .await
+                .unwrap_err();
+            match &err {
+                DnsRegistryError::NameClaimed {
+                    fqdn: name,
+                    owner_kind,
+                    owner_id,
+                    holder_kind,
+                    holder_id,
+                } => {
+                    assert_eq!(name, fqdn, "the name is normalised");
+                    assert_eq!((owner_kind.as_str(), *owner_id), ("environment", 12));
+                    assert_eq!((holder_kind.as_str(), *holder_id), ("service_role", 4));
+                }
+                other => panic!("expected NameClaimed, got {other:?}"),
+            }
+            let message = err.to_string();
+            assert!(
+                message.contains("service_role 4") && message.contains("environment 12"),
+                "{message}"
+            );
+        }
+
+        let after = registry.get_full_zone().await.unwrap();
+        assert_eq!(
+            after.records, before.records,
+            "a refused publish writes nothing"
+        );
+        assert_eq!(
+            after.generation, before.generation,
+            "nor bumps the generation"
+        );
+
+        let conflicts = registry.list_name_conflicts().await.unwrap();
+        assert_eq!(conflicts.len(), 1, "repeats update one conflict row");
+        assert_eq!(conflicts[0].fqdn, fqdn);
+        assert_eq!(
+            (conflicts[0].owner_kind.as_str(), conflicts[0].owner_id),
+            ("environment", 12)
+        );
+        assert_eq!(
+            (conflicts[0].holder_kind.as_str(), conflicts[0].holder_id),
+            ("service_role", 4)
+        );
+        assert!(conflicts[0].last_seen_at >= conflicts[0].first_seen_at);
+
+        // The holder goes away: the name is free, and the environment's next
+        // publish claims it and clears its conflict.
+        registry
+            .delete_by_owner(OwnerKind::ServiceRole, 4)
+            .await
+            .unwrap();
+        assert!(
+            registry.claim_for(fqdn).await.unwrap().is_none(),
+            "deleting releases the claim"
+        );
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                12,
+                &[env_draft(12, fqdn, "172.20.0.1")],
+            )
+            .await
+            .expect("a released name can be claimed");
+        assert!(registry.list_name_conflicts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_publish_releases_names_it_stops_using() {
         let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
@@ -1003,42 +1490,111 @@ mod tests {
         let db = test_db.connection_arc();
         let registry = DnsRegistry::new(db.clone());
 
-        let draft = |owner_id: i64| EndpointDraft {
-            fqdn: "production.echo.temps.local".into(),
-            record_type: RecordType::A,
-            target_ip: Some("172.20.0.5".into()),
-            target_port: Some(80),
-            ttl: 10,
-            owner_kind: OwnerKind::Deployment,
-            owner_id,
-            // node_id left NULL to avoid the FK to `nodes` (the conflict under
-            // test is on (fqdn, record_type, target_ip), independent of node_id).
-            node_id: None,
+        // An environment renamed from `staging` to `preview`.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                5,
+                &[env_draft(5, "staging.shop.temps.local", "172.20.0.1")],
+            )
+            .await
+            .unwrap();
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                5,
+                &[env_draft(5, "preview.shop.temps.local", "172.20.0.1")],
+            )
+            .await
+            .unwrap();
+        assert!(registry
+            .claim_for("staging.shop.temps.local")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(rows_named(db.as_ref(), "staging.shop.temps.local")
+            .await
+            .is_empty());
+
+        // Another environment can now take the old name.
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                6,
+                &[env_draft(6, "staging.shop.temps.local", "172.20.0.1")],
+            )
+            .await
+            .expect("the released name is free");
+    }
+
+    #[tokio::test]
+    async fn test_holder_replaces_leftover_rows_from_a_rolled_back_binary() {
+        // A binary older than the claims publishes as `deployment` and
+        // ignores claims. After upgrading again, the environment, which
+        // holds the name, must not be stuck behind those rows.
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
         };
-
-        // Deployment 100 publishes its endpoint.
-        let g1 = registry
-            .replace_endpoints_for_owner(OwnerKind::Deployment, 100, &[draft(100)])
+        let db = test_db.connection_arc();
+        let registry = DnsRegistry::new(db.clone());
+        let fqdn = "production.shop.temps.local";
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                9,
+                &[env_draft(9, fqdn, "172.20.0.1")],
+            )
             .await
-            .expect("first publish should succeed");
-
-        // Deployment 200 re-deploys onto the same node, reusing the same IP.
-        let g2 = registry
-            .replace_endpoints_for_owner(OwnerKind::Deployment, 200, &[draft(200)])
+            .unwrap();
+        // What the old binary writes: same name, its own owner, same IP and
+        // a second node's IP.
+        for ip in ["172.20.0.1", "172.20.1.1"] {
+            db.execute(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "INSERT INTO service_endpoints (fqdn, record_type, target_ip, target_port, ttl, \
+                 owner_kind, owner_id, generation) VALUES ($1, 'A', $2, 80, 10, 'deployment', 77, 1) \
+                 ON CONFLICT (fqdn, record_type, target_ip) DO UPDATE SET owner_kind = 'deployment', owner_id = 77",
+                [fqdn.into(), ip.into()],
+            ))
             .await
-            .expect("re-deploy reusing the IP must upsert, not violate the unique index");
+            .unwrap();
+        }
 
-        assert!(g2 > g1, "each publish bumps the generation");
-
-        // Exactly one row for the tuple, now owned by deployment 200 at gen g2.
-        let rows = service_endpoints::Entity::find()
-            .filter(service_endpoints::Column::Fqdn.eq("production.echo.temps.local"))
-            .all(db.as_ref())
+        registry
+            .replace_endpoints_for_owner(
+                OwnerKind::Environment,
+                9,
+                &[
+                    env_draft(9, fqdn, "172.20.0.1"),
+                    env_draft(9, fqdn, "172.20.2.1"),
+                ],
+            )
             .await
-            .expect("query endpoints");
-        assert_eq!(rows.len(), 1, "upsert keeps one row per (fqdn, type, ip)");
-        assert_eq!(rows[0].owner_id, 200, "newest owner wins");
-        assert_eq!(rows[0].generation, g2, "row carries the newest generation");
+            .expect("the holder republishes over leftovers");
+        let rows = rows_named(db.as_ref(), fqdn).await;
+        let mut got: Vec<_> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.owner_kind.clone(),
+                    r.owner_id,
+                    r.target_ip.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                ("environment".to_string(), 9, "172.20.0.1".to_string()),
+                ("environment".to_string(), 9, "172.20.2.1".to_string()),
+            ],
+            "leftovers under a held name are replaced, not merged"
+        );
     }
 
     #[tokio::test]

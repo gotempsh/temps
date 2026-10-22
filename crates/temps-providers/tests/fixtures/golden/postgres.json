@@ -1,0 +1,99 @@
+[
+  {
+    "body": {
+      "HostConfig": {
+        "Mounts": [
+          {
+            "Source": "postgres-golden_data",
+            "Target": "/var/lib/postgresql",
+            "Type": "volume"
+          }
+        ]
+      },
+      "Image": "gotempsh/postgres-walg:18-bookworm"
+    },
+    "name": "postgres-golden_data-walg-probe",
+    "platform": null
+  },
+  {
+    "body": {
+      "Cmd": [
+        "postgres",
+        "-c",
+        "max_connections=100",
+        "-c",
+        "wal_level=replica",
+        "-c",
+        "archive_mode=off",
+        "-c",
+        "archive_timeout=60",
+        "-c",
+        "shared_preload_libraries=pg_stat_statements"
+      ],
+      "Env": [
+        "PGDATA=/var/lib/postgresql/18/docker",
+        "POSTGRES_DB=postgres",
+        "POSTGRES_HOST_AUTH_METHOD=md5",
+        "POSTGRES_PASSWORD=testpass123",
+        "POSTGRES_USER=postgres"
+      ],
+      "ExposedPorts": {
+        "5432/tcp": {}
+      },
+      "Healthcheck": {
+        "Interval": 1000000000,
+        "Retries": 3,
+        "StartInterval": 1000000000,
+        "StartPeriod": 30000000000,
+        "Test": [
+          "CMD-SHELL",
+          "pg_isready -U 'postgres' -d 'postgres'"
+        ],
+        "Timeout": 3000000000
+      },
+      "HostConfig": {
+        "LogConfig": {
+          "Config": {
+            "max-file": "3",
+            "max-size": "20m"
+          },
+          "Type": "json-file"
+        },
+        "Mounts": [
+          {
+            "Source": "postgres-golden_data",
+            "Target": "/var/lib/postgresql",
+            "Type": "volume"
+          }
+        ],
+        "PidsLimit": 512,
+        "PortBindings": {
+          "5432/tcp": [
+            {
+              "HostIp": "127.0.0.1",
+              "HostPort": "15432"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "always"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ]
+      },
+      "Image": "gotempsh/postgres-walg:18-bookworm",
+      "Labels": {
+        "temps.service_name": "golden",
+        "temps.service_type": "postgres"
+      },
+      "NetworkingConfig": {
+        "EndpointsConfig": {
+          "temps-app-network": {}
+        }
+      }
+    },
+    "name": "postgres-golden",
+    "platform": null
+  }
+]

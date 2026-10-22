@@ -1,0 +1,68 @@
+[
+  {
+    "body": {
+      "Env": [
+        "MONGO_INITDB_DATABASE=admin",
+        "MONGO_INITDB_ROOT_PASSWORD=testpass123",
+        "MONGO_INITDB_ROOT_USERNAME=root"
+      ],
+      "ExposedPorts": {
+        "27017/tcp": {}
+      },
+      "Healthcheck": {
+        "Interval": 2000000000,
+        "Retries": 5,
+        "StartInterval": 2000000000,
+        "StartPeriod": 45000000000,
+        "Test": [
+          "CMD-SHELL",
+          "mongosh --norc --quiet --eval 'db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME, process.env.MONGO_INITDB_ROOT_PASSWORD); db.adminCommand({ping: 1})' || exit 1"
+        ],
+        "Timeout": 10000000000
+      },
+      "HostConfig": {
+        "LogConfig": {
+          "Config": {
+            "max-file": "3",
+            "max-size": "20m"
+          },
+          "Type": "json-file"
+        },
+        "Mounts": [
+          {
+            "Source": "temps-mongodb-golden-data",
+            "Target": "/data/db",
+            "Type": "volume"
+          }
+        ],
+        "PidsLimit": 512,
+        "PortBindings": {
+          "27017/tcp": [
+            {
+              "HostIp": "127.0.0.1",
+              "HostPort": "17017"
+            }
+          ]
+        },
+        "RestartPolicy": {
+          "Name": "always"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ]
+      },
+      "Image": "gotempsh/mongodb-walg:8.0",
+      "Labels": {
+        "temps.name": "golden",
+        "temps.service": "mongodb"
+      },
+      "NetworkingConfig": {
+        "EndpointsConfig": {
+          "temps-app-network": {}
+        }
+      }
+    },
+    "name": "temps-mongodb-golden",
+    "platform": null
+  }
+]

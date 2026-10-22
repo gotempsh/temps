@@ -1,0 +1,50 @@
+{
+  "body": {
+    "Env": [
+      "NODE_ENV=production",
+      "PORT=3000"
+    ],
+    "ExposedPorts": {
+      "3000/tcp": {}
+    },
+    "HostConfig": {
+      "CapDrop": [
+        "ALL"
+      ],
+      "Init": true,
+      "LogConfig": {
+        "Config": {
+          "max-file": "3",
+          "max-size": "50m"
+        },
+        "Type": "json-file"
+      },
+      "Memory": 536870912,
+      "MemorySwap": 536870912,
+      "NanoCpus": 500000000,
+      "NetworkMode": "temps-app-network",
+      "PidsLimit": 512,
+      "PortBindings": {
+        "3000/tcp": [
+          {
+            "HostIp": "127.0.0.1"
+          }
+        ]
+      },
+      "RestartPolicy": {
+        "Name": "on-failure"
+      },
+      "SecurityOpt": [
+        "no-new-privileges:true"
+      ]
+    },
+    "Image": "registry.example.test/shop/web:4f2a9c1",
+    "Labels": {
+      "sh.temps.deploy_id": "31",
+      "sh.temps.environment": "production",
+      "sh.temps.project_id": "7"
+    }
+  },
+  "name": "shop-production-31",
+  "platform": null
+}

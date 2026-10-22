@@ -61,6 +61,8 @@ base64 = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 tempfile = "3"
 # `test-util` provides the paused clock the build-queue tests use.
 tokio = { workspace = true, features = ["test-util"] }

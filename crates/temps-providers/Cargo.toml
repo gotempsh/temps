@@ -69,6 +69,8 @@ hex = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 tokio-test = "0.4"
 testcontainers = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }

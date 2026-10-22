@@ -1,0 +1,32 @@
+{
+  "body": {
+    "Cmd": [
+      "bin/worker",
+      "--queue",
+      "default"
+    ],
+    "Env": [
+      "NODE_ENV=production",
+      "PORT=3000"
+    ],
+    "ExposedPorts": {},
+    "HostConfig": {
+      "CapDrop": [
+        "ALL"
+      ],
+      "Init": true,
+      "NetworkMode": "temps-app-network",
+      "PidsLimit": 512,
+      "PortBindings": {},
+      "RestartPolicy": {
+        "Name": "always"
+      },
+      "SecurityOpt": [
+        "no-new-privileges:true"
+      ]
+    },
+    "Image": "registry.example.test/shop/web:4f2a9c1"
+  },
+  "name": "worker-production-12",
+  "platform": null
+}

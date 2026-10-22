@@ -13,7 +13,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use temps_entities::{
-    deployment_containers, deployments, environments, nodes, projects, sandboxes,
+    deployment_containers, deployments, environments, external_services, nodes, projects,
+    sandboxes, service_members,
 };
 
 /// `deployment_containers.status` for a container Temps confirmed is gone from
@@ -305,6 +306,24 @@ pub enum NodeError {
         count: u64,
     },
 
+    /// `external_services.node_id` and `service_members.node_id` are `ON
+    /// DELETE SET NULL`, and NULL means "the control plane": removing the
+    /// node would silently re-home these databases onto the control plane,
+    /// where none of their containers or data exist (ADR-055 defect 10).
+    #[error(
+        "Node '{node_name}' (id {node_id}) still hosts {} managed service(s): {}. Removing it \
+         would silently re-home them onto the control plane, where their containers and data \
+         do not exist. Delete them, or move them to another node, before removing the node",
+        services.len(),
+        describe_services(services)
+    )]
+    HostsManagedServices {
+        node_id: i32,
+        node_name: String,
+        /// Services on the node, or with a cluster member on it.
+        services: Vec<NodeServiceReference>,
+    },
+
     #[error(
         "Node '{node_name}' (id {node_id}) still has {count} container(s) of current or \
          in-progress deployments, or of the deployment a rollout in progress would fall back \
@@ -478,6 +497,28 @@ pub enum NodeError {
 
     #[error("DNS registry operation failed: {0}")]
     DnsRegistry(#[from] temps_dns::DnsRegistryError),
+}
+
+/// A managed service that blocks a node's removal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeServiceReference {
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+}
+
+/// `postgres 'orders' (id 4), ...` for messages.
+fn describe_services(services: &[NodeServiceReference]) -> String {
+    services
+        .iter()
+        .map(|s| {
+            format!(
+                "{} '{}' (id {})",
+                s.service_type, s.service_name, s.service_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The row a [`NodePlacementReference`] was read from, to rewrite it.
@@ -1706,6 +1747,15 @@ impl NodeService {
         Ok(count)
     }
 
+    /// Internal DNS names refused because another owner holds them
+    /// (ADR-055 §10), oldest first.
+    pub async fn dns_name_conflicts(
+        &self,
+    ) -> Result<Vec<temps_entities::dns_name_conflicts::Model>, NodeError> {
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        Ok(dns_registry.list_name_conflicts().await?)
+    }
+
     /// List only active nodes (heartbeat within the threshold).
     pub async fn list_active(
         &self,
@@ -1925,7 +1975,9 @@ impl NodeService {
     /// Refused while the node hosts live sandboxes (ADR-048): the
     /// `sandboxes.node_id` FK is `ON DELETE SET NULL`, so deleting the row
     /// would silently re-home those sandboxes to the control plane, where no
-    /// container exists for them.
+    /// container exists for them. Refused for the same reason while it hosts
+    /// a managed service or a cluster member
+    /// ([`NodeError::HostsManagedServices`]).
     ///
     /// The node's internal DNS records are deleted in the same transaction,
     /// so resolvers stop answering with its addresses as soon as it is gone.
@@ -1975,6 +2027,17 @@ impl NodeService {
                 node_id,
                 node_name: locked.name,
                 count: live_sandboxes,
+            });
+        }
+        // Same lock argument as sandboxes: a service or member insert takes a
+        // KEY SHARE lock on the node row through its `node_id` foreign key,
+        // so it is either committed and counted here, or fails afterwards.
+        let services = Self::managed_services_on(&txn, node_id).await?;
+        if !services.is_empty() {
+            return Err(NodeError::HostsManagedServices {
+                node_id,
+                node_name: locked.name,
+                services,
             });
         }
         // Checked again under the lock: a deployment may have placed a
@@ -2439,6 +2502,36 @@ impl NodeService {
     /// A node cannot be removed while this is non-zero.
     pub async fn live_sandbox_count(&self, node_id: i32) -> Result<u64, NodeError> {
         Self::live_sandbox_count_on(self.db.as_ref(), node_id).await
+    }
+
+    /// Managed services placed on `node_id`, or with a cluster member there,
+    /// in id order. One query.
+    async fn managed_services_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+    ) -> Result<Vec<NodeServiceReference>, NodeError> {
+        let members_here = sea_orm::sea_query::Query::select()
+            .column(service_members::Column::ServiceId)
+            .from(service_members::Entity)
+            .and_where(service_members::Column::NodeId.eq(node_id))
+            .to_owned();
+        let services = external_services::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::NodeId.eq(node_id))
+                    .add(external_services::Column::Id.in_subquery(members_here)),
+            )
+            .order_by_asc(external_services::Column::Id)
+            .all(db)
+            .await?;
+        Ok(services
+            .into_iter()
+            .map(|s| NodeServiceReference {
+                service_id: s.id,
+                service_name: s.name,
+                service_type: s.service_type,
+            })
+            .collect())
     }
 
     async fn live_sandbox_count_on<C: sea_orm::ConnectionTrait>(
@@ -3192,6 +3285,8 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // no managed service or cluster member on the node
+            .append_query_results(vec![Vec::<external_services::Model>::new()])
             // nothing serving on the node under the lock
             .append_query_results(vec![vec![count_row(0)]])
             // no environment or project targets the node
@@ -3221,6 +3316,7 @@ mod tests {
         let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
             .append_query_results(vec![vec![count_row(0)]]) // no live sandboxes
+            .append_query_results(vec![Vec::<external_services::Model>::new()]) // no managed services
             .append_query_results(vec![vec![count_row(1)]]) // one serving container
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -3500,6 +3596,107 @@ mod tests {
             zone.generation > before,
             "resolvers must see the removal as a new generation"
         );
+    }
+
+    /// A managed service row of `topology`, placed on `node_id`.
+    async fn seed_service(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        topology: &str,
+        node_id: Option<i32>,
+    ) -> external_services::Model {
+        external_services::ActiveModel {
+            name: Set(name.to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set(topology.to_string()),
+            node_id: Set(node_id),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    /// ADR-055 phase 0: a node that hosts a database, directly or as a
+    /// cluster member, cannot be removed. Removal used to succeed and the
+    /// `ON DELETE SET NULL` on `external_services.node_id` silently moved
+    /// the service onto the control plane, where no container exists.
+    #[tokio::test]
+    async fn test_remove_refuses_a_node_that_hosts_managed_services() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-db", "hash", "https://10.100.0.3:3100"))
+            .await
+            .unwrap();
+
+        let standalone = seed_service(db.as_ref(), "orders-db", "standalone", Some(node.id)).await;
+        // A cluster whose service row sits on the control plane but has a
+        // member on the worker.
+        let cluster = seed_service(db.as_ref(), "cache-cluster", "cluster", None).await;
+        let member = service_members::ActiveModel {
+            service_id: Set(cluster.id),
+            node_id: Set(Some(node.id)),
+            role: Set("replica".to_string()),
+            container_name: Set("cache-cluster-1".to_string()),
+            status: Set("running".to_string()),
+            ordinal: Set(1),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        // A service elsewhere must not be listed.
+        seed_service(db.as_ref(), "elsewhere-db", "standalone", None).await;
+
+        let err = service.remove(node.id).await.unwrap_err();
+        match &err {
+            NodeError::HostsManagedServices {
+                node_id, services, ..
+            } => {
+                assert_eq!(*node_id, node.id);
+                let ids: Vec<_> = services.iter().map(|s| s.service_id).collect();
+                assert_eq!(ids, vec![standalone.id, cluster.id]);
+            }
+            other => panic!("expected HostsManagedServices, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("orders-db") && message.contains("cache-cluster"),
+            "{message}"
+        );
+
+        // Nothing moved: the services still point at the node.
+        let reloaded = external_services::Entity::find_by_id(standalone.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.node_id, Some(node.id));
+        assert!(nodes::Entity::find_by_id(node.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+
+        // Once both are gone from the node, it can be removed.
+        service_members::Entity::delete_by_id(member.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        external_services::Entity::delete_by_id(standalone.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        service.remove(node.id).await.unwrap();
     }
 
     /// Regression: removing a node while a route reload republishes its DNS

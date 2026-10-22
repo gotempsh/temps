@@ -72,6 +72,8 @@ pub mod deployments;
 pub mod dns_instance_identity;
 pub mod dns_managed_domains;
 pub mod dns_managed_record_states;
+pub mod dns_name_claims;
+pub mod dns_name_conflicts;
 pub mod dns_providers;
 pub mod dns_reconciliation_runs;
 pub mod domain_delivery_bindings;

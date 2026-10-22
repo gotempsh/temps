@@ -68,3 +68,5 @@ tempfile = { workspace = true }
 microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
