@@ -3945,7 +3945,279 @@ fn ip_restriction_denies(
 static IP_DENY_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
     crate::ip_access::DenyLogLimiter::new(10, 20);
 
-fn legacy_ip_gate_denies(
+/// The 426 page attack mode answers a request with no TLS fingerprint.
+const HTTPS_REQUIRED_HTML: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTTPS Required</title>
+    <style>
+        body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .container { background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
+        h1 { color: #1a202c; margin-bottom: 16px; }
+        p { color: #4a5568; line-height: 1.6; }
+        .icon { font-size: 64px; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔒</div>
+        <h1>HTTPS Required</h1>
+        <p>This site requires a secure connection (HTTPS) for enhanced security and bot protection.</p>
+        <p>Please use <strong>https://</strong> instead of http://</p>
+    </div>
+</body>
+</html>"#;
+
+/// Caps "shadow evaluation disagrees" log lines at 20 per 10 seconds,
+/// process-wide. Every disagreement is counted in
+/// `proxy.ingress_shadow_mismatches`; only the log line is limited.
+static INGRESS_SHADOW_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
+    crate::ip_access::DenyLogLimiter::new(10, 20);
+
+/// The request facts [`LoadBalancer::decide_environment_access`] reads.
+/// Plain borrows, so the decision can await the captcha cache without
+/// holding the request context.
+struct AccessRequest<'a> {
+    request: &'a RequestHeader,
+    host: &'a str,
+    path: &'a str,
+    tls_fingerprint: Option<&'a str>,
+    policy_decision: temps_core::RequestPolicyDecision,
+    ip_restricted: bool,
+    client_ip: Option<std::net::IpAddr>,
+    rate_limit: Option<crate::rate_limiter::ResolvedRateLimit<'a>>,
+    password: Option<crate::ingress::PasswordFacts>,
+}
+
+impl LoadBalancer {
+    /// Whether the client with `fingerprint` completed this environment's
+    /// captcha. One moka cache read; a cache or database error reads as
+    /// "not completed", which shows the challenge again.
+    async fn captcha_completed(&self, environment_id: i32, fingerprint: Option<&str>) -> bool {
+        let Some(fingerprint) = fingerprint else {
+            return false;
+        };
+        self.challenge_service
+            .is_challenge_completed(environment_id, fingerprint, "ja4")
+            .await
+            .unwrap_or(false)
+    }
+
+    /// The access decision for an environment request (ADR-055 §11).
+    ///
+    /// `legacy` runs the legacy chain. `enforce` runs the environment's
+    /// compiled endpoint when the route snapshot has one, refuses when its
+    /// endpoint did not compile, and otherwise (a reload in flight) runs
+    /// the legacy chain. `shadow` decides with the legacy chain and also
+    /// evaluates the endpoint from the facts the chain recorded, counting
+    /// every disagreement.
+    ///
+    /// The endpoint stands in for the legacy chain only behind the default
+    /// request policy (`Continue`) and an IP gate that reads the
+    /// `project_ip_access_rules` table the endpoint's IP policy is derived
+    /// from; behind anything else the legacy chain decides.
+    ///
+    /// No lock, no I/O and no allocation beyond the legacy chain's own: one
+    /// snapshot refcount, the compiled policies, the shared rate-limit
+    /// counters and, only for a captcha, the same cache read as before.
+    async fn decide_environment_access(
+        &self,
+        project_ctx: &ProjectContext,
+        access: AccessRequest<'_>,
+    ) -> crate::ingress::AccessOutcome {
+        use crate::ingress::{
+            enforce_step, grant_host, legacy_access, legacy_after_captcha, shadow_step,
+            AccessOutcome, EndpointRequest, GrantFacts, LegacyFacts, LegacyRequest, Step,
+        };
+        use temps_entities::ingress_mode::IngressMode;
+
+        let environment = &project_ctx.environment;
+        let environment_id = environment.id;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // The captcha's own assets and verification bypass attack mode.
+        let captcha_path = access.path.starts_with("/api/_temps/captcha")
+            || access.path.starts_with("/api/__temps/temps_captcha_wasm");
+        let has_tls_fingerprint = access.tls_fingerprint.is_some();
+        let mode = environment.ingress_mode;
+
+        let snapshot = if mode.compiles()
+            && matches!(
+                access.policy_decision,
+                temps_core::RequestPolicyDecision::Continue
+            )
+            && self.project_ip_gate.reads_project_ip_access_rules()
+        {
+            self.route_table
+                .as_ref()
+                .map(|table| table.ingress_snapshot())
+        } else {
+            None
+        };
+        let endpoint = snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.environment_endpoint(environment_id, access.path));
+        let broken = snapshot
+            .as_deref()
+            .is_some_and(|snapshot| snapshot.is_broken(environment_id));
+        let mut host_buffer = [0u8; 256];
+        let host = grant_host(access.host, &mut host_buffer);
+
+        if mode == IngressMode::Enforce {
+            if let (Some(snapshot), Some(endpoint)) = (snapshot.as_deref(), endpoint) {
+                let request = EndpointRequest {
+                    request: access.request,
+                    environment_id,
+                    client_ip: access.client_ip,
+                    captcha_path,
+                    has_tls_fingerprint,
+                    password: access.password,
+                    grants: GrantFacts {
+                        master: self.crypto.ingress_grant_master_key(),
+                        revocations: snapshot.revocations(),
+                        host,
+                        now_secs,
+                    },
+                };
+                return match enforce_step(endpoint, &request, &self.rate_limiter, false, 0) {
+                    Step::Done(outcome) => outcome,
+                    Step::NeedsCaptcha { resume_at } => {
+                        if !self
+                            .captcha_completed(environment_id, access.tls_fingerprint)
+                            .await
+                        {
+                            AccessOutcome::CaptchaChallenge
+                        } else {
+                            match enforce_step(
+                                endpoint,
+                                &request,
+                                &self.rate_limiter,
+                                true,
+                                resume_at,
+                            ) {
+                                Step::Done(outcome) => outcome,
+                                Step::NeedsCaptcha { .. } => AccessOutcome::CaptchaChallenge,
+                            }
+                        }
+                    }
+                };
+            }
+            if broken {
+                return AccessOutcome::Unavailable;
+            }
+        }
+
+        let legacy = LegacyRequest {
+            client_ip: access.client_ip,
+            ip_restricted: access.ip_restricted,
+            rate_limit: access.rate_limit,
+            attack_mode: environment
+                .attack_mode
+                .unwrap_or(project_ctx.project.attack_mode),
+            captcha_path,
+            has_tls_fingerprint,
+            password: access.password,
+        };
+        let mut facts = LegacyFacts::default();
+        let outcome = match legacy_access(&legacy, &self.rate_limiter, now_secs, &mut facts) {
+            Step::Done(outcome) => outcome,
+            Step::NeedsCaptcha { .. } => {
+                let completed = self
+                    .captcha_completed(environment_id, access.tls_fingerprint)
+                    .await;
+                legacy_after_captcha(&legacy, completed, &mut facts)
+            }
+        };
+
+        if mode == IngressMode::Shadow {
+            let shadow = match (snapshot.as_deref(), endpoint) {
+                (Some(snapshot), Some(endpoint)) => {
+                    let request = EndpointRequest {
+                        request: access.request,
+                        environment_id,
+                        client_ip: access.client_ip,
+                        captcha_path,
+                        has_tls_fingerprint,
+                        password: access.password,
+                        grants: GrantFacts {
+                            master: self.crypto.ingress_grant_master_key(),
+                            revocations: snapshot.revocations(),
+                            host,
+                            now_secs,
+                        },
+                    };
+                    Some((endpoint.id, shadow_step(endpoint, &request, &facts)))
+                }
+                // Enforcing would refuse this request.
+                _ if broken => Some((0, AccessOutcome::Unavailable)),
+                // No endpoint yet (a reload in flight): nothing to compare.
+                _ => None,
+            };
+            if let Some((endpoint_id, shadow)) = shadow {
+                let mismatch = shadow.response_class() != outcome.response_class();
+                self.proxy_metrics.record_ingress_shadow(mismatch);
+                if mismatch {
+                    if let Some(suppressed) = INGRESS_SHADOW_LOG_LIMITER.admit(now_secs) {
+                        warn!(
+                            environment_id,
+                            project_id = project_ctx.project.id,
+                            endpoint_id,
+                            legacy = outcome.label(),
+                            endpoint = shadow.label(),
+                            suppressed_since_last_log = suppressed,
+                            "Ingress shadow evaluation disagrees with the legacy access chain"
+                        );
+                    }
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Answers a `TempsLogin` exchange at
+    /// [`GRANT_EXCHANGE_PATH`](crate::ingress::GRANT_EXCHANGE_PATH): only
+    /// reached when the environment enforces a compiled endpoint that asked
+    /// for a login. Once per sign-in, so it may allocate.
+    fn exchange_ingress_grant(
+        &self,
+        environment_id: i32,
+        host: &str,
+        query: Option<&str>,
+        secure: bool,
+    ) -> Result<crate::ingress::SessionExchange, crate::ingress::ExchangeError> {
+        let owner = temps_workload_ingress::ProductRef {
+            kind: temps_workload_ingress::ProductKind::Environment,
+            id: i64::from(environment_id),
+        };
+        let snapshot = self
+            .route_table
+            .as_ref()
+            .map(|table| table.ingress_snapshot());
+        let endpoint = snapshot.as_deref().and_then(|snapshot| {
+            snapshot.environment_endpoint(environment_id, crate::ingress::GRANT_EXCHANGE_PATH)
+        });
+        let (Some(snapshot), Some(endpoint)) = (snapshot.as_deref(), endpoint) else {
+            return Err(crate::ingress::ExchangeError::NotLoginProtected { owner });
+        };
+        let mut host_buffer = [0u8; 256];
+        let grants = crate::ingress::GrantFacts {
+            master: self.crypto.ingress_grant_master_key(),
+            revocations: snapshot.revocations(),
+            host: crate::ingress::grant_host(host, &mut host_buffer),
+            now_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        crate::ingress::exchange_grant(endpoint, &grants, query, secure)
+    }
+}
+
+pub(crate) fn legacy_ip_gate_denies(
     decision: temps_core::RequestPolicyDecision,
     gate: &dyn temps_core::ProjectIpGate,
     project_id: i32,
@@ -3964,7 +4236,7 @@ fn legacy_ip_gate_denies(
     }
 }
 
-fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+pub(crate) fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
@@ -6249,41 +6521,20 @@ impl ProxyHttp for LoadBalancer {
                 ctx.routing_status = "request_policy_unavailable".to_string();
                 return Ok(true);
             }
-            if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
-                match decision {
-                    temps_core::RequestPolicyDecision::Deny {
-                        reason,
-                        rule_id,
-                        revision,
-                    } => warn!(
-                        project_id = project_ctx.project.id,
-                        environment_id = project_ctx.environment.id,
-                        reason,
-                        rule_id,
-                        revision,
-                        "Request denied by project policy"
-                    ),
-                    _ => {
-                        // Counted for every denial; logged through a
-                        // process-wide limiter so a scan against a locked
-                        // project cannot flood the log (the counter keeps
-                        // the true rate).
-                        self.proxy_metrics.record_ip_access_denied();
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
-                            warn!(
-                                environment_id = project_ctx.environment.id,
-                                project_id = project_ctx.project.id,
-                                ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                                suppressed_since_last_log = suppressed,
-                                "Request denied by project IP restriction"
-                            );
-                        }
-                    }
-                }
+            if let temps_core::RequestPolicyDecision::Deny {
+                reason,
+                rule_id,
+                revision,
+            } = decision
+            {
+                warn!(
+                    project_id = project_ctx.project.id,
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    rule_id,
+                    revision,
+                    "Request denied by project policy"
+                );
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
                 response.insert_header("X-Request-ID", &ctx.request_id)?;
@@ -6294,118 +6545,302 @@ impl ProxyHttp for LoadBalancer {
                 session
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
-                ctx.routing_status =
-                    if matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
-                        "request_policy_denied"
-                    } else {
-                        "project_ip_restricted"
-                    }
-                    .to_string();
+                ctx.routing_status = "request_policy_denied".to_string();
                 return Ok(true);
             }
 
-            // Per-client-IP rate limits and rate-limit blacklists (issue
-            // #1288). Runs after the IP restriction gate so a denied caller
-            // never consumes budget. An unresolvable client IP is not
-            // limited: there is nothing to attribute the request to, and the
-            // IP gate above already fails closed where a policy requires it.
-            if let Some(client_ip) = parsed_ip {
-                if let Some(resolved) = crate::rate_limiter::resolve_policy(
-                    &instance_rate_limiting,
-                    effective_config.security.as_ref(),
-                    project_ctx.environment.id,
-                ) {
+            // The access decision (ADR-055 §11): the legacy chain, or the
+            // environment's compiled ingress endpoint, as its
+            // `ingress_mode` says. Either way it is one `AccessOutcome`,
+            // answered below by the same responses.
+            let password_protection = project_ctx
+                .environment
+                .deployment_config
+                .as_ref()
+                .and_then(|dc| dc.security.as_ref())
+                .and_then(|s| s.password_protection.as_ref())
+                .filter(|pp| pp.enabled);
+            let access_outcome = self
+                .decide_environment_access(
+                    project_ctx,
+                    AccessRequest {
+                        request: session.req_header(),
+                        host: &ctx.host,
+                        path: &ctx.path,
+                        tls_fingerprint: ctx.tls_fingerprint.as_deref(),
+                        policy_decision: decision,
+                        ip_restricted,
+                        client_ip: parsed_ip,
+                        rate_limit: crate::rate_limiter::resolve_policy(
+                            &instance_rate_limiting,
+                            effective_config.security.as_ref(),
+                            project_ctx.environment.id,
+                        ),
+                        password: password_protection.map(|pp| crate::ingress::PasswordFacts {
+                            verify_post: ctx.path
+                                == crate::handler::password_wall::PASSWORD_VERIFY_PATH
+                                && ctx.method == "POST",
+                            cookie_valid: find_request_cookie(
+                                session.req_header(),
+                                crate::handler::password_wall::PASSWORD_COOKIE_NAME,
+                                |value| {
+                                    crate::handler::password_wall::validate_cookie(
+                                        value,
+                                        project_ctx.environment.id,
+                                        &pp.password_hash,
+                                    )
+                                    .then_some(true)
+                                },
+                            )
+                            .unwrap_or(false),
+                        }),
+                    },
+                )
+                .await;
+
+            match access_outcome {
+                crate::ingress::AccessOutcome::Allow
+                | crate::ingress::AccessOutcome::PasswordWall => {}
+                crate::ingress::AccessOutcome::IpForbidden
+                | crate::ingress::AccessOutcome::Forbidden => {
+                    // Counted for every denial; logged through a
+                    // process-wide limiter so a scan against a locked
+                    // project cannot flood the log (the counter keeps
+                    // the true rate).
+                    self.proxy_metrics.record_ip_access_denied();
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    match resolved.check(&self.rate_limiter, client_ip, now_secs) {
-                        crate::rate_limiter::RateLimitDecision::Allow => {}
-                        crate::rate_limiter::RateLimitDecision::Blacklisted => {
-                            self.proxy_metrics.record_rate_limited();
+                    if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
+                        warn!(
+                            environment_id = project_ctx.environment.id,
+                            project_id = project_ctx.project.id,
+                            ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                            outcome = access_outcome.label(),
+                            suppressed_since_last_log = suppressed,
+                            "Request denied by project IP restriction"
+                        );
+                    }
+                    // A generic 403 with no detail: an unauthenticated
+                    // caller must not be able to tell "this project is
+                    // restricted" from "this project does not exist".
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                        .await?;
+                    ctx.routing_status =
+                        if access_outcome == crate::ingress::AccessOutcome::IpForbidden {
+                            "project_ip_restricted"
+                        } else {
+                            "ingress_forbidden"
+                        }
+                        .to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::Blacklisted => {
+                    self.proxy_metrics.record_rate_limited();
+                    warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        "Request denied by rate-limit blacklist"
+                    );
+                    // Same generic 403 as the IP restriction above.
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                        .await?;
+                    ctx.routing_status = "rate_limit_blacklisted".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::TooManyRequests {
+                    window,
+                    retry_after_secs,
+                } => {
+                    self.proxy_metrics.record_rate_limited();
+                    debug!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        window = window.as_str(),
+                        "Request rejected by rate limit"
+                    );
+                    let mut response = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                    response.insert_header("Retry-After", retry_after_secs.to_string())?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Too Many Requests\n")), true)
+                        .await?;
+                    ctx.routing_status = "rate_limited".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::Unavailable => {
+                    warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        "Environment enforces an ingress endpoint that did not compile; refusing the request"
+                    );
+                    let mut response =
+                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(
+                            Some(Bytes::from_static(b"Service unavailable\n")),
+                            true,
+                        )
+                        .await?;
+                    ctx.routing_status = "ingress_endpoint_unavailable".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::LoginRequired
+                    if ctx.path == crate::ingress::GRANT_EXCHANGE_PATH =>
+                {
+                    let secure = self.is_https_request(session);
+                    let exchange = self.exchange_ingress_grant(
+                        project_ctx.environment.id,
+                        &ctx.host,
+                        ctx.query_string.as_deref(),
+                        secure,
+                    );
+                    let mut response = match exchange {
+                        Ok(exchange) => {
+                            info!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                grant_id = exchange.grant_id,
+                                user_id = exchange.user_id,
+                                "Temps login grant exchanged for an ingress session"
+                            );
+                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+                            response.insert_header("Location", exchange.location)?;
+                            response.insert_header("Set-Cookie", exchange.set_cookie)?;
+                            response
+                        }
+                        Err(error) => {
                             warn!(
                                 project_id = project_ctx.project.id,
                                 environment_id = project_ctx.environment.id,
-                                ip = %client_ip,
-                                "Request denied by rate-limit blacklist"
+                                error = %error,
+                                "Refused a Temps login grant exchange"
                             );
-                            // Same generic 403 as the IP restriction above.
-                            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                                .await?;
-                            ctx.routing_status = "rate_limit_blacklisted".to_string();
-                            return Ok(true);
+                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
                         }
-                        crate::rate_limiter::RateLimitDecision::Limited {
-                            window,
-                            retry_after_secs,
-                        } => {
-                            self.proxy_metrics.record_rate_limited();
-                            debug!(
+                    };
+                    let refused = response.status != StatusCode::SEE_OTHER;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    let body: &'static [u8] = if refused {
+                        b"This sign-in link is invalid or has expired. Reload the page to sign in again.\n"
+                    } else {
+                        b"Signed in.\n"
+                    };
+                    session
+                        .write_response_body(Some(Bytes::from_static(body)), true)
+                        .await?;
+                    ctx.routing_status = if refused {
+                        "ingress_grant_refused"
+                    } else {
+                        "ingress_grant_exchanged"
+                    }
+                    .to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::LoginRequired => {
+                    let external_url = self
+                        .config_service
+                        .get_settings()
+                        .await
+                        .ok()
+                        .and_then(|settings| settings.external_url);
+                    let next = match ctx.query_string.as_deref() {
+                        Some(qs) if !qs.is_empty() => format!("{}?{}", ctx.path, qs),
+                        _ => ctx.path.clone(),
+                    };
+                    let scheme = if self.is_https_request(session) {
+                        crate::ingress::LoginScheme::Https
+                    } else {
+                        crate::ingress::LoginScheme::Http
+                    };
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let location = external_url.as_deref().and_then(|base| {
+                        crate::ingress::login_redirect_url(
+                            base,
+                            self.crypto.ingress_grant_master_key(),
+                            temps_workload_ingress::ProductRef {
+                                kind: temps_workload_ingress::ProductKind::Environment,
+                                id: i64::from(project_ctx.environment.id),
+                            },
+                            scheme,
+                            &ctx.host,
+                            &next,
+                            now_secs,
+                        )
+                    });
+                    let mut response = match location {
+                        Some(location) => {
+                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+                            response.insert_header("Location", location)?;
+                            response
+                        }
+                        None => {
+                            warn!(
                                 project_id = project_ctx.project.id,
                                 environment_id = project_ctx.environment.id,
-                                ip = %client_ip,
-                                window = window.as_str(),
-                                scope = ?resolved.scope,
-                                "Request rejected by rate limit"
+                                "Environment requires a Temps login but the instance has no valid external URL to send the visitor to"
                             );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                            response.insert_header("Retry-After", retry_after_secs.to_string())?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(b"Too Many Requests\n")),
-                                    true,
-                                )
-                                .await?;
-                            ctx.routing_status = "rate_limited".to_string();
-                            return Ok(true);
+                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
                         }
-                    }
+                    };
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(
+                            Some(Bytes::from_static(b"Sign in to Temps to open this page.\n")),
+                            true,
+                        )
+                        .await?;
+                    ctx.routing_status = "ingress_login_required".to_string();
+                    return Ok(true);
                 }
-            }
-
-            // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
-            // This includes:
-            // - /api/_temps/captcha/* - Challenge verification endpoints
-            // - /api/__temps/temps_captcha_wasm.js - WASM JavaScript bindings
-            // - /api/__temps/temps_captcha_wasm_bg.wasm - WASM binary module
-            let is_captcha_endpoint = ctx.path.starts_with("/api/_temps/captcha")
-                || ctx.path.starts_with("/api/__temps/temps_captcha_wasm");
-
-            // Check if attack mode is enabled. The environment-level override
-            // (Option<bool>, NULL = inherit) falls back to the project-wide setting.
-            let effective_attack_mode = project_ctx
-                .environment
-                .attack_mode
-                .unwrap_or(project_ctx.project.attack_mode);
-            if !is_captcha_endpoint && effective_attack_mode {
-                // Attack mode REQUIRES HTTPS for JA4 fingerprinting
-                // Reject HTTP connections to prevent bot bypass
-                debug!(
-                    "Attack mode enabled for environment {}, fingerprint: {:?}, user_agent: {}",
-                    project_ctx.environment.id, ctx.tls_fingerprint, ctx.user_agent
-                );
-
-                let (identifier_type, identifier) = if let Some(ref fingerprint) =
-                    ctx.tls_fingerprint
-                {
-                    ("ja4", fingerprint.as_str())
-                } else {
-                    // No TLS fingerprint means HTTP connection - reject it
+                crate::ingress::AccessOutcome::HttpsRequired => {
+                    // Attack mode REQUIRES HTTPS for JA4 fingerprinting.
+                    // Reject HTTP connections to prevent bot bypass.
                     debug!(
                         "Attack mode: HTTPS required for environment {} (HTTP request from {})",
                         project_ctx.environment.id,
@@ -6413,8 +6848,7 @@ impl ProxyHttp for LoadBalancer {
                     );
 
                     // Return 426 Upgrade Required
-                    let mut response =
-                        ResponseHeader::build(StatusCode::from_u16(426).unwrap(), None)?;
+                    let mut response = ResponseHeader::build(StatusCode::UPGRADE_REQUIRED, None)?;
                     response.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     response.insert_header("Upgrade", "TLS/1.2, TLS/1.3")?;
                     response.insert_header("Connection", "Upgrade")?;
@@ -6423,32 +6857,11 @@ impl ProxyHttp for LoadBalancer {
                         .write_response_header(Box::new(response), true)
                         .await?;
 
-                    let html = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTTPS Required</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-        .container { background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
-        h1 { color: #1a202c; margin-bottom: 16px; }
-        p { color: #4a5568; line-height: 1.6; }
-        .icon { font-size: 64px; margin-bottom: 16px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">🔒</div>
-        <h1>HTTPS Required</h1>
-        <p>This site requires a secure connection (HTTPS) for enhanced security and bot protection.</p>
-        <p>Please use <strong>https://</strong> instead of http://</p>
-    </div>
-</body>
-</html>"#.to_string();
-
                     session
-                        .write_response_body(Some(Bytes::from(html)), true)
+                        .write_response_body(
+                            Some(Bytes::from_static(HTTPS_REQUIRED_HTML.as_bytes())),
+                            true,
+                        )
                         .await?;
 
                     return Err(Error::because(
@@ -6456,18 +6869,12 @@ impl ProxyHttp for LoadBalancer {
                         "HTTPS required in attack mode",
                         pingora_core::Error::new(pingora::ErrorType::HTTPStatus(426)),
                     ));
-                };
-
-                let is_challenge_completed = self
-                    .challenge_service
-                    .is_challenge_completed(project_ctx.environment.id, identifier, identifier_type)
-                    .await
-                    .unwrap_or(false);
-
-                if !is_challenge_completed {
+                }
+                crate::ingress::AccessOutcome::CaptchaChallenge => {
+                    let identifier = ctx.tls_fingerprint.as_deref().unwrap_or("");
                     debug!(
-                        "Attack mode: Challenge required for {} {} on environment {}",
-                        identifier_type, identifier, project_ctx.environment.id
+                        "Attack mode: Challenge required for ja4 {} on environment {}",
+                        identifier, project_ctx.environment.id
                     );
 
                     // Return 403 with HTML challenge page
@@ -6485,7 +6892,7 @@ impl ProxyHttp for LoadBalancer {
                         project_ctx.environment.id,
                         ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string()),
                         identifier,
-                        identifier_type,
+                        "ja4",
                     );
 
                     session
@@ -6501,16 +6908,30 @@ impl ProxyHttp for LoadBalancer {
                 }
             }
 
-            // Password wall: check if environment has password protection enabled
-            let password_protection = project_ctx
-                .environment
-                .deployment_config
-                .as_ref()
-                .and_then(|dc| dc.security.as_ref())
-                .and_then(|s| s.password_protection.as_ref())
-                .filter(|pp| pp.enabled);
-
-            if let Some(pp) = password_protection {
+            // Password wall: the outcome says the wall decides this request
+            // (no valid cookie, or the wall's own verify POST).
+            if access_outcome == crate::ingress::AccessOutcome::PasswordWall
+                && password_protection.is_none()
+            {
+                // The compiled endpoint asked for a wall this environment no
+                // longer has (a reload in flight): refuse rather than guess.
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Retry-After", "1")?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                    .await?;
+                ctx.routing_status = "ingress_endpoint_unavailable".to_string();
+                return Ok(true);
+            }
+            if let Some(pp) = password_protection
+                .filter(|_| access_outcome == crate::ingress::AccessOutcome::PasswordWall)
+            {
                 let password_hash = pp.password_hash.clone();
                 let env_id = project_ctx.environment.id;
                 let project_name = &project_ctx.project.name;

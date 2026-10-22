@@ -772,6 +772,9 @@ struct RouteTableSnapshot {
     /// Application hosts with no live upstream. Deliberately not part of
     /// `ownership`, so on-demand wake gating is unchanged.
     unavailable: UnavailableHosts,
+    /// Compiled ingress endpoints of every non-legacy environment (ADR-055
+    /// §11). Shared by reference: a request takes one refcount, never a copy.
+    ingress: Arc<crate::ingress::IngressSnapshot>,
 }
 
 impl RouteTableSnapshot {
@@ -3053,6 +3056,25 @@ impl CachedPeerTable {
             }
         };
 
+        // Ingress endpoints (ADR-055 §11). Same carry-forward as path routes:
+        // a failed read keeps the previous compiled endpoints, so an
+        // enforcing environment keeps the access it had rather than none.
+        let ingress = match crate::ingress::load_ingress_snapshot(
+            self.db.as_ref(),
+            &app_settings.rate_limiting,
+        )
+        .await
+        {
+            Ok(snapshot) => Arc::new(snapshot),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "failed to load ingress endpoints; keeping the previous ones (will retry on next reload)"
+                );
+                self.route_snapshot.load().ingress.clone()
+            }
+        };
+
         // Atomically replace all route tables
         let route_count = routes.len();
         let http_routes_count = http_routes_map.len();
@@ -3077,6 +3099,7 @@ impl CachedPeerTable {
             ownership: route_ownership,
             path_routes,
             unavailable,
+            ingress,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -3380,6 +3403,13 @@ impl CachedPeerTable {
             _ => host,
         };
         reserved.eq_ignore_ascii_case(host.trim_end_matches('.'))
+    }
+
+    /// The compiled ingress endpoints published with the current routes
+    /// (ADR-055 §11). One lock-free snapshot load and one refcount; the
+    /// caller decides a request against it without further shared state.
+    pub fn ingress_snapshot(&self) -> Arc<crate::ingress::IngressSnapshot> {
+        Arc::clone(&self.route_snapshot.load().ingress)
     }
 
     /// The status-page binding for `host`, if it is a status page's custom

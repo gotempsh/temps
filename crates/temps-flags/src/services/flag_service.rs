@@ -778,6 +778,7 @@ mod tests {
             attack_mode: None,
             last_activity_at: None,
             force_https: None,
+            ingress_mode: Default::default(),
         }
     }
 

@@ -119,7 +119,7 @@ fn require_plaintext_environment_read(auth: &temps_auth::AuthContext) -> Result<
 /// (`project_access_guard!` is a no-op), so this is reachable against any
 /// project -- including one an admin just created for host Docker access,
 /// which "carries no restrictive access grants of its own" (ADR 045).
-async fn require_granted_project_write_authority(
+pub(crate) async fn require_granted_project_write_authority(
     environment_service: &crate::services::environment_service::EnvironmentService,
     auth: &temps_auth::AuthContext,
     project_id: i32,

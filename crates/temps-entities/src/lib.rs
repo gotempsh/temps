@@ -261,3 +261,8 @@ pub mod secret_history;
 pub mod workload_events;
 pub mod workload_instances;
 pub mod workloads;
+// ADR-055 Phase 8: ingress endpoints and access policies
+pub mod ingress_access_policies;
+pub mod ingress_endpoints;
+pub mod ingress_login_grants;
+pub mod ingress_mode;

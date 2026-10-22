@@ -1508,6 +1508,7 @@ pub(crate) mod tests {
             attack_mode: None,
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
         }
     }
 

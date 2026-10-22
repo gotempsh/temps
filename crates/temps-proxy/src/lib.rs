@@ -21,6 +21,7 @@ mod connection_limiter;
 pub mod console_unavailable;
 pub mod crawler_detector;
 pub mod handler;
+pub mod ingress;
 pub mod ip_access;
 pub mod metrics;
 pub mod on_demand;

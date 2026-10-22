@@ -395,6 +395,77 @@ impl AuditOperation for ProjectSecretDeletedAudit {
     }
 }
 
+/// An environment's ingress mode or Temps login requirement changed
+/// (ADR-055 §11).
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressSettingsUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub previous_mode: &'static str,
+    pub mode: &'static str,
+    pub previous_require_login: bool,
+    pub require_login: bool,
+}
+
+impl AuditOperation for IngressSettingsUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ENVIRONMENT_INGRESS_SETTINGS_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
+/// A user was issued a Temps login grant for an environment's host. The
+/// grant token itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressLoginGrantIssuedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub environment_id: i32,
+    pub grant_id: i64,
+    pub host: String,
+    pub permission: String,
+}
+
+impl AuditOperation for IngressLoginGrantIssuedAudit {
+    fn operation_type(&self) -> String {
+        "INGRESS_LOGIN_GRANT_ISSUED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -22,6 +22,7 @@ import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
+import { EnvironmentIngressCard } from './EnvironmentIngressCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -332,6 +333,12 @@ export function EnvironmentDetail({
         projectId={project.id}
         environmentId={environment.id}
         scopeName={environment.name}
+      />
+
+      <EnvironmentIngressCard
+        key={`ingress:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
       />
 
       <SubdomainCard

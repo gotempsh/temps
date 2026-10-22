@@ -16,6 +16,7 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
+temps-workload-ingress = { path = "../temps-workload-ingress" }
 serde = { workspace = true }
 tokio = { workspace = true }
 log = { workspace = true }
@@ -33,4 +34,5 @@ axum-macros = { workspace = true }
 http = { workspace = true }
 futures-util = { workspace = true }
 slug = { workspace = true }
+url = { workspace = true }
 argon2 = { workspace = true }

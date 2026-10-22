@@ -1213,6 +1213,7 @@ mod tests {
             expires_at: now,
             preview_password_hash: password_hash.map(|s| s.to_string()),
             preview_password_hint: None,
+            preview_access: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

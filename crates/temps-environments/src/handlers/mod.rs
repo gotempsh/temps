@@ -3,6 +3,7 @@
 
 pub mod audit;
 pub mod handler;
+pub mod ingress;
 pub mod types;
 
 pub use audit::*;

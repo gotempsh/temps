@@ -12,6 +12,7 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::environment_service::EnvironmentService;
+use crate::services::ingress_service::IngressService;
 use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
 
@@ -57,6 +58,7 @@ impl TempsPlugin for EnvironmentsPlugin {
             context.register_service(env_var_service);
             let secret_service = Arc::new(SecretService::new(db.clone(), encryption_service));
             context.register_service(secret_service);
+            context.register_service(Arc::new(IngressService::new(db.clone())));
             tracing::debug!("Environments plugin services registered successfully");
             Ok(())
         })
@@ -80,6 +82,14 @@ impl TempsPlugin for EnvironmentsPlugin {
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
+        let ingress_state = Arc::new(crate::handlers::ingress::IngressAppState {
+            ingress_service: context.require_service::<IngressService>(),
+            environment_service: environment_service.clone(),
+            cookie_crypto: context.require_service::<temps_core::CookieCrypto>(),
+            audit_service: audit_service.clone(),
+            project_access_checker: project_access_checker.clone(),
+        });
+
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
             env_var_service,
@@ -94,12 +104,16 @@ impl TempsPlugin for EnvironmentsPlugin {
             sensitive_action_authorizer,
         );
 
-        let routes = crate::handlers::configure_routes().with_state(app_state);
+        let routes = crate::handlers::configure_routes()
+            .with_state(app_state)
+            .merge(crate::handlers::ingress::configure_routes().with_state(ingress_state));
         Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<crate::handlers::ApiDoc as OpenApiTrait>::openapi())
+        let mut doc = <crate::handlers::ApiDoc as OpenApiTrait>::openapi();
+        doc.merge(<crate::handlers::ingress::IngressApiDoc as OpenApiTrait>::openapi());
+        Some(doc)
     }
 }
 

@@ -61,6 +61,12 @@ pub struct Model {
     /// Last proxied request timestamp for on-demand environments.
     /// Persisted periodically by the idle sweep, not on every request.
     pub last_activity_at: Option<DBDateTime>,
+    /// Which access evaluator decides this environment's requests
+    /// (ADR-055 §11): the legacy chain, the legacy chain compared against the
+    /// compiled endpoint, or the compiled endpoint. A serialized row from
+    /// before the column reads as `legacy`.
+    #[serde(default)]
+    pub ingress_mode: super::ingress_mode::IngressMode,
 }
 
 /// Serialize a claim on the global preview-hostname namespace and return any

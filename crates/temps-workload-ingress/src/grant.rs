@@ -44,6 +44,10 @@ const KEY_LABEL: &[u8] = b"temps-ingress-grant-v1|";
 /// and the numeric fields.
 pub const MAX_GRANT_PAYLOAD: usize = 512;
 
+/// The path on the endpoint's host where the console's redirect lands with
+/// an exchange grant (`?grant=<token>&next=<path>`).
+pub const EXCHANGE_PATH: &str = "/.well-known/temps/ingress/grant";
+
 /// How long an exchange grant lives: long enough to cross a redirect.
 pub const EXCHANGE_GRANT_TTL_SECS: u64 = 120;
 
@@ -366,6 +370,99 @@ pub fn admits(
         && !revocations.contains(claims.grant_id)
 }
 
+/// How long the ingress's signed login request stays valid: the time a
+/// visitor may spend signing in to the console.
+pub const LOGIN_REQUEST_TTL_SECS: u64 = 15 * 60;
+
+/// The scheme the ingress was reached on, so the console redirects back
+/// over the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginScheme {
+    Http,
+    Https,
+}
+
+impl LoginScheme {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LoginScheme::Http => "http",
+            LoginScheme::Https => "https",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "http" => Some(LoginScheme::Http),
+            "https" => Some(LoginScheme::Https),
+            _ => None,
+        }
+    }
+}
+
+fn login_request_mac(
+    key: &GrantKey,
+    scheme: LoginScheme,
+    host: &str,
+    issued_at: u64,
+) -> HmacSha256 {
+    let mut mac = mac_for(&key.0);
+    mac.update(b"login|");
+    mac.update(scheme.as_str().as_bytes());
+    mac.update(b"|");
+    for byte in host.bytes() {
+        mac.update(&[byte.to_ascii_lowercase()]);
+    }
+    mac.update(b"|");
+    let mut digits = [0u8; 20];
+    mac.update(format_i64(issued_at as i64, &mut digits));
+    mac
+}
+
+/// Signs the ingress's redirect to the console login page.
+///
+/// The console only issues an exchange grant for a host the owner's ingress
+/// asked about: without this signature, anyone could make the console
+/// redirect a signed-in user, with a grant, to a host of their choosing.
+pub fn sign_login_request(
+    key: &GrantKey,
+    scheme: LoginScheme,
+    host: &str,
+    issued_at: u64,
+) -> String {
+    URL_SAFE_NO_PAD.encode(
+        login_request_mac(key, scheme, host, issued_at)
+            .finalize()
+            .into_bytes(),
+    )
+}
+
+/// Whether `signature` is the ingress's signature over this login request
+/// and the request is at most [`LOGIN_REQUEST_TTL_SECS`] old (and not from
+/// the future, beyond a minute of clock skew).
+pub fn login_request_valid(
+    key: &GrantKey,
+    scheme: LoginScheme,
+    host: &str,
+    issued_at: u64,
+    signature: &str,
+    now: u64,
+) -> bool {
+    if issued_at > now.saturating_add(60) || now.saturating_sub(issued_at) > LOGIN_REQUEST_TTL_SECS
+    {
+        return false;
+    }
+    if host.is_empty() || signature.len() > 64 {
+        return false;
+    }
+    let mut tag = [0u8; 48];
+    let Ok(len) = URL_SAFE_NO_PAD.decode_slice(signature, &mut tag) else {
+        return false;
+    };
+    login_request_mac(key, scheme, host, issued_at)
+        .verify_slice(&tag[..len])
+        .is_ok()
+}
+
 /// Grant ids revoked before they expired. Carried in the snapshot until
 /// the last of them expires.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -422,6 +519,82 @@ mod tests {
             usage,
             now,
         }
+    }
+
+    #[test]
+    fn a_login_request_verifies_only_for_its_owner_scheme_host_and_window() {
+        let key = GrantKey::derive(&MASTER, sandbox(3));
+        let host = "app.example.test";
+        let signature = sign_login_request(&key, LoginScheme::Https, host, 1_000);
+        assert!(login_request_valid(
+            &key,
+            LoginScheme::Https,
+            "APP.example.test",
+            1_000,
+            &signature,
+            1_000 + LOGIN_REQUEST_TTL_SECS
+        ));
+        // Another owner's key, scheme, host or timestamp.
+        let other = GrantKey::derive(&MASTER, sandbox(4));
+        assert!(!login_request_valid(
+            &other,
+            LoginScheme::Https,
+            host,
+            1_000,
+            &signature,
+            1_000
+        ));
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Http,
+            host,
+            1_000,
+            &signature,
+            1_000
+        ));
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Https,
+            "shop.example.test",
+            1_000,
+            &signature,
+            1_000
+        ));
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Https,
+            host,
+            1_001,
+            &signature,
+            1_001
+        ));
+        // Too old, from the future, or garbage.
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Https,
+            host,
+            1_000,
+            &signature,
+            1_001 + LOGIN_REQUEST_TTL_SECS
+        ));
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Https,
+            host,
+            1_000,
+            &signature,
+            900
+        ));
+        assert!(!login_request_valid(
+            &key,
+            LoginScheme::Https,
+            host,
+            1_000,
+            "not-a-signature!",
+            1_000
+        ));
+        assert_eq!(LoginScheme::parse("https"), Some(LoginScheme::Https));
+        assert_eq!(LoginScheme::parse("ftp"), None);
     }
 
     #[test]

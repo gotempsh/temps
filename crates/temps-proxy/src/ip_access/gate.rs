@@ -606,6 +606,10 @@ impl ProjectIpGate for ProjectIpAccessGate {
             _ => false,
         }
     }
+
+    fn reads_project_ip_access_rules(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

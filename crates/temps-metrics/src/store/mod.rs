@@ -59,6 +59,8 @@ pub const DELTA_COUNTER_METRICS: &[&str] = &[
     "proxy.log_write_retries",
     "proxy.log_batches_dropped",
     "proxy.log_entries_dropped",
+    "proxy.ingress_shadow_evaluations",
+    "proxy.ingress_shadow_mismatches",
 ];
 
 /// Returns `true` when `metric_name` is a per-interval delta counter that

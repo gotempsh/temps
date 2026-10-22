@@ -315,72 +315,75 @@ impl CompiledEndpoint {
 
     /// Runs the policies in order; the first that does not pass decides.
     pub fn evaluate(&self, ctx: &impl RequestContext) -> Decision<'_> {
-        for policy in self.policies.iter() {
-            match policy {
-                Policy::Public => {}
-                Policy::Password { password_ref } => {
-                    if !ctx.has_password_grant(self, *password_ref) {
-                        return Decision::Challenge(Challenge::Password {
-                            password_ref: *password_ref,
-                        });
-                    }
-                }
-                Policy::TempsLogin { permission } => {
-                    if !ctx.has_login_grant(self, permission) {
-                        return Decision::Challenge(Challenge::TempsLogin { permission });
-                    }
-                }
-                Policy::SignedLink => {
-                    if !ctx.has_signed_link(self) {
-                        return Decision::Deny(DenyReason::SignedLinkRequired);
-                    }
-                }
-                Policy::IpRules {
-                    rules,
-                    any_allow,
-                    unresolved,
-                } => {
-                    let Some(ip) = ctx.client_ip() else {
-                        match unresolved {
-                            UnresolvedClient::Deny => {
-                                return Decision::Deny(DenyReason::IpNotAllowed)
-                            }
-                            UnresolvedClient::Admit => continue,
-                        }
-                    };
-                    match rules.iter().find(|(cidr, _)| cidr.matches(ip)) {
-                        Some((_, true)) => {}
-                        Some((_, false)) => return Decision::Deny(DenyReason::IpNotAllowed),
-                        None if *any_allow => return Decision::Deny(DenyReason::IpNotAllowed),
-                        None => {}
-                    }
-                }
-                Policy::RateLimit(limit) => {
-                    // An unknown client is not counted; an exempt one never is.
-                    let Some(ip) = ctx.client_ip() else { continue };
-                    if !limit.exempts(ip) && !ctx.within_rate_limit(self, limit) {
-                        return Decision::TooManyRequests;
-                    }
-                }
-                Policy::Geo { allow, deny } => {
-                    let code = ctx
-                        .country()
-                        .map(|[a, b]| [a.to_ascii_uppercase(), b.to_ascii_uppercase()]);
-                    let denied = code.is_some_and(|c| deny.contains(&c));
-                    let not_allowed =
-                        !allow.is_empty() && !code.is_some_and(|c| allow.contains(&c));
-                    if denied || not_allowed {
-                        return Decision::Deny(DenyReason::CountryNotAllowed);
-                    }
-                }
-                Policy::Captcha => {
-                    if !ctx.captcha_passed(self) {
-                        return Decision::Challenge(Challenge::Captcha);
-                    }
-                }
+        self.evaluate_from(0, ctx).0
+    }
+
+    /// Runs the policies from position `start` on and returns the decision
+    /// with the position of the policy that made it (the policy count for
+    /// `Allow`).
+    ///
+    /// A caller whose fact for one policy needs an asynchronous read (a
+    /// captcha completion behind a cache) answers `false` for it, and when
+    /// that policy is the one that decided, reads the fact and resumes
+    /// after it, so the policies before it (a rate limit that counts) run
+    /// exactly once.
+    pub fn evaluate_from(&self, start: usize, ctx: &impl RequestContext) -> (Decision<'_>, usize) {
+        for (at, policy) in self.policies.iter().enumerate().skip(start) {
+            if let Some(decision) = self.check(policy, ctx) {
+                return (decision, at);
             }
         }
-        Decision::Allow
+        (Decision::Allow, self.policies.len())
+    }
+
+    /// One policy: `None` when it passes.
+    fn check<'a>(&'a self, policy: &'a Policy, ctx: &impl RequestContext) -> Option<Decision<'a>> {
+        match policy {
+            Policy::Public => None,
+            Policy::Password { password_ref } => (!ctx.has_password_grant(self, *password_ref))
+                .then_some(Decision::Challenge(Challenge::Password {
+                    password_ref: *password_ref,
+                })),
+            Policy::TempsLogin { permission } => (!ctx.has_login_grant(self, permission))
+                .then_some(Decision::Challenge(Challenge::TempsLogin { permission })),
+            Policy::SignedLink => (!ctx.has_signed_link(self))
+                .then_some(Decision::Deny(DenyReason::SignedLinkRequired)),
+            Policy::IpRules {
+                rules,
+                any_allow,
+                unresolved,
+            } => {
+                let Some(ip) = ctx.client_ip() else {
+                    return match unresolved {
+                        UnresolvedClient::Deny => Some(Decision::Deny(DenyReason::IpNotAllowed)),
+                        UnresolvedClient::Admit => None,
+                    };
+                };
+                match rules.iter().find(|(cidr, _)| cidr.matches(ip)) {
+                    Some((_, true)) => None,
+                    Some((_, false)) => Some(Decision::Deny(DenyReason::IpNotAllowed)),
+                    None if *any_allow => Some(Decision::Deny(DenyReason::IpNotAllowed)),
+                    None => None,
+                }
+            }
+            Policy::RateLimit(limit) => {
+                // An unknown client is not counted; an exempt one never is.
+                let ip = ctx.client_ip()?;
+                (!limit.exempts(ip) && !ctx.within_rate_limit(self, limit))
+                    .then_some(Decision::TooManyRequests)
+            }
+            Policy::Geo { allow, deny } => {
+                let code = ctx
+                    .country()
+                    .map(|[a, b]| [a.to_ascii_uppercase(), b.to_ascii_uppercase()]);
+                let denied = code.is_some_and(|c| deny.contains(&c));
+                let not_allowed = !allow.is_empty() && !code.is_some_and(|c| allow.contains(&c));
+                (denied || not_allowed).then_some(Decision::Deny(DenyReason::CountryNotAllowed))
+            }
+            Policy::Captcha => {
+                (!ctx.captcha_passed(self)).then_some(Decision::Challenge(Challenge::Captcha))
+            }
+        }
     }
 }
 
@@ -749,6 +752,42 @@ mod tests {
             exempt: exempt.into_iter().map(str::to_string).collect(),
             scope: RateLimitScope::Endpoint,
         }
+    }
+
+    #[test]
+    fn evaluation_resumes_after_the_policy_that_decided() {
+        let e = CompiledEndpoint::compile(&endpoint(
+            1,
+            10,
+            "shop.example.test",
+            1,
+            None,
+            vec![
+                rate_limit(vec![]),
+                AccessPolicy::Captcha,
+                AccessPolicy::Password { password_ref: 4 },
+            ],
+        ))
+        .unwrap();
+        let ctx = Ctx::default();
+        assert_eq!(
+            e.evaluate_from(0, &ctx),
+            (Decision::Challenge(Challenge::Captcha), 1)
+        );
+        // The captcha turned out to be solved: resume after it.
+        assert_eq!(
+            e.evaluate_from(2, &ctx),
+            (
+                Decision::Challenge(Challenge::Password { password_ref: 4 }),
+                2
+            )
+        );
+        let ctx = Ctx {
+            password: true,
+            ..Ctx::default()
+        };
+        assert_eq!(e.evaluate_from(2, &ctx), (Decision::Allow, 3));
+        assert_eq!(e.evaluate_from(9, &ctx), (Decision::Allow, 3));
     }
 
     #[test]

@@ -107,6 +107,13 @@ pub struct Model {
     /// the UI so users can tell two passwords apart without storing the
     /// full plaintext anywhere.
     pub preview_password_hint: Option<String>,
+
+    /// Who may open the preview URLs when no password is set (ADR-055
+    /// §11). Sandboxes created before the column are `legacy` (anyone who
+    /// can reach the hostname); new ones default to `temps_login`. A
+    /// serialized row from before the column reads as `legacy`, unchanged.
+    #[serde(default = "super::ingress_mode::SandboxPreviewAccess::unchanged")]
+    pub preview_access: super::ingress_mode::SandboxPreviewAccess,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

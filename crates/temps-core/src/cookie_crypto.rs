@@ -42,8 +42,16 @@ const COOKIE_KEY_DERIVATION_SALT: &[u8] = b"temps-cookie-crypto-v1";
 /// domain-separation salt. This stops the raw secret bytes from doubling as an AES
 /// key, and keeps this key independent of any other key derived from the same secret.
 fn derive_cookie_key(secret_key: &[u8; 32]) -> [u8; 32] {
-    let (prk, _) =
-        hkdf::Hkdf::<sha2::Sha256>::extract(Some(COOKIE_KEY_DERIVATION_SALT), secret_key);
+    derive_key(COOKIE_KEY_DERIVATION_SALT, secret_key)
+}
+
+/// Domain-separation salt for the ingress login-grant master key (ADR-055
+/// §11). Independent of the cookie key: a grant MAC key never doubles as an
+/// AES key.
+const INGRESS_GRANT_KEY_DERIVATION_SALT: &[u8] = b"temps-ingress-grant-v1";
+
+fn derive_key(salt: &[u8], secret_key: &[u8; 32]) -> [u8; 32] {
+    let (prk, _) = hkdf::Hkdf::<sha2::Sha256>::extract(Some(salt), secret_key);
     let mut key = [0u8; 32];
     key.copy_from_slice(prk.as_slice());
     key
@@ -58,6 +66,9 @@ pub struct CookieCrypto {
     /// tokens) readable across the upgrade. Values re-encrypted after the upgrade
     /// move to the derived key on their own.
     legacy_cipher: Aes256Gcm,
+    /// Master key the console signs ingress login grants with and the proxy
+    /// verifies them with; each owner's key is derived from it.
+    ingress_grant_master: [u8; 32],
 }
 
 impl std::fmt::Debug for CookieCrypto {
@@ -100,7 +111,16 @@ impl CookieCrypto {
         Self {
             cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(derived)),
             legacy_cipher: Aes256Gcm::new(&Key::<Aes256Gcm>::from(*secret_key)),
+            ingress_grant_master: derive_key(INGRESS_GRANT_KEY_DERIVATION_SALT, secret_key),
         }
+    }
+
+    /// The master key for ingress login grants (ADR-055 §11), derived from
+    /// the instance secret under its own salt. Every process holding the
+    /// secret (console and proxies) derives the same key, so a grant the
+    /// console signs verifies at any proxy without a key exchange.
+    pub fn ingress_grant_master_key(&self) -> &[u8; 32] {
+        &self.ingress_grant_master
     }
 
     /// Encrypt a string value for use in cookies
@@ -176,6 +196,21 @@ mod tests {
     fn get_test_crypto_hex() -> CookieCrypto {
         let test_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // 64 hex chars
         CookieCrypto::new(test_key).unwrap()
+    }
+
+    #[test]
+    fn ingress_grant_key_is_stable_and_independent_of_the_cookie_key() {
+        let secret = *b"test_key_32_bytes_long_for_tests";
+        let a = CookieCrypto::from_bytes(&secret);
+        let b = CookieCrypto::from_bytes(&secret);
+        assert_eq!(a.ingress_grant_master_key(), b.ingress_grant_master_key());
+        assert_ne!(a.ingress_grant_master_key(), &derive_cookie_key(&secret));
+        assert_ne!(a.ingress_grant_master_key(), &secret);
+        let other = CookieCrypto::from_bytes(b"another_key_32_bytes_long_tests!");
+        assert_ne!(
+            a.ingress_grant_master_key(),
+            other.ingress_grant_master_key()
+        );
     }
 
     #[test]

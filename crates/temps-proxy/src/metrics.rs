@@ -123,6 +123,13 @@ pub const METRIC_RATE_LIMITED: &str = "proxy.rate_limited";
 /// series for the whole proxy: the client IP, project and mode are
 /// deliberately not dimensions, so a flood cannot grow cardinality.
 pub const METRIC_IP_ACCESS_DENIED: &str = "proxy.ip_access_denied";
+/// Requests to a `shadow`-mode environment that the compiled ingress
+/// endpoint also decided (ADR-055 §11). One series: no host, project or
+/// outcome dimension.
+pub const METRIC_INGRESS_SHADOW_EVALUATIONS: &str = "proxy.ingress_shadow_evaluations";
+/// Shadow evaluations whose response differed from the legacy chain's. The
+/// sampled log line names the environment and both outcomes.
+pub const METRIC_INGRESS_SHADOW_MISMATCHES: &str = "proxy.ingress_shadow_mismatches";
 pub const METRIC_STREAMING_DURATION_AVG: &str = "proxy.streaming_duration_avg_ms";
 /// Request-log batch writes that hit a transient database conflict (deadlock
 /// or serialization failure) and were retried. Each retry of one batch counts
@@ -212,6 +219,9 @@ pub struct ProxyMetrics {
     rate_limited: AtomicU64,
     /// Requests refused by a project/environment IP access policy (403).
     ip_access_denied: AtomicU64,
+    /// Shadow-mode ingress evaluations, and those that disagreed.
+    ingress_shadow_evaluations: AtomicU64,
+    ingress_shadow_mismatches: AtomicU64,
     /// Request-log batch writes retried after a transient DB conflict.
     log_write_retries: AtomicU64,
     /// Request-log batches abandoned after retries were exhausted.
@@ -332,6 +342,17 @@ impl ProxyMetrics {
         self.ip_access_denied.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one shadow-mode ingress evaluation and whether it disagreed
+    /// with the legacy chain. Relaxed atomic adds.
+    pub fn record_ingress_shadow(&self, mismatch: bool) {
+        self.ingress_shadow_evaluations
+            .fetch_add(1, Ordering::Relaxed);
+        if mismatch {
+            self.ingress_shadow_mismatches
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Count one retry of a request-log batch write. Called from the
     /// background batch writer, never the request path.
     pub fn record_log_write_retry(&self) {
@@ -375,6 +396,8 @@ impl ProxyMetrics {
             streaming_sum_ms: self.streaming_sum_ms.load(Ordering::Relaxed),
             rate_limited: self.rate_limited.load(Ordering::Relaxed),
             ip_access_denied: self.ip_access_denied.load(Ordering::Relaxed),
+            ingress_shadow_evaluations: self.ingress_shadow_evaluations.load(Ordering::Relaxed),
+            ingress_shadow_mismatches: self.ingress_shadow_mismatches.load(Ordering::Relaxed),
             log_write_retries: self.log_write_retries.load(Ordering::Relaxed),
             log_batches_dropped: self.log_batches_dropped.load(Ordering::Relaxed),
             log_entries_dropped: self.log_entries_dropped.load(Ordering::Relaxed),
@@ -400,6 +423,8 @@ pub struct MetricsSnapshot {
     streaming_sum_ms: u64,
     rate_limited: u64,
     ip_access_denied: u64,
+    ingress_shadow_evaluations: u64,
+    ingress_shadow_mismatches: u64,
     log_write_retries: u64,
     log_batches_dropped: u64,
     log_entries_dropped: u64,
@@ -440,6 +465,12 @@ impl MetricsSnapshot {
             streaming_sum_ms: self.streaming_sum_ms.saturating_sub(prev.streaming_sum_ms),
             rate_limited: self.rate_limited.saturating_sub(prev.rate_limited),
             ip_access_denied: self.ip_access_denied.saturating_sub(prev.ip_access_denied),
+            ingress_shadow_evaluations: self
+                .ingress_shadow_evaluations
+                .saturating_sub(prev.ingress_shadow_evaluations),
+            ingress_shadow_mismatches: self
+                .ingress_shadow_mismatches
+                .saturating_sub(prev.ingress_shadow_mismatches),
             log_write_retries: self
                 .log_write_retries
                 .saturating_sub(prev.log_write_retries),
@@ -480,6 +511,8 @@ pub struct MetricsDelta {
     streaming_sum_ms: u64,
     rate_limited: u64,
     ip_access_denied: u64,
+    ingress_shadow_evaluations: u64,
+    ingress_shadow_mismatches: u64,
     log_write_retries: u64,
     log_batches_dropped: u64,
     log_entries_dropped: u64,
@@ -562,6 +595,16 @@ impl MetricsDelta {
             ProxySample {
                 name: METRIC_IP_ACCESS_DENIED,
                 value: self.ip_access_denied as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_INGRESS_SHADOW_EVALUATIONS,
+                value: self.ingress_shadow_evaluations as f64,
+                is_counter: true,
+            },
+            ProxySample {
+                name: METRIC_INGRESS_SHADOW_MISMATCHES,
+                value: self.ingress_shadow_mismatches as f64,
                 is_counter: true,
             },
             ProxySample {
@@ -852,7 +895,7 @@ mod tests {
     fn test_samples_idle_interval_emits_only_counters() {
         let delta = MetricsDelta::default();
         let samples = delta.samples();
-        assert_eq!(samples.len(), 15);
+        assert_eq!(samples.len(), 17);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
     }
 
@@ -885,6 +928,24 @@ mod tests {
             .find(|s| s.name == METRIC_IP_ACCESS_DENIED)
             .map(|s| (s.value, s.is_counter));
         assert_eq!(denied, Some((3.0, true)));
+    }
+
+    #[test]
+    fn test_ingress_shadow_evaluations_and_mismatches_are_counted_per_interval() {
+        let m = ProxyMetrics::default();
+        let first = m.snapshot();
+        m.record_ingress_shadow(false);
+        m.record_ingress_shadow(true);
+        m.record_ingress_shadow(false);
+        let samples = m.snapshot().delta_since(&first).samples();
+        let value = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .map(|s| (s.value, s.is_counter))
+        };
+        assert_eq!(value(METRIC_INGRESS_SHADOW_EVALUATIONS), Some((3.0, true)));
+        assert_eq!(value(METRIC_INGRESS_SHADOW_MISMATCHES), Some((1.0, true)));
     }
 
     #[test]

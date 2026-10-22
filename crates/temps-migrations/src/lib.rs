@@ -45,3 +45,5 @@ pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainC
 pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;
 
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
+
+pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;

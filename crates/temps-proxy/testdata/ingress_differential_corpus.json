@@ -1,0 +1,367 @@
+{
+  "description": "ADR-055 Phase 8 differential corpus: every request is decided by the legacy access chain and by the compiled ingress endpoint (enforce and shadow) and must get the same response. Hosts and addresses are documentation ranges only.",
+  "scenarios": [
+    {
+      "name": "public environment, no access settings",
+      "host": "app.example.test",
+      "requests": [
+        { "ip": "203.0.113.10" },
+        { "ip": "2001:db8::10" },
+        { "ip": null },
+        { "ip": "not-an-ip" },
+        { "ip": "203.0.113.10", "tls": false },
+        { "ip": "203.0.113.10", "method": "POST", "path": "/api/items" }
+      ]
+    },
+    {
+      "name": "password wall: cookie, no cookie, verify POST",
+      "host": "app.example.test",
+      "password": true,
+      "requests": [
+        { "ip": "203.0.113.20" },
+        { "ip": "203.0.113.20", "password_cookie": true },
+        { "ip": "203.0.113.20", "path": "/_temps/password-verify", "method": "POST" },
+        { "ip": "203.0.113.20", "path": "/_temps/password-verify", "method": "POST", "password_cookie": true },
+        { "ip": "203.0.113.20", "path": "/_temps/password-verify", "method": "GET", "password_cookie": true },
+        { "ip": null, "password_cookie": true },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "project IP allow list",
+      "host": "shop.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["198.51.100.0/24", "2001:db8:1::/48", "192.0.2.7/32"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "198.51.100.255" },
+        { "ip": "198.51.101.1" },
+        { "ip": "::ffff:198.51.100.9" },
+        { "ip": "::ffff:198.51.101.9" },
+        { "ip": "2001:db8:1::5" },
+        { "ip": "2001:db8:2::5" },
+        { "ip": "192.0.2.7" },
+        { "ip": "192.0.2.8" },
+        { "ip": null },
+        { "ip": "garbage" }
+      ]
+    },
+    {
+      "name": "project IP deny list",
+      "host": "shop.example.test",
+      "ip_rules": [
+        { "mode": "deny", "cidrs": ["203.0.113.0/25", "2001:db8:dead::/48"] }
+      ],
+      "requests": [
+        { "ip": "203.0.113.1" },
+        { "ip": "203.0.113.127" },
+        { "ip": "203.0.113.128" },
+        { "ip": "::ffff:203.0.113.5" },
+        { "ip": "2001:db8:dead::1" },
+        { "ip": "2001:db8:beef::1" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "environment override disables a project allow list",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["198.51.100.0/24"] },
+        { "environment": true, "mode": "disabled", "cidrs": [] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "203.0.113.1" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "environment allow list overrides a project deny list",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "deny", "cidrs": ["198.51.100.0/24"] },
+        { "environment": true, "mode": "allow", "cidrs": ["198.51.100.0/25"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "198.51.100.200" },
+        { "ip": "203.0.113.1" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "another environment's override does not apply",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["198.51.100.0/24"] },
+        { "other_environment": true, "mode": "disabled", "cidrs": [] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "203.0.113.1" }
+      ]
+    },
+    {
+      "name": "allow list skips malformed and host-bit entries",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["not-a-cidr", "10.0.0.1/8", " 198.51.100.0/24 ", "300.1.1.1/32"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.3" },
+        { "ip": "10.0.0.1" },
+        { "ip": "10.1.2.3" },
+        { "ip": "203.0.113.3" }
+      ]
+    },
+    {
+      "name": "allow list of only malformed entries refuses everyone",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["nope", "10.0.0.1/8"] }
+      ],
+      "requests": [
+        { "ip": "10.0.0.1" },
+        { "ip": "203.0.113.3" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "empty allow list refuses everyone",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": [] }
+      ],
+      "requests": [
+        { "ip": "203.0.113.3" },
+        { "ip": "2001:db8::3" }
+      ]
+    },
+    {
+      "name": "deny list with a malformed entry refuses everyone",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "deny", "cidrs": ["198.51.100.0/24", "bogus"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "203.0.113.1" },
+        { "ip": "2001:db8::1" }
+      ]
+    },
+    {
+      "name": "empty deny list is no policy",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "deny", "cidrs": [] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "unknown IP mode refuses everyone",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allowlist", "cidrs": ["198.51.100.0/24"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "IPv4-mapped IPv6 allow entry folds to IPv4",
+      "host": "app.example.test",
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["::ffff:198.51.100.0/120"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.1" },
+        { "ip": "::ffff:198.51.100.2" },
+        { "ip": "198.51.101.1" }
+      ]
+    },
+    {
+      "name": "instance rate limit per minute and per hour",
+      "host": "app.example.test",
+      "instance": { "enabled": true, "max_requests_per_minute": 3, "max_requests_per_hour": 5 },
+      "requests": [
+        { "ip": "203.0.113.30", "repeat": 4 },
+        { "ip": "203.0.113.31", "repeat": 2 },
+        { "ip": "203.0.113.30", "at": 61 },
+        { "ip": "203.0.113.30", "at": 125, "repeat": 3 },
+        { "ip": "203.0.113.30", "at": 3600 },
+        { "ip": null, "repeat": 6 },
+        { "ip": "2001:db8::30", "repeat": 4 },
+        { "ip": "::ffff:203.0.113.31", "repeat": 2 }
+      ]
+    },
+    {
+      "name": "instance whitelist and blacklist",
+      "host": "app.example.test",
+      "instance": {
+        "enabled": true,
+        "max_requests_per_minute": 1,
+        "max_requests_per_hour": 0,
+        "whitelist_ips": ["198.51.100.0/24", "2001:db8::77", "junk"],
+        "blacklist_ips": ["203.0.113.66", "192.0.2.1/16", "::ffff:198.51.100.200"]
+      },
+      "requests": [
+        { "ip": "198.51.100.5", "repeat": 3 },
+        { "ip": "2001:db8::77", "repeat": 3 },
+        { "ip": "203.0.113.66" },
+        { "ip": "::ffff:203.0.113.66" },
+        { "ip": "192.0.200.9" },
+        { "ip": "198.51.100.200" },
+        { "ip": "203.0.113.67", "repeat": 2 },
+        { "ip": null, "repeat": 2 }
+      ]
+    },
+    {
+      "name": "instance rate limiting disabled ignores its lists",
+      "host": "app.example.test",
+      "instance": {
+        "enabled": false,
+        "max_requests_per_minute": 1,
+        "blacklist_ips": ["203.0.113.66"]
+      },
+      "requests": [
+        { "ip": "203.0.113.66", "repeat": 3 }
+      ]
+    },
+    {
+      "name": "project rate limit replaces the instance limits, keeps the instance blacklist",
+      "host": "shop.example.test",
+      "instance": {
+        "enabled": true,
+        "max_requests_per_minute": 1,
+        "max_requests_per_hour": 100,
+        "whitelist_ips": ["198.51.100.0/24"],
+        "blacklist_ips": ["203.0.113.66"]
+      },
+      "project_security": {
+        "enabled": true,
+        "rateLimiting": { "maxRequestsPerMinute": 2, "whitelistIps": ["192.0.2.0/24"], "blacklistIps": ["203.0.113.99"] }
+      },
+      "requests": [
+        { "ip": "203.0.113.40", "repeat": 3 },
+        { "ip": "198.51.100.40", "repeat": 3 },
+        { "ip": "192.0.2.40", "repeat": 3 },
+        { "ip": "203.0.113.66" },
+        { "ip": "203.0.113.99" }
+      ]
+    },
+    {
+      "name": "project rate limit switched off falls back to the instance policy",
+      "host": "shop.example.test",
+      "instance": { "enabled": true, "max_requests_per_minute": 1 },
+      "project_security": {
+        "enabled": false,
+        "rateLimiting": { "maxRequestsPerMinute": 50, "blacklistIps": ["203.0.113.99"] }
+      },
+      "requests": [
+        { "ip": "203.0.113.99", "repeat": 2 },
+        { "ip": "203.0.113.41", "repeat": 2 }
+      ]
+    },
+    {
+      "name": "environment security overrides the project rate limit",
+      "host": "app.example.test",
+      "project_security": {
+        "enabled": true,
+        "rateLimiting": { "maxRequestsPerMinute": 10 }
+      },
+      "environment_security": {
+        "enabled": true,
+        "rateLimiting": { "maxRequestsPerMinute": 1 }
+      },
+      "requests": [
+        { "ip": "203.0.113.42", "repeat": 3 }
+      ]
+    },
+    {
+      "name": "blacklist with no limits",
+      "host": "app.example.test",
+      "project_security": {
+        "enabled": true,
+        "rateLimiting": { "maxRequestsPerMinute": 0, "maxRequestsPerHour": 0, "blacklistIps": ["203.0.113.0/24"] }
+      },
+      "requests": [
+        { "ip": "203.0.113.50", "repeat": 3 },
+        { "ip": "198.51.100.50", "repeat": 3 },
+        { "ip": null }
+      ]
+    },
+    {
+      "name": "attack mode: HTTPS, challenge, completion, captcha paths",
+      "host": "app.example.test",
+      "project_attack_mode": true,
+      "requests": [
+        { "ip": "203.0.113.60", "tls": false },
+        { "ip": "203.0.113.60" },
+        { "ip": "203.0.113.60", "captcha_completed": true },
+        { "ip": "203.0.113.60", "path": "/api/_temps/captcha/verify", "method": "POST", "tls": false },
+        { "ip": "203.0.113.60", "path": "/api/__temps/temps_captcha_wasm.js" },
+        { "ip": null, "captcha_completed": true }
+      ]
+    },
+    {
+      "name": "environment attack mode override",
+      "host": "app.example.test",
+      "project_attack_mode": true,
+      "environment_attack_mode": false,
+      "requests": [
+        { "ip": "203.0.113.61", "tls": false },
+        { "ip": "203.0.113.61" }
+      ]
+    },
+    {
+      "name": "environment enables attack mode the project leaves off",
+      "host": "app.example.test",
+      "environment_attack_mode": true,
+      "requests": [
+        { "ip": "203.0.113.62", "tls": false },
+        { "ip": "203.0.113.62", "captcha_completed": true }
+      ]
+    },
+    {
+      "name": "order: IP gate, then rate limit, then captcha, then password",
+      "host": "shop.example.test",
+      "instance": { "enabled": true, "max_requests_per_minute": 2 },
+      "project_attack_mode": true,
+      "password": true,
+      "ip_rules": [
+        { "mode": "deny", "cidrs": ["203.0.113.0/24"] }
+      ],
+      "requests": [
+        { "ip": "203.0.113.70", "repeat": 4, "captcha_completed": true, "password_cookie": true },
+        { "ip": "198.51.100.70", "tls": false },
+        { "ip": "198.51.100.70" },
+        { "ip": "198.51.100.70", "captcha_completed": true },
+        { "ip": "198.51.100.70", "captcha_completed": true, "password_cookie": true },
+        { "ip": "198.51.100.71", "captcha_completed": true, "password_cookie": true },
+        { "ip": "198.51.100.71", "captcha_completed": true, "path": "/_temps/password-verify", "method": "POST" },
+        { "ip": "198.51.100.71", "captcha_completed": true, "password_cookie": true, "at": 60 },
+        { "ip": null, "captcha_completed": true, "password_cookie": true }
+      ]
+    },
+    {
+      "name": "password wall behind a rate limit and an allow list",
+      "host": "app.example.test",
+      "instance": { "enabled": true, "max_requests_per_minute": 1, "whitelist_ips": ["198.51.100.0/24"] },
+      "password": true,
+      "ip_rules": [
+        { "mode": "allow", "cidrs": ["198.51.100.0/24", "192.0.2.0/24"] }
+      ],
+      "requests": [
+        { "ip": "198.51.100.80", "repeat": 3 },
+        { "ip": "198.51.100.80", "password_cookie": true, "repeat": 2 },
+        { "ip": "192.0.2.80", "password_cookie": true, "repeat": 3 },
+        { "ip": "203.0.113.80", "password_cookie": true }
+      ]
+    }
+  ]
+}
