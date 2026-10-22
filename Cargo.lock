@@ -13428,6 +13428,8 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "temps-runtime-health",
+ "temps-workload",
+ "temps-workload-docker",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",

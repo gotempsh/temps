@@ -1087,22 +1087,14 @@ pub fn hardened_host_config(
     secrets_bind: Option<String>,
     docker_socket_bind: Option<&str>,
 ) -> bollard::models::HostConfig {
-    let binds: Vec<String> = secrets_bind
-        .into_iter()
-        .chain(docker_socket_bind.map(str::to_string))
-        .collect();
-    bollard::models::HostConfig {
-        // Security hardening: drop all Linux capabilities by default
-        cap_drop: Some(vec!["ALL".to_string()]),
-        // Security hardening: prevent privilege escalation via setuid/setgid
-        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-        // Security hardening: limit number of processes to prevent fork bombs
-        pids_limit: Some(512),
-        // Security hardening: use init process for proper signal handling and zombie reaping
-        init: Some(true),
-        binds: (!binds.is_empty()).then_some(binds),
-        ..Default::default()
-    }
+    // ADR-055 phase 1: the hardening lives with the Docker driver, which
+    // every workload container is created through.
+    temps_workload_docker::hardened_host_config(
+        secrets_bind
+            .into_iter()
+            .chain(docker_socket_bind.map(str::to_string))
+            .collect(),
+    )
 }
 
 /// Host address published container ports bind to, shared with whoever may
@@ -3087,14 +3079,12 @@ impl DockerRuntime {
         }
     }
 
-    fn map_restart_policy(policy: &crate::RestartPolicy) -> bollard::models::RestartPolicyNameEnum {
+    fn workload_restart_policy(policy: &crate::RestartPolicy) -> temps_workload::RestartPolicy {
         match policy {
-            crate::RestartPolicy::Never => bollard::models::RestartPolicyNameEnum::NO,
-            crate::RestartPolicy::Always => bollard::models::RestartPolicyNameEnum::ALWAYS,
-            crate::RestartPolicy::OnFailure => bollard::models::RestartPolicyNameEnum::ON_FAILURE,
-            crate::RestartPolicy::UnlessStopped => {
-                bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED
-            }
+            crate::RestartPolicy::Never => temps_workload::RestartPolicy::Never,
+            crate::RestartPolicy::Always => temps_workload::RestartPolicy::Always,
+            crate::RestartPolicy::OnFailure => temps_workload::RestartPolicy::OnFailure,
+            crate::RestartPolicy::UnlessStopped => temps_workload::RestartPolicy::UnlessStopped,
         }
     }
 
@@ -4199,24 +4189,26 @@ impl ContainerDeployer for DockerRuntime {
             }
         }
 
-        // Create port bindings
-        let mut port_bindings = HashMap::new();
-        let mut exposed_ports = Vec::new();
-
-        for port_mapping in &request.port_mappings {
-            let container_port_key =
-                format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
-            let host_port_binding = self.host_port_binding(port_mapping);
-
-            port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
-            exposed_ports.push(container_port_key);
-        }
-
-        // Create host config with log rotation to prevent unbounded disk growth
-        let log_config = request
-            .log_config
-            .as_ref()
-            .map(|lc| lc.to_bollard_log_config());
+        // ADR-055 phase 1: the request is built by the Docker driver from an
+        // instance spec. The golden captures in
+        // `tests/golden_container_create.rs` pin it to the request this
+        // function built by hand before.
+        let ports: Vec<temps_workload::PortBinding> = request
+            .port_mappings
+            .iter()
+            .map(|port_mapping| {
+                let binding = self.host_port_binding(port_mapping);
+                temps_workload::PortBinding {
+                    container_port: port_mapping.container_port,
+                    protocol: match port_mapping.protocol {
+                        crate::Protocol::Tcp => temps_workload::PortProtocol::Tcp,
+                        crate::Protocol::Udp => temps_workload::PortProtocol::Udp,
+                    },
+                    host_ip: binding.host_ip.unwrap_or_default(),
+                    host_port: binding.host_port.and_then(|p| p.parse().ok()),
+                }
+            })
+            .collect();
 
         // When secrets are present, materialize them as files in a per-container
         // host directory (mode 0700) and bind-mount that directory into the
@@ -4284,85 +4276,91 @@ impl ContainerDeployer for DockerRuntime {
             );
         }
 
-        let host_config = bollard::models::HostConfig {
-            port_bindings: Some(port_bindings),
-            network_mode: Some(self.network_name.clone()),
-            dns: dns_for_container,
-            restart_policy: Some(bollard::models::RestartPolicy {
-                name: Some(Self::map_restart_policy(&request.restart_policy)),
+        // A limit of 0 is the explicit "uncapped" sentinel: leave Docker's
+        // memory cap unset so the container runs unlimited. Swap is capped at
+        // the memory limit so the advertised hard cap is real (Docker would
+        // otherwise let a "512 MB" app reach ~1 GiB of memory+swap).
+        let memory_bytes = request
+            .resource_limits
+            .memory_limit_mb
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb as i64 * 1024 * 1024);
+        let spec = temps_workload::InstanceSpec {
+            owner: temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Deployment, 0),
+            name: request.container_name.clone(),
+            image: request.image_name.clone(),
+            platform: None,
+            env: request
+                .environment_vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            // Delivered through `secrets_bind`, prepared above.
+            secret_files: Vec::new(),
+            command: request.command.clone(),
+            entrypoint: None,
+            workdir: None,
+            user: None,
+            ports,
+            restart: Self::workload_restart_policy(&request.restart_policy),
+            limits: temps_workload::InstanceLimits {
+                nano_cpus: request
+                    .resource_limits
+                    .cpu_limit
+                    .map(|cores| (cores * 1_000_000_000.0) as i64),
+                memory_bytes,
+                memory_swap_bytes: memory_bytes,
+                pids: None,
+                disk_mb: None,
+            },
+            log_rotation: request
+                .log_config
+                .as_ref()
+                .map(|lc| temps_workload::LogRotation {
+                    max_size: lc.max_size.clone(),
+                    max_file: lc.max_file,
+                }),
+            // Used by the log aggregator for container discovery.
+            labels: request
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            security: if docker_socket_bind.is_some() {
+                temps_workload::SecurityProfile::HostPrivileged
+            } else {
+                temps_workload::SecurityProfile::Trusted
+            },
+        };
+        let attachments = temps_workload::Attachments {
+            network: temps_workload::NetworkAttachment {
+                primary: Some(self.network_name.clone()),
+                dns: dns_for_container,
                 ..Default::default()
-            }),
-            // A limit of 0 is the explicit "uncapped" sentinel → leave Docker's
-            // memory cap unset (None) so the container runs unlimited.
-            memory: request
-                .resource_limits
-                .memory_limit_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb as i64 * 1024 * 1024),
-            // Cap swap at the memory limit so the advertised hard cap is real.
-            // Docker lets a container use swap up to its memory limit when
-            // memory_swap is left unset, which would let a "512 MB" app reach
-            // ~1 GiB of memory+swap.
-            // Setting memory_swap == memory disables swap for the container.
-            memory_swap: request
-                .resource_limits
-                .memory_limit_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb as i64 * 1024 * 1024),
-            nano_cpus: request
-                .resource_limits
-                .cpu_limit
-                .map(|cores| (cores * 1_000_000_000.0) as i64),
-            log_config,
-            // Capability drops, no-new-privileges, the PID limit, the init
-            // process and every bind (secrets, plus the ADR-045 Docker socket
-            // when this host grants it) come from one pure helper so the
-            // hardening cannot drift between call sites or be weakened by
-            // adding a mount.
-            ..hardened_host_config(secrets_bind, docker_socket_bind)
+            },
+            volumes: Vec::new(),
         };
-
-        // Build container labels (used by log aggregator for container discovery)
-        let container_labels = if request.labels.is_empty() {
-            None
-        } else {
-            Some(request.labels.clone())
-        };
-
-        // Create container config
-        let container_config = bollard::models::ContainerCreateBody {
-            image: Some(request.image_name.clone()),
-            env: Some(
-                request
-                    .environment_vars
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect(),
-            ),
-            exposed_ports: Some(exposed_ports),
-            host_config: Some(host_config),
-            cmd: request.command.clone(),
-            labels: container_labels,
-            ..Default::default()
-        };
+        // Secrets first, then the socket: binds are collected, never
+        // assigned, so neither can drop the other.
+        let binds: Vec<String> = secrets_bind
+            .into_iter()
+            .chain(docker_socket_bind.map(str::to_string))
+            .collect();
 
         // Create container — require the daemon here (as late as possible).
         // If Docker is unavailable, ensure_network_exists() above already
         // returned DockerUnavailable; this call is the guard for paths that
         // skip network creation (e.g. when it already exists).
         let docker = self.require_docker()?;
-        let container = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&request.container_name)
-                        .build(),
-                ),
-                container_config,
-            )
+        let container = temps_workload_docker::DockerDriver::new(docker.as_ref().clone())
+            .create_with_binds(&spec, &attachments, binds)
             .await
             .map_err(|e| {
-                DeployerError::DeploymentFailed(format!("Failed to create container: {}", e))
+                let reason = match e {
+                    temps_workload::DriverError::Runtime { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                DeployerError::DeploymentFailed(format!("Failed to create container: {}", reason))
             })?;
 
         // Write the host-owned receipt before the candidate can be assigned a
