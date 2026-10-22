@@ -72,6 +72,8 @@ function formatProviderType(type: string): string {
       return 'Azure DNS'
     case 'digitalocean':
       return 'DigitalOcean'
+    case 'desec':
+      return 'deSEC'
     default:
       return type.charAt(0).toUpperCase() + type.slice(1)
   }

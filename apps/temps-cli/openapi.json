@@ -21008,6 +21008,24 @@
           },
           {
             "properties": {
+              "api_token": {
+                "$ref": "#/components/schemas/SecretString"
+              },
+              "type": {
+                "enum": [
+                  "desec"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "api_token",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
               "private_key": {
                 "$ref": "#/components/schemas/SecretString"
               },
@@ -21196,6 +21214,7 @@
           "namecheap",
           "route53",
           "digitalocean",
+          "desec",
           "gcp",
           "azure",
           "manual",
