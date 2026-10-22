@@ -163,6 +163,7 @@ cron:
         .map(|job| CronConfig {
             path: job.path.clone(),
             schedule: job.schedule.clone(),
+            job: None,
         })
         .collect();
 
@@ -181,6 +182,7 @@ fn test_noop_cron_service() {
     let configs = vec![CronConfig {
         path: "/test".to_string(),
         schedule: "* * * * *".to_string(),
+        job: None,
     }];
 
     // Should succeed without doing anything
@@ -195,10 +197,12 @@ async fn test_mock_cron_service_success() {
         CronConfig {
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * *".to_string(),
+            job: None,
         },
         CronConfig {
             path: "/api/cron/task2".to_string(),
             schedule: "0 12 * * *".to_string(),
+            job: None,
         },
     ];
 
@@ -217,6 +221,7 @@ async fn test_mock_cron_service_failure() {
     let configs = vec![CronConfig {
         path: "/api/cron/task".to_string(),
         schedule: "0 0 * * *".to_string(),
+        job: None,
     }];
 
     let result = service.configure_crons(1, 1, configs).await;
@@ -283,6 +288,7 @@ cron: []
         .map(|job| CronConfig {
             path: job.path.clone(),
             schedule: job.schedule.clone(),
+            job: None,
         })
         .collect();
 

@@ -29,8 +29,9 @@ pub use condition::{
 pub use driver::{
     ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError, ExecSpec,
     ExecStream, InstanceHandle, InstanceLimits, InstanceSpec, InstanceState, InstanceStats,
-    InstanceStatus, LimitSupport, LogLine, LogQuery, LogRotation, LogStream, NetworkAttachment,
-    PortBinding, PreparedArtifact, RuntimeDriver, SecretFile, SnapshotRef, VolumeKinds,
+    InstanceStatus, LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream,
+    NetworkAttachment, PortBinding, PreparedArtifact, RuntimeDriver, SecretFile, SnapshotRef,
+    VolumeKinds,
 };
 pub use reference::{InvalidWorkloadRef, UnknownWorkloadKind, WorkloadKind, WorkloadRef};
 pub use resources::{ResourceAmounts, Resources};

@@ -71,6 +71,53 @@ pub struct CronInfo {
     created_at: String,
     updated_at: String,
     deleted_at: Option<String>,
+    /// `http` (a GET to `path` on the running deployment) or `job`
+    /// (`command` run in the environment's image until it exits). For a
+    /// `job`, `path` is the cron's key, `job:<name>`.
+    #[schema(example = "http")]
+    mode: String,
+    /// The argv a `job` cron runs. Absent for `http`.
+    command: Option<Vec<String>>,
+    /// `allow | forbid | replace`: what a `job` run does while the previous
+    /// one is still active.
+    #[schema(example = "forbid")]
+    concurrency_policy: String,
+    /// A `job` run that cannot start within this many seconds of its
+    /// scheduled time is skipped.
+    starting_deadline_seconds: Option<i32>,
+    /// Attempts after the first when a `job` run fails.
+    retry_limit: i32,
+    /// Maximum run time of a `job` run; absent takes the default (3600).
+    timeout_seconds: Option<i32>,
+    /// How long a finished `job` run's container is kept; absent takes the
+    /// default (600).
+    ttl_seconds_after_finished: Option<i32>,
+}
+
+impl From<temps_entities::crons::Model> for CronInfo {
+    fn from(cron: temps_entities::crons::Model) -> Self {
+        let command = cron
+            .command
+            .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok());
+        Self {
+            id: cron.id,
+            project_id: cron.project_id,
+            environment_id: cron.environment_id,
+            path: cron.path,
+            schedule: cron.schedule,
+            next_run: cron.next_run.map(|dt| dt.to_rfc3339()),
+            created_at: cron.created_at.to_rfc3339(),
+            updated_at: cron.updated_at.to_rfc3339(),
+            deleted_at: cron.deleted_at.map(|dt| dt.to_rfc3339()),
+            mode: cron.mode,
+            command,
+            concurrency_policy: cron.concurrency_policy,
+            starting_deadline_seconds: cron.starting_deadline_seconds,
+            retry_limit: cron.retry_limit,
+            timeout_seconds: cron.timeout_seconds,
+            ttl_seconds_after_finished: cron.ttl_seconds_after_finished,
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -83,6 +130,42 @@ pub struct CronExecutionInfo {
     headers: String,
     response_time_ms: i32,
     error_message: Option<String>,
+    /// `running | succeeded | failed | skipped` for a `job` run; absent
+    /// for an `http` call, whose outcome is `status_code`.
+    state: Option<String>,
+    /// Exit code of the run's last attempt.
+    exit_code: Option<i32>,
+    /// Attempts made (1 + retries).
+    attempt: Option<i32>,
+    /// When a `job` run finished, ISO 8601 UTC.
+    finished_at: Option<String>,
+    /// The last lines of the run's output, with secret values redacted.
+    output_tail: Option<String>,
+    /// The workload the `job` run executed as.
+    workload_id: Option<i64>,
+}
+
+impl From<temps_entities::cron_executions::Model> for CronExecutionInfo {
+    fn from(exec: temps_entities::cron_executions::Model) -> Self {
+        Self {
+            id: exec.id,
+            cron_id: exec.cron_id,
+            executed_at: exec.executed_at.to_rfc3339(),
+            url: exec.url,
+            status_code: exec.status_code,
+            headers: exec.headers,
+            response_time_ms: exec.response_time_ms,
+            error_message: exec.error_message,
+            state: exec.state,
+            exit_code: exec.exit_code,
+            attempt: exec.attempt,
+            finished_at: exec
+                .finished_at
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+            output_tail: exec.output_tail,
+            workload_id: exec.workload_id,
+        }
+    }
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -163,20 +246,7 @@ async fn get_environment_crons(
         .get_environment_crons(project_id, env_id)
         .await?;
 
-    let cron_infos: Vec<CronInfo> = crons
-        .into_iter()
-        .map(|cron| CronInfo {
-            id: cron.id,
-            project_id: cron.project_id,
-            environment_id: cron.environment_id,
-            path: cron.path,
-            schedule: cron.schedule,
-            next_run: cron.next_run.map(|dt| dt.to_rfc3339()),
-            created_at: cron.created_at.to_rfc3339(),
-            updated_at: cron.updated_at.to_rfc3339(),
-            deleted_at: cron.deleted_at.map(|dt| dt.to_rfc3339()),
-        })
-        .collect();
+    let cron_infos: Vec<CronInfo> = crons.into_iter().map(CronInfo::from).collect();
 
     Ok(Json(cron_infos))
 }
@@ -216,17 +286,7 @@ async fn get_cron_by_id(
         .get_cron_by_id(project_id, env_id, cron_id)
         .await?;
 
-    let cron_info = CronInfo {
-        id: cron.id,
-        project_id: cron.project_id,
-        environment_id: cron.environment_id,
-        path: cron.path,
-        schedule: cron.schedule,
-        next_run: cron.next_run.map(|dt| dt.to_rfc3339()),
-        created_at: cron.created_at.to_rfc3339(),
-        updated_at: cron.updated_at.to_rfc3339(),
-        deleted_at: cron.deleted_at.map(|dt| dt.to_rfc3339()),
-    };
+    let cron_info = CronInfo::from(cron);
 
     Ok(Json(cron_info))
 }
@@ -277,16 +337,7 @@ async fn get_cron_executions(
 
     let execution_infos: Vec<CronExecutionInfo> = executions
         .into_iter()
-        .map(|exec| CronExecutionInfo {
-            id: exec.id,
-            cron_id: exec.cron_id,
-            executed_at: exec.executed_at.to_rfc3339(),
-            url: exec.url,
-            status_code: exec.status_code,
-            headers: exec.headers,
-            response_time_ms: exec.response_time_ms,
-            error_message: exec.error_message,
-        })
+        .map(CronExecutionInfo::from)
         .collect();
 
     Ok(Json(execution_infos))

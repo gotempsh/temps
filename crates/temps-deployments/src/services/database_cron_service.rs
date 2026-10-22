@@ -25,7 +25,14 @@ use tokio::time::{self, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::configure_crons::{CronConfig, CronConfigError, CronConfigService};
+use crate::services::cron_jobs::{
+    deployment_container_import, insert_running, job_dispatch_decision, job_spec, run_name,
+    CronJobColumns, JobDispatch, CRON_OWNER_KIND, RECORD_RUN_FINALIZER,
+};
 use crate::services::deployment_token_service::DeploymentTokenService;
+use temps_core::CronConcurrencyPolicy;
+use temps_entities::{environments, projects};
+use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 
 #[derive(Error, Debug)]
 pub enum CronServiceError {
@@ -72,6 +79,23 @@ pub enum CronServiceError {
 
     #[error("Failed to notify about cron error: {0}")]
     NotificationError(String),
+
+    #[error("Workload plane {operation} for job cron {cron_id} failed: {message}")]
+    WorkloadPlane {
+        cron_id: i32,
+        operation: &'static str,
+        message: String,
+    },
+
+    #[error(
+        "Job cron {cron_id} cannot run: deployment {deployment_id} of environment {env_id} \
+         has no container image (a job runs in the environment's current deployment image)"
+    )]
+    NoJobImage {
+        cron_id: i32,
+        deployment_id: i32,
+        env_id: i32,
+    },
 }
 
 /// Floor for the cron scheduler's between-tick sleep.
@@ -95,6 +119,19 @@ pub struct DatabaseCronConfigService {
     /// set from `initialize_plugin_services`. Unset means failures are only
     /// recorded in the execution history.
     alarm_service: OnceLock<Arc<AlarmService>>,
+    /// Runs `job` crons (ADR-055 §14). Late-bound like the alarm service:
+    /// the plane needs the audit logger, which is only resolvable once
+    /// every plugin has registered. Unset means `job` crons are recorded
+    /// as failed with that reason; `http` crons never use it.
+    plane: OnceLock<Arc<WorkloadPlane>>,
+}
+
+/// Where a `job` cron's run comes from: the environment's current
+/// deployment.
+struct JobTarget {
+    image: String,
+    container_id: String,
+    project_slug: String,
 }
 
 impl DatabaseCronConfigService {
@@ -109,7 +146,13 @@ impl DatabaseCronConfigService {
             queue,
             deployment_token_service,
             alarm_service: OnceLock::new(),
+            plane: OnceLock::new(),
         }
+    }
+
+    /// Wire in the workload plane that runs `job` crons.
+    pub fn set_workload_plane(&self, plane: Arc<WorkloadPlane>) {
+        let _ = self.plane.set(plane);
     }
 
     /// Wire in the alarm service once every plugin has registered.
@@ -251,6 +294,7 @@ impl CronConfigService for DatabaseCronConfigService {
         for cron_config in cron_configs {
             // Check if cron already exists
             let existing_cron = existing_crons.iter().find(|c| c.path == cron_config.path);
+            let job_columns = CronJobColumns::from_config(&cron_config);
 
             match existing_cron {
                 Some(cron) if cron.schedule != cron_config.schedule => {
@@ -266,6 +310,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     cron_update.schedule = Set(cron_config.schedule.clone());
                     cron_update.updated_at = Set(Utc::now());
                     cron_update.next_run = Set(Some(next_run));
+                    job_columns.apply(&mut cron_update);
                     cron_update.update(self.db.as_ref()).await.map_err(|e| {
                         CronConfigError::DatabaseError(format!("Failed to update cron: {}", e))
                     })?;
@@ -274,6 +319,25 @@ impl CronConfigService for DatabaseCronConfigService {
                         "Updated cron job '{}' with schedule '{}', next run at {:?}",
                         cron.path, cron_config.schedule, next_run
                     );
+                }
+                // Same schedule, changed job settings (command, policy,
+                // limits): update them without moving the next run. Never
+                // true for an `http` cron, whose columns stay at their
+                // defaults.
+                Some(cron) if !job_columns.matches(cron) => {
+                    info!(
+                        "Updating job cron '{}' (cron {}): run settings changed",
+                        cron.path, cron.id
+                    );
+                    let mut cron_update: crons::ActiveModel = cron.clone().into();
+                    cron_update.updated_at = Set(Utc::now());
+                    job_columns.apply(&mut cron_update);
+                    cron_update.update(self.db.as_ref()).await.map_err(|e| {
+                        CronConfigError::DatabaseError(format!(
+                            "Failed to update job cron {} ('{}'): {}",
+                            cron.id, cron.path, e
+                        ))
+                    })?;
                 }
                 Some(cron) => {
                     info!(
@@ -288,7 +352,7 @@ impl CronConfigService for DatabaseCronConfigService {
                     let next_run = Self::calculate_next_run(&cron_config.schedule)?;
                     let now = Utc::now();
 
-                    let new_cron = crons::ActiveModel {
+                    let mut new_cron = crons::ActiveModel {
                         project_id: Set(project_id),
                         environment_id: Set(environment_id),
                         path: Set(cron_config.path.clone()),
@@ -299,6 +363,7 @@ impl CronConfigService for DatabaseCronConfigService {
                         deleted_at: Set(None),
                         ..Default::default()
                     };
+                    job_columns.apply(&mut new_cron);
 
                     match new_cron.insert(self.db.as_ref()).await {
                         Ok(cron) => {
@@ -576,6 +641,12 @@ impl DatabaseCronConfigService {
                 None => self.retire_cron(cron).await?,
             }
 
+            // A `job` cron runs on the workload plane; everything below is
+            // the `http` path, unchanged.
+            if cron.mode == crons::MODE_JOB {
+                return self.dispatch_job(cron, due_at, now).await;
+            }
+
             // Execute the cron
             let start_time = std::time::Instant::now();
             let result = self.execute_cron(cron).await;
@@ -695,6 +766,225 @@ impl DatabaseCronConfigService {
             }
         }
 
+        Ok(())
+    }
+
+    /// Dispatch the run of `job` cron `cron` due at `due_at` to the
+    /// workload plane, with Kubernetes CronJob semantics (ADR-055 §14).
+    ///
+    /// Every outcome is in `cron_executions`: a started run as `running`
+    /// (its finalizer completes the row), a skipped one as `skipped`, and
+    /// one that could not start as `failed` with why. Only a failure to
+    /// reach the plane's own tables is returned as an error.
+    async fn dispatch_job(
+        &self,
+        cron: &crons::Model,
+        due_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<(), CronServiceError> {
+        let Some(plane) = self.plane.get() else {
+            warn!(
+                cron_id = cron.id,
+                project_id = cron.project_id,
+                "job cron is due but no workload plane is running on this server"
+            );
+            return self
+                .record_job_outcome(
+                    cron,
+                    now,
+                    cron_executions::STATE_FAILED,
+                    "PlaneUnavailable: no workload plane is running on this server, so job \
+                     crons cannot run (HTTP crons are unaffected); check the server log for \
+                     why it did not start"
+                        .to_string(),
+                )
+                .await;
+        };
+        let plane_error = |operation: &'static str| {
+            move |e: temps_workload_plane::PlaneError| CronServiceError::WorkloadPlane {
+                cron_id: cron.id,
+                operation,
+                message: e.to_string(),
+            }
+        };
+
+        let owner = Owner::new(CRON_OWNER_KIND, i64::from(cron.id));
+        let active: Vec<i64> = plane
+            .list_active(&owner)
+            .await
+            .map_err(plane_error("listing active runs"))?
+            .into_iter()
+            .map(|run| run.id)
+            .collect();
+        let policy = CronConcurrencyPolicy::from_stored(&cron.concurrency_policy);
+        match job_dispatch_decision(policy, cron.starting_deadline_seconds, due_at, now, &active) {
+            JobDispatch::Run => {}
+            JobDispatch::Skip { reason, message } => {
+                info!(cron_id = cron.id, reason, "job cron run skipped: {message}");
+                return self
+                    .record_job_outcome(
+                        cron,
+                        now,
+                        cron_executions::STATE_SKIPPED,
+                        format!("{reason}: {message}"),
+                    )
+                    .await;
+            }
+            JobDispatch::Replace { active } => {
+                for workload_id in active {
+                    info!(
+                        cron_id = cron.id,
+                        workload_id, "replacing the active run of a job cron"
+                    );
+                    plane
+                        .delete(
+                            workload_id,
+                            "Replaced",
+                            &format!(
+                                "concurrency_policy is replace: stopped for the run due at {}",
+                                due_at.to_rfc3339()
+                            ),
+                        )
+                        .await
+                        .map_err(plane_error("replacing an active run"))?;
+                }
+            }
+        }
+
+        let target = match self.job_target(cron).await {
+            Ok(target) => target,
+            Err(e) => {
+                warn!(cron_id = cron.id, "job cron run could not start: {e}");
+                return self
+                    .record_job_outcome(
+                        cron,
+                        now,
+                        cron_executions::STATE_FAILED,
+                        format!("NoDeployment: {e}"),
+                    )
+                    .await;
+            }
+        };
+        let import =
+            deployment_container_import(cron.project_id, cron.environment_id, &target.container_id);
+        let spec = match job_spec(cron, &target.image, import) {
+            Ok(spec) => spec,
+            Err(e) => {
+                warn!(cron_id = cron.id, "job cron run could not start: {e}");
+                return self
+                    .record_job_outcome(
+                        cron,
+                        now,
+                        cron_executions::STATE_FAILED,
+                        format!("InvalidJob: {e}"),
+                    )
+                    .await;
+            }
+        };
+        let request = ApplyRequest {
+            owner,
+            name: run_name(cron.id, due_at),
+            spec,
+            project_slug: Some(target.project_slug),
+            finalizers: vec![RECORD_RUN_FINALIZER.to_string()],
+        };
+        match plane.apply(request).await {
+            Ok(workload_id) => {
+                insert_running(self.db.as_ref(), cron, workload_id, now).await?;
+                info!(
+                    cron_id = cron.id,
+                    workload_id,
+                    image = %target.image,
+                    "job cron run dispatched"
+                );
+                Ok(())
+            }
+            // Refused at admission (already audit-logged by the plane) or
+            // not stored: either way this occurrence did not run.
+            Err(e) => {
+                warn!(cron_id = cron.id, "job cron run was not admitted: {e}");
+                self.record_job_outcome(
+                    cron,
+                    now,
+                    cron_executions::STATE_FAILED,
+                    format!("NotAdmitted: {e}"),
+                )
+                .await
+            }
+        }
+    }
+
+    /// The image, a running container (whose variables the run gets) and
+    /// the project slug of `cron`'s environment's current deployment.
+    async fn job_target(&self, cron: &crons::Model) -> Result<JobTarget, CronServiceError> {
+        let no_deployment = || CronServiceError::NoActiveDeployment {
+            env_id: cron.environment_id,
+        };
+        let environment = environments::Entity::find_by_id(cron.environment_id)
+            .filter(environments::Column::ProjectId.eq(cron.project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(no_deployment)?;
+        let deployment_id = environment
+            .current_deployment_id
+            .ok_or_else(no_deployment)?;
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(no_deployment)?;
+        let image = deployment
+            .image_name
+            .filter(|image| !image.trim().is_empty())
+            .ok_or(CronServiceError::NoJobImage {
+                cron_id: cron.id,
+                deployment_id,
+                env_id: cron.environment_id,
+            })?;
+        let container = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .order_by_asc(deployment_containers::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(no_deployment)?;
+        let project = projects::Entity::find_by_id(cron.project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(no_deployment)?;
+        Ok(JobTarget {
+            image,
+            container_id: container.container_id,
+            project_slug: project.slug,
+        })
+    }
+
+    /// Record a `job` cron occurrence that did not become a run.
+    async fn record_job_outcome(
+        &self,
+        cron: &crons::Model,
+        now: DateTime<Utc>,
+        state: &'static str,
+        message: String,
+    ) -> Result<(), CronServiceError> {
+        let status_code = if state == cron_executions::STATE_SKIPPED {
+            0
+        } else {
+            500
+        };
+        cron_executions::ActiveModel {
+            cron_id: Set(cron.id),
+            executed_at: Set(now),
+            url: Set(cron.path.clone()),
+            status_code: Set(status_code),
+            headers: Set("{}".to_string()),
+            response_time_ms: Set(0),
+            error_message: Set(Some(message)),
+            state: Set(Some(state.to_string())),
+            finished_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await?;
         Ok(())
     }
 
@@ -1404,6 +1694,7 @@ mod tests {
         let configs = vec![CronConfig {
             path: "/api/cron/cleanup".to_string(),
             schedule: "0 0 * * * *".to_string(),
+            job: None,
         }];
 
         service
@@ -1440,6 +1731,7 @@ mod tests {
         let configs = vec![CronConfig {
             path: "/api/cron/daily".to_string(),
             schedule: "0 0 * * *".to_string(),
+            job: None,
         }];
 
         service
@@ -1477,6 +1769,7 @@ mod tests {
         let configs = vec![CronConfig {
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * * *".to_string(),
+            job: None,
         }];
         service
             .configure_crons(project.id, environment.id, configs)
@@ -1486,6 +1779,7 @@ mod tests {
         let updated_configs = vec![CronConfig {
             path: "/api/cron/task".to_string(),
             schedule: "0 */5 * * * *".to_string(),
+            job: None,
         }];
         service
             .configure_crons(project.id, environment.id, updated_configs)
@@ -1522,10 +1816,12 @@ mod tests {
             CronConfig {
                 path: "/api/cron/task1".to_string(),
                 schedule: "0 0 * * * *".to_string(),
+                job: None,
             },
             CronConfig {
                 path: "/api/cron/task2".to_string(),
                 schedule: "0 0 * * * *".to_string(),
+                job: None,
             },
         ];
         service
@@ -1536,6 +1832,7 @@ mod tests {
         let updated_configs = vec![CronConfig {
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * * *".to_string(),
+            job: None,
         }];
         service
             .configure_crons(project.id, environment.id, updated_configs)
@@ -1650,6 +1947,13 @@ mod tests {
             updated_at: Utc::now(),
             next_run: None,
             deleted_at: None,
+            mode: crons::MODE_HTTP.to_string(),
+            command: None,
+            concurrency_policy: "forbid".to_string(),
+            starting_deadline_seconds: None,
+            retry_limit: 0,
+            timeout_seconds: None,
+            ttl_seconds_after_finished: None,
         }
     }
 
@@ -1999,5 +2303,355 @@ mod tests {
         );
         // The alarm row is still recorded even though delivery never finishes.
         assert_eq!(wait_for_cron_alarms(db.as_ref(), project.id).await.len(), 1);
+    }
+
+    // ---- job crons (ADR-055 §14) ----
+
+    fn job_config(retry_limit: u32, policy: CronConcurrencyPolicy) -> CronConfig {
+        CronConfig {
+            path: "job:nightly-report".to_string(),
+            schedule: "0 3 * * *".to_string(),
+            job: Some(crate::jobs::configure_crons::JobCronConfig {
+                command: vec!["bin/report".to_string(), "--yesterday".to_string()],
+                concurrency_policy: policy,
+                starting_deadline_seconds: Some(300),
+                retry_limit,
+                timeout_seconds: Some(1800),
+                ttl_seconds_after_finished: None,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn configure_crons_stores_job_settings_and_updates_them_in_place() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let service = cron_service(&db);
+        let http = CronConfig {
+            path: "/api/cron/cleanup".to_string(),
+            schedule: "0 0 * * *".to_string(),
+            job: None,
+        };
+
+        service
+            .configure_crons(
+                project.id,
+                environment.id,
+                vec![http.clone(), job_config(1, CronConcurrencyPolicy::Forbid)],
+            )
+            .await
+            .expect("configured");
+        let rows = service
+            .get_environment_crons(project.id, environment.id)
+            .await
+            .expect("listed");
+        let http_row = rows.iter().find(|c| c.path == "/api/cron/cleanup").unwrap();
+        assert_eq!(http_row.mode, crons::MODE_HTTP);
+        assert_eq!(http_row.command, None);
+        let job_row = rows
+            .iter()
+            .find(|c| c.path == "job:nightly-report")
+            .unwrap();
+        assert_eq!(job_row.mode, crons::MODE_JOB);
+        assert_eq!(
+            job_row.command,
+            Some(serde_json::json!(["bin/report", "--yesterday"]))
+        );
+        assert_eq!(job_row.concurrency_policy, "forbid");
+        assert_eq!(job_row.retry_limit, 1);
+        assert_eq!(job_row.starting_deadline_seconds, Some(300));
+        assert_eq!(job_row.timeout_seconds, Some(1800));
+
+        // Same schedule, new settings: updated without moving the next run,
+        // and the HTTP cron is left alone.
+        service
+            .configure_crons(
+                project.id,
+                environment.id,
+                vec![http, job_config(3, CronConcurrencyPolicy::Replace)],
+            )
+            .await
+            .expect("reconfigured");
+        let rows = service
+            .get_environment_crons(project.id, environment.id)
+            .await
+            .expect("listed");
+        let updated = rows
+            .iter()
+            .find(|c| c.path == "job:nightly-report")
+            .unwrap();
+        assert_eq!(updated.id, job_row.id);
+        assert_eq!(updated.retry_limit, 3);
+        assert_eq!(updated.concurrency_policy, "replace");
+        assert_eq!(updated.next_run, job_row.next_run);
+        let http_again = rows.iter().find(|c| c.path == "/api/cron/cleanup").unwrap();
+        assert_eq!(http_again.updated_at, http_row.updated_at);
+    }
+
+    async fn job_cron_fixture(
+        db: &Arc<DatabaseConnection>,
+        policy: CronConcurrencyPolicy,
+    ) -> crons::Model {
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .expect("fixtures");
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("job-cron-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            image_name: Set(Some("registry.example.test/shop:41".to_string())),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("deployment insert");
+        deployment_containers::ActiveModel {
+            deployment_id: Set(deployment.id),
+            container_id: Set("job-cron-container-id".to_string()),
+            container_name: Set("job-cron-container".to_string()),
+            container_port: Set(Some(3000)),
+            deployed_at: Set(Utc::now()),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("container insert");
+        environments::Entity::update_many()
+            .col_expr(
+                environments::Column::CurrentDeploymentId,
+                Expr::value(deployment.id),
+            )
+            .filter(environments::Column::Id.eq(environment.id))
+            .exec(db.as_ref())
+            .await
+            .expect("current deployment set");
+
+        let service = cron_service(db);
+        service
+            .configure_crons(project.id, environment.id, vec![job_config(0, policy)])
+            .await
+            .expect("configured");
+        service
+            .get_environment_crons(project.id, environment.id)
+            .await
+            .expect("listed")
+            .into_iter()
+            .next()
+            .expect("the job cron")
+    }
+
+    struct AcceptingAudit;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for AcceptingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A plane with no node: runs are stored and admitted, never started,
+    /// which is all the dispatcher's decisions need.
+    fn nodeless_plane(db: &Arc<DatabaseConnection>) -> Arc<WorkloadPlane> {
+        Arc::new(WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-p2-cron-test"),
+        ))
+    }
+
+    async fn executions_of(db: &DatabaseConnection, cron_id: i32) -> Vec<cron_executions::Model> {
+        cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron_id))
+            .order_by_asc(cron_executions::Column::Id)
+            .all(db)
+            .await
+            .expect("executions")
+    }
+
+    #[tokio::test]
+    async fn a_due_job_cron_with_no_plane_is_recorded_failed_with_the_reason() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let cron = job_cron_fixture(&db, CronConcurrencyPolicy::Forbid).await;
+        let service = cron_service(&db);
+        let due_at = Utc::now() - chrono::Duration::seconds(5);
+        service
+            .dispatch_job(&cron, due_at, Utc::now())
+            .await
+            .expect("recorded");
+        let executions = executions_of(db.as_ref(), cron.id).await;
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].state.as_deref(),
+            Some(cron_executions::STATE_FAILED)
+        );
+        assert!(executions[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("PlaneUnavailable")));
+    }
+
+    #[tokio::test]
+    async fn job_cron_runs_follow_forbid_the_starting_deadline_and_the_finalizer() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let cron = job_cron_fixture(&db, CronConcurrencyPolicy::Forbid).await;
+        let service = cron_service(&db);
+        let plane = nodeless_plane(&db);
+        service.set_workload_plane(plane.clone());
+
+        // 1. The first occurrence becomes a run of the deployment image.
+        let first_due = Utc::now() - chrono::Duration::seconds(5);
+        service
+            .dispatch_job(&cron, first_due, Utc::now())
+            .await
+            .expect("dispatched");
+        let owner = Owner::new(CRON_OWNER_KIND, i64::from(cron.id));
+        let active = plane.list_active(&owner).await.expect("active runs");
+        assert_eq!(active.len(), 1);
+        let run = &active[0];
+        assert_eq!(run.name, run_name(cron.id, first_due));
+        assert_eq!(
+            run.spec.artifact,
+            temps_workload::Artifact::oci("registry.example.test/shop:41")
+        );
+        assert_eq!(
+            run.spec.env.imports,
+            vec![deployment_container_import(
+                cron.project_id,
+                cron.environment_id,
+                "job-cron-container-id"
+            )]
+        );
+        assert_eq!(run.finalizers, vec![RECORD_RUN_FINALIZER.to_string()]);
+        let executions = executions_of(db.as_ref(), cron.id).await;
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].workload_id, Some(run.id));
+        assert_eq!(
+            executions[0].state.as_deref(),
+            Some(cron_executions::STATE_RUNNING)
+        );
+
+        // 2. The next occurrence, while the first is active: forbid skips it.
+        let second_due = first_due + chrono::Duration::minutes(1);
+        service
+            .dispatch_job(&cron, second_due, second_due)
+            .await
+            .expect("skipped");
+        assert_eq!(plane.list_active(&owner).await.expect("active").len(), 1);
+        let executions = executions_of(db.as_ref(), cron.id).await;
+        assert_eq!(executions.len(), 2);
+        assert_eq!(
+            executions[1].state.as_deref(),
+            Some(cron_executions::STATE_SKIPPED)
+        );
+        assert!(executions[1]
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("ConcurrencyForbidden")));
+
+        // 3. Ten minutes late with a 300s starting deadline: skipped.
+        let third_due = second_due + chrono::Duration::minutes(1);
+        service
+            .dispatch_job(&cron, third_due, third_due + chrono::Duration::minutes(10))
+            .await
+            .expect("skipped");
+        let executions = executions_of(db.as_ref(), cron.id).await;
+        assert!(executions[2]
+            .error_message
+            .as_deref()
+            .is_some_and(|m| m.starts_with("MissedStartingDeadline")));
+
+        // 4. The run finishes: its finalizer completes the same row.
+        let mut finished = plane.get(run.id).await.expect("the run");
+        finished.status.phase = temps_workload::WorkloadPhase::Succeeded;
+        finished.status.exit_code = Some(0);
+        finished.attempt = 1;
+        finished.finished_at = Some(Utc::now());
+        finished.output_tail = Some("report written\n".to_string());
+        temps_workload_plane::Finalizer::finalize(
+            &crate::services::cron_jobs::CronRunFinalizer::new(db.clone()),
+            &finished,
+        )
+        .await
+        .expect("finalized");
+        let executions = executions_of(db.as_ref(), cron.id).await;
+        assert_eq!(
+            executions.len(),
+            3,
+            "the run's row is completed, not duplicated"
+        );
+        assert_eq!(
+            executions[0].state.as_deref(),
+            Some(cron_executions::STATE_SUCCEEDED)
+        );
+        assert_eq!(executions[0].status_code, 200);
+        assert_eq!(executions[0].exit_code, Some(0));
+        assert_eq!(
+            executions[0].output_tail.as_deref(),
+            Some("report written\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_deletes_the_active_run_and_starts_the_new_one() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let cron = job_cron_fixture(&db, CronConcurrencyPolicy::Replace).await;
+        let service = cron_service(&db);
+        let plane = nodeless_plane(&db);
+        service.set_workload_plane(plane.clone());
+        let owner = Owner::new(CRON_OWNER_KIND, i64::from(cron.id));
+
+        let first_due = Utc::now() - chrono::Duration::seconds(5);
+        service
+            .dispatch_job(&cron, first_due, Utc::now())
+            .await
+            .expect("dispatched");
+        let first = plane.list_active(&owner).await.expect("active")[0].id;
+
+        let second_due = first_due + chrono::Duration::minutes(1);
+        service
+            .dispatch_job(&cron, second_due, second_due)
+            .await
+            .expect("replaced");
+        let active = plane.list_active(&owner).await.expect("active");
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].id, first);
+        assert_eq!(active[0].name, run_name(cron.id, second_due));
+        let replaced = plane.get(first).await.expect("the replaced run");
+        assert!(replaced.deleted_at.is_some());
+        assert_eq!(
+            replaced
+                .status
+                .condition(temps_workload::ConditionKind::Completed)
+                .map(|c| c.reason.as_str()),
+            Some("Replaced")
+        );
     }
 }

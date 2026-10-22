@@ -57,6 +57,77 @@ impl DeploymentsPlugin {
             pending_job_processor: tokio::sync::Mutex::new(None),
         }
     }
+
+    /// Build the workload plane that runs `job` crons, start its
+    /// reconciler and hand it to the cron scheduler.
+    ///
+    /// Runs on node 0 (this host) only: with local workloads disabled, or
+    /// no Docker daemon, the plane still starts and reports every run as
+    /// `NoEligibleNode` instead of the cron silently doing nothing. With no
+    /// audit logger the plane is not started (its refusals must be
+    /// audited) and `job` crons are recorded as failed with that reason.
+    fn start_workload_plane(&self, context: &PluginContext) {
+        let Some(cron_service) =
+            context.get_service::<crate::services::DatabaseCronConfigService>()
+        else {
+            tracing::warn!("Cron scheduler service is not registered; job crons cannot run");
+            return;
+        };
+        let Some(audit) = context.get_service::<dyn temps_core::AuditLogger>() else {
+            tracing::warn!(
+                "No audit logger is registered; the workload plane is not started, so job \
+                 crons are recorded as failed (HTTP crons are unaffected)"
+            );
+            return;
+        };
+        let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let deployment_service = context.require_service::<DeploymentService>();
+        let docker_handle = context.require_service::<temps_core::DockerHandle>();
+        let local_workloads =
+            temps_core::policy_or_default(context.get_service::<temps_core::LocalWorkloadPolicy>());
+        let driver = match docker_handle.cloned() {
+            Some(docker) if local_workloads.local_workloads_enabled() => {
+                let driver: Arc<dyn temps_workload::RuntimeDriver> = Arc::new(
+                    temps_workload_docker::DockerDriver::new(docker.as_ref().clone()),
+                );
+                Some(driver)
+            }
+            _ => {
+                tracing::info!(
+                    "No local Docker daemon for workloads in this process; job cron runs will \
+                     report NoEligibleNode"
+                );
+                None
+            }
+        };
+
+        let mut config = temps_workload_plane::PlaneConfig::new("temps");
+        config.network = Some(temps_core::NETWORK_NAME.clone());
+        config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
+        let plane = Arc::new(
+            temps_workload_plane::WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(driver),
+                Arc::new(crate::services::cron_jobs::DeploymentEnvSource::new(
+                    deployment_service,
+                )),
+                audit,
+                config,
+            )
+            .with_finalizer(Arc::new(
+                crate::services::cron_jobs::CronRunFinalizer::new(db),
+            )),
+        );
+        match plane.start() {
+            // Dropping the handle leaves the reconciler running for the
+            // life of the process.
+            Ok(_handle) => {
+                cron_service.set_workload_plane(plane);
+                tracing::info!("Workload plane started; job crons are enabled");
+            }
+            Err(e) => tracing::error!("Workload plane did not start: {e}"),
+        }
+    }
 }
 
 impl Default for DeploymentsPlugin {
@@ -719,6 +790,12 @@ impl TempsPlugin for DeploymentsPlugin {
                     "Cron scheduler service is not registered; cron failure alarms are off"
                 ),
             }
+
+            // The workload plane runs `job` crons (ADR-055 §14). Built here,
+            // not at registration, because it audit-logs its admission
+            // refusals and the audit logger is only resolvable now. Started
+            // once per process. `http` crons never touch it.
+            self.start_workload_plane(context);
 
             // Wire auditing for deploy-path security events — currently the
             // ADR-045 record that a deployment received the host Docker

@@ -257,3 +257,7 @@ pub mod http_checks;
 
 pub mod env_var_history;
 pub mod secret_history;
+
+pub mod workload_events;
+pub mod workload_instances;
+pub mod workloads;

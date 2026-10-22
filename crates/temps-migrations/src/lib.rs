@@ -24,6 +24,10 @@ pub use migration::m20261022_000001_dns_name_claims::{
     backfill_sql as dns_name_claims_backfill_sql, Migration as DnsNameClaimsMigration,
 };
 
+pub use migration::m20261022_000002_workloads::{
+    Migration as WorkloadsMigration, WORKLOAD_TABLES_SQL,
+};
+
 pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
 
 pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;

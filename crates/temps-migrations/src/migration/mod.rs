@@ -30,6 +30,7 @@ mod m20261020_000004_client_outcomes;
 mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
 pub(crate) mod m20261022_000001_dns_name_claims;
+pub(crate) mod m20261022_000002_workloads;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -813,6 +814,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000001_create_ai_blueprints::Migration),
             Box::new(m20261020_000002_create_autofix_incidents::Migration),
             Box::new(m20261022_000001_dns_name_claims::Migration),
+            Box::new(m20261022_000002_workloads::Migration),
         ]
     }
 }

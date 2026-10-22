@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload-plane"
+description = "The workload plane: workload objects, admission, conditions, events and the reconciler (ADR-055 §2, §4, §18)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# The only plane crate that touches the database. Drivers arrive as
+# `Arc<dyn RuntimeDriver>`; this crate never depends on a driver crate.
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-env = { path = "../temps-workload-env" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+bytes = { workspace = true }
+bollard = { workspace = true }
+temps-database = { path = "../temps-database" }
+temps-migrations = { path = "../temps-migrations" }
+temps-workload-docker = { path = "../temps-workload-docker" }
+uuid = { workspace = true }

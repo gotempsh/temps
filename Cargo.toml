@@ -30,6 +30,7 @@ members = [
     "crates/temps-workload-ingress",
     "crates/temps-workload-volumes",
     "crates/temps-workload-docker",
+    "crates/temps-workload-plane",
     "crates/temps-projects",
     "crates/temps-domains",
     "crates/temps-proxy",

@@ -32,8 +32,115 @@ pub trait CronConfigService: Send + Sync {
 /// Cron configuration for service layer
 #[derive(Debug, Clone)]
 pub struct CronConfig {
+    /// The cron's identity in its environment. For an `http` cron, the path
+    /// it calls; for a `job` cron, [`JOB_KEY_PREFIX`] plus its name (or its
+    /// command, when it has no name).
     pub path: String,
     pub schedule: String,
+    /// Set for a `job` cron (ADR-055 §14); `None` for `http`.
+    pub job: Option<JobCronConfig>,
+}
+
+/// Prefix of a `job` cron's key in `crons.path`. An `http` path cannot
+/// start with it, so the two kinds never collide.
+pub const JOB_KEY_PREFIX: &str = "job:";
+
+/// Longest `job` cron key stored in `crons.path`.
+pub const MAX_JOB_KEY_LEN: usize = 200;
+
+/// A `job` cron's run settings, as written in `.temps.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCronConfig {
+    pub command: Vec<String>,
+    pub concurrency_policy: temps_core::CronConcurrencyPolicy,
+    pub starting_deadline_seconds: Option<u32>,
+    pub retry_limit: u32,
+    pub timeout_seconds: Option<u32>,
+    pub ttl_seconds_after_finished: Option<u32>,
+}
+
+impl CronConfig {
+    /// The service-layer form of one `.temps.yaml` cron entry. Refuses an
+    /// entry that sets neither (or both) of `path` and `command`, an empty
+    /// or NUL-carrying command, job-only fields on an `http` entry, and an
+    /// `http` path that looks like a job key.
+    pub fn from_repo(entry: &temps_core::CronJobConfig) -> Result<Self, CronConfigError> {
+        let describe = || match (&entry.name, entry.path.is_empty()) {
+            (Some(name), _) => format!("cron '{name}' (schedule '{}')", entry.schedule),
+            (None, false) => format!("cron '{}' (schedule '{}')", entry.path, entry.schedule),
+            (None, true) => format!("cron with schedule '{}'", entry.schedule),
+        };
+        let Some(command) = &entry.command else {
+            if entry.path.is_empty() {
+                return Err(CronConfigError::ConfigError(format!(
+                    "{} sets neither `path` (an HTTP cron) nor `command` (a job cron)",
+                    describe()
+                )));
+            }
+            let job_fields = entry.job_only_fields();
+            if !job_fields.is_empty() {
+                return Err(CronConfigError::ConfigError(format!(
+                    "{} is an HTTP cron but sets {}, which only apply to a job cron \
+                     (one with `command`)",
+                    describe(),
+                    job_fields.join(", ")
+                )));
+            }
+            if entry.path.starts_with(JOB_KEY_PREFIX) {
+                return Err(CronConfigError::ConfigError(format!(
+                    "{}: an HTTP cron path cannot start with '{JOB_KEY_PREFIX}'",
+                    describe()
+                )));
+            }
+            return Ok(Self {
+                path: entry.path.clone(),
+                schedule: entry.schedule.clone(),
+                job: None,
+            });
+        };
+        if !entry.path.is_empty() {
+            return Err(CronConfigError::ConfigError(format!(
+                "{} sets both `path` and `command`; a cron is either an HTTP call or a job",
+                describe()
+            )));
+        }
+        if command.is_empty() || command.iter().all(|arg| arg.trim().is_empty()) {
+            return Err(CronConfigError::ConfigError(format!(
+                "{} has an empty `command`",
+                describe()
+            )));
+        }
+        if command.iter().any(|arg| arg.contains('\0')) {
+            return Err(CronConfigError::ConfigError(format!(
+                "{} has a `command` argument containing a NUL byte",
+                describe()
+            )));
+        }
+        let identity = match entry.name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => command.join(" "),
+        };
+        let mut key = format!("{JOB_KEY_PREFIX}{identity}");
+        if key.len() > MAX_JOB_KEY_LEN {
+            let mut end = MAX_JOB_KEY_LEN;
+            while !key.is_char_boundary(end) {
+                end -= 1;
+            }
+            key.truncate(end);
+        }
+        Ok(Self {
+            path: key,
+            schedule: entry.schedule.clone(),
+            job: Some(JobCronConfig {
+                command: command.clone(),
+                concurrency_policy: entry.concurrency_policy.unwrap_or_default(),
+                starting_deadline_seconds: entry.starting_deadline_seconds,
+                retry_limit: entry.retry_limit.unwrap_or(0),
+                timeout_seconds: entry.timeout_seconds,
+                ttl_seconds_after_finished: entry.ttl_seconds_after_finished,
+            }),
+        })
+    }
 }
 
 /// Errors that can occur during cron configuration
@@ -233,14 +340,21 @@ impl ConfigureCronsJob {
         ))
         .await?;
 
-        // Convert to service layer format
-        let cron_configs: Vec<CronConfig> = cron_jobs
+        // Convert to service layer format. One invalid entry fails the
+        // whole step, as an invalid schedule already does, so the crons
+        // never end up half-configured.
+        let cron_configs = match cron_jobs
             .iter()
-            .map(|job| CronConfig {
-                path: job.path.clone(),
-                schedule: job.schedule.clone(),
-            })
-            .collect();
+            .map(|job| CronConfig::from_repo(job))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(configs) => configs,
+            Err(e) => {
+                let error_msg = format!("❌ Failed to configure cron jobs: {}", e);
+                self.log(error_msg.clone()).await?;
+                return Err(WorkflowError::JobExecutionFailed(error_msg));
+            }
+        };
 
         // Configure crons via service
         match self
@@ -723,6 +837,7 @@ cron:
             .map(|job| CronConfig {
                 path: job.path.clone(),
                 schedule: job.schedule.clone(),
+                job: None,
             })
             .collect();
 
@@ -735,12 +850,147 @@ cron:
         assert_eq!(cron_configs[2].schedule, "0 9 * * 1");
     }
 
+    fn repo_entries(yaml: &str) -> Vec<temps_core::CronJobConfig> {
+        TempsConfig::from_yaml(yaml)
+            .unwrap()
+            .cron_jobs()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn from_repo_keeps_http_entries_as_they_were() {
+        let entries = repo_entries(
+            r#"
+cron:
+  - path: /api/cleanup
+    schedule: "0 0 * * *"
+    name: Cleanup
+"#,
+        );
+        let config = CronConfig::from_repo(&entries[0]).unwrap();
+        assert_eq!(config.path, "/api/cleanup");
+        assert_eq!(config.schedule, "0 0 * * *");
+        assert!(config.job.is_none());
+    }
+
+    #[test]
+    fn from_repo_keys_a_job_by_name_and_applies_cronjob_defaults() {
+        let entries = repo_entries(
+            r#"
+cron:
+  - name: nightly-report
+    command: ["bin/report", "--yesterday"]
+    schedule: "0 3 * * *"
+  - command: ["bin/sweep"]
+    schedule: "0 4 * * *"
+    concurrency_policy: allow
+    retry_limit: 3
+"#,
+        );
+        let named = CronConfig::from_repo(&entries[0]).unwrap();
+        assert_eq!(named.path, "job:nightly-report");
+        let job = named.job.unwrap();
+        assert_eq!(job.command, vec!["bin/report", "--yesterday"]);
+        assert_eq!(
+            job.concurrency_policy,
+            temps_core::CronConcurrencyPolicy::Forbid
+        );
+        assert_eq!(job.retry_limit, 0);
+        assert_eq!(job.starting_deadline_seconds, None);
+        assert_eq!(job.timeout_seconds, None);
+
+        let unnamed = CronConfig::from_repo(&entries[1]).unwrap();
+        assert_eq!(unnamed.path, "job:bin/sweep");
+        let job = unnamed.job.unwrap();
+        assert_eq!(
+            job.concurrency_policy,
+            temps_core::CronConcurrencyPolicy::Allow
+        );
+        assert_eq!(job.retry_limit, 3);
+    }
+
+    #[test]
+    fn from_repo_bounds_a_long_job_key() {
+        let entry = temps_core::CronJobConfig {
+            schedule: "0 3 * * *".into(),
+            command: Some(vec!["é".repeat(300)]),
+            ..Default::default()
+        };
+        let config = CronConfig::from_repo(&entry).unwrap();
+        assert!(config.path.len() <= MAX_JOB_KEY_LEN);
+        assert!(config.path.starts_with(JOB_KEY_PREFIX));
+    }
+
+    #[test]
+    fn from_repo_refuses_ambiguous_or_misplaced_fields() {
+        let refused = |entry: temps_core::CronJobConfig, expected: &str| {
+            let error = CronConfig::from_repo(&entry).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected '{expected}' in '{error}'"
+            );
+        };
+        refused(
+            temps_core::CronJobConfig {
+                schedule: "0 3 * * *".into(),
+                ..Default::default()
+            },
+            "neither `path`",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                path: "/api/x".into(),
+                schedule: "0 3 * * *".into(),
+                command: Some(vec!["true".into()]),
+                ..Default::default()
+            },
+            "both `path` and `command`",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                path: "/api/x".into(),
+                schedule: "0 3 * * *".into(),
+                retry_limit: Some(2),
+                timeout_seconds: Some(5),
+                ..Default::default()
+            },
+            "retry_limit, timeout_seconds, which only apply to a job cron",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                path: "job:x".into(),
+                schedule: "0 3 * * *".into(),
+                ..Default::default()
+            },
+            "cannot start with 'job:'",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                schedule: "0 3 * * *".into(),
+                command: Some(vec![" ".into()]),
+                ..Default::default()
+            },
+            "empty `command`",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                schedule: "0 3 * * *".into(),
+                command: Some(vec!["a\0b".into()]),
+                ..Default::default()
+            },
+            "NUL byte",
+        );
+    }
+
     #[test]
     fn test_noop_cron_service() {
         let service = NoOpCronConfigService;
         let configs = vec![CronConfig {
             path: "/test".to_string(),
             schedule: "* * * * *".to_string(),
+            job: None,
         }];
 
         // Should succeed without doing anything
@@ -755,10 +1005,12 @@ cron:
             CronConfig {
                 path: "/api/cron/task1".to_string(),
                 schedule: "0 0 * * *".to_string(),
+                job: None,
             },
             CronConfig {
                 path: "/api/cron/task2".to_string(),
                 schedule: "0 12 * * *".to_string(),
+                job: None,
             },
         ];
 
@@ -777,6 +1029,7 @@ cron:
         let configs = vec![CronConfig {
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * *".to_string(),
+            job: None,
         }];
 
         let result = service.configure_crons(1, 1, configs).await;
@@ -870,6 +1123,7 @@ cron: []
             .map(|job| CronConfig {
                 path: job.path.clone(),
                 schedule: job.schedule.clone(),
+                job: None,
             })
             .collect();
 

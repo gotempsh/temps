@@ -13513,6 +13513,10 @@ dependencies = [
  "temps-screenshots",
  "temps-vulnerability-scanner",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-env",
+ "temps-workload-plane",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -15605,6 +15609,31 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-workload-plane"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-migrations",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-env",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

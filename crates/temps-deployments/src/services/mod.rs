@@ -45,6 +45,7 @@ pub use stage_log_writer::*;
 pub mod job_tracker;
 pub use job_tracker::*;
 
+pub mod cron_jobs;
 pub mod database_cron_service;
 pub use database_cron_service::*;
 

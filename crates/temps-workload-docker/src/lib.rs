@@ -23,16 +23,17 @@ use bollard::models::{
     RestartPolicyNameEnum,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions, LogsOptions,
-    RemoveContainerOptions, StartContainerOptions, StatsOptions, StopContainerOptions,
+    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, InspectContainerOptions,
+    ListContainersOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    StatsOptions, StopContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,
     InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus, Isolation,
-    LimitSupport, LogLine, LogQuery, LogRotation, LogStream, PortProtocol, PreparedArtifact,
-    RestartPolicy, RuntimeDriver, VolumeKinds,
+    LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream, PortProtocol,
+    PreparedArtifact, RestartPolicy, RuntimeDriver, VolumeKinds,
 };
 
 /// The driver's name in handles, capabilities and errors.
@@ -515,6 +516,60 @@ impl RuntimeDriver for DockerDriver {
             memory_bytes: stats.memory_stats.and_then(|m| m.usage),
             pids: stats.pids_stats.and_then(|p| p.current),
         })
+    }
+
+    async fn list(
+        &self,
+        labels: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Vec<ListedInstance>, DriverError> {
+        let options = ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "label".to_string(),
+                labels.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+            )])),
+            ..Default::default()
+        };
+        let containers = self
+            .docker
+            .list_containers(Some(options))
+            .await
+            .map_err(runtime("list", "*"))?;
+        Ok(containers
+            .into_iter()
+            .filter_map(|c| {
+                let id = c.id?;
+                let name = c
+                    .names
+                    .and_then(|names| names.into_iter().next())
+                    .map(|n| n.trim_start_matches('/').to_string())
+                    .unwrap_or_else(|| id.clone());
+                Some(ListedInstance {
+                    handle: InstanceHandle {
+                        driver: DRIVER.to_string(),
+                        id,
+                        name,
+                    },
+                    labels: c.labels.unwrap_or_default().into_iter().collect(),
+                })
+            })
+            .collect())
+    }
+
+    async fn wait(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
+        let options = WaitContainerOptions {
+            condition: "not-running".to_string(),
+        };
+        let mut stream = self.docker.wait_container(&handle.id, Some(options));
+        match stream.next().await {
+            // A non-zero exit arrives as an error carrying the code; either
+            // way the instance has stopped running.
+            None
+            | Some(Ok(_))
+            | Some(Err(bollard::errors::Error::DockerContainerWaitError { .. })) => Ok(()),
+            Some(Err(e)) if is_not_found(&e) => Ok(()),
+            Some(Err(e)) => Err(runtime("wait", &handle.name)(e)),
+        }
     }
 }
 

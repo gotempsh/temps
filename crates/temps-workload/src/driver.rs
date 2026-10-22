@@ -241,6 +241,14 @@ pub struct ExecSpec {
     pub workdir: Option<String>,
 }
 
+/// An instance a driver found on its node, with the labels it carries.
+/// Used by the reconciler to find instances it no longer tracks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedInstance {
+    pub handle: InstanceHandle,
+    pub labels: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotRef {
     pub driver: String,
@@ -331,6 +339,33 @@ pub trait RuntimeDriver: Send + Sync {
         Err(DriverError::Unsupported {
             driver: self.capabilities().name.clone(),
             operation: "snapshot",
+            instance: handle.name.clone(),
+        })
+    }
+
+    /// Every instance on this node carrying all of `labels` (running or
+    /// not). The reconciler uses it to find instances it no longer tracks;
+    /// a driver that cannot list returns `Unsupported`, and orphan cleanup
+    /// is skipped with a logged reason.
+    async fn list(
+        &self,
+        _labels: &BTreeMap<String, String>,
+    ) -> Result<Vec<ListedInstance>, DriverError> {
+        Err(DriverError::Unsupported {
+            driver: self.capabilities().name.clone(),
+            operation: "list",
+            instance: String::new(),
+        })
+    }
+
+    /// Resolves when the instance is no longer running (it exited, or it is
+    /// gone). Lets the reconciler react to an exit instead of polling; a
+    /// driver that cannot wait returns `Unsupported` and the reconciler
+    /// polls `inspect` instead.
+    async fn wait(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported {
+            driver: self.capabilities().name.clone(),
+            operation: "wait",
             instance: handle.name.clone(),
         })
     }
@@ -437,6 +472,22 @@ mod tests {
             error,
             DriverError::Unsupported {
                 operation: "exec",
+                ..
+            }
+        ));
+        let error = driver.wait(&handle).await.unwrap_err();
+        assert!(matches!(
+            error,
+            DriverError::Unsupported {
+                operation: "wait",
+                ..
+            }
+        ));
+        let error = driver.list(&BTreeMap::new()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            DriverError::Unsupported {
+                operation: "list",
                 ..
             }
         ));

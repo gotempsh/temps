@@ -131,6 +131,12 @@ pub struct EnvSpec {
     pub secrets: Vec<SecretRef>,
     #[serde(default)]
     pub delivery: Delivery,
+    /// Sources whose every variable the workload receives, resolved only at
+    /// create time like `secrets`: a job imports the environment of the
+    /// deployment it runs beside (`deployment_container:<id>`). Lower
+    /// precedence than `secrets` and `vars`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub imports: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,8 +313,20 @@ pub enum Lifetime {
         #[serde(default)]
         restart: RestartPolicy,
     },
-    /// Runs until the process exits; killed after `timeout_secs`.
-    RunToCompletion { timeout_secs: u32 },
+    /// Runs until the process exits (a job, a cron run). Kubernetes Job
+    /// semantics: the run is killed and failed `timeout_secs` after it was
+    /// created (`activeDeadlineSeconds`; `0` takes the kind's default), a
+    /// failed attempt is retried up to `retry_limit` more times
+    /// (`backoffLimit`), and a finished run is removed
+    /// `ttl_secs_after_finished` after it finished (`None` takes the kind's
+    /// default).
+    RunToCompletion {
+        timeout_secs: u32,
+        #[serde(default)]
+        retry_limit: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ttl_secs_after_finished: Option<u32>,
+    },
     /// Stopped after `idle_secs` without traffic, woken by the activator.
     ScaleToZero { idle_secs: u32 },
 }
@@ -361,6 +379,7 @@ mod tests {
                     source: "env_var:12".into(),
                 }],
                 delivery: Delivery::Baked,
+                imports: vec![],
             },
             resources: Resources::default(),
             volumes: vec![],
@@ -368,7 +387,11 @@ mod tests {
             network: NetworkSpec::default(),
             probes: Probes::default(),
             placement: PlacementSpec::default(),
-            lifetime: Lifetime::RunToCompletion { timeout_secs: 600 },
+            lifetime: Lifetime::RunToCompletion {
+                timeout_secs: 600,
+                retry_limit: 2,
+                ttl_secs_after_finished: Some(300),
+            },
             security: None,
             labels: BTreeMap::new(),
         }
@@ -383,6 +406,22 @@ mod tests {
         assert_eq!(json["owner"]["kind"], "job");
         let back: WorkloadSpec = serde_json::from_value(json).unwrap();
         assert_eq!(back, spec);
+    }
+
+    #[test]
+    fn a_run_to_completion_lifetime_stored_before_retries_takes_no_retries() {
+        let lifetime: Lifetime = serde_json::from_value(serde_json::json!({
+            "type": "run_to_completion", "timeout_secs": 60
+        }))
+        .unwrap();
+        assert_eq!(
+            lifetime,
+            Lifetime::RunToCompletion {
+                timeout_secs: 60,
+                retry_limit: 0,
+                ttl_secs_after_finished: None
+            }
+        );
     }
 
     #[test]

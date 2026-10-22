@@ -15,7 +15,10 @@ pub enum ConditionKind {
     Ready,
     PolicyEnforced,
     LimitEnforced,
-    /// A run-to-completion workload finished (successfully or not).
+    /// A run-to-completion workload finished: `True` (`Succeeded`) when its
+    /// last attempt exited 0, `False` with the reason it failed otherwise
+    /// (`BackoffLimitExceeded`, `DeadlineExceeded`, `ArtifactPullFailed`,
+    /// a deletion's reason). Absent while it runs.
     Completed,
 }
 
