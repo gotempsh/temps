@@ -21,8 +21,8 @@ use temps_core::EncryptionService;
 
 use crate::console_oidc_bootstrap::{ConsentTrace, ConsoleAccessConsent, ConsoleOidcApplyFailure};
 use temps_core::{
-    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleProvisioner,
-    DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
+    BackupScheduleAuthority, ManagedBackupArchiveConflict, ManagedBackupSchedule,
+    ManagedBackupScheduleProvisioner, DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
@@ -379,11 +379,15 @@ impl CloudService {
     /// has not read one yet (a restart, say). A schedule is never created
     /// from a guessed figure: a 30-day plan must not end up with a 7-day
     /// schedule because the capability was not loaded.
-    async fn plan_retention_days(&self, s3_source_id: i32) -> Result<u16, CloudServiceError> {
+    async fn plan_retention_days(
+        &self,
+        s3_source_id: i32,
+        authority: BackupScheduleAuthority,
+    ) -> Result<u16, CloudServiceError> {
         if let Some(days) = self.loaded_retention_days() {
             return Ok(days);
         }
-        let outcome = self.provision_managed_backup_source().await;
+        let outcome = self.provision_managed_backup_source(authority).await;
         self.loaded_retention_days().ok_or_else(|| {
             temps_core::ManagedBackupScheduleError::Create {
                 s3_source_id,
@@ -473,9 +477,21 @@ impl CloudService {
     /// already targets it, and answer the setup with the schedule attached.
     /// The operator-facing entry point behind "Create nightly schedule";
     /// enrollment calls the same path when it first creates the destination.
+    ///
+    /// The schedule backs up every database and the control plane, so only
+    /// [`BackupScheduleAuthority::InstanceAdmin`] may create it (NV1); a
+    /// scoped caller gets [`temps_core::ManagedBackupScheduleError::NotAuthorized`]
+    /// before any lookup or Cloud call.
     pub async fn ensure_managed_backup_schedule(
         &self,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSetup, CloudServiceError> {
+        if !authority.is_instance_admin() {
+            let s3_source_id = self.managed_backup_source_id().await?.unwrap_or(0);
+            return Err(
+                temps_core::ManagedBackupScheduleError::NotAuthorized { s3_source_id }.into(),
+            );
+        }
         let _guard = self.managed_backup_reconcile_lock.lock().await;
         let setup = match self.managed_backup_setup() {
             Some(setup) => setup,
@@ -491,9 +507,9 @@ impl CloudService {
                 reason: "the backup plugin is not enabled on this instance".to_string(),
             }
         })?;
-        let retention_days = self.plan_retention_days(source_id).await?;
+        let retention_days = self.plan_retention_days(source_id, authority).await?;
         let schedule = provisioner
-            .ensure_schedule_for_source(source_id, retention_days)
+            .ensure_schedule_for_source(source_id, retention_days, authority)
             .await?;
         tracing::info!(
             schedule_id = schedule.id,
@@ -917,22 +933,28 @@ impl CloudService {
     pub async fn update_feature_switches(
         &self,
         switches: CloudFeatureSwitches,
+        authority: BackupScheduleAuthority,
     ) -> Result<CloudStatus, CloudServiceError> {
         self.patch_feature_switches(
             Some(switches.telemetry),
             Some(switches.backups),
             Some(switches.notifications),
             Some(switches.console_access),
+            authority,
         )
         .await
     }
 
+    /// `authority` only matters when turning backups on provisions the
+    /// managed destination for the first time: its nightly schedule is
+    /// created for an instance administrator and withheld otherwise (NV1).
     pub async fn patch_feature_switches(
         &self,
         telemetry: Option<bool>,
         backups: Option<bool>,
         notifications: Option<bool>,
         console_access: Option<bool>,
+        authority: BackupScheduleAuthority,
     ) -> Result<CloudStatus, CloudServiceError> {
         let _update = self.feature_update_lock.lock().await;
         let updated = self
@@ -941,7 +963,7 @@ impl CloudService {
             .await?;
         let switches = self.publish_cloud_switches(&updated)?;
         if switches.backups {
-            self.reconcile_managed_backup_source().await?;
+            self.reconcile_managed_backup_source(authority).await?;
         } else {
             self.set_managed_backup_setup(default_managed_backup_setup(false));
         }
@@ -1157,12 +1179,19 @@ impl CloudService {
     /// still see the prior credential, and it exists so a caller with a side
     /// effect that belongs to linking — ADR-042's purchase-triggered telemetry
     /// activation — does not fire it on an ordinary credential recovery.
+    ///
+    /// `authority` decides only the nightly schedule for a newly created
+    /// managed destination (NV1): enrollment itself, and the destination,
+    /// succeed for any `settings:write` holder.
     pub async fn enroll(
         &self,
         code: &str,
+        authority: BackupScheduleAuthority,
     ) -> Result<(CloudStatus, ManagedBackupOutcome, EnrollmentKind), CloudServiceError> {
         let enrollment = self.enroll_link(code).await?;
-        let backup_outcome = self.provision_managed_backups_after_enrollment().await;
+        let backup_outcome = self
+            .provision_managed_backups_after_enrollment(authority)
+            .await;
         let status = self.status().await?;
         Ok((status, backup_outcome, enrollment))
     }
@@ -1295,8 +1324,11 @@ impl CloudService {
     /// The second half of [`Self::enroll`]: fetch the tenant's managed backup
     /// credential (if the plan includes one) and record the resulting setup
     /// state. Never fails -- see [`ManagedBackupOutcome`].
-    pub async fn provision_managed_backups_after_enrollment(&self) -> ManagedBackupOutcome {
-        let backup_outcome = self.provision_managed_backup_source().await;
+    pub async fn provision_managed_backups_after_enrollment(
+        &self,
+        authority: BackupScheduleAuthority,
+    ) -> ManagedBackupOutcome {
+        let backup_outcome = self.provision_managed_backup_source(authority).await;
         self.set_managed_backup_setup(managed_backup_setup_from_outcome(&backup_outcome));
         backup_outcome
     }
@@ -1305,7 +1337,15 @@ impl CloudService {
     /// it into `s3_sources`. Failures are logged and returned as
     /// [`ManagedBackupOutcome::Unavailable`] rather than propagated — a
     /// linked instance must never lose its link over this.
-    pub(crate) async fn provision_managed_backup_source(&self) -> ManagedBackupOutcome {
+    ///
+    /// When the destination is created for the first time it also gets its
+    /// nightly schedule -- but only for [`BackupScheduleAuthority::InstanceAdmin`].
+    /// For a scoped caller the schedule is withheld and the console keeps
+    /// offering "Create nightly schedule" to an administrator (NV1).
+    pub(crate) async fn provision_managed_backup_source(
+        &self,
+        authority: BackupScheduleAuthority,
+    ) -> ManagedBackupOutcome {
         let capability = match self.link.managed_backup_credentials().await {
             Ok(capability) => capability,
             Err(error) => {
@@ -1348,7 +1388,14 @@ impl CloudService {
                 // nightly schedule the offer promises (ADR-044). Best effort
                 // here; the console shows the gap and offers the same action
                 // if this does not happen.
-                if let Some(provisioner) = self.schedule_provisioner.get() {
+                if !authority.is_instance_admin() {
+                    tracing::info!(
+                        "created the Temps Cloud backup destination but withheld its nightly \
+                         schedule: it backs up every database and the control plane, which \
+                         only an instance administrator may set up. An administrator can create \
+                         it from Settings -> Temps Cloud."
+                    );
+                } else if let Some(provisioner) = self.schedule_provisioner.get() {
                     if let Ok(Some(source_id)) = self.managed_backup_source_id().await {
                         // The capability was read just above, so the plan's
                         // retention is loaded.
@@ -1356,7 +1403,7 @@ impl CloudService {
                             .loaded_retention_days()
                             .unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS);
                         match provisioner
-                            .ensure_schedule_for_source(source_id, retention_days)
+                            .ensure_schedule_for_source(source_id, retention_days, authority)
                             .await
                         {
                             Ok(schedule) => tracing::info!(
@@ -1502,8 +1549,11 @@ impl CloudService {
             > 0)
     }
 
+    /// `authority` gates only the nightly schedule a first-time destination
+    /// would get (see [`Self::provision_managed_backup_source`]).
     pub async fn reconcile_managed_backup_source(
         &self,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSetup, CloudServiceError> {
         let _guard = self.managed_backup_reconcile_lock.lock().await;
         if !self.link.feature_switches().backups {
@@ -1512,7 +1562,7 @@ impl CloudService {
             return Ok(setup);
         }
 
-        let outcome = self.provision_managed_backup_source().await;
+        let outcome = self.provision_managed_backup_source(authority).await;
         let setup = managed_backup_setup_from_outcome(&outcome);
         self.set_managed_backup_setup(setup.clone());
         Ok(self.with_schedule(setup).await)
@@ -2287,7 +2337,13 @@ mod tests {
         )));
         for _ in 0..2 {
             let result = service
-                .patch_feature_switches(None, None, None, Some(false))
+                .patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                )
                 .await;
             assert!(
                 matches!(result, Err(CloudServiceError::ConsoleOidcProvisioning(_))),
@@ -2806,7 +2862,13 @@ mod tests {
         attach_oidc(&service, oidc_db);
 
         service
-            .patch_feature_switches(None, None, None, Some(false))
+            .patch_feature_switches(
+                None,
+                None,
+                None,
+                Some(false),
+                BackupScheduleAuthority::InstanceAdmin,
+            )
             .await
             .expect("disabling must succeed and revoke the provider");
 
@@ -3022,7 +3084,13 @@ mod tests {
         assert_eq!(managed_provider_count(&db).await, 1);
 
         service
-            .patch_feature_switches(None, None, None, Some(false))
+            .patch_feature_switches(
+                None,
+                None,
+                None,
+                Some(false),
+                BackupScheduleAuthority::InstanceAdmin,
+            )
             .await
             .expect("disable");
 
@@ -3048,7 +3116,13 @@ mod tests {
             let service = real_service(db.clone());
             // Reset to a known state: off, no provider.
             service
-                .patch_feature_switches(None, None, None, Some(false))
+                .patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                )
                 .await
                 .expect("reset");
             let dir = tempfile::tempdir().expect("tempdir");
@@ -3056,7 +3130,13 @@ mod tests {
 
             let (bootstrap, disable) = tokio::join!(
                 service.apply_console_oidc_bootstrap_file(&path),
-                service.patch_feature_switches(None, None, None, Some(false)),
+                service.patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                ),
             );
             bootstrap.expect("the bootstrap itself must not fail in a race");
             disable.expect("the disable itself must not fail in a race");

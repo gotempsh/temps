@@ -19,7 +19,7 @@ use chrono::Utc;
 use http::HeaderMap;
 use sea_orm::{
     sea_query::OnConflict, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, TransactionTrait,
+    DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QuerySelect, TransactionTrait,
 };
 use temps_entities::{
     revenue_customers_state, revenue_events, revenue_integrations::Model as IntegrationModel,
@@ -296,17 +296,74 @@ async fn upsert_customer(
     Ok(())
 }
 
+/// What projecting one event into an existing subscription row does.
+#[derive(Debug, PartialEq, Eq)]
+enum SubscriptionProjection {
+    /// The event is older than the newest one already applied: it stays in
+    /// the event log but must not roll the row back.
+    Stale,
+    /// Apply the event. `status` is the status to write, or `None` to keep
+    /// the row's current status.
+    Apply { status: Option<&'static str> },
+}
+
+/// Decide how an event at `occurred_at` updates a row last fenced at
+/// `last_event_at`.
+///
+/// The fence orders *lifecycle* events only -- the ones that carry a
+/// subscription status (created/updated/canceled):
+///
+/// * A lifecycle event strictly older than the fence is stale.
+/// * An event that carries no subscription status (an invoice or
+///   realized-MRR event) is never fenced and never changes the status. It is
+///   not part of the lifecycle order: `invoice.paid` is stamped with the
+///   moment it was paid while its `mrr.realized` lines are stamped with the
+///   line's period start, which is earlier, so fencing them would drop every
+///   invoice-derived MRR update. It used to default the status to "active",
+///   which revived canceled subscriptions on every later invoice webhook.
+/// * At the same instant as the fence (providers report whole seconds, so
+///   a cancellation and an update can share one), a canceled subscription
+///   is not moved back to a live status.
+fn plan_subscription_projection(
+    current_status: &str,
+    last_event_at: Option<chrono::DateTime<Utc>>,
+    occurred_at: chrono::DateTime<Utc>,
+    event_status: Option<SubscriptionStatus>,
+) -> SubscriptionProjection {
+    let Some(event_status) = event_status else {
+        return SubscriptionProjection::Apply { status: None };
+    };
+    if last_event_at.is_some_and(|fence| occurred_at < fence) {
+        return SubscriptionProjection::Stale;
+    }
+    let revives_canceled = current_status == SubscriptionStatus::Canceled.as_str()
+        && event_status != SubscriptionStatus::Canceled
+        && last_event_at == Some(occurred_at);
+    let status = (!revives_canceled).then(|| event_status.as_str());
+    SubscriptionProjection::Apply { status }
+}
+
+/// The fence after applying an event: only a lifecycle event (one carrying
+/// a subscription status) moves it, and never backwards. See
+/// [`plan_subscription_projection`] for why invoice events stay out of it.
+fn next_subscription_fence(
+    last_event_at: Option<chrono::DateTime<Utc>>,
+    occurred_at: chrono::DateTime<Utc>,
+    event_status: Option<SubscriptionStatus>,
+) -> Option<chrono::DateTime<Utc>> {
+    match (event_status, last_event_at) {
+        (None, fence) => fence,
+        (Some(_), None) => Some(occurred_at),
+        (Some(_), Some(fence)) => Some(fence.max(occurred_at)),
+    }
+}
+
 async fn upsert_subscription(
     txn: &DatabaseTransaction,
     integration: &IntegrationModel,
     subscription_ref: &str,
     event: &NormalizedEvent,
 ) -> Result<(), RevenueError> {
-    let status = event
-        .subscription_status
-        .unwrap_or(SubscriptionStatus::Active)
-        .as_str()
-        .to_string();
     let canceled_at = if matches!(event.event_type, NormalizedEventType::SubscriptionCanceled) {
         Some(event.occurred_at)
     } else {
@@ -318,16 +375,45 @@ async fn upsert_subscription(
         None
     };
 
+    // Row lock: two webhooks for the same subscription in flight must apply
+    // their fence checks one after the other.
     let existing = revenue_subscriptions_state::Entity::find()
         .filter(revenue_subscriptions_state::Column::IntegrationId.eq(integration.id))
         .filter(revenue_subscriptions_state::Column::ProviderSubscriptionId.eq(subscription_ref))
+        .lock_exclusive()
         .one(txn)
         .await?;
 
     match existing {
         Some(row) => {
+            let status = match plan_subscription_projection(
+                &row.status,
+                row.last_event_at,
+                event.occurred_at,
+                event.subscription_status,
+            ) {
+                SubscriptionProjection::Stale => {
+                    debug!(
+                        integration_id = integration.id,
+                        subscription = %subscription_ref,
+                        event_id = %event.provider_event_id,
+                        occurred_at = %event.occurred_at,
+                        last_event_at = ?row.last_event_at,
+                        "not projecting out-of-order subscription event: a newer one was already applied"
+                    );
+                    return Ok(());
+                }
+                SubscriptionProjection::Apply { status } => status,
+            };
+            let fence = next_subscription_fence(
+                row.last_event_at,
+                event.occurred_at,
+                event.subscription_status,
+            );
             let mut active: revenue_subscriptions_state::ActiveModel = row.into();
-            active.status = Set(status);
+            if let Some(status) = status {
+                active.status = Set(status.to_string());
+            }
             if let Some(m) = event.mrr_minor {
                 active.mrr_minor = Set(m);
             }
@@ -337,9 +423,15 @@ async fn upsert_subscription(
             if canceled_at.is_some() {
                 active.canceled_at = Set(canceled_at);
             }
+            active.last_event_at = Set(fence);
             active.update(txn).await?;
         }
         None => {
+            let status = event
+                .subscription_status
+                .unwrap_or(SubscriptionStatus::Active)
+                .as_str()
+                .to_string();
             let row = revenue_subscriptions_state::ActiveModel {
                 project_id: Set(integration.project_id),
                 integration_id: Set(integration.id),
@@ -352,6 +444,13 @@ async fn upsert_subscription(
                 started_at: Set(started_at.or(Some(event.occurred_at))),
                 canceled_at: Set(canceled_at),
                 updated_at: Set(Utc::now()),
+                // A row first created by an invoice is left unfenced, so the
+                // subscription's own (earlier) lifecycle events still apply.
+                last_event_at: Set(next_subscription_fence(
+                    None,
+                    event.occurred_at,
+                    event.subscription_status,
+                )),
                 ..Default::default()
             };
             row.insert(txn).await?;
@@ -436,6 +535,148 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
     use temps_entities::revenue_integrations;
+
+    fn at(seconds: i64) -> chrono::DateTime<Utc> {
+        chrono::DateTime::from_timestamp(1_790_000_000 + seconds, 0).unwrap()
+    }
+
+    #[test]
+    fn older_event_never_rolls_a_subscription_back() {
+        // Delivered after a cancellation that happened later.
+        assert_eq!(
+            plan_subscription_projection(
+                "canceled",
+                Some(at(60)),
+                at(0),
+                Some(SubscriptionStatus::Active)
+            ),
+            SubscriptionProjection::Stale
+        );
+        // Same for a lifecycle event that moves a live subscription.
+        assert_eq!(
+            plan_subscription_projection(
+                "past_due",
+                Some(at(60)),
+                at(59),
+                Some(SubscriptionStatus::Active)
+            ),
+            SubscriptionProjection::Stale
+        );
+    }
+
+    #[test]
+    fn invoice_events_are_not_fenced_and_do_not_move_the_fence() {
+        // `invoice.paid` at T_paid is followed in the same batch by its
+        // `mrr.realized` lines stamped with the (earlier) period start. Those
+        // carry the invoice-derived MRR and must still apply.
+        let paid = at(30 * 86_400);
+        let period_start = at(0);
+        let fence = next_subscription_fence(Some(at(10)), paid, None);
+        assert_eq!(fence, Some(at(10)), "an invoice must not move the fence");
+        assert_eq!(
+            plan_subscription_projection("active", fence, period_start, None),
+            SubscriptionProjection::Apply { status: None }
+        );
+        // Even behind a lifecycle fence, a status-less event still applies
+        // (its MRR) without touching the status.
+        assert_eq!(
+            plan_subscription_projection("canceled", Some(paid), period_start, None),
+            SubscriptionProjection::Apply { status: None }
+        );
+    }
+
+    #[test]
+    fn a_row_created_by_an_invoice_still_accepts_its_earlier_lifecycle_events() {
+        // The invoice arrives first and creates the row unfenced...
+        let fence = next_subscription_fence(None, at(60), None);
+        assert_eq!(fence, None);
+        // ...so the subscription.created that happened before it applies.
+        assert_eq!(
+            plan_subscription_projection(
+                "active",
+                fence,
+                at(0),
+                Some(SubscriptionStatus::Trialing)
+            ),
+            SubscriptionProjection::Apply {
+                status: Some("trialing")
+            }
+        );
+    }
+
+    #[test]
+    fn lifecycle_events_move_the_fence_forward_only() {
+        assert_eq!(
+            next_subscription_fence(None, at(5), Some(SubscriptionStatus::Active)),
+            Some(at(5))
+        );
+        assert_eq!(
+            next_subscription_fence(Some(at(9)), at(5), Some(SubscriptionStatus::Active)),
+            Some(at(9))
+        );
+        assert_eq!(
+            next_subscription_fence(Some(at(9)), at(12), Some(SubscriptionStatus::Canceled)),
+            Some(at(12))
+        );
+    }
+
+    #[test]
+    fn newer_event_is_applied() {
+        assert_eq!(
+            plan_subscription_projection(
+                "active",
+                Some(at(0)),
+                at(60),
+                Some(SubscriptionStatus::Canceled)
+            ),
+            SubscriptionProjection::Apply {
+                status: Some("canceled")
+            }
+        );
+        // An unfenced row (written before the fence existed, or by a CSV
+        // import) accepts the next event, as it always did.
+        assert_eq!(
+            plan_subscription_projection("active", None, at(0), Some(SubscriptionStatus::PastDue)),
+            SubscriptionProjection::Apply {
+                status: Some("past_due")
+            }
+        );
+    }
+
+    #[test]
+    fn status_less_event_keeps_the_current_status() {
+        // An invoice webhook after a cancellation used to default the status
+        // to "active" and revive the subscription.
+        assert_eq!(
+            plan_subscription_projection("canceled", Some(at(0)), at(60), None),
+            SubscriptionProjection::Apply { status: None }
+        );
+    }
+
+    #[test]
+    fn same_instant_event_does_not_revive_a_canceled_subscription() {
+        assert_eq!(
+            plan_subscription_projection(
+                "canceled",
+                Some(at(10)),
+                at(10),
+                Some(SubscriptionStatus::Active)
+            ),
+            SubscriptionProjection::Apply { status: None }
+        );
+        // A same-instant event may still move a live subscription.
+        assert_eq!(
+            plan_subscription_projection(
+                "active",
+                Some(at(10)),
+                at(10),
+                Some(SubscriptionStatus::Canceled)
+            ),
+            SubscriptionProjection::Apply {
+                status: Some("canceled")
+            }
+        );
+    }
 
     fn make_encryption() -> Arc<EncryptionService> {
         Arc::new(

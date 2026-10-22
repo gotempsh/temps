@@ -55014,6 +55014,14 @@
           "name": {
             "type": "string"
           },
+          "project_id": {
+            "description": "Project the secret is scoped to; `null` means instance-wide.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "secret_type": {
             "type": "string"
           },
@@ -68034,6 +68042,14 @@
           },
           "name": {
             "type": "string"
+          },
+          "project_id": {
+            "description": "Project whose agent runs receive the secret. Omit for an instance-wide\nsecret, which is injected into every project's agent runs and so is\nreadable by anyone who can run an agent in any project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "secret_type": {
             "description": "\"env\" (environment variable) or \"file\" (written to mount_path)",
@@ -90054,7 +90070,7 @@
                 }
               }
             },
-            "description": "Insufficient permissions"
+            "description": "Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane"
           },
           "409": {
             "content": {
@@ -98150,7 +98166,7 @@
                 }
               }
             },
-            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore"
+            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted or has not completed (pending, running or failed), or a requested new-service name is already owned by a service or another active restore"
           }
         },
         "security": [
@@ -126573,6 +126589,9 @@
           "404": {
             "description": "Project or deployment not found"
           },
+          "409": {
+            "description": "Deployment is not live (only a deployed deployment can be paused)"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -126684,6 +126703,9 @@
           },
           "404": {
             "description": "Project or deployment not found"
+          },
+          "409": {
+            "description": "Deployment is not paused (only a paused deployment can be resumed)"
           },
           "500": {
             "description": "Internal server error"
@@ -145174,7 +145196,7 @@
                 }
               }
             },
-            "description": "List of global agent secrets"
+            "description": "Agent secrets in every scope (instance-wide and per project)"
           },
           "401": {
             "description": "Unauthorized"
@@ -145223,6 +145245,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
           }
         },
         "security": [
@@ -145246,6 +145271,16 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Project scope; omit for the instance-wide secret.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           }
         ],

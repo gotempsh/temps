@@ -1030,7 +1030,7 @@ impl AgentExecutor {
         //
         // The autofixer path has no `project_agents::Model` because it is not
         // a persistent agent — we still want the global config repo overlay
-        // and the project-level secrets, so we synthesize a minimal config
+        // and the project's secrets, so we synthesize a minimal config
         // when `agent_config` is None.
         let owned_synthetic;
         let config_for_injection: &temps_entities::project_agents::Model = match agent_config {
@@ -1070,6 +1070,22 @@ impl AgentExecutor {
         Ok(handle)
     }
 
+    /// Resolve the secrets `project_id`'s runs receive and register their
+    /// values for redaction on `run_id`. Anything the sandbox prints is
+    /// persisted where the project's members can read it, so every phase
+    /// that runs in a run's sandbox calls this first: the registry is
+    /// bounded and may have evicted a run that sat idle between phases.
+    pub(crate) async fn register_run_secrets(
+        &self,
+        run_id: i32,
+        project_id: i32,
+    ) -> Result<Vec<crate::services::secret_service::ResolvedSecret>, AgentError> {
+        let secrets = self.secret_service.resolve_secrets(project_id).await?;
+        self.run_service
+            .register_secret_values(run_id, secrets.iter().map(|s| s.value.clone()));
+        Ok(secrets)
+    }
+
     /// Inject config repos and secrets into the sandbox.
     ///
     /// Overlay order: repo's own `.claude/` → global config repo → per-agent config repo.
@@ -1082,7 +1098,7 @@ impl AgentExecutor {
         &self,
         run_id: i32,
         config: &temps_entities::project_agents::Model,
-        _project_id: i32,
+        project_id: i32,
         connection_id: Option<i32>,
     ) -> Result<(), AgentError> {
         // Load global AI config settings (config repo URL + branch)
@@ -1099,8 +1115,12 @@ impl AgentExecutor {
             })
             .unwrap_or_default();
 
-        // Collect all secrets up front — needed for placeholder resolution in config files
-        let secrets = self.secret_service.resolve_secrets().await?;
+        // Collect the secrets this project's runs may receive up front — needed
+        // for placeholder resolution in config files. Another project's
+        // secrets are never resolved here, so neither the sandbox nor a
+        // `${TEMPS_SECRET:...}` placeholder in project-controlled config can
+        // reach them.
+        let secrets = self.register_run_secrets(run_id, project_id).await?;
         let secret_map: std::collections::HashMap<String, String> = secrets
             .iter()
             .map(|s| (s.name.clone(), s.value.clone()))
@@ -2135,6 +2155,8 @@ impl AgentExecutor {
                 .await;
         }
         let _ = self.sandbox_registry.release(run_id).await;
+        // The sandbox is gone, so nothing more is printed for this run.
+        self.run_service.forget_secret_values(run_id);
         if work_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&work_dir).await {
                 tracing::warn!(
@@ -5763,6 +5785,63 @@ mod tests {
             confidence,
             times_used: 0,
         }
+    }
+
+    /// A phase resuming in an idle run's sandbox re-registers the project's
+    /// secret values, so output it persists is redacted even after the
+    /// bounded registry evicted the run.
+    #[tokio::test]
+    async fn register_run_secrets_restores_redaction_for_an_evicted_run() {
+        let enc = make_encryption_service();
+        let secret = temps_entities::agent_secrets::Model {
+            id: 1,
+            project_id: Some(3),
+            name: "DB_PASSWORD".to_string(),
+            secret_type: "env".to_string(),
+            encrypted_value: enc.encrypt_string("evicted-run-secret").unwrap(),
+            mount_path: None,
+            description: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![secret]])
+                .into_connection(),
+        );
+        let recorder = Arc::new(GitRecorder::default());
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder,
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let run_svc = Arc::new(AgentRunService::new(db.clone()));
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            run_svc.clone(),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db),
+        );
+        // The run's entry was evicted while it waited between phases.
+        assert_eq!(
+            run_svc.redact(9, "pw=evicted-run-secret"),
+            "pw=evicted-run-secret"
+        );
+
+        executor
+            .register_run_secrets(9, 3)
+            .await
+            .expect("resolving the project's secrets");
+
+        assert_eq!(run_svc.redact(9, "pw=evicted-run-secret"), "pw=[redacted]");
     }
 
     fn make_executor_for_memory_tests() -> AgentExecutor {

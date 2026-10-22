@@ -40,6 +40,35 @@ struct ImportSession {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What executing an import session creates, derived from its plan. The
+/// import handler holds the caller to the same create permissions these
+/// resources need when made directly, so `imports:create` alone cannot stand
+/// in for them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportExecutionScope {
+    pub source: ImportSource,
+    /// At least one service will be provisioned (`ServiceAction::Create`).
+    pub creates_services: bool,
+    /// At least one custom domain will be attached (`DomainAction::Import`).
+    pub creates_domains: bool,
+}
+
+impl ImportExecutionScope {
+    pub fn from_plan(plan: &ImportPlan) -> ImportServiceResult<Self> {
+        Ok(Self {
+            source: ImportSource::from_str(&plan.source)?,
+            creates_services: plan
+                .services
+                .iter()
+                .any(|service| service.action == temps_import_types::ServiceAction::Create),
+            creates_domains: plan
+                .domains
+                .iter()
+                .any(|domain| domain.action == temps_import_types::DomainAction::Import),
+        })
+    }
+}
+
 /// Shared by every operation that reads or acts on a session
 /// (`execute_import`, `get_status`): a session's plan carries the source
 /// platform's env vars, so leaking one cross-user is a real credential
@@ -799,6 +828,23 @@ impl ImportOrchestrator {
     }
 
     /// Get import status
+    /// What executing a session will touch, for authorizing it against the
+    /// caller's own permissions before anything is created. Ownership is
+    /// checked exactly as for `execute_import`, so a non-owner learns nothing
+    /// about the session.
+    pub fn execution_scope(
+        &self,
+        user_id: i32,
+        session_id: &str,
+    ) -> ImportServiceResult<ImportExecutionScope> {
+        let sessions = self.sessions_read()?;
+        let session = sessions
+            .get(session_id)
+            .ok_or_else(|| ImportServiceError::SessionNotFound(session_id.to_string()))?;
+        check_session_ownership(session, user_id, session_id)?;
+        ImportExecutionScope::from_plan(&session.plan)
+    }
+
     pub async fn get_status(
         &self,
         user_id: i32,
@@ -874,6 +920,51 @@ mod tests {
     // fully initialized services (ProjectService, DeploymentService, GitProviderManager).
     // These services have complex dependencies that are difficult to mock in unit tests.
     // Full functionality tests should be done as integration tests with a real database.
+
+    /// F7: the execution scope reflects what the plan will actually create;
+    /// skipped and linked resources do not demand create permissions.
+    #[test]
+    fn execution_scope_counts_only_resources_the_plan_creates() {
+        use temps_import_types::{DomainAction, DomainPlan, ServiceAction, ServicePlan};
+
+        let service = |action| ServicePlan {
+            name: "db".to_string(),
+            service_type: "postgres".to_string(),
+            version: None,
+            parameters: HashMap::new(),
+            env_var_mappings: HashMap::new(),
+            action,
+            action_description: String::new(),
+            data_implications: Vec::new(),
+        };
+        let domain = |action| DomainPlan {
+            domain: "app.example.com".to_string(),
+            environment: "production".to_string(),
+            redirect_to: None,
+            status_code: None,
+            action,
+            action_description: String::new(),
+            replacement: None,
+        };
+
+        let mut plan = create_test_plan();
+        let scope = ImportExecutionScope::from_plan(&plan).unwrap();
+        assert_eq!(scope.source, ImportSource::Docker);
+        assert!(!scope.creates_services && !scope.creates_domains);
+
+        plan.services = vec![
+            service(ServiceAction::Skip),
+            service(ServiceAction::LinkExternal),
+        ];
+        plan.domains = vec![domain(DomainAction::Skip)];
+        let scope = ImportExecutionScope::from_plan(&plan).unwrap();
+        assert!(!scope.creates_services && !scope.creates_domains);
+
+        plan.services.push(service(ServiceAction::Create));
+        plan.domains.push(domain(DomainAction::Import));
+        let scope = ImportExecutionScope::from_plan(&plan).unwrap();
+        assert!(scope.creates_services && scope.creates_domains);
+    }
 
     fn create_test_plan() -> temps_import_types::ImportPlan {
         temps_import_types::ImportPlan {

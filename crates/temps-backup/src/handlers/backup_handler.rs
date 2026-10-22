@@ -9,10 +9,11 @@ use crate::handlers::audit::{
     ScheduleServiceDetachedAudit, ScheduleServicesAttachedAudit,
 };
 use crate::handlers::authz::{
-    accessible_service_ids, filter_accessible_schedules, require_backup_access,
-    require_backup_collection_access, require_backup_collection_scope_access,
-    require_global_backup_admin, require_schedule_access, require_schedule_attach_access,
-    require_service_access,
+    accessible_service_ids, filter_accessible_schedules, require_admin_for_instance_wide_schedule,
+    require_backup_access, require_backup_collection_access,
+    require_backup_collection_scope_access, require_global_backup_admin,
+    require_instance_wide_schedule_admin, require_schedule_access, require_schedule_attach_access,
+    require_service_access, schedule_authority,
 };
 use crate::handlers::types::BackupAppState;
 use crate::services::BackupTriggerParams;
@@ -1246,6 +1247,7 @@ async fn attach_schedule_services(
         Permission::BackupsCreate,
     )
     .await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "attach services to").await?;
 
     let inserted = app_state
         .backup_service
@@ -1318,6 +1320,7 @@ async fn detach_schedule_service(
         "detach services from",
     )
     .await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "detach services from").await?;
     require_service_access(
         &app_state,
         &auth,
@@ -1966,6 +1969,17 @@ async fn create_backup_schedule(
     Json(request): Json<CreateBackupScheduleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    // Both flags default to true, so an omitted field is an instance-wide
+    // schedule. That needs an instance administrator even on a plain OSS
+    // install, where the guard below fails open (NV1).
+    if request.target_all_services.unwrap_or(true) || request.include_control_plane.unwrap_or(true)
+    {
+        require_instance_wide_schedule_admin(
+            &auth,
+            &format!("backup schedule '{}'", request.name),
+            "create",
+        )?;
+    }
     // A schedule cannot have project ownership until services are attached
     // after creation, so every new schedule is initially global or ownerless
     // under project-aware authorization.
@@ -1977,7 +1991,7 @@ async fn create_backup_schedule(
 
     match app_state
         .backup_service
-        .create_backup_schedule(request)
+        .create_backup_schedule(request, schedule_authority(&auth))
         .await
     {
         Ok(schedule) => {
@@ -2055,7 +2069,11 @@ async fn delete_backup_schedule(
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     permission_guard!(auth, BackupsDelete);
     require_schedule_access(&app_state, &auth, id, Permission::BackupsDelete, "delete").await?;
-    let result = app_state.backup_service.delete_backup_schedule(id).await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "delete").await?;
+    let result = app_state
+        .backup_service
+        .delete_backup_schedule(id, schedule_authority(&auth))
+        .await?;
     if result {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -2288,6 +2306,7 @@ async fn run_schedule_now(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
     require_schedule_access(&app_state, &auth, id, Permission::BackupsCreate, "run").await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "run").await?;
 
     let response = app_state
         .backup_service
@@ -3013,6 +3032,7 @@ async fn disable_backup_schedule(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
     require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "disable").await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "disable").await?;
     let schedule = app_state.backup_service.disable_backup_schedule(id).await?;
 
     let audit = BackupScheduleStatusChangedAudit {
@@ -3057,6 +3077,7 @@ async fn enable_backup_schedule(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
     require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "enable").await?;
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "enable").await?;
     let schedule = app_state.backup_service.enable_backup_schedule(id).await?;
     let audit = BackupScheduleStatusChangedAudit {
         context: AuditContext {
@@ -3120,12 +3141,18 @@ async fn update_backup_schedule(
     if matches!(request.target_all_services, Some(true))
         || matches!(request.include_control_plane, Some(true))
     {
+        require_instance_wide_schedule_admin(
+            &auth,
+            &format!("backup schedule {id}"),
+            "make instance-wide",
+        )?;
         require_global_backup_admin(&app_state, &auth, "make a backup schedule global")?;
     }
+    require_admin_for_instance_wide_schedule(&app_state, &auth, id, "update").await?;
 
     let schedule = app_state
         .backup_service
-        .update_backup_schedule(id, request.clone())
+        .update_backup_schedule(id, request.clone(), schedule_authority(&auth))
         .await?;
 
     let audit = BackupScheduleUpdatedAudit {

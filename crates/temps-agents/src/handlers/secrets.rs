@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::get,
@@ -25,6 +25,11 @@ use crate::services::secret_service::SecretType;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpsertSecretRequest {
     pub name: String,
+    /// Project whose agent runs receive the secret. Omit for an instance-wide
+    /// secret, which is injected into every project's agent runs and so is
+    /// readable by anyone who can run an agent in any project.
+    #[serde(default)]
+    pub project_id: Option<i32>,
     /// "env" (environment variable) or "file" (written to mount_path)
     #[serde(default = "default_env")]
     pub secret_type: String,
@@ -41,6 +46,8 @@ fn default_env() -> String {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SecretResponse {
     pub id: i32,
+    /// Project the secret is scoped to; `null` means instance-wide.
+    pub project_id: Option<i32>,
     pub name: String,
     pub secret_type: String,
     /// Always masked in responses
@@ -55,6 +62,7 @@ impl From<temps_entities::agent_secrets::Model> for SecretResponse {
     fn from(model: temps_entities::agent_secrets::Model) -> Self {
         Self {
             id: model.id,
+            project_id: model.project_id,
             name: model.name,
             secret_type: model.secret_type,
             value: "***".to_string(),
@@ -64,6 +72,14 @@ impl From<temps_entities::agent_secrets::Model> for SecretResponse {
             updated_at: model.updated_at.to_rfc3339(),
         }
     }
+}
+
+/// Selects which scope a secret name refers to.
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SecretScopeQuery {
+    /// Project scope; omit for the instance-wide secret.
+    pub project_id: Option<i32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -78,12 +94,14 @@ pub struct ListSecretsResponse {
 struct SecretUpsertedAudit {
     context: AuditContext,
     secret_name: String,
+    project_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct SecretDeletedAudit {
     context: AuditContext,
     secret_name: String,
+    project_id: Option<i32>,
 }
 
 impl AuditOperation for SecretUpsertedAudit {
@@ -142,7 +160,7 @@ pub fn routes() -> Router<Arc<AppState>> {
     get,
     path = "/settings/secrets",
     responses(
-        (status = 200, description = "List of global agent secrets", body = ListSecretsResponse),
+        (status = 200, description = "Agent secrets in every scope (instance-wide and per project)", body = ListSecretsResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -175,6 +193,7 @@ pub async fn list_secrets(
     responses(
         (status = 201, description = "Secret created/updated", body = SecretResponse),
         (status = 400, description = "Validation error"),
+        (status = 404, description = "Project not found"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -197,6 +216,7 @@ pub async fn upsert_secret(
         .secret_service
         .upsert_secret(
             &request.name,
+            request.project_id,
             secret_type,
             &request.value,
             request.mount_path.as_deref(),
@@ -212,6 +232,7 @@ pub async fn upsert_secret(
             user_agent: metadata.user_agent.clone(),
         },
         secret_name: secret.name.clone(),
+        project_id: secret.project_id,
     };
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         tracing::error!(
@@ -230,6 +251,7 @@ pub async fn upsert_secret(
     path = "/settings/secrets/{name}",
     params(
         ("name" = String, Path, description = "Secret name"),
+        SecretScopeQuery,
     ),
     responses(
         (status = 204, description = "Secret deleted"),
@@ -244,12 +266,13 @@ pub async fn delete_secret(
     State(app_state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Path(name): Path<String>,
+    Query(scope): Query<SecretScopeQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
     app_state
         .secret_service
-        .delete_secret(&name)
+        .delete_secret(&name, scope.project_id)
         .await
         .map_err(Problem::from)?;
 
@@ -260,6 +283,7 @@ pub async fn delete_secret(
             user_agent: metadata.user_agent.clone(),
         },
         secret_name: name.clone(),
+        project_id: scope.project_id,
     };
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
         tracing::error!(

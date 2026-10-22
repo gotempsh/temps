@@ -4,9 +4,10 @@
 use chrono::Utc;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::fs;
 use tokio::process::Command;
@@ -119,6 +120,57 @@ pub struct AutofixerService {
     /// `AgentExecutor::prepare_sandbox_workspace`, so any change to the AI
     /// agent environment applies uniformly.
     executor: Arc<AgentExecutor>,
+    /// Runs whose analysis, fix, feedback or PR phase is executing right
+    /// now. `cancel_run` does not wait for that phase, which keeps writing
+    /// logs and its final status after the sandbox is gone, so the run's
+    /// secret values must outlive the cancel until the phase ends.
+    phases_in_flight: Arc<Mutex<HashMap<i32, PhaseInFlight>>>,
+}
+
+/// Bookkeeping for one run in [`AutofixerService::phases_in_flight`].
+#[derive(Debug, Default)]
+struct PhaseInFlight {
+    /// Phases of this run currently executing (normally at most one).
+    active: usize,
+    /// Set by `cancel_run` while a phase was executing: the last phase to end
+    /// drops the run's secret values instead of the cancel.
+    forget_secrets_on_exit: bool,
+}
+
+/// Held for the duration of a phase. Dropping it, including on panic, ends
+/// the phase and performs any secret forget a cancel deferred to it.
+struct PhaseGuard {
+    run_id: i32,
+    phases_in_flight: Arc<Mutex<HashMap<i32, PhaseInFlight>>>,
+    run_service: Arc<AgentRunService>,
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let forget = {
+            let mut phases = self
+                .phases_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match phases.get_mut(&self.run_id) {
+                Some(entry) if entry.active > 1 => {
+                    entry.active -= 1;
+                    false
+                }
+                Some(_) => phases
+                    .remove(&self.run_id)
+                    .is_some_and(|entry| entry.forget_secrets_on_exit),
+                None => false,
+            }
+        };
+        if forget {
+            tracing::debug!(
+                "Autofixer run {}: phase ended after cancel, dropping its secret values",
+                self.run_id
+            );
+            self.run_service.forget_secret_values(self.run_id);
+        }
+    }
 }
 
 impl AutofixerService {
@@ -142,6 +194,48 @@ impl AutofixerService {
             source_map_service,
             sandbox_registry,
             executor,
+            phases_in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Marks a phase of `run_id` as executing until the guard is dropped.
+    fn begin_phase(&self, run_id: i32) -> PhaseGuard {
+        self.phases_in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(run_id)
+            .or_default()
+            .active += 1;
+        PhaseGuard {
+            run_id,
+            phases_in_flight: self.phases_in_flight.clone(),
+            run_service: self.run_service.clone(),
+        }
+    }
+
+    /// Drops the run's secret values now if no phase is executing; otherwise
+    /// leaves that to the phase, whose remaining writes still need them.
+    fn forget_secrets_unless_phase_in_flight(&self, run_id: i32) {
+        let deferred = {
+            let mut phases = self
+                .phases_in_flight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match phases.get_mut(&run_id) {
+                Some(entry) => {
+                    entry.forget_secrets_on_exit = true;
+                    true
+                }
+                None => false,
+            }
+        };
+        if deferred {
+            tracing::debug!(
+                "Autofixer run {}: cancelled mid-phase, keeping secret values until the phase ends",
+                run_id
+            );
+        } else {
+            self.run_service.forget_secret_values(run_id);
         }
     }
 
@@ -244,6 +338,7 @@ impl AutofixerService {
     /// (the caller should spawn this in a background task after creating the record).
     pub async fn run_analysis(&self, run_id: i32) {
         tracing::info!("Autofixer run {}: starting analysis phase", run_id);
+        let _phase = self.begin_phase(run_id);
 
         match self.run_analysis_inner(run_id).await {
             Ok(()) => {
@@ -251,22 +346,8 @@ impl AutofixerService {
             }
             Err(e) => {
                 tracing::error!("Autofixer run {}: analysis failed: {}", run_id, e);
-                let _ = self
-                    .run_service
-                    .update_status(
-                        run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Analysis failed: {}", e), None)
+                self.run_service
+                    .record_run_failure(run_id, e.to_string(), &format!("Analysis failed: {}", e))
                     .await;
             }
         }
@@ -527,6 +608,7 @@ impl AutofixerService {
     /// Should be spawned as a background task by the handler.
     pub async fn run_fix(&self, run_id: i32) {
         tracing::info!("Autofixer run {}: starting fix phase", run_id);
+        let _phase = self.begin_phase(run_id);
 
         match self.run_fix_inner(run_id).await {
             Ok(()) => {
@@ -534,22 +616,8 @@ impl AutofixerService {
             }
             Err(e) => {
                 tracing::error!("Autofixer run {}: fix failed: {}", run_id, e);
-                let _ = self
-                    .run_service
-                    .update_status(
-                        run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Fix failed: {}", e), None)
+                self.run_service
+                    .record_run_failure(run_id, e.to_string(), &format!("Fix failed: {}", e))
                     .await;
             }
         }
@@ -577,6 +645,12 @@ impl AutofixerService {
                 ),
             });
         }
+
+        // The run may have waited in "analyzed" long enough for the bounded
+        // redaction registry to evict it; protect the fix output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
 
         // Update status → "fixing"
         self.run_service
@@ -770,6 +844,7 @@ impl AutofixerService {
             }
             // Clean up sandbox + work dir since there's nothing to create a PR from
             let _ = self.sandbox_registry.release(run_id).await;
+            self.run_service.forget_secret_values(run_id);
             let _ = fs::remove_dir_all(&work_dir).await;
             return Ok(());
         }
@@ -817,6 +892,7 @@ impl AutofixerService {
     /// rejects with a conflict-style validation error so the caller knows to
     /// wait instead of racing.
     pub async fn create_pr(&self, run_id: i32) -> Result<PullRequest, AgentError> {
+        let _phase = self.begin_phase(run_id);
         let run = self.run_service.get_run(run_id).await?;
 
         // Idempotency: if we already created a PR for this run, return it
@@ -856,6 +932,12 @@ impl AutofixerService {
                 ),
             });
         }
+
+        // The run may have waited in "fix_ready" long enough for the bounded
+        // redaction registry to evict it; protect the push output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
 
         let project = projects::Entity::find_by_id(run.project_id)
             .one(self.db.as_ref())
@@ -1065,6 +1147,7 @@ impl AutofixerService {
         }
         // Release sandbox, then clean up temp dir
         let _ = self.sandbox_registry.release(run_id).await;
+        self.run_service.forget_secret_values(run_id);
         if let Err(e) = fs::remove_dir_all(&work_dir).await {
             tracing::warn!(
                 "Autofixer run {}: failed to clean up work dir {:?}: {}",
@@ -1117,6 +1200,7 @@ impl AutofixerService {
             "Autofixer run {}: continuing conversation with user feedback",
             run_id
         );
+        let _phase = self.begin_phase(run_id);
 
         match self.continue_with_feedback_inner(run_id).await {
             Ok(()) => {
@@ -1128,26 +1212,11 @@ impl AutofixerService {
                     run_id,
                     e
                 );
-                let _ = self
-                    .run_service
-                    .update_status(
+                self.run_service
+                    .record_run_failure(
                         run_id,
-                        UpdateRunFields {
-                            status: Some("failed".to_string()),
-                            phase: Some("failed".to_string()),
-                            error_message: Some(e.to_string()),
-                            completed_at: Some(Utc::now()),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = self
-                    .run_service
-                    .append_log(
-                        run_id,
-                        "error",
+                        e.to_string(),
                         &format!("Conversation failed: {}", e),
-                        None,
                     )
                     .await;
             }
@@ -1168,6 +1237,12 @@ impl AutofixerService {
                 ),
             });
         }
+
+        // The run may have waited long enough for the bounded redaction
+        // registry to evict it; protect the conversation's output again.
+        self.executor
+            .register_run_secrets(run_id, run.project_id)
+            .await?;
 
         // Verify work directory still exists (no re-cloning needed)
         let work_dir = Self::work_dir(run_id);
@@ -1335,8 +1410,12 @@ impl AutofixerService {
         if let Some(token_id) = self.executor.run_token_ids.write().await.remove(&run_id) {
             self.executor.revoke_run_token(run_id, token_id).await;
         }
-        // Release sandbox, then clean up temp dir
+        // Release sandbox, then clean up temp dir. With the sandbox gone the
+        // agent prints nothing more, but a phase still executing keeps
+        // persisting what it already read (and its failure), so its secret
+        // values are only dropped once that phase has ended.
         let _ = self.sandbox_registry.release(run_id).await;
+        self.forget_secrets_unless_phase_in_flight(run_id);
         let work_dir = Self::work_dir(run_id);
         if work_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&work_dir).await {
@@ -1618,6 +1697,404 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("num_items".to_string(), Value::BigInt(Some(n)));
         m
+    }
+
+    // ---- Secret redaction lifecycle (F1) ----
+
+    /// Git provider stand-in: none of the redaction tests reach git.
+    struct NoGitProvider;
+
+    #[async_trait::async_trait]
+    impl GitProviderManagerTrait for NoGitProvider {
+        async fn clone_repository(
+            &self,
+            connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            _target_dir: &std::path::Path,
+            _branch_or_ref: Option<&str>,
+        ) -> Result<(), temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+        async fn get_repository_info(
+            &self,
+            connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+        ) -> Result<temps_git::RepositoryInfo, temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+        async fn download_archive(
+            &self,
+            connection_id: i32,
+            _repo_owner: &str,
+            _repo_name: &str,
+            _branch_or_ref: &str,
+            _archive_path: &std::path::Path,
+            _progress: Option<&temps_git::ArchiveProgressSender>,
+        ) -> Result<(), temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+        async fn get_connection_access_token(
+            &self,
+            connection_id: i32,
+        ) -> Result<(String, String), temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+        #[allow(clippy::too_many_arguments)]
+        async fn push_files_and_create_pr(
+            &self,
+            connection_id: i32,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+            _base_branch: &str,
+            _files: Vec<(String, Vec<u8>)>,
+            _commit_message: &str,
+            _pr_title: &str,
+            _pr_body: &str,
+        ) -> Result<PullRequest, temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+        async fn mint_scoped_repo_token(
+            &self,
+            connection_id: i32,
+            _owner: &str,
+            _repo: &str,
+            _operation: temps_git::ScopedTokenOp,
+        ) -> Result<temps_git::ScopedTokenGrant, temps_git::GitProviderManagerError> {
+            Err(temps_git::GitProviderManagerError::ConnectionNotFound(
+                connection_id,
+            ))
+        }
+    }
+
+    struct NoJobQueue;
+
+    #[async_trait::async_trait]
+    impl JobQueue for NoJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("autofixer redaction tests never subscribe")
+        }
+    }
+
+    const REDACTION_TEST_SECRET: &str = "autofixer-run-secret-value";
+
+    fn redaction_test_encryption() -> Arc<EncryptionService> {
+        Arc::new(EncryptionService::new_from_password(
+            "test-password-for-autofixer-redaction",
+        ))
+    }
+
+    fn project_secret_row(
+        enc: &EncryptionService,
+        project_id: i32,
+    ) -> temps_entities::agent_secrets::Model {
+        temps_entities::agent_secrets::Model {
+            id: 1,
+            project_id: Some(project_id),
+            name: "DB_PASSWORD".to_string(),
+            secret_type: "env".to_string(),
+            encrypted_value: enc.encrypt_string(REDACTION_TEST_SECRET).unwrap(),
+            mount_path: None,
+            description: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn redaction_log_row(run_id: i32) -> temps_entities::agent_run_logs::Model {
+        temps_entities::agent_run_logs::Model {
+            id: 1,
+            run_id,
+            level: "info".to_string(),
+            message: String::new(),
+            metadata: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// An autofixer service over `db`, plus the run service it records into.
+    fn make_autofixer(db: sea_orm::DatabaseConnection) -> (AutofixerService, Arc<AgentRunService>) {
+        let db = Arc::new(db);
+        let enc = redaction_test_encryption();
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(NoGitProvider);
+        let queue: Arc<dyn JobQueue> = Arc::new(NoJobQueue);
+        let run_service = Arc::new(AgentRunService::new(db.clone()));
+        let sandbox_registry = Arc::new(SandboxRegistry::new(Arc::new(
+            crate::sandbox::local::LocalSandboxProvider::new(),
+        )));
+        let executor = Arc::new(AgentExecutor::new(
+            db.clone(),
+            git.clone(),
+            enc.clone(),
+            queue.clone(),
+            run_service.clone(),
+            Arc::new(crate::services::config_service::AgentConfigService::new(
+                db.clone(),
+                enc.clone(),
+            )),
+            Arc::new(temps_notifications::services::NotificationService::new(
+                db.clone(),
+                enc.clone(),
+            )),
+            sandbox_registry.clone(),
+            Arc::new(crate::services::secret_service::SecretService::new(
+                db.clone(),
+                enc.clone(),
+            )),
+            Arc::new(crate::services::definition_service::DefinitionService::new(
+                db.clone(),
+                enc.clone(),
+            )),
+        ));
+        let autofixer = AutofixerService::new(
+            db.clone(),
+            git,
+            enc,
+            queue,
+            run_service.clone(),
+            Arc::new(SourceMapService::new(db)),
+            sandbox_registry,
+            executor,
+        );
+        (autofixer, run_service)
+    }
+
+    /// A run id whose autofixer work directory does not exist, so a phase
+    /// stops at the work-directory check instead of reaching the sandbox.
+    fn run_id_without_work_dir(run_id: i32) -> i32 {
+        assert!(
+            !AutofixerService::work_dir(run_id).exists(),
+            "test run {run_id} unexpectedly has a work directory"
+        );
+        run_id
+    }
+
+    /// A run that waited in "analyzed" until the bounded registry evicted
+    /// it has its project's secrets registered again before the fix phase.
+    #[tokio::test]
+    async fn fix_phase_re_registers_an_evicted_runs_secrets() {
+        let run_id = run_id_without_work_dir(910_001);
+        let enc = redaction_test_encryption();
+        let run = make_run_with_analysis(run_id, 10);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run.clone()]]) // get_run
+            .append_query_results(vec![Vec::<settings::Model>::new()]) // sandbox settings
+            .append_query_results(vec![vec![project_secret_row(&enc, 10)]]) // secrets
+            .append_query_results(vec![vec![run.clone()]]) // update_status: get_run
+            .append_query_results(vec![vec![run]]) // update_status: UPDATE
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        let printed = format!("DB_PASSWORD={REDACTION_TEST_SECRET}");
+        assert_eq!(run_service.redact(run_id, &printed), printed);
+
+        let result = autofixer.run_fix_inner(run_id).await;
+
+        assert!(
+            matches!(result, Err(AgentError::Validation { .. })),
+            "the phase stops at the missing work directory, got {result:?}"
+        );
+        assert_eq!(
+            run_service.redact(run_id, &printed),
+            "DB_PASSWORD=[redacted]"
+        );
+    }
+
+    /// Feedback on an idle "analyzed" run re-registers its secrets too.
+    #[tokio::test]
+    async fn feedback_phase_re_registers_an_evicted_runs_secrets() {
+        let run_id = run_id_without_work_dir(910_002);
+        let enc = redaction_test_encryption();
+        let run = agent_runs::Model {
+            user_context: Some("please also check the retry path".to_string()),
+            ..make_run_with_analysis(run_id, 10)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run]]) // get_run
+            .append_query_results(vec![Vec::<settings::Model>::new()]) // sandbox settings
+            .append_query_results(vec![vec![project_secret_row(&enc, 10)]]) // secrets
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+
+        let result = autofixer.continue_with_feedback_inner(run_id).await;
+
+        assert!(
+            matches!(result, Err(AgentError::Validation { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+    }
+
+    /// Creating the PR for an idle "fix_ready" run re-registers its secrets
+    /// before anything else touches the sandbox.
+    #[tokio::test]
+    async fn create_pr_re_registers_an_evicted_runs_secrets() {
+        let run_id = run_id_without_work_dir(910_003);
+        let enc = redaction_test_encryption();
+        let run = make_run(run_id, 10, "fix_ready", Some("fix_ready"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run]]) // get_run
+            .append_query_results(vec![vec![project_secret_row(&enc, 10)]]) // secrets
+            .append_query_results(vec![Vec::<projects::Model>::new()]) // project lookup
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+
+        let result = autofixer.create_pr(run_id).await;
+
+        assert!(
+            matches!(result, Err(AgentError::ProjectNotFound { project_id: 10 })),
+            "{result:?}"
+        );
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+    }
+
+    /// A phase whose secrets cannot be resolved fails instead of running
+    /// with nothing registered for redaction.
+    #[tokio::test]
+    async fn fix_phase_fails_closed_when_secrets_cannot_be_resolved() {
+        let run_id = run_id_without_work_dir(910_004);
+        let run = make_run_with_analysis(run_id, 10);
+        let unreadable = temps_entities::agent_secrets::Model {
+            encrypted_value: "not-a-ciphertext".to_string(),
+            ..project_secret_row(&redaction_test_encryption(), 10)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run]]) // get_run
+            .append_query_results(vec![Vec::<settings::Model>::new()]) // sandbox settings
+            .append_query_results(vec![vec![unreadable]]) // secrets
+            .into_connection();
+        let (autofixer, _run_service) = make_autofixer(db);
+
+        let result = autofixer.run_fix_inner(run_id).await;
+
+        assert!(
+            matches!(result, Err(AgentError::EncryptionError { .. })),
+            "the fix must not start with unresolved secrets, got {result:?}"
+        );
+    }
+
+    /// A failed phase persists its error redacted and then drops the run's
+    /// secret values.
+    #[tokio::test]
+    async fn failed_fix_phase_redacts_its_error_and_forgets_the_secrets() {
+        let run_id = run_id_without_work_dir(910_005);
+        // Wrong phase: the fix is refused, and the failure arm records it.
+        let run = make_run(run_id, 10, "analyzing", Some("analyzing"));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run.clone()]]) // get_run
+            .append_query_results(vec![Vec::<settings::Model>::new()]) // sandbox settings
+            .append_query_results(vec![vec![run.clone()]]) // update_status: get_run
+            .append_query_results(vec![vec![run]]) // update_status: UPDATE
+            .append_query_results(vec![vec![redaction_log_row(run_id)]]) // append_log
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+
+        autofixer.run_fix(run_id).await;
+
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            REDACTION_TEST_SECRET,
+            "a failed run's secret values must be dropped"
+        );
+    }
+
+    /// Cancelling a run drops its secret values once the sandbox is gone.
+    #[tokio::test]
+    async fn cancel_forgets_the_runs_secrets() {
+        let run_id = run_id_without_work_dir(910_006);
+        let run = make_run_with_analysis(run_id, 10);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run.clone()]]) // get_run
+            .append_query_results(vec![vec![run.clone()]]) // update_status: get_run
+            .append_query_results(vec![vec![run]]) // update_status: UPDATE
+            .append_query_results(vec![vec![redaction_log_row(run_id)]]) // append_log
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+
+        autofixer.cancel_run(run_id).await.expect("cancel");
+
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            REDACTION_TEST_SECRET
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_mid_phase_keeps_secrets_until_the_phase_ends() {
+        let run_id = run_id_without_work_dir(910_007);
+        let run = make_run_with_analysis(run_id, 10);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![run.clone()]]) // get_run
+            .append_query_results(vec![vec![run.clone()]]) // update_status: get_run
+            .append_query_results(vec![vec![run]]) // update_status: UPDATE
+            .append_query_results(vec![vec![redaction_log_row(run_id)]]) // append_log
+            .into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+        let phase = autofixer.begin_phase(run_id);
+
+        autofixer.cancel_run(run_id).await.expect("cancel");
+
+        // The phase is still persisting what the agent printed and its own
+        // failure, so those writes must still be redacted.
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+        drop(phase);
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            REDACTION_TEST_SECRET
+        );
+        assert!(autofixer
+            .phases_in_flight
+            .lock()
+            .expect("phases lock")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_phase_ending_without_a_cancel_keeps_secrets_for_the_next_phase() {
+        let run_id = run_id_without_work_dir(910_008);
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let (autofixer, run_service) = make_autofixer(db);
+        run_service.register_secret_values(run_id, [REDACTION_TEST_SECRET.to_string()]);
+
+        let outer = autofixer.begin_phase(run_id);
+        drop(autofixer.begin_phase(run_id));
+        drop(outer);
+
+        assert_eq!(
+            run_service.redact(run_id, REDACTION_TEST_SECRET),
+            crate::services::run_service::REDACTED_SECRET
+        );
+        assert!(autofixer
+            .phases_in_flight
+            .lock()
+            .expect("phases lock")
+            .is_empty());
     }
 
     #[test]

@@ -1209,8 +1209,12 @@ fn bootstrap_cloud_enrollment_from_env(
                 // access explicitly from Settings > Temps Cloud or the CLI.
             },
             move || async move {
+                // First-boot input supplied by whoever runs the host: the
+                // instance acting on its own behalf.
                 provision_service
-                    .provision_managed_backups_after_enrollment()
+                    .provision_managed_backups_after_enrollment(
+                        temps_core::BackupScheduleAuthority::InstanceAdmin,
+                    )
                     .await
             },
             move |backup_outcome| async move {

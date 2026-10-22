@@ -30,6 +30,7 @@ use yaml_serde;
 use cron::Schedule;
 use temps_core::notifications::BackupFailureData;
 use temps_core::secret_string::SecretString;
+use temps_core::BackupScheduleAuthority;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
@@ -557,6 +558,35 @@ fn validated_snapshot_prefix(
 
     let relative_prefix = segments[..=uuid_index].join("/");
     Ok(build_s3_key(configured_root, &relative_prefix))
+}
+
+/// Refuse an instance-wide schedule -- one that targets every external
+/// service or includes the control plane -- to a caller that does not run the
+/// instance (NV1). Such a schedule dumps Temps's own database, so holding
+/// `backups:*` (and `settings:write`) is not enough: a `Role::Custom` user or
+/// API key with those grants must still be refused. Project-scoped schedules
+/// (specific services, no control plane) are unaffected.
+fn ensure_schedule_authority(
+    authority: BackupScheduleAuthority,
+    schedule: &str,
+    target_all_services: bool,
+    include_control_plane: bool,
+    operation: &str,
+) -> Result<(), BackupError> {
+    if authority.is_instance_admin() || (!target_all_services && !include_control_plane) {
+        return Ok(());
+    }
+    let reach = match (target_all_services, include_control_plane) {
+        (true, true) => "targets every external service and includes the control plane",
+        (true, false) => "targets every external service",
+        (false, _) => "includes the control plane",
+    };
+    Err(BackupError::Forbidden {
+        resource: schedule.to_string(),
+        detail: format!(
+            "Only an instance administrator may {operation} a backup schedule that {reach}"
+        ),
+    })
 }
 
 fn validate_retention_period(days: i32) -> Result<(), BackupError> {
@@ -6008,16 +6038,28 @@ SELECT cp.id
     }
 
     /// Create a new backup schedule
+    ///
+    /// `authority` is who asked: an instance-wide schedule (the defaults:
+    /// every service plus the control plane) is refused to
+    /// [`BackupScheduleAuthority::Scoped`] before anything is read or written.
     pub async fn create_backup_schedule(
         &self,
         request: CreateBackupScheduleRequest,
+        authority: BackupScheduleAuthority,
     ) -> Result<BackupSchedule, BackupError> {
         use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 
-        validate_retention_period(request.retention_period)?;
-
         let target_all = request.target_all_services.unwrap_or(true);
         let include_control_plane = request.include_control_plane.unwrap_or(true);
+        ensure_schedule_authority(
+            authority,
+            &format!("backup schedule '{}'", request.name),
+            target_all,
+            include_control_plane,
+            "create",
+        )?;
+
+        validate_retention_period(request.retention_period)?;
         if target_all && !request.service_ids.is_empty() {
             return Err(BackupError::Validation(
                 "service_ids cannot be set when target_all_services=true".to_string(),
@@ -6336,12 +6378,24 @@ SELECT cp.id
         })
     }
 
-    /// Delete a backup schedule
-    pub async fn delete_backup_schedule(&self, id: i32) -> Result<bool, BackupError> {
+    /// Delete a backup schedule. An instance-wide schedule may only be
+    /// deleted with [`BackupScheduleAuthority::InstanceAdmin`].
+    pub async fn delete_backup_schedule(
+        &self,
+        id: i32,
+        authority: BackupScheduleAuthority,
+    ) -> Result<bool, BackupError> {
         use sea_orm::EntityTrait;
 
         // Ensure it exists to preserve previous behavior/logging
         let schedule = self.get_backup_schedule(id).await?;
+        ensure_schedule_authority(
+            authority,
+            &format!("backup schedule {id}"),
+            schedule.target_all_services,
+            schedule.include_control_plane,
+            "delete",
+        )?;
 
         let result = temps_entities::backup_schedules::Entity::delete_by_id(id)
             .exec(self.db.as_ref())
@@ -6557,7 +6611,11 @@ SELECT cp.id
             service_ids: vec![service.id],
         };
 
-        let schedule = self.create_backup_schedule(request).await?;
+        // The generated schedule targets exactly one service and never the
+        // control plane, so it is project-scoped whoever triggered it.
+        let schedule = self
+            .create_backup_schedule(request, BackupScheduleAuthority::Scoped)
+            .await?;
         let mut generated_schedule: temps_entities::backup_schedules::ActiveModel =
             schedule.clone().into();
         generated_schedule.generated_kind = Set(Some("mariadb_base_backup".to_string()));
@@ -9621,15 +9679,27 @@ ORDER BY a.opened_at DESC
     ///   it differs from the stored value, `next_run` is recomputed.
     /// - `retention_period`: must be >= 1.
     /// - `max_runtime_secs`: `Some(Some(n))` requires `n >= 60`.
+    ///
+    /// An instance-wide schedule -- before or after the update -- may only be
+    /// changed with [`BackupScheduleAuthority::InstanceAdmin`]: a scoped
+    /// caller can neither edit one nor widen a project schedule into one.
     pub async fn update_backup_schedule(
         &self,
         id: i32,
         request: UpdateBackupScheduleRequest,
+        authority: BackupScheduleAuthority,
     ) -> Result<temps_entities::backup_schedules::Model, BackupError> {
         use sea_orm::{ActiveModelTrait, ConnectionTrait, IntoActiveModel, Set};
 
         // 1. Load the existing schedule (returns NotFound if absent).
         let existing = self.get_backup_schedule(id).await?;
+        ensure_schedule_authority(
+            authority,
+            &format!("backup schedule {id}"),
+            existing.target_all_services || request.target_all_services == Some(true),
+            existing.include_control_plane || request.include_control_plane == Some(true),
+            "update",
+        )?;
         let requested_target_all = request.target_all_services;
         let requested_service_ids = request.service_ids.clone();
 
@@ -10053,10 +10123,27 @@ mod tests {
         }
     }
 
+    /// A service over a mock database whose Docker client is never dialled:
+    /// these tests exercise authorization and validation only, so they must
+    /// not depend on a local Docker socket being present.
     fn make_scope_test_service(db: Arc<DatabaseConnection>) -> BackupService {
+        let docker =
+            Docker::connect_with_http("http://127.0.0.1:9", 1, bollard::API_DEFAULT_VERSION)
+                .expect("building an HTTP Docker client does not connect");
+        let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
+            db.clone(),
+            Arc::new(
+                EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            ),
+            Arc::new(docker),
+            Arc::new(temps_providers::DnsRegistry::new(db.clone())),
+        ));
         BackupService::new(
             db.clone(),
-            create_mock_external_service_manager(db),
+            external_service_manager,
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
@@ -12174,7 +12261,10 @@ mod tests {
         };
 
         let schedule = backup_service
-            .create_backup_schedule(schedule_request)
+            .create_backup_schedule(
+                schedule_request,
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
             .await
             .expect("Failed to create backup schedule");
 
@@ -12551,20 +12641,23 @@ mod tests {
             .expect("Failed to create S3 source");
 
         let schedule = backup_service
-            .create_backup_schedule(CreateBackupScheduleRequest {
-                name: "toggle-schedule".to_string(),
-                backup_type: "full".to_string(),
-                retention_period: 7,
-                s3_source_id: Some(s3_source.id),
-                schedule_expression: "0 0 2 * * *".to_string(),
-                enabled: true,
-                description: None,
-                tags: vec![],
-                max_runtime_secs: None,
-                target_all_services: None,
-                include_control_plane: None,
-                service_ids: vec![],
-            })
+            .create_backup_schedule(
+                CreateBackupScheduleRequest {
+                    name: "toggle-schedule".to_string(),
+                    backup_type: "full".to_string(),
+                    retention_period: 7,
+                    s3_source_id: Some(s3_source.id),
+                    schedule_expression: "0 0 2 * * *".to_string(),
+                    enabled: true,
+                    description: None,
+                    tags: vec![],
+                    max_runtime_secs: None,
+                    target_all_services: None,
+                    include_control_plane: None,
+                    service_ids: vec![],
+                },
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
             .await
             .expect("Failed to create backup schedule");
 
@@ -13748,7 +13841,13 @@ mod tests {
             service_ids: None,
         };
 
-        let result = svc.update_backup_schedule(1, request).await;
+        let result = svc
+            .update_backup_schedule(
+                1,
+                request,
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await;
         assert!(result.is_err(), "Invalid cron must be rejected");
         // Validation fires before any DB write — error is Validation, not Schedule,
         // because validate_backup_schedule wraps the cron parse error in Validation.
@@ -13803,7 +13902,13 @@ mod tests {
             service_ids: None,
         };
 
-        let result = svc.update_backup_schedule(1, request).await;
+        let result = svc
+            .update_backup_schedule(
+                1,
+                request,
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await;
         assert!(
             result.is_ok(),
             "Valid cron change must succeed: {:?}",
@@ -13855,7 +13960,13 @@ mod tests {
             service_ids: None,
         };
 
-        let result = svc.update_backup_schedule(1, request).await;
+        let result = svc
+            .update_backup_schedule(
+                1,
+                request,
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await;
         assert!(
             result.is_ok(),
             "Name-only update must succeed: {:?}",
@@ -13866,6 +13977,224 @@ mod tests {
         // Other fields unchanged from make_test_schedule defaults.
         assert_eq!(model.retention_period, schedule.retention_period);
         assert_eq!(model.schedule_expression, schedule.schedule_expression);
+    }
+
+    // ── NV1: instance-wide schedules need an instance administrator ────────
+
+    fn nv1_create_request(
+        target_all_services: Option<bool>,
+        include_control_plane: Option<bool>,
+        service_ids: Vec<i32>,
+    ) -> CreateBackupScheduleRequest {
+        CreateBackupScheduleRequest {
+            name: "nightly".to_string(),
+            backup_type: "full".to_string(),
+            retention_period: 7,
+            s3_source_id: Some(1),
+            schedule_expression: "0 0 2 * * *".to_string(),
+            enabled: true,
+            description: None,
+            tags: vec![],
+            max_runtime_secs: None,
+            target_all_services,
+            include_control_plane,
+            service_ids,
+        }
+    }
+
+    fn nv1_rename_request() -> UpdateBackupScheduleRequest {
+        UpdateBackupScheduleRequest {
+            name: Some("renamed".to_string()),
+            description: None,
+            schedule_expression: None,
+            retention_period: None,
+            max_runtime_secs: None,
+            enabled: None,
+            tags: None,
+            target_all_services: None,
+            include_control_plane: None,
+            service_ids: None,
+        }
+    }
+
+    fn nv1_project_scoped_schedule(id: i32) -> temps_entities::backup_schedules::Model {
+        temps_entities::backup_schedules::Model {
+            target_all_services: false,
+            include_control_plane: false,
+            ..make_test_schedule(id, 1)
+        }
+    }
+
+    /// The rule itself: only the combination "scoped caller + instance-wide
+    /// reach" is refused; an administrator may do anything and a scoped
+    /// caller keeps project-scoped schedules.
+    #[test]
+    fn nv1_schedule_authority_refuses_only_scoped_instance_wide_schedules() {
+        for (target_all, control_plane) in [(true, true), (true, false), (false, true)] {
+            assert!(ensure_schedule_authority(
+                BackupScheduleAuthority::InstanceAdmin,
+                "backup schedule 1",
+                target_all,
+                control_plane,
+                "create",
+            )
+            .is_ok());
+            let refused = ensure_schedule_authority(
+                BackupScheduleAuthority::Scoped,
+                "backup schedule 1",
+                target_all,
+                control_plane,
+                "create",
+            );
+            match refused {
+                Err(BackupError::Forbidden { resource, detail }) => {
+                    assert_eq!(resource, "backup schedule 1");
+                    assert!(detail.contains("instance administrator"), "{detail}");
+                }
+                other => panic!(
+                    "scoped caller must be refused ({target_all}, {control_plane}): {other:?}"
+                ),
+            }
+        }
+        assert!(ensure_schedule_authority(
+            BackupScheduleAuthority::Scoped,
+            "backup schedule 1",
+            false,
+            false,
+            "create",
+        )
+        .is_ok());
+    }
+
+    /// A scoped caller (e.g. a `Role::Custom` key with `settings:write` +
+    /// `backups:write`) cannot create an instance-wide schedule through the
+    /// service, whichever flag makes it instance-wide -- including the
+    /// defaults -- and is refused before any database access.
+    #[tokio::test]
+    async fn nv1_scoped_caller_cannot_create_an_instance_wide_schedule() {
+        for (target_all, control_plane) in [
+            (None, None),
+            (Some(true), Some(false)),
+            (Some(false), Some(true)),
+        ] {
+            let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+            let svc = make_scope_test_service(db);
+            let result = svc
+                .create_backup_schedule(
+                    nv1_create_request(target_all, control_plane, vec![]),
+                    BackupScheduleAuthority::Scoped,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(BackupError::Forbidden { .. })),
+                "({target_all:?}, {control_plane:?}) must be refused, got {result:?}"
+            );
+        }
+    }
+
+    /// A scoped caller still gets past the authority check for a
+    /// project-scoped schedule: the request reaches ordinary validation (here
+    /// the retention bound) exactly as before.
+    #[tokio::test]
+    async fn nv1_scoped_caller_keeps_creating_project_scoped_schedules() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let svc = make_scope_test_service(db);
+        let mut request = nv1_create_request(Some(false), Some(false), vec![42]);
+        request.retention_period = 0;
+        let result = svc
+            .create_backup_schedule(request, BackupScheduleAuthority::Scoped)
+            .await;
+        assert!(
+            matches!(result, Err(BackupError::Validation(_))),
+            "a project-scoped create must reach validation, got {result:?}"
+        );
+    }
+
+    /// Editing a project-scoped schedule as a scoped caller is unchanged.
+    #[tokio::test]
+    async fn nv1_scoped_caller_keeps_updating_project_scoped_schedules() {
+        let schedule = nv1_project_scoped_schedule(1);
+        let updated_row = temps_entities::backup_schedules::Model {
+            name: "renamed".to_string(),
+            ..schedule.clone()
+        };
+        // The schedule keeps one attached database, counted in the update's
+        // transaction before the "nothing to back up" check.
+        let mut count_row = BTreeMap::new();
+        count_row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(1)));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![schedule]])
+                .append_query_results(vec![vec![count_row]])
+                .append_query_results(vec![vec![updated_row]])
+                .into_connection(),
+        );
+        let svc = make_scope_test_service(db);
+        let model = svc
+            .update_backup_schedule(1, nv1_rename_request(), BackupScheduleAuthority::Scoped)
+            .await
+            .expect("a project-scoped rename must still succeed for a scoped caller");
+        assert_eq!(model.name, "renamed");
+    }
+
+    /// A scoped caller may neither edit an instance-wide schedule nor widen
+    /// a project-scoped one into one.
+    #[tokio::test]
+    async fn nv1_scoped_caller_cannot_edit_or_widen_into_an_instance_wide_schedule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_test_schedule(1, 1)]])
+                .into_connection(),
+        );
+        let svc = make_scope_test_service(db);
+        let edit = svc
+            .update_backup_schedule(1, nv1_rename_request(), BackupScheduleAuthority::Scoped)
+            .await;
+        assert!(
+            matches!(edit, Err(BackupError::Forbidden { .. })),
+            "editing an instance-wide schedule must be refused, got {edit:?}"
+        );
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![nv1_project_scoped_schedule(2)]])
+                .into_connection(),
+        );
+        let svc = make_scope_test_service(db);
+        let widen = svc
+            .update_backup_schedule(
+                2,
+                UpdateBackupScheduleRequest {
+                    include_control_plane: Some(true),
+                    ..nv1_rename_request()
+                },
+                BackupScheduleAuthority::Scoped,
+            )
+            .await;
+        assert!(
+            matches!(widen, Err(BackupError::Forbidden { .. })),
+            "adding the control plane must be refused, got {widen:?}"
+        );
+    }
+
+    /// Deleting an instance-wide schedule as a scoped caller is refused
+    /// before the DELETE runs: the mock holds no exec result, so reaching the
+    /// DELETE would surface as a database error, not `Forbidden`.
+    #[tokio::test]
+    async fn nv1_scoped_caller_cannot_delete_an_instance_wide_schedule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_test_schedule(1, 1)]])
+                .into_connection(),
+        );
+        let svc = make_scope_test_service(db);
+        let result = svc
+            .delete_backup_schedule(1, BackupScheduleAuthority::Scoped)
+            .await;
+        assert!(
+            matches!(result, Err(BackupError::Forbidden { .. })),
+            "got {result:?}"
+        );
     }
 
     /// When `find_by_id` returns no row (empty result), the service must return
@@ -13900,7 +14229,13 @@ mod tests {
             service_ids: None,
         };
 
-        let result = svc.update_backup_schedule(999, request).await;
+        let result = svc
+            .update_backup_schedule(
+                999,
+                request,
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await;
         assert!(result.is_err(), "Missing schedule must return NotFound");
         assert!(
             matches!(result.unwrap_err(), BackupError::NotFound { .. }),
@@ -14677,20 +15012,23 @@ mod tests {
         );
 
         let schedule = service
-            .create_backup_schedule(CreateBackupScheduleRequest {
-                name: "Weekly selected database".to_string(),
-                backup_type: "full".to_string(),
-                retention_period: 7,
-                s3_source_id: Some(s3_source.id),
-                schedule_expression: "0 0 0 * * SUN".to_string(),
-                enabled: true,
-                description: None,
-                tags: vec![],
-                max_runtime_secs: None,
-                target_all_services: Some(false),
-                include_control_plane: Some(false),
-                service_ids: vec![database.id],
-            })
+            .create_backup_schedule(
+                CreateBackupScheduleRequest {
+                    name: "Weekly selected database".to_string(),
+                    backup_type: "full".to_string(),
+                    retention_period: 7,
+                    s3_source_id: Some(s3_source.id),
+                    schedule_expression: "0 0 0 * * SUN".to_string(),
+                    enabled: true,
+                    description: None,
+                    tags: vec![],
+                    max_runtime_secs: None,
+                    target_all_services: Some(false),
+                    include_control_plane: Some(false),
+                    service_ids: vec![database.id],
+                },
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
+            )
             .await
             .expect("weekly specific schedule should be created");
 
@@ -15117,6 +15455,7 @@ mod tests {
                 include_control_plane: None,
                 service_ids: None,
             },
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
         )
         .await
         .expect("update succeeds");
@@ -15147,6 +15486,7 @@ mod tests {
                 include_control_plane: None,
                 service_ids: None,
             },
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
         )
         .await
         .expect("update back to specific");
@@ -15179,6 +15519,7 @@ mod tests {
                     include_control_plane: Some(false),
                     service_ids: Some(vec![svc_a.id]),
                 },
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
             )
             .await
             .expect("atomic specific-target update succeeds");
@@ -15254,7 +15595,7 @@ mod tests {
         };
 
         let err = svc
-            .create_backup_schedule(request)
+            .create_backup_schedule(request, temps_core::BackupScheduleAuthority::InstanceAdmin)
             .await
             .expect_err("empty fan-out must be rejected");
         assert!(
@@ -15613,6 +15954,7 @@ mod tests {
                     include_control_plane: Some(false),
                     service_ids: None,
                 },
+                temps_core::BackupScheduleAuthority::InstanceAdmin,
             )
             .await
             .expect_err("empty fan-out must be rejected");
@@ -15839,6 +16181,7 @@ mod tests {
                 include_control_plane: None,
                 service_ids: None,
             },
+            temps_core::BackupScheduleAuthority::InstanceAdmin,
         )
         .await
         .expect("retention update succeeds");

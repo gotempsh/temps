@@ -159,8 +159,8 @@ pub enum AgentError {
         reason: String,
     },
 
-    #[error("Secret '{name}' not found")]
-    SecretNotFound { name: String },
+    #[error("Agent secret '{name}' not found in {scope}")]
+    SecretNotFound { name: String, scope: String },
 
     #[error("Skill definition '{slug}' not found in project {project_id}")]
     SkillDefinitionNotFound { project_id: i32, slug: String },

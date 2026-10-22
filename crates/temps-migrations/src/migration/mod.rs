@@ -373,6 +373,8 @@ mod m20261019_000002_create_ai_chat_operations;
 mod m20261019_000003_drop_ai_data_access_from_external_services;
 mod m20261020_000001_create_ai_blueprints;
 mod m20261020_000002_create_autofix_incidents;
+mod m20261022_000001_scope_agent_secrets_to_projects;
+mod m20261022_000002_fence_revenue_subscription_events;
 
 pub struct Migrator;
 
@@ -832,6 +834,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261021_000001_ingress_hostname_choices::Migration),
             // #1596: per-project GitHub repository webhooks for non-App connections.
             Box::new(m20261022_000001_add_github_repo_webhook::Migration),
+            Box::new(m20261022_000001_scope_agent_secrets_to_projects::Migration),
+            Box::new(m20261022_000002_fence_revenue_subscription_events::Migration),
         ]
     }
 }

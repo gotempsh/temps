@@ -50,6 +50,8 @@ import type {
   SecretResponse as AgentSecret,
   UpsertSecretRequest as CreateSecretRequest,
 } from '@/api/client/types.gen'
+import { ProjectSelect } from '@/components/project/ProjectSelect'
+import { secretScopeLabel, secretScopeQuery } from './secretScope'
 
 export function AgentSecrets() {
   const queryClient = useQueryClient()
@@ -97,8 +99,10 @@ export function AgentSecrets() {
               Secrets
             </CardTitle>
             <CardDescription>
-              Encrypted secrets injected into all agent sandboxes as environment
-              variables or files. Reference in config with{' '}
+              Encrypted secrets injected into agent sandboxes as environment
+              variables or files. Instance-wide secrets reach every
+              project&apos;s agents; project secrets reach only that
+              project&apos;s. Reference in config with{' '}
               <code className="bg-muted px-1 rounded text-xs">
                 {'${TEMPS_SECRET:name}'}
               </code>
@@ -145,6 +149,7 @@ export function AgentSecrets() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Name</TableHead>
+                  <TableHead>Scope</TableHead>
                   <TableHead className="hidden sm:table-cell">Type</TableHead>
                   <TableHead className="hidden md:table-cell">
                     Description
@@ -160,6 +165,9 @@ export function AgentSecrets() {
                   <TableRow key={secret.id}>
                     <TableCell className="font-mono text-sm">
                       {secret.name}
+                    </TableCell>
+                    <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
+                      {secretScopeLabel(secret)}
                     </TableCell>
                     <TableCell className="hidden sm:table-cell">
                       <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs">
@@ -187,7 +195,7 @@ export function AgentSecrets() {
                             setEditingSecret(secret)
                             setDialogOpen(true)
                           }}
-                          aria-label={`Edit ${secret.name}`}
+                          aria-label={`Edit ${secret.name} (${secretScopeLabel(secret)})`}
                         >
                           <Pencil className="h-3.5 w-3.5" />
                         </Button>
@@ -197,7 +205,7 @@ export function AgentSecrets() {
                           className="h-7 w-7"
                           onClick={() => setSecretToDelete(secret)}
                           disabled={deleteMutation.isPending}
-                          aria-label={`Delete ${secret.name}`}
+                          aria-label={`Delete ${secret.name} (${secretScopeLabel(secret)})`}
                         >
                           <Trash2 className="h-3.5 w-3.5 text-destructive" />
                         </Button>
@@ -229,12 +237,19 @@ export function AgentSecrets() {
           if (!open) setSecretToDelete(null)
         }}
         resourceType="secret"
-        resourceName={secretToDelete?.name ?? ''}
+        resourceName={
+          secretToDelete
+            ? `${secretToDelete.name} (${secretScopeLabel(secretToDelete)})`
+            : ''
+        }
         consequences={`Any agent or sandbox referencing it via \${TEMPS_SECRET:${secretToDelete?.name ?? ''}} will fail to resolve it.`}
         isPending={deleteMutation.isPending}
         onConfirm={() => {
           if (secretToDelete)
-            deleteMutation.mutate({ path: { name: secretToDelete.name } })
+            deleteMutation.mutate({
+              path: { name: secretToDelete.name },
+              query: secretScopeQuery(secretToDelete),
+            })
         }}
       />
     </Card>
@@ -262,6 +277,12 @@ function SecretDialog({
   const [value, setValue] = useState('')
   const [mountPath, setMountPath] = useState(secret?.mount_path ?? '')
   const [description, setDescription] = useState(secret?.description ?? '')
+  // `null` is instance-wide. A secret's scope is part of its identity (the
+  // same name can exist in several scopes), so an edit keeps it; moving one
+  // means adding it in the new scope and deleting the old row.
+  const [scopeProjectId, setScopeProjectId] = useState<number | null>(
+    secret?.project_id ?? null
+  )
 
   const handleSubmit = () => {
     if (!name.trim()) {
@@ -291,6 +312,11 @@ function SecretDialog({
 
     onSubmit({
       name: name.trim(),
+      ...(secret
+        ? secretScopeQuery(secret)
+        : scopeProjectId == null
+          ? undefined
+          : { project_id: scopeProjectId }),
       secret_type: secretType,
       value: value.trim(),
       mount_path: secretType === 'file' ? mountPath.trim() : undefined,
@@ -336,6 +362,25 @@ function SecretDialog({
                   </code>
                 </>
               )}
+            </p>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label>Scope</Label>
+            <ProjectSelect
+              ariaLabel="Scope"
+              allLabel="Instance-wide (every project)"
+              value={scopeProjectId}
+              onValueChange={setScopeProjectId}
+              disabled={isEdit}
+              className="sm:w-full"
+            />
+            <p className="text-xs text-muted-foreground">
+              {isEdit
+                ? 'The scope of an existing secret cannot be changed. To move it, add it again in the new scope, then delete this one.'
+                : scopeProjectId == null
+                  ? "Injected into every project's agents."
+                  : "Injected only into this project's agents. It takes precedence over an instance-wide secret of the same name."}
             </p>
           </div>
 

@@ -42,7 +42,12 @@ pub async fn run(service: Arc<CloudService>, mut cancel: watch::Receiver<bool>) 
                     debug!("Cloud is not linked; skipping backup credential rotation tick");
                     continue;
                 }
-                match service.provision_managed_backup_source().await {
+                // The instance rotating its own credential: no request
+                // principal, so it acts as the instance.
+                match service
+                    .provision_managed_backup_source(temps_core::BackupScheduleAuthority::InstanceAdmin)
+                    .await
+                {
                     // `provision_managed_backup_source` already logs the
                     // specifics (including the loud error for a bucket
                     // change) at every outcome; the loop itself only needs

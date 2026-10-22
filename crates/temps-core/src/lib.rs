@@ -128,8 +128,8 @@ pub use error_builder::*;
 pub use jobs::*;
 pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
-    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
-    ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
+    BackupScheduleAuthority, ManagedBackupArchiveConflict, ManagedBackupSchedule,
+    ManagedBackupScheduleError, ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
     DEFAULT_MANAGED_BACKUP_RETENTION_DAYS, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
     MANAGED_BACKUP_SCHEDULE_NAME,
 };

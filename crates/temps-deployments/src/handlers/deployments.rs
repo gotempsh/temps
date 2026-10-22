@@ -533,6 +533,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Invalid Deployment State")
                     .with_detail(msg)
             }
+            DeploymentError::DeploymentStateConflict { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Deployment State Conflict")
+                    .with_detail(err.to_string())
+            }
             DeploymentError::PipelineError(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Pipeline Error")
@@ -938,6 +943,7 @@ pub async fn promote_deployment(
     responses(
         (status = 200, description = "Deployment paused successfully", body = DeploymentStateResponse),
         (status = 404, description = "Project or deployment not found"),
+        (status = 409, description = "Deployment is not live (only a deployed deployment can be paused)"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -994,6 +1000,7 @@ pub async fn pause_deployment(
     responses(
         (status = 200, description = "Deployment resumed successfully", body = DeploymentStateResponse),
         (status = 404, description = "Project or deployment not found"),
+        (status = 409, description = "Deployment is not paused (only a paused deployment can be resumed)"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2976,6 +2983,26 @@ pub async fn purge_environment_asset_cache(
 
 #[cfg(test)]
 mod tests {
+
+    mod lifecycle_conflict_tests {
+        use crate::services::services::DeploymentError;
+        use axum::http::StatusCode;
+        use temps_core::problemdetails::Problem;
+
+        #[test]
+        fn refused_pause_or_resume_is_a_409_naming_the_state() {
+            let problem = Problem::from(DeploymentError::DeploymentStateConflict {
+                deployment_id: 9,
+                operation: "resume",
+                state: "stopped".to_string(),
+                expected: "paused",
+            });
+            assert_eq!(problem.status_code, StatusCode::CONFLICT);
+            let body = serde_json::to_string(&problem.body).unwrap();
+            assert!(body.contains("deployment 9"), "{body}");
+            assert!(body.contains("'stopped'"), "{body}");
+        }
+    }
 
     mod job_log_tail_tests {
         use super::super::{validate_job_log_tail, MAX_JOB_LOG_TAIL_LINES};

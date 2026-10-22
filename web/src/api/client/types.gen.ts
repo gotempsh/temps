@@ -25211,6 +25211,10 @@ export type SecretResponse = {
     id: number;
     mount_path?: string | null;
     name: string;
+    /**
+     * Project the secret is scoped to; `null` means instance-wide.
+     */
+    project_id?: number | null;
     secret_type: string;
     updated_at: string;
     /**
@@ -31185,6 +31189,12 @@ export type UpsertSecretRequest = {
      */
     mount_path?: string | null;
     name: string;
+    /**
+     * Project whose agent runs receive the secret. Omit for an instance-wide
+     * secret, which is injected into every project's agent runs and so is
+     * readable by anyone who can run an agent in any project.
+     */
+    project_id?: number | null;
     /**
      * "env" (environment variable) or "file" (written to mount_path)
      */
@@ -43611,7 +43621,7 @@ export type EnsureCloudBackupScheduleErrors = {
      */
     401: ProblemDetails;
     /**
-     * Insufficient permissions
+     * Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane
      */
     403: ProblemDetails;
     /**
@@ -49092,7 +49102,7 @@ export type StartRestoreErrors = {
      */
     404: ProblemDetails;
     /**
-     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore
+     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted or has not completed (pending, running or failed), or a requested new-service name is already owned by a service or another active restore
      */
     409: ProblemDetails;
 };
@@ -66029,6 +66039,10 @@ export type PauseDeploymentErrors = {
      */
     404: unknown;
     /**
+     * Deployment is not live (only a deployed deployment can be paused)
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -66104,6 +66118,10 @@ export type ResumeDeploymentErrors = {
      * Project or deployment not found
      */
     404: unknown;
+    /**
+     * Deployment is not paused (only a paused deployment can be resumed)
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -77446,7 +77464,7 @@ export type ListSecretsErrors = {
 
 export type ListSecretsResponses = {
     /**
-     * List of global agent secrets
+     * Agent secrets in every scope (instance-wide and per project)
      */
     200: ListSecretsResponse;
 };
@@ -77473,6 +77491,10 @@ export type UpsertSecretErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
 };
 
 export type UpsertSecretResponses = {
@@ -77492,7 +77514,12 @@ export type DeleteSecretData = {
          */
         name: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Project scope; omit for the instance-wide secret.
+         */
+        project_id?: number;
+    };
     url: '/settings/secrets/{name}';
 };
 

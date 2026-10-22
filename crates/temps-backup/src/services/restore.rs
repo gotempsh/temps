@@ -35,6 +35,12 @@ pub enum RestoreError {
     #[error("Backup {backup_id} is being deleted and cannot be restored")]
     BackupDeleting { backup_id: i32 },
 
+    #[error(
+        "Backup {backup_id} is in state '{state}' and cannot be restored: only a completed \
+         backup holds a full snapshot. Wait for it to finish, or pick a completed backup."
+    )]
+    BackupNotRestorable { backup_id: i32, state: String },
+
     #[error("External service {service_id} not found")]
     ServiceNotFound { service_id: i32 },
 
@@ -1108,6 +1114,11 @@ impl RestoreService {
                     .one(self.db.as_ref())
                     .await?
                     .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+                // Reject before any engine or capability work: a pending,
+                // running or failed backup points at a partial (or empty)
+                // snapshot, and an in-place restore from it would wipe the
+                // target. Admission re-checks this under the row lock.
+                ensure_backup_restorable(&backup)?;
 
                 // Fail closed: a backup some service produced must have a
                 // known engine, otherwise the compatibility check below
@@ -2894,6 +2905,22 @@ async fn reserve_restore_service_name(
         })
 }
 
+/// Only a `completed` backup may be restored. `deleting` keeps its own error
+/// so the console can say why; every other state (`pending`, `running`,
+/// `failed`) has no complete snapshot behind its `s3_location`.
+fn ensure_backup_restorable(backup: &temps_entities::backups::Model) -> Result<(), RestoreError> {
+    match backup.state.as_str() {
+        "completed" => Ok(()),
+        "deleting" => Err(RestoreError::BackupDeleting {
+            backup_id: backup.id,
+        }),
+        state => Err(RestoreError::BackupNotRestorable {
+            backup_id: backup.id,
+            state: state.to_string(),
+        }),
+    }
+}
+
 /// The checks and insert of [`insert_restore_run`], inside its transaction.
 async fn lock_and_insert_restore_run(
     transaction: &sea_orm::DatabaseTransaction,
@@ -2915,9 +2942,7 @@ async fn lock_and_insert_restore_run(
             .one(transaction)
             .await?
             .ok_or(RestoreError::BackupNotFound { backup_id })?;
-        if backup.state == "deleting" {
-            return Err(RestoreError::BackupDeleting { backup_id });
-        }
+        ensure_backup_restorable(&backup)?;
     }
     // Deletion takes this same short source lock and refuses active runs,
     // so its cascade cannot remove a clone's durable name reservation.
@@ -5188,6 +5213,93 @@ mod tests {
             matches!(err, RestoreError::BackupNotFound { backup_id: 999 }),
             "got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn only_completed_backups_are_restorable() {
+        assert!(ensure_backup_restorable(&tracked_backup(7)).is_ok());
+        assert!(matches!(
+            ensure_backup_restorable(&temps_entities::backups::Model {
+                state: "deleting".into(),
+                ..tracked_backup(7)
+            }),
+            Err(RestoreError::BackupDeleting { backup_id: 7 })
+        ));
+        for state in ["pending", "running", "failed"] {
+            let backup = temps_entities::backups::Model {
+                state: state.into(),
+                ..tracked_backup(7)
+            };
+            match ensure_backup_restorable(&backup) {
+                Err(RestoreError::BackupNotRestorable {
+                    backup_id: 7,
+                    state: rejected,
+                }) => assert_eq!(rejected, state),
+                other => panic!("state '{state}' must not be restorable, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_restore_rejects_a_running_backup_before_touching_the_target() {
+        // Only the backup lookup is mocked: reaching the target-service
+        // lookup would exhaust the mock and fail with a different error.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![temps_entities::backups::Model {
+                    state: "running".into(),
+                    ..tracked_backup(42)
+                }]])
+                .into_connection(),
+        );
+        if Docker::connect_with_local_defaults().is_err() {
+            eprintln!("Docker not available, skipping");
+            return;
+        }
+        let svc = build_restore_service(db);
+
+        let err = svc
+            .start_restore(1, BackupSelector::Id(42), RestoreRequestMode::InPlace, 1)
+            .await
+            .expect_err("a running backup must not be restorable");
+        assert!(
+            matches!(
+                &err,
+                RestoreError::BackupNotRestorable { backup_id: 42, state } if state == "running"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_a_backup_that_failed_after_the_precheck() {
+        // The pre-check in `start_restore` reads without a lock; a backup
+        // can fail between it and admission, so admission re-checks under
+        // the row lock and must refuse before inserting the run.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![temps_entities::backups::Model {
+                state: "failed".into(),
+                ..tracked_backup(42)
+            }]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+
+        let err = lock_and_insert_restore_run(
+            &txn,
+            <temps_entities::restore_runs::ActiveModel as Default>::default(),
+            Some(42),
+            3,
+            true,
+        )
+        .await
+        .expect_err("a failed backup must not be admitted");
+        assert!(
+            matches!(
+                &err,
+                RestoreError::BackupNotRestorable { backup_id: 42, state } if state == "failed"
+            ),
+            "got {err:?}"
         );
     }
 

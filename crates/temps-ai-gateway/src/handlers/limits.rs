@@ -18,8 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, project_access_guard, project_scope_guard};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use tracing::error;
@@ -218,6 +218,17 @@ fn require_limits_reader(auth: &temps_auth::AuthContext) -> Result<(), Problem> 
     Ok(())
 }
 
+/// Limit writers need the same operator standing as readers. `AiGatewayWrite`
+/// alone is grantable to a custom role or API key that is meant to be confined
+/// to one project, and a limit write on any project (or the instance default
+/// every project inherits) would let it raise its own spend cap or zero
+/// another project's.
+fn require_limits_writer(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, AiGatewayWrite);
+    permission_guard!(auth, SystemAdmin);
+    Ok(())
+}
+
 #[utoipa::path(
     tag = "AI Gateway Limits",
     get,
@@ -287,7 +298,7 @@ async fn update_instance_limits(
     axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Json(body): Json<LimitSettingsBody>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
 
     let saved = app_state
         .limits_service
@@ -363,7 +374,9 @@ async fn update_project_limits(
     Path(project_id): Path<i32>,
     Json(body): Json<LimitSettingsBody>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let saved = app_state
         .limits_service
@@ -377,8 +390,8 @@ async fn update_project_limits(
         saved,
     )
     .await;
-    // Only the saved settings: this endpoint needs `AiGatewayWrite`, while the
-    // month-to-date spend in `ProjectLimitsResponse` is admin-only.
+    // Only the saved settings: the month-to-date spend lives in
+    // `ProjectLimitsResponse`, served by the read endpoint.
     Ok(Json(LimitSettingsBody::from(saved)))
 }
 
@@ -401,7 +414,9 @@ async fn reset_project_limits(
     axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let cleared = app_state
         .limits_service
@@ -456,6 +471,33 @@ mod tests {
     #[test]
     fn administrators_may_read_limits() {
         assert!(require_limits_reader(&test_auth(Role::Admin)).is_ok());
+    }
+
+    #[test]
+    fn administrators_may_write_limits() {
+        assert!(require_limits_writer(&test_auth(Role::Admin)).is_ok());
+    }
+
+    #[test]
+    fn non_administrators_cannot_write_limits() {
+        for role in [Role::User, Role::Reader] {
+            let err = require_limits_writer(&test_auth(role))
+                .expect_err("limit writes span every project");
+            assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// F8: a custom grant of `ai_gateway:write` without `system:admin` (the
+    /// shape of a project-confined custom role or API key) must not be able to
+    /// rewrite any project's limits.
+    #[test]
+    fn custom_ai_gateway_write_without_system_admin_cannot_write_limits() {
+        let mut auth = test_auth(Role::Reader);
+        auth.custom_permissions = Some(vec![temps_auth::permissions::Permission::AiGatewayWrite]);
+        assert!(auth.has_permission(&temps_auth::permissions::Permission::AiGatewayWrite));
+        let err = require_limits_writer(&auth)
+            .expect_err("ai_gateway:write alone is not an operator grant");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
     #[test]
