@@ -262,15 +262,40 @@ pub struct Probes {
     pub liveness: Option<Probe>,
 }
 
+/// The value a [`LabelSelector`] key requires: one value, or any of a set
+/// (the `target_labels` array form, an OR).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum LabelValues {
+    One(String),
+    AnyOf(Vec<String>),
+}
+
+impl LabelValues {
+    /// Whether a node's label value satisfies this requirement.
+    pub fn matches(&self, value: &str) -> bool {
+        match self {
+            LabelValues::One(required) => required == value,
+            LabelValues::AnyOf(required) => required.iter().any(|r| r == value),
+        }
+    }
+}
+
+/// Node label requirements: every key must match (AND), and a key with
+/// several values matches any of them (OR). The `target_labels` semantics.
+pub type LabelSelector = BTreeMap<String, LabelValues>;
+
 /// Where instances may run (§8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlacementSpec {
-    /// Required node set; `None` = any eligible node.
+    /// Required node set; `None` = any eligible node. Strict: when no node
+    /// of the set is eligible the workload is not scheduled anywhere else.
+    /// Node `0` is the control plane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nodes: Option<Vec<i32>>,
     /// Stacks with `nodes`, with `target_labels` semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub labels: Option<BTreeMap<String, String>>,
+    pub labels: Option<LabelSelector>,
     /// Replicas on different nodes.
     #[serde(default)]
     pub spread: bool,
@@ -281,6 +306,28 @@ pub struct PlacementSpec {
 impl PlacementSpec {
     fn one() -> u32 {
         1
+    }
+
+    /// The pinned node set, if any. An empty list names no node, so it is
+    /// no constraint (`target_nodes: []`).
+    pub fn pinned_nodes(&self) -> Option<&[i32]> {
+        self.nodes.as_deref().filter(|nodes| !nodes.is_empty())
+    }
+
+    /// The label selector, if it requires anything.
+    pub fn label_selector(&self) -> Option<&LabelSelector> {
+        self.labels.as_ref().filter(|labels| !labels.is_empty())
+    }
+
+    /// Whether a node with `node_labels` satisfies the label selector.
+    pub fn labels_match(&self, node_labels: &BTreeMap<String, String>) -> bool {
+        self.label_selector().is_none_or(|selector| {
+            selector.iter().all(|(key, required)| {
+                node_labels
+                    .get(key)
+                    .is_some_and(|value| required.matches(value))
+            })
+        })
     }
 }
 
@@ -442,6 +489,34 @@ mod tests {
         );
         assert_eq!(spec.network.egress, None);
         assert!(spec.security.is_none());
+    }
+
+    #[test]
+    fn a_label_selector_keeps_the_target_labels_or_and_and_semantics() {
+        let placement: PlacementSpec = serde_json::from_value(serde_json::json!({
+            "labels": { "region": ["us", "asia"], "gpu": "true" }
+        }))
+        .unwrap();
+        let node = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        assert!(placement.labels_match(&node(&[("region", "asia"), ("gpu", "true")])));
+        assert!(!placement.labels_match(&node(&[("region", "eu"), ("gpu", "true")])));
+        assert!(!placement.labels_match(&node(&[("region", "us")])));
+        assert!(PlacementSpec::default().labels_match(&BTreeMap::new()));
+        let empty = PlacementSpec {
+            nodes: Some(vec![]),
+            labels: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        assert_eq!(empty.pinned_nodes(), None, "an empty list pins nothing");
+        assert!(empty.label_selector().is_none());
+        let back: PlacementSpec =
+            serde_json::from_value(serde_json::to_value(&placement).unwrap()).unwrap();
+        assert_eq!(back, placement);
     }
 
     #[test]

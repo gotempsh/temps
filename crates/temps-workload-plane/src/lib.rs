@@ -34,8 +34,10 @@ pub mod audit;
 pub mod env;
 pub mod error;
 pub mod events;
+pub mod inventory;
 pub mod plane;
 pub mod reconciler;
+pub mod scheduler;
 
 #[cfg(test)]
 mod testing;
@@ -49,6 +51,11 @@ pub use error::{AdmissionError, PlaneError};
 pub use plane::{
     ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, ReconcilerHandle, WorkloadPlane,
     WorkloadView,
+};
+pub use scheduler::{
+    explain, recommend_pinning, ExplainContext, Explanation, NodeExclusion, NodeFacts,
+    NodeRecommendation, NodeRole, NodeUsage, PinningRecommendation, Placement, Reservation,
+    ScheduleError, ScheduleRequest, SchedulerConfig, SocketGate, UnifiedScheduler,
 };
 
 /// Labels the plane adds to every instance it creates, next to

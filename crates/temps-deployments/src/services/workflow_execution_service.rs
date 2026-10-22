@@ -469,6 +469,11 @@ pub struct WorkflowExecutionService {
     docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
+    /// ADR-055 Phase 5: the unified scheduler's inputs, for `shadow` and
+    /// `enforce` environments.
+    workload_placement: OnceCell<Arc<crate::services::WorkloadPlacementService>>,
+    /// The workload plane `enforce` environments start replicas through.
+    workload_plane: OnceCell<Arc<temps_workload_plane::WorkloadPlane>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
     file_store: OnceCell<Arc<dyn temps_file_store::FileStore>>,
     /// Anonymous product telemetry reporter (late-bound, optional). Set via
@@ -519,6 +524,8 @@ impl WorkflowExecutionService {
             docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
+            workload_placement: OnceCell::new(),
+            workload_plane: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
@@ -548,6 +555,19 @@ impl WorkflowExecutionService {
     /// Set the node scheduler for multi-node deployments
     pub fn set_node_scheduler(&self, scheduler: Arc<crate::services::NodeScheduler>) {
         let _ = self.node_scheduler.set(scheduler);
+    }
+
+    /// Set the placement service `shadow`/`enforce` deployments use.
+    pub fn set_workload_placement(
+        &self,
+        placement: Arc<crate::services::WorkloadPlacementService>,
+    ) {
+        let _ = self.workload_placement.set(placement);
+    }
+
+    /// Set the workload plane `enforce` deployments start replicas through.
+    pub fn set_workload_plane(&self, plane: Arc<temps_workload_plane::WorkloadPlane>) {
+        let _ = self.workload_plane.set(plane);
     }
 
     /// Set the encryption service for decrypting node tokens during remote deployments
@@ -1913,6 +1933,22 @@ impl WorkflowExecutionService {
                             .unwrap_or(true)
                     });
                 builder = builder.anti_affinity(anti_affinity);
+
+                // ADR-055: the environment's workload mode. `legacy` gets
+                // nothing extra, so its deploy path is exactly today's.
+                let workload_mode = environment.workload_mode;
+                let workload_plane = match (workload_mode, self.workload_placement.get()) {
+                    (
+                        temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Legacy,
+                        _,
+                    )
+                    | (_, None) => None,
+                    (_, Some(placement)) => Some(crate::jobs::WorkloadPlaneDeploy {
+                        placement: placement.clone(),
+                        plane: self.workload_plane.get().cloned(),
+                    }),
+                };
+                builder = builder.workload_mode(workload_mode, workload_plane);
 
                 // Rolling update awareness: query existing containers for this
                 // environment so the scheduler can avoid placing new replicas on

@@ -47,3 +47,5 @@ pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMi
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
 
 pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;
+
+pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;

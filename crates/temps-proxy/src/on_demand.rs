@@ -1675,6 +1675,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                workload_mode: Default::default(),
             }]])
             // containers query
             .append_query_results(vec![vec![deployment_containers::Model {
@@ -1759,6 +1760,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                workload_mode: Default::default(),
             }]])
             // containers query
             .append_query_results(vec![vec![deployment_containers::Model {
@@ -1934,6 +1936,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                workload_mode: Default::default(),
             }]])
             // containers
             .append_query_results(vec![vec![deployment_containers::Model {
@@ -2012,6 +2015,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                workload_mode: Default::default(),
             }]])
             .into_connection();
 
@@ -2090,6 +2094,7 @@ mod tests {
                 force_https: None,
                 last_activity_at: None,
                 ingress_mode: Default::default(),
+                workload_mode: Default::default(),
             }]])
             // containers (3 replicas)
             .append_query_results(vec![vec![
@@ -2486,6 +2491,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
 
         let container = deployment_containers::Model {
@@ -2597,6 +2603,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
 
         let container1 = deployment_containers::Model {
@@ -2724,6 +2731,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
 
         let container = deployment_containers::Model {
@@ -2830,6 +2838,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 

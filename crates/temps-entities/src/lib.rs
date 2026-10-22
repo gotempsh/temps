@@ -266,3 +266,6 @@ pub mod ingress_access_policies;
 pub mod ingress_endpoints;
 pub mod ingress_login_grants;
 pub mod ingress_mode;
+// ADR-055 Phase 5: deployment workload mode and node resource settings
+pub mod environment_workload_mode;
+pub mod node_resource_settings;

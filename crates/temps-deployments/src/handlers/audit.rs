@@ -635,3 +635,32 @@ mod node_audit_tests {
         assert_eq!(json["failed_redeploys"], 1);
     }
 }
+
+/// An admin changed an environment's `workload_mode` (ADR-055 Phase 5).
+/// Moving back to `legacy` is the rollback, so both values are recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentWorkloadModeChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub previous_mode: String,
+    pub workload_mode: String,
+}
+
+impl_audit_operation!(
+    EnvironmentWorkloadModeChangedAudit,
+    "ENVIRONMENT_WORKLOAD_MODE_CHANGED"
+);
+
+/// An admin changed a node's resource policy or system reserve (node 0 is
+/// the control plane).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeResourcesChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub previous_resource_policy: String,
+    pub resource_policy: String,
+    pub previous_system_reserved: temps_entities::node_resource_settings::SystemReserved,
+    pub system_reserved: temps_entities::node_resource_settings::SystemReserved,
+}
+
+impl_audit_operation!(NodeResourcesChangedAudit, "NODE_RESOURCES_CHANGED");
