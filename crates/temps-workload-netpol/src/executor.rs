@@ -260,7 +260,7 @@ impl DockerVmNft {
                 &name,
                 &self.base_image,
                 &["apk", "add", "--no-cache", "nftables"],
-                false,
+                HelperMode::Plain,
                 None,
             )
             .await
@@ -306,19 +306,29 @@ impl DockerVmNft {
         name: &str,
         image: &str,
         cmd: &[&str],
-        privileged_net: bool,
+        mode: HelperMode,
         upload: Option<&str>,
     ) -> Result<(i64, String), NftError> {
-        let host_config = if privileged_net {
-            HostConfig {
+        let host_config = match mode {
+            HelperMode::Plain => HostConfig::default(),
+            HelperMode::NetAdmin => HostConfig {
                 network_mode: Some("host".to_string()),
                 cap_drop: Some(vec!["ALL".to_string()]),
                 cap_add: Some(vec!["NET_ADMIN".to_string()]),
                 security_opt: Some(vec!["no-new-privileges".to_string()]),
                 ..Default::default()
-            }
-        } else {
-            HostConfig::default()
+            },
+            // Reads other containers' /proc/<pid>/root/sys: needs the host
+            // PID namespace and SYS_PTRACE, and nothing else.
+            HelperMode::PortProbe => HostConfig {
+                network_mode: Some("host".to_string()),
+                pid_mode: Some("host".to_string()),
+                cap_drop: Some(vec!["ALL".to_string()]),
+                cap_add: Some(vec!["SYS_PTRACE".to_string()]),
+                security_opt: Some(vec!["no-new-privileges".to_string()]),
+                readonly_rootfs: Some(true),
+                ..Default::default()
+            },
         };
         let body = ContainerCreateBody {
             image: Some(image.to_string()),
@@ -397,13 +407,43 @@ impl DockerVmNft {
                 &name,
                 &self.image,
                 &["/bin/sh", "-c", script],
-                true,
+                HelperMode::NetAdmin,
                 ruleset,
             )
             .await;
         self.remove_container(&name).await;
         result
     }
+
+    /// Runs `script` in a helper on the VM's host PID namespace with
+    /// `SYS_PTRACE` only (see [`crate::ports`]).
+    pub(crate) async fn run_port_probe(&self, script: &str) -> Result<(i64, String), NftError> {
+        let _serial = self.serial.lock().await;
+        self.ensure_helper_image().await?;
+        let name = helper_name("ports");
+        let result = self
+            .run_container(
+                &name,
+                &self.image,
+                &["/bin/sh", "-c", script],
+                HelperMode::PortProbe,
+                None,
+            )
+            .await;
+        self.remove_container(&name).await;
+        result
+    }
+}
+
+/// What a helper container may do.
+#[derive(Debug, Clone, Copy)]
+enum HelperMode {
+    /// Building the image: no special access.
+    Plain,
+    /// `nft`: the VM's network namespace with `NET_ADMIN`.
+    NetAdmin,
+    /// Port resolution: the VM's PID namespace with `SYS_PTRACE`.
+    PortProbe,
 }
 
 /// A tar archive holding `/netpol.nft`.

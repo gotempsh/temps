@@ -72,6 +72,12 @@ impl Cidr {
     pub fn is_ipv4(&self) -> bool {
         self.addr.is_ipv4()
     }
+
+    /// Whether `addr` is inside the block. Addresses of the other family
+    /// never are.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        addr.is_ipv4() == self.addr.is_ipv4() && mask(addr, self.prefix) == self.addr
+    }
 }
 
 fn mask(addr: IpAddr, prefix: u8) -> IpAddr {
@@ -313,6 +319,18 @@ mod tests {
         let cidr: Peer = serde_json::from_str(r#"{"cidr":"10.0.0.0/8"}"#).unwrap();
         assert_eq!(cidr, Peer::Cidr("10.0.0.0/8".parse().unwrap()));
         assert!(serde_json::from_str::<Peer>(r#"{"cidr":"10.0.0.1/8"}"#).is_err());
+    }
+
+    #[test]
+    fn cidrs_contain_their_own_family_only() {
+        let block: Cidr = "10.237.0.0/16".parse().unwrap();
+        assert!(block.contains("10.237.4.9".parse().unwrap()));
+        assert!(!block.contains("10.238.0.1".parse().unwrap()));
+        assert!(!block.contains("::ffff:10.237.4.9".parse().unwrap()));
+        let all: Cidr = "0.0.0.0/0".parse().unwrap();
+        assert!(all.contains("192.0.2.1".parse().unwrap()));
+        assert!(!all.contains("2001:db8::1".parse().unwrap()));
+        assert!(Cidr::host("fd00::9".parse().unwrap()).contains("fd00::9".parse().unwrap()));
     }
 
     #[test]

@@ -1,0 +1,51 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum NetworkPolicyError {
+    #[error("Network policy rule {rule_id} not found")]
+    RuleNotFound { rule_id: i64 },
+
+    #[error("Node {node_id} not found; node 0 is the control plane, other ids are `nodes` rows")]
+    NodeNotFound { node_id: i32 },
+
+    #[error("Invalid network policy rule: {message}")]
+    Validation { message: String },
+
+    #[error(
+        "Rule {rule_id} was created by the {link_table} link {link_id} and is removed by \
+         unlinking, not by deleting the rule"
+    )]
+    LinkOwned {
+        rule_id: i64,
+        link_table: String,
+        link_id: i64,
+    },
+
+    #[error("Stored network policy rule {rule_id} is invalid: {reason}")]
+    InvalidStoredRule { rule_id: i64, reason: String },
+
+    #[error("Stored network policy profile for {subject} is invalid: {reason}")]
+    InvalidStoredProfile { subject: String, reason: String },
+
+    #[error("Network policy database operation '{operation}' failed: {source}")]
+    Database {
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+}
+
+impl NetworkPolicyError {
+    pub(crate) fn db(operation: &'static str) -> impl FnOnce(sea_orm::DbErr) -> Self {
+        move |source| NetworkPolicyError::Database { operation, source }
+    }
+
+    pub(crate) fn validation(message: impl Into<String>) -> Self {
+        NetworkPolicyError::Validation {
+            message: message.into(),
+        }
+    }
+}

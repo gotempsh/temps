@@ -13,10 +13,13 @@ homepage.workspace = true
 
 [dependencies]
 temps-workload = { path = "../temps-workload" }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
+crossbeam-queue = "0.3"
 futures = { workspace = true }
+httparse = "1.10"
 serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }

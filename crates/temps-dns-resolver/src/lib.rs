@@ -25,17 +25,21 @@
 pub mod authority;
 pub mod config;
 pub mod error;
+#[cfg(feature = "sync")]
 pub mod handle;
 pub mod record;
+#[cfg(feature = "sync")]
 pub mod sync_client;
 pub mod upstream;
 pub mod zone_store;
 
-pub use authority::{RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};
+pub use authority::{ZoneAuthority, RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};
 pub use config::ResolverConfig;
 pub use error::ResolverError;
+#[cfg(feature = "sync")]
 pub use handle::{ResolverHandle, ResolverStatus};
 pub use record::{OwnerKind, RecordKind, ZoneRecord};
+#[cfg(feature = "sync")]
 pub use sync_client::{SyncClient, SyncStatus};
 pub use zone_store::ZoneStore;
 

@@ -19,16 +19,34 @@
 //!
 //! Nothing here touches the database or calls another concern crate.
 
+pub mod binding;
+pub mod dns;
+pub mod egress;
+pub mod enforcer;
 pub mod executor;
 pub mod identity;
 pub mod microsandbox;
 pub mod nft;
+pub mod ports;
 pub mod rule;
 
+pub use binding::{
+    compile_bindings, node_removal_ruleset, BindingError, PortBinding, BINDING_PRIORITY,
+};
+pub use dns::{DnsDecision, DnsPolicy};
+pub use egress::{
+    EgressPolicy, EgressProxy, EgressProxyConfig, EgressRule, EgressStats, EgressTable,
+    EgressTarget, HostPattern, RelayUpstream,
+};
+pub use enforcer::{
+    identify, DockerInstanceSource, EnforcerError, InstanceSource, NodeEnforcer, NodeMode,
+    PassOutcome, PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
+};
 pub use executor::{choose_executor, DockerVmNft, HostNft, NftError, NftExecutor};
 pub use identity::IdentityMap;
 pub use microsandbox::{to_sdk_policy, SdkNetworkPolicy, Translated};
 pub use nft::{compile, removal_ruleset, CompileError, Compiled, TableName};
+pub use ports::{choose_port_resolver, PortQuery, PortResolver};
 pub use rule::{
     Action, Cidr, Direction, InvalidCidr, L4Protocol, Origin, Peer, PortRange, Profile, Rule,
     WorkloadPolicy,

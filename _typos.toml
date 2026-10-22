@@ -68,3 +68,6 @@ caf = "caf"
 "ba96c0f7" = "ba96c0f7"
 # rustix's write-only file-open flag.
 WRONLY = "WRONLY"
+# Plural of HTTP `DELETE` in a console comment; typos "corrects" it to
+# `DELETEEs`, which is itself a misspelling.
+DELETEs = "DELETEs"

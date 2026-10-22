@@ -114,6 +114,8 @@ members = [
     "examples/lighthouse-plugin",
     "examples/indexnow-plugin",
     "examples/google-indexing-plugin",
+    "crates/temps-netpol-probe",
+    "crates/temps-network-policy",
 ]
 
 [workspace.package]

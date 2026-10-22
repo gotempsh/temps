@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-netpol-probe"
+description = "The per-node network policy runtime (restricted DNS and the egress proxy) as a standalone binary, and the Docker proofs that drive it (ADR-055 §9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "temps-netpol-probe"
+path = "src/main.rs"
+
+[dependencies]
+temps-workload = { path = "../temps-workload" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+temps-dns-resolver = { path = "../temps-dns-resolver", default-features = false }
+hickory-server = { version = "0.26", default-features = false }
+hickory-proto = { version = "0.26", default-features = false, features = ["std"] }
+arc-swap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+bollard = { workspace = true }
+futures = { workspace = true }

@@ -46,4 +46,7 @@ pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMi
 
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
 
+pub use migration::m20261022_000007_network_policy::{
+    backfill_sql as network_policy_backfill_sql, Migration as NetworkPolicyMigration,
+};
 pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;

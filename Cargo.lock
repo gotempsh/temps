@@ -13129,6 +13129,7 @@ dependencies = [
  "temps-migrations",
  "temps-monitoring",
  "temps-network",
+ "temps-network-policy",
  "temps-notifications",
  "temps-observability",
  "temps-otel",
@@ -13586,6 +13587,7 @@ name = "temps-dns-resolver"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "chrono",
  "hickory-proto",
@@ -13596,6 +13598,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-core",
+ "temps-workload",
+ "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
@@ -14639,6 +14643,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-netpol-probe"
+version = "0.1.0-beta.57"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bollard",
+ "futures",
+ "hickory-proto",
+ "hickory-server",
+ "serde",
+ "serde_json",
+ "temps-dns-resolver",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "temps-network"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -14669,6 +14694,31 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "temps-network-policy"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "bollard",
+ "chrono",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -15606,10 +15656,13 @@ dependencies = [
 name = "temps-workload-netpol"
 version = "0.1.0-beta.57"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "bollard",
  "bytes",
+ "crossbeam-queue",
  "futures",
+ "httparse",
  "rand 0.10.3",
  "serde",
  "serde_json",

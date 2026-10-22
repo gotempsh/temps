@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-network-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Network policy rules for every workload kind, per-node modes, and the node-0 enforcer (ADR-052 §4, ADR-055 phase 7)"
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bollard = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+temps-database = { path = "../temps-database" }

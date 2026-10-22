@@ -90,6 +90,7 @@ temps-project-groups = { path = "../temps-project-groups" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-webhooks = { path = "../temps-webhooks" }
 temps-wireguard = { path = "../temps-wireguard" }
+temps-network-policy = { path = "../temps-network-policy" }
 tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace

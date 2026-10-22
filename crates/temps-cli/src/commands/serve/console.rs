@@ -4093,6 +4093,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     ));
     plugin_manager.register_plugin(external_plugins_plugin);
 
+    // NetworkPolicyPlugin - network policy rules for every workload kind,
+    // per-node modes, and node 0's enforcer (ADR-052 §4, ADR-055 phase 7).
+    // Every node defaults to `legacy`, where the enforcer only reads the
+    // mode: no Docker call, no nftables.
+    debug!("Registering NetworkPolicyPlugin");
+    plugin_manager.register_plugin(Box::new(temps_network_policy::NetworkPolicyPlugin::new()));
+
     // Extra plugins from the calling binary (EE, etc.). Registered last so
     // they can resolve every OSS service via `require_service`. See ADR 0001
     // §"Extension points exposed by OSS" — this is the
@@ -7301,7 +7308,7 @@ mod console_oidc_bootstrap_audit_tests {
     }
 
     #[tokio::test]
-    async fn unreadable_and_unparseable_files_are_not_audited() {
+    async fn unreadable_and_unparsable_files_are_not_audited() {
         let (context, recorder) = context_with_logger();
 
         report_console_oidc_bootstrap_error(

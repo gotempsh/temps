@@ -10,6 +10,13 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["sync"]
+# The control-plane sync client and the resolver handle that runs it. Off,
+# the crate is the authority alone: what the per-node probe and policy
+# tests embed without pulling in the control-plane client stack.
+sync = ["dep:reqwest", "dep:temps-core"]
+
 [dependencies]
 # Hickory DNS — embedded server for the internal *.temps.local zone.
 # Pinned to 0.25 to match the resolver versions used elsewhere in the
@@ -32,10 +39,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 # HTTP client for the sync long-poll
-reqwest = { workspace = true }
+reqwest = { workspace = true, optional = true }
 # The cluster-CA trust for the control plane (`node_pki::control_plane_client_config`),
 # shared with every other control-plane client on a node.
-temps-core = { path = "../temps-core" }
+temps-core = { path = "../temps-core", optional = true }
+# Policy-aware answers for restricted workloads (ADR-055 §9).
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+arc-swap = { workspace = true }
 
 # Error handling & logging
 thiserror = { workspace = true }
@@ -47,6 +57,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 hickory-resolver = "0.26"
+temps-workload = { path = "../temps-workload" }
 tokio-test = "0.4"
 wiremock = "0.6"
 tempfile = "3"

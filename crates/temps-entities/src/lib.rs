@@ -262,7 +262,12 @@ pub mod workload_events;
 pub mod workload_instances;
 pub mod workloads;
 // ADR-055 Phase 8: ingress endpoints and access policies
+pub mod control_plane_node_settings;
 pub mod ingress_access_policies;
 pub mod ingress_endpoints;
 pub mod ingress_login_grants;
 pub mod ingress_mode;
+pub mod network_policy_profiles;
+pub mod network_policy_rules;
+pub mod network_policy_state;
+pub mod node_network_policy_modes;

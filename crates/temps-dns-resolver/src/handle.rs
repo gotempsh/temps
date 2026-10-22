@@ -74,6 +74,15 @@ impl ResolverHandle {
     /// sync loop is running. The first sync round may not have completed
     /// yet — but the disk snapshot (if any) is already serving.
     pub async fn start(config: ResolverConfig) -> Result<Self, ResolverError> {
+        Self::start_with_policy(config, None).await
+    }
+
+    /// [`ResolverHandle::start`], answering restricted workloads from
+    /// `policy` (see [`ZoneAuthority::with_policy`]).
+    pub async fn start_with_policy(
+        config: ResolverConfig,
+        policy: Option<Arc<arc_swap::ArcSwap<temps_workload_netpol::DnsPolicy>>>,
+    ) -> Result<Self, ResolverError> {
         let zone = Arc::new(ZoneStore::new(config.snapshot_path()));
         zone.load_from_disk();
 
@@ -98,6 +107,9 @@ impl ResolverHandle {
         let mut authority = ZoneAuthority::new(zone.clone());
         if let Some(upstream) = upstream {
             authority = authority.with_upstream(upstream);
+        }
+        if let Some(policy) = policy {
+            authority = authority.with_policy(policy);
         }
         let mut server = Server::new(authority);
 

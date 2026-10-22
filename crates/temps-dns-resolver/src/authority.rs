@@ -34,6 +34,9 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use tracing::{debug, trace, warn};
 
+use arc_swap::ArcSwap;
+use temps_workload_netpol::dns::{DnsDecision, DnsPolicy};
+
 use crate::record::ZoneRecord;
 use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
@@ -48,6 +51,9 @@ pub const RESOLVER_MARKER_VALUE: &str = "temps-dns-resolver-v1";
 pub struct ZoneAuthority {
     zone: Arc<ZoneStore>,
     upstream: Option<Arc<UpstreamResolver>>,
+    /// Per-source answers for restricted workloads (ADR-055 §9). `None`
+    /// (and an open snapshot) is today's resolver.
+    policy: Option<Arc<ArcSwap<DnsPolicy>>>,
 }
 
 impl ZoneAuthority {
@@ -55,7 +61,17 @@ impl ZoneAuthority {
         Self {
             zone,
             upstream: None,
+            policy: None,
         }
+    }
+
+    /// Answers restricted sources from the policy snapshot: the names
+    /// their policy allows (and the group short names of those), nothing
+    /// else, and never a forwarded lookup. The snapshot is swapped by the
+    /// node enforcer; reading it is one atomic load per query.
+    pub fn with_policy(mut self, policy: Arc<ArcSwap<DnsPolicy>>) -> Self {
+        self.policy = Some(policy);
+        self
     }
 
     pub fn with_upstream(mut self, upstream: Arc<UpstreamResolver>) -> Self {
@@ -130,11 +146,37 @@ impl RequestHandler for ZoneAuthority {
             return reply_nodata(request, &mut response_handle, info.metadata).await;
         }
 
+        // Policy: who is asking decides what they may learn. A refused
+        // name is NXDOMAIN, not REFUSED, so a stub resolver does not move
+        // on to a second nameserver and ask there.
+        let normalized = temps_workload_netpol::dns::normalize(&qname_str);
+        let policy = self.policy.as_ref().map(|p| p.load_full());
+        let (lookup_name, restricted) = match policy
+            .as_deref()
+            .map(|p| p.decide(request.src().ip(), &normalized))
+        {
+            None => (normalized.clone(), false),
+            Some(DnsDecision::Unrestricted { lookup }) => (lookup.to_string(), false),
+            Some(DnsDecision::Answer { lookup }) => (lookup.to_string(), true),
+            Some(DnsDecision::Refuse) => {
+                debug!(
+                    qname = %qname_str,
+                    source = %request.src().ip(),
+                    "DNS query refused by network policy"
+                );
+                return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+            }
+        };
+        let in_zone = in_zone || is_internal_zone(&lookup_name);
+
         // Outside-zone queries are forwarded recursively. We are the
         // *only* nameserver app containers see, so falling through to
         // NXDOMAIN here would break `apt-get`, `wget`, package installs,
         // outbound API calls, …
         if !in_zone {
+            if restricted {
+                return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
+            }
             if let Some(upstream) = &self.upstream {
                 trace!(qname = %qname_str, qtype = ?qtype, "forwarding to upstream");
                 return upstream
@@ -159,9 +201,11 @@ impl RequestHandler for ZoneAuthority {
         //     the connection, so returning NXDOMAIN here breaks every
         //     IPv4-only internal name.
         //   - name doesn't exist at all → NXDOMAIN.
-        let any_match = snapshot.lookup(&qname_str).next().is_some();
+        // An alias (a group short name) is answered from its canonical
+        // name's records, under the name that was asked.
+        let any_match = snapshot.lookup(&lookup_name).next().is_some();
         let matches: Vec<&ZoneRecord> = snapshot
-            .lookup(&qname_str)
+            .lookup(&lookup_name)
             .filter(|r| matches_qtype(r, qtype))
             .collect();
 
