@@ -1111,6 +1111,9 @@ pub struct LoadBalancer {
     project_context_resolver: Arc<dyn ProjectContextResolver>,
     cookie_config: CookieConfig,
     crypto: Arc<temps_core::CookieCrypto>,
+    /// `TempsLogin` exchange grants already traded on this proxy, so each
+    /// is used once (ADR-055 §11). Taken once per sign-in, never per request.
+    consumed_exchanges: Arc<crate::ingress::ConsumedExchanges>,
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
@@ -1276,6 +1279,7 @@ impl LoadBalancer {
             project_context_resolver,
             cookie_config: CookieConfig::default(),
             crypto,
+            consumed_exchanges: Arc::new(crate::ingress::ConsumedExchanges::default()),
             static_asset_lookup: Arc::new(
                 crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
             ),
@@ -4213,7 +4217,7 @@ impl LoadBalancer {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         };
-        crate::ingress::exchange_grant(endpoint, &grants, query, secure)
+        crate::ingress::exchange_grant(endpoint, &grants, &self.consumed_exchanges, query, secure)
     }
 }
 
@@ -6725,6 +6729,10 @@ impl ProxyHttp for LoadBalancer {
                         ctx.query_string.as_deref(),
                         secure,
                     );
+                    // The query holds the grant: keep it out of the proxy
+                    // log, which outlives the grant and is readable by
+                    // project members.
+                    ctx.query_string = None;
                     let mut response = match exchange {
                         Ok(exchange) => {
                             info!(

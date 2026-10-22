@@ -633,6 +633,77 @@ pub enum ExchangeError {
         #[source]
         source: grant::GrantError,
     },
+    #[error("exchange grant {grant_id} for {owner} was already traded for a session")]
+    AlreadyUsed { owner: ProductRef, grant_id: i64 },
+    #[error(
+        "exchange for {owner} refused: {capacity} unexpired exchange grants are already \
+         recorded on this proxy"
+    )]
+    ReplayGuardFull { owner: ProductRef, capacity: usize },
+}
+
+/// Exchange grants this proxy has already traded for a session, so each
+/// is used once.
+///
+/// An exchange grant rides in a URL, which browsers keep in history and
+/// logs can capture. Without this record, anyone who saw the URL within
+/// the grant's lifetime could trade it for a session of their own. Each
+/// sign-in mints a grant with its own id, so a second exchange of an id is
+/// always a replay.
+///
+/// The record is bounded: an entry leaves once its grant has expired, and
+/// a full record refuses new exchanges rather than forgetting live ones.
+/// It is taken only on the exchange path, once per sign-in, never per
+/// request. It is per process: in a split topology with several proxies a
+/// grant could still be traded once on each of them within its lifetime.
+#[derive(Debug)]
+pub struct ConsumedExchanges {
+    used: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
+    capacity: usize,
+}
+
+impl Default for ConsumedExchanges {
+    fn default() -> Self {
+        Self::with_capacity(10_000)
+    }
+}
+
+impl ConsumedExchanges {
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            used: std::sync::Mutex::new(std::collections::HashMap::new()),
+            capacity,
+        }
+    }
+
+    /// Records `grant_id` as traded. Refuses an id already recorded, and a
+    /// new id when the record is full of unexpired grants.
+    fn consume(
+        &self,
+        owner: ProductRef,
+        grant_id: i64,
+        expires_at: u64,
+        now: u64,
+    ) -> Result<(), ExchangeError> {
+        let mut used = self
+            .used
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if used.contains_key(&grant_id) {
+            return Err(ExchangeError::AlreadyUsed { owner, grant_id });
+        }
+        if used.len() >= self.capacity {
+            used.retain(|_, expires| *expires > now);
+            if used.len() >= self.capacity {
+                return Err(ExchangeError::ReplayGuardFull {
+                    owner,
+                    capacity: self.capacity,
+                });
+            }
+        }
+        used.insert(grant_id, expires_at);
+        Ok(())
+    }
 }
 
 /// Trades the exchange grant in the query of a request to
@@ -641,10 +712,12 @@ pub enum ExchangeError {
 /// The exchange grant must be signed by the endpoint owner's key, for this
 /// host and the endpoint's `TempsLogin` permission, unexpired and not
 /// revoked. The session grant keeps its id, so revoking the grant row
-/// revokes both. Runs once per sign-in, never per request.
+/// revokes both. Each exchange grant is traded once (`consumed`). Runs once
+/// per sign-in, never per request.
 pub fn exchange_grant(
     endpoint: &CompiledEndpoint,
     grants: &GrantFacts<'_>,
+    consumed: &ConsumedExchanges,
     query: Option<&str>,
     secure: bool,
 ) -> Result<SessionExchange, ExchangeError> {
@@ -681,6 +754,7 @@ pub fn exchange_grant(
         grants.revocations,
     )
     .map_err(|source| ExchangeError::Refused { owner, source })?;
+    consumed.consume(owner, claims.grant_id, claims.expires_at, grants.now_secs)?;
     let session = grant::mint(
         &key,
         &grant::GrantClaims {
@@ -1088,7 +1162,9 @@ mod tests {
             T0 + 60,
         );
         let query = format!("grant={token}&next=%2Fdashboard%3Ftab%3D1");
-        let exchange = exchange_grant(&ep, &facts, Some(&query), true).expect("exchange");
+        let consumed = ConsumedExchanges::default();
+        let exchange =
+            exchange_grant(&ep, &facts, &consumed, Some(&query), true).expect("exchange");
         assert_eq!(exchange.location, "/dashboard?tab=1");
         assert_eq!((exchange.grant_id, exchange.user_id), (12, 4));
         assert!(exchange.set_cookie.starts_with("_temps_ingress=tg1."));
@@ -1107,9 +1183,22 @@ mod tests {
         request.append_header("cookie", cookie).expect("cookie");
         assert!(session_grant_admits(&request, &ep, "projects:read", &facts));
 
+        // The same grant cannot be traded again: its URL may have leaked.
+        assert!(matches!(
+            exchange_grant(&ep, &facts, &consumed, Some(&query), true),
+            Err(ExchangeError::AlreadyUsed { grant_id: 12, .. })
+        ));
+
         // Over plain HTTP the cookie is not `Secure`; an unsafe next goes home.
         let query = format!("grant={token}&next=https%3A%2F%2Felsewhere.example.test%2F");
-        let exchange = exchange_grant(&ep, &facts, Some(&query), false).expect("exchange");
+        let exchange = exchange_grant(
+            &ep,
+            &facts,
+            &ConsumedExchanges::default(),
+            Some(&query),
+            false,
+        )
+        .expect("exchange");
         assert_eq!(exchange.location, "/");
         assert!(!exchange.set_cookie.contains("Secure"));
     }
@@ -1130,8 +1219,9 @@ mod tests {
         }
         let (none_ref, revoked_ref) = (&none, &revoked);
         let ep = login_endpoint();
+        let consumed = ConsumedExchanges::default();
         let exchange = |token: &str, facts: &GrantFacts<'_>| {
-            exchange_grant(&ep, facts, Some(&format!("grant={token}")), true)
+            exchange_grant(&ep, facts, &consumed, Some(&format!("grant={token}")), true)
         };
         let host = Some("app.example.test");
         let session = exchange_token(
@@ -1216,17 +1306,48 @@ mod tests {
             })
         ));
         assert!(matches!(
-            exchange_grant(&ep, &facts(host, none_ref), Some("next=%2F"), true),
+            exchange_grant(
+                &ep,
+                &facts(host, none_ref),
+                &consumed,
+                Some("next=%2F"),
+                true
+            ),
             Err(ExchangeError::MissingGrant { .. })
         ));
         assert!(matches!(
             exchange_grant(
                 &endpoint(vec![]),
                 &facts(host, none_ref),
+                &consumed,
                 Some(&format!("grant={valid}")),
                 true
             ),
             Err(ExchangeError::NotLoginProtected { .. })
+        ));
+    }
+
+    #[test]
+    fn the_replay_guard_forgets_expired_grants_and_refuses_when_full_of_live_ones() {
+        let owner = ProductRef {
+            kind: ProductKind::Environment,
+            id: 7,
+        };
+        let guard = ConsumedExchanges::with_capacity(2);
+        guard.consume(owner, 1, T0 + 10, T0).expect("first");
+        guard.consume(owner, 2, T0 + 60, T0).expect("second");
+        // Full of unexpired grants: a new one is refused, not an old one dropped.
+        assert!(matches!(
+            guard.consume(owner, 3, T0 + 60, T0),
+            Err(ExchangeError::ReplayGuardFull { capacity: 2, .. })
+        ));
+        // Once grant 1 has expired it makes room; grant 2 is still a replay.
+        guard
+            .consume(owner, 3, T0 + 60, T0 + 11)
+            .expect("room after expiry");
+        assert!(matches!(
+            guard.consume(owner, 2, T0 + 60, T0 + 11),
+            Err(ExchangeError::AlreadyUsed { grant_id: 2, .. })
         ));
     }
 
