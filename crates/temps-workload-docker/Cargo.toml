@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload-docker"
+description = "The Docker RuntimeDriver: the one place a workload's container-create request is built (ADR-055 §6, §18)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-workload = { path = "../temps-workload" }
+async-trait = { workspace = true }
+bollard = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+temps-docker-capture = { path = "../temps-docker-capture" }
+tokio = { workspace = true }

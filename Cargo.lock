@@ -12488,6 +12488,8 @@ dependencies = [
  "temps-git",
  "temps-notifications",
  "temps-vm-agent",
+ "temps-workload",
+ "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15533,6 +15535,86 @@ dependencies = [
  "tokio",
  "tracing",
  "x25519-dalek",
+]
+
+[[package]]
+name = "temps-workload"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "temps-workload-docker"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "serde_json",
+ "temps-docker-capture",
+ "temps-workload",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-env"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "temps-workload-ingress"
+version = "0.1.0-beta.57"
+dependencies = [
+ "serde",
+ "serde_json",
+ "temps-workload",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "temps-workload-netpol"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "futures",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tar",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-volumes"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]

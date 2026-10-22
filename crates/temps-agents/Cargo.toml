@@ -70,3 +70,6 @@ microsandbox = { version = "=0.7.8", default-features = false, features = ["loca
 [dev-dependencies]
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
+# ADR-055 §9: the netpol translation must deserialize into the pinned SDK.
+temps-workload = { path = "../temps-workload" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
