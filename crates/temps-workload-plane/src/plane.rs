@@ -529,24 +529,15 @@ impl WorkloadPlane {
         let Some(latest) = latest else {
             return Ok(None);
         };
-        // On the control plane, the runtime that created it (the node
-        // driver, or a local one such as WASM); a worker's instance is read
-        // through the node driver, as before.
-        let driver = match latest.node_id {
-            None => self.local_driver_named(&latest.driver),
-            Some(_) => self.control_plane_driver(),
-        };
-        let Ok(driver) = driver else {
-            return Ok(None);
-        };
         let handle: temps_workload::InstanceHandle = serde_json::from_value(latest.handle.clone())
             .map_err(|e| PlaneError::Corrupt {
                 workload_id: id,
                 field: "instance handle",
                 reason: format!("instance {}: {e}", latest.id),
             })?;
-        // The driver of the node the instance is on: a worker's replica
-        // is answered from its node's reports, not the control plane.
+        // The driver of the node the instance is on: on the control plane
+        // the runtime that created it (the node driver, or a local one such
+        // as WASM); a worker's replica is answered from its node's reports.
         let driver = match self.driver_of(&latest).await {
             Ok(driver) => driver,
             Err(reason) if latest.node_id.is_none() => {
