@@ -40,6 +40,7 @@ pub mod plane;
 pub mod reconciler;
 pub mod scheduler;
 pub mod stream;
+pub mod volumes;
 
 #[cfg(test)]
 mod testing;
@@ -52,8 +53,8 @@ pub use env::{EnvSource, NoEnvSource};
 pub use error::{AdmissionError, PlaneError};
 pub use node::{Placed, Placement as AttemptPlacement, StreamNodeDriver, STREAM_DRIVER};
 pub use plane::{
-    ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, ReconcilerHandle, WorkloadPlane,
-    WorkloadView,
+    ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, PlaneSlot, ReconcilerHandle,
+    VolumeApplied, WorkloadPlane, WorkloadView,
 };
 pub use scheduler::{
     explain, recommend_pinning, ExplainContext, Explanation, NodeExclusion, NodeFacts,
@@ -61,6 +62,9 @@ pub use scheduler::{
     ScheduleError, ScheduleRequest, SchedulerConfig, SocketGate, UnifiedScheduler,
 };
 pub use stream::{parse_cursor, StreamMetrics, StreamMetricsSnapshot, SweepOutcome};
+pub use volumes::{
+    DeletedVolume, NewVolume, VolumeAttachment, VolumeRecord, VolumeStore, VolumeStoreError,
+};
 
 /// Labels the plane adds to every instance it creates, next to
 /// [`temps_workload::labels`].

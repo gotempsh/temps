@@ -102,6 +102,7 @@ pub(crate) async fn test_db() -> Option<TestDatabase> {
     };
     let tables = temps_migrations::WORKLOAD_TABLES_SQL
         .iter()
+        .chain(temps_migrations::VOLUME_TABLES_SQL)
         .copied()
         .chain(std::iter::once(
             temps_migrations::WORKLOAD_INSTANCE_PORTS_SQL,

@@ -36,6 +36,8 @@ use crate::scheduler::{
     self, Explanation, Placement, ScheduleRequest, SchedulerConfig, UnifiedScheduler,
 };
 use crate::stream::StreamMetrics;
+use crate::volumes::{bind_source, pin_for, VolumeStore};
+use temps_workload_volumes::{VolumePin, VolumeProvider};
 
 /// The product object that owns a workload: `cron/7`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -204,6 +206,40 @@ pub struct WorkloadPlane {
     /// Where new attempts run. `None`: on the control plane (node 0).
     pub(crate) placement: Option<Arc<dyn AttemptPlacement>>,
     pub(crate) stream_metrics: StreamMetrics,
+    /// Creates volume backings on the control plane (node 0). `None`: the
+    /// runtime creates a named volume on first bind, without labels.
+    pub(crate) volume_provider: Option<Arc<dyn VolumeProvider>>,
+}
+
+/// The plane, bound once it starts. Plugins that register before
+/// `temps serve` starts the plane hold the slot and read it per call; an
+/// empty slot means this process runs no plane.
+#[derive(Debug, Default)]
+pub struct PlaneSlot(std::sync::OnceLock<Arc<WorkloadPlane>>);
+
+impl PlaneSlot {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bind the plane. `false` when one was already bound (it is kept).
+    pub fn set(&self, plane: Arc<WorkloadPlane>) -> bool {
+        self.0.set(plane).is_ok()
+    }
+
+    pub fn get(&self) -> Option<Arc<WorkloadPlane>> {
+        self.0.get().cloned()
+    }
+}
+
+/// What [`WorkloadPlane::apply_with_volumes`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeApplied {
+    pub workload_id: i64,
+    /// Where the volumes pin the workload, and why (`None` without
+    /// volumes). Its `Display` is the console's "pinned to node 0 by volume
+    /// `data`".
+    pub pin: Option<VolumePin>,
 }
 
 /// Environments staged in this process, by key.
@@ -276,7 +312,14 @@ impl WorkloadPlane {
             staged_env: Arc::new(Mutex::new(HashMap::new())),
             placement: None,
             stream_metrics: StreamMetrics::default(),
+            volume_provider: None,
         }
+    }
+
+    /// Create volume backings on the control plane through `provider`.
+    pub fn with_volume_provider(mut self, provider: Arc<dyn VolumeProvider>) -> Self {
+        self.volume_provider = Some(provider);
+        self
     }
 
     /// Place new attempts through `placement` (workers included) instead
@@ -582,26 +625,7 @@ impl WorkloadPlane {
             },
         ) {
             Ok(spec) => spec,
-            Err(refusal) => {
-                tracing::warn!(
-                    workload = %refusal.workload,
-                    owner = %refusal.owner,
-                    rule = %refusal.rule,
-                    "workload refused at admission: {}",
-                    refusal.message
-                );
-                if let Err(error) = self
-                    .audit
-                    .create_audit_log(&AdmissionRefusedAudit::from(&refusal))
-                    .await
-                {
-                    tracing::error!(
-                        workload = %refusal.workload,
-                        "failed to audit-log an admission refusal: {error}"
-                    );
-                }
-                return Err(refusal.into());
-            }
+            Err(refusal) => return Err(self.refuse(refusal).await),
         };
         let profile = admitted.security.map(|p| p.as_str()).unwrap_or("none");
         let spec_json = serde_json::to_value(&admitted).map_err(|e| PlaneError::Encode {
@@ -689,6 +713,162 @@ impl WorkloadPlane {
         tracing::info!(workload_id = id, owner = %owner, name = %name, profile, "workload applied");
         self.wake();
         Ok(id)
+    }
+
+    /// Log and audit an admission refusal, and return it as the error.
+    async fn refuse(&self, refusal: crate::error::AdmissionError) -> PlaneError {
+        tracing::warn!(
+            workload = %refusal.workload,
+            owner = %refusal.owner,
+            rule = %refusal.rule,
+            "workload refused at admission: {}",
+            refusal.message
+        );
+        if let Err(error) = self
+            .audit
+            .create_audit_log(&AdmissionRefusedAudit::from(&refusal))
+            .await
+        {
+            tracing::error!(
+                workload = %refusal.workload,
+                "failed to audit-log an admission refusal: {error}"
+            );
+        }
+        refusal.into()
+    }
+
+    /// Apply a spec that mounts volumes of `volume_owner` (ADR-055 §12).
+    ///
+    /// The mounts are checked against the owner's volume rows (names, paths,
+    /// the driver's volume kinds); the volumes pin the workload to their
+    /// node (§8), which replaces `spec.placement.nodes` and is recorded as a
+    /// `PinnedByVolume` event. A volume with no node yet is created on the
+    /// node the spec is pinned to (it must name exactly one), through the
+    /// volume provider on the control plane, and bound there. The plane, not
+    /// the product, sets each mount's bind source, so a spec can never bind
+    /// a host path. Any refusal is an audited [`AdmissionRule::Validation`].
+    ///
+    /// A spec without mounts is a plain [`WorkloadPlane::apply`].
+    ///
+    /// [`AdmissionRule::Validation`]: crate::AdmissionRule::Validation
+    pub async fn apply_with_volumes(
+        &self,
+        mut request: ApplyRequest,
+        volume_owner: &Owner,
+    ) -> Result<VolumeApplied, PlaneError> {
+        if request.spec.volumes.is_empty() {
+            return Ok(VolumeApplied {
+                workload_id: self.apply(request).await?,
+                pin: None,
+            });
+        }
+        let workload_name = request.name.clone();
+        let owner_text = request.owner.to_string();
+        let refusal = |message: String| crate::error::AdmissionError {
+            rule: crate::AdmissionRule::Validation,
+            workload: workload_name.clone(),
+            owner: owner_text.clone(),
+            message,
+        };
+        let store = VolumeStore::new(self.db.clone());
+        let records = store
+            .all_of(volume_owner)
+            .await
+            .map_err(|source| PlaneError::Volume {
+                workload: request.name.clone(),
+                operation: "read",
+                source: Box::new(source),
+            })?;
+        let spec_owner = request.spec.owner;
+        let pin = match pin_for(
+            spec_owner,
+            &request.spec.volumes,
+            &records,
+            request.spec.placement.pinned_nodes(),
+        ) {
+            Ok(pin) => pin,
+            Err(error) => {
+                let refused = refusal(format!("volumes of {volume_owner}: {error}"));
+                return Err(self.refuse(refused).await);
+            }
+        };
+        let node_id = match (&pin, request.spec.placement.pinned_nodes()) {
+            (Some(pin), _) => pin.node_id,
+            (None, Some([node])) => *node,
+            (None, _) => {
+                let names: Vec<&str> = request
+                    .spec
+                    .volumes
+                    .iter()
+                    .map(|m| m.volume.as_str())
+                    .collect();
+                let refused = refusal(format!(
+                    "volume(s) {names:?} of {volume_owner} have not been created on any node \
+                     yet, and the workload is not pinned to exactly one node to create them on"
+                ));
+                return Err(self.refuse(refused).await);
+            }
+        };
+        request.spec.placement.nodes = Some(vec![node_id]);
+        let mut names = Vec::with_capacity(request.spec.volumes.len());
+        for mount in &mut request.spec.volumes {
+            // `pin_for` resolved every mount, so the record exists.
+            let Some(record) = records.iter().find(|r| r.name == mount.volume) else {
+                continue;
+            };
+            if node_id == scheduler::CONTROL_PLANE_NODE_ID {
+                if let Some(provider) = self.volume_provider.as_ref() {
+                    provider
+                        .ensure(&record.as_volume(spec_owner))
+                        .await
+                        .map_err(|source| PlaneError::VolumeProvider {
+                            workload: workload_name.clone(),
+                            volume: record.name.clone(),
+                            node_id,
+                            source: Box::new(source),
+                        })?;
+                }
+            }
+            if record.node_id.is_none() {
+                let bound = store
+                    .bind_node(volume_owner, record.id, node_id)
+                    .await
+                    .map_err(|source| PlaneError::Volume {
+                        workload: workload_name.clone(),
+                        operation: "bound to their node",
+                        source: Box::new(source),
+                    })?;
+                if bound != node_id {
+                    let refused = refusal(format!(
+                        "volume '{}' of {volume_owner} was created on node {bound} while this \
+                         workload was being placed on node {node_id}; apply it again",
+                        record.name
+                    ));
+                    return Err(self.refuse(refused).await);
+                }
+            }
+            mount.source = Some(bind_source(&record.backing).to_string());
+            names.push(record.name.clone());
+        }
+        names.sort();
+        let pin = VolumePin {
+            node_id,
+            volumes: names,
+        };
+        let workload_id = self.apply(request).await?;
+        events::record(
+            self.db.as_ref(),
+            workload_id,
+            None,
+            "PinnedByVolume",
+            &pin.to_string(),
+            Utc::now(),
+        )
+        .await?;
+        Ok(VolumeApplied {
+            workload_id,
+            pin: Some(pin),
+        })
     }
 
     /// Apply, then wait until `condition` is `True`. A workload that finishes

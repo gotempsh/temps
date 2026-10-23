@@ -430,6 +430,7 @@ mod tests {
             volume: volume.to_string(),
             mount_path: path.to_string(),
             read_only: false,
+            source: None,
         }
     }
 

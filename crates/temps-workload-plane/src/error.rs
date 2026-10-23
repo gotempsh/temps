@@ -122,6 +122,25 @@ pub enum PlaneError {
         reason: String,
     },
 
+    #[error("workload '{workload}': its volumes could not be {operation}: {source}")]
+    Volume {
+        workload: String,
+        operation: &'static str,
+        #[source]
+        source: Box<crate::volumes::VolumeStoreError>,
+    },
+
+    #[error(
+        "workload '{workload}': volume '{volume}' could not be created on node {node_id}: {source}"
+    )]
+    VolumeProvider {
+        workload: String,
+        volume: String,
+        node_id: i32,
+        #[source]
+        source: Box<temps_workload_volumes::VolumeError>,
+    },
+
     #[error("database error while {operation} (workload {workload}): {source}")]
     Database {
         operation: &'static str,

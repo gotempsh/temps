@@ -43,6 +43,7 @@ temps-workload = { path = "../temps-workload" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-plane = { path = "../temps-workload-plane" }
+temps-workload-volumes = { path = "../temps-workload-volumes" }
 ipnet = "2.10"
 serde = { workspace = true }
 tokio = { workspace = true }

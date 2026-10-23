@@ -19,6 +19,7 @@
 //! - [`mariadb_physical`]: MariaDB via `mariadb-backup` physical base (PITR).
 //! - [`mariadb_dump`]: MariaDB via `mariadb-dump` logical dump (fallback).
 //! - [`s3_mirror`]: S3-compatible object storage via `rc mirror` (RustFS CLI).
+//! - [`workload_job`]: Postgres on a worker node, as a job on that node (ADR-055).
 //! - [`dispatch`]: Engine-key resolution helper (`resolve_engine_key`).
 //!
 //! ## Adding a new engine
@@ -44,3 +45,4 @@ pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
 mod walg_size;
+pub mod workload_job;

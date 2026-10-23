@@ -1950,6 +1950,45 @@ impl WorkflowExecutionService {
                 };
                 builder = builder.workload_mode(workload_mode, workload_plane);
 
+                // ADR-055 Phase 9: the environment's attached volumes. One
+                // indexed query; empty for every environment without one,
+                // which then deploys exactly as before. Unreadable volumes
+                // fail the deploy: a replica must never start without its
+                // data.
+                let volume_owner =
+                    crate::services::workload_volumes::environment_volume_owner(environment.id);
+                let volume_records = temps_workload_plane::VolumeStore::new(self.db.clone())
+                    .all_of(&volume_owner)
+                    .await
+                    .map_err(|e| {
+                        WorkflowExecutionError::JobCreationFailed(format!(
+                            "reading the volumes of environment {} for deployment {}: {e}",
+                            environment.id, deployment.id
+                        ))
+                    })?;
+                let volume_mounts: Vec<temps_workload::VolumeMount> = volume_records
+                    .iter()
+                    .filter_map(temps_workload_plane::VolumeRecord::mount)
+                    .collect();
+                if !volume_mounts.is_empty() {
+                    let pin = temps_workload_plane::volumes::pin_for(
+                        temps_workload::WorkloadRef::new(
+                            temps_workload::WorkloadKind::Deployment,
+                            i64::from(deployment.id),
+                        ),
+                        &volume_mounts,
+                        &volume_records,
+                        None,
+                    )
+                    .map_err(|e| {
+                        WorkflowExecutionError::JobCreationFailed(format!(
+                            "the volumes of environment {} cannot be mounted by deployment {}: {e}",
+                            environment.id, deployment.id
+                        ))
+                    })?;
+                    builder = builder.volume_mounts(volume_mounts, pin);
+                }
+
                 // Rolling update awareness: query existing containers for this
                 // environment so the scheduler can avoid placing new replicas on
                 // nodes that still host outgoing containers.

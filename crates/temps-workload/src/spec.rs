@@ -146,6 +146,12 @@ pub struct VolumeMount {
     pub mount_path: String,
     #[serde(default)]
     pub read_only: bool,
+    /// What the runtime binds (a Docker volume name), resolved by the plane
+    /// from the volume's row at apply ([`WorkloadSpec::volumes`] names the
+    /// resource, never the backing). `None` until resolved; a mount without
+    /// a source is not bound by the plane's template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

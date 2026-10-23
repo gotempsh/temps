@@ -18,6 +18,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-env = { path = "../temps-workload-env" }
+temps-workload-volumes = { path = "../temps-workload-volumes" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }

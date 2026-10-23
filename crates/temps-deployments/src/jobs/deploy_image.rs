@@ -592,6 +592,13 @@ pub struct DeploymentJobConfig {
     /// logs whether it agrees; `Enforce` places with the unified scheduler
     /// and starts control-plane replicas through the workload plane.
     pub workload_mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+    /// The environment's attached volumes (ADR-055 Phase 9), sources
+    /// resolved. Empty for every environment without one, which deploys
+    /// exactly as before. Mounted only in `enforce`, one replica, on the
+    /// control plane; anything else fails the deployment with the reason.
+    pub volume_mounts: Vec<temps_workload::VolumeMount>,
+    /// Where those volumes pin the replica, when any has a node yet.
+    pub volume_pin: Option<temps_workload_volumes::VolumePin>,
 }
 
 /// One replica's placement, and the guarantee the scheduler attached to it.
@@ -643,6 +650,8 @@ impl Default for DeploymentJobConfig {
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
             workload_mode: Default::default(),
+            volume_mounts: Vec::new(),
+            volume_pin: None,
         }
     }
 }
@@ -3060,6 +3069,20 @@ impl DeployImageJob {
         // node reserve, enforced capacity, placements in flight) and the
         // reservation is held until the replicas are started.
         let enforce = self.config.workload_mode == EnvironmentWorkloadMode::Enforce;
+        // ADR-055 Phase 9: attached volumes are mounted only through the
+        // plane, by one replica, on the control plane. Anything else fails
+        // here with the fix, never deploys a replica without its data.
+        if !self.config.volume_mounts.is_empty() {
+            if let Some(message) = crate::services::workload_volumes::volumes_blocker(
+                context.environment_id,
+                self.config.workload_mode,
+                i32::try_from(self.config.replicas).unwrap_or(i32::MAX),
+                self.config.volume_pin.as_ref().map(|pin| pin.node_id),
+            ) {
+                self.log(context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+        }
         let mut _in_flight: Option<temps_workload_plane::inventory::InFlightGuard> = None;
         let (node_assignments, docker_socket_required) = if enforce {
             let (assignments, socket_required, guard) =
@@ -3351,6 +3374,17 @@ impl DeployImageJob {
                     platform,
                     ..
                 } => {
+                    // The agent's deploy call carries no volumes: a replica
+                    // with volumes never starts there without its data.
+                    if !self.config.volume_mounts.is_empty() {
+                        let message = format!(
+                            "Replica {} was placed on node '{node_name}', but this environment \
+                             mounts volumes, which only control-plane replicas receive",
+                            replica_index + 1
+                        );
+                        self.log(context, format!("ERROR: {message}")).await?;
+                        return Err(WorkflowError::JobExecutionFailed(message));
+                    }
                     // Look up the node's token from the node service
                     let token = self.get_node_token(assignment).await?;
                     // Build the deployer via the shared factory so https:// nodes
@@ -4982,9 +5016,27 @@ impl DeployImageJob {
                 "workload plane unavailable".to_string(),
             ));
         };
-        let placement = self.workload_placement_spec().map_err(|e| {
+        let mut placement = self.workload_placement_spec().map_err(|e| {
             WorkflowError::JobExecutionFailed(format!("Cannot schedule this deployment: {e}"))
         })?;
+        // A node-local volume pins the replica (§8, strict): to the
+        // volume's node, or to the control plane where an uncreated volume
+        // will be created.
+        if !self.config.volume_mounts.is_empty() {
+            let pin = self.config.volume_pin.clone().unwrap_or_else(|| {
+                temps_workload_volumes::VolumePin {
+                    node_id: temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID,
+                    volumes: self
+                        .config
+                        .volume_mounts
+                        .iter()
+                        .map(|m| m.volume.clone())
+                        .collect(),
+                }
+            });
+            placement.nodes = Some(vec![pin.node_id]);
+            self.log(context, format!("Replica {pin}")).await?;
+        }
         let image_platforms = self.available_image_platforms(image_output).await;
         let spec = temps_workload::WorkloadSpec {
             owner: temps_workload::WorkloadRef::new(
@@ -5092,6 +5144,10 @@ impl DeployImageJob {
             node_deployer,
             context.deployment_id,
             Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
+        )
+        .with_volumes(
+            self.config.volume_mounts.clone(),
+            crate::services::workload_volumes::environment_volume_owner(context.environment_id),
         );
         Ok(Arc::new(match node_id {
             Some(node_id) => deployer.on_node(node_id),
@@ -5406,6 +5462,17 @@ impl DeployImageJobBuilder {
     ) -> Self {
         self.config.workload_mode = mode;
         self.workload_plane = workload_plane;
+        self
+    }
+
+    /// The environment's attached volumes (ADR-055 Phase 9).
+    pub fn volume_mounts(
+        mut self,
+        mounts: Vec<temps_workload::VolumeMount>,
+        pin: Option<temps_workload_volumes::VolumePin>,
+    ) -> Self {
+        self.config.volume_mounts = mounts;
+        self.config.volume_pin = pin;
         self
     }
 

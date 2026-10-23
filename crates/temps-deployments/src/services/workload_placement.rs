@@ -1100,8 +1100,14 @@ impl WorkloadPlacementService {
         let (environment, project) = self.environment_and_project(environment_id).await?;
         let env_cfg = environment.deployment_config.as_ref();
         let proj_cfg = project.deployment_config.as_ref();
-        let placement =
+        let mut placement =
             placement_spec_for(env_cfg, proj_cfg, Self::replicas_of(&environment, &project))?;
+        // A node-local volume pins the environment (ADR-055 §8, §12); the
+        // explanation shows the pin and, if its node is ineligible, why the
+        // replica would stay unscheduled.
+        if let Some(pin) = self.volume_pin(environment_id).await? {
+            placement.nodes = Some(vec![pin.node_id]);
+        }
         let resources = resources_for(env_cfg, proj_cfg);
         let context = ExplainContext {
             linked_service_nodes: self.linked_service_nodes(project.id).await?,
@@ -1126,6 +1132,37 @@ impl WorkloadPlacementService {
             &context,
         );
         Ok((explanation, context))
+    }
+
+    /// Where the environment's attached volumes pin its replicas, if any
+    /// has a node yet ("pinned to node 0 by volume `data`").
+    pub async fn volume_pin(
+        &self,
+        environment_id: i32,
+    ) -> Result<Option<temps_workload_volumes::VolumePin>, WorkloadPlacementError> {
+        let records = temps_workload_plane::VolumeStore::new(self.db.clone())
+            .all_of(&crate::services::workload_volumes::environment_volume_owner(environment_id))
+            .await
+            .map_err(|e| WorkloadPlacementError::Settings {
+                operation: "read for the environment's volumes",
+                reason: e.to_string(),
+            })?;
+        let mounts: Vec<temps_workload::VolumeMount> = records
+            .iter()
+            .filter_map(temps_workload_plane::VolumeRecord::mount)
+            .collect();
+        if mounts.is_empty() {
+            return Ok(None);
+        }
+        temps_workload_plane::volumes::pin_for(
+            temps_workload::WorkloadRef::new(WorkloadKind::Deployment, 0),
+            &mounts,
+            &records,
+            None,
+        )
+        .map_err(|e| WorkloadPlacementError::Validation {
+            message: format!("the volumes of environment {environment_id}: {e}"),
+        })
     }
 
     /// A recommendation for an environment that moved between nodes

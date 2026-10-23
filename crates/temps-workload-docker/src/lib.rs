@@ -33,9 +33,11 @@ use futures::{StreamExt, TryStreamExt};
 pub mod data;
 pub mod secrets;
 pub mod shape;
+pub mod volume;
 
 pub use data::{data_container_create_body, data_host_config, DataExtras, DATA_DEFAULT_PIDS_LIMIT};
 pub use shape::{diff as shape_diff, ContainerShape, ShapeDifference, ShapeField};
+pub use volume::DockerVolumeProvider;
 
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,

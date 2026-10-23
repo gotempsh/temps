@@ -139,6 +139,10 @@ pub struct PlaneContainerDeployer {
     /// Container id -> workload id, for retiring a replica through the
     /// plane. One deploy job's replicas: a handful of entries.
     workloads: Mutex<HashMap<String, i64>>,
+    /// The environment's attached volumes and their owner (ADR-055 Phase
+    /// 9). Empty: the replica mounts nothing, exactly as before.
+    volumes: Vec<temps_workload::VolumeMount>,
+    volume_owner: Option<Owner>,
 }
 
 impl PlaneContainerDeployer {
@@ -155,6 +159,8 @@ impl PlaneContainerDeployer {
             node_id: CONTROL_PLANE_NODE_ID,
             ready_timeout,
             workloads: Mutex::new(HashMap::new()),
+            volumes: Vec::new(),
+            volume_owner: None,
         }
     }
 
@@ -162,6 +168,15 @@ impl PlaneContainerDeployer {
     /// worker's deployer.
     pub fn on_node(mut self, node_id: i32) -> Self {
         self.node_id = node_id;
+        self
+    }
+
+    /// Mount `volumes` of `owner` in every replica this deployer starts.
+    pub fn with_volumes(mut self, volumes: Vec<temps_workload::VolumeMount>, owner: Owner) -> Self {
+        if !volumes.is_empty() {
+            self.volumes = volumes;
+            self.volume_owner = Some(owner);
+        }
         self
     }
 
@@ -198,28 +213,53 @@ impl ContainerDeployer for PlaneContainerDeployer {
                 })
                 .collect(),
         );
-        let spec =
+        let mut spec =
             deployment_workload_spec(&request, self.deployment_id, self.node_id, staged.import())?;
+        spec.volumes = self.volumes.clone();
         let container_port = request
             .port_mappings
             .first()
             .map(|mapping| mapping.container_port)
             .unwrap_or(0);
-        let view = self
-            .plane
-            .apply_and_wait(
-                ApplyRequest {
-                    owner: Owner::new(DEPLOYMENT_OWNER_KIND, i64::from(self.deployment_id)),
-                    name: request.container_name.clone(),
-                    spec,
-                    project_slug: request.project_slug.clone(),
-                    finalizers: Vec::new(),
-                },
-                ConditionKind::Running,
-                self.ready_timeout,
-            )
-            .await
-            .map_err(|e| self.plane_error(&format!("start {}", request.container_name), e))?;
+        let apply = ApplyRequest {
+            owner: Owner::new(DEPLOYMENT_OWNER_KIND, i64::from(self.deployment_id)),
+            name: request.container_name.clone(),
+            spec,
+            project_slug: request.project_slug.clone(),
+            finalizers: Vec::new(),
+        };
+        let start = |e: temps_workload_plane::PlaneError| {
+            self.plane_error(&format!("start {}", request.container_name), e)
+        };
+        let view = match self.volume_owner.as_ref() {
+            None => self
+                .plane
+                .apply_and_wait(apply, ConditionKind::Running, self.ready_timeout)
+                .await
+                .map_err(start)?,
+            Some(owner) => {
+                let applied = self
+                    .plane
+                    .apply_with_volumes(apply, owner)
+                    .await
+                    .map_err(start)?;
+                if let Some(pin) = applied.pin.as_ref() {
+                    tracing::info!(
+                        deployment_id = self.deployment_id,
+                        workload_id = applied.workload_id,
+                        "deployment replica {pin}"
+                    );
+                }
+                self.plane
+                    .wait_for(
+                        applied.workload_id,
+                        ConditionKind::Running,
+                        self.ready_timeout,
+                    )
+                    .await
+                    .map_err(start)?
+            }
+        };
         // The values were only needed for the create.
         drop(staged);
         let (handle, status) = self

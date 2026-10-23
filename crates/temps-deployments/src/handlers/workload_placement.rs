@@ -154,6 +154,9 @@ pub struct PlacementExplanationResponse {
     pub unschedulable: Option<String>,
     pub unschedulable_reason: Option<String>,
     pub warnings: Vec<String>,
+    /// Why the environment is pinned by its volumes, e.g. "pinned to node 0
+    /// by volume `data`" (ADR-055 §12). `null` without attached volumes.
+    pub pinned_by: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, IntoParams)]
@@ -360,7 +363,13 @@ pub async fn admin_explain_environment_placement(
 ) -> Result<Json<PlacementExplanationResponse>, Problem> {
     permission_guard!(auth, SettingsRead);
     let (explanation, _) = state.service.explain_environment(environment_id).await?;
+    let pinned_by = state
+        .service
+        .volume_pin(environment_id)
+        .await?
+        .map(|pin| pin.to_string());
     Ok(Json(PlacementExplanationResponse {
+        pinned_by,
         environment_id,
         recommended: explanation
             .recommended
