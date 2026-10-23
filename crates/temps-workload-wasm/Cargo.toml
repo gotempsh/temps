@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload-wasm"
+description = "The WASM RuntimeDriver: WASI modules run in-process under wasmtime with fuel and memory limits (ADR-055 §6, phase 10)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# wasmtime is large (cranelift). Nothing in the default `temps` build links
+# this crate: `temps-cli` depends on it only behind its `wasm` feature.
+[dependencies]
+temps-workload = { path = "../temps-workload" }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+# Only what a WASI preview 1 module needs: the runtime, the cranelift
+# compiler and async calls (so a request's timeout can interrupt a guest).
+# No cache, no parallel compilation, no pooling allocator: memory is
+# reserved per instance and freed with it.
+wasmtime = { version = "50", default-features = false, features = [
+    "runtime",
+    "std",
+    "cranelift",
+    "async",
+] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p1"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# Test modules are written as WAT and assembled in the test, so no binary
+# blob is committed.
+wat = "1"

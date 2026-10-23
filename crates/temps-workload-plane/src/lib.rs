@@ -38,7 +38,9 @@ pub mod inventory;
 pub mod node;
 pub mod plane;
 pub mod reconciler;
+pub mod scale;
 pub mod scheduler;
+pub mod shared;
 pub mod stream;
 pub mod volumes;
 
@@ -56,11 +58,13 @@ pub use plane::{
     ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, PlaneSlot, ReconcilerHandle,
     VolumeApplied, WorkloadPlane, WorkloadView,
 };
+pub use scale::{driver_fits, Awake, STALE_WAKE_SECS};
 pub use scheduler::{
     explain, recommend_pinning, ExplainContext, Explanation, NodeExclusion, NodeFacts,
     NodeRecommendation, NodeRole, NodeUsage, PinningRecommendation, Placement, Reservation,
     ScheduleError, ScheduleRequest, SchedulerConfig, SocketGate, UnifiedScheduler,
 };
+pub use shared::{LocalDrivers, SharedPlane};
 pub use stream::{parse_cursor, StreamMetrics, StreamMetricsSnapshot, SweepOutcome};
 pub use volumes::{
     DeletedVolume, NewVolume, VolumeAttachment, VolumeRecord, VolumeStore, VolumeStoreError,

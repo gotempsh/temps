@@ -738,6 +738,10 @@ impl ProxyCommand {
             // entrypoint gets.
             project_ip_gate,
             request_policy_gate,
+            // Functions (ADR-055 phase 10) are served by `temps serve`,
+            // whose process runs the workload plane that wakes them; this
+            // split-mode proxy routes none.
+            None,
         ) {
             Ok(_) => {
                 info!("Proxy server exited");

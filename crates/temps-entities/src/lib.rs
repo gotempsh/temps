@@ -284,3 +284,5 @@ pub mod external_service_workload_mode;
 // ADR-055 Phase 9: volumes for deployments; backups as jobs
 pub mod workload_volume_attachments;
 pub mod workload_volumes;
+// ADR-055 Phase 10: functions
+pub mod functions;

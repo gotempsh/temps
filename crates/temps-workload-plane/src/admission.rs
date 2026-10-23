@@ -291,6 +291,9 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             "name '{name}' must be lowercase letters, digits and inner hyphens"
         ));
     }
+    if spec.owner.kind == WorkloadKind::Function {
+        return validate_function(spec);
+    }
     let deployment = spec.owner.kind == WorkloadKind::Deployment;
     match spec.owner.kind {
         WorkloadKind::Job => {
@@ -421,6 +424,104 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// A function (ADR-055 phase 10): scale-to-zero, exactly one HTTP port,
+/// and either an OCI image in a container or a WASM module run in-host.
+/// Egress is whatever admission chose (functions are untrusted, so at most
+/// restricted); whether a driver can enforce it is decided when the plane
+/// picks the driver, which reports a driver that cannot as
+/// `NoEligibleDriver` instead of running the function unconfined.
+fn validate_function(spec: &WorkloadSpec) -> Result<(), String> {
+    match &spec.lifetime {
+        Lifetime::ScaleToZero { idle_secs } if *idle_secs > 0 => {}
+        Lifetime::ScaleToZero { .. } => {
+            return Err("a function's idle time must be at least 1 second".to_string());
+        }
+        other => {
+            return Err(format!(
+                "a function must have a scale_to_zero lifetime, got {other:?}"
+            ));
+        }
+    }
+    match (&spec.artifact, spec.isolation) {
+        (Artifact::OciImage { reference, .. }, _) if reference.trim().is_empty() => {
+            return Err("the OCI image reference is empty".to_string());
+        }
+        (Artifact::OciImage { .. }, Isolation::Process) => {}
+        (Artifact::WasmComponent { blob, digest }, Isolation::InHost) => {
+            if blob.trim().is_empty() {
+                return Err("the WASM module location is empty".to_string());
+            }
+            if !digest.starts_with("sha256:") {
+                return Err(format!(
+                    "the WASM module digest '{digest}' must be a sha256 digest (sha256:<hex>)"
+                ));
+            }
+        }
+        (artifact, isolation) => {
+            return Err(format!(
+                "a function runs an OCI image with process isolation or a WASM module in-host; \
+                 got {} with {isolation:?} isolation",
+                artifact_kind(artifact)
+            ));
+        }
+    }
+    if spec.ports.len() != 1 {
+        return Err(format!(
+            "a function serves exactly one HTTP port, got {}",
+            spec.ports.len()
+        ));
+    }
+    if let Some(command) = &spec.process.command {
+        if command.iter().any(|arg| arg.contains('\0')) {
+            return Err("command contains a NUL byte".to_string());
+        }
+    }
+    if !spec.env.secrets.is_empty() {
+        return Err(format!(
+            "{} secret reference(s) need secret-file delivery, which functions do not have; \
+             pass the environment as an import instead",
+            spec.env.secrets.len()
+        ));
+    }
+    if !spec.volumes.is_empty() {
+        return Err(format!(
+            "{} volume mount(s) requested; a function mounts no volumes",
+            spec.volumes.len()
+        ));
+    }
+    if spec.placement.replicas != 1 {
+        return Err(format!(
+            "a function runs one instance at a time, got replicas {}",
+            spec.placement.replicas
+        ));
+    }
+    if let Some(nodes) = spec.placement.nodes.as_ref() {
+        if nodes.iter().any(|node| *node != 0) {
+            return Err(format!(
+                "placement on nodes {nodes:?} is not available; functions run on the control plane"
+            ));
+        }
+    }
+    if let Some(label) = spec
+        .labels
+        .keys()
+        .find(|key| crate::labels::RESERVED.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "label '{label}' is set by the plane, not the product"
+        ));
+    }
+    Ok(())
+}
+
+fn artifact_kind(artifact: &Artifact) -> &'static str {
+    match artifact {
+        Artifact::OciImage { .. } => "an OCI image",
+        Artifact::WasmComponent { .. } => "a WASM module",
+        Artifact::Rootfs { .. } => "a root filesystem",
+    }
 }
 
 /// What a managed database needs (Phase 4): a long-running `service`
@@ -822,6 +923,91 @@ mod tests {
             admit(&policy, bad_name).unwrap_err().rule,
             AdmissionRule::Validation
         );
+    }
+
+    #[test]
+    fn a_function_is_admitted_untrusted_with_restricted_egress() {
+        let owner = Owner::new("function", 9);
+        let policy = AdmissionPolicy::default();
+        let spec = crate::testing::function_spec("sha256:ab12");
+        let admitted = admit(&policy, input(spec, &owner, None)).expect("admitted");
+        assert_eq!(admitted.security, Some(SecurityProfile::Untrusted));
+        assert_eq!(admitted.network.egress, Some(EgressProfile::Restricted));
+
+        // Asking for open egress does not get it.
+        let mut open = crate::testing::function_spec("sha256:ab12");
+        open.network.egress = Some(EgressProfile::Open);
+        let admitted = admit(&policy, input(open, &owner, None)).expect("admitted");
+        assert_eq!(admitted.network.egress, Some(EgressProfile::Restricted));
+
+        // An OCI function is admitted with process isolation.
+        let mut oci = crate::testing::function_spec("sha256:ab12");
+        oci.artifact = Artifact::oci("registry.example.test/fn:1");
+        oci.isolation = Isolation::Process;
+        admit(&policy, input(oci, &owner, None)).expect("an OCI function is admitted");
+    }
+
+    #[test]
+    fn function_validation_refuses_what_a_function_cannot_be() {
+        let owner = Owner::new("function", 9);
+        let policy = AdmissionPolicy::default();
+        type Mutation = Box<dyn Fn(&mut WorkloadSpec)>;
+        let cases: Vec<(&str, Mutation, &str)> = vec![
+            (
+                "long running",
+                Box::new(|s| {
+                    s.lifetime = Lifetime::LongRunning {
+                        restart: Default::default(),
+                    }
+                }),
+                "scale_to_zero",
+            ),
+            (
+                "no idle time",
+                Box::new(|s| s.lifetime = Lifetime::ScaleToZero { idle_secs: 0 }),
+                "at least 1 second",
+            ),
+            (
+                "wasm in a container",
+                Box::new(|s| s.isolation = Isolation::Process),
+                "in-host",
+            ),
+            ("no port", Box::new(|s| s.ports.clear()), "exactly one"),
+            (
+                "bad digest",
+                Box::new(|s| {
+                    s.artifact = Artifact::WasmComponent {
+                        blob: "/x.wasm".into(),
+                        digest: "md5:1".into(),
+                    }
+                }),
+                "sha256",
+            ),
+            (
+                "volume",
+                Box::new(|s| {
+                    s.volumes.push(temps_workload::VolumeMount {
+                        volume: "data".into(),
+                        mount_path: "/data".into(),
+                        read_only: false,
+                    })
+                }),
+                "no volumes",
+            ),
+            (
+                "worker node",
+                Box::new(|s| s.placement.nodes = Some(vec![3])),
+                "control plane",
+            ),
+        ];
+        for (case, mutate, expected) in cases {
+            let mut spec = crate::testing::function_spec("sha256:ab12");
+            mutate(&mut spec);
+            let error = admit(&policy, input(spec, &owner, None))
+                .expect_err(&format!("{case} must be refused"));
+            assert_eq!(error.rule, AdmissionRule::Validation, "{case}: {error}");
+            assert!(error.message.contains(expected), "{case}: {error}");
+        }
     }
 
     fn database_spec() -> WorkloadSpec {

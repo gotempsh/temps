@@ -141,6 +141,20 @@ pub enum PlaneError {
         source: Box<temps_workload_volumes::VolumeError>,
     },
 
+    #[error("workload {workload_id} cannot be woken: {reason}")]
+    NotWakeable { workload_id: i64, reason: String },
+
+    #[error("workload {workload_id}: no runtime driver on the control plane can run it: {reason}")]
+    NoEligibleDriver { workload_id: i64, reason: String },
+
+    #[error("workload {workload_id}: waking attempt {attempt} failed ({reason}): {message}")]
+    WakeFailed {
+        workload_id: i64,
+        attempt: i32,
+        reason: &'static str,
+        message: String,
+    },
+
     #[error("database error while {operation} (workload {workload}): {source}")]
     Database {
         operation: &'static str,

@@ -149,6 +149,14 @@ impl DeploymentsPlugin {
         if let Some(provider) = volume_provider {
             plane = plane.with_volume_provider(provider);
         }
+        // ADR-055 phase 10: runtimes the binary adds on the control plane
+        // next to the node driver (the WASM driver, behind `temps-cli`'s
+        // `wasm` feature). None registered: functions report it.
+        if let Some(local) = context.get_service::<temps_workload_plane::LocalDrivers>() {
+            for extra in local.drivers() {
+                plane = plane.with_local_driver(extra.clone());
+            }
+        }
         // ADR-055 §8: the plane schedules from the product's node inventory
         // with the same threshold and control-plane policy as NodeScheduler.
         if let Some(placement) = placement {
@@ -171,7 +179,12 @@ impl DeploymentsPlugin {
                 }
                 // `enforce` environments start replicas through it.
                 if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
-                    workflow.set_workload_plane(plane);
+                    workflow.set_workload_plane(plane.clone());
+                }
+                // Products registered beside deployments (functions) find
+                // the started plane here.
+                if let Some(shared) = context.get_service::<temps_workload_plane::SharedPlane>() {
+                    shared.set(plane);
                 }
                 tracing::info!(
                     "Workload plane started; job crons are enabled and the node state stream \

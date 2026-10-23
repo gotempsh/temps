@@ -32,6 +32,12 @@ members = [
     "crates/temps-workload-docker",
     "crates/temps-workload-plane",
     "crates/temps-workload-node",
+    "crates/temps-workload-activator",
+    # The WASM driver (wasmtime). A member so workspace checks cover it; the
+    # `temps` binary only links it with `--features wasm`.
+    "crates/temps-workload-wasm",
+    # Functions (ADR-055 phase 10): a product on the workload plane.
+    "crates/temps-functions",
     "crates/temps-projects",
     "crates/temps-domains",
     "crates/temps-proxy",

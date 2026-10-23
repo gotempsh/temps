@@ -21,6 +21,11 @@ path = "src/main.rs"
 name = "temps_cli"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Run WASM functions in-process (ADR-055 phase 10). See the dependency.
+wasm = ["dep:temps-workload-wasm"]
+
 [dependencies]
 # All library crates
 temps-agent = { path = "../temps-agent" }
@@ -80,6 +85,14 @@ temps-telemetry = { path = "../temps-telemetry" }
 temps-projects = { path = "../temps-projects" }
 temps-providers = { path = "../temps-providers" }
 temps-proxy = { path = "../temps-proxy" }
+temps-functions = { path = "../temps-functions" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-activator = { path = "../temps-workload-activator" }
+temps-workload-plane = { path = "../temps-workload-plane" }
+# The WASM runtime driver (wasmtime, ADR-055 phase 10). Off by default: it
+# links cranelift into the binary; enabling it by default is a release
+# decision. `cargo build --features wasm` runs WASM functions in-process.
+temps-workload-wasm = { path = "../temps-workload-wasm", optional = true }
 temps-routes = { path = "../temps-routes" }
 temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
