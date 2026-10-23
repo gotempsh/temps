@@ -220,6 +220,40 @@ pub struct HeartbeatApiRequest {
     /// clears it.
     pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeat>,
+    /// What the node runtime observed of the workload instances assigned to
+    /// this node (ADR-055 §7), only those that changed since its last
+    /// accepted heartbeat. Sent by agents that advertise the `state_stream`
+    /// capability; absent from older agents. A report this control plane
+    /// cannot read is dropped (and logged), never the heartbeat.
+    #[serde(default, deserialize_with = "lenient_instance_reports")]
+    #[schema(value_type = Option<Vec<Object>>)]
+    pub instances: Option<Vec<temps_workload::stream::InstanceReport>>,
+}
+
+/// Read `instances`, dropping entries this version cannot decode (a newer
+/// agent's condition kind), so a heartbeat is never refused for them.
+fn lenient_instance_reports<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<temps_workload::stream::InstanceReport>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw.map(|entries| {
+        entries
+            .into_iter()
+            .filter_map(|entry| match serde_json::from_value(entry) {
+                Ok(report) => Some(report),
+                Err(e) => {
+                    warn!(
+                        "dropped an instance report this control plane cannot read: {}",
+                        e
+                    );
+                    None
+                }
+            })
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -750,7 +784,7 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
 }
 
 /// SHA-256 hash a token string
-fn sha256_hash(token: &str) -> String {
+pub(crate) fn sha256_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     hex::encode(digest)
 }
@@ -1000,7 +1034,7 @@ fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -
 }
 
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1056,7 +1090,7 @@ fn is_safe_api_address(addr: &str) -> bool {
 }
 
 /// Extract and verify the bearer token from request headers.
-fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -1686,6 +1720,9 @@ async fn node_heartbeat(
     // for the architecture-change audit — without it, an operator repointing a
     // daemon and something impersonating the node produce identical records.
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    // The node state stream (ADR-055 §7). Layered onto the node routes by
+    // `temps serve`; absent elsewhere, where instance reports are ignored.
+    node_state: Option<axum::Extension<Arc<crate::services::NodeStateService>>>,
     Path(node_id): Path<i32>,
     Json(request): Json<HeartbeatApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -1778,6 +1815,26 @@ async fn node_heartbeat(
                 alarm_service,
             )
             .await;
+        }
+    }
+
+    // Instance reports of the node runtime: written only when they changed.
+    // A failure is the plane's to report; the node resends what was not
+    // accepted on its next beat, so the heartbeat itself still succeeds.
+    if let Some(reports) = request.instances.as_deref() {
+        match node_state {
+            Some(axum::Extension(node_state)) => match node_state.ingest(node_id, reports).await {
+                Ok(changed) if changed > 0 => {
+                    tracing::debug!(node_id, changed, "recorded instance reports")
+                }
+                Ok(_) => {}
+                Err(e) => warn!(node_id, "instance reports were not recorded: {}", e),
+            },
+            None => tracing::debug!(
+                node_id,
+                count = reports.len(),
+                "instance reports ignored: no node state stream in this process"
+            ),
         }
     }
 
@@ -4871,6 +4928,26 @@ mod tests {
         let json = r#"{"capacity": {"cpu_percent": 10}}"#;
         let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
         assert!(req.dns_resolver.is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_instance_reports_are_optional_and_unreadable_ones_are_dropped() {
+        let old: HeartbeatApiRequest = serde_json::from_str(r#"{"capacity": {}}"#).unwrap();
+        assert!(old.instances.is_none());
+
+        let json = r#"{
+            "capacity": {"node_capabilities": ["state_stream"]},
+            "instances": [
+                {"instance_id": 4, "phase": "running", "conditions": []},
+                {"instance_id": "not-a-number", "phase": "running"},
+                {"instance_id": 5, "phase": "failed", "exit_code": 2}
+            ]
+        }"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        let reports = req.instances.expect("instances must deserialize");
+        let ids: Vec<i64> = reports.iter().map(|r| r.instance_id).collect();
+        assert_eq!(ids, vec![4, 5]);
+        assert_eq!(reports[1].exit_code, Some(2));
     }
 
     #[test]

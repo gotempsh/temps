@@ -3265,7 +3265,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_notification_route",
         "update_notification_route",
         "delete_notification_route",
-        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; DELETEs always wait ──
+        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; DELETE calls always wait ──
         // Project source and deployment settings
         "set_alternate_sources",
         "change_project_source",
@@ -4868,6 +4868,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
+    // ADR-055 §7: the node state stream, served to workers that advertise
+    // `state_stream`. The heartbeat handler reads the same service from an
+    // extension to record instance reports.
+    let node_routes =
+        match service_context.get_service::<temps_deployments::services::NodeStateService>() {
+            Some(node_state) => node_routes
+                .layer(axum::Extension(node_state.clone()))
+                .merge(
+                    temps_deployments::handlers::node_state::configure_routes().with_state(
+                        Arc::new(temps_deployments::handlers::node_state::NodeStateAppState {
+                            node_service: node_service.clone(),
+                            node_state,
+                            audit_service: service_context
+                                .require_service::<dyn temps_core::AuditLogger>(),
+                        }),
+                    ),
+                ),
+            None => {
+                debug!("Node state stream is not registered in this process; workers use /agent/*");
+                node_routes
+            }
+        };
 
     // Start periodic node health check with failover (every 60s)
     {
@@ -7301,7 +7323,7 @@ mod console_oidc_bootstrap_audit_tests {
     }
 
     #[tokio::test]
-    async fn unreadable_and_unparseable_files_are_not_audited() {
+    async fn unreadable_and_unparsable_files_are_not_audited() {
         let (context, recorder) = context_with_logger();
 
         report_console_oidc_bootstrap_error(

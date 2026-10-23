@@ -30,6 +30,8 @@ use crate::audit::AdmissionRefusedAudit;
 use crate::env::EnvSource;
 use crate::error::PlaneError;
 use crate::events;
+use crate::node::Placement;
+use crate::stream::StreamMetrics;
 
 /// The product object that owns a workload: `cron/7`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -182,6 +184,9 @@ pub struct WorkloadPlane {
     /// Cleared when the driver reports it cannot wait for exits.
     pub(crate) driver_waits: Arc<AtomicBool>,
     pub(crate) started: AtomicBool,
+    /// Where new attempts run. `None`: on the control plane (node 0).
+    pub(crate) placement: Option<Arc<dyn Placement>>,
+    pub(crate) stream_metrics: StreamMetrics,
 }
 
 impl fmt::Debug for WorkloadPlane {
@@ -190,6 +195,7 @@ impl fmt::Debug for WorkloadPlane {
             .field("scope", &self.config.scope)
             .field("driver", &self.driver)
             .field("finalizers", &self.finalizers.keys().collect::<Vec<_>>())
+            .field("placement", &self.placement.is_some())
             .finish()
     }
 }
@@ -215,7 +221,16 @@ impl WorkloadPlane {
             redactors: Mutex::new(HashMap::new()),
             driver_waits: Arc::new(AtomicBool::new(true)),
             started: AtomicBool::new(false),
+            placement: None,
+            stream_metrics: StreamMetrics::default(),
         }
+    }
+
+    /// Place new attempts through `placement` (workers included) instead
+    /// of always on the control plane.
+    pub fn with_placement(mut self, placement: Arc<dyn Placement>) -> Self {
+        self.placement = Some(placement);
+        self
     }
 
     pub fn with_finalizer(mut self, finalizer: Arc<dyn Finalizer>) -> Self {

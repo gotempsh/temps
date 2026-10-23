@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload-node"
+description = "The node runtime: reconciles the instances assigned to a node from its desired-state stream (ADR-055 §7)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# No database: a worker runs this. Drivers arrive as `Arc<dyn RuntimeDriver>`
+# and the control plane as `Arc<dyn ControlPlaneLink>`.
+[dependencies]
+temps-workload = { path = "../temps-workload" }
+temps-workload-env = { path = "../temps-workload-env" }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+tempfile = { workspace = true }

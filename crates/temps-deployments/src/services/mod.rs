@@ -108,3 +108,8 @@ pub(crate) mod deployment_commit;
 pub mod ci_dispatch;
 
 pub mod runtime_health;
+
+pub mod node_state;
+pub use node_state::{
+    AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,
+};

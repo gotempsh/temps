@@ -460,7 +460,9 @@ impl Finalizer for CronRunFinalizer {
 }
 
 /// A run's variables: those of a running container of the deployment it
-/// runs beside, read from that container.
+/// runs beside, read from that container on this host and recomputed from
+/// its deployment on a worker (see
+/// [`DeploymentService::job_import_env_variables`]).
 pub struct DeploymentEnvSource {
     deployment_service: Arc<DeploymentService>,
 }
@@ -493,7 +495,7 @@ impl EnvSource for DeploymentEnvSource {
         })?;
         let vars = self
             .deployment_service
-            .get_container_env_variables(project_id, environment_id, container_id.to_string())
+            .job_import_env_variables(project_id, environment_id, container_id.to_string())
             .await
             .map_err(|e| {
                 format!(

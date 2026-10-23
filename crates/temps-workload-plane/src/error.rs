@@ -83,6 +83,26 @@ pub enum PlaneError {
     #[error("the reconciler of plane '{scope}' is already running; a plane runs one")]
     ReconcilerAlreadyStarted { scope: String },
 
+    #[error("instance {instance_id} is not an unfinished instance assigned to node {node_id}")]
+    InstanceNotOnNode { instance_id: i64, node_id: i32 },
+
+    #[error(
+        "workload {workload_id}: the environment of instance {instance_id} could not be resolved: \
+         {reason}"
+    )]
+    EnvironmentUnavailable {
+        workload_id: i64,
+        instance_id: i64,
+        reason: String,
+    },
+
+    #[error("workload {workload_id}: node {node_id} is unavailable: {reason}")]
+    NodeUnavailable {
+        workload_id: i64,
+        node_id: i32,
+        reason: String,
+    },
+
     #[error("database error while {operation} (workload {workload}): {source}")]
     Database {
         operation: &'static str,

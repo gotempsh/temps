@@ -101,6 +101,12 @@ pub struct AgentCommand {
     #[arg(long, default_value_t = 443)]
     pub public_ingress_https_port: u16,
 
+    /// Do not run the node runtime or advertise the `state_stream`
+    /// capability (ADR-055 §7): the control plane drives this node through
+    /// the `/agent/*` API only, as older agents are. A rollback switch.
+    #[arg(long)]
+    pub disable_state_stream: bool,
+
     #[command(subcommand)]
     pub service: Option<AgentSubcommand>,
 }
@@ -130,6 +136,7 @@ impl AgentCommand {
             .build()?;
 
         rt.block_on(async move {
+            let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
 
             let docker = bollard::Docker::connect_with_defaults()
@@ -400,7 +407,7 @@ impl AgentCommand {
                 });
             }
 
-            temps_agent::server::start_agent_server(
+            temps_agent::server::start_agent_server_with(
                 deployer,
                 builder,
                 Some(docker),
@@ -411,6 +418,9 @@ impl AgentCommand {
                     host_bind_address: host_bind_slot,
                 },
                 docker_socket_grant,
+                temps_agent::server::AgentServerOptions {
+                    state_stream: !disable_state_stream,
+                },
             )
             .await
             .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;
