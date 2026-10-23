@@ -19,7 +19,8 @@ use sea_orm::{
 use temps_core::AuditLogger;
 use temps_entities::{workload_instances, workloads};
 use temps_workload::{
-    ConditionKind, ConditionStatus, RuntimeDriver, WorkloadPhase, WorkloadSpec, WorkloadStatus,
+    ConditionKind, ConditionStatus, Isolation, RuntimeDriver, WorkloadPhase, WorkloadSpec,
+    WorkloadStatus,
 };
 use temps_workload_env::Redactor;
 use tokio::sync::{watch, Notify};
@@ -179,6 +180,10 @@ impl ReconcilerHandle {
 pub struct WorkloadPlane {
     pub(crate) db: Arc<DatabaseConnection>,
     pub(crate) driver: NodeDriver,
+    /// More node-0 drivers, for workloads that request an isolation the
+    /// primary driver does not provide (ADR-055 Phase 10: a Firecracker
+    /// driver for `micro_vm` deployments). Empty on almost every host.
+    pub(crate) isolated_drivers: Vec<Arc<dyn RuntimeDriver>>,
     pub(crate) env: Arc<dyn EnvSource>,
     pub(crate) audit: Arc<dyn AuditLogger>,
     pub(crate) config: PlaneConfig,
@@ -258,6 +263,7 @@ impl WorkloadPlane {
         Self {
             db,
             driver,
+            isolated_drivers: Vec::new(),
             env,
             audit,
             config,
@@ -299,6 +305,109 @@ impl WorkloadPlane {
 
     pub fn scheduler(&self) -> &UnifiedScheduler {
         &self.scheduler
+    }
+
+    /// Also run node-0 workloads that request `driver`'s isolation through
+    /// it (ADR-055 §6: "Firecracker for deployments needs no new driver,
+    /// only a different isolation request"). A driver whose isolation the
+    /// primary driver or an earlier one already provides is ignored, so the
+    /// choice per isolation is fixed at startup.
+    pub fn with_control_plane_driver(mut self, driver: Arc<dyn RuntimeDriver>) -> Self {
+        let isolation = driver.capabilities().isolation;
+        if self.control_plane_isolations().contains(&isolation) {
+            tracing::warn!(
+                driver = %driver.capabilities().name,
+                isolation = ?isolation,
+                "a node-0 driver for this isolation is already registered; ignoring the second"
+            );
+            return self;
+        }
+        self.isolated_drivers.push(driver);
+        self
+    }
+
+    /// The isolations the control plane (node 0) can run: its primary
+    /// driver's (process, also when this host has no daemon, so the reason a
+    /// process workload fails stays `NoEligibleNode` at the reconciler) and
+    /// every driver added with [`Self::with_control_plane_driver`].
+    pub fn control_plane_isolations(&self) -> Vec<Isolation> {
+        let primary = self
+            .driver
+            .0
+            .as_ref()
+            .map(|driver| driver.capabilities().isolation)
+            .unwrap_or(Isolation::Process);
+        let mut isolations = vec![primary];
+        for driver in &self.isolated_drivers {
+            let isolation = driver.capabilities().isolation;
+            if !isolations.contains(&isolation) {
+                isolations.push(isolation);
+            }
+        }
+        isolations
+    }
+
+    /// The node-0 driver that provides `isolation`, or why there is none.
+    pub(crate) fn control_plane_driver_for(
+        &self,
+        isolation: Isolation,
+    ) -> Result<Arc<dyn RuntimeDriver>, String> {
+        if let Some(driver) = self.driver.0.as_ref() {
+            if driver.capabilities().isolation == isolation {
+                return Ok(driver.clone());
+            }
+        }
+        if let Some(driver) = self
+            .isolated_drivers
+            .iter()
+            .find(|driver| driver.capabilities().isolation == isolation)
+        {
+            return Ok(driver.clone());
+        }
+        match (&self.driver.0, isolation) {
+            (None, Isolation::Process) => Err(NO_CONTROL_PLANE_DRIVER.to_string()),
+            _ => Err(no_driver_for_isolation(
+                isolation,
+                &self.control_plane_driver_names(),
+            )),
+        }
+    }
+
+    /// The node-0 driver named `name` (an instance row's `driver`); the
+    /// primary driver for rows written before drivers were named per
+    /// isolation.
+    pub(crate) fn control_plane_driver_named(
+        &self,
+        name: &str,
+    ) -> Result<Arc<dyn RuntimeDriver>, String> {
+        if let Some(driver) = self
+            .isolated_drivers
+            .iter()
+            .find(|driver| driver.capabilities().name == name)
+        {
+            return Ok(driver.clone());
+        }
+        self.driver
+            .0
+            .clone()
+            .ok_or_else(|| NO_CONTROL_PLANE_DRIVER.to_string())
+    }
+
+    /// Every node-0 driver, the primary first.
+    pub(crate) fn control_plane_drivers(&self) -> Vec<Arc<dyn RuntimeDriver>> {
+        self.driver
+            .0
+            .iter()
+            .chain(self.isolated_drivers.iter())
+            .cloned()
+            .collect()
+    }
+
+    fn control_plane_driver_names(&self) -> Vec<String> {
+        self.control_plane_drivers()
+            .iter()
+            .map(|driver| driver.capabilities().name.clone())
+            .collect()
     }
 
     /// Stage `vars` for one create: the spec imports
@@ -347,6 +456,15 @@ impl WorkloadPlane {
                 reason,
             })?;
         self.in_flight.apply(&mut nodes);
+        // The inventory knows rows, not this process's drivers: node 0
+        // provides what its registered drivers provide.
+        let isolations = self.control_plane_isolations();
+        for node in nodes
+            .iter_mut()
+            .filter(|node| node.id == scheduler::CONTROL_PLANE_NODE_ID)
+        {
+            node.isolations = isolations.clone();
+        }
         Ok(nodes)
     }
 
@@ -426,22 +544,13 @@ impl WorkloadPlane {
         ))
     }
 
-    /// The latest instance of workload `id` and what the driver reports for
-    /// it now (state, address, published ports). `None` before the first
-    /// instance exists or without a driver.
-    pub async fn instance_status(
+    /// The latest instance of workload `id` and the driver that runs it.
+    /// `None` before the first instance exists, or when no driver serves it
+    /// (this host has no runtime).
+    async fn latest_instance(
         &self,
         id: i64,
-    ) -> Result<
-        Option<(
-            temps_workload::InstanceHandle,
-            temps_workload::InstanceStatus,
-        )>,
-        PlaneError,
-    > {
-        let Some(driver) = self.driver.0.clone() else {
-            return Ok(None);
-        };
+    ) -> Result<Option<(temps_workload::InstanceHandle, Arc<dyn RuntimeDriver>)>, PlaneError> {
         let latest = workload_instances::Entity::find()
             .filter(workload_instances::Column::WorkloadId.eq(id))
             .order_by_desc(workload_instances::Column::Attempt)
@@ -458,6 +567,31 @@ impl WorkloadPlane {
                 field: "instance handle",
                 reason: format!("instance {}: {e}", latest.id),
             })?;
+        match self.driver_of(&latest).await {
+            Ok(driver) => Ok(Some((handle, driver))),
+            Err(reason) => {
+                tracing::debug!(workload_id = id, "no driver serves the instance: {reason}");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The latest instance of workload `id` and what the driver reports for
+    /// it now (state, address, published ports). `None` before the first
+    /// instance exists or without a driver.
+    pub async fn instance_status(
+        &self,
+        id: i64,
+    ) -> Result<
+        Option<(
+            temps_workload::InstanceHandle,
+            temps_workload::InstanceStatus,
+        )>,
+        PlaneError,
+    > {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
         let status = driver
             .inspect(&handle)
             .await
@@ -467,6 +601,83 @@ impl WorkloadPlane {
                 source,
             })?;
         Ok(Some((handle, status)))
+    }
+
+    /// The last `tail` output lines of workload `id`'s latest instance, from
+    /// its driver (`None` when it has no instance yet). For products whose
+    /// instance is not a container the host's Docker can read (a microVM).
+    pub async fn instance_logs(
+        &self,
+        id: i64,
+        tail: u32,
+    ) -> Result<Option<Vec<temps_workload::LogLine>>, PlaneError> {
+        use futures::TryStreamExt;
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        let driver_error = |source| PlaneError::Driver {
+            workload_id: id,
+            operation: "read the instance's logs",
+            source,
+        };
+        let stream = driver
+            .logs(
+                &handle,
+                temps_workload::LogQuery {
+                    since: None,
+                    tail: Some(tail),
+                    follow: false,
+                },
+            )
+            .await
+            .map_err(driver_error)?;
+        let lines: Vec<temps_workload::LogLine> =
+            stream.try_collect().await.map_err(driver_error)?;
+        Ok(Some(lines))
+    }
+
+    /// Run `command` in workload `id`'s latest instance and collect its
+    /// output (bounded by the driver's exec). `None` when it has no
+    /// instance yet.
+    pub async fn instance_exec(
+        &self,
+        id: i64,
+        exec: temps_workload::ExecSpec,
+    ) -> Result<Option<Vec<temps_workload::LogLine>>, PlaneError> {
+        use futures::TryStreamExt;
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        let driver_error = |source| PlaneError::Driver {
+            workload_id: id,
+            operation: "exec in the instance",
+            source,
+        };
+        let stream = driver.exec(&handle, exec).await.map_err(driver_error)?;
+        let lines: Vec<temps_workload::LogLine> =
+            stream.try_collect().await.map_err(driver_error)?;
+        Ok(Some(lines))
+    }
+
+    /// The workload whose latest instance has runtime id `instance_id`, and
+    /// the driver that runs it, so a product holding only the id (a
+    /// deployment's `container_id`) can act on an instance the host's Docker
+    /// cannot see (a microVM). `None` when no instance has that id.
+    pub async fn workload_for_instance(
+        &self,
+        instance_id: &str,
+    ) -> Result<Option<(i64, String)>, PlaneError> {
+        let row = workload_instances::Entity::find()
+            .filter(Expr::cust_with_values("handle->>'id' = $1", [instance_id]))
+            .order_by_desc(workload_instances::Column::Id)
+            .limit(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db(
+                "finding the instance by its runtime id",
+                format!("instance {instance_id}"),
+            ))?;
+        Ok(row.map(|row| (row.workload_id, row.driver)))
     }
 
     pub fn with_finalizer(mut self, finalizer: Arc<dyn Finalizer>) -> Self {
@@ -835,6 +1046,31 @@ fn condition_explanation(
         "NotObserved".to_string(),
         format!("the plane has not reported {condition:?} yet"),
     )
+}
+
+pub(crate) const NO_CONTROL_PLANE_DRIVER: &str = "0/1 nodes eligible: the control plane (node 0) \
+     has no runtime driver; the Docker daemon was not reachable when temps started";
+
+/// Why node 0 cannot run a workload requesting `isolation`.
+pub(crate) fn no_driver_for_isolation(isolation: Isolation, drivers: &[String]) -> String {
+    let wanted = scheduler::isolation_name(isolation);
+    let have = if drivers.is_empty() {
+        "none".to_string()
+    } else {
+        drivers.join(", ")
+    };
+    match isolation {
+        Isolation::MicroVm => format!(
+            "0/1 nodes eligible: the control plane (node 0) has no runtime that provides \
+             {wanted} isolation (drivers: {have}). Set up Firecracker on this host (`sudo temps \
+             firecracker setup`) and restart temps, or set the environment's workload isolation \
+             back to process"
+        ),
+        _ => format!(
+            "0/1 nodes eligible: the control plane (node 0) has no runtime that provides \
+             {wanted} isolation (drivers: {have})"
+        ),
+    }
 }
 
 pub(crate) fn decode_status(row: &workloads::Model) -> Result<WorkloadStatus, PlaneError> {

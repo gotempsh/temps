@@ -16,6 +16,7 @@ pub mod pty_agent_bundle;
 pub mod remote;
 pub mod routing;
 pub mod user;
+pub mod workload_vm;
 
 /// The Docker named volume holding `/home/temps` for a sandbox whose
 /// container suffix is `label`.

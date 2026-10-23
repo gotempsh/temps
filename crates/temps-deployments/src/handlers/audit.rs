@@ -666,6 +666,21 @@ impl_audit_operation!(
     "ENVIRONMENT_WORKLOAD_MODE_CHANGED"
 );
 
+/// An admin changed the isolation an environment's plane-run deployments
+/// request (ADR-055 Phase 10). `process` is the rollback.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentWorkloadIsolationChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub previous_isolation: String,
+    pub workload_isolation: String,
+}
+
+impl_audit_operation!(
+    EnvironmentWorkloadIsolationChangedAudit,
+    "ENVIRONMENT_WORKLOAD_ISOLATION_CHANGED"
+);
+
 /// An admin changed a node's resource policy or system reserve (node 0 is
 /// the control plane).
 #[derive(Debug, Clone, Serialize)]

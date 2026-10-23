@@ -123,8 +123,35 @@ pub enum Request {
         pattern: String,
         signal: i32,
     },
+    /// Start a long-running process and return at once (ADR-055 Phase 10:
+    /// a deployment's main process in a microVM). Its output goes to
+    /// `log_path`; [`Request::ProcessStatus`] reports whether it still runs.
+    Spawn {
+        cmd: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        uid: Option<u32>,
+        #[serde(default)]
+        gid: Option<u32>,
+        #[serde(default)]
+        log_path: Option<String>,
+    },
+    /// Whether a process [`Request::Spawn`] started still runs.
+    ProcessStatus {
+        pid: u32,
+    },
     Shutdown,
 }
+
+/// Where a spawned process writes its output when the request names no path.
+pub const DEFAULT_SPAWN_LOG: &str = "/var/log/temps-workload.log";
+
+/// Most processes [`Request::Spawn`] tracks at once: a workload VM runs one
+/// main process, so this only bounds a misbehaving host.
+pub const MAX_SPAWNED_PROCESSES: usize = 16;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
@@ -138,6 +165,15 @@ pub enum Response {
     },
     File {
         data_hex: String,
+    },
+    Spawned {
+        pid: u32,
+    },
+    ProcessStatus {
+        running: bool,
+        /// Set once the process exited (`-1` when killed by a signal).
+        #[serde(default)]
+        exit_code: Option<i32>,
     },
     Err {
         message: String,
@@ -391,6 +427,43 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn spawn_and_status_round_trip_on_the_wire() {
+        let request: Request = serde_json::from_str(
+            r#"{"op":"spawn","cmd":["/app/server","--port","8080"],"env":{"A":"b"},"uid":1000}"#,
+        )
+        .expect("spawn parses");
+        match request {
+            Request::Spawn {
+                cmd,
+                env,
+                uid,
+                gid,
+                log_path,
+                ..
+            } => {
+                assert_eq!(cmd, ["/app/server", "--port", "8080"]);
+                assert_eq!(env["A"], "b");
+                assert_eq!(uid, Some(1000));
+                assert_eq!(gid, None);
+                assert_eq!(log_path, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let status: Request =
+            serde_json::from_str(r#"{"op":"process_status","pid":42}"#).expect("status parses");
+        assert!(matches!(status, Request::ProcessStatus { pid: 42 }));
+        let response = serde_json::to_string(&Response::ProcessStatus {
+            running: false,
+            exit_code: Some(3),
+        })
+        .expect("serialises");
+        assert_eq!(
+            response,
+            r#"{"result":"process_status","running":false,"exit_code":3}"#
+        );
+    }
 
     #[test]
     fn relay_moves_bytes_both_ways_and_ends_when_the_host_closes() {

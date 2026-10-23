@@ -138,6 +138,17 @@ impl DeploymentsPlugin {
             db,
         )))
         .with_placement(attempt_placement);
+        // ADR-055 Phase 10: a host with a working Firecracker also runs
+        // `micro_vm` deployment replicas on node 0. The explain endpoint is
+        // told, so it answers as the plane schedules.
+        if let Some(micro_vm) =
+            context.get_service::<crate::services::plane_deployer::ControlPlaneMicroVmDriver>()
+        {
+            plane = plane.with_control_plane_driver(micro_vm.0.clone());
+        }
+        if let Some(placement) = placement.as_ref() {
+            placement.set_control_plane_isolations(plane.control_plane_isolations());
+        }
         // ADR-055 §8: the plane schedules from the product's node inventory
         // with the same threshold and control-plane policy as NodeScheduler.
         if let Some(placement) = placement {

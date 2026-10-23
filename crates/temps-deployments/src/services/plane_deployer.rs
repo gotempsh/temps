@@ -19,6 +19,13 @@
 //! What the plane cannot yet deliver is refused up front with the reason,
 //! never dropped silently: secret files (`/run/secrets`) and the ADR-045
 //! Docker socket. Such an environment stays on `legacy` or `shadow`.
+//!
+//! ADR-055 Phase 10: an environment whose `workload_isolation` is
+//! `micro_vm` asks for [`Isolation::MicroVm`]. The plane places it only on a
+//! node whose driver provides it (refused with the scheduler's reason
+//! otherwise), and a microVM is not a container the local Docker can act
+//! on, so every operation on such a replica goes through the plane
+//! (inspect, logs, exec, retire) instead of the local deployer.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -29,14 +36,24 @@ use temps_deployer::{
     ContainerDeployer, ContainerInfo, ContainerStatus, DeployRequest, DeployResult, DeployerError,
 };
 use temps_workload::{
-    Artifact, ConditionKind, EnvSpec, Lifetime, NetworkSpec, PlacementSpec, PortProtocol, PortSpec,
-    Process, ResourceAmounts, Resources, WorkloadKind, WorkloadRef, WorkloadSpec,
+    Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, NetworkSpec, PlacementSpec,
+    PortProtocol, PortSpec, Process, ResourceAmounts, Resources, RuntimeDriver, WorkloadKind,
+    WorkloadRef, WorkloadSpec,
 };
 use temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID;
 use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 
 /// Owner kind of a deployment's workloads.
 pub const DEPLOYMENT_OWNER_KIND: &str = "deployment";
+
+/// The control plane's microVM runtime (ADR-055 Phase 10), registered by
+/// the agents plugin when this host has a working Firecracker. The
+/// deployments plugin adds it to the workload plane; without it a
+/// `micro_vm` replica is refused with the scheduler's reason.
+pub struct ControlPlaneMicroVmDriver(pub Arc<dyn RuntimeDriver>);
+
+/// How many log lines a microVM replica's log read returns.
+const MICRO_VM_LOG_TAIL: u32 = 500;
 
 /// The `Deployment` workload one replica's create request becomes: pinned
 /// to the control plane (the job already placed it there), long-running
@@ -46,6 +63,7 @@ pub fn deployment_workload_spec(
     request: &DeployRequest,
     deployment_id: i32,
     staged_import: String,
+    isolation: Isolation,
 ) -> Result<WorkloadSpec, DeployerError> {
     if !request.secrets.is_empty() {
         return Err(DeployerError::DeploymentFailed(format!(
@@ -62,6 +80,15 @@ pub fn deployment_workload_spec(
              workload_mode back to legacy (or shadow) to deploy it",
             request.container_name,
             request.project_slug.as_deref().unwrap_or("<unknown>")
+        )));
+    }
+    if isolation == Isolation::MicroVm && !request.extra_networks.is_empty() {
+        return Err(DeployerError::DeploymentFailed(format!(
+            "Container {} must join Docker network(s) {}, which a microVM cannot: it runs on \
+             its own TAP device. Set this environment's workload_isolation back to process to \
+             deploy it",
+            request.container_name,
+            request.extra_networks.join(", ")
         )));
     }
     let restart = match request.restart_policy {
@@ -90,7 +117,7 @@ pub fn deployment_workload_spec(
     Ok(WorkloadSpec {
         owner: WorkloadRef::new(WorkloadKind::Deployment, i64::from(deployment_id)),
         artifact: Artifact::oci(request.image_name.clone()),
-        isolation: Default::default(),
+        isolation,
         process: Process {
             command: request.command.clone(),
             ..Default::default()
@@ -145,6 +172,8 @@ pub struct PlaneContainerDeployer {
     local: Arc<dyn ContainerDeployer>,
     deployment_id: i32,
     ready_timeout: Duration,
+    /// What the replicas this deployer creates ask for.
+    isolation: Isolation,
     /// Container id -> workload id, for retiring a replica through the
     /// plane. One deploy job's replicas: a handful of entries.
     workloads: Mutex<HashMap<String, i64>>,
@@ -162,8 +191,57 @@ impl PlaneContainerDeployer {
             local,
             deployment_id,
             ready_timeout,
+            isolation: Isolation::Process,
             workloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Ask for `isolation` (the environment's `workload_isolation`).
+    pub fn with_isolation(mut self, isolation: Isolation) -> Self {
+        self.isolation = isolation;
+        self
+    }
+
+    /// The plane workload behind `container_id` when its runtime is not the
+    /// local Docker (a microVM), so the caller must go through the plane.
+    /// `None` for a container: the local deployer serves it as before.
+    async fn plane_only_workload(&self, container_id: &str) -> Result<Option<i64>, DeployerError> {
+        let found = self
+            .plane
+            .workload_for_instance(container_id)
+            .await
+            .map_err(|e| self.plane_error(&format!("look up instance {container_id}"), e))?;
+        Ok(match found {
+            Some((workload_id, driver)) if driver != temps_workload_docker::DRIVER => {
+                Some(workload_id)
+            }
+            _ => None,
+        })
+    }
+
+    async fn plane_logs(
+        &self,
+        workload_id: i64,
+        container_id: &str,
+    ) -> Result<String, DeployerError> {
+        let lines = self
+            .plane
+            .instance_logs(workload_id, MICRO_VM_LOG_TAIL)
+            .await
+            .map_err(|e| self.plane_error(&format!("read the logs of {container_id}"), e))?
+            .unwrap_or_default();
+        Ok(lines
+            .iter()
+            .map(|line| String::from_utf8_lossy(&line.line).into_owned())
+            .collect())
+    }
+
+    fn unsupported_for_micro_vm(&self, operation: &str, container_id: &str) -> DeployerError {
+        DeployerError::DeploymentFailed(format!(
+            "Cannot {operation} replica {container_id} of deployment {}: it runs in a microVM, \
+             which supports inspect, logs, exec and removal only",
+            self.deployment_id
+        ))
     }
 
     fn plane_error(&self, operation: &str, error: impl std::fmt::Display) -> DeployerError {
@@ -191,7 +269,12 @@ impl ContainerDeployer for PlaneContainerDeployer {
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
         );
-        let spec = deployment_workload_spec(&request, self.deployment_id, staged.import())?;
+        let spec = deployment_workload_spec(
+            &request,
+            self.deployment_id,
+            staged.import(),
+            self.isolation,
+        )?;
         let container_port = request
             .port_mappings
             .first()
@@ -238,6 +321,8 @@ impl ContainerDeployer for PlaneContainerDeployer {
             deployment_id = self.deployment_id,
             workload_id = view.id,
             container_id = %handle.id,
+            driver = %handle.driver,
+            isolation = temps_workload_plane::scheduler::isolation_name(self.isolation),
             "deployment replica started through the workload plane"
         );
         Ok(DeployResult {
@@ -256,29 +341,86 @@ impl ContainerDeployer for PlaneContainerDeployer {
         command: Vec<String>,
         timeout: Duration,
     ) -> Result<temps_deployer::ExecResult, DeployerError> {
-        self.local
-            .exec_in_container(container_id, command, timeout)
-            .await
+        let Some(workload_id) = self.plane_only_workload(container_id).await? else {
+            return self
+                .local
+                .exec_in_container(container_id, command, timeout)
+                .await;
+        };
+        let exec = self.plane.instance_exec(
+            workload_id,
+            temps_workload::ExecSpec {
+                command,
+                env: Vec::new(),
+                workdir: None,
+            },
+        );
+        let lines = tokio::time::timeout(timeout, exec).await.map_err(|_| {
+            self.plane_error(
+                &format!("exec in {container_id}"),
+                format!("timed out after {timeout:?}"),
+            )
+        })?;
+        // A failing command is the stream's last item: report it as a
+        // non-zero exit, like a container's exec.
+        let (exit_code, lines) = match lines {
+            Ok(lines) => (0, lines.unwrap_or_default()),
+            Err(error) => {
+                tracing::debug!(container_id, %error, "microVM exec failed");
+                (1, Vec::new())
+            }
+        };
+        let mut output = String::new();
+        let mut truncated = false;
+        for line in &lines {
+            let text = String::from_utf8_lossy(&line.line);
+            if output.len() + text.len() > temps_deployer::MAX_EXEC_OUTPUT_BYTES {
+                truncated = true;
+                break;
+            }
+            output.push_str(&text);
+        }
+        Ok(temps_deployer::ExecResult {
+            exit_code,
+            output,
+            truncated,
+        })
     }
 
     async fn start_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        if self.plane_only_workload(container_id).await?.is_some() {
+            // The plane keeps a long-running replica running.
+            return Ok(());
+        }
         self.local.start_container(container_id).await
     }
 
+    /// A microVM replica is stopped by retiring its workload: the plane
+    /// does not keep a stopped instance around.
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            return self.retire(workload_id, container_id).await;
+        }
         self.local.stop_container(container_id).await
     }
 
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        if self.plane_only_workload(container_id).await?.is_some() {
+            return Err(self.unsupported_for_micro_vm("pause", container_id));
+        }
         self.local.pause_container(container_id).await
     }
 
     async fn resume_container(&self, container_id: &str) -> Result<(), DeployerError> {
+        if self.plane_only_workload(container_id).await?.is_some() {
+            return Err(self.unsupported_for_micro_vm("resume", container_id));
+        }
         self.local.resume_container(container_id).await
     }
 
     /// Retire through the plane when this deployer started it (the plane
-    /// removes the instance), else remove it directly.
+    /// removes the instance), else remove it directly. A microVM is only
+    /// ever removed by the plane.
     async fn remove_container(&self, container_id: &str) -> Result<(), DeployerError> {
         let workload = self
             .workloads
@@ -286,29 +428,43 @@ impl ContainerDeployer for PlaneContainerDeployer {
             .ok()
             .and_then(|mut workloads| workloads.remove(container_id));
         if let Some(workload_id) = workload {
-            self.plane
-                .delete(
-                    workload_id,
-                    "Retired",
-                    &format!(
-                        "deployment {} removed container {container_id}",
-                        self.deployment_id
-                    ),
-                )
-                .await
-                .map_err(|e| self.plane_error("retire the replica", e))?;
+            self.retire(workload_id, container_id).await?;
+        }
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            return self.retire(workload_id, container_id).await;
         }
         self.local.remove_container(container_id).await
     }
 
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError> {
-        self.local.get_container_info(container_id).await
+        let Some(workload_id) = self.plane_only_workload(container_id).await? else {
+            return self.local.get_container_info(container_id).await;
+        };
+        let view =
+            self.plane.get(workload_id).await.map_err(|e| {
+                self.plane_error(&format!("read the workload of {container_id}"), e)
+            })?;
+        let (handle, status) = self
+            .plane
+            .instance_status(workload_id)
+            .await
+            .map_err(|e| self.plane_error(&format!("inspect {container_id}"), e))?
+            .ok_or_else(|| {
+                self.plane_error(
+                    &format!("inspect {container_id}"),
+                    format!("workload {workload_id} has no instance"),
+                )
+            })?;
+        Ok(micro_vm_container_info(&view.spec, &handle, &status))
     }
 
     async fn get_container_stats(
         &self,
         container_id: &str,
     ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+        if self.plane_only_workload(container_id).await?.is_some() {
+            return Err(self.unsupported_for_micro_vm("read resource usage of", container_id));
+        }
         self.local.get_container_stats(container_id).await
     }
 
@@ -317,18 +473,98 @@ impl ContainerDeployer for PlaneContainerDeployer {
     }
 
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError> {
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            return self.plane_logs(workload_id, container_id).await;
+        }
         self.local.get_container_logs(container_id).await
     }
 
+    /// A microVM's logs are read, not followed: the stream is the current
+    /// tail, then ends.
     async fn stream_container_logs(
         &self,
         container_id: &str,
     ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+        if let Some(workload_id) = self.plane_only_workload(container_id).await? {
+            let text = self.plane_logs(workload_id, container_id).await?;
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            return Ok(Box::new(futures::stream::iter(lines)));
+        }
         self.local.stream_container_logs(container_id).await
     }
 
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
         self.local.image_exists(image_name).await
+    }
+}
+
+impl PlaneContainerDeployer {
+    async fn retire(&self, workload_id: i64, container_id: &str) -> Result<(), DeployerError> {
+        self.plane
+            .delete(
+                workload_id,
+                "Retired",
+                &format!(
+                    "deployment {} removed container {container_id}",
+                    self.deployment_id
+                ),
+            )
+            .await
+            .map_err(|e| self.plane_error("retire the replica", e))
+    }
+}
+
+/// What a microVM replica looks like to code that reads container info.
+fn micro_vm_container_info(
+    spec: &WorkloadSpec,
+    handle: &temps_workload::InstanceHandle,
+    status: &temps_workload::InstanceStatus,
+) -> ContainerInfo {
+    let image_name = match &spec.artifact {
+        Artifact::OciImage { reference, .. } => reference.clone(),
+        other => format!("{other:?}"),
+    };
+    ContainerInfo {
+        container_id: handle.id.clone(),
+        container_name: handle.name.clone(),
+        image_name,
+        status: match status.state {
+            temps_workload::InstanceState::Created => ContainerStatus::Created,
+            temps_workload::InstanceState::Running => ContainerStatus::Running,
+            temps_workload::InstanceState::Exited => ContainerStatus::Exited,
+            temps_workload::InstanceState::Missing => ContainerStatus::Dead,
+        },
+        created_at: status.started_at.unwrap_or_else(chrono::Utc::now),
+        ports: status
+            .published_ports
+            .iter()
+            .filter_map(|binding| {
+                Some(temps_deployer::PortMapping {
+                    host_port: binding.host_port?,
+                    container_port: binding.container_port,
+                    protocol: match binding.protocol {
+                        PortProtocol::Tcp => temps_deployer::Protocol::Tcp,
+                        PortProtocol::Udp => temps_deployer::Protocol::Udp,
+                    },
+                    host_ip: Some(binding.host_ip.clone()),
+                })
+            })
+            .collect(),
+        // Never read back: the values live in the VM only.
+        environment_vars: HashMap::new(),
+        restart_count: None,
+        labels: spec
+            .labels
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        exit_code: status.exit_code.and_then(|code| i32::try_from(code).ok()),
+        exit_reason: status.exit_code.map(|code| format!("Exit code {code}")),
+        oom_killed: None,
+        error_message: None,
+        finished_at: status.finished_at,
+        started_at: status.started_at,
+        cpu_limit_cores: None,
     }
 }
 
@@ -367,7 +603,8 @@ mod tests {
 
     #[test]
     fn a_replica_becomes_a_pinned_long_running_deployment_workload() {
-        let spec = deployment_workload_spec(&request(), 42, "staged:k".into()).unwrap();
+        let spec = deployment_workload_spec(&request(), 42, "staged:k".into(), Isolation::Process)
+            .unwrap();
         assert_eq!(spec.owner, WorkloadRef::new(WorkloadKind::Deployment, 42));
         assert_eq!(spec.placement.nodes, Some(vec![0]), "placed by the job");
         assert_eq!(
@@ -398,7 +635,9 @@ mod tests {
         with_secret
             .secrets
             .insert("DATABASE_PASSWORD".into(), "x".into());
-        let error = deployment_workload_spec(&with_secret, 42, "staged:k".into()).unwrap_err();
+        let error =
+            deployment_workload_spec(&with_secret, 42, "staged:k".into(), Isolation::Process)
+                .unwrap_err();
         let message = error.to_string();
         assert!(message.contains("app-production-42-1"), "{message}");
         assert!(message.contains("legacy"), "{message}");
@@ -409,9 +648,10 @@ mod tests {
 
         let mut with_socket = request();
         with_socket.control_plane_grants_socket = true;
-        let message = deployment_workload_spec(&with_socket, 42, "staged:k".into())
-            .unwrap_err()
-            .to_string();
+        let message =
+            deployment_workload_spec(&with_socket, 42, "staged:k".into(), Isolation::Process)
+                .unwrap_err()
+                .to_string();
         assert!(
             message.contains("ADR 045") && message.contains("'shop'"),
             "{message}"

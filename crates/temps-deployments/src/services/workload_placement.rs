@@ -34,6 +34,7 @@ use sea_orm::{
 use serde::Serialize;
 use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_entities::deployment_config::DeploymentConfig;
+use temps_entities::environment_workload_isolation::{self, EnvironmentWorkloadIsolation};
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::node_resource_settings::{self, NodeResourcePolicy, SystemReserved};
 use temps_entities::{environments, nodes, projects};
@@ -579,6 +580,18 @@ pub struct WorkloadPlacementService {
     scheduler_config: SchedulerConfig,
     socket_grant: DockerSocketGrant,
     heartbeat_threshold_secs: i64,
+    /// The isolations the control plane's runtime drivers provide, once the
+    /// workload plane is built (ADR-055 Phase 10). Unset means a plain
+    /// container host: `process` only.
+    control_plane_isolations: std::sync::OnceLock<Vec<Isolation>>,
+}
+
+/// The plane's isolation for an environment's setting.
+pub fn isolation_for(setting: EnvironmentWorkloadIsolation) -> Isolation {
+    match setting {
+        EnvironmentWorkloadIsolation::Process => Isolation::Process,
+        EnvironmentWorkloadIsolation::MicroVm => Isolation::MicroVm,
+    }
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -617,6 +630,16 @@ impl WorkloadPlacementService {
             scheduler_config: legacy.unified_scheduler_config(),
             socket_grant: legacy.docker_socket_grant().clone(),
             heartbeat_threshold_secs: legacy.heartbeat_threshold_secs(),
+            control_plane_isolations: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Record what the control plane's drivers provide, so the explain
+    /// endpoint answers as the plane schedules. Set once, when the plane is
+    /// built; a second call is ignored.
+    pub fn set_control_plane_isolations(&self, isolations: Vec<Isolation>) {
+        if self.control_plane_isolations.set(isolations).is_err() {
+            tracing::debug!("control-plane isolations already recorded; keeping the first");
         }
     }
 
@@ -744,6 +767,9 @@ impl WorkloadPlacementService {
             NodeResourcePolicy::BestEffort
         };
         control_plane.system_reserved = Self::control_plane_reserved(&control);
+        if let Some(isolations) = self.control_plane_isolations.get() {
+            control_plane.isolations = isolations.clone();
+        }
         if let Some(local) = load.get(&CONTROL_PLANE_NODE_ID) {
             control_plane.committed = local.reservation;
             control_plane.live_instances = local.instances;
@@ -900,6 +926,50 @@ impl WorkloadPlacementService {
                 .update(self.db.as_ref())
                 .await
                 .map_err(db_error("writing the environment's workload mode"))?;
+        }
+        Ok(previous)
+    }
+
+    async fn environment_isolation_row(
+        &self,
+        environment_id: i32,
+    ) -> Result<environment_workload_isolation::Model, WorkloadPlacementError> {
+        environment_workload_isolation::Entity::find_by_id(environment_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(db_error("reading the environment's workload isolation"))?
+            .filter(|environment| environment.deleted_at.is_none())
+            .ok_or(WorkloadPlacementError::EnvironmentNotFound { environment_id })
+    }
+
+    /// The isolation the environment's plane-run deployments request.
+    pub async fn environment_workload_isolation(
+        &self,
+        environment_id: i32,
+    ) -> Result<EnvironmentWorkloadIsolation, WorkloadPlacementError> {
+        Ok(self
+            .environment_isolation_row(environment_id)
+            .await?
+            .workload_isolation)
+    }
+
+    /// Set the environment's isolation; returns the previous one. Only
+    /// `enforce` deployments honour it; `process` is the rollback.
+    pub async fn set_environment_workload_isolation(
+        &self,
+        environment_id: i32,
+        isolation: EnvironmentWorkloadIsolation,
+    ) -> Result<EnvironmentWorkloadIsolation, WorkloadPlacementError> {
+        let row = self.environment_isolation_row(environment_id).await?;
+        let previous = row.workload_isolation;
+        if previous != isolation {
+            let mut active: environment_workload_isolation::ActiveModel = row.into();
+            active.workload_isolation = Set(isolation);
+            active.updated_at = Set(Utc::now());
+            active
+                .update(self.db.as_ref())
+                .await
+                .map_err(db_error("writing the environment's workload isolation"))?;
         }
         Ok(previous)
     }
@@ -1098,6 +1168,13 @@ impl WorkloadPlacementService {
         environment_id: i32,
     ) -> Result<(Explanation, ExplainContext), WorkloadPlacementError> {
         let (environment, project) = self.environment_and_project(environment_id).await?;
+        // Only `enforce` honours the isolation setting, so only it is
+        // explained with it.
+        let isolation = if environment.workload_mode == EnvironmentWorkloadMode::Enforce {
+            isolation_for(self.environment_workload_isolation(environment_id).await?)
+        } else {
+            Isolation::Process
+        };
         let env_cfg = environment.deployment_config.as_ref();
         let proj_cfg = project.deployment_config.as_ref();
         let placement =
@@ -1112,7 +1189,7 @@ impl WorkloadPlacementService {
             kind: WorkloadKind::Deployment,
             placement: &placement,
             resources: &resources,
-            isolation: Isolation::Process,
+            isolation,
             image_platforms: &[],
             socket_gate: self.socket_gate_for(Some(&project.slug)),
             exclude_node_ids: &[],
@@ -1957,5 +2034,123 @@ mod tests {
             agreed + expected
         );
         assert!(agreed >= 20, "the bulk of the set must agree outright");
+    }
+
+    /// ADR-055 Phase 10: the per-environment isolation defaults to
+    /// `process`, a write returns the previous value, and the explain
+    /// endpoint refuses `micro_vm` with the scheduler's reason until the
+    /// control plane reports a driver that provides it.
+    #[tokio::test]
+    async fn environment_isolation_round_trips_and_explains_the_micro_vm_refusal() {
+        use temps_entities::upstream_config::UpstreamList;
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Postgres unavailable, skipping the isolation round trip: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = projects::ActiveModel {
+            name: Set("isolated-app".to_string()),
+            slug: Set("isolated-app".to_string()),
+            repo_name: Set("app".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("isolated-app".to_string()),
+            host: Set("isolated-app.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert environment");
+        let node_service = Arc::new(NodeService::new(db.clone()));
+        let legacy = NodeScheduler::new(node_service.clone());
+        let service = WorkloadPlacementService::new(
+            db.clone(),
+            node_service,
+            proof_config_service(db.clone()),
+            &legacy,
+        );
+
+        assert_eq!(
+            service
+                .environment_workload_isolation(environment.id)
+                .await
+                .expect("read default"),
+            EnvironmentWorkloadIsolation::Process
+        );
+        let previous = service
+            .set_environment_workload_isolation(
+                environment.id,
+                EnvironmentWorkloadIsolation::MicroVm,
+            )
+            .await
+            .expect("set micro_vm");
+        assert_eq!(previous, EnvironmentWorkloadIsolation::Process);
+        assert_eq!(
+            service
+                .environment_workload_isolation(environment.id)
+                .await
+                .expect("read back"),
+            EnvironmentWorkloadIsolation::MicroVm
+        );
+        // Writing an unrelated column through the full entity keeps it.
+        service
+            .set_environment_workload_mode(environment.id, EnvironmentWorkloadMode::Enforce)
+            .await
+            .expect("set enforce");
+        assert_eq!(
+            service
+                .environment_workload_isolation(environment.id)
+                .await
+                .expect("read after mode change"),
+            EnvironmentWorkloadIsolation::MicroVm
+        );
+
+        let (refused, _) = service
+            .explain_environment(environment.id)
+            .await
+            .expect("explain without a vm driver");
+        assert_eq!(refused.placement, None, "{refused:?}");
+        let exclusion = refused
+            .excluded
+            .iter()
+            .find(|e| e.node_id == CONTROL_PLANE_NODE_ID)
+            .expect("the control plane is excluded");
+        assert_eq!(exclusion.reason.code(), "DriverUnsupported");
+        assert!(exclusion.to_string().contains("micro_vm"), "{exclusion}");
+
+        service.set_control_plane_isolations(vec![Isolation::Process, Isolation::MicroVm]);
+        let (placed, _) = service
+            .explain_environment(environment.id)
+            .await
+            .expect("explain with a vm driver");
+        assert_eq!(
+            placed.placement,
+            Some(vec![CONTROL_PLANE_NODE_ID]),
+            "{placed:?}"
+        );
+
+        let missing = service
+            .set_environment_workload_isolation(i32::MAX, EnvironmentWorkloadIsolation::MicroVm)
+            .await
+            .expect_err("unknown environment");
+        assert!(matches!(
+            missing,
+            WorkloadPlacementError::EnvironmentNotFound { environment_id } if environment_id == i32::MAX
+        ));
     }
 }

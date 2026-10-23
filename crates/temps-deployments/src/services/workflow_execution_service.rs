@@ -1949,6 +1949,41 @@ impl WorkflowExecutionService {
                     }),
                 };
                 builder = builder.workload_mode(workload_mode, workload_plane);
+                // ADR-055 Phase 10: only `enforce` runs replicas through the
+                // plane, so only it honours the isolation setting. `legacy`
+                // does not even read it.
+                let reads_isolation = workload_mode
+                    != temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Legacy;
+                if let Some(placement) = self.workload_placement.get().filter(|_| reads_isolation) {
+                    let isolation = placement
+                        .environment_workload_isolation(environment.id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowExecutionError::InvalidJobConfig(format!(
+                                "Deployment {}: cannot read the workload isolation of \
+                                 environment {}: {e}",
+                                deployment.id, environment.id
+                            ))
+                        })?;
+                    if workload_mode
+                        == temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Enforce
+                    {
+                        builder = builder.workload_isolation(
+                            crate::services::workload_placement::isolation_for(isolation),
+                        );
+                    } else if isolation
+                        != temps_entities::environment_workload_isolation::EnvironmentWorkloadIsolation::Process
+                    {
+                        info!(
+                            deployment_id = deployment.id,
+                            environment_id = environment.id,
+                            workload_isolation = isolation.as_str(),
+                            workload_mode = workload_mode.as_str(),
+                            "workload isolation is ignored outside workload_mode enforce; \
+                             deploying a container"
+                        );
+                    }
+                }
 
                 // Rolling update awareness: query existing containers for this
                 // environment so the scheduler can avoid placing new replicas on
@@ -3047,6 +3082,7 @@ impl WorkflowExecutionService {
                     .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
+                    .workload_mode(environment.workload_mode)
                     .build()?;
 
                 Ok(Arc::new(job))

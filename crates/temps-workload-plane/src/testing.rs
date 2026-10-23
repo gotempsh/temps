@@ -276,6 +276,18 @@ impl FakeDriver {
         })
     }
 
+    /// A fake driver named `name` that provides `isolation` (a microVM
+    /// driver beside the primary one, ADR-055 Phase 10).
+    pub(crate) fn with_isolation(name: &str, isolation: Isolation) -> Arc<Self> {
+        let mut capabilities = Self::new().capabilities.clone();
+        capabilities.name = name.to_string();
+        capabilities.isolation = isolation;
+        Arc::new(Self {
+            capabilities,
+            state: Mutex::new(FakeState::default()),
+        })
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().expect("lock")
     }
@@ -332,9 +344,9 @@ impl FakeDriver {
         );
     }
 
-    fn handle(name: &str) -> InstanceHandle {
+    fn handle(&self, name: &str) -> InstanceHandle {
         InstanceHandle {
-            driver: "fake".into(),
+            driver: self.capabilities.name.clone(),
             id: name.to_string(),
             name: name.to_string(),
         }
@@ -392,7 +404,7 @@ impl RuntimeDriver for FakeDriver {
             },
         );
         state.created.push((spec.clone(), attach.clone()));
-        Ok(Self::handle(&spec.name))
+        Ok(self.handle(&spec.name))
     }
 
     async fn start(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
@@ -480,7 +492,7 @@ impl RuntimeDriver for FakeDriver {
             .iter()
             .filter(|(_, i)| labels.iter().all(|(k, v)| i.labels.get(k) == Some(v)))
             .map(|(name, i)| ListedInstance {
-                handle: Self::handle(name),
+                handle: self.handle(name),
                 labels: i.labels.clone(),
             })
             .collect())

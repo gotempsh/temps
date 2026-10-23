@@ -592,6 +592,10 @@ pub struct DeploymentJobConfig {
     /// logs whether it agrees; `Enforce` places with the unified scheduler
     /// and starts control-plane replicas through the workload plane.
     pub workload_mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+    /// What `enforce` replicas ask the plane for (ADR-055 Phase 10, the
+    /// environment's `workload_isolation`). `legacy` and `shadow` keep a
+    /// container whatever it says.
+    pub workload_isolation: temps_workload::Isolation,
 }
 
 /// One replica's placement, and the guarantee the scheduler attached to it.
@@ -643,6 +647,7 @@ impl Default for DeploymentJobConfig {
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
             workload_mode: Default::default(),
+            workload_isolation: temps_workload::Isolation::Process,
         }
     }
 }
@@ -4985,7 +4990,7 @@ impl DeployImageJob {
                 i64::from(context.deployment_id),
             ),
             artifact: temps_workload::Artifact::oci(image_output.image_tag.clone()),
-            isolation: Default::default(),
+            isolation: self.config.workload_isolation,
             process: Default::default(),
             env: Default::default(),
             resources: workload_resources(&self.config.resources),
@@ -5009,7 +5014,11 @@ impl DeployImageJob {
         };
         self.log(
             context,
-            "Placing replicas with the unified scheduler (workload_mode: enforce)".to_string(),
+            format!(
+                "Placing replicas with the unified scheduler (workload_mode: enforce, \
+                 isolation: {})",
+                temps_workload_plane::scheduler::isolation_name(self.config.workload_isolation)
+            ),
         )
         .await?;
         let name = format!("deployment-{}", context.deployment_id);
@@ -5082,7 +5091,8 @@ impl DeployImageJob {
                 self.container_deployer.clone(),
                 context.deployment_id,
                 Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
-            ),
+            )
+            .with_isolation(self.config.workload_isolation),
         ))
     }
 }
@@ -5393,6 +5403,12 @@ impl DeployImageJobBuilder {
     ) -> Self {
         self.config.workload_mode = mode;
         self.workload_plane = workload_plane;
+        self
+    }
+
+    /// The isolation `enforce` replicas request (ADR-055 Phase 10).
+    pub fn workload_isolation(mut self, isolation: temps_workload::Isolation) -> Self {
+        self.config.workload_isolation = isolation;
         self
     }
 
