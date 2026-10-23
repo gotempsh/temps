@@ -114,6 +114,8 @@ import {
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
 import { describeUpdatedPlacements } from '@/lib/node-placements'
+import { NodeWorkloadSettings } from '@/components/nodes/NodeWorkloadSettings'
+import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
 
 // ── Helpers ──
 
@@ -1465,6 +1467,17 @@ function NodeDetail({
         <BuilderLimitsPanel key={node.id} node={node} />
       )}
 
+      {/* Workload plane (ADR-055): sandbox drivers, scheduling resources,
+          network policy mode and the desired-state stream. Node 0 is the
+          control plane. */}
+      {(node.role === 'worker' || node.role === 'control-plane') && (
+        <NodeWorkloadSettings
+          key={`workload-${node.id}`}
+          nodeId={node.id}
+          nodeName={node.name}
+        />
+      )}
+
       {/* Metrics */}
       {metrics && (
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1889,6 +1902,8 @@ export function NodesPage() {
         </CardHeader>
         <CardContent className="space-y-6">
           <JoinTokenSection />
+
+          <NodeStateStreamStatus />
 
           {stranded.length > 0 && (
             <Alert className="border-amber-500/30 bg-amber-500/5">

@@ -19,6 +19,7 @@ describe('flat project navigation', () => {
       'deployments',
       'environments',
       'environment-variables',
+      'functions',
       'logs',
       'errors',
       'traces',
@@ -53,6 +54,7 @@ describe('flat project navigation', () => {
       'dashboards/custom': 'monitoring',
       'cron-jobs/12': 'monitoring',
       'cron-jobs/new': 'monitoring',
+      functions: 'functions',
       observe: 'project',
     } as const))
       expect(resolveProjectPrimaryRoute(path)).toBe(section)

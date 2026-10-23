@@ -23,6 +23,8 @@ import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 import { EnvironmentIngressCard } from './EnvironmentIngressCard'
+import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
+import { EnvironmentWorkloadCard } from './EnvironmentWorkloadCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -338,6 +340,16 @@ export function EnvironmentDetail({
       <EnvironmentIngressCard
         key={`ingress:${environment.id}`}
         projectId={project.id}
+        environmentId={environment.id}
+      />
+
+      <EnvironmentWorkloadCard
+        key={`workload:${environment.id}`}
+        environmentId={environment.id}
+      />
+
+      <EnvironmentVolumesCard
+        key={`volumes:${environment.id}`}
         environmentId={environment.id}
       />
 

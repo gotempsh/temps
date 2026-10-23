@@ -431,6 +431,16 @@ const TelemetrySettingsPage = lazy(() =>
     default: m.TelemetrySettingsPage,
   }))
 )
+const NetworkPolicyPage = lazy(() =>
+  import('./pages/settings/NetworkPolicyPage').then((m) => ({
+    default: m.NetworkPolicyPage,
+  }))
+)
+const FunctionsSettingsPage = lazy(() =>
+  import('./pages/settings/FunctionsSettingsPage').then((m) => ({
+    default: m.FunctionsSettingsPage,
+  }))
+)
 const NodeDetailPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodeDetailPage,
@@ -930,6 +940,14 @@ const FullAppRoutes = () => {
                           <Route
                             path="traefik-discovery"
                             element={<TraefikDiscoveryPage />}
+                          />
+                          <Route
+                            path="network-policy"
+                            element={<NetworkPolicyPage />}
+                          />
+                          <Route
+                            path="functions"
+                            element={<FunctionsSettingsPage />}
                           />
                           <Route
                             path="mcp-server"

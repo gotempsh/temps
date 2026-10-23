@@ -101,6 +101,7 @@ import {
   UsersRound,
   Wand2,
   Workflow,
+  Zap,
   type LucideIcon,
 } from 'lucide-react'
 import {
@@ -1007,6 +1008,12 @@ export const projectNavItems: NavigationItem[] = [
     url: 'environment-variables',
     icon: Key,
     keywords: ['variables', 'env', 'config'],
+  },
+  {
+    title: 'Functions',
+    url: 'functions',
+    icon: Zap,
+    keywords: ['functions', 'wasm', 'serverless', 'scale to zero'],
   },
   {
     title: 'Secrets',

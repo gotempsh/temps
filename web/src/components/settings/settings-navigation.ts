@@ -16,6 +16,7 @@ import {
   KeyRound,
   LockKeyhole,
   Monitor,
+  Network,
   RadioTower,
   Server,
   Settings2,
@@ -23,6 +24,7 @@ import {
   Users,
   UsersRound,
   Waypoints,
+  Zap,
 } from 'lucide-react'
 import type { ComponentType, ReactNode } from 'react'
 import { createElement, Fragment } from 'react'
@@ -117,6 +119,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         icon: Waypoints,
       },
       { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
+      {
+        title: 'Functions',
+        url: '/settings/functions',
+        icon: Zap,
+        keywords: ['wasm', 'serverless', 'runtime', 'scale to zero'],
+      },
     ],
   },
   {
@@ -128,6 +136,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         url: '/settings/on-demand-tls',
         icon: LockKeyhole,
         keywords: ['certificates', 'https', 'ssl', "let's encrypt", 'acme'],
+      },
+      {
+        title: 'Network Policy',
+        url: '/settings/network-policy',
+        icon: Network,
+        keywords: ['egress', 'ingress', 'firewall', 'rules', 'isolation'],
       },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       {

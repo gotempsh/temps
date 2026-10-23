@@ -47,6 +47,7 @@ import { ProjectPageNotFound } from '@/components/project/ProjectPageNotFound'
 import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
+import { ProjectFunctions } from '@/components/project/ProjectFunctions'
 import CronMonitors from './CronMonitors'
 import ProjectFeedback from './ProjectFeedback'
 import TelemetryReleases from './TelemetryReleases'
@@ -832,6 +833,10 @@ export function ProjectDetail() {
               <Route
                 path="analytics/*"
                 element={<ProjectAnalytics project={project} />}
+              />
+              <Route
+                path="functions"
+                element={<ProjectFunctions project={project} />}
               />
               <Route
                 path="storage"

@@ -27,6 +27,7 @@ import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
+import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
@@ -1324,6 +1325,16 @@ export function ServiceDetail() {
 
             {/* Resources: container runtime, live CPU/mem, applied limits */}
             <ServiceResourcesPanel
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+            />
+
+            {/*
+              How the database's container is built (ADR-055 workload plane)
+              and the recreate from its workload spec. Instance-admin only;
+              other roles see what it is and who can change it.
+            */}
+            <ServiceWorkloadModeCard
               serviceId={service.service.id}
               serviceName={service.service.name}
             />
