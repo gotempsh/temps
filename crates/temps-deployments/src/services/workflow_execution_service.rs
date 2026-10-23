@@ -6839,6 +6839,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

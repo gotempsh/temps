@@ -274,3 +274,6 @@ pub mod node_network_policy_modes;
 // ADR-055 Phase 5: deployment workload mode and node resource settings
 pub mod environment_workload_mode;
 pub mod node_resource_settings;
+
+// ADR-055 Phase 6: sandboxes onto runtime drivers
+pub mod sandbox_driver_mode;

@@ -115,6 +115,10 @@ pub struct Model {
     pub public_ingress_route_count: Option<i32>,
     pub public_ingress_unsupported_route_count: Option<i32>,
     pub public_ingress_unsupported_reasons: Json,
+    /// Which code path serves this node's sandboxes (ADR-055 phase 6):
+    /// the old providers (`legacy`), the old providers plus a logged plan
+    /// (`shadow`), or the driver facade (`enforce`).
+    pub sandbox_driver_mode: super::sandbox_driver_mode::SandboxDriverMode,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -226,6 +230,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: now,
             updated_at: now,
         }

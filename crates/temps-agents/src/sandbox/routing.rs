@@ -444,6 +444,7 @@ mod tests {
                 work_dir: "/home/temps/workspace".into(),
                 backend: self.backend,
                 image: "test-image".to_string(),
+                conditions: Vec::new(),
             }
         }
     }

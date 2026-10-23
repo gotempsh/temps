@@ -546,6 +546,7 @@ impl FirecrackerSandboxProvider {
             work_dir: PathBuf::from(WORK_DIR),
             backend: super::SandboxBackend::Firecracker,
             image,
+            conditions: Vec::new(),
         }
     }
 

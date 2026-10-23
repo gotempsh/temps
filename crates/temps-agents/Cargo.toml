@@ -15,6 +15,8 @@ temps-core = { path = "../temps-core" }
 temps-ai = { path = "../temps-ai" }
 temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
+# ADR-055 §6: sandbox backends are runtime drivers (`SandboxExt`).
+temps-workload = { path = "../temps-workload" }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }
@@ -43,6 +45,8 @@ anyhow = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
 reqwest = { workspace = true }
+# ADR-055 phase 6: sandbox byte channels (terminal, agent runtime) to worker nodes.
+tokio-tungstenite = { workspace = true }
 base64 = { workspace = true }
 http-body-util = { workspace = true }
 tar = "0.4"
@@ -71,5 +75,4 @@ microsandbox = { version = "=0.7.8", default-features = false, features = ["loca
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 §9: the netpol translation must deserialize into the pinned SDK.
-temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }

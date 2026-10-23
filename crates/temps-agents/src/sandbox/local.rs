@@ -40,6 +40,7 @@ impl SandboxProvider for LocalSandboxProvider {
             work_dir: config.host_work_dir,
             backend: super::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         })
     }
 
@@ -257,6 +258,7 @@ impl SandboxProvider for LocalSandboxProvider {
                 work_dir: autopilot_dir,
                 backend: super::SandboxBackend::Local,
                 image: String::new(),
+                conditions: Vec::new(),
             }));
         }
 
@@ -269,6 +271,7 @@ impl SandboxProvider for LocalSandboxProvider {
                 work_dir: autofixer_dir,
                 backend: super::SandboxBackend::Local,
                 image: String::new(),
+                conditions: Vec::new(),
             }));
         }
 
@@ -377,6 +380,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             backend: crate::sandbox::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
 
         let result = provider.exec(&handle, vec![], HashMap::new(), None).await;
@@ -396,6 +400,7 @@ mod tests {
             work_dir: work_dir.clone(),
             backend: crate::sandbox::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
 
         assert!(provider.is_alive(&handle).await.unwrap());

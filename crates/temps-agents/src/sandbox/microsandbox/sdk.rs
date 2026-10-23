@@ -514,6 +514,7 @@ impl MicrosandboxSandboxProvider {
             work_dir: PathBuf::from(WORK_DIR),
             backend: SandboxBackend::Microsandbox,
             image,
+            conditions: Vec::new(),
         }
     }
 

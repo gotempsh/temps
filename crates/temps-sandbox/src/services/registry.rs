@@ -941,6 +941,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             })
         }
 
@@ -1096,6 +1097,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             }))
         }
 
@@ -1615,6 +1617,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 
@@ -1644,6 +1647,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 

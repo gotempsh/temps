@@ -296,6 +296,27 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
             "/agent/sandboxes/status",
             post(sandbox_handlers::sandbox_status),
         )
+        // ADR-055 phase 6: forwarded only for nodes in `enforce` mode.
+        .route(
+            "/agent/sandboxes/resize-disk",
+            post(sandbox_handlers::resize_sandbox_disk),
+        )
+        .route(
+            "/agent/sandboxes/image-identity",
+            post(sandbox_handlers::sandbox_image_identity),
+        )
+        .route(
+            "/agent/sandboxes/agent-runtime-check",
+            post(sandbox_handlers::check_sandbox_agent_runtime),
+        )
+        .route(
+            "/agent/sandboxes/recover-agent-harness",
+            post(sandbox_handlers::recover_sandbox_agent_harness),
+        )
+        .route(
+            "/agent/sandboxes/byte-channel",
+            get(sandbox_handlers::open_sandbox_byte_channel),
+        )
         .layer(middleware::from_fn_with_state(
             sandbox_state.clone(),
             sandbox_handlers::redact_host_paths,
@@ -1273,7 +1294,7 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 14] = [
+    const SANDBOX_ROUTES: [&str; 18] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1288,6 +1309,10 @@ mod tests {
         "/agent/sandboxes/recover",
         "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
+        "/agent/sandboxes/resize-disk",
+        "/agent/sandboxes/image-identity",
+        "/agent/sandboxes/agent-runtime-check",
+        "/agent/sandboxes/recover-agent-harness",
     ];
     const UPLOAD_ROUTES: [&str; 2] = [
         "/agent/sandboxes/write-file",
@@ -1349,6 +1374,41 @@ mod tests {
                 response.status()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_byte_channel_route_is_registered_behind_agent_auth() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        let get = |token: Option<&str>| {
+            let mut request = axum::http::Request::get(
+                "/agent/sandboxes/byte-channel?sandbox=temps-sandbox-abc&channel=terminal",
+            );
+            if let Some(token) = token {
+                request =
+                    request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request.body(axum::body::Body::empty()).unwrap()
+        };
+        for token in [None, Some("wrong")] {
+            let response = app.clone().oneshot(get(token)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "byte channel with token {token:?}"
+            );
+        }
+        let response = app.clone().oneshot(get(Some("secret"))).await.unwrap();
+        assert!(
+            !matches!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND
+                    | axum::http::StatusCode::METHOD_NOT_ALLOWED
+                    | axum::http::StatusCode::UNAUTHORIZED
+            ),
+            "byte channel answered {}",
+            response.status()
+        );
     }
 
     #[tokio::test]

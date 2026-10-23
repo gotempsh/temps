@@ -4994,6 +4994,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            control_plane_sandbox_driver_mode: Default::default(),
             updated_at: Utc::now(),
         }
     }

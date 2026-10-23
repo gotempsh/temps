@@ -220,6 +220,17 @@ pub struct NodePublicIngressChangedAudit {
     pub enabled: bool,
 }
 
+/// An administrator moved a node's sandboxes to another code path
+/// (ADR-055 phase 6). `node_id` 0 is the control plane.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeSandboxDriverModeChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+    pub previous_mode: String,
+    pub mode: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodeBuildLimitsChangedAudit {
     pub context: AuditContext,
@@ -493,6 +504,10 @@ impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
+impl_audit_operation!(
+    NodeSandboxDriverModeChangedAudit,
+    "NODE_SANDBOX_DRIVER_MODE_CHANGED"
+);
 impl_audit_operation!(NodeRemovalAudit, "NODE_REMOVAL");
 impl_audit_operation!(NodeDrainAudit, "NODE_DRAIN");
 impl_audit_operation!(WireguardMeshEnabledAudit, "WIREGUARD_MESH_ENABLED");

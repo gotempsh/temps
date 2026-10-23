@@ -7264,6 +7264,7 @@ mod tests {
                         work_dir: PathBuf::from("/home/temps/workspace"),
                         backend: temps_agents::sandbox::SandboxBackend::Docker,
                         image: "test-image".to_string(),
+                        conditions: Vec::new(),
                     },
                     stop: Arc::new(|| Box::pin(async { Ok(()) })),
                 })
@@ -7289,6 +7290,7 @@ mod tests {
             work_dir: PathBuf::from("/tmp/workspace-model-discovery"),
             backend: temps_agents::sandbox::SandboxBackend::Local,
             image: "test-image".to_string(),
+            conditions: Vec::new(),
         }
     }
 
@@ -8080,6 +8082,7 @@ mod tests {
             work_dir: PathBuf::from("/home/temps/workspace"),
             backend: temps_agents::sandbox::SandboxBackend::Docker,
             image: "test-image".to_string(),
+            conditions: Vec::new(),
         };
 
         service.cache_sandbox_handle("app-one".to_string(), handle);

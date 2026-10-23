@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod docker;
+pub mod driver;
+pub mod facade;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;
+pub mod mode_routing;
 pub mod node_routing;
 pub mod pty_agent_bundle;
 pub mod remote;
@@ -160,6 +163,15 @@ pub struct SandboxHandle {
     /// booted instead of a vague "platform default". Empty on recovered
     /// handles (the DB already holds the recorded value).
     pub image: String,
+    /// What the driver facade found when it placed the sandbox (ADR-055
+    /// §5, §6): `LimitEnforced = False` with the reason when a requested
+    /// limit could not be applied, and `Scheduled` when the preferred
+    /// driver was passed over. Only the facade (`enforce` mode) sets it;
+    /// empty on every other path, and then omitted from the wire so legacy
+    /// requests and responses are byte for byte what they were.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub conditions: Vec<temps_workload::Condition>,
 }
 
 /// Configuration for creating a new sandbox.
@@ -2001,6 +2013,7 @@ mod tests {
             work_dir: std::env::current_dir().expect("current directory"),
             backend: SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
         let provider = local::LocalSandboxProvider::new();
         let fence_result = provider
