@@ -352,14 +352,14 @@ pub struct ResourceAmounts { pub cpu_millis: Option<u32>, pub memory_mb: Option<
     wants density.
 - **Temps reserves capacity for itself.** Each node has a `system_reserved`
   amount (cpu, memory), stored on the node row with a default per role. The
-  initial defaults below are estimates. Phase 5 replaces them with values
-  measured on both hardware targets:
+  defaults below are measured (resident memory of long-running Linux nodes,
+  and of TimescaleDB tuned for a 4 GB host after a pgbench read/write run):
 
-  | Role | Default reserve | Covers |
-  |---|---|---|
-  | control plane, local database | 0.5 vCPU, 1 GB | proxy, Postgres, reconciler, builds |
-  | control plane, external database | 0.25 vCPU, 512 MB | proxy, reconciler, builds |
-  | worker | 0.25 vCPU, 256 MB | agent, resolver, egress proxy |
+  | Role | Default reserve | Covers | Measured |
+  |---|---|---|---|
+  | control plane, local database | 0.5 vCPU, 1.5 GB | proxy, Postgres, reconciler, builds | ~1.57 GB: `temps serve` 257-316 MB, Docker ~150 MB, Postgres 1.07 GiB |
+  | control plane, external database | 0.25 vCPU, 512 MB | proxy, reconciler, builds | ~310-455 MB |
+  | worker | 0.25 vCPU, 256 MB | agent, resolver, egress proxy | <= ~215 MB: agent 35-47 MB, dockerd + containerd 64-150 MB |
 
   - The reserve is a **scheduling deduction**. Schedulable capacity is the
     node's capacity minus the reserve, in both `best_effort` (where the 0.90

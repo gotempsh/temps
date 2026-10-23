@@ -1680,7 +1680,10 @@ mod tests {
         let idle = loaded(worker(2, "idle"), 85.0, 3.2, 4.0);
         assert!((busy.load_score().unwrap() - 0.78).abs() < 1e-9);
         let mut reserved = busy.clone();
-        reserved.system_reserved = SystemReserved::CONTROL_PLANE_LOCAL_DATABASE;
+        reserved.system_reserved = SystemReserved {
+            cpu_millis: 500,
+            memory_mb: 1024,
+        };
         let with_reserve = reserved.load_score().unwrap();
         assert!(with_reserve > 1.0, "{with_reserve}");
         assert_eq!(

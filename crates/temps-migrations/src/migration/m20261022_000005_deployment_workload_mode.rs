@@ -13,7 +13,7 @@
 //!   reservations would exceed the node's schedulable capacity.
 //! - `nodes.system_reserved` (`{"cpu_millis", "memory_mb"}`): the capacity
 //!   Temps keeps for itself on the node, deducted before scheduling. The
-//!   defaults are ADR-055 §5's estimates per role: a worker keeps 0.25 vCPU
+//!   defaults are ADR-055 §5's measured values per role: a worker keeps 0.25 vCPU
 //!   and 256 MB; a control-plane row keeps the control plane's larger
 //!   (local-database) reserve. The control plane itself (node 0) is not a
 //!   row; its values live in the instance settings beside its other
@@ -54,7 +54,7 @@ ALTER TABLE nodes
     ADD COLUMN IF NOT EXISTS system_reserved JSONB NOT NULL
         DEFAULT '{"cpu_millis": 250, "memory_mb": 256}'::jsonb;
 UPDATE nodes
-   SET system_reserved = '{"cpu_millis": 500, "memory_mb": 1024}'::jsonb
+   SET system_reserved = '{"cpu_millis": 500, "memory_mb": 1536}'::jsonb
  WHERE role IN ('control', 'control-plane');
 "#,
             )

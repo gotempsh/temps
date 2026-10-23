@@ -67,17 +67,23 @@ pub struct SystemReserved {
 }
 
 impl SystemReserved {
-    /// §5 estimate for a worker: agent, resolver, egress proxy.
+    /// §5 default for a worker: agent, resolver, egress proxy. Measured
+    /// at most ~215 MB resident (agent 35-47 MB, dockerd + containerd
+    /// 64-150 MB).
     pub const WORKER: SystemReserved = SystemReserved {
         cpu_millis: 250,
         memory_mb: 256,
     };
-    /// §5 estimate for a control plane with its database on the same host.
+    /// §5 default for a control plane with its database on the same host.
+    /// Measured ~1.57 GB resident: `temps serve` 257-316 MB, the Docker
+    /// daemons ~150 MB, and TimescaleDB tuned for a 4 GB host at 1.07 GiB
+    /// after a pgbench read/write run (its 1 GB `shared_buffers` resident).
     pub const CONTROL_PLANE_LOCAL_DATABASE: SystemReserved = SystemReserved {
         cpu_millis: 500,
-        memory_mb: 1024,
+        memory_mb: 1536,
     };
-    /// §5 estimate for a control plane with an external database.
+    /// §5 default for a control plane with an external database. Measured
+    /// ~310-455 MB resident (`temps serve` plus the Docker daemons).
     pub const CONTROL_PLANE_EXTERNAL_DATABASE: SystemReserved = SystemReserved {
         cpu_millis: 250,
         memory_mb: 512,

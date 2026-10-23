@@ -649,7 +649,11 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["resource_policy"], "best_effort");
-        assert_eq!(body["system_reserved"]["memory_mb"], 1024);
+        assert_eq!(
+            body["system_reserved"]["memory_mb"],
+            temps_entities::node_resource_settings::SystemReserved::CONTROL_PLANE_LOCAL_DATABASE
+                .memory_mb
+        );
         assert_eq!(body["system_reserved_is_default"], true);
 
         let (status, _, body) = send(
