@@ -231,6 +231,11 @@ pub enum ProbeKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Probe {
     pub kind: ProbeKind,
+    /// Seconds after start before failures count (Kubernetes
+    /// `initialDelaySeconds`). On a startup probe it is the grace period a
+    /// slow first boot gets (a database initialising its data directory).
+    #[serde(default)]
+    pub initial_delay_secs: u32,
     #[serde(default = "Probe::default_period_secs")]
     pub period_secs: u32,
     #[serde(default = "Probe::default_timeout_secs")]
@@ -240,6 +245,17 @@ pub struct Probe {
 }
 
 impl Probe {
+    /// A probe with the default period, timeout and threshold.
+    pub fn new(kind: ProbeKind) -> Self {
+        Self {
+            kind,
+            initial_delay_secs: 0,
+            period_secs: Self::default_period_secs(),
+            timeout_secs: Self::default_timeout_secs(),
+            failure_threshold: Self::default_failure_threshold(),
+        }
+    }
+
     fn default_period_secs() -> u32 {
         10
     }
@@ -442,6 +458,21 @@ mod tests {
         );
         assert_eq!(spec.network.egress, None);
         assert!(spec.security.is_none());
+    }
+
+    #[test]
+    fn a_probe_stored_before_initial_delay_takes_none() {
+        let probe: Probe = serde_json::from_value(serde_json::json!({
+            "kind": { "type": "exec", "command": ["true"] }
+        }))
+        .unwrap();
+        assert_eq!(probe.initial_delay_secs, 0);
+        assert_eq!(
+            probe,
+            Probe::new(ProbeKind::Exec {
+                command: vec!["true".into()]
+            })
+        );
     }
 
     #[test]

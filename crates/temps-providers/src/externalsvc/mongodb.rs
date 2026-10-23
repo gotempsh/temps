@@ -171,7 +171,7 @@ const MONGO_ROOT_PASSWORD_ENV: &str = "MONGO_INITDB_ROOT_PASSWORD";
 /// unauthenticated connection, so a bare `db.adminCommand({ping: 1})` reports
 /// healthy regardless of the credentials. `db.auth()` throwing on rejection is
 /// what makes this check fail closed.
-const HEALTHCHECK_COMMAND: &str = concat!(
+pub(crate) const HEALTHCHECK_COMMAND: &str = concat!(
     "mongosh --norc --quiet --eval ",
     "'db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME, ",
     "process.env.MONGO_INITDB_ROOT_PASSWORD); db.adminCommand({ping: 1})'",
@@ -686,28 +686,45 @@ impl MongodbService {
             ..Default::default()
         };
 
-        let container = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&container_name)
-                        .build(),
-                ),
-                container_config,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create MongoDB container: {}", e))?;
+        // ADR-055 Phase 4: a database in `enforce` mode is created from its
+        // admitted workload spec through the Docker driver; every other
+        // database sends this request exactly as before.
+        let container_id = match crate::workload::registry::enforced_create(
+            docker,
+            &container_name,
+            &container_config,
+        )
+        .await
+        {
+            Some(created) => {
+                created.map_err(|e| anyhow::anyhow!("Failed to create MongoDB container: {}", e))?
+            }
+            None => {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&container_name)
+                                .build(),
+                        ),
+                        container_config,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create MongoDB container: {}", e))?
+                    .id
+            }
+        };
 
         docker
             .start_container(
-                &container.id,
+                &container_id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start MongoDB container: {}", e))?;
 
         // Wait for container to be healthy
-        self.wait_for_container_health(docker, &container.id)
+        self.wait_for_container_health(docker, &container_id)
             .await?;
 
         // Replica set mode: initiate the set after first healthy boot. This
@@ -718,7 +735,7 @@ impl MongodbService {
                 .await?;
         }
 
-        info!("MongoDB container {} created and started", container.id);
+        info!("MongoDB container {} created and started", container_id);
         Ok(())
     }
 

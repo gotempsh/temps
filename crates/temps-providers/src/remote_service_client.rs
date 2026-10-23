@@ -14,6 +14,7 @@ use tracing::{error, info};
 
 use crate::externalsvc::{HealthProbeResult, ServiceConfig};
 use crate::services::ExternalServiceError;
+use crate::workload::ServiceWorkloadError;
 
 /// Response envelope from the agent API (mirrors `AgentResponse` in temps-agent).
 #[derive(Deserialize)]
@@ -134,6 +135,48 @@ pub struct RemoteHealthProbeRequest {
 pub struct RemoteHealthProbeResponse {
     pub result: HealthProbeResult,
 }
+
+/// Request for `POST /agent/services/workload` (ADR-055 Phase 4): create a
+/// database container from its admitted workload spec through the agent's
+/// Docker driver, instead of the agent building its own request.
+///
+/// The plan never holds a secret value; the values travel next to it in
+/// `secrets`, only inside the TLS-protected body, and are never logged
+/// (`Debug` prints their names only).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct ServiceWorkloadCreateRequest {
+    /// The `external_services.name`, for the recreate guard's messages.
+    pub service_name: String,
+    pub plan: crate::workload::DatabaseWorkloadPlan,
+    /// Secret values by the names the plan's spec references.
+    #[serde(default)]
+    pub secrets: std::collections::BTreeMap<String, String>,
+    /// The Docker network the container joins (the app network).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Replace the running container through the recreate guard (the
+    /// confirmed recreate) instead of creating a new one.
+    #[serde(default)]
+    pub replace_existing: bool,
+}
+
+impl std::fmt::Debug for ServiceWorkloadCreateRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceWorkloadCreateRequest")
+            .field("service_name", &self.service_name)
+            .field("plan", &self.plan)
+            .field("secrets", &self.secrets.keys().collect::<Vec<_>>())
+            .field("network", &self.network)
+            .field("replace_existing", &self.replace_existing)
+            .finish()
+    }
+}
+
+/// How long the agent may take to create (or recreate, through the guard)
+/// a database from its spec: pull, create, the health wait and the data
+/// fingerprint comparison.
+const WORKLOAD_CREATE_TIMEOUT: Duration = Duration::from_secs(600);
+const WORKLOAD_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl RemoteServiceClient {
     /// Create a new client for the given agent.
@@ -340,6 +383,100 @@ impl RemoteServiceClient {
             truncate_utf8(error, MAX_HEALTH_ERROR_BYTES);
         }
         Ok(response)
+    }
+
+    /// Inspect a database container and its image on the remote node, for
+    /// the shadow pass and the pending changes of a recreate (ADR-055
+    /// Phase 4). An agent from before Phase 4 answers
+    /// [`ServiceWorkloadError::AgentUnsupported`].
+    pub async fn service_snapshot(
+        &self,
+        container_name: &str,
+    ) -> Result<crate::workload::runtime::ContainerSnapshot, ServiceWorkloadError> {
+        let path = format!("/agent/services/{}/snapshot", container_name);
+        self.workload_call(
+            self.client.get(format!("{}{}", self.agent_url, path)),
+            &path,
+            container_name,
+            "read a database container snapshot",
+            "inspect",
+            WORKLOAD_SNAPSHOT_TIMEOUT,
+        )
+        .await
+    }
+
+    /// Create (or, with `replace_existing`, recreate) a database container
+    /// from its admitted spec on the remote node.
+    pub async fn create_service_workload(
+        &self,
+        request: &ServiceWorkloadCreateRequest,
+    ) -> Result<RemoteServiceCreateResponse, ServiceWorkloadError> {
+        info!(
+            service = %request.service_name,
+            container = %request.plan.container_name,
+            node = %self.node_name,
+            replace_existing = request.replace_existing,
+            "Creating database container from its workload spec on remote node"
+        );
+        let path = "/agent/services/workload";
+        self.workload_call(
+            self.client
+                .post(format!("{}{}", self.agent_url, path))
+                .json(request),
+            path,
+            &request.plan.container_name,
+            "create a database container from its workload spec",
+            "create",
+            WORKLOAD_CREATE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn workload_call<T: for<'de> Deserialize<'de>>(
+        &self,
+        builder: reqwest::RequestBuilder,
+        path: &str,
+        container: &str,
+        unsupported: &'static str,
+        operation: &'static str,
+        timeout: Duration,
+    ) -> Result<T, ServiceWorkloadError> {
+        let url = format!("{}{}", self.agent_url, path);
+        let agent_error = |reason: String| ServiceWorkloadError::Agent {
+            node: self.node_name.clone(),
+            operation,
+            container: container.to_string(),
+            reason,
+        };
+        let response = builder
+            .timeout(timeout)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| agent_error(format!("failed to reach the agent at {url}: {e}")))?;
+        // An agent from before Phase 4 has no such route: `404`, or `405`
+        // where the path matches `/agent/services/{name}`.
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            return Err(ServiceWorkloadError::AgentUnsupported {
+                node: self.node_name.clone(),
+                operation: unsupported,
+            });
+        }
+        let (status, body): (_, AgentResponse<T>) = self
+            .decode_agent_response(response, &url)
+            .await
+            .map_err(|e| agent_error(e.to_string()))?;
+        if !body.success {
+            return Err(agent_error(format!(
+                "the agent answered {status}: {}",
+                body.error.unwrap_or_default()
+            )));
+        }
+        body.data
+            .ok_or_else(|| agent_error(format!("the agent answered {status} with no data")))
     }
 
     // -----------------------------------------------------------------------

@@ -46,6 +46,13 @@ use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
+
+// ADR-055 Phase 4: per-database workload mode, pending changes, recreate
+// from the spec and the shadow pass.
+mod workload_ops;
+pub use workload_ops::{
+    RecreateOutcome, WorkloadModeChange, WorkloadModeStatus, SHADOW_BATCH, SHADOW_INTERVAL,
+};
 // Add these constants at the top of the file proper key management
 #[allow(dead_code)]
 const NONCE_LENGTH: usize = 12;
@@ -8787,13 +8794,25 @@ echo "[restore] Pre-seed complete"
             );
         }
 
-        // Create the container on the remote node
-        let response = client.create_service(create_params).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Remote agent create_service failed: {}", e),
-            }
-        })?;
+        // Create the container on the remote node. A database in `enforce`
+        // mode (ADR-055 Phase 4) is created from its admitted workload spec
+        // through the agent's Docker driver; every other service sends the
+        // agent's own request exactly as before.
+        let response = if service.workload_mode.creates_from_spec() {
+            self.create_remote_from_workload_spec(service, &client, &create_params)
+                .await
+                .map_err(|e| ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("Remote agent create from workload spec failed: {}", e),
+                })?
+        } else {
+            client.create_service(create_params).await.map_err(|e| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("Remote agent create_service failed: {}", e),
+                }
+            })?
+        };
 
         info!(
             "Service {} created on node {} — container {} (port {})",
@@ -22272,6 +22291,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
     }
 
@@ -25480,6 +25500,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
     }
 

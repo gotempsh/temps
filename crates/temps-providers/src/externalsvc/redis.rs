@@ -633,32 +633,49 @@ impl RedisService {
             Err(e) => return Err(anyhow::anyhow!("Failed to create volume: {:?}", e)),
         }
 
-        let container = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&container_name)
-                        .build(),
-                ),
-                container_config,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create Redis container: {:?}", e))?;
+        // ADR-055 Phase 4: a database in `enforce` mode is created from its
+        // admitted workload spec through the Docker driver; every other
+        // database sends this request exactly as before.
+        let container_id = match crate::workload::registry::enforced_create(
+            docker,
+            &container_name,
+            &container_config,
+        )
+        .await
+        {
+            Some(created) => {
+                created.map_err(|e| anyhow::anyhow!("Failed to create Redis container: {}", e))?
+            }
+            None => {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&container_name)
+                                .build(),
+                        ),
+                        container_config,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create Redis container: {:?}", e))?
+                    .id
+            }
+        };
 
         docker
             .start_container(
-                &container.id,
+                &container_id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start Redis container: {:?}", e))?;
 
         // Wait for container to be healthy
-        self.wait_for_container_health(docker, &container.id)
+        self.wait_for_container_health(docker, &container_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to wait for Redis container health: {:?}", e))?;
 
-        info!("Redis container {} created and started", container.id);
+        info!("Redis container {} created and started", container_id);
         Ok(())
     }
 

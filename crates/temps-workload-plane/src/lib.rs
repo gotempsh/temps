@@ -41,8 +41,8 @@ pub mod reconciler;
 mod testing;
 
 pub use admission::{
-    admit, AdmissionInput, AdmissionPolicy, AdmissionRule, ImageAllowList, Quotas,
-    DEFAULT_JOB_TIMEOUT_SECS, DEFAULT_JOB_TTL_SECS,
+    admit, admit_data_service, AdmissionInput, AdmissionPolicy, AdmissionRule, ImageAllowList,
+    Quotas, DEFAULT_JOB_TIMEOUT_SECS, DEFAULT_JOB_TTL_SECS,
 };
 pub use env::{EnvSource, NoEnvSource};
 pub use error::{AdmissionError, PlaneError};

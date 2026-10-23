@@ -3898,6 +3898,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
@@ -4356,6 +4357,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
         .into_active_model()
         .insert(&db)
@@ -4646,6 +4648,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
         .into_active_model()
         .insert(db)
@@ -5970,6 +5973,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
 
         assert_eq!(
@@ -6783,6 +6787,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
         .into_active_model()
         .insert(&db)

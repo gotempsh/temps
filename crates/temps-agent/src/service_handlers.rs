@@ -616,6 +616,261 @@ pub async fn create_service(
     }
 }
 
+/// Pull `image` unless it is present. The same pull `create_service` does.
+async fn pull_service_image(docker: &bollard::Docker, image: &str) -> Result<(), String> {
+    use bollard::query_parameters::CreateImageOptions;
+    use futures::StreamExt;
+
+    tracing::info!(image = %image, "Pulling image (if not present)...");
+    let mut pull_stream = docker.create_image(
+        Some(CreateImageOptions {
+            from_image: Some(image.to_string()),
+            ..Default::default()
+        }),
+        None,
+        None,
+    );
+    while let Some(result) = pull_stream.next().await {
+        if let Err(e) = result {
+            return Err(format!("Failed to pull image '{}': {}", image, e));
+        }
+    }
+    tracing::info!(image = %image, "Image ready");
+    Ok(())
+}
+
+/// Create (or recreate) a database container from its admitted workload
+/// spec (ADR-055 Phase 4, `enforce` mode).
+///
+/// Unlike `create_service`, the agent builds no request of its own: the
+/// spec is admitted again here, and the container-create request is the
+/// Docker driver's for the `Data` profile -- the same host config, restart
+/// policy, healthcheck, log rotation and labels the control plane gives a
+/// database. What stays node-local is only where the container attaches:
+/// this agent's private address for the published port, the app network,
+/// the overlay and this node's resolvers. With `replace_existing` the
+/// running container is replaced through the recreate guard, which keeps
+/// the original until the replacement is healthy on the same data.
+///
+/// Not part of the agent's OpenAPI document: the request carries the plane's
+/// `WorkloadSpec`, which is an internal contract between the control plane
+/// and its agents of the same release.
+pub async fn create_service_workload(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_providers::remote_service_client::ServiceWorkloadCreateRequest>,
+) -> impl IntoResponse {
+    use temps_providers::workload::runtime;
+
+    let Some(docker) = state.docker.as_ref() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Docker client not available on this agent".to_string(),
+        )
+        .into_response();
+    };
+    // Admission runs on both sides: a request is never trusted to have
+    // been admitted by its sender.
+    let plan = match request.plan.readmit() {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::warn!(container = %request.plan.container_name, error = %e, "Refused a database workload spec");
+            return error_response(StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+    let container_name = plan.container_name.clone();
+    tracing::info!(
+        service = %request.service_name,
+        container = %container_name,
+        engine = %plan.engine,
+        replace_existing = request.replace_existing,
+        workload_mode = "enforce",
+        "Creating database container from its workload spec"
+    );
+
+    for mount in &plan.spec.volumes {
+        let create_opts = bollard::models::VolumeCreateRequest {
+            name: Some(mount.volume.clone()),
+            ..Default::default()
+        };
+        if let Err(e) = docker.create_volume(create_opts).await {
+            tracing::warn!(
+                volume = %mount.volume,
+                "Volume creation returned error (may already exist): {}",
+                e
+            );
+        }
+    }
+
+    match ensure_service_network(
+        docker,
+        request.network.as_deref(),
+        temps_core::NETWORK_NAME.as_str(),
+    )
+    .await
+    {
+        Ok(Some(app_network)) => {
+            if let Err(error) =
+                temps_deployer::metadata_egress::apply_metadata_egress_block(docker, app_network)
+                    .await
+            {
+                tracing::warn!(
+                    network = app_network,
+                    error = %error,
+                    "Cloud-metadata egress block is incomplete; ensure nftables is installed and \
+                     the agent has CAP_NET_ADMIN"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(message) => {
+            tracing::error!(service = %container_name, "{}", message);
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        }
+    }
+
+    // Admission refuses anything but an OCI image.
+    let image = plan.image().unwrap_or_default().to_string();
+    if let Err(message) = pull_service_image(docker, &image).await {
+        tracing::error!(container = %container_name, "{}", message);
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+    }
+
+    let node = temps_providers::workload::NodeAttachment {
+        host_ip: state.host_bind_address(),
+        network: request.network.clone(),
+        dns: state
+            .overlay_bridge_address
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|ip| vec![ip.to_string()]))
+            .map(temps_deployer::docker::dns_with_fallback),
+    };
+    let attach_overlay = |id: String| async move {
+        if let Err(e) = attach_to_overlay_if_present(docker, &id).await {
+            tracing::warn!(
+                container = %id,
+                error = %e,
+                "Failed to attach service container to overlay; continuing single-host"
+            );
+        }
+    };
+
+    let created = if request.replace_existing {
+        match runtime::snapshot(docker, &container_name).await {
+            Ok(runtime::ContainerSnapshot {
+                found: true,
+                inspect: Some(existing),
+                ..
+            }) => {
+                runtime::recreate_from_plan(
+                    docker,
+                    &plan,
+                    &request.service_name,
+                    &existing,
+                    &request.secrets,
+                    &node,
+                    attach_overlay,
+                )
+                .await
+            }
+            Ok(_) => Err(
+                temps_providers::workload::ServiceWorkloadError::ContainerMissing {
+                    service_id: plan.service_id,
+                    container: container_name.clone(),
+                    node: "this node".to_string(),
+                },
+            ),
+            Err(e) => Err(e),
+        }
+    } else {
+        runtime::create_and_start(docker, &plan, &request.secrets, &node, attach_overlay)
+            .await
+            .map(|_| ())
+    };
+    if let Err(e) = created {
+        tracing::error!(container = %container_name, error = %e, "Failed to create database container from its workload spec");
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    if let Err(e) =
+        install_overlay_peer_routes_after_start(docker, &container_name, &state.overlay_peers).await
+    {
+        tracing::warn!(
+            container = %container_name,
+            error = %e,
+            "Failed to install overlay peer routes; cross-worker traffic to other CIDRs will fail"
+        );
+    }
+
+    let mut host_port = plan.host_port.unwrap_or(0);
+    let mut compute_ip = None;
+    let mut container_id = String::new();
+    match docker
+        .inspect_container(&container_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => {
+            container_id = info.id.clone().unwrap_or_default();
+            if host_port == 0 {
+                host_port = info
+                    .network_settings
+                    .as_ref()
+                    .and_then(|n| n.ports.as_ref())
+                    .and_then(|ports| {
+                        ports
+                            .values()
+                            .flatten()
+                            .flatten()
+                            .find_map(|b| b.host_port.as_deref()?.parse::<u16>().ok())
+                    })
+                    .unwrap_or(0);
+            }
+            compute_ip = extract_overlay_ip(&info);
+        }
+        Err(e) => tracing::warn!(
+            container = %container_name,
+            "Failed to inspect container after start: {}",
+            e
+        ),
+    }
+    tracing::info!(
+        container = %container_name,
+        container_id = %container_id,
+        host_port,
+        compute_ip = ?compute_ip,
+        workload_mode = "enforce",
+        "Database container created from its workload spec and started"
+    );
+    ok_response(ServiceCreateResponse {
+        container_id,
+        container_name,
+        host_port,
+        compute_ip,
+    })
+    .into_response()
+}
+
+/// Inspect a database container and its image (ADR-055 Phase 4): what the
+/// control plane's shadow pass and pending-changes listing compare with the
+/// database's spec. Read-only. A missing container is `found: false`, not
+/// an error, so the caller can tell it from an agent without this route.
+pub async fn service_snapshot(
+    State(state): State<Arc<AgentState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(docker) = state.docker.as_ref() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Docker client not available on this agent".to_string(),
+        )
+        .into_response();
+    };
+    match temps_providers::workload::runtime::snapshot(docker, &name).await {
+        Ok(snapshot) => ok_response(snapshot).into_response(),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 /// Stop a service container.
 #[utoipa::path(
     tag = "Services",

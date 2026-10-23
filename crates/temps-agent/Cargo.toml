@@ -63,6 +63,8 @@ tempfile = { workspace = true }
 [dev-dependencies]
 # ADR-055 golden captures of the container-create request.
 temps-docker-capture = { path = "../temps-docker-capture" }
+# ADR-055 Phase 4: `external_services` rows for the shadow-pass proof.
+temps-entities = { path = "../temps-entities" }
 tempfile = "3"
 # `test-util` provides the paused clock the build-queue tests use.
 tokio = { workspace = true, features = ["test-util"] }

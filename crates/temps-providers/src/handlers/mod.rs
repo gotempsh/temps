@@ -9,6 +9,7 @@ pub mod metrics_handlers;
 pub mod pg_stat_statements_handlers;
 pub mod query_handlers;
 pub mod types;
+pub mod workload_handlers;
 pub use audit::*;
 pub use handlers::*;
 pub use metrics_handlers::*;

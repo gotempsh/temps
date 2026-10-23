@@ -37,6 +37,10 @@ pub const DEFAULT_JOB_TTL_SECS: u32 = 600;
 /// Longest workload name: a DNS label, so it can become a container name.
 pub const MAX_NAME_LEN: usize = 63;
 
+/// Docker allows longer container names than plane names, and databases
+/// keep theirs (Phase 4).
+pub const MAX_SERVICE_NAME_LEN: usize = 128;
+
 /// The rule that refused a spec.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -142,6 +146,29 @@ fn kind_egress(kind: WorkloadKind) -> EgressProfile {
 pub fn admit(
     policy: &AdmissionPolicy,
     input: AdmissionInput<'_>,
+) -> Result<WorkloadSpec, AdmissionError> {
+    admit_with(policy, input, validate)
+}
+
+/// Admit a managed database's spec (ADR-055 Phase 4, kind `service`).
+///
+/// The same rules in the same order as [`admit`]; only the last one,
+/// validation, checks what a database needs instead of what a job may do.
+/// Databases are not stored as plane workloads (the plane's reconciler runs
+/// jobs), so [`admit`], which `WorkloadPlane::apply` calls, still refuses
+/// the `service` kind: a database spec is only ever admitted here, by the
+/// two code paths that create database containers.
+pub fn admit_data_service(
+    policy: &AdmissionPolicy,
+    input: AdmissionInput<'_>,
+) -> Result<WorkloadSpec, AdmissionError> {
+    admit_with(policy, input, validate_data_service)
+}
+
+fn admit_with(
+    policy: &AdmissionPolicy,
+    input: AdmissionInput<'_>,
+    validate: fn(&WorkloadSpec, &str) -> Result<(), String>,
 ) -> Result<WorkloadSpec, AdmissionError> {
     let AdmissionInput {
         mut spec,
@@ -333,6 +360,125 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
                 "placement on nodes {nodes:?} is not available; jobs run on the control plane"
             ));
         }
+    }
+    if let Some(label) = spec
+        .labels
+        .keys()
+        .find(|key| crate::labels::RESERVED.contains(&key.as_str()))
+    {
+        return Err(format!(
+            "label '{label}' is set by the plane, not the product"
+        ));
+    }
+    Ok(())
+}
+
+/// What a managed database needs (Phase 4): a long-running `service`
+/// instance that always restarts, in a container, with its named data
+/// volume, one published port and an exec readiness check (the Docker
+/// healthcheck the engines have always had). Secrets are allowed: they are
+/// resolved by the creating path and never stored in the spec.
+fn validate_data_service(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
+    // Docker's container-name rule: existing database containers keep their
+    // names (`temps-mongodb-orders`, `postgres-orders`), which may hold `_`
+    // and `.` and so are not plane names.
+    let valid_name = name.len() <= MAX_SERVICE_NAME_LEN
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if !valid_name {
+        return Err(format!(
+            "container name '{name}' must be 1 to {MAX_SERVICE_NAME_LEN} characters of letters, \
+             digits, '_', '.' and '-', starting with a letter or digit"
+        ));
+    }
+    if spec.owner.kind != WorkloadKind::Service {
+        return Err(format!(
+            "kind '{}' is not a managed database; only the service kind is admitted here",
+            spec.owner.kind
+        ));
+    }
+    if spec.lifetime
+        != (Lifetime::LongRunning {
+            restart: temps_workload::RestartPolicy::Always,
+        })
+    {
+        return Err(format!(
+            "a database must be long-running and always restart, got {:?}",
+            spec.lifetime
+        ));
+    }
+    match &spec.artifact {
+        Artifact::OciImage { reference, .. } if reference.trim().is_empty() => {
+            return Err("the OCI image reference is empty".to_string());
+        }
+        Artifact::OciImage { .. } => {}
+        other => {
+            return Err(format!(
+                "artifact {other:?} needs a driver this node does not have; databases run OCI images"
+            ));
+        }
+    }
+    if spec.isolation != Isolation::Process {
+        return Err(format!(
+            "isolation {:?} is not available; databases run with process isolation",
+            spec.isolation
+        ));
+    }
+    if spec.security != Some(SecurityProfile::Data) {
+        return Err(format!(
+            "a database runs with the data profile, got {:?}",
+            spec.security
+        ));
+    }
+    if let Some(command) = &spec.process.command {
+        if command.is_empty() {
+            return Err("command is empty; omit it to keep the image's".to_string());
+        }
+        if command.iter().any(|arg| arg.contains('\0')) {
+            return Err("command contains a NUL byte".to_string());
+        }
+    }
+    if spec.volumes.is_empty() {
+        return Err("a database must mount its data volume".to_string());
+    }
+    for mount in &spec.volumes {
+        if mount.volume.is_empty() || mount.volume.contains(['/', ':']) {
+            return Err(format!(
+                "volume '{}' must be a named volume; a database never mounts a host path",
+                mount.volume
+            ));
+        }
+        if !mount.mount_path.starts_with('/') || mount.mount_path.contains(':') {
+            return Err(format!(
+                "mount path '{}' of volume '{}' must be an absolute container path",
+                mount.mount_path, mount.volume
+            ));
+        }
+    }
+    if spec.ports.len() != 1 {
+        return Err(format!(
+            "a database publishes exactly one port, got {}",
+            spec.ports.len()
+        ));
+    }
+    match spec.probes.readiness.as_ref().map(|p| &p.kind) {
+        Some(temps_workload::ProbeKind::Exec { command }) if !command.is_empty() => {}
+        _ => {
+            return Err(
+                "a database needs an exec readiness probe (its Docker healthcheck)".to_string(),
+            );
+        }
+    }
+    if spec.placement.replicas != 1 {
+        return Err(format!(
+            "a database runs one instance, got replicas {}",
+            spec.placement.replicas
+        ));
     }
     if let Some(label) = spec
         .labels
@@ -560,5 +706,152 @@ mod tests {
             admit(&policy, bad_name).unwrap_err().rule,
             AdmissionRule::Validation
         );
+    }
+
+    fn database_spec() -> WorkloadSpec {
+        let exec = temps_workload::ProbeKind::Exec {
+            command: vec!["/bin/sh".into(), "-c".into(), "redis-cli ping".into()],
+        };
+        WorkloadSpec {
+            owner: temps_workload::WorkloadRef::new(WorkloadKind::Service, 4),
+            artifact: Artifact::oci("gotempsh/redis-walg:8-bookworm"),
+            isolation: Isolation::Process,
+            process: Default::default(),
+            env: Default::default(),
+            resources: Default::default(),
+            volumes: vec![temps_workload::VolumeMount {
+                volume: "redis_data_cache".into(),
+                mount_path: "/data".into(),
+                read_only: false,
+            }],
+            ports: vec![temps_workload::PortSpec {
+                name: "redis".into(),
+                container_port: 6379,
+                protocol: Default::default(),
+                app_protocol: Default::default(),
+            }],
+            network: Default::default(),
+            probes: temps_workload::Probes {
+                readiness: Some(temps_workload::Probe::new(exec)),
+                ..Default::default()
+            },
+            placement: Default::default(),
+            lifetime: Lifetime::LongRunning {
+                restart: temps_workload::RestartPolicy::Always,
+            },
+            security: None,
+            labels: Default::default(),
+        }
+    }
+
+    fn database_input<'a>(spec: WorkloadSpec, owner: &'a Owner) -> AdmissionInput<'a> {
+        AdmissionInput {
+            spec,
+            name: "redis-cache",
+            owner,
+            project_slug: None,
+            active_for_owner: 0,
+        }
+    }
+
+    #[test]
+    fn a_database_is_admitted_with_the_data_profile_and_open_egress() {
+        let owner = Owner::new("external_service", 4);
+        let admitted = admit_data_service(
+            &AdmissionPolicy::default(),
+            database_input(database_spec(), &owner),
+        )
+        .expect("admitted");
+        assert_eq!(admitted.security, Some(SecurityProfile::Data));
+        assert_eq!(admitted.network.egress, Some(EgressProfile::Open));
+
+        // A database never gets the socket, even for a granted slug.
+        let policy = AdmissionPolicy {
+            grant: DockerSocketGrant::from_slugs(["infra-agent"]),
+            ..Default::default()
+        };
+        let mut granted = database_input(database_spec(), &owner);
+        granted.project_slug = Some("infra-agent");
+        assert_eq!(
+            admit_data_service(&policy, granted).unwrap().security,
+            Some(SecurityProfile::Data)
+        );
+    }
+
+    #[test]
+    fn the_plane_still_refuses_a_database_spec() {
+        let owner = Owner::new("external_service", 4);
+        let refused = admit(
+            &AdmissionPolicy::default(),
+            database_input(database_spec(), &owner),
+        )
+        .unwrap_err();
+        assert_eq!(refused.rule, AdmissionRule::Validation);
+        assert!(refused.message.contains("only jobs"), "{}", refused.message);
+    }
+
+    #[test]
+    fn database_validation_refuses_what_a_database_cannot_be() {
+        let owner = Owner::new("external_service", 4);
+        type Mutation = Box<dyn Fn(&mut WorkloadSpec)>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            (
+                "job kind",
+                Box::new(|s| s.owner = temps_workload::WorkloadRef::new(WorkloadKind::Job, 4)),
+            ),
+            (
+                "run to completion",
+                Box::new(|s| {
+                    s.lifetime = Lifetime::RunToCompletion {
+                        timeout_secs: 60,
+                        retry_limit: 0,
+                        ttl_secs_after_finished: None,
+                    }
+                }),
+            ),
+            (
+                "unless-stopped",
+                Box::new(|s| {
+                    s.lifetime = Lifetime::LongRunning {
+                        restart: temps_workload::RestartPolicy::UnlessStopped,
+                    }
+                }),
+            ),
+            ("no volume", Box::new(|s| s.volumes.clear())),
+            (
+                "host path",
+                Box::new(|s| s.volumes[0].volume = "/var/lib/data".into()),
+            ),
+            ("no port", Box::new(|s| s.ports.clear())),
+            ("no probe", Box::new(|s| s.probes = Default::default())),
+            (
+                "reserved label",
+                Box::new(|s| {
+                    s.labels
+                        .insert(temps_workload::labels::OWNER_ID.into(), "9".into());
+                }),
+            ),
+            ("empty image", Box::new(|s| s.artifact = Artifact::oci(" "))),
+        ];
+        for (case, mutate) in cases {
+            let mut spec = database_spec();
+            mutate(&mut spec);
+            let error =
+                admit_data_service(&AdmissionPolicy::default(), database_input(spec, &owner))
+                    .expect_err(&format!("{case} must be refused"));
+            assert_eq!(error.rule, AdmissionRule::Validation, "{case}: {error}");
+        }
+        let mut bad_name = database_input(database_spec(), &owner);
+        bad_name.name = "-redis";
+        assert_eq!(
+            admit_data_service(&AdmissionPolicy::default(), bad_name)
+                .unwrap_err()
+                .rule,
+            AdmissionRule::Validation
+        );
+        // Existing container names keep their underscores.
+        let mut kept = database_input(database_spec(), &owner);
+        kept.name = "redis_cache.v2";
+        assert!(admit_data_service(&AdmissionPolicy::default(), kept).is_ok());
     }
 }
