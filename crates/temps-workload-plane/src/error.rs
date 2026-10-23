@@ -83,6 +83,25 @@ pub enum PlaneError {
     #[error("the reconciler of plane '{scope}' is already running; a plane runs one")]
     ReconcilerAlreadyStarted { scope: String },
 
+    /// The plane was built without a node inventory, so it cannot place or
+    /// explain anything beyond the control plane.
+    #[error(
+        "plane '{scope}' has no node inventory; placement for workload '{workload}' cannot be \
+         computed"
+    )]
+    NoInventory { scope: String, workload: String },
+
+    #[error("reading the node inventory for workload '{workload}' failed: {reason}")]
+    Inventory { workload: String, reason: String },
+
+    /// No node can take the workload: `Scheduled = False` with `reason`.
+    #[error("workload '{workload}' cannot be scheduled ({reason}): {message}")]
+    Unschedulable {
+        workload: String,
+        reason: &'static str,
+        message: String,
+    },
+
     #[error("database error while {operation} (workload {workload}): {source}")]
     Database {
         operation: &'static str,

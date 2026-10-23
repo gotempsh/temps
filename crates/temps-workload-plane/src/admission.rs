@@ -214,8 +214,12 @@ pub fn admit(
         }
     }
 
-    // 4. Quotas.
-    if active_for_owner >= policy.quotas.max_active_per_owner {
+    // 4. Quotas. The active-run limit bounds run-to-completion workloads (a
+    // schedule whose runs never finish); a deployment holds one long-running
+    // workload per replica, bounded by its replica count.
+    if matches!(spec.lifetime, Lifetime::RunToCompletion { .. })
+        && active_for_owner >= policy.quotas.max_active_per_owner
+    {
         return Err(refuse(
             AdmissionRule::Quota,
             format!(
@@ -260,14 +264,24 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             "name '{name}' must be lowercase letters, digits and inner hyphens"
         ));
     }
-    if spec.owner.kind != WorkloadKind::Job {
-        return Err(format!(
-            "kind '{}' is not run by the plane yet; phase 2 runs only jobs",
-            spec.owner.kind
-        ));
-    }
-    if !matches!(spec.lifetime, Lifetime::RunToCompletion { .. }) {
-        return Err("a job must have a run_to_completion lifetime".to_string());
+    let deployment = spec.owner.kind == WorkloadKind::Deployment;
+    match spec.owner.kind {
+        WorkloadKind::Job => {
+            if !matches!(spec.lifetime, Lifetime::RunToCompletion { .. }) {
+                return Err("a job must have a run_to_completion lifetime".to_string());
+            }
+        }
+        // Phase 5: one replica of a deployment revision.
+        WorkloadKind::Deployment => {
+            if !matches!(spec.lifetime, Lifetime::LongRunning { .. }) {
+                return Err("a deployment replica must have a long_running lifetime".to_string());
+            }
+        }
+        other => {
+            return Err(format!(
+                "kind '{other}' is not run by the plane yet; it runs jobs and deployment replicas"
+            ));
+        }
     }
     match &spec.artifact {
         Artifact::OciImage { reference, .. } if reference.trim().is_empty() => {
@@ -307,7 +321,7 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             spec.volumes.len()
         ));
     }
-    if !spec.ports.is_empty() {
+    if !deployment && !spec.ports.is_empty() {
         return Err(format!(
             "{} port(s) requested; a job publishes no ports",
             spec.ports.len()
@@ -323,11 +337,14 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
     }
     if spec.placement.replicas != 1 {
         return Err(format!(
-            "a job runs one instance, got replicas {}",
+            "a workload runs one instance (a deployment submits one workload per replica), got \
+             replicas {}",
             spec.placement.replicas
         ));
     }
-    if let Some(nodes) = &spec.placement.nodes {
+    // A deployment replica may be pinned anywhere: the reconciler reports a
+    // pin it cannot meet as `Scheduled = False` (strict pinning, §8).
+    if let Some(nodes) = spec.placement.nodes.as_ref().filter(|_| !deployment) {
         if nodes.iter().any(|node| *node != 0) {
             return Err(format!(
                 "placement on nodes {nodes:?} is not available; jobs run on the control plane"
@@ -501,6 +518,61 @@ mod tests {
                 AdmissionRule::Quota,
                 AdmissionRule::Validation,
             ]
+        );
+    }
+
+    fn deployment_spec() -> WorkloadSpec {
+        let mut spec = job_spec("app:1");
+        spec.owner = temps_workload::WorkloadRef::new(WorkloadKind::Deployment, 42);
+        spec.lifetime = Lifetime::LongRunning {
+            restart: Default::default(),
+        };
+        spec.ports.push(temps_workload::PortSpec {
+            name: "http".into(),
+            container_port: 3000,
+            protocol: Default::default(),
+            app_protocol: Default::default(),
+        });
+        spec
+    }
+
+    #[test]
+    fn a_deployment_replica_is_admitted_with_ports_and_any_pin() {
+        let owner = Owner::new("deployment", 42);
+        let mut spec = deployment_spec();
+        spec.placement.nodes = Some(vec![3]);
+        let mut request = input(spec, &owner, Some("shop"));
+        // The active-run quota is for run-to-completion workloads only.
+        request.active_for_owner = 50;
+        let admitted = admit(&AdmissionPolicy::default(), request).expect("admitted");
+        assert_eq!(admitted.security, Some(SecurityProfile::Trusted));
+        assert_eq!(admitted.network.egress, Some(EgressProfile::Open));
+
+        let mut job_lifetime = deployment_spec();
+        job_lifetime.lifetime = Lifetime::RunToCompletion {
+            timeout_secs: 0,
+            retry_limit: 0,
+            ttl_secs_after_finished: None,
+        };
+        let refused = admit(
+            &AdmissionPolicy::default(),
+            input(job_lifetime, &owner, None),
+        )
+        .unwrap_err();
+        assert_eq!(refused.rule, AdmissionRule::Validation);
+        assert!(
+            refused.message.contains("long_running"),
+            "{}",
+            refused.message
+        );
+
+        let mut two = deployment_spec();
+        two.placement.replicas = 2;
+        let refused = admit(&AdmissionPolicy::default(), input(two, &owner, None)).unwrap_err();
+        assert!(
+            refused.message.contains("one workload per replica"),
+            "{}",
+            refused.message
         );
     }
 

@@ -49,9 +49,33 @@ pub(crate) struct ResolvedEnv {
 
 /// Imports first, then the spec's own variables, which win. Secret
 /// references are refused at admission until secret-file delivery exists.
+#[cfg(test)]
 pub(crate) async fn resolve(spec: &EnvSpec, source: &dyn EnvSource) -> Result<ResolvedEnv, String> {
+    resolve_with_staged(spec, source, &|_| None).await
+}
+
+/// Answers a `staged:` import from this process's staged environments.
+pub(crate) type StagedLookup<'a> = dyn Fn(&str) -> Option<Vec<(String, String)>> + Sync + 'a;
+
+/// [`resolve`], with environments staged in this process
+/// (`WorkloadPlane::stage_env`) answering their imports first.
+pub(crate) async fn resolve_with_staged(
+    spec: &EnvSpec,
+    source: &dyn EnvSource,
+    staged: &StagedLookup<'_>,
+) -> Result<ResolvedEnv, String> {
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     for import in &spec.imports {
+        if import.starts_with(crate::plane::STAGED_IMPORT_PREFIX) {
+            let imported = staged(import).ok_or_else(|| {
+                format!(
+                    "import '{import}' was staged by a process that no longer holds it (staged \
+                     environments live only in memory until the instance is created)"
+                )
+            })?;
+            vars.extend(imported);
+            continue;
+        }
         let imported = source
             .import(import)
             .await

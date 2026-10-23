@@ -36,7 +36,7 @@ pub use driver::{
 pub use reference::{InvalidWorkloadRef, UnknownWorkloadKind, WorkloadKind, WorkloadRef};
 pub use resources::{ResourceAmounts, Resources};
 pub use spec::{
-    AppProtocol, Artifact, Delivery, EgressProfile, EnvSpec, Isolation, Lifetime, NetworkSpec,
-    PlacementSpec, PortProtocol, PortSpec, Probe, ProbeKind, Probes, Process, RestartPolicy,
-    SecretRef, SecurityProfile, VolumeMount, WorkloadSpec,
+    AppProtocol, Artifact, Delivery, EgressProfile, EnvSpec, Isolation, LabelSelector, LabelValues,
+    Lifetime, NetworkSpec, PlacementSpec, PortProtocol, PortSpec, Probe, ProbeKind, Probes,
+    Process, RestartPolicy, SecretRef, SecurityProfile, VolumeMount, WorkloadSpec,
 };

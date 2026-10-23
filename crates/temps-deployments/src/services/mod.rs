@@ -108,3 +108,7 @@ pub(crate) mod deployment_commit;
 pub mod ci_dispatch;
 
 pub mod runtime_health;
+
+pub mod workload_placement;
+pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
+pub mod plane_deployer;

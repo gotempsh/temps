@@ -30,6 +30,10 @@ use crate::audit::AdmissionRefusedAudit;
 use crate::env::EnvSource;
 use crate::error::PlaneError;
 use crate::events;
+use crate::inventory::{InFlightGuard, InFlightLedger, NodeInventory, PlacementHints};
+use crate::scheduler::{
+    self, Explanation, Placement, ScheduleRequest, SchedulerConfig, UnifiedScheduler,
+};
 
 /// The product object that owns a workload: `cron/7`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -86,6 +90,10 @@ pub struct PlaneConfig {
     pub poll_interval: Duration,
     /// Lines of output kept for a finished run.
     pub output_tail_lines: u32,
+    /// Host interface a long-running instance's ports are published on
+    /// (the runtime picks the port). Never `0.0.0.0`: the proxy reaches the
+    /// instance over loopback or the node's private address.
+    pub publish_host_ip: String,
 }
 
 impl PlaneConfig {
@@ -97,6 +105,7 @@ impl PlaneConfig {
             resync_interval: Duration::from_secs(300),
             poll_interval: Duration::from_secs(5),
             output_tail_lines: 50,
+            publish_host_ip: "127.0.0.1".to_string(),
         }
     }
 }
@@ -182,6 +191,44 @@ pub struct WorkloadPlane {
     /// Cleared when the driver reports it cannot wait for exits.
     pub(crate) driver_waits: Arc<AtomicBool>,
     pub(crate) started: AtomicBool,
+    /// Where the scheduler's node facts come from; `None` = control plane
+    /// only (phase 2).
+    pub(crate) inventory: Option<Arc<dyn NodeInventory>>,
+    pub(crate) scheduler: Arc<UnifiedScheduler>,
+    pub(crate) in_flight: Arc<InFlightLedger>,
+    /// Environments staged for one create, by import name (`staged:<key>`):
+    /// never stored in a spec.
+    pub(crate) staged_env: StagedEnvs,
+}
+
+/// Environments staged in this process, by key.
+pub(crate) type StagedEnvs = Arc<Mutex<HashMap<String, Vec<(String, String)>>>>;
+
+/// The import name of an environment staged with
+/// [`WorkloadPlane::stage_env`].
+pub const STAGED_IMPORT_PREFIX: &str = "staged:";
+
+/// Removes a staged environment when dropped.
+#[derive(Debug)]
+pub struct StagedEnvGuard {
+    staged: StagedEnvs,
+    key: String,
+}
+
+impl StagedEnvGuard {
+    /// The import to put in `EnvSpec::imports`.
+    pub fn import(&self) -> String {
+        format!("{STAGED_IMPORT_PREFIX}{}", self.key)
+    }
+}
+
+impl Drop for StagedEnvGuard {
+    fn drop(&mut self) {
+        self.staged
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.key);
+    }
 }
 
 impl fmt::Debug for WorkloadPlane {
@@ -215,7 +262,196 @@ impl WorkloadPlane {
             redactors: Mutex::new(HashMap::new()),
             driver_waits: Arc::new(AtomicBool::new(true)),
             started: AtomicBool::new(false),
+            inventory: None,
+            scheduler: Arc::new(UnifiedScheduler::new(SchedulerConfig::new(
+                scheduler::platforms_equal,
+            ))),
+            in_flight: InFlightLedger::new(),
+            staged_env: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Feed the scheduler from `inventory` (ADR-055 §8).
+    pub fn with_inventory(mut self, inventory: Arc<dyn NodeInventory>) -> Self {
+        self.inventory = Some(inventory);
+        self
+    }
+
+    pub fn with_scheduler_config(mut self, config: SchedulerConfig) -> Self {
+        self.scheduler = Arc::new(UnifiedScheduler::new(config));
+        self
+    }
+
+    pub fn scheduler(&self) -> &UnifiedScheduler {
+        &self.scheduler
+    }
+
+    /// Stage `vars` for one create: the spec imports
+    /// [`StagedEnvGuard::import`] instead of holding the values, so a
+    /// deployment's variables (secrets among them) are never written into
+    /// the stored spec. The values live in this process's memory until the
+    /// guard drops; an instance recreated after a restart cannot read them
+    /// and fails with `EnvironmentUnavailable`.
+    pub fn stage_env(&self, key: &str, vars: Vec<(String, String)>) -> StagedEnvGuard {
+        self.staged_env
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key.to_string(), vars);
+        StagedEnvGuard {
+            staged: Arc::clone(&self.staged_env),
+            key: key.to_string(),
+        }
+    }
+
+    pub(crate) fn staged(&self, import: &str) -> Option<Vec<(String, String)>> {
+        let key = import.strip_prefix(STAGED_IMPORT_PREFIX)?;
+        self.staged_env
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    async fn facts_for(
+        &self,
+        workload: &str,
+        hints: &PlacementHints,
+    ) -> Result<Vec<scheduler::NodeFacts>, PlaneError> {
+        let inventory = self
+            .inventory
+            .as_ref()
+            .ok_or_else(|| PlaneError::NoInventory {
+                scope: self.config.scope.clone(),
+                workload: workload.to_string(),
+            })?;
+        let mut nodes = inventory
+            .nodes(hints.project_slug.as_deref())
+            .await
+            .map_err(|reason| PlaneError::Inventory {
+                workload: workload.to_string(),
+                reason,
+            })?;
+        self.in_flight.apply(&mut nodes);
+        Ok(nodes)
+    }
+
+    fn request_for<'a>(
+        &self,
+        spec: &'a WorkloadSpec,
+        hints: &'a PlacementHints,
+    ) -> ScheduleRequest<'a> {
+        ScheduleRequest {
+            kind: spec.owner.kind,
+            placement: &spec.placement,
+            resources: &spec.resources,
+            isolation: spec.isolation,
+            image_platforms: &hints.image_platforms,
+            socket_gate: self
+                .inventory
+                .as_ref()
+                .and_then(|inventory| inventory.socket_gate(hints.project_slug.as_deref())),
+            exclude_node_ids: &hints.exclude_node_ids,
+            exclude_control_plane: hints.exclude_control_plane,
+            affinity_nodes: &hints.affinity_nodes,
+        }
+    }
+
+    /// Place `spec` (strictly: a pin that cannot be met is an error, never
+    /// a quiet move). The reservation of each replica is held as in flight
+    /// until the returned guard drops, so concurrent placements see it.
+    pub async fn schedule(
+        &self,
+        name: &str,
+        spec: &WorkloadSpec,
+        hints: &PlacementHints,
+    ) -> Result<(Placement, InFlightGuard), PlaneError> {
+        let nodes = self.facts_for(name, hints).await?;
+        let placement = self
+            .scheduler
+            .schedule(&nodes, &self.request_for(spec, hints))
+            .map_err(|error| PlaneError::Unschedulable {
+                workload: name.to_string(),
+                reason: error.reason(),
+                message: error.to_string(),
+            })?;
+        let guard = self.in_flight.hold(&placement.nodes, placement.reservation);
+        Ok((placement, guard))
+    }
+
+    /// A scheduler dry run for `spec` (ADR-055 §8): the recommended nodes
+    /// with reasons (linked service's node, image cached, architecture,
+    /// headroom), the nodes passed over and why, and where it would go now.
+    /// Changes nothing.
+    pub async fn explain(
+        &self,
+        spec: &WorkloadSpec,
+        hints: &PlacementHints,
+    ) -> Result<Explanation, PlaneError> {
+        let name = format!("{}", spec.owner);
+        let nodes = self.facts_for(&name, hints).await?;
+        let image = match &spec.artifact {
+            temps_workload::Artifact::OciImage { reference, .. } => Some(reference.as_str()),
+            _ => None,
+        };
+        let context = match self.inventory.as_ref() {
+            Some(inventory) => inventory
+                .explain_context(hints, image)
+                .await
+                .map_err(|reason| PlaneError::Inventory {
+                    workload: name.clone(),
+                    reason,
+                })?,
+            None => Default::default(),
+        };
+        Ok(scheduler::explain(
+            &self.scheduler,
+            &nodes,
+            &self.request_for(spec, hints),
+            &context,
+        ))
+    }
+
+    /// The latest instance of workload `id` and what the driver reports for
+    /// it now (state, address, published ports). `None` before the first
+    /// instance exists or without a driver.
+    pub async fn instance_status(
+        &self,
+        id: i64,
+    ) -> Result<
+        Option<(
+            temps_workload::InstanceHandle,
+            temps_workload::InstanceStatus,
+        )>,
+        PlaneError,
+    > {
+        let Some(driver) = self.driver.0.clone() else {
+            return Ok(None);
+        };
+        let latest = workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.eq(id))
+            .order_by_desc(workload_instances::Column::Attempt)
+            .limit(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db("reading the latest instance", id))?;
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+        let handle: temps_workload::InstanceHandle = serde_json::from_value(latest.handle.clone())
+            .map_err(|e| PlaneError::Corrupt {
+                workload_id: id,
+                field: "instance handle",
+                reason: format!("instance {}: {e}", latest.id),
+            })?;
+        let status = driver
+            .inspect(&handle)
+            .await
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "inspect the instance",
+                source,
+            })?;
+        Ok(Some((handle, status)))
     }
 
     pub fn with_finalizer(mut self, finalizer: Arc<dyn Finalizer>) -> Self {
@@ -442,7 +678,7 @@ impl WorkloadPlane {
             if current.is_some_and(|c| c.status == ConditionStatus::True) {
                 return Ok(view);
             }
-            let (status, reason, message) = explain(&view.status, condition);
+            let (status, reason, message) = condition_explanation(&view.status, condition);
             if view.status.phase.is_terminal() || view.deleted_at.is_some() {
                 return Err(PlaneError::ConditionFailed {
                     workload_id: id,
@@ -561,7 +797,10 @@ impl WorkloadPlane {
 
 /// The condition's status, reason and message; when it is not set, the
 /// first `False` condition, which is usually why.
-fn explain(status: &WorkloadStatus, condition: ConditionKind) -> (ConditionStatus, String, String) {
+fn condition_explanation(
+    status: &WorkloadStatus,
+    condition: ConditionKind,
+) -> (ConditionStatus, String, String) {
     if let Some(c) = status.condition(condition) {
         return (c.status, c.reason.clone(), c.message.clone());
     }

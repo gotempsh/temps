@@ -2379,6 +2379,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 

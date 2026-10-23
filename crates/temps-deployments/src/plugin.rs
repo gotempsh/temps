@@ -104,25 +104,36 @@ impl DeploymentsPlugin {
         let mut config = temps_workload_plane::PlaneConfig::new("temps");
         config.network = Some(temps_core::NETWORK_NAME.clone());
         config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
-        let plane = Arc::new(
-            temps_workload_plane::WorkloadPlane::new(
-                db.clone(),
-                temps_workload_plane::NodeDriver(driver),
-                Arc::new(crate::services::cron_jobs::DeploymentEnvSource::new(
-                    deployment_service,
-                )),
-                audit,
-                config,
-            )
-            .with_finalizer(Arc::new(
-                crate::services::cron_jobs::CronRunFinalizer::new(db),
+        let placement = context.get_service::<crate::services::WorkloadPlacementService>();
+        let mut plane = temps_workload_plane::WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(driver),
+            Arc::new(crate::services::cron_jobs::DeploymentEnvSource::new(
+                deployment_service,
             )),
-        );
+            audit,
+            config,
+        )
+        .with_finalizer(Arc::new(crate::services::cron_jobs::CronRunFinalizer::new(
+            db,
+        )));
+        // ADR-055 §8: the plane schedules from the product's node inventory
+        // with the same threshold and control-plane policy as NodeScheduler.
+        if let Some(placement) = placement {
+            plane = plane
+                .with_scheduler_config(placement.scheduler_config().clone())
+                .with_inventory(placement);
+        }
+        let plane = Arc::new(plane);
         match plane.start() {
             // Dropping the handle leaves the reconciler running for the
             // life of the process.
             Ok(_handle) => {
-                cron_service.set_workload_plane(plane);
+                cron_service.set_workload_plane(plane.clone());
+                // `enforce` environments start replicas through it.
+                if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
+                    workflow.set_workload_plane(plane);
+                }
                 tracing::info!("Workload plane started; job crons are enabled");
             }
             Err(e) => tracing::error!("Workload plane did not start: {e}"),
@@ -500,7 +511,7 @@ impl TempsPlugin for DeploymentsPlugin {
             // must drop out of the pool instead of taking the replica.
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
             let node_scheduler = Arc::new(
-                crate::services::NodeScheduler::new(node_service)
+                crate::services::NodeScheduler::new(node_service.clone())
                     .with_platform_source(image_builder.clone())
                     // Without this the `Local` slot stays in the pool even in a
                     // profile with no Docker daemon, and a zero-node install
@@ -514,6 +525,19 @@ impl TempsPlugin for DeploymentsPlugin {
                     ),
             );
             workflow_execution_service.set_node_scheduler(node_scheduler.clone());
+
+            // ADR-055 Phase 5: the unified scheduler's view of the nodes,
+            // built from the same settings as NodeScheduler so a shadow run
+            // differs only where the ADR says it does. Feeds the workload
+            // plane's scheduler and the admin placement API.
+            let workload_placement = Arc::new(crate::services::WorkloadPlacementService::new(
+                db.clone(),
+                node_service,
+                config_service.clone(),
+                &node_scheduler,
+            ));
+            workflow_execution_service.set_workload_placement(workload_placement.clone());
+            context.register_service(workload_placement);
             deployment_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
@@ -1188,6 +1212,15 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)
             .merge(
+                handlers::workload_placement::configure_routes().with_state(Arc::new(
+                    handlers::workload_placement::WorkloadPlacementAppState {
+                        service: context
+                            .require_service::<crate::services::WorkloadPlacementService>(),
+                        audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                    },
+                )),
+            )
+            .merge(
                 handlers::runtime_health::routes()
                     .with_state(Arc::new(handlers::runtime_health::RuntimeHealthAppState {
                     service: context
@@ -1240,6 +1273,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 traefik_discovery_schema,
                 compose_check_schema,
                 <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
             ],
         ))
     }

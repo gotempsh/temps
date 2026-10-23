@@ -47,9 +47,9 @@ use temps_core::docker_socket_grant::DOCKER_SOCKET_BIND;
 use temps_entities::{workload_instances, workloads};
 use temps_workload::{
     labels as workload_labels, Attachments, ConditionKind, ConditionStatus, DriverError,
-    InstanceHandle, InstanceLimits, InstanceSpec, InstanceState, Lifetime, LogQuery, LogRotation,
-    NetworkAttachment, Resources, RestartPolicy, RuntimeDriver, SecurityProfile, WorkloadPhase,
-    WorkloadStatus,
+    InstanceHandle, InstanceLimits, InstanceSpec, InstanceState, Lifetime, LimitSupport, LogQuery,
+    LogRotation, NetworkAttachment, PortBinding, Resources, RestartPolicy, RuntimeDriver,
+    SecurityProfile, WorkloadPhase, WorkloadStatus,
 };
 
 use crate::admission::DEFAULT_JOB_TTL_SECS;
@@ -348,20 +348,27 @@ impl WorkloadPlane {
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, PlaneError> {
         let mut status = view.status.clone();
-        let Lifetime::RunToCompletion {
-            timeout_secs,
-            retry_limit,
-            ttl_secs_after_finished,
-        } = view.spec.lifetime
-        else {
-            let message = format!(
-                "lifetime {:?} is not reconciled by the plane yet",
-                view.spec.lifetime
-            );
-            fail(&mut status, "UnsupportedLifetime", &message, now);
-            return self
-                .conclude(row, view, instances, status, now, now, None)
-                .await;
+        let (timeout_secs, retry_limit, ttl_secs_after_finished) = match view.spec.lifetime {
+            Lifetime::RunToCompletion {
+                timeout_secs,
+                retry_limit,
+                ttl_secs_after_finished,
+            } => (timeout_secs, retry_limit, ttl_secs_after_finished),
+            Lifetime::LongRunning { .. } => {
+                return self.drive_long_running(row, view, instances, now).await;
+            }
+            Lifetime::ScaleToZero { .. } => {
+                // Admission refuses it; a row written by a newer binary is
+                // failed with why rather than run as something else.
+                let message = format!(
+                    "lifetime {:?} is not reconciled by the plane yet",
+                    view.spec.lifetime
+                );
+                fail(&mut status, "UnsupportedLifetime", &message, now);
+                return self
+                    .conclude(row, view, instances, status, now, now, None)
+                    .await;
+            }
         };
         let ttl = Duration::seconds(i64::from(
             ttl_secs_after_finished.unwrap_or(DEFAULT_JOB_TTL_SECS),
@@ -397,6 +404,7 @@ impl WorkloadPlane {
             "runs on the control plane (node 0)",
             now,
         );
+        set_limit_condition(&mut status, &view.spec.resources, &driver, now);
         let deadline = row.created_at + Duration::seconds(i64::from(timeout_secs));
 
         if now >= deadline {
@@ -447,7 +455,7 @@ impl WorkloadPlane {
 
         let Some(latest) = instances.last().cloned() else {
             return self
-                .start_attempt(row, view, status, 1, deadline, ttl, &driver, now)
+                .start_attempt(row, view, status, 1, Some(deadline), ttl, &driver, now)
                 .await;
         };
         let attempt = u32::try_from(latest.attempt).unwrap_or(1);
@@ -463,7 +471,7 @@ impl WorkloadPlane {
                         // The row was written but the container never was:
                         // the previous process stopped before creating it.
                         return self
-                            .launch(row, view, status, latest, deadline, ttl, &driver, now)
+                            .launch(row, view, status, latest, Some(deadline), ttl, &driver, now)
                             .await;
                     }
                     InstanceState::Created => {
@@ -486,12 +494,28 @@ impl WorkloadPlane {
                                 .await;
                         }
                         return self
-                            .mark_started(row, status, &latest, handle, deadline, &driver, now)
+                            .mark_started(
+                                row,
+                                status,
+                                &latest,
+                                handle,
+                                Some(deadline),
+                                &driver,
+                                now,
+                            )
                             .await;
                     }
                     InstanceState::Running => {
                         return self
-                            .mark_started(row, status, &latest, handle, deadline, &driver, now)
+                            .mark_started(
+                                row,
+                                status,
+                                &latest,
+                                handle,
+                                Some(deadline),
+                                &driver,
+                                now,
+                            )
                             .await;
                     }
                     InstanceState::Exited => {
@@ -606,7 +630,16 @@ impl WorkloadPlane {
                 .await
                 .map_err(driver_error(row.id, "remove the failed attempt"))?;
             return self
-                .start_attempt(row, view, status, attempt + 1, deadline, ttl, &driver, now)
+                .start_attempt(
+                    row,
+                    view,
+                    status,
+                    attempt + 1,
+                    Some(deadline),
+                    ttl,
+                    &driver,
+                    now,
+                )
                 .await;
         }
         let message =
@@ -632,6 +665,210 @@ impl WorkloadPlane {
             .await
     }
 
+    /// A long-running workload (one deployment replica, ADR-055 Phase 5):
+    /// create its one instance and report it. The runtime restarts a
+    /// crashed process in place (its restart policy), as the legacy
+    /// deployer's containers are; the plane never replaces a replica on its
+    /// own, because the product owns the revision's lifecycle (blue/green,
+    /// sleep, retirement). The owner deletes the workload to retire it.
+    async fn drive_long_running(
+        &self,
+        row: workloads::Model,
+        view: WorkloadView,
+        instances: Vec<workload_instances::Model>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, PlaneError> {
+        let mut status = view.status.clone();
+        let ttl = Duration::seconds(i64::from(DEFAULT_JOB_TTL_SECS));
+        // Strict pinning (§8): this plane runs instances on the control
+        // plane only, so a replica pinned elsewhere stays unscheduled with
+        // the reason instead of quietly running on node 0.
+        if let Some(pinned) = view
+            .spec
+            .placement
+            .pinned_nodes()
+            .filter(|nodes| !nodes.contains(&crate::scheduler::CONTROL_PLANE_NODE_ID))
+        {
+            let message = format!(
+                "pinned to node(s) {pinned:?}, and this plane runs instances only on the control \
+                 plane (node 0); worker replicas are placed by the deployment, not the plane"
+            );
+            status.set_condition(
+                ConditionKind::Scheduled,
+                ConditionStatus::False,
+                "PinnedNodeNotServed",
+                &message,
+                now,
+            );
+            status.phase = WorkloadPhase::Pending;
+            if self.write_status(&row, &status, None).await? {
+                events::record(
+                    self.db.as_ref(),
+                    row.id,
+                    None,
+                    "PinnedNodeNotServed",
+                    &message,
+                    now,
+                )
+                .await?;
+            }
+            return Ok(None);
+        }
+        let Some(driver) = self.driver.0.clone() else {
+            let message = "0/1 nodes eligible: the control plane (node 0) has no runtime driver; \
+                           the Docker daemon was not reachable when temps started";
+            status.set_condition(
+                ConditionKind::Scheduled,
+                ConditionStatus::False,
+                "NoEligibleNode",
+                message,
+                now,
+            );
+            fail(&mut status, "NoEligibleNode", message, now);
+            events::record(
+                self.db.as_ref(),
+                row.id,
+                None,
+                "NoEligibleNode",
+                message,
+                now,
+            )
+            .await?;
+            return self
+                .conclude(row, view, instances, status, now, now + ttl, None)
+                .await;
+        };
+        status.set_condition(
+            ConditionKind::Scheduled,
+            ConditionStatus::True,
+            "ControlPlane",
+            "runs on the control plane (node 0)",
+            now,
+        );
+        set_limit_condition(&mut status, &view.spec.resources, &driver, now);
+
+        let Some(latest) = instances.last().cloned() else {
+            return self
+                .start_attempt(row, view, status, 1, None, ttl, &driver, now)
+                .await;
+        };
+        let attempt = latest.attempt;
+        if latest.phase != PHASE_PENDING && latest.phase != PHASE_RUNNING {
+            // Finished instance rows of a live long-running workload only
+            // exist after a conclusion; nothing to drive.
+            return Ok(None);
+        }
+        let handle = handle_of(&latest)?;
+        let observed = driver
+            .inspect(&handle)
+            .await
+            .map_err(driver_error(row.id, "inspect the instance"))?;
+        let poll = Duration::from_std(self.config.resync_interval).unwrap_or(Duration::minutes(5));
+        match observed.state {
+            InstanceState::Missing if latest.phase == PHASE_PENDING => {
+                self.launch(row, view, status, latest, None, ttl, &driver, now)
+                    .await
+            }
+            InstanceState::Created => {
+                if let Err(error) = driver.start(&handle).await {
+                    return self
+                        .launch_failed(
+                            row,
+                            view,
+                            instances,
+                            status,
+                            &latest,
+                            &driver,
+                            &handle,
+                            "StartFailed",
+                            error,
+                            now,
+                            ttl,
+                        )
+                        .await;
+                }
+                self.mark_started(row, status, &latest, handle, None, &driver, now)
+                    .await
+            }
+            InstanceState::Running => {
+                self.mark_started(row, status, &latest, handle, None, &driver, now)
+                    .await
+            }
+            InstanceState::Exited => {
+                // Stopped and not restarted by its restart policy: the owner
+                // stopped it (scale to zero, an environment put to sleep) or
+                // it crashed past the policy. The owner decides; the plane
+                // never replaces a deployment replica behind its back, and
+                // picks it up again when the owner starts it.
+                let message = format!(
+                    "attempt {attempt} ('{}') is stopped (exit code {:?}); it runs again when \
+                     its owner starts it",
+                    handle.name, observed.exit_code
+                );
+                status.ready_instances = 0;
+                status.exit_code = observed.exit_code;
+                status.set_condition(
+                    ConditionKind::Running,
+                    ConditionStatus::False,
+                    "Stopped",
+                    &message,
+                    now,
+                );
+                status.set_condition(
+                    ConditionKind::Ready,
+                    ConditionStatus::False,
+                    "Stopped",
+                    &message,
+                    now,
+                );
+                status.phase = WorkloadPhase::Running;
+                if self.write_status(&row, &status, None).await? {
+                    events::record(
+                        self.db.as_ref(),
+                        row.id,
+                        Some(latest.id),
+                        "Stopped",
+                        &message,
+                        now,
+                    )
+                    .await?;
+                }
+                Ok(Some(now + poll))
+            }
+            InstanceState::Missing => {
+                // Removed outside the plane (the legacy retire path, an
+                // operator): the replica is gone. Never recreated: a
+                // retired revision must not come back.
+                self.finish_instance(latest.id, PHASE_FAILED, None, now)
+                    .await?;
+                let message = format!(
+                    "attempt {attempt}: container '{}' was removed outside the plane; the \
+                     replica is not recreated",
+                    handle.name
+                );
+                status.set_condition(
+                    ConditionKind::Running,
+                    ConditionStatus::False,
+                    "InstanceRemoved",
+                    &message,
+                    now,
+                );
+                fail(&mut status, "InstanceRemoved", &message, now);
+                events::record(
+                    self.db.as_ref(),
+                    row.id,
+                    Some(latest.id),
+                    "InstanceRemoved",
+                    &message,
+                    now,
+                )
+                .await?;
+                self.conclude(row, view, instances, status, now, now + ttl, None)
+                    .await
+            }
+        }
+    }
+
     /// Insert attempt `attempt`'s row, then create and start it. The row
     /// comes first, so a crash between the two leaves a row the next pass
     /// finishes, never a container nothing tracks.
@@ -642,7 +879,7 @@ impl WorkloadPlane {
         view: WorkloadView,
         status: WorkloadStatus,
         attempt: u32,
-        deadline: DateTime<Utc>,
+        deadline: Option<DateTime<Utc>>,
         ttl: Duration,
         driver: &Arc<dyn RuntimeDriver>,
         now: DateTime<Utc>,
@@ -690,7 +927,7 @@ impl WorkloadPlane {
         view: WorkloadView,
         mut status: WorkloadStatus,
         instance: workload_instances::Model,
-        deadline: DateTime<Utc>,
+        deadline: Option<DateTime<Utc>>,
         ttl: Duration,
         driver: &Arc<dyn RuntimeDriver>,
         now: DateTime<Utc>,
@@ -745,7 +982,11 @@ impl WorkloadPlane {
             now,
         );
 
-        let resolved = match env::resolve(&spec.env, self.env.as_ref()).await {
+        let resolved = match env::resolve_with_staged(&spec.env, self.env.as_ref(), &|import| {
+            self.staged(import)
+        })
+        .await
+        {
             Ok(resolved) => resolved,
             Err(reason) => {
                 let message =
@@ -803,10 +1044,29 @@ impl WorkloadPlane {
             entrypoint: spec.process.entrypoint.clone(),
             workdir: spec.process.workdir.clone(),
             user: spec.process.user.clone(),
-            ports: Vec::new(),
-            // The plane retries, not the runtime: a restarted container
-            // would hide the exit the retry limit counts.
-            restart: RestartPolicy::Never,
+            ports: match spec.lifetime {
+                Lifetime::LongRunning { .. } | Lifetime::ScaleToZero { .. } => spec
+                    .ports
+                    .iter()
+                    .map(|port| PortBinding {
+                        container_port: port.container_port,
+                        protocol: port.protocol,
+                        host_ip: self.config.publish_host_ip.clone(),
+                        host_port: None,
+                    })
+                    .collect(),
+                Lifetime::RunToCompletion { .. } => Vec::new(),
+            },
+            restart: match spec.lifetime {
+                // The runtime restarts a long-running instance in place, as
+                // the legacy deployer's containers are.
+                Lifetime::LongRunning { restart } => restart,
+                // The plane retries, not the runtime: a restarted container
+                // would hide the exit the retry limit counts.
+                Lifetime::RunToCompletion { .. } | Lifetime::ScaleToZero { .. } => {
+                    RestartPolicy::Never
+                }
+            },
             limits: limits_from(&spec.resources),
             log_rotation: Some(LogRotation {
                 max_size: "10m".to_string(),
@@ -952,7 +1212,7 @@ impl WorkloadPlane {
         mut status: WorkloadStatus,
         instance: &workload_instances::Model,
         handle: InstanceHandle,
-        deadline: DateTime<Utc>,
+        deadline: Option<DateTime<Utc>>,
         driver: &Arc<dyn RuntimeDriver>,
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, PlaneError> {
@@ -981,15 +1241,28 @@ impl WorkloadPlane {
         status.ready_instances = 1;
         status.exit_code = None;
         status.phase = WorkloadPhase::Running;
+        if matches!(view_lifetime(&row), Some(Lifetime::LongRunning { .. })) {
+            // No readiness probe is run by the plane yet: the product gates
+            // traffic on its own health check (blue/green stays in the
+            // product), so a running instance is reported ready with why.
+            status.set_condition(
+                ConditionKind::Ready,
+                ConditionStatus::True,
+                "NoProbe",
+                "running; the plane runs no readiness probe, the owner checks health",
+                now,
+            );
+        }
         self.write_status(&row, &status, None).await?;
         self.watch(driver, instance.id, handle);
         let waits = self.driver_waits.load(Ordering::Relaxed);
         let poll = Duration::from_std(self.config.poll_interval).unwrap_or(Duration::seconds(5));
-        Ok(Some(if waits {
-            deadline
-        } else {
-            deadline.min(now + poll)
-        }))
+        Ok(match (deadline, waits) {
+            (Some(deadline), true) => Some(deadline),
+            (Some(deadline), false) => Some(deadline.min(now + poll)),
+            (None, true) => None,
+            (None, false) => Some(now + poll),
+        })
     }
 
     /// Write the finished status (with its expiry, in the same statement,
@@ -1328,7 +1601,11 @@ impl WorkloadPlane {
             .cloned();
         let redactor = match known {
             Some(redactor) => redactor,
-            None => match env::resolve(&view.spec.env, self.env.as_ref()).await {
+            None => match env::resolve_with_staged(&view.spec.env, self.env.as_ref(), &|import| {
+                self.staged(import)
+            })
+            .await
+            {
                 Ok(resolved) => resolved.redactor,
                 Err(reason) => {
                     tracing::debug!(workload_id = view.id, "output tail skipped: {reason}");
@@ -1437,6 +1714,72 @@ impl WorkloadPlane {
     }
 }
 
+/// The lifetime of the stored spec, when it decodes.
+fn view_lifetime(row: &workloads::Model) -> Option<Lifetime> {
+    serde_json::from_value::<temps_workload::WorkloadSpec>(row.spec.clone())
+        .ok()
+        .map(|spec| spec.lifetime)
+}
+
+/// `LimitEnforced` (ADR-055 §5): a limit is always applied, and one the
+/// driver cannot apply is reported with the reason, never ignored silently.
+/// Not set when the spec sets no limit.
+fn set_limit_condition(
+    status: &mut WorkloadStatus,
+    resources: &Resources,
+    driver: &Arc<dyn RuntimeDriver>,
+    now: DateTime<Utc>,
+) {
+    let Some(limits) = resources.limits else {
+        return;
+    };
+    let capabilities = driver.capabilities();
+    let support: LimitSupport = capabilities.limits;
+    let mut unenforced = Vec::new();
+    if limits.cpu_millis.is_some() && !support.cpu {
+        unenforced.push(format!(
+            "{}: CPU limits are not supported",
+            capabilities.name
+        ));
+    }
+    if limits.memory_mb.is_some() && !support.memory {
+        unenforced.push(format!(
+            "{}: memory limits are not supported",
+            capabilities.name
+        ));
+    }
+    if limits.pids.is_some() && !support.pids {
+        unenforced.push(format!(
+            "{}: process limits are not supported",
+            capabilities.name
+        ));
+    }
+    if let Some(disk) = limits.disk_mb.filter(|_| !support.disk) {
+        unenforced.push(format!(
+            "{}: the {disk} MB disk limit needs an XFS/overlay2 project quota on this host, \
+             which this driver does not apply",
+            capabilities.name
+        ));
+    }
+    if unenforced.is_empty() {
+        status.set_condition(
+            ConditionKind::LimitEnforced,
+            ConditionStatus::True,
+            "Applied",
+            "every configured limit is applied by the runtime",
+            now,
+        );
+    } else {
+        status.set_condition(
+            ConditionKind::LimitEnforced,
+            ConditionStatus::False,
+            "LimitUnsupported",
+            unenforced.join("; "),
+            now,
+        );
+    }
+}
+
 fn view_spec_ttl(row: &workloads::Model) -> Option<Duration> {
     let spec: temps_workload::WorkloadSpec = serde_json::from_value(row.spec.clone()).ok()?;
     match spec.lifetime {
@@ -1452,8 +1795,8 @@ fn view_spec_ttl(row: &workloads::Model) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::testing::{
-        apply_request, job_spec, job_spec_with, plane, plane_with, test_db, FakeDriver,
-        RecordingFinalizer,
+        apply_request, deployment_spec, job_spec, job_spec_with, plane, plane_with, test_db,
+        FakeDriver, RecordingFinalizer,
     };
     use crate::NodeDriver;
 
@@ -1777,5 +2120,113 @@ mod tests {
         assert!(driver.exists("another-planes-instance"));
         assert!(driver.exists(&tracked[0]));
         assert_eq!(plane.get(id).await.expect("read").attempt, 1);
+    }
+
+    #[tokio::test]
+    async fn a_deployment_replica_runs_until_its_owner_retires_it_and_is_never_recreated() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let mut spec = deployment_spec("app:1");
+        spec.resources.limits = Some(temps_workload::ResourceAmounts {
+            memory_mb: Some(256),
+            disk_mb: Some(1024),
+            ..Default::default()
+        });
+        let id = plane
+            .apply(apply_request(42, "app-r1", spec))
+            .await
+            .expect("applied");
+        let now = Utc::now();
+        plane.reconcile_at(now, false).await;
+        let running = driver.running();
+        assert_eq!(running.len(), 1, "one instance started");
+        let created = driver.created();
+        let (instance, _) = &created[0];
+        assert_eq!(instance.ports.len(), 1);
+        assert_eq!(instance.ports[0].container_port, 3000);
+        assert_eq!(
+            instance.ports[0].host_ip, "127.0.0.1",
+            "never all interfaces"
+        );
+        assert_eq!(instance.restart, RestartPolicy::UnlessStopped);
+        assert_eq!(instance.limits.memory_bytes, Some(256 * 1024 * 1024));
+
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Running);
+        let ready = view.status.condition(ConditionKind::Ready).expect("ready");
+        assert_eq!(ready.status, ConditionStatus::True);
+        assert_eq!(ready.reason, "NoProbe");
+        // The fake driver applies no limit: each one is named, never ignored.
+        let limit = view
+            .status
+            .condition(ConditionKind::LimitEnforced)
+            .expect("limit condition");
+        assert_eq!(limit.status, ConditionStatus::False);
+        assert_eq!(limit.reason, "LimitUnsupported");
+        assert!(
+            limit.message.contains("1024 MB disk limit"),
+            "{}",
+            limit.message
+        );
+        assert!(limit.message.contains("memory"), "{}", limit.message);
+
+        // Stopped by its owner (an environment put to sleep): reported, kept,
+        // not replaced.
+        driver.exit(&running[0], 0);
+        plane.reconcile_at(now, false).await;
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Running);
+        let state = view
+            .status
+            .condition(ConditionKind::Running)
+            .expect("running");
+        assert_eq!(state.status, ConditionStatus::False);
+        assert_eq!(state.reason, "Stopped");
+        assert!(driver.exists(&running[0]), "a stopped replica is kept");
+        assert_eq!(driver.created().len(), 1, "and not replaced");
+
+        // Removed outside the plane (the legacy retire path): the workload
+        // fails with why, and nothing is recreated.
+        driver.forget(&running[0]);
+        plane.reconcile_at(now + Duration::seconds(30), false).await;
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Failed);
+        let state = view
+            .status
+            .condition(ConditionKind::Running)
+            .expect("running");
+        assert_eq!(state.reason, "InstanceRemoved");
+        plane.reconcile_at(now + Duration::seconds(60), false).await;
+        assert_eq!(
+            driver.created().len(),
+            1,
+            "a retired replica never comes back"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_pinned_to_a_worker_stays_unscheduled_with_the_reason() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let mut spec = deployment_spec("app:1");
+        spec.placement.nodes = Some(vec![3]);
+        let id = plane
+            .apply(apply_request(42, "app-pinned", spec))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(
+            driver.created().is_empty(),
+            "never quietly placed on node 0"
+        );
+        let view = plane.get(id).await.expect("read");
+        assert!(!view.status.phase.is_terminal(), "pending, not failed");
+        let scheduled = view
+            .status
+            .condition(ConditionKind::Scheduled)
+            .expect("scheduled");
+        assert_eq!(scheduled.status, ConditionStatus::False);
+        assert_eq!(scheduled.reason, "PinnedNodeNotServed");
+        assert!(scheduled.message.contains("[3]"), "{}", scheduled.message);
     }
 }

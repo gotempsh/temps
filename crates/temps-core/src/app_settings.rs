@@ -195,6 +195,13 @@ pub struct AppSettings {
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
 
+    /// The control plane's (node 0's) scheduling settings, the counterpart
+    /// of `nodes.resource_policy` / `nodes.system_reserved` on worker rows
+    /// (ADR-055 §5). Stored here because node 0 is not a `nodes` row; changed
+    /// through `PUT /nodes/0/resources`.
+    #[serde(default)]
+    pub control_plane_resources: ControlPlaneResourceSettings,
+
     /// Retention policy for locally-built deployment images. Modeled as a
     /// settings row (not an env var) per CLAUDE.md so an operator can change
     /// the system-wide default at runtime without restarting the binary.
@@ -982,6 +989,24 @@ pub struct BuildLimitsSettings {
     /// accepts through the client, with a warning in the server log.
     #[schema(minimum = 0, example = 2048)]
     pub memory_limit_mb: u32,
+}
+
+/// The control plane's scheduling settings (ADR-055 §5).
+///
+/// `None` reserves take the §5 default for the control plane, which depends
+/// on whether its PostgreSQL runs on the same host (0.5 vCPU / 1 GB) or not
+/// (0.25 vCPU / 512 MB). Those defaults are estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ControlPlaneResourceSettings {
+    /// `true` = `enforced`: refuse a placement on the control plane whose
+    /// reservations exceed its capacity minus the reserve. `false` (the
+    /// default) = `best_effort`.
+    pub enforce_reservations: bool,
+    /// CPU kept for Temps itself, in millicores. `None` = the default.
+    pub system_reserved_cpu_millis: Option<u32>,
+    /// Memory kept for Temps itself, in megabytes. `None` = the default.
+    pub system_reserved_memory_mb: Option<u32>,
 }
 
 /// System-wide retention policy for locally-built deployment images.
@@ -2337,6 +2362,7 @@ impl Default for AppSettings {
             connection_limits: ConnectionLimitSettings::default(),
             tenant_resource_ceilings: TenantResourceCeilings::default(),
             build_limits: BuildLimitsSettings::default(),
+            control_plane_resources: ControlPlaneResourceSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),

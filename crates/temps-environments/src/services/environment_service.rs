@@ -1896,6 +1896,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
         let mut fenced = environment.clone();
         fenced.deleted_at = Some(chrono::Utc::now());
@@ -2017,6 +2018,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
 
         // Query sequence:
@@ -2119,6 +2121,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         };
         let updated_env = environments::Model {
             deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
@@ -2371,6 +2374,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -2494,6 +2498,7 @@ mod tests {
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 

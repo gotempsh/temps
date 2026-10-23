@@ -120,6 +120,7 @@ pub fn environment_model(
         force_https: None,
         last_activity_at: None,
         ingress_mode: Default::default(),
+        workload_mode: Default::default(),
     }
 }
 

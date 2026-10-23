@@ -702,6 +702,10 @@ fn collect_capacity_metrics() -> serde_json::Value {
         "memory_total_bytes": sys.total_memory(),
         "disk_used_bytes": disk_used,
         "disk_total_bytes": disk_total,
+        // ADR-055 §5: the scheduler deducts `system_reserved` (millicores)
+        // from the node's CPU capacity, and an enforcing node counts
+        // reservations against it. Only the core count makes that possible.
+        "cpu_cores": sys.cpus().len(),
     })
 }
 

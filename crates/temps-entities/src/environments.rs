@@ -67,6 +67,12 @@ pub struct Model {
     /// before the column reads as `legacy`.
     #[serde(default)]
     pub ingress_mode: super::ingress_mode::IngressMode,
+    /// Which scheduler places this environment's deployments (ADR-055
+    /// Phase 5): `NodeScheduler`, both compared, or the unified scheduler and
+    /// the workload plane. A serialized row from before the column reads as
+    /// `legacy`.
+    #[serde(default)]
+    pub workload_mode: super::environment_workload_mode::EnvironmentWorkloadMode,
 }
 
 /// Serialize a claim on the global preview-hostname namespace and return any

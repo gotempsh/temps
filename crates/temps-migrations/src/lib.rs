@@ -50,3 +50,5 @@ pub use migration::m20261022_000007_network_policy::{
     backfill_sql as network_policy_backfill_sql, Migration as NetworkPolicyMigration,
 };
 pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;
+
+pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;

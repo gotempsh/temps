@@ -55,6 +55,23 @@ pub(crate) fn job_spec_with(
     }
 }
 
+/// One replica of a deployment revision (Phase 5): long-running, one port.
+pub(crate) fn deployment_spec(image: &str) -> WorkloadSpec {
+    let mut spec = job_spec(image);
+    spec.owner = WorkloadRef::new(WorkloadKind::Deployment, 42);
+    spec.process = Process::default();
+    spec.lifetime = Lifetime::LongRunning {
+        restart: temps_workload::RestartPolicy::UnlessStopped,
+    };
+    spec.ports.push(temps_workload::PortSpec {
+        name: "http".into(),
+        container_port: 3000,
+        protocol: Default::default(),
+        app_protocol: Default::default(),
+    });
+    spec
+}
+
 pub(crate) fn job_spec(image: &str) -> WorkloadSpec {
     job_spec_with(image, 600, 0, None)
 }
