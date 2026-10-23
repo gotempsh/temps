@@ -590,6 +590,7 @@ fn register_problem(node_id: i32, error: MeshError) -> Problem {
         MeshError::Corrupt { .. }
         | MeshError::Database(_)
         | MeshError::InvalidCidr { .. }
+        | MeshError::CaPredatesCertificateHistory { .. }
         | MeshError::OverlapsComputePool { .. }
         | MeshError::InvalidPort(_)
         | MeshError::PortClashesWithVxlan(_)

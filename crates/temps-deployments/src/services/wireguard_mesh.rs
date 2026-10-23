@@ -198,6 +198,14 @@ pub struct WireguardMeshStatusResponse {
     pub reason: Option<String>,
     /// Mesh address pool, when enabled.
     pub cidr: Option<String>,
+    /// The pool the mesh uses, or would use if turned on now: nodes get
+    /// their mesh addresses from it. Unrelated to the compute pool.
+    pub pool_cidr: String,
+    /// Whether the cluster CA must be rotated before the mesh can be turned
+    /// on: it predates certificate address history, so no pool can be
+    /// proven free of its worker certificates. Always `false` once the mesh
+    /// is on.
+    pub ca_rotation_required: bool,
     /// UDP port every node must accept from the others — the configured
     /// one even while the mesh is off, so it can be opened in advance.
     pub listen_port: u16,
@@ -286,6 +294,16 @@ impl WireguardMeshService {
                 .await
                 .map_err(mesh("read the mesh port"))?,
         };
+        let pool_cidr = match &settings {
+            Some(settings) => settings.cidr,
+            None => temps_network::mesh::configured_pool(db)
+                .await
+                .map_err(mesh("read the mesh pool"))?,
+        };
+        let ca_rotation_required = settings.is_none()
+            && temps_network::mesh::ca_predates_certificate_history(db)
+                .await
+                .map_err(mesh("read the cluster CA's certificate history"))?;
         let (state, mut reason) = state_of(settings.as_ref(), published.is_some());
         if state == WireguardMeshState::Starting {
             if let Some(failure) = temps_network::control_plane::last_setup_failure() {
@@ -389,7 +407,9 @@ impl WireguardMeshService {
             cidr: settings.as_ref().map(|settings| settings.cidr.to_string()),
             listen_port,
             control_plane,
-            can_enable: settings.is_none() && blocker.is_none(),
+            pool_cidr: pool_cidr.to_string(),
+            ca_rotation_required,
+            can_enable: settings.is_none() && blocker.is_none() && !ca_rotation_required,
             enable_blocker: blocker,
             enable_command: ENABLE_MESH_COMMAND.to_string(),
             join_url,

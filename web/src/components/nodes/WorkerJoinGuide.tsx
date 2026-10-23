@@ -47,6 +47,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import { Button } from '@/components/ui/button'
+import { MeshCaRotationRequired } from '@/components/nodes/RotateClusterCaDialog'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -1050,6 +1051,10 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
       </div>
       <ul className="list-disc space-y-1 pl-5 text-xs">
         <li>
+          Nodes get mesh addresses from <code>{mesh.pool_cidr}</code>, separate
+          from the range containers use.
+        </li>
+        <li>
           Every node must accept UDP <code>{mesh.listen_port}</code> from the
           other nodes.
         </li>
@@ -1060,7 +1065,9 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         </li>
       </ul>
 
-      {mesh.enable_blocker ? (
+      {mesh.ca_rotation_required ? (
+        <MeshCaRotationRequired mesh={mesh} />
+      ) : mesh.enable_blocker ? (
         <Alert className="border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           <AlertTitle className="text-amber-700 dark:text-amber-400">
