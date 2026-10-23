@@ -72,6 +72,26 @@ pub(crate) fn deployment_spec(image: &str) -> WorkloadSpec {
     spec
 }
 
+/// A WASM function (Phase 10): scale-to-zero, one port, in-host.
+pub(crate) fn function_spec(digest: &str) -> WorkloadSpec {
+    let mut spec = job_spec("unused");
+    spec.owner = WorkloadRef::new(WorkloadKind::Function, 9);
+    spec.artifact = Artifact::WasmComponent {
+        blob: "/var/lib/temps/functions/9.wasm".into(),
+        digest: digest.into(),
+    };
+    spec.isolation = Isolation::InHost;
+    spec.process = Process::default();
+    spec.lifetime = Lifetime::ScaleToZero { idle_secs: 300 };
+    spec.ports.push(temps_workload::PortSpec {
+        name: "http".into(),
+        container_port: 8080,
+        protocol: Default::default(),
+        app_protocol: Default::default(),
+    });
+    spec
+}
+
 pub(crate) fn job_spec(image: &str) -> WorkloadSpec {
     job_spec_with(image, 600, 0, None)
 }
@@ -236,6 +256,8 @@ pub(crate) fn plane_with(
 
 struct FakeInstance {
     state: InstanceState,
+    /// Published ports, with the host port the fake "allocated".
+    ports: Vec<temps_workload::PortBinding>,
     exit_code: Option<i64>,
     labels: BTreeMap<String, String>,
     finished_at: Option<chrono::DateTime<Utc>>,
@@ -266,6 +288,28 @@ impl FakeDriver {
                 },
                 isolation: Isolation::Process,
                 network_attachment: AttachmentKind::DockerNetwork,
+                volumes: VolumeKinds::default(),
+                exec: false,
+                snapshot: false,
+                resize_disk: false,
+                limits: LimitSupport::default(),
+            },
+            state: Mutex::new(FakeState::default()),
+        })
+    }
+
+    /// A WASM-like driver: in-host, confines egress itself, publishes the
+    /// instance's port.
+    pub(crate) fn wasm() -> Arc<Self> {
+        Arc::new(Self {
+            capabilities: DriverCapabilities {
+                name: "fake-wasm".into(),
+                artifacts: ArtifactKinds {
+                    wasm: true,
+                    ..Default::default()
+                },
+                isolation: Isolation::InHost,
+                network_attachment: AttachmentKind::InHost,
                 volumes: VolumeKinds::default(),
                 exec: false,
                 snapshot: false,
@@ -322,6 +366,7 @@ impl FakeDriver {
             name.to_string(),
             FakeInstance {
                 state: InstanceState::Exited,
+                ports: Vec::new(),
                 exit_code: Some(0),
                 labels: labels
                     .iter()
@@ -332,9 +377,9 @@ impl FakeDriver {
         );
     }
 
-    fn handle(name: &str) -> InstanceHandle {
+    fn handle(&self, name: &str) -> InstanceHandle {
         InstanceHandle {
-            driver: "fake".into(),
+            driver: self.capabilities.name.clone(),
             id: name.to_string(),
             name: name.to_string(),
         }
@@ -348,12 +393,16 @@ impl RuntimeDriver for FakeDriver {
     }
 
     async fn prepare(&self, artifact: &Artifact) -> Result<PreparedArtifact, DriverError> {
-        let Artifact::OciImage { reference, .. } = artifact else {
-            return Err(DriverError::Unsupported {
-                driver: "fake".into(),
-                operation: "non-OCI artifacts",
-                instance: String::new(),
-            });
+        let reference = match artifact {
+            Artifact::OciImage { reference, .. } if self.capabilities.artifacts.oci => reference,
+            Artifact::WasmComponent { digest, .. } if self.capabilities.artifacts.wasm => digest,
+            _ => {
+                return Err(DriverError::Unsupported {
+                    driver: self.capabilities.name.clone(),
+                    operation: "this artifact kind",
+                    instance: String::new(),
+                })
+            }
         };
         if self.state().fail_prepare {
             return Err(DriverError::Artifact {
@@ -382,9 +431,18 @@ impl RuntimeDriver for FakeDriver {
                 reason: "name already in use".into(),
             });
         }
+        let next_port = 40_000 + u16::try_from(state.created.len()).unwrap_or(0);
         state.instances.insert(
             spec.name.clone(),
             FakeInstance {
+                ports: spec
+                    .ports
+                    .iter()
+                    .map(|binding| temps_workload::PortBinding {
+                        host_port: Some(next_port),
+                        ..binding.clone()
+                    })
+                    .collect(),
                 state: InstanceState::Created,
                 exit_code: None,
                 labels: spec.labels.clone(),
@@ -392,7 +450,7 @@ impl RuntimeDriver for FakeDriver {
             },
         );
         state.created.push((spec.clone(), attach.clone()));
-        Ok(Self::handle(&spec.name))
+        Ok(self.handle(&spec.name))
     }
 
     async fn start(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
@@ -427,9 +485,10 @@ impl RuntimeDriver for FakeDriver {
 
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let state = self.state();
-        let (state, exit_code, finished_at) = match state.instances.get(&handle.id) {
-            Some(i) => (i.state, i.exit_code, i.finished_at),
-            None => (InstanceState::Missing, None, None),
+        let (state, exit_code, finished_at, published_ports) = match state.instances.get(&handle.id)
+        {
+            Some(i) => (i.state, i.exit_code, i.finished_at, i.ports.clone()),
+            None => (InstanceState::Missing, None, None, Vec::new()),
         };
         Ok(InstanceStatus {
             state,
@@ -437,7 +496,7 @@ impl RuntimeDriver for FakeDriver {
             started_at: None,
             finished_at,
             address: None,
-            published_ports: vec![],
+            published_ports,
         })
     }
 
@@ -480,7 +539,7 @@ impl RuntimeDriver for FakeDriver {
             .iter()
             .filter(|(_, i)| labels.iter().all(|(k, v)| i.labels.get(k) == Some(v)))
             .map(|(name, i)| ListedInstance {
-                handle: Self::handle(name),
+                handle: self.handle(name),
                 labels: i.labels.clone(),
             })
             .collect())

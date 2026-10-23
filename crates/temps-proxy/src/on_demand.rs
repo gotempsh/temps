@@ -19,10 +19,15 @@ use sea_orm::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use temps_core::{ForceRouteReloadJob, Job, JobQueue, OnDemandWaker};
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::{deployment_containers, environments};
+use temps_workload_activator::{
+    ActivationBackend, ActivationError, ActivationKey, ActivationKind, Activator, Registration,
+    Woken,
+};
 use thiserror::Error;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
@@ -164,6 +169,12 @@ pub struct OnDemandManager {
     /// many connections and pin proxy worker tasks. Requests that can't get a
     /// permit get an immediate retryable 503 instead of parking.
     wake_slots: Arc<Semaphore>,
+
+    /// The process's activator (ADR-055 phase 10), once attached. Only
+    /// environments whose `workload_mode` is `enforce` are woken through
+    /// it, and only from their first wake on; every other environment
+    /// keeps the path above exactly as before. Unset: nothing changes.
+    activator: OnceLock<Arc<Activator>>,
 }
 
 /// Maximum number of requests allowed to be parked in the inline wake path
@@ -176,7 +187,6 @@ const MAX_CONCURRENT_WAKE_WAITERS: usize = 256;
 pub(crate) struct OnDemandConfig {
     pub(crate) environment_id: i32,
     pub(crate) idle_timeout_seconds: i32,
-    #[allow(dead_code)] // stored for use when waking via SleepingEnvironmentInfo
     pub(crate) wake_timeout_seconds: i32,
 }
 
@@ -198,7 +208,38 @@ impl OnDemandManager {
             queue,
             route_reloaded: Notify::new(),
             wake_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_WAKE_WAITERS)),
+            activator: OnceLock::new(),
         }
+    }
+
+    /// Wake and sleep `enforce` environments through `activator` (ADR-055
+    /// phase 10): it serialises their wakes with every other scale-to-zero
+    /// target and its sweep puts them back to sleep. The activator's
+    /// environment backend is this manager's own container path, so what
+    /// waking does is unchanged; who decides when is the activator. A
+    /// second call is ignored.
+    pub fn attach_activator(self: &Arc<Self>, activator: Arc<Activator>) {
+        activator.set_backend(
+            ActivationKind::Environment,
+            Arc::new(EnvironmentActivationBackend {
+                manager: Arc::downgrade(self),
+            }),
+        );
+        if self.activator.set(activator).is_err() {
+            warn!("on-demand manager already has an activator; the second one is ignored");
+        }
+    }
+
+    fn activation_key(environment_id: i32) -> ActivationKey {
+        ActivationKey::new(ActivationKind::Environment, i64::from(environment_id))
+    }
+
+    /// The activator, when attached and `environment_id` is registered
+    /// with it (an `enforce` environment it has woken).
+    fn activator_for(&self, environment_id: i32) -> Option<&Arc<Activator>> {
+        self.activator
+            .get()
+            .filter(|activator| activator.is_registered(Self::activation_key(environment_id)))
     }
 
     /// Whether a container with the given `node_id` lives on this proxy's node
@@ -242,6 +283,10 @@ impl OnDemandManager {
     /// Record that a request was received for an environment.
     /// Called on every proxied request — must be O(1) and lock-free.
     pub fn record_activity(&self, environment_id: i32) {
+        if let Some(activator) = self.activator.get() {
+            // One `ArcSwap` load; a no-op for an environment it does not track.
+            activator.touch(Self::activation_key(environment_id));
+        }
         let now = self.current_epoch_secs();
         if let Some(entry) = self.last_activity.get(&environment_id) {
             entry.value().store(now, Ordering::Relaxed);
@@ -385,6 +430,9 @@ impl OnDemandManager {
         self.configs.remove(&environment_id);
         self.last_activity.remove(&environment_id);
         self.wake_states.remove(&environment_id);
+        if let Some(activator) = self.activator.get() {
+            activator.unregister(Self::activation_key(environment_id));
+        }
     }
 
     // ── Sleep (Idle -> Sleeping) ──
@@ -403,6 +451,15 @@ impl OnDemandManager {
             let config = entry.value();
             let env_id = config.environment_id;
 
+            // The activator's sweep puts the environments it woke to sleep;
+            // this one only persists their activity for the UI.
+            if let Some(activator) = self.activator_for(env_id) {
+                if let Some(last) = activator.last_activity(Self::activation_key(env_id)) {
+                    activity_updates.push((env_id, last));
+                }
+                continue;
+            }
+
             if let Some(last) = self.last_activity.get(&env_id) {
                 let last_secs = last.value().load(Ordering::Relaxed);
                 activity_updates.push((env_id, last_secs));
@@ -410,7 +467,7 @@ impl OnDemandManager {
                 let idle_secs = now.saturating_sub(last_secs);
 
                 if idle_secs >= config.idle_timeout_seconds as u64 {
-                    match self.sleep_environment(env_id).await {
+                    match self.sleep_containers(env_id).await {
                         Ok(true) => {
                             info!(
                                 environment_id = env_id,
@@ -476,6 +533,20 @@ impl OnDemandManager {
     /// Returns Ok(true) if this call won the race and performed the sleep.
     /// Returns Ok(false) if the environment was already sleeping or has no deployment.
     pub async fn sleep_environment(&self, environment_id: i32) -> Result<bool, OnDemandError> {
+        let slept = self.sleep_containers(environment_id).await?;
+        if slept {
+            // Put to sleep outside the activator (the console): it wakes it
+            // again on the next request instead of routing to a stopped one.
+            if let Some(activator) = self.activator.get() {
+                activator.mark_asleep(Self::activation_key(environment_id));
+            }
+        }
+        Ok(slept)
+    }
+
+    /// Stop the environment's local containers and mark it sleeping (the
+    /// container path, shared by the legacy sweep and the activator).
+    async fn sleep_containers(&self, environment_id: i32) -> Result<bool, OnDemandError> {
         // Atomic CAS via UPDATE WHERE — only one proxy wins
         let result = self
             .db
@@ -600,7 +671,87 @@ impl OnDemandManager {
 
     /// Wake an environment: start all containers, wait for health checks, set sleeping=false.
     /// Handles concurrent requests: first caller starts containers, others wait.
+    ///
+    /// With an activator attached, an `enforce` environment is woken
+    /// through it (one more row read per wake, none per request).
     pub async fn wake_environment(
+        &self,
+        environment_id: i32,
+        wake_timeout_seconds: i32,
+    ) -> Result<(), OnDemandError> {
+        if let Some(activator) = self.activator.get() {
+            let key = Self::activation_key(environment_id);
+            let env = environments::Entity::find_by_id(environment_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(OnDemandError::NotFound { environment_id })?;
+            if env.workload_mode == EnvironmentWorkloadMode::Enforce {
+                return self
+                    .wake_through_activator(activator, key, &env, wake_timeout_seconds)
+                    .await;
+            }
+            // Switched back from `enforce`: the legacy sweep owns it again.
+            activator.unregister(key);
+        }
+        self.wake_containers(environment_id, wake_timeout_seconds)
+            .await
+    }
+
+    async fn wake_through_activator(
+        &self,
+        activator: &Activator,
+        key: ActivationKey,
+        env: &environments::Model,
+        wake_timeout_seconds: i32,
+    ) -> Result<(), OnDemandError> {
+        let environment_id = env.id;
+        if !activator.is_registered(key) {
+            let idle_secs = self
+                .configs
+                .get(&environment_id)
+                .map(|config| config.idle_timeout_seconds)
+                .or_else(|| {
+                    env.deployment_config
+                        .as_ref()
+                        .map(|config| config.idle_timeout_seconds)
+                })
+                .unwrap_or(300);
+            activator.register(
+                key,
+                Registration {
+                    idle_secs: u32::try_from(idle_secs.max(1)).unwrap_or(300),
+                    wake_timeout_secs: u32::try_from(wake_timeout_seconds.max(1)).unwrap_or(30),
+                    awake: false,
+                },
+            );
+            debug!(
+                environment_id,
+                "enforce environment registered with the activator"
+            );
+        }
+        activator
+            .activate(key)
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                ActivationError::WakeTimeout { .. } => OnDemandError::WakeTimeout {
+                    environment_id,
+                    timeout_secs: wake_timeout_seconds,
+                },
+                ActivationError::NotRegistered { .. }
+                | ActivationError::NoBackend { .. }
+                | ActivationError::Saturated { .. }
+                | ActivationError::WakeFailed { .. }
+                | ActivationError::SleepFailed { .. } => OnDemandError::ContainerOperation {
+                    container_id: "all".to_string(),
+                    reason: format!("activator: {error}"),
+                },
+            })
+    }
+
+    /// Start the environment's containers (the container path, shared by
+    /// the legacy wake and the activator's environment backend).
+    async fn wake_containers(
         &self,
         environment_id: i32,
         wake_timeout_seconds: i32,
@@ -1022,6 +1173,53 @@ impl OnDemandWaker for OnDemandManager {
         self.sleep_environment(environment_id)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+/// What waking and sleeping an `enforce` environment mean to the
+/// activator: this manager's container path. Holds the manager weakly (the
+/// manager holds the activator), so neither keeps the other alive.
+struct EnvironmentActivationBackend {
+    manager: Weak<OnDemandManager>,
+}
+
+impl EnvironmentActivationBackend {
+    fn manager(&self, key: ActivationKey) -> Result<Arc<OnDemandManager>, String> {
+        self.manager
+            .upgrade()
+            .ok_or_else(|| format!("{key}: the on-demand manager has shut down"))
+    }
+
+    fn environment_id(key: ActivationKey) -> Result<i32, String> {
+        i32::try_from(key.id).map_err(|_| format!("{key}: not an environment id"))
+    }
+}
+
+#[async_trait]
+impl ActivationBackend for EnvironmentActivationBackend {
+    async fn wake(&self, key: ActivationKey) -> Result<Woken, String> {
+        let manager = self.manager(key)?;
+        let environment_id = Self::environment_id(key)?;
+        let wake_timeout = manager
+            .configs
+            .get(&environment_id)
+            .map(|config| config.wake_timeout_seconds)
+            .unwrap_or(30);
+        manager
+            .wake_containers(environment_id, wake_timeout)
+            .await
+            .map_err(|e| e.to_string())?;
+        // The route table resolves the upstream once it reloads.
+        Ok(Woken { address: None })
+    }
+
+    async fn sleep(&self, key: ActivationKey) -> Result<bool, String> {
+        let manager = self.manager(key)?;
+        let environment_id = Self::environment_id(key)?;
+        manager
+            .sleep_containers(environment_id)
+            .await
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -4405,5 +4603,94 @@ mod tests {
             vec!["local-1"],
             "must stop only the local container, leaving the remote one running"
         );
+    }
+
+    // ── ADR-055 phase 10: `enforce` environments wake through the activator ──
+
+    fn exec(rows_affected: u64) -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }
+    }
+
+    #[tokio::test]
+    async fn enforce_environment_wakes_and_sleeps_through_the_activator() {
+        let mut env = make_env_model(7, 10, Some(700), true);
+        env.workload_mode = EnvironmentWorkloadMode::Enforce;
+        let container = make_container(1, 700, "enforce-container", None);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Query and exec results are consumed from separate queues.
+            // Queries: the wake's workload_mode read, then the container
+            // path's environment and containers, for the wake and the sleep.
+            .append_query_results(vec![vec![env.clone()]])
+            .append_query_results(vec![vec![env.clone()]])
+            .append_query_results(vec![vec![container.clone()]])
+            .append_query_results(vec![vec![env.clone()]])
+            .append_query_results(vec![vec![container]])
+            // Execs: wake CAS, last_activity_at, NOTIFY; the legacy sweep's
+            // activity persist; sleep CAS, NOTIFY.
+            .append_exec_results(vec![exec(1), exec(1), exec(0)])
+            .append_exec_results(vec![exec(1)])
+            .append_exec_results(vec![exec(1), exec(0)])
+            .into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = Arc::new(OnDemandManager::new_test(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+        ));
+        let activator = Arc::new(Activator::new(Default::default()));
+        manager.attach_activator(activator.clone());
+        manager.register_on_demand_environment(7, 60, 30);
+
+        manager
+            .wake_environment(7, 30)
+            .await
+            .expect("an enforce environment wakes through the activator");
+        let key = OnDemandManager::activation_key(7);
+        assert_eq!(
+            activator.state(key),
+            Some(temps_workload_activator::ActivationState::Awake)
+        );
+        assert_eq!(lifecycle.started_containers(), vec!["enforce-container"]);
+
+        // The legacy sweep leaves it to the activator, even long idle.
+        manager
+            .last_activity
+            .insert(7, AtomicU64::new(manager.current_epoch_secs() - 600));
+        assert!(manager.sweep_idle_environments().await.is_empty());
+        assert!(lifecycle.stopped_containers().is_empty());
+
+        let swept = activator.sweep_at(manager.current_epoch_secs() + 61).await;
+        assert_eq!(swept.slept, vec![key]);
+        assert_eq!(lifecycle.stopped_containers(), vec!["enforce-container"]);
+        assert_eq!(
+            activator.state(key),
+            Some(temps_workload_activator::ActivationState::Asleep)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_environment_keeps_the_old_path_with_an_activator_attached() {
+        let env = make_env_model(8, 10, Some(800), true);
+        let container = make_container(1, 800, "legacy-container", None);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env.clone()]])
+            .append_exec_results(vec![exec(1)])
+            .append_query_results(vec![vec![env]])
+            .append_query_results(vec![vec![container]])
+            .append_exec_results(vec![exec(0)])
+            .into_connection();
+        let lifecycle = Arc::new(MockLifecycle::new());
+        let manager = Arc::new(OnDemandManager::new_test(
+            Arc::new(db),
+            Arc::clone(&lifecycle) as Arc<dyn ContainerLifecycle>,
+        ));
+        let activator = Arc::new(Activator::new(Default::default()));
+        manager.attach_activator(activator.clone());
+
+        manager.wake_environment(8, 30).await.expect("legacy wake");
+        assert_eq!(lifecycle.started_containers(), vec!["legacy-container"]);
+        assert!(!activator.is_registered(OnDemandManager::activation_key(8)));
     }
 }

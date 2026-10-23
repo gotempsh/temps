@@ -127,6 +127,8 @@ pub enum ActivationError {
     Saturated { key: ActivationKey, limit: usize },
     #[error("waking {key} failed: {reason}")]
     WakeFailed { key: ActivationKey, reason: String },
+    #[error("putting {key} to sleep failed: {reason}")]
+    SleepFailed { key: ActivationKey, reason: String },
     #[error("{key} did not become ready within {timeout_secs}s")]
     WakeTimeout {
         key: ActivationKey,
@@ -450,6 +452,15 @@ impl Activator {
         self.hosts.store(Arc::new(hosts));
     }
 
+    /// Route `host` to `key` (one target created at runtime), keeping every
+    /// other hostname.
+    pub fn add_host(&self, host: &str, key: ActivationKey) {
+        let _guard = self.write_lock();
+        let mut hosts: Hosts = (**self.hosts.load()).clone();
+        hosts.insert(host.to_ascii_lowercase(), key);
+        self.hosts.store(Arc::new(hosts));
+    }
+
     /// The target `host` routes to. `host` must already be lowercase and
     /// without a port (the proxy's normalised host). Request path: one
     /// `ArcSwap` load, and no hashing at all while no host is routed.
@@ -644,6 +655,52 @@ impl Activator {
             }
         });
         Ok(())
+    }
+
+    /// Put `key` to sleep now, whatever its idle time (an operator's
+    /// "sleep" button). `Ok(false)` when it was not awake. A wake or a sleep
+    /// already in progress wins: this one does nothing.
+    pub async fn sleep_now(&self, key: ActivationKey) -> Result<bool, ActivationError> {
+        let slot = self
+            .slots
+            .load()
+            .get(&key)
+            .cloned()
+            .ok_or(ActivationError::NotRegistered { key })?;
+        let backend = self
+            .backends
+            .load()
+            .get(&key.kind)
+            .cloned()
+            .ok_or(ActivationError::NoBackend { key })?;
+        if !slot.transition(AWAKE, SLEEPING) {
+            return Ok(false);
+        }
+        match tokio::time::timeout(self.config.sleep_timeout, backend.sleep(key)).await {
+            Ok(Ok(_)) => {
+                slot.address.store(None);
+                self.metrics.sleeps.fetch_add(1, Ordering::Relaxed);
+                tracing::info!(target_key = %key, "activator put the target to sleep on request");
+                slot.set(ASLEEP);
+                Ok(true)
+            }
+            Ok(Err(reason)) => {
+                self.metrics.sleep_failures.fetch_add(1, Ordering::Relaxed);
+                slot.set(AWAKE);
+                Err(ActivationError::SleepFailed { key, reason })
+            }
+            Err(_) => {
+                self.metrics.sleep_failures.fetch_add(1, Ordering::Relaxed);
+                slot.set(AWAKE);
+                Err(ActivationError::SleepFailed {
+                    key,
+                    reason: format!(
+                        "it did not stop within {}s",
+                        self.config.sleep_timeout.as_secs()
+                    ),
+                })
+            }
+        }
     }
 
     /// Put every awake target idle for at least its idle time to sleep.
@@ -1031,6 +1088,48 @@ mod tests {
         );
         activator.unregister(function(12));
         assert_eq!(activator.key_for_host("fn.example.test"), None);
+    }
+
+    #[tokio::test]
+    async fn sleep_now_stops_an_awake_target_and_reports_a_failed_stop() {
+        let backend = Arc::new(Counting::default());
+        let activator = activator_with(Arc::clone(&backend));
+        activator.register(function(30), asleep(3600));
+        assert!(!activator.sleep_now(function(30)).await.expect("asleep"));
+        activator.activate(function(30)).await.expect("woken");
+        assert!(activator.sleep_now(function(30)).await.expect("slept"));
+        assert_eq!(activator.state(function(30)), Some(ActivationState::Asleep));
+        assert_eq!(backend.sleeps.load(Ordering::SeqCst), 1);
+
+        activator.activate(function(30)).await.expect("woken again");
+        backend.fail_sleeps.store(true, Ordering::SeqCst);
+        let error = activator
+            .sleep_now(function(30))
+            .await
+            .expect_err("stop fails");
+        assert!(
+            matches!(&error, ActivationError::SleepFailed { reason, .. } if reason.contains("did not answer")),
+            "{error}"
+        );
+        assert_eq!(activator.state(function(30)), Some(ActivationState::Awake));
+        assert!(matches!(
+            activator.sleep_now(function(31)).await,
+            Err(ActivationError::NotRegistered { .. })
+        ));
+    }
+
+    #[test]
+    fn add_host_keeps_the_other_hosts() {
+        let activator = Activator::default();
+        activator.replace_hosts(
+            ActivationKind::Function,
+            [("a.example.test".to_string(), 1)],
+        );
+        activator.add_host("B.example.test", function(2));
+        assert_eq!(activator.key_for_host("a.example.test"), Some(function(1)));
+        assert_eq!(activator.key_for_host("b.example.test"), Some(function(2)));
+        activator.unregister(function(2));
+        assert_eq!(activator.key_for_host("b.example.test"), None);
     }
 
     #[tokio::test]

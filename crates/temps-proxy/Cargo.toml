@@ -23,6 +23,7 @@ temps-file-store = { path = "../temps-file-store" }
 temps-geo = { path = "../temps-geo" }
 temps-routes = { path = "../temps-routes" }
 temps-workload-ingress = { path = "../temps-workload-ingress" }
+temps-workload-activator = { path = "../temps-workload-activator" }
 temps-metrics = { path = "../temps-metrics" }
 temps-migrations = { path = "../temps-migrations" }
 serde = { workspace = true }

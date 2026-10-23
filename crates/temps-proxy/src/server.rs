@@ -443,6 +443,10 @@ pub fn setup_proxy_server(
     // for why that is an accepted limitation rather than a bug.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
+    // The process's activator (ADR-055 phase 10): function hostnames are
+    // served through it. `None` (the standalone `temps proxy`, which runs
+    // no workload plane): no function is routed.
+    activator: Option<Arc<temps_workload_activator::Activator>>,
 ) -> Result<()> {
     // Fail fast and loud if the configured ports are already taken. Without
     // this, a bind conflict is only discovered deep inside Pingora's own
@@ -645,6 +649,10 @@ pub fn setup_proxy_server(
     if let Some(ref on_demand_manager) = on_demand_manager {
         lb = lb.with_on_demand_manager(Arc::clone(on_demand_manager));
         info!("On-demand scale-to-zero enabled");
+    }
+    if let Some(activator) = activator {
+        lb = lb.with_activator(activator);
+        info!("Function hostnames are served through the activator");
     }
 
     // Wire path-keyed file store for static asset serving

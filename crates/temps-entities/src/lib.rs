@@ -280,3 +280,6 @@ pub mod sandbox_driver_mode;
 
 // ADR-055 Phase 4: databases onto the workload plane
 pub mod external_service_workload_mode;
+
+// ADR-055 Phase 10: functions
+pub mod functions;

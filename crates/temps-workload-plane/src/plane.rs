@@ -204,6 +204,10 @@ pub struct WorkloadPlane {
     /// Where new attempts run. `None`: on the control plane (node 0).
     pub(crate) placement: Option<Arc<dyn AttemptPlacement>>,
     pub(crate) stream_metrics: StreamMetrics,
+    /// More runtimes on the control plane next to `driver` (the WASM
+    /// driver). Chosen by capability for the workloads that need them;
+    /// see [`WorkloadPlane::with_local_driver`].
+    pub(crate) local_drivers: Vec<Arc<dyn RuntimeDriver>>,
 }
 
 /// Environments staged in this process, by key.
@@ -243,6 +247,14 @@ impl fmt::Debug for WorkloadPlane {
             .field("driver", &self.driver)
             .field("finalizers", &self.finalizers.keys().collect::<Vec<_>>())
             .field("placement", &self.placement.is_some())
+            .field(
+                "local_drivers",
+                &self
+                    .local_drivers
+                    .iter()
+                    .map(|driver| driver.capabilities().name.clone())
+                    .collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -276,7 +288,17 @@ impl WorkloadPlane {
             staged_env: Arc::new(Mutex::new(HashMap::new())),
             placement: None,
             stream_metrics: StreamMetrics::default(),
+            local_drivers: Vec::new(),
         }
+    }
+
+    /// Add a runtime on the control plane next to the node driver (the
+    /// WASM driver). The plane picks it by capability for a scale-to-zero
+    /// workload whose artifact, isolation or egress the node driver cannot
+    /// serve; jobs and deployment replicas keep the node driver.
+    pub fn with_local_driver(mut self, driver: Arc<dyn RuntimeDriver>) -> Self {
+        self.local_drivers.push(driver);
+        self
     }
 
     /// Place new attempts through `placement` (workers included) instead
@@ -439,9 +461,6 @@ impl WorkloadPlane {
         )>,
         PlaneError,
     > {
-        let Some(driver) = self.driver.0.clone() else {
-            return Ok(None);
-        };
         let latest = workload_instances::Entity::find()
             .filter(workload_instances::Column::WorkloadId.eq(id))
             .order_by_desc(workload_instances::Column::Attempt)
@@ -450,6 +469,16 @@ impl WorkloadPlane {
             .await
             .map_err(PlaneError::db("reading the latest instance", id))?;
         let Some(latest) = latest else {
+            return Ok(None);
+        };
+        // On the control plane, the runtime that created it (the node
+        // driver, or a local one such as WASM); a worker's instance is read
+        // through the node driver, as before.
+        let driver = match latest.node_id {
+            None => self.local_driver_named(&latest.driver),
+            Some(_) => self.control_plane_driver(),
+        };
+        let Ok(driver) = driver else {
             return Ok(None);
         };
         let handle: temps_workload::InstanceHandle = serde_json::from_value(latest.handle.clone())

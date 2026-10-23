@@ -998,6 +998,26 @@ impl ServeCommand {
             on_demand_manager.start_sweep_task(std::time::Duration::from_secs(60));
         }
 
+        // ADR-055 phase 10: one activator per process wakes scale-to-zero
+        // targets on their first request and its one sweep (O(targets), every
+        // 30 s) puts idle ones back to sleep: functions, and on-demand
+        // environments whose `workload_mode` is `enforce`. Every other
+        // environment keeps the on-demand manager's own path above.
+        let activator = Arc::new(temps_workload_activator::Activator::new(
+            temps_workload_activator::ActivatorConfig::default(),
+        ));
+        if let Some(ref on_demand_manager) = on_demand_manager {
+            on_demand_manager.attach_activator(activator.clone());
+        }
+        {
+            let _runtime = rt.enter();
+            // Detached: it sweeps for the life of the process.
+            drop(activator.spawn_sweeper(std::time::Duration::from_secs(30)));
+        }
+        let local_drivers = Arc::new(temps_workload_plane::LocalDrivers::new(
+            local_runtime_drivers(),
+        ));
+
         // NOW start the route-reload machinery. `start_listening` subscribes to
         // PG NOTIFY synchronously and spawns the initial load in the background,
         // so none of these block the proxy bind. The sleeping callback above is
@@ -1231,6 +1251,8 @@ impl ServeCommand {
             on_demand_waker: on_demand_manager
                 .clone()
                 .map(|m| m as Arc<dyn temps_core::OnDemandWaker>),
+            activator: activator.clone(),
+            local_drivers,
             extra_plugins,
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
@@ -1365,8 +1387,31 @@ impl ServeCommand {
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
+            Some(activator),
         )
     }
+}
+
+/// Runtime drivers this binary adds on the control plane next to the node
+/// driver (ADR-055 phase 10). With the `wasm` feature: the in-process WASM
+/// driver, so WASM functions run. Without it, none, and functions say so.
+#[cfg(feature = "wasm")]
+fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
+    match temps_workload_wasm::WasmDriver::new(temps_workload_wasm::WasmDriverConfig::default()) {
+        Ok(driver) => {
+            info!("WASM runtime driver enabled; WASM functions run in this process");
+            vec![Arc::new(driver) as Arc<dyn temps_workload::RuntimeDriver>]
+        }
+        Err(e) => {
+            tracing::error!("WASM runtime driver did not start; WASM functions cannot run: {e}");
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(not(feature = "wasm"))]
+fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
+    Vec::new()
 }
 
 #[cfg(test)]

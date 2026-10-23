@@ -66,10 +66,10 @@ const BACKOFF_BASE_SECS: i64 = 10;
 const BACKOFF_MAX_SECS: i64 = 360;
 const LOGS_TIMEOUT: StdDuration = StdDuration::from_secs(5);
 
-const PHASE_PENDING: &str = "pending";
-const PHASE_RUNNING: &str = "running";
-const PHASE_SUCCEEDED: &str = "succeeded";
-const PHASE_FAILED: &str = "failed";
+pub(crate) const PHASE_PENDING: &str = "pending";
+pub(crate) const PHASE_RUNNING: &str = "running";
+pub(crate) const PHASE_SUCCEEDED: &str = "succeeded";
+pub(crate) const PHASE_FAILED: &str = "failed";
 
 /// What a pass did, and when the next one is due.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -94,7 +94,7 @@ fn backoff(attempt: u32) -> Duration {
     Duration::seconds((BACKOFF_BASE_SECS << exponent).min(BACKOFF_MAX_SECS))
 }
 
-fn instance_name(scope: &str, kind: &str, workload_id: i64, attempt: u32) -> String {
+pub(crate) fn instance_name(scope: &str, kind: &str, workload_id: i64, attempt: u32) -> String {
     format!("{scope}-{kind}-{workload_id}-a{attempt}")
 }
 
@@ -125,11 +125,13 @@ fn fail(status: &mut WorkloadStatus, reason: &str, message: &str, now: DateTime<
     status.phase = WorkloadPhase::Failed;
 }
 
-fn is_finished(instance: &workload_instances::Model) -> bool {
+pub(crate) fn is_finished(instance: &workload_instances::Model) -> bool {
     instance.phase == PHASE_SUCCEEDED || instance.phase == PHASE_FAILED
 }
 
-fn handle_of(instance: &workload_instances::Model) -> Result<InstanceHandle, PlaneError> {
+pub(crate) fn handle_of(
+    instance: &workload_instances::Model,
+) -> Result<InstanceHandle, PlaneError> {
     serde_json::from_value(instance.handle.clone()).map_err(|e| PlaneError::Corrupt {
         workload_id: instance.workload_id,
         field: "instance handle",
@@ -137,7 +139,7 @@ fn handle_of(instance: &workload_instances::Model) -> Result<InstanceHandle, Pla
     })
 }
 
-fn driver_error(
+pub(crate) fn driver_error(
     workload_id: i64,
     operation: &'static str,
 ) -> impl FnOnce(DriverError) -> PlaneError {
@@ -357,16 +359,7 @@ impl WorkloadPlane {
                 return self.drive_long_running(row, view, instances, now).await;
             }
             Lifetime::ScaleToZero { .. } => {
-                // Admission refuses it; a row written by a newer binary is
-                // failed with why rather than run as something else.
-                let message = format!(
-                    "lifetime {:?} is not reconciled by the plane yet",
-                    view.spec.lifetime
-                );
-                fail(&mut status, "UnsupportedLifetime", &message, now);
-                return self
-                    .conclude(row, view, instances, status, now, now, None)
-                    .await;
+                return self.drive_scale_to_zero(row, view, instances, now).await;
             }
         };
         let ttl = Duration::seconds(i64::from(
@@ -884,7 +877,7 @@ impl WorkloadPlane {
     }
 
     /// The control plane's own driver, or why there is none.
-    fn control_plane_driver(&self) -> Result<Arc<dyn RuntimeDriver>, String> {
+    pub(crate) fn control_plane_driver(&self) -> Result<Arc<dyn RuntimeDriver>, String> {
         self.driver
             .0
             .clone()
@@ -897,7 +890,7 @@ impl WorkloadPlane {
         instance: &workload_instances::Model,
     ) -> Result<Arc<dyn RuntimeDriver>, String> {
         match instance.node_id {
-            None => self.control_plane_driver(),
+            None => self.local_driver_named(&instance.driver),
             Some(node_id) => match &self.placement {
                 Some(placement) => placement.driver_for(node_id, &instance.driver).await,
                 None => Err(format!(
@@ -1274,7 +1267,7 @@ impl WorkloadPlane {
 
     /// The instance runs: record it and wait for its exit.
     #[allow(clippy::too_many_arguments)]
-    async fn mark_started(
+    pub(crate) async fn mark_started(
         &self,
         row: workloads::Model,
         mut status: WorkloadStatus,
@@ -1309,7 +1302,10 @@ impl WorkloadPlane {
         status.ready_instances = 1;
         status.exit_code = None;
         status.phase = WorkloadPhase::Running;
-        if matches!(view_lifetime(&row), Some(Lifetime::LongRunning { .. })) {
+        if matches!(
+            view_lifetime(&row),
+            Some(Lifetime::LongRunning { .. } | Lifetime::ScaleToZero { .. })
+        ) {
             // No readiness probe is run by the plane yet: the product gates
             // traffic on its own health check (blue/green stays in the
             // product), so a running instance is reported ready with why.
@@ -1581,7 +1577,7 @@ impl WorkloadPlane {
 
     /// Write `status` if it differs from what is stored. Returns whether
     /// it wrote. Only a live row is written: a concurrent delete wins.
-    async fn write_status(
+    pub(crate) async fn write_status(
         &self,
         row: &workloads::Model,
         status: &WorkloadStatus,
@@ -1617,7 +1613,7 @@ impl WorkloadPlane {
         Ok(true)
     }
 
-    async fn finish_instance(
+    pub(crate) async fn finish_instance(
         &self,
         instance_id: i64,
         phase: &str,
@@ -1810,7 +1806,7 @@ impl WorkloadPlane {
 const NO_CONTROL_PLANE_DRIVER: &str = "0/1 nodes eligible: the control plane (node 0) has no \
      runtime driver; the Docker daemon was not reachable when temps started";
 
-fn set_scheduled(status: &mut WorkloadStatus, node_id: Option<i32>, now: DateTime<Utc>) {
+pub(crate) fn set_scheduled(status: &mut WorkloadStatus, node_id: Option<i32>, now: DateTime<Utc>) {
     let (reason, message) = match node_id {
         None => (
             "ControlPlane",
@@ -1837,7 +1833,7 @@ fn view_lifetime(row: &workloads::Model) -> Option<Lifetime> {
 /// `LimitEnforced` (ADR-055 §5): a limit is always applied, and one the
 /// driver cannot apply is reported with the reason, never ignored silently.
 /// Not set when the spec sets no limit.
-fn set_limit_condition(
+pub(crate) fn set_limit_condition(
     status: &mut WorkloadStatus,
     resources: &Resources,
     driver: &Arc<dyn RuntimeDriver>,

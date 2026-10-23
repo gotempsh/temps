@@ -13411,6 +13411,7 @@ dependencies = [
  "temps-external-plugins",
  "temps-file-store",
  "temps-flags",
+ "temps-functions",
  "temps-geo",
  "temps-git",
  "temps-import",
@@ -13444,6 +13445,10 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-activator",
+ "temps-workload-plane",
+ "temps-workload-wasm",
  "thiserror 2.0.21",
  "tikv-jemallocator",
  "tokio",
@@ -14309,6 +14314,38 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "temps-functions"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "tempfile",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-workload",
+ "temps-workload-activator",
+ "temps-workload-ingress",
+ "temps-workload-plane",
+ "temps-workload-wasm",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+ "wat",
 ]
 
 [[package]]
@@ -15402,6 +15439,7 @@ dependencies = [
  "temps-migrations",
  "temps-presets",
  "temps-routes",
+ "temps-workload-activator",
  "temps-workload-ingress",
  "testcontainers",
  "thiserror 2.0.21",

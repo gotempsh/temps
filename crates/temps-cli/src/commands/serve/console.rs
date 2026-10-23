@@ -1893,6 +1893,13 @@ pub struct ConsoleApiParams {
     pub ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     pub additional_templates: Vec<std::path::PathBuf>,
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
+    /// The process's activator (ADR-055 phase 10), shared with the proxy:
+    /// functions register their hostnames with it and it wakes them.
+    pub activator: Arc<temps_workload_activator::Activator>,
+    /// Extra control-plane runtime drivers for the workload plane (the
+    /// WASM driver with the `wasm` feature). Empty: functions report that
+    /// no runtime runs them.
+    pub local_drivers: Arc<temps_workload_plane::LocalDrivers>,
     /// Additional plugins registered by an external entrypoint (e.g. the
     /// EE binary). Registered immediately before `initialize_plugins`, so
     /// they observe every OSS service in the registry and can wrap or
@@ -3452,6 +3459,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         ready_signal,
         additional_templates,
         on_demand_waker,
+        activator,
+        local_drivers,
         extra_plugins,
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
@@ -3690,6 +3699,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         service_context.register_service(waker as Arc<dyn temps_core::OnDemandWaker>);
         debug!("Registered OnDemandWaker for environment wake/sleep endpoints");
     }
+
+    // ADR-055 phase 10: the activator, the plane handle the deployments
+    // plugin fills once the plane starts, and the extra runtimes it adds.
+    service_context.register_service(activator);
+    service_context.register_service(Arc::new(temps_workload_plane::SharedPlane::new()));
+    service_context.register_service(local_drivers);
 
     // Whether this process runs workloads on its own host. Plugins that exist
     // only to manage local containers are not constructed at all when it is
@@ -3937,6 +3952,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
+
+    // Functions (ADR-055 phase 10) run on the workload plane the
+    // deployments plugin starts.
+    debug!("Registering FunctionsPlugin");
+    plugin_manager.register_plugin(Box::new(temps_functions::FunctionsPlugin::new()));
 
     // 9.0. McpServerPlugin (ADR-039) - MCP server for AI tool integration.
     // Depends on ProjectsPlugin and DeploymentsPlugin (services registered above).
