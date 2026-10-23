@@ -280,6 +280,79 @@ impl AuditOperation for ContinuousArchiveSourceRepointedAudit {
     }
 }
 
+/// An administrator moved a database between `legacy`, `shadow` and
+/// `enforce` (ADR-055 Phase 4). `pending_change_fields` names what a
+/// recreate from the spec would change at the time of the move.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceWorkloadModeChangedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub service_type: String,
+    pub previous_mode: String,
+    pub new_mode: String,
+    pub pending_change_fields: Vec<String>,
+}
+
+impl AuditOperation for ExternalServiceWorkloadModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_WORKLOAD_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// An administrator confirmed, and Temps performed, the recreate of an
+/// `enforce`-mode database's container from its workload spec.
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceWorkloadRecreatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub name: String,
+    pub node_id: Option<i32>,
+    pub confirmed_fingerprint: String,
+    pub applied_change_fields: Vec<String>,
+    pub remaining_change_fields: Vec<String>,
+}
+
+impl AuditOperation for ExternalServiceWorkloadRecreatedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_WORKLOAD_RECREATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 impl AuditOperation for ExternalServiceUpdatedAudit {
     fn operation_type(&self) -> String {
         "EXTERNAL_SERVICE_UPDATED".to_string()

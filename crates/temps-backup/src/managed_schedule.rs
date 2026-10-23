@@ -336,6 +336,7 @@ mod tests {
             container_name: None,
             continuous_archive_s3_source_id: pinned,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
     }
 

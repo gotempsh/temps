@@ -4164,6 +4164,7 @@ mod tests {
             created_by_user_id: Some(1),
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
         let linked_service = project_services::Model {
             id: 1,
@@ -4840,6 +4841,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -5008,6 +5010,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
         let link = project_services::Model {
             id: 1,

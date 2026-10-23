@@ -188,6 +188,15 @@ pub fn build_router(
             get(service_handlers::service_status),
         )
         .route("/agent/services/exec", post(service_handlers::service_exec))
+        // ADR-055 Phase 4: databases created from their workload spec.
+        .route(
+            "/agent/services/workload",
+            post(service_handlers::create_service_workload),
+        )
+        .route(
+            "/agent/services/{name}/snapshot",
+            get(service_handlers::service_snapshot),
+        )
         .route(
             "/agent/services/runtime-env",
             post(service_handlers::runtime_env),

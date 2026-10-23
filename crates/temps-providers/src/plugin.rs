@@ -151,6 +151,20 @@ impl TempsPlugin for ProvidersPlugin {
                 ),
             }
 
+            // ADR-055 Phase 4: which control-plane databases are created
+            // from their workload spec (`enforce`), then the bounded shadow
+            // pass for `shadow` ones. Both read only rows whose mode is not
+            // `legacy`, so a default install does no work here.
+            // The registry is loaded before routes serve, so no create races it.
+            if let Err(error) = external_service_manager.load_workload_registry().await {
+                tracing::error!(
+                    error = %error,
+                    "Could not load which databases are in workload mode 'enforce'; their \
+                     engines use the legacy create request until the next start"
+                );
+            }
+            external_service_manager.spawn_workload_shadow_loop();
+
             // Spawn role reconcilers for every cluster that's already
             // running. Without this, after a control-plane restart no
             // reconciler exists for any pre-existing cluster and the
@@ -285,11 +299,14 @@ impl TempsPlugin for ProvidersPlugin {
         let pg_stat_routes = crate::handlers::pg_stat_statements_handlers::configure_routes()
             .with_state(app_state.clone());
         let data_import_routes =
-            crate::handlers::data_import_handlers::configure_routes().with_state(app_state);
+            crate::handlers::data_import_handlers::configure_routes().with_state(app_state.clone());
+        let workload_routes =
+            crate::handlers::workload_handlers::configure_routes().with_state(app_state);
 
         let router = providers_routes
             .merge(pg_stat_routes)
-            .merge(data_import_routes);
+            .merge(data_import_routes)
+            .merge(workload_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -300,7 +317,12 @@ impl TempsPlugin for ProvidersPlugin {
         let pg_stat = <PgStatStatementsApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::data_import_handlers::DataImportApiDoc;
         let data_import = <DataImportApiDoc as OpenApiTrait>::openapi();
-        Some(merge_openapi_schemas(base, vec![pg_stat, data_import]))
+        use crate::handlers::workload_handlers::WorkloadModeApiDoc;
+        let workload = <WorkloadModeApiDoc as OpenApiTrait>::openapi();
+        Some(merge_openapi_schemas(
+            base,
+            vec![pg_stat, data_import, workload],
+        ))
     }
 }
 

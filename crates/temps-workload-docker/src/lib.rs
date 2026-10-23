@@ -29,11 +29,17 @@ use bollard::query_parameters::{
 };
 use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
+pub mod data;
+pub mod shape;
+
+pub use data::{data_container_create_body, data_host_config, DataExtras, DATA_DEFAULT_PIDS_LIMIT};
+pub use shape::{diff as shape_diff, ContainerShape, ShapeDifference, ShapeField};
+
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,
     InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus, Isolation,
     LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream, PortProtocol,
-    PreparedArtifact, RestartPolicy, RuntimeDriver, VolumeKinds,
+    PreparedArtifact, RestartPolicy, RuntimeDriver, SecurityProfile, VolumeKinds,
 };
 
 /// The driver's name in handles, capabilities and errors.
@@ -117,7 +123,12 @@ pub fn container_create_body(
         .into_iter()
         .chain(attach.volumes.iter().cloned())
         .collect();
-    let mut hardened = hardened_host_config(binds);
+    // `Data` (databases) is the control-plane database host config; every
+    // other profile starts from the hardened one.
+    let mut hardened = match spec.security {
+        SecurityProfile::Data => data_host_config(binds),
+        _ => hardened_host_config(binds),
+    };
     if let Some(pids) = spec.limits.pids {
         hardened.pids_limit = Some(pids);
     }
@@ -223,6 +234,30 @@ impl DockerDriver {
         binds: Vec<String>,
     ) -> Result<InstanceHandle, DriverError> {
         let body = container_create_body(spec, attach, binds);
+        self.create_from_body(spec, body).await
+    }
+
+    /// Creates a database container: the `Data` request of
+    /// [`data_container_create_body`] (healthcheck from the probes, the
+    /// database's extra host settings). Both the control plane and the worker
+    /// agent create managed databases through this (ADR-055 Phase 4).
+    pub async fn create_data_with_binds(
+        &self,
+        spec: &InstanceSpec,
+        probes: &temps_workload::Probes,
+        extras: &DataExtras,
+        attach: &Attachments,
+        binds: Vec<String>,
+    ) -> Result<InstanceHandle, DriverError> {
+        let body = data_container_create_body(spec, probes, extras, attach, binds);
+        self.create_from_body(spec, body).await
+    }
+
+    async fn create_from_body(
+        &self,
+        spec: &InstanceSpec,
+        body: ContainerCreateBody,
+    ) -> Result<InstanceHandle, DriverError> {
         let mut options = CreateContainerOptionsBuilder::new().name(&spec.name);
         if let Some(platform) = &spec.platform {
             options = options.platform(platform);

@@ -372,6 +372,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         }
     }
 

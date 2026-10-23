@@ -26,6 +26,9 @@ temps-dns = { path = "../temps-dns" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-plane = { path = "../temps-workload-plane" }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

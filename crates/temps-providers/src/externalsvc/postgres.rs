@@ -1011,31 +1011,47 @@ impl PostgresService {
             ..Default::default()
         };
 
-        let container = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&container_name)
-                        .build(),
-                ),
-                container_config,
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create PostgreSQL container: {}", e))?;
+        // ADR-055 Phase 4: a database in `enforce` mode is created from its
+        // admitted workload spec through the Docker driver; every other
+        // database sends this request exactly as before.
+        let container_id = match crate::workload::registry::enforced_create(
+            docker,
+            &container_name,
+            &container_config,
+        )
+        .await
+        {
+            Some(created) => created
+                .map_err(|e| anyhow::anyhow!("Failed to create PostgreSQL container: {}", e))?,
+            None => {
+                docker
+                    .create_container(
+                        Some(
+                            bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                                .name(&container_name)
+                                .build(),
+                        ),
+                        container_config,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to create PostgreSQL container: {}", e))?
+                    .id
+            }
+        };
 
         docker
             .start_container(
-                &container.id,
+                &container_id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
             .map_err(|e| anyhow::anyhow!("Failed to start PostgreSQL container: {}", e))?;
 
         // Wait for container to be healthy
-        self.wait_for_container_health(docker, &container.id)
+        self.wait_for_container_health(docker, &container_id)
             .await?;
 
-        info!("PostgreSQL container {} created and started", container.id);
+        info!("PostgreSQL container {} created and started", container_id);
         Ok(())
     }
 
@@ -8400,6 +8416,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

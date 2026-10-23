@@ -18,6 +18,7 @@ bollard = { workspace = true }
 bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
+serde = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]

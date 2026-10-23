@@ -89,6 +89,14 @@ pub struct Model {
     /// permanent, not worth retrying forever. Added by
     /// `m20260904_000003_add_continuous_archive_source_to_external_services`.
     pub continuous_archive_pinned_at: Option<DBDateTime>,
+    /// How this database's containers are created (ADR-055 Phase 4): the
+    /// engine's own request (`legacy`), the same with the workload spec
+    /// compared in the background (`shadow`), or the admitted spec through
+    /// the Docker driver (`enforce`). Changed only by an administrator, and
+    /// audit-logged. A serialized row from before the column reads as
+    /// `legacy`. Added by `m20261022_000004_external_services_workload_mode`.
+    #[serde(default)]
+    pub workload_mode: super::external_service_workload_mode::ServiceWorkloadMode,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
