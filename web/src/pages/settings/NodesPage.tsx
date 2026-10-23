@@ -1620,7 +1620,8 @@ function ClusterTrustCard() {
             <AlertDescription>
               Rotation immediately invalidates worker trust and outstanding
               enrollment tokens. Every worker must be re-enrolled. Only a full
-              Admin using a fresh MFA-verified browser session can proceed.
+              Admin in a browser session can proceed, and an Admin with MFA
+              re-verifies it first.
             </AlertDescription>
           </Alert>
           <Button

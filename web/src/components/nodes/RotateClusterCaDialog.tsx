@@ -31,8 +31,8 @@ const ROTATE_CLUSTER_CA_CONFIRMATION = 'ROTATE CLUSTER CA'
 
 /**
  * Typed-confirmation dialog that rotates the cluster CA. The server also
- * requires a full Admin with a fresh MFA-verified session, and compares the
- * fingerprint shown here against the active one.
+ * requires a full Admin in a browser session (re-verifying MFA when enrolled),
+ * and compares the fingerprint shown here against the active one.
  */
 export function RotateClusterCaDialog({
   open,
