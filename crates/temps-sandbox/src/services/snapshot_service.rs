@@ -1201,6 +1201,7 @@ mod tests {
             work_dir: std::path::PathBuf::from("/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 

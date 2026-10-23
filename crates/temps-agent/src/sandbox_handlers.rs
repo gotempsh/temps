@@ -25,7 +25,10 @@
 //! they are returned.
 
 use axum::{
-    extract::{Request, State},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Query, Request, State,
+    },
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
@@ -42,16 +45,20 @@ use temps_agents::ai_cli::OnEventCallback;
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
 use temps_agents::sandbox::remote::{
-    is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteCreateRequest,
-    RemoteDestroyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest, RemoteExecResponse,
-    RemoteFileContents, RemoteHandleRequest, RemoteKillRequest, RemoteOkResponse,
-    RemoteReadFileRequest, RemoteRecoverRequest, RemoteReleaseOrphanedRequest,
+    is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteByteChannel,
+    RemoteByteChannelError, RemoteByteChannelQuery, RemoteCreateRequest, RemoteDestroyRequest,
+    RemoteErrorBody, RemoteExecFrame, RemoteExecRequest, RemoteExecResponse, RemoteFileContents,
+    RemoteHandleRequest, RemoteImageIdentityResponse, RemoteKillRequest, RemoteOkResponse,
+    RemoteReadFileRequest, RemoteRecoverHarnessRequest, RemoteRecoverRequest,
+    RemoteReleaseOrphanedRequest, RemoteResizeDiskRequest, RemoteRuntimeCompatibility,
     RemoteStatusResponse, RemoteWriteDirectoryRequest, RemoteWriteFileRequest,
     EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX, WORKER_EXEC_OUTPUT_LIMIT,
     WORKER_READ_FILE_MAX_BYTES,
 };
+use temps_agents::sandbox::user::SANDBOX_WORK_DIR;
 use temps_agents::sandbox::{
-    ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxHandle, SandboxProvider,
+    ExecStream, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig, SandboxHandle,
+    SandboxProvider,
 };
 
 /// Request body cap for the two sandbox upload routes (`write-file`,
@@ -386,7 +393,8 @@ pub async fn redact_host_paths(
 ) -> Response {
     let path = request.uri().path().to_string();
     let response = next.run(request).await;
-    if response.status().is_success() {
+    // 101 is a byte-channel upgrade: nothing to redact, and it has no body.
+    if response.status().is_success() || response.status().is_informational() {
         return response;
     }
     let (mut parts, body) = response.into_parts();
@@ -1627,6 +1635,273 @@ pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusRe
     }))
 }
 
+// ── ADR-055 phase 6: driver operations forwarded by `enforce` nodes ──────
+//
+// The control plane only calls these for a node whose sandbox driver mode
+// is `enforce`; in `legacy` it still refuses the operations itself (422)
+// without contacting the node. They replay one more `SandboxProvider` call
+// each, against the same handle re-resolution as every route above.
+
+/// `POST /agent/sandboxes/resize-disk`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/resize-disk",
+    request_body = RemoteResizeDiskRequest,
+    responses(
+        (status = 200, description = "Disk resized", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle, or an invalid size", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Resize failed, or this node's driver cannot resize disks", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resize_sandbox_disk(
+    State(state): HostState,
+    Json(req): Json<RemoteResizeDiskRequest>,
+) -> ApiResult<RemoteOkResponse> {
+    if req.new_size_mb == 0 {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "cannot resize the disk of sandbox '{}' to 0 MB",
+                req.handle.sandbox_name
+            ),
+        ));
+    }
+    let host = host(&state)?;
+    let handle = require_handle(host, req.handle).await?;
+    host.provider
+        .resize_disk(&handle, req.new_size_mb)
+        .await
+        .map_err(provider_err)?;
+    Ok(ok())
+}
+
+/// `POST /agent/sandboxes/image-identity`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-identity",
+    request_body = RemoteHandleRequest,
+    responses(
+        (status = 200, description = "Immutable image identity of the sandbox", body = RemoteImageIdentityResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Identity lookup failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn sandbox_image_identity(
+    State(state): HostState,
+    Json(req): Json<RemoteHandleRequest>,
+) -> ApiResult<RemoteImageIdentityResponse> {
+    let host = host(&state)?;
+    let handle = require_handle(host, req.handle).await?;
+    let image = host
+        .provider
+        .image_identity(&handle)
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(RemoteImageIdentityResponse { image }))
+}
+
+/// `POST /agent/sandboxes/agent-runtime-check`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/agent-runtime-check",
+    request_body = RemoteHandleRequest,
+    responses(
+        (status = 200, description = "Whether the retained agent runtime can be used", body = RemoteRuntimeCompatibility),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Probe failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn check_sandbox_agent_runtime(
+    State(state): HostState,
+    Json(req): Json<RemoteHandleRequest>,
+) -> ApiResult<RemoteRuntimeCompatibility> {
+    let host = host(&state)?;
+    let handle = require_handle(host, req.handle).await?;
+    let compatibility = host
+        .provider
+        .check_agent_runtime(&handle)
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(RemoteRuntimeCompatibility::from(compatibility)))
+}
+
+/// `POST /agent/sandboxes/recover-agent-harness`
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/recover-agent-harness",
+    request_body = RemoteRecoverHarnessRequest,
+    responses(
+        (status = 200, description = "Orphaned harness processes are gone", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Recovery failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn recover_sandbox_agent_harness(
+    State(state): HostState,
+    Json(req): Json<RemoteRecoverHarnessRequest>,
+) -> ApiResult<RemoteOkResponse> {
+    let host = host(&state)?;
+    let handle = require_handle(host, req.handle).await?;
+    host.provider
+        .recover_agent_harness(&handle, req.epoch)
+        .await
+        .map_err(provider_err)?;
+    Ok(ok())
+}
+
+/// The handle a byte-channel request names: only the sandbox name travels,
+/// [`require_handle`] fills in the container id from this node's Docker.
+fn byte_channel_handle(sandbox: &str) -> SandboxHandle {
+    SandboxHandle {
+        node_id: None,
+        sandbox_id: String::new(),
+        sandbox_name: sandbox.to_string(),
+        work_dir: PathBuf::from(SANDBOX_WORK_DIR),
+        backend: SandboxBackend::Docker,
+        image: String::new(),
+        conditions: Vec::new(),
+    }
+}
+
+/// `GET /agent/sandboxes/byte-channel` — a WebSocket carrying one sandbox
+/// byte channel: the interactive terminal's PTY agent protocol, or the
+/// retained agent runtime's daemon protocol. Binary frames are the channel's
+/// bytes in both directions; a text frame from the node is a
+/// [`RemoteByteChannelError`] and ends the channel. The sandbox is resolved
+/// and the channel opened *before* the upgrade, so a missing sandbox or a
+/// failed attach is an ordinary HTTP error the control plane maps like any
+/// other sandbox call.
+#[utoipa::path(
+    tag = "Sandboxes",
+    get,
+    path = "/agent/sandboxes/byte-channel",
+    params(RemoteByteChannelQuery),
+    responses(
+        (status = 101, description = "WebSocket carrying the channel's bytes"),
+        (status = 400, description = "Not a sandbox", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Opening the channel failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody),
+        (status = 504, description = "The guest did not answer the attach in time", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn open_sandbox_byte_channel(
+    State(state): HostState,
+    Query(query): Query<RemoteByteChannelQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let host = host(&state)?;
+    let handle = require_handle(host, byte_channel_handle(&query.sandbox)).await?;
+    let attachment = match query.channel {
+        RemoteByteChannel::Terminal => host.provider.attach_pty(&handle).await,
+        RemoteByteChannel::AgentRuntime => host.provider.connect_agent_runtime(&handle).await,
+    }
+    .map_err(provider_err)?;
+    tracing::info!(
+        sandbox = %handle.sandbox_name,
+        channel = ?query.channel,
+        "Opened a sandbox byte channel for the control plane"
+    );
+    let work_root = state.work_root.clone();
+    let sandbox = handle.sandbox_name;
+    Ok(ws
+        .max_message_size(BYTE_CHANNEL_MAX_FRAME)
+        .on_upgrade(move |socket| pump_byte_channel(socket, attachment, work_root, sandbox))
+        .into_response())
+}
+
+/// Largest frame either side of a byte channel accepts. Terminal and
+/// runtime frames are small; this only bounds what one message can make
+/// the agent buffer.
+const BYTE_CHANNEL_MAX_FRAME: usize = 1024 * 1024;
+
+/// Pump one byte channel until either side ends it. When the control plane
+/// closes the socket the guest's stdin is shut, which ends the in-sandbox
+/// relay; when the guest side ends the socket is closed.
+async fn pump_byte_channel(
+    socket: WebSocket,
+    attachment: temps_agents::sandbox::PtyAttachment,
+    work_root: PathBuf,
+    sandbox: String,
+) {
+    use futures::{SinkExt, StreamExt};
+    use tokio::io::AsyncWriteExt;
+
+    let (mut to_cp, mut from_cp) = socket.split();
+    let temps_agents::sandbox::PtyAttachment {
+        mut output,
+        mut input,
+    } = attachment;
+
+    let to_guest = async {
+        while let Some(message) = from_cp.next().await {
+            match message {
+                Ok(WsMessage::Binary(bytes)) => {
+                    if input.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(WsMessage::Close(_)) | Err(_) => break,
+                // Text, ping and pong carry nothing for the guest.
+                Ok(WsMessage::Text(_)) | Ok(WsMessage::Ping(_)) | Ok(WsMessage::Pong(_)) => {}
+            }
+        }
+        let _ = input.shutdown().await;
+    };
+
+    let from_guest = async {
+        while let Some(chunk) = output.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if to_cp.send(WsMessage::Binary(bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let message = redact_work_root(&message, &work_root).unwrap_or(message);
+                    tracing::warn!(sandbox = %sandbox, error = %message, "Sandbox byte channel failed");
+                    if let Ok(text) =
+                        serde_json::to_string(&RemoteByteChannelError { error: message })
+                    {
+                        let _ = to_cp.send(WsMessage::Text(text.into())).await;
+                    }
+                    break;
+                }
+            }
+        }
+        let _ = to_cp.send(WsMessage::Close(None)).await;
+    };
+
+    tokio::select! {
+        _ = to_guest => {}
+        _ = from_guest => {}
+    }
+    tracing::debug!(sandbox = %sandbox, "Sandbox byte channel closed");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1984,6 +2259,7 @@ mod tests {
             work_dir: PathBuf::from("/home/temps/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 

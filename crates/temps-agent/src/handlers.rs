@@ -447,6 +447,11 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::recover_sandbox,
         crate::sandbox_handlers::release_orphaned_sandbox_resources,
         crate::sandbox_handlers::sandbox_status,
+        crate::sandbox_handlers::resize_sandbox_disk,
+        crate::sandbox_handlers::sandbox_image_identity,
+        crate::sandbox_handlers::check_sandbox_agent_runtime,
+        crate::sandbox_handlers::recover_sandbox_agent_harness,
+        crate::sandbox_handlers::open_sandbox_byte_channel,
     ),
     components(schemas(
         AgentResponse<temps_deployer::DeployResult>,
@@ -518,6 +523,12 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         temps_agents::sandbox::remote::RemoteStatusResponse,
         temps_agents::sandbox::remote::RemoteOkResponse,
         temps_agents::sandbox::remote::RemoteErrorBody,
+        temps_agents::sandbox::remote::RemoteResizeDiskRequest,
+        temps_agents::sandbox::remote::RemoteImageIdentityResponse,
+        temps_agents::sandbox::remote::RemoteRuntimeCompatibility,
+        temps_agents::sandbox::remote::RemoteRecoverHarnessRequest,
+        temps_agents::sandbox::remote::RemoteByteChannel,
+        temps_agents::sandbox::remote::RemoteByteChannelError,
     )),
     info(
         title = "Temps Agent API",
@@ -2700,6 +2711,10 @@ mod openapi_response_tests {
             "sandboxes~1start",
             "sandboxes~1recover",
             "sandboxes~1status",
+            "sandboxes~1resize-disk",
+            "sandboxes~1image-identity",
+            "sandboxes~1agent-runtime-check",
+            "sandboxes~1recover-agent-harness",
         ] {
             for status in ["200", "401"] {
                 let pointer = format!("/paths/~1agent~1{route}/post/responses/{status}");
@@ -2715,6 +2730,10 @@ mod openapi_response_tests {
             "/paths/~1agent~1sandboxes~1write-directory/post/responses/413",
             "/paths/~1agent~1sandboxes~1write-file/post/responses/503",
             "/paths/~1agent~1sandboxes~1exec/post/responses/404",
+            "/paths/~1agent~1sandboxes~1byte-channel/get/responses/101",
+            "/paths/~1agent~1sandboxes~1byte-channel/get/responses/401",
+            "/paths/~1agent~1sandboxes~1byte-channel/get/responses/404",
+            "/components/schemas/RemoteRuntimeCompatibility",
             "/components/schemas/RemoteErrorBody",
             "/components/schemas/SandboxHandle",
         ] {

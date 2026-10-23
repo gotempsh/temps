@@ -18543,6 +18543,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -18840,6 +18841,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -24975,6 +24977,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            control_plane_sandbox_driver_mode: Default::default(),
             updated_at: Utc::now(),
         }
     }

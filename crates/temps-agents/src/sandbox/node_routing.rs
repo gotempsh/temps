@@ -482,6 +482,9 @@ struct NodeClientKey {
     defaults: RemoteSandboxDefaults,
     /// The client trusts this cluster CA.
     cluster_ca_cert_pem: Option<String>,
+    /// Which operations the client forwards (ADR-055 §6); switching the
+    /// node's mode rebuilds it on the next call.
+    sandbox_driver_mode: temps_entities::sandbox_driver_mode::SandboxDriverMode,
 }
 
 impl NodeClientKey {
@@ -491,6 +494,7 @@ impl NodeClientKey {
             token_encrypted: node.token_encrypted.clone(),
             defaults: sandbox_defaults(&settings.agent_sandbox),
             cluster_ca_cert_pem: settings.multi_node.cluster_ca_cert_pem.clone(),
+            sandbox_driver_mode: node.sandbox_driver_mode,
         }
     }
 }
@@ -535,6 +539,21 @@ impl NodeProviderFactory for MtlsProviderFactory {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // Byte channels (terminal, agent runtime) are only forwarded in
+        // `enforce`; their WebSocket presents the same identity as `client`.
+        let ws_connector = if node.sandbox_driver_mode.uses_drivers()
+            && temps_deployments::cluster_ca::is_https_address(&node.address)
+        {
+            let config = temps_deployments::cluster_ca::cp_ws_client_config(
+                self.config_service.as_ref(),
+                self.encryption_service.as_ref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+        } else {
+            None
+        };
         Ok(Arc::new(
             RemoteSandboxProvider::new(
                 node.id,
@@ -543,7 +562,9 @@ impl NodeProviderFactory for MtlsProviderFactory {
                 token,
                 client,
             )
-            .with_defaults(defaults),
+            .with_defaults(defaults)
+            .with_driver_mode(node.sandbox_driver_mode)
+            .with_ws_connector(ws_connector),
         ))
     }
 }
@@ -772,6 +793,7 @@ mod tests {
                 work_dir: PathBuf::from("/w"),
                 backend: SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             })
         }
         async fn exec(
@@ -844,6 +866,7 @@ mod tests {
                 work_dir: PathBuf::from("/w"),
                 backend: SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             }))
         }
         fn name(&self) -> &str {
@@ -970,6 +993,7 @@ mod tests {
             work_dir: PathBuf::from("/w"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -1100,6 +1124,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: now,
             updated_at: now,
         }
@@ -1322,6 +1347,14 @@ mod tests {
         let mut ca = base.clone();
         ca.multi_node.cluster_ca_cert_pem = Some("rotated-ca".to_string());
         assert_ne!(key, NodeClientKey::new(&n, &ca), "cluster CA");
+        let mut enforcing = n.clone();
+        enforcing.sandbox_driver_mode =
+            temps_entities::sandbox_driver_mode::SandboxDriverMode::Enforce;
+        assert_ne!(
+            key,
+            NodeClientKey::new(&enforcing, &base),
+            "sandbox driver mode"
+        );
     }
 
     #[tokio::test]

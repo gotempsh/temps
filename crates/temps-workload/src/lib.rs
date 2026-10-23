@@ -21,6 +21,7 @@ pub mod driver;
 pub mod labels;
 pub mod reference;
 pub mod resources;
+pub mod sandbox;
 pub mod spec;
 
 pub use condition::{
@@ -35,6 +36,13 @@ pub use driver::{
 };
 pub use reference::{InvalidWorkloadRef, UnknownWorkloadKind, WorkloadKind, WorkloadRef};
 pub use resources::{ResourceAmounts, Resources};
+pub use sandbox::{
+    choose_driver, limit_condition, supports, unenforced_limits, AgentRuntimeCompatibility,
+    ByteChannel, DriverCandidate, DriverChoice, DriverRejection, EgressSupport, ExecLine,
+    ExecLineSink, ExecOutput, ExecUser, LimitKind, NoEligibleDriver, ProcessSignal,
+    RequestedLimits, SandboxCapabilities, SandboxCreate, SandboxExec, SandboxExt, SandboxFeature,
+    SandboxInstance, SandboxLimits, SandboxRequirements, SandboxSnapshot, SnapshotFile,
+};
 pub use spec::{
     AppProtocol, Artifact, Delivery, EgressProfile, EnvSpec, Isolation, Lifetime, NetworkSpec,
     PlacementSpec, PortProtocol, PortSpec, Probe, ProbeKind, Probes, Process, RestartPolicy,

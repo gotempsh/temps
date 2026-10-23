@@ -1212,6 +1212,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            control_plane_sandbox_driver_mode: Default::default(),
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1269,7 +1270,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unparseable_or_missing_configuration_reserves_nothing_from_it() {
+    async fn unparsable_or_missing_configuration_reserves_nothing_from_it() {
         let networks = networks_of(vec![network_config(true, "not-a-cidr", None)]).await;
         assert_eq!(
             networks.iter().map(|n| n.name).collect::<Vec<_>>(),

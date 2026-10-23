@@ -47,3 +47,8 @@ pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMi
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
 
 pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;
+
+pub use migration::m20261022_000006_nodes_sandbox_driver_mode::{
+    Migration as NodesSandboxDriverModeMigration, DOWN_SQL as NODES_SANDBOX_DRIVER_MODE_DOWN_SQL,
+    UP_SQL as NODES_SANDBOX_DRIVER_MODE_UP_SQL,
+};

@@ -296,6 +296,16 @@ pub enum DriverError {
         instance: String,
         reason: String,
     },
+    /// A backend failure kept whole, so a facade over the driver can recover
+    /// the backend's own error (and its HTTP mapping) by downcasting.
+    #[error("driver '{driver}' failed to {operation} instance '{instance}': {source}")]
+    Backend {
+        driver: String,
+        operation: &'static str,
+        instance: String,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 #[async_trait]

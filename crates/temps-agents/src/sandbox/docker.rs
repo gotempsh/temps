@@ -3841,6 +3841,7 @@ impl DockerSandboxProvider {
                     work_dir: PathBuf::from(CONTAINER_WORK_DIR),
                     backend: super::SandboxBackend::Docker,
                     image: String::new(),
+                    conditions: Vec::new(),
                 }))
             }
             Err(error) if docker_error_is_not_found(&error) => Ok(None),
@@ -4715,6 +4716,7 @@ impl SandboxProvider for DockerSandboxProvider {
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
             backend: super::SandboxBackend::Docker,
             image: image.to_string(),
+            conditions: Vec::new(),
         })
     }
 
@@ -10556,6 +10558,7 @@ function response() {{
             work_dir: "/home/temps/workspace".into(),
             backend: crate::sandbox::SandboxBackend::Docker,
             image: base_image.to_string(),
+            conditions: Vec::new(),
         };
 
         let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
@@ -11273,6 +11276,7 @@ function response() {{
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
             backend: super::super::SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         };
         let reattached = match &parked {
             Ok(info) => Some(
@@ -11596,6 +11600,7 @@ fn a_failed_inspection_is_unknown_unless_the_container_is_gone() {
         work_dir: std::path::PathBuf::from("/workspace"),
         backend: crate::sandbox::SandboxBackend::Docker,
         image: String::new(),
+        conditions: Vec::new(),
     };
     let gone = bollard::errors::Error::DockerResponseServerError {
         status_code: 404,

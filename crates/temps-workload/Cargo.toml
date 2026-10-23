@@ -19,7 +19,8 @@ chrono = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# `AsyncWrite`, for the sandbox byte channels.
+tokio = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
-tokio = { workspace = true }

@@ -499,6 +499,23 @@ pub enum NodeError {
     DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
+/// The control plane is node 0 (it has no `nodes` row); the sandbox driver
+/// mode API takes that id for it.
+use super::node_scheduler::CONTROL_PLANE_NODE_ID;
+/// The name the control plane goes by in that API and its audit records.
+pub const CONTROL_PLANE_NODE_NAME: &str = "control-plane";
+
+pub use temps_entities::sandbox_driver_mode::SandboxDriverMode;
+
+/// One node's sandbox driver mode (ADR-055 phase 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxDriverModeSetting {
+    /// [`CONTROL_PLANE_NODE_ID`] for the control plane.
+    pub node_id: i32,
+    pub node_name: String,
+    pub mode: SandboxDriverMode,
+}
+
 /// A managed service that blocks a node's removal.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct NodeServiceReference {
@@ -1582,6 +1599,77 @@ impl NodeService {
             return Err(NodeError::NotFoundById { node_id });
         }
         Ok(())
+    }
+
+    /// Which code path serves a node's sandboxes (ADR-055 phase 6). Node
+    /// id [`CONTROL_PLANE_NODE_ID`] is the control plane, whose mode lives on
+    /// the `network_config` singleton because it has no `nodes` row.
+    pub async fn sandbox_driver_mode(
+        &self,
+        node_id: i32,
+    ) -> Result<SandboxDriverModeSetting, NodeError> {
+        if node_id == CONTROL_PLANE_NODE_ID {
+            let mode = temps_entities::network_config::Entity::find_by_id(1)
+                .one(self.db.as_ref())
+                .await?
+                .map(|row| row.control_plane_sandbox_driver_mode)
+                .unwrap_or_default();
+            return Ok(SandboxDriverModeSetting {
+                node_id,
+                node_name: CONTROL_PLANE_NODE_NAME.to_string(),
+                mode,
+            });
+        }
+        let node = self.get_by_id(node_id).await?;
+        Ok(SandboxDriverModeSetting {
+            node_id: node.id,
+            node_name: node.name,
+            mode: node.sandbox_driver_mode,
+        })
+    }
+
+    /// Move one node's sandboxes to another code path. Returns the setting
+    /// before and after, for the audit record. Only worker nodes host
+    /// sandboxes; the control plane is node [`CONTROL_PLANE_NODE_ID`].
+    pub async fn set_sandbox_driver_mode(
+        &self,
+        node_id: i32,
+        mode: SandboxDriverMode,
+    ) -> Result<(SandboxDriverModeSetting, SandboxDriverModeSetting), NodeError> {
+        let before = self.sandbox_driver_mode(node_id).await?;
+        if node_id == CONTROL_PLANE_NODE_ID {
+            // The singleton row is seeded by migration; the upsert also
+            // covers a database where it was removed by hand.
+            self.db
+                .execute(sea_orm::Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "INSERT INTO network_config (id, control_plane_sandbox_driver_mode) \
+                     VALUES (1, $1) ON CONFLICT (id) DO UPDATE \
+                     SET control_plane_sandbox_driver_mode = \
+                         EXCLUDED.control_plane_sandbox_driver_mode, updated_at = NOW()",
+                    vec![mode.as_str().into()],
+                ))
+                .await?;
+        } else {
+            let node = self.get_by_id(node_id).await?;
+            if node.role != "worker" {
+                return Err(NodeError::Validation {
+                    message: format!(
+                        "Node '{}' (id {}) has role '{}'; sandboxes run only on worker nodes \
+                         and on the control plane (node {}), so it has no sandbox driver mode",
+                        node.name, node_id, node.role, CONTROL_PLANE_NODE_ID
+                    ),
+                });
+            }
+            let mut active: nodes::ActiveModel = node.into();
+            active.sandbox_driver_mode = Set(mode);
+            active.update(self.db.as_ref()).await?;
+        }
+        let after = SandboxDriverModeSetting {
+            mode,
+            ..before.clone()
+        };
+        Ok((before, after))
     }
 
     pub async fn set_public_ingress_enabled(
@@ -3185,6 +3273,7 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            sandbox_driver_mode: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -3502,6 +3591,96 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored_targets(&blog), Some(vec![0, a]), "not targeting it");
+    }
+
+    /// ADR-055 phase 6 against the real schema: both columns default to
+    /// `legacy`, node 0's upsert works on the singleton row, the CHECK
+    /// constraints refuse unknown modes, and the migration's `down` and `up`
+    /// are both real.
+    #[tokio::test]
+    async fn sandbox_driver_modes_persist_and_the_schema_refuses_unknown_ones() {
+        use sea_orm::ConnectionTrait;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let worker = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        assert_eq!(worker.sandbox_driver_mode, SandboxDriverMode::Legacy);
+
+        let cp = service
+            .sandbox_driver_mode(CONTROL_PLANE_NODE_ID)
+            .await
+            .unwrap();
+        assert_eq!(cp.mode, SandboxDriverMode::Legacy);
+        assert_eq!(cp.node_name, CONTROL_PLANE_NODE_NAME);
+        let (before, after) = service
+            .set_sandbox_driver_mode(CONTROL_PLANE_NODE_ID, SandboxDriverMode::Enforce)
+            .await
+            .unwrap();
+        assert_eq!(
+            (before.mode, after.mode),
+            (SandboxDriverMode::Legacy, SandboxDriverMode::Enforce)
+        );
+        assert_eq!(
+            service
+                .sandbox_driver_mode(CONTROL_PLANE_NODE_ID)
+                .await
+                .unwrap()
+                .mode,
+            SandboxDriverMode::Enforce
+        );
+
+        let (before, after) = service
+            .set_sandbox_driver_mode(worker.id, SandboxDriverMode::Shadow)
+            .await
+            .unwrap();
+        assert_eq!(
+            (before.mode, after.mode, after.node_name.as_str()),
+            (
+                SandboxDriverMode::Legacy,
+                SandboxDriverMode::Shadow,
+                "worker-1"
+            )
+        );
+        assert_eq!(
+            service.sandbox_driver_mode(worker.id).await.unwrap().mode,
+            SandboxDriverMode::Shadow
+        );
+
+        for sql in [
+            format!(
+                "UPDATE nodes SET sandbox_driver_mode = 'turbo' WHERE id = {}",
+                worker.id
+            ),
+            "UPDATE network_config SET control_plane_sandbox_driver_mode = 'turbo' WHERE id = 1"
+                .to_string(),
+        ] {
+            let err = db
+                .execute_unprepared(&sql)
+                .await
+                .expect_err("an unknown mode violates the CHECK constraint");
+            assert!(err.to_string().contains("sandbox_driver_mode"), "{err}");
+        }
+
+        db.execute_unprepared(temps_migrations::NODES_SANDBOX_DRIVER_MODE_DOWN_SQL)
+            .await
+            .expect("down");
+        assert!(db
+            .execute_unprepared("SELECT sandbox_driver_mode FROM nodes")
+            .await
+            .is_err());
+        db.execute_unprepared(temps_migrations::NODES_SANDBOX_DRIVER_MODE_UP_SQL)
+            .await
+            .expect("up again");
+        assert_eq!(
+            service.sandbox_driver_mode(worker.id).await.unwrap().mode,
+            SandboxDriverMode::Legacy,
+            "re-applied columns start at the default"
+        );
     }
 
     /// Emptying a pinned placement would let it run on any node, so the

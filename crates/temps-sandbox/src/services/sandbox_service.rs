@@ -1664,6 +1664,7 @@ impl SandboxService {
             })),
         )
         .await;
+        self.record_driver_conditions(row.id, &handle).await;
 
         tracing::info!(
             "Created agent-run sandbox {} (internal {}) for run {}",
@@ -2439,6 +2440,7 @@ impl SandboxService {
             })),
         )
         .await;
+        self.record_driver_conditions(row.id, &handle).await;
 
         tracing::info!(
             "Created standalone sandbox {} (internal {}) for user {}",
@@ -5013,6 +5015,39 @@ TEMPS_ASKPASS_EOF\n\
             })
     }
 
+    /// Put what the driver facade reported when it placed the sandbox on its
+    /// timeline (ADR-055 §5): a requested limit the driver could not apply
+    /// (`LimitEnforced = False`, with the reason) or a passed-over driver.
+    /// Nothing is recorded when there is nothing to say, which is always the
+    /// case outside `enforce` mode.
+    async fn record_driver_conditions(
+        &self,
+        sandbox_id: i32,
+        handle: &temps_agents::sandbox::SandboxHandle,
+    ) {
+        if handle.conditions.is_empty() {
+            return;
+        }
+        let conditions = match serde_json::to_value(&handle.conditions) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to encode driver conditions for sandbox {} ({}): {}",
+                    sandbox_id,
+                    handle.sandbox_name,
+                    e
+                );
+                return;
+            }
+        };
+        self.record_event(
+            sandbox_id,
+            "driver_conditions",
+            Some(serde_json::json!({ "conditions": conditions })),
+        )
+        .await;
+    }
+
     /// Append one operation to a sandbox's timeline. Best-effort — a failed
     /// insert is logged, never fatal to the operation it records.
     async fn record_event(
@@ -7117,6 +7152,7 @@ mod storage_cleanup_tests {
             work_dir: PathBuf::from("/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
