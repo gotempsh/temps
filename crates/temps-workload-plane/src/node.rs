@@ -255,6 +255,26 @@ impl RuntimeDriver for StreamNodeDriver {
     }
 }
 
+/// The binds of an instance: the ADR-045 socket for `HostPrivileged`, then
+/// each resolved volume mount (`source:path[:ro]`). A mount without a
+/// source is not bound; admission refuses one for the kinds that mount.
+pub(crate) fn volume_binds(spec: &WorkloadSpec, security: SecurityProfile) -> Vec<String> {
+    let socket =
+        (security == SecurityProfile::HostPrivileged).then(|| DOCKER_SOCKET_BIND.to_string());
+    socket
+        .into_iter()
+        .chain(spec.volumes.iter().filter_map(|mount| {
+            mount.source.as_ref().map(|source| {
+                let mut bind = format!("{source}:{}", mount.mount_path);
+                if mount.read_only {
+                    bind.push_str(":ro");
+                }
+                bind
+            })
+        }))
+        .collect()
+}
+
 const NODE_PHASES: [&str; 4] = ["pending", "running", "succeeded", "failed"];
 
 impl WorkloadPlane {
@@ -328,12 +348,9 @@ impl WorkloadPlane {
                     dns: None,
                 },
                 // Admission gave this profile only to an ADR-045 granted
-                // project; every other workload never gets the socket.
-                volumes: if security == SecurityProfile::HostPrivileged {
-                    vec![DOCKER_SOCKET_BIND.to_string()]
-                } else {
-                    Vec::new()
-                },
+                // project; every other workload never gets the socket. Then
+                // the volumes, whose sources the plane resolved (§12).
+                volumes: volume_binds(spec, security),
             },
         }
     }

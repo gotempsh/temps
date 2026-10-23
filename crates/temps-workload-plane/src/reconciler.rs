@@ -709,27 +709,27 @@ impl WorkloadPlane {
             .filter(|nodes| !nodes.contains(&crate::scheduler::CONTROL_PLANE_NODE_ID))
         {
             let message = format!(
-                "pinned to node(s) {pinned:?}, and this plane runs instances only on the control \
-                 plane (node 0); worker replicas are placed by the deployment, not the plane"
+                "pinned to node(s) {pinned:?}{}, and this plane runs instances only on the \
+                 control plane (node 0); worker replicas are placed by the deployment, not the \
+                 plane",
+                pin_cause(&view.spec)
             );
+            // A volume's node is a pin the product cannot drop: say so.
+            let reason = if view.spec.volumes.is_empty() {
+                "PinnedNodeNotServed"
+            } else {
+                "PinnedByVolume"
+            };
             status.set_condition(
                 ConditionKind::Scheduled,
                 ConditionStatus::False,
-                "PinnedNodeNotServed",
+                reason,
                 &message,
                 now,
             );
             status.phase = WorkloadPhase::Pending;
             if self.write_status(&row, &status, None).await? {
-                events::record(
-                    self.db.as_ref(),
-                    row.id,
-                    None,
-                    "PinnedNodeNotServed",
-                    &message,
-                    now,
-                )
-                .await?;
+                events::record(self.db.as_ref(), row.id, None, reason, &message, now).await?;
             }
             return Ok(None);
         }
@@ -914,10 +914,29 @@ impl WorkloadPlane {
         &self,
         view: &WorkloadView,
     ) -> Result<(Option<i32>, Arc<dyn RuntimeDriver>), String> {
+        let pinned = view.spec.placement.pinned_nodes();
         let placed = match &self.placement {
             None => Placed::ControlPlane,
             Some(placement) => placement.place(view).await?,
         };
+        // Strict pinning (§8): a placement outside the pin is refused, never
+        // run (a backup job must run where its database's volume is).
+        let placed_on = match &placed {
+            Placed::ControlPlane => crate::scheduler::CONTROL_PLANE_NODE_ID,
+            Placed::Node { node_id, .. } => *node_id,
+        };
+        if let Some(pinned) = pinned.filter(|nodes| !nodes.contains(&placed_on)) {
+            return Err(format!(
+                "workload {} is pinned to node(s) {pinned:?}{}, but {}",
+                view.id,
+                pin_cause(&view.spec),
+                if self.placement.is_none() {
+                    "this plane places attempts only on the control plane (node 0)".to_string()
+                } else {
+                    format!("its placement chose node {placed_on}")
+                }
+            ));
+        }
         match placed {
             Placed::ControlPlane => Ok((None, self.control_plane_driver()?)),
             Placed::Node {
@@ -1902,6 +1921,27 @@ fn view_spec_ttl(row: &workloads::Model) -> Option<Duration> {
         } => ttl_secs_after_finished.map(|s| Duration::seconds(i64::from(s))),
         _ => None,
     }
+}
+
+/// Why a workload is pinned, for messages: its volumes, when it mounts any.
+fn pin_cause(spec: &temps_workload::WorkloadSpec) -> String {
+    if spec.volumes.is_empty() {
+        return String::new();
+    }
+    let names: Vec<String> = spec
+        .volumes
+        .iter()
+        .map(|m| format!("`{}`", m.volume))
+        .collect();
+    format!(
+        " by {} {}",
+        if names.len() == 1 {
+            "volume"
+        } else {
+            "volumes"
+        },
+        names.join(", ")
+    )
 }
 
 #[cfg(test)]

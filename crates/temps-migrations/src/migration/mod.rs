@@ -37,6 +37,7 @@ pub(crate) mod m20261022_000005_deployment_workload_mode;
 pub(crate) mod m20261022_000006_nodes_sandbox_driver_mode;
 pub(crate) mod m20261022_000007_network_policy;
 pub(crate) mod m20261022_000008_ingress_endpoints;
+pub(crate) mod m20261023_000010_workload_volumes;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -827,6 +828,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261022_000006_nodes_sandbox_driver_mode::Migration),
             Box::new(m20261022_000007_network_policy::Migration),
             Box::new(m20261022_000008_ingress_endpoints::Migration),
+            Box::new(m20261023_000010_workload_volumes::Migration),
         ]
     }
 }

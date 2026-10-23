@@ -679,3 +679,47 @@ pub struct NodeResourcesChangedAudit {
 }
 
 impl_audit_operation!(NodeResourcesChangedAudit, "NODE_RESOURCES_CHANGED");
+
+/// An admin created a volume for an environment (ADR-055 Phase 9).
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeCreatedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub size_mb: Option<u64>,
+    pub retain_on_delete: bool,
+}
+
+impl_audit_operation!(EnvironmentVolumeCreatedAudit, "ENVIRONMENT_VOLUME_CREATED");
+
+/// An admin attached (`mount_path` set) or detached (`None`) an
+/// environment's volume.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeAttachmentChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub mount_path: Option<String>,
+    pub read_only: bool,
+}
+
+impl_audit_operation!(
+    EnvironmentVolumeAttachmentChangedAudit,
+    "ENVIRONMENT_VOLUME_ATTACHMENT_CHANGED"
+);
+
+/// An admin deleted an environment's volume, and whether its data went
+/// with it.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeDeletedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub backing_removed: bool,
+    pub backing_kept_reason: Option<String>,
+}
+
+impl_audit_operation!(EnvironmentVolumeDeletedAudit, "ENVIRONMENT_VOLUME_DELETED");

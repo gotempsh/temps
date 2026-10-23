@@ -125,6 +125,10 @@ impl DeploymentsPlugin {
             context.require_service::<temps_core::EncryptionService>(),
             Some(image_builder),
         ));
+        let volume_provider = docker_volume_provider(
+            context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            Some(docker_handle.clone()),
+        );
         let mut plane = temps_workload_plane::WorkloadPlane::new(
             db.clone(),
             temps_workload_plane::NodeDriver(driver),
@@ -138,6 +142,9 @@ impl DeploymentsPlugin {
             db,
         )))
         .with_placement(attempt_placement);
+        if let Some(provider) = volume_provider {
+            plane = plane.with_volume_provider(provider);
+        }
         // ADR-055 §8: the plane schedules from the product's node inventory
         // with the same threshold and control-plane policy as NodeScheduler.
         if let Some(placement) = placement {
@@ -154,6 +161,10 @@ impl DeploymentsPlugin {
                 node_state.set_plane(plane.clone());
                 node_state.start_retention(node_service);
                 cron_service.set_workload_plane(plane.clone());
+                // Backups as jobs (Phase 9) read it from here.
+                if let Some(slot) = context.get_service::<temps_workload_plane::PlaneSlot>() {
+                    slot.set(plane.clone());
+                }
                 // `enforce` environments start replicas through it.
                 if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
                     workflow.set_workload_plane(plane);
@@ -166,6 +177,21 @@ impl DeploymentsPlugin {
             Err(e) => tracing::error!("Workload plane did not start: {e}"),
         }
     }
+}
+
+/// The control plane's Docker volume provider, when this process has a
+/// Docker daemon for local workloads.
+fn docker_volume_provider(
+    policy: Option<Arc<temps_core::LocalWorkloadPolicy>>,
+    docker: Option<Arc<temps_core::DockerHandle>>,
+) -> Option<Arc<dyn temps_workload_volumes::VolumeProvider>> {
+    if !temps_core::policy_or_default(policy).local_workloads_enabled() {
+        return None;
+    }
+    let docker = docker.and_then(|handle| handle.cloned())?;
+    Some(Arc::new(temps_workload_docker::DockerVolumeProvider::new(
+        docker.as_ref().clone(),
+    )))
 }
 
 impl Default for DeploymentsPlugin {
@@ -569,6 +595,19 @@ impl TempsPlugin for DeploymentsPlugin {
             ));
             workflow_execution_service.set_workload_placement(workload_placement.clone());
             context.register_service(workload_placement);
+
+            // ADR-055 Phase 9: environment volumes, and the slot the backup
+            // plugin reads the plane from once it starts.
+            let volume_provider: Option<Arc<dyn temps_workload_volumes::VolumeProvider>> =
+                docker_volume_provider(
+                    context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                    context.get_service::<temps_core::DockerHandle>(),
+                );
+            context.register_service(Arc::new(crate::services::WorkloadVolumeService::new(
+                db.clone(),
+                volume_provider,
+            )));
+            context.register_service(Arc::new(temps_workload_plane::PlaneSlot::new()));
             deployment_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
@@ -1263,6 +1302,15 @@ impl TempsPlugin for DeploymentsPlugin {
                 )),
             )
             .merge(
+                handlers::workload_volumes::configure_routes().with_state(Arc::new(
+                    handlers::workload_volumes::WorkloadVolumesAppState {
+                        service: context
+                            .require_service::<crate::services::WorkloadVolumeService>(),
+                        audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                    },
+                )),
+            )
+            .merge(
                 handlers::node_state::configure_status_routes().with_state(Arc::new(
                     handlers::node_state::NodeStateStatusAppState {
                         node_state: context.require_service::<crate::services::NodeStateService>(),
@@ -1325,6 +1373,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 compose_check_schema,
                 <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::workload_volumes::WorkloadVolumesApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::sandbox_driver_mode::SandboxDriverModeApiDoc as UtoimaOpenApi>::openapi(
                 ),
             ],

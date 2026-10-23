@@ -111,6 +111,8 @@ pub mod runtime_health;
 
 pub mod workload_placement;
 pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
+pub mod workload_volumes;
+pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
 pub mod node_state;
 pub mod plane_deployer;
 pub use node_state::{

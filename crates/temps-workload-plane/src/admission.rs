@@ -342,11 +342,38 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             spec.env.secrets.len()
         ));
     }
-    if !spec.volumes.is_empty() {
+    // Phase 9: a deployment replica mounts its environment's volumes,
+    // resolved by `WorkloadPlane::apply_with_volumes`, which sets each bind
+    // source from the volume's row. A source the plane did not set (or a
+    // host path) never reaches the runtime.
+    if !spec.volumes.is_empty() && !deployment {
         return Err(format!(
             "{} volume mount(s) requested; jobs cannot mount volumes yet",
             spec.volumes.len()
         ));
+    }
+    for mount in &spec.volumes {
+        match mount.source.as_deref() {
+            None => {
+                return Err(format!(
+                    "volume '{}' is not resolved; volumes are mounted through \
+                     apply_with_volumes, which checks them against their owner's rows",
+                    mount.volume
+                ));
+            }
+            Some(source)
+                if source.is_empty()
+                    || source.contains(['/', ':', '\0'])
+                    || source.starts_with('.') =>
+            {
+                return Err(format!(
+                    "volume '{}' binds '{source}', which is not a named volume; a workload \
+                     never mounts a host path",
+                    mount.volume
+                ));
+            }
+            Some(_) => {}
+        }
     }
     if !deployment && !spec.ports.is_empty() {
         return Err(format!(
@@ -369,14 +396,20 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             spec.placement.replicas
         ));
     }
-    // A deployment replica may be pinned anywhere: the reconciler reports a
-    // pin it cannot meet as `Scheduled = False` (strict pinning, §8).
-    if let Some(nodes) = spec.placement.nodes.as_ref().filter(|_| !deployment) {
-        if nodes.iter().any(|node| *node != 0) {
-            return Err(format!(
-                "placement on nodes {nodes:?} is not available; jobs run on the control plane"
-            ));
-        }
+    // A workload may be pinned anywhere (Phase 9: a backup job runs on the
+    // node holding its database's volume). The reconciler reports a pin it
+    // cannot meet as `Scheduled = False` (strict pinning, §8); it never
+    // moves the workload.
+    if let Some(node) = spec
+        .placement
+        .nodes
+        .iter()
+        .flatten()
+        .find(|node| **node < 0)
+    {
+        return Err(format!(
+            "placement on node {node} is invalid; node ids start at 0 (the control plane)"
+        ));
     }
     if let Some(label) = spec
         .labels
@@ -761,8 +794,19 @@ mod tests {
                 }),
             ),
             (
-                "worker node",
-                Box::new(|s| s.placement.nodes = Some(vec![3])),
+                "negative node",
+                Box::new(|s| s.placement.nodes = Some(vec![-1])),
+            ),
+            (
+                "job volume",
+                Box::new(|s| {
+                    s.volumes.push(temps_workload::VolumeMount {
+                        volume: "data".into(),
+                        mount_path: "/data".into(),
+                        read_only: false,
+                        source: Some("temps-vol-environment-3-data".into()),
+                    })
+                }),
             ),
         ];
         for (case, mutate) in cases {
@@ -795,6 +839,7 @@ mod tests {
                 volume: "redis_data_cache".into(),
                 mount_path: "/data".into(),
                 read_only: false,
+                source: None,
             }],
             ports: vec![temps_workload::PortSpec {
                 name: "redis".into(),
@@ -859,7 +904,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(refused.rule, AdmissionRule::Validation);
-        assert!(refused.message.contains("only jobs"), "{}", refused.message);
+        assert!(
+            refused.message.contains("is not run by the plane yet"),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

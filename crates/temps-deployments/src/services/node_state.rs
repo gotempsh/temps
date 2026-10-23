@@ -800,12 +800,20 @@ impl NodeWorkloadPlacement {
 impl AttemptPlacement for NodeWorkloadPlacement {
     async fn place(&self, workload: &WorkloadView) -> Result<Placed, String> {
         let targets = self.targets(workload).await?;
+        // A spec's own pin (a backup job on its database's node, ADR-055
+        // Phase 9) wins over the environment's targets; the plane refuses
+        // a placement outside it.
+        let pinned = workload.spec.placement.pinned_nodes();
         let outcome = self
             .scheduler
             .schedule_placement(ReplicaPlacementRequest {
                 replica_count: 1,
-                labels: targets.target_labels.as_ref(),
-                target_node_ids: targets.target_nodes.as_deref(),
+                labels: if pinned.is_some() {
+                    None
+                } else {
+                    targets.target_labels.as_ref()
+                },
+                target_node_ids: pinned.or(targets.target_nodes.as_deref()),
                 anti_affinity: false,
                 exclude_node_ids: &[],
                 image_platforms: &[],

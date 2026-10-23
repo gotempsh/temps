@@ -100,7 +100,10 @@ pub(crate) async fn test_db() -> Option<TestDatabase> {
             panic!("test database could not be created: {text}");
         }
     };
-    for statement in temps_migrations::WORKLOAD_TABLES_SQL {
+    for statement in temps_migrations::WORKLOAD_TABLES_SQL
+        .iter()
+        .chain(temps_migrations::VOLUME_TABLES_SQL)
+    {
         db.db
             .execute_unprepared(statement)
             .await

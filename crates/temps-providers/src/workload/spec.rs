@@ -678,6 +678,7 @@ pub fn database_workload_spec(
                 volume: volume.clone(),
                 mount_path: path.clone(),
                 read_only: false,
+                source: None,
             })
             .collect(),
         ports: vec![PortSpec {
