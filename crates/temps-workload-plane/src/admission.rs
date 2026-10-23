@@ -859,7 +859,11 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(refused.rule, AdmissionRule::Validation);
-        assert!(refused.message.contains("only jobs"), "{}", refused.message);
+        assert!(
+            refused.message.contains("is not run by the plane"),
+            "{}",
+            refused.message
+        );
     }
 
     #[test]

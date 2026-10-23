@@ -34,6 +34,10 @@ pub struct Model {
     pub ready: bool,
     pub conditions: Json,
     pub exit_code: Option<i64>,
+    /// `[temps_workload::PortBinding]` a worker's node runtime published,
+    /// as its heartbeat reports them. `[]` on the control plane, whose
+    /// driver answers directly.
+    pub published_ports: Json,
     pub started_at: Option<DBDateTime>,
     pub finished_at: Option<DBDateTime>,
     pub change_seq: i64,

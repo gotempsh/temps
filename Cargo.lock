@@ -15632,6 +15632,7 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "temps-docker-capture",
  "temps-workload",
  "tokio",

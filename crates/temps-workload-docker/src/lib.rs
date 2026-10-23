@@ -16,6 +16,7 @@
 //! the Docker socket (ADR-045).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use bollard::models::{
@@ -30,6 +31,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 pub mod data;
+pub mod secrets;
 pub mod shape;
 
 pub use data::{data_container_create_body, data_host_config, DataExtras, DATA_DEFAULT_PIDS_LIMIT};
@@ -213,6 +215,9 @@ fn is_not_found(error: &bollard::errors::Error) -> bool {
 pub struct DockerDriver {
     docker: Docker,
     capabilities: DriverCapabilities,
+    /// Where per-instance secret directories live (`<root>/<instance>`).
+    /// `None`: specs with secret files are refused.
+    secrets_root: Option<PathBuf>,
 }
 
 impl DockerDriver {
@@ -220,7 +225,60 @@ impl DockerDriver {
         Self {
             docker,
             capabilities: capabilities(),
+            secrets_root: None,
         }
+    }
+
+    /// Deliver secret files at `/run/secrets` from `<root>/<instance>`
+    /// (mode 0700, files 0400, owned by the image's numeric `USER`), the way
+    /// the legacy deployer does. The root must survive a reboot: the
+    /// directory is bind-mounted for the container's whole life.
+    pub fn with_secrets_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.secrets_root = Some(root.into());
+        self
+    }
+
+    /// Write `spec`'s secret files and return the bind that mounts them,
+    /// or `None` when it has none.
+    async fn write_secret_files(
+        &self,
+        spec: &InstanceSpec,
+    ) -> Result<Option<(PathBuf, String)>, DriverError> {
+        if spec.secret_files.is_empty() {
+            return Ok(None);
+        }
+        let secrets_error = |reason: String| DriverError::Secrets {
+            driver: DRIVER.to_string(),
+            instance: spec.name.clone(),
+            reason,
+        };
+        let Some(root) = &self.secrets_root else {
+            return Err(secrets_error(
+                "secret files need a host directory and this driver has no secrets root; \
+                 create through a driver built with a secrets root"
+                    .to_string(),
+            ));
+        };
+        secrets::validate_secret_dir_name(&spec.name)
+            .map_err(|e| secrets_error(format!("derive host dir: {e}")))?;
+        let dir = root.join(&spec.name);
+        let files: HashMap<String, String> = spec
+            .secret_files
+            .iter()
+            .map(|file| (file.name.clone(), file.value.clone()))
+            .collect();
+        let owner = secrets::image_owner(&self.docker, &spec.image).await;
+        secrets::write_secrets_to_host_dir(&dir, &files, Some(owner))
+            .map_err(|e| secrets_error(format!("write host dir {}: {e}", dir.display())))?;
+        let bind = secrets::secrets_bind(&dir);
+        Ok(Some((dir, bind)))
+    }
+
+    /// The secrets directory of instance `name`, when this driver has one.
+    fn secrets_dir_of(&self, name: &str) -> Option<PathBuf> {
+        let root = self.secrets_root.as_ref()?;
+        secrets::validate_secret_dir_name(name).ok()?;
+        Some(root.join(name))
     }
 
     /// Creates the container with the caller's host-local binds (see
@@ -369,14 +427,17 @@ impl RuntimeDriver for DockerDriver {
         spec: &InstanceSpec,
         attach: &Attachments,
     ) -> Result<InstanceHandle, DriverError> {
-        if !spec.secret_files.is_empty() {
-            return Err(DriverError::Secrets {
-                driver: DRIVER.to_string(),
-                instance: spec.name.clone(),
-                reason: "secret files need a host directory; create through the node runtime, which owns it".to_string(),
-            });
-        }
-        let handle = self.create_with_binds(spec, attach, Vec::new()).await?;
+        let secrets = self.write_secret_files(spec).await?;
+        let binds = secrets.iter().map(|(_, bind)| bind.clone()).collect();
+        let handle = match self.create_with_binds(spec, attach, binds).await {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some((dir, _)) = &secrets {
+                    secrets::remove_secrets_dir(dir);
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.attach_networks(&handle, attach).await {
             let _ = self.remove(&handle, true).await;
             return Err(error);
@@ -413,7 +474,7 @@ impl RuntimeDriver for DockerDriver {
             v: purge,
             ..Default::default()
         };
-        match self
+        let removed = match self
             .docker
             .remove_container(&handle.id, Some(options))
             .await
@@ -421,7 +482,14 @@ impl RuntimeDriver for DockerDriver {
             Ok(()) => Ok(()),
             Err(e) if is_not_found(&e) => Ok(()),
             Err(e) => Err(runtime("remove", &handle.name)(e)),
+        };
+        // The container is gone, so nothing holds its secrets any more.
+        if removed.is_ok() {
+            if let Some(dir) = self.secrets_dir_of(&handle.name) {
+                secrets::remove_secrets_dir(&dir);
+            }
         }
+        removed
     }
 
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
@@ -736,6 +804,50 @@ mod tests {
             restart_policy_name(RestartPolicy::UnlessStopped),
             RestartPolicyNameEnum::UNLESS_STOPPED
         );
+    }
+
+    #[tokio::test]
+    async fn secret_files_are_written_privately_and_bound_read_only() {
+        let fake = temps_docker_capture::FakeDocker::start().await.unwrap();
+        fake.allow_create("shop-production-31");
+        let root = tempfile::tempdir().unwrap();
+        let driver = DockerDriver::new(fake.docker()).with_secrets_root(root.path());
+        let mut s = spec();
+        s.secret_files.push(temps_workload::SecretFile {
+            name: "API_TOKEN".into(),
+            value: "seeded-token-value".into(),
+        });
+        let handle = driver.create(&s, &attach()).await.expect("created");
+
+        let dir = root.path().join("shop-production-31");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("API_TOKEN")).unwrap(),
+            "seeded-token-value"
+        );
+        let create = &fake.creates()[0];
+        let body = serde_json::to_string(&create.body).unwrap();
+        assert!(
+            body.contains(&format!("{}:/run/secrets:ro", dir.display())),
+            "{body}"
+        );
+        assert!(!body.contains("seeded-token-value"), "{body}");
+
+        driver.remove(&handle, true).await.expect("removed");
+        assert!(!dir.exists(), "removing the instance removes its secrets");
+    }
+
+    #[tokio::test]
+    async fn a_failed_create_leaves_no_secrets_behind() {
+        let fake = temps_docker_capture::FakeDocker::start().await.unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let driver = DockerDriver::new(fake.docker()).with_secrets_root(root.path());
+        let mut s = spec();
+        s.secret_files.push(temps_workload::SecretFile {
+            name: "API_TOKEN".into(),
+            value: "v".into(),
+        });
+        driver.create(&s, &attach()).await.unwrap_err();
+        assert!(!root.path().join("shop-production-31").exists());
     }
 
     #[tokio::test]

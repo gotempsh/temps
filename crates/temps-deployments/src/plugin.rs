@@ -88,7 +88,11 @@ impl DeploymentsPlugin {
         let driver = match docker_handle.cloned() {
             Some(docker) if local_workloads.local_workloads_enabled() => {
                 let driver: Arc<dyn temps_workload::RuntimeDriver> = Arc::new(
-                    temps_workload_docker::DockerDriver::new(docker.as_ref().clone()),
+                    // The legacy deployer's secrets root, so a replica's
+                    // `/run/secrets` lives where it always has and survives
+                    // a reboot.
+                    temps_workload_docker::DockerDriver::new(docker.as_ref().clone())
+                        .with_secrets_root(temps_workload_docker::secrets::default_secrets_root()),
                 );
                 Some(driver)
             }

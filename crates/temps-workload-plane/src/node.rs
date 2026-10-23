@@ -31,10 +31,10 @@ use temps_core::docker_socket_grant::DOCKER_SOCKET_BIND;
 use temps_entities::{workload_instances, workloads};
 use temps_workload::stream::{InstanceEnv, InstanceReport, InstanceTemplate};
 use temps_workload::{
-    labels as workload_labels, Artifact, Attachments, ConditionStatus, DriverCapabilities,
-    DriverError, InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus,
-    Lifetime, LogQuery, LogRotation, LogStream, NetworkAttachment, PortBinding, PreparedArtifact,
-    RestartPolicy, RuntimeDriver, SecurityProfile, WorkloadSpec,
+    labels as workload_labels, Artifact, Attachments, ConditionKind, ConditionStatus,
+    DriverCapabilities, DriverError, InstanceHandle, InstanceSpec, InstanceState, InstanceStats,
+    InstanceStatus, Lifetime, LogQuery, LogRotation, LogStream, NetworkAttachment, PortBinding,
+    PreparedArtifact, RestartPolicy, RuntimeDriver, SecurityProfile, WorkloadSpec,
 };
 
 use crate::env;
@@ -67,6 +67,17 @@ pub trait Placement: Send + Sync {
     /// The node of `workload`'s next attempt, or why none is eligible
     /// (the `NoEligibleNode` message).
     async fn place(&self, workload: &WorkloadView) -> Result<Placed, String>;
+
+    /// `workload`'s next attempt on worker `node_id`, which its owner
+    /// already chose (a deployment replica the deploy job placed): only
+    /// the driver is decided here, or why the node cannot run it.
+    async fn place_on(&self, workload: &WorkloadView, node_id: i32) -> Result<Placed, String> {
+        Err(format!(
+            "workload {} is pinned to node {node_id}, and this plane's placement does not \
+             place pinned workloads on workers",
+            workload.id
+        ))
+    }
 
     /// The driver of an instance on worker `node_id` created by the driver
     /// named `driver`, or why it is unavailable.
@@ -215,9 +226,19 @@ impl RuntimeDriver for StreamNodeDriver {
                 published_ports: Vec::new(),
             });
         };
-        let state = match row.phase.as_str() {
-            "pending" => InstanceState::Created,
-            "running" => InstanceState::Running,
+        let conditions: Vec<temps_workload::Condition> =
+            serde_json::from_value(row.conditions.clone()).unwrap_or_default();
+        // What the node reported of a long-running instance it keeps as
+        // the same attempt: stopped by its owner, or removed after it ran.
+        let not_running = conditions
+            .iter()
+            .find(|c| c.kind == ConditionKind::Running && c.status == ConditionStatus::False)
+            .map(|c| c.reason.as_str());
+        let state = match (row.phase.as_str(), not_running) {
+            ("pending", _) => InstanceState::Created,
+            ("running", Some("InstanceRemoved")) => InstanceState::Missing,
+            ("running", Some("Stopped")) => InstanceState::Exited,
+            ("running", _) => InstanceState::Running,
             _ => InstanceState::Exited,
         };
         Ok(InstanceStatus {
@@ -226,7 +247,8 @@ impl RuntimeDriver for StreamNodeDriver {
             started_at: row.started_at,
             finished_at: row.finished_at,
             address: row.address,
-            published_ports: Vec::new(),
+            published_ports: serde_json::from_value(row.published_ports.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -335,6 +357,7 @@ impl WorkloadPlane {
                     Vec::new()
                 },
             },
+            long_running: matches!(spec.lifetime, Lifetime::LongRunning { .. }),
         }
     }
 
@@ -397,6 +420,7 @@ impl WorkloadPlane {
         Ok(InstanceEnv {
             instance_id,
             env: resolved.env,
+            secret_files: resolved.secret_files,
         })
     }
 
@@ -460,6 +484,17 @@ impl WorkloadPlane {
                     field: "instance conditions",
                     reason: e.to_string(),
                 })?;
+            let published_ports =
+                serde_json::to_value(&report.published_ports).map_err(|e| PlaneError::Encode {
+                    workload: format!("instance {}", row.id),
+                    field: "instance published ports",
+                    reason: e.to_string(),
+                })?;
+            // Running, and not reported stopped or removed.
+            let ready = phase == "running"
+                && !report.conditions.iter().any(|c| {
+                    c.kind == ConditionKind::Running && c.status == ConditionStatus::False
+                });
             // Stored at PostgreSQL's microsecond precision: a runtime's
             // nanosecond timestamps compared as sent would differ on every
             // heartbeat and turn "written only when changed" into a write
@@ -475,6 +510,8 @@ impl WorkloadPlane {
             if phase == row.phase
                 && report.exit_code == row.exit_code
                 && conditions == row.conditions
+                && published_ports == row.published_ports
+                && ready == row.ready
                 && started_at == row.started_at
                 && finished_at == row.finished_at
             {
@@ -486,9 +523,10 @@ impl WorkloadPlane {
                     workload_instances::Column::Phase,
                     Expr::value(phase.clone()),
                 )
+                .col_expr(workload_instances::Column::Ready, Expr::value(ready))
                 .col_expr(
-                    workload_instances::Column::Ready,
-                    Expr::value(phase == "running"),
+                    workload_instances::Column::PublishedPorts,
+                    Expr::value(published_ports.clone()),
                 )
                 .col_expr(
                     workload_instances::Column::ExitCode,
@@ -571,6 +609,13 @@ mod tests {
                 node_id: 5,
                 node_name: "worker-a".into(),
                 driver: self.driver_for(5, STREAM_DRIVER).await?,
+            })
+        }
+        async fn place_on(&self, _: &WorkloadView, node_id: i32) -> Result<Placed, String> {
+            Ok(Placed::Node {
+                node_id,
+                node_name: format!("worker-{node_id}"),
+                driver: self.driver_for(node_id, STREAM_DRIVER).await?,
             })
         }
         async fn driver_for(
@@ -672,6 +717,7 @@ mod tests {
             started_at: Some(started),
             finished_at: None,
             conditions: Vec::new(),
+            published_ports: Vec::new(),
         };
         assert_eq!(
             plane
@@ -704,6 +750,79 @@ mod tests {
         let view = plane.get(id).await.expect("read");
         assert_eq!(view.status.phase, WorkloadPhase::Succeeded);
         assert_eq!(view.status.exit_code, Some(0));
+    }
+
+    /// A deployment replica pinned to one worker runs there through its
+    /// stream, and the host port the worker published comes back with its
+    /// report: that is the address the control-plane proxy dials.
+    #[tokio::test]
+    async fn a_replica_pinned_to_a_worker_runs_there_and_reports_its_published_port() {
+        let Some(db) = test_db().await else { return };
+        let control_plane = FakeDriver::new();
+        let rpc = FakeDriver::new();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.db.clone(),
+                NodeDriver(Some(control_plane.clone())),
+                Arc::new(NoEnvSource),
+                Arc::new(RecordingAudit::default()),
+                PlaneConfig::new(format!(
+                    "t{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                )),
+            )
+            .with_placement(Arc::new(OnWorker {
+                db: db.db.clone(),
+                rpc: rpc.clone(),
+            })),
+        );
+        let mut spec = crate::testing::deployment_spec("app:1");
+        spec.placement.nodes = Some(vec![7]);
+        let id = plane
+            .apply(apply_request(42, "app-on-worker", spec))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(control_plane.running().is_empty(), "nothing runs on node 0");
+
+        let row = workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.eq(id))
+            .one(db.db.as_ref())
+            .await
+            .expect("read")
+            .expect("an instance row");
+        assert_eq!(row.node_id, Some(7), "on the pinned worker");
+        assert_eq!(row.driver, STREAM_DRIVER);
+
+        let published = temps_workload::PortBinding {
+            container_port: 3000,
+            protocol: temps_workload::PortProtocol::Tcp,
+            host_ip: "10.0.0.7".into(),
+            host_port: Some(40000),
+        };
+        let report = InstanceReport {
+            instance_id: row.id,
+            phase: "running".into(),
+            exit_code: None,
+            started_at: Some(Utc::now()),
+            finished_at: None,
+            conditions: Vec::new(),
+            published_ports: vec![published.clone()],
+        };
+        assert_eq!(
+            plane
+                .ingest_node_reports(7, &[report])
+                .await
+                .expect("ingested"),
+            1
+        );
+        let (_, status) = plane
+            .instance_status(id)
+            .await
+            .expect("status")
+            .expect("an instance");
+        assert_eq!(status.state, temps_workload::InstanceState::Running);
+        assert_eq!(status.published_ports, vec![published]);
     }
 
     #[test]

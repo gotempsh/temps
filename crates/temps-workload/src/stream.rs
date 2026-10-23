@@ -209,6 +209,12 @@ pub struct InstanceTemplate {
     pub labels: BTreeMap<String, String>,
     pub security: SecurityProfile,
     pub attachments: Attachments,
+    /// A long-running instance (a deployment replica): a stop is reported
+    /// as `Running = False / Stopped`, not as a finished attempt, and a
+    /// container removed after it ran is never recreated. Absent from
+    /// older control planes, which only sent jobs.
+    #[serde(default)]
+    pub long_running: bool,
 }
 
 impl InstanceTemplate {
@@ -250,6 +256,10 @@ pub struct StateAck {
 pub struct InstanceEnv {
     pub instance_id: i64,
     pub env: Vec<(String, String)>,
+    /// Delivered at `/run/secrets/<name>`. Absent from older control
+    /// planes, which never sent any.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_files: Vec<crate::SecretFile>,
 }
 
 impl std::fmt::Debug for InstanceEnv {
@@ -257,6 +267,7 @@ impl std::fmt::Debug for InstanceEnv {
         f.debug_struct("InstanceEnv")
             .field("instance_id", &self.instance_id)
             .field("variables", &self.env.len())
+            .field("secret_files", &self.secret_files.len())
             .finish()
     }
 }
@@ -278,6 +289,9 @@ pub struct InstanceReport {
     /// `ArtifactReady = False / ArtifactPullFailed`.
     #[serde(default)]
     pub conditions: Vec<Condition>,
+    /// The host ports the instance actually got. Absent from older nodes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_ports: Vec<crate::PortBinding>,
 }
 
 #[cfg(test)]
@@ -289,9 +303,14 @@ mod tests {
         let env = InstanceEnv {
             instance_id: 7,
             env: vec![("API_TOKEN".into(), "tok-very-secret".into())],
+            secret_files: vec![crate::SecretFile {
+                name: "DB_PASSWORD".into(),
+                value: "file-very-secret".into(),
+            }],
         };
         let shown = format!("{env:?}");
         assert!(!shown.contains("tok-very-secret"), "{shown}");
+        assert!(!shown.contains("file-very-secret"), "{shown}");
         assert!(shown.contains("variables: 1"), "{shown}");
     }
 

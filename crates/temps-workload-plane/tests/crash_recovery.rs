@@ -195,7 +195,13 @@ async fn the_next_plane_finishes_or_cleans_up_a_run_its_predecessor_left_mid_run
             panic!("test database could not be created: {text}");
         }
     };
-    for statement in temps_migrations::WORKLOAD_TABLES_SQL {
+    let tables = temps_migrations::WORKLOAD_TABLES_SQL
+        .iter()
+        .copied()
+        .chain(std::iter::once(
+            temps_migrations::WORKLOAD_INSTANCE_PORTS_SQL,
+        ));
+    for statement in tables {
         db.db
             .execute_unprepared(statement)
             .await

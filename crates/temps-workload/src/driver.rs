@@ -89,7 +89,7 @@ pub struct PreparedArtifact {
 
 /// A secret file delivered at `/run/secrets/<name>`. The value never
 /// appears in `Debug` output.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecretFile {
     pub name: String,
     pub value: String,

@@ -31,7 +31,7 @@ use temps_workload::{
     RuntimeDriver, SecurityProfile,
 };
 
-use crate::store::{NodeState, SecretStore, SnapshotStore, StoreError};
+use crate::store::{KeptEnv, NodeState, SecretStore, SnapshotStore, StoreError};
 
 /// Why the control plane could not be reached or answered with an error.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -94,6 +94,39 @@ pub struct NodeRuntime {
     sent: Mutex<BTreeMap<i64, InstanceReport>>,
     /// Wakes the heartbeat early when a report changed.
     pub reports_changed: Arc<tokio::sync::Notify>,
+    /// The host address published ports bind to (this node's private
+    /// address), read at each create; `None` keeps the template's.
+    publish_host_ip: Option<PublishHostIp>,
+}
+
+/// Answers this node's current private address.
+pub type PublishHostIp = Arc<dyn Fn() -> String + Send + Sync>;
+
+/// A condition with a caller-chosen transition time, so a state reported on
+/// every pass compares equal to the last report (and is not re-sent, nor
+/// re-written by the control plane, on every heartbeat).
+fn condition_at(
+    kind: ConditionKind,
+    status: ConditionStatus,
+    reason: &str,
+    message: String,
+    at: chrono::DateTime<Utc>,
+) -> Condition {
+    Condition {
+        kind,
+        status,
+        reason: reason.to_string(),
+        message,
+        last_transition_at: at,
+    }
+}
+
+/// When `previous` first reported `reason`, else now.
+fn reported_since(previous: Option<&InstanceReport>, reason: &str) -> chrono::DateTime<Utc> {
+    previous
+        .and_then(|p| p.conditions.iter().find(|c| c.reason == reason))
+        .map(|c| c.last_transition_at)
+        .unwrap_or_else(Utc::now)
 }
 
 fn condition(kind: ConditionKind, reason: &str, message: String) -> Condition {
@@ -147,7 +180,15 @@ impl NodeRuntime {
             synced: std::sync::atomic::AtomicBool::new(synced),
             sent: Mutex::new(BTreeMap::new()),
             reports_changed: Arc::new(tokio::sync::Notify::new()),
+            publish_host_ip: None,
         })
+    }
+
+    /// Bind published ports to the address `host_ip` answers at create
+    /// time, never the control plane's (ADR-045's private-address rule).
+    pub fn with_publish_host_ip(mut self, host_ip: PublishHostIp) -> Self {
+        self.publish_host_ip = Some(host_ip);
+        self
     }
 
     pub fn node_id(&self) -> i32 {
@@ -354,6 +395,7 @@ impl NodeRuntime {
             started_at: observed.started_at,
             finished_at: None,
             conditions: Vec::new(),
+            published_ports: observed.published_ports.clone(),
         };
         if !is_active(&instance.phase) {
             if observed.state == InstanceState::Running {
@@ -379,9 +421,45 @@ impl NodeRuntime {
             }
             return None;
         }
+        let long_running = instance.template.long_running;
         match observed.state {
+            InstanceState::Running if long_running => Some(InstanceReport {
+                phase: "running".to_string(),
+                conditions: vec![condition_at(
+                    ConditionKind::Running,
+                    ConditionStatus::True,
+                    "Started",
+                    format!(
+                        "instance '{}' is running on node {}",
+                        handle.name, self.node_id
+                    ),
+                    observed
+                        .started_at
+                        .unwrap_or_else(|| reported_since(previous, "Started")),
+                )],
+                ..base
+            }),
             InstanceState::Running => Some(InstanceReport {
                 phase: "running".to_string(),
+                ..base
+            }),
+            // A stopped replica is its owner's to start again: still the
+            // same attempt, reported stopped.
+            InstanceState::Exited if long_running => Some(InstanceReport {
+                phase: "running".to_string(),
+                exit_code: observed.exit_code,
+                conditions: vec![condition_at(
+                    ConditionKind::Running,
+                    ConditionStatus::False,
+                    "Stopped",
+                    format!(
+                        "instance '{}' on node {} is stopped (exit code {:?})",
+                        handle.name, self.node_id, observed.exit_code
+                    ),
+                    observed
+                        .finished_at
+                        .unwrap_or_else(|| reported_since(previous, "Stopped")),
+                )],
                 ..base
             }),
             InstanceState::Exited => {
@@ -405,6 +483,26 @@ impl NodeRuntime {
                 }),
                 Err(error) => Some(self.failed_to(&base, "StartFailed", &handle, error, outcome)),
             },
+            InstanceState::Missing if long_running && instance.phase == "running" => {
+                // Removed after it ran (the owner retired it, or an
+                // operator): never recreated, so a retired revision cannot
+                // come back. The control plane concludes the workload.
+                Some(InstanceReport {
+                    phase: "running".to_string(),
+                    conditions: vec![condition_at(
+                        ConditionKind::Running,
+                        ConditionStatus::False,
+                        "InstanceRemoved",
+                        format!(
+                            "instance '{}' was removed from node {} after it ran; it is not \
+                             recreated",
+                            handle.name, self.node_id
+                        ),
+                        reported_since(previous, "InstanceRemoved"),
+                    )],
+                    ..base
+                })
+            }
             InstanceState::Missing => {
                 if previous.is_some_and(|p| p.phase == "running") {
                     // It ran here and is gone: the attempt was lost.
@@ -476,19 +574,23 @@ impl NodeRuntime {
                 ..base
             });
         }
-        let env = match self.link.instance_env(instance.id).await {
+        let kept = match self.link.instance_env(instance.id).await {
             Ok(env) => {
-                if let Err(error) = self.secrets.save(&handle.name, &env.env) {
+                let kept = KeptEnv {
+                    env: env.env,
+                    secret_files: env.secret_files,
+                };
+                if let Err(error) = self.secrets.save(&handle.name, &kept) {
                     tracing::warn!(
                         node_id = self.node_id,
                         instance = %handle.name,
                         "keeping the instance's secret file failed: {error}"
                     );
                 }
-                env.env
+                kept
             }
             Err(link_error) => match self.secrets.load(&handle.name) {
-                Ok(Some(env)) => env,
+                Ok(Some(kept)) => kept,
                 Ok(None) | Err(_) => {
                     outcome.waiting_for_secrets += 1;
                     let message = format!(
@@ -529,10 +631,17 @@ impl NodeRuntime {
             }
         };
         let attach = instance.template.attachments.clone();
-        let spec = instance
+        let mut spec = instance
             .template
             .clone()
-            .into_spec(prepared.local_ref.clone(), env);
+            .into_spec(prepared.local_ref.clone(), kept.env);
+        spec.secret_files = kept.secret_files;
+        if let Some(host_ip) = &self.publish_host_ip {
+            let host_ip = host_ip();
+            for port in &mut spec.ports {
+                port.host_ip = host_ip.clone();
+            }
+        }
         let created = match self.driver.create(&spec, &attach).await {
             Ok(created) => created,
             Err(error) => {
@@ -551,9 +660,24 @@ impl NodeRuntime {
             instance_id = instance.id,
             "created and started an instance from the state stream"
         );
+        // The host ports Docker picked, in the same report: the control
+        // plane routes to them as soon as it sees the instance running.
+        let published_ports = match self.driver.inspect(&created).await {
+            Ok(status) => status.published_ports,
+            Err(error) => {
+                tracing::warn!(
+                    node_id = self.node_id,
+                    instance = %handle.name,
+                    "reading the started instance's ports failed; the next pass reports them: \
+                     {error}"
+                );
+                Vec::new()
+            }
+        };
         Some(InstanceReport {
             phase: "running".to_string(),
             started_at: Some(Utc::now()),
+            published_ports,
             ..base
         })
     }
@@ -711,6 +835,8 @@ mod tests {
     #[derive(Default)]
     struct FakeDocker {
         containers: Mutex<HashMap<String, FakeContainer>>,
+        /// What each container published: Docker picks port 40000.
+        ports: Mutex<HashMap<String, Vec<temps_workload::PortBinding>>>,
     }
 
     fn caps() -> &'static DriverCapabilities {
@@ -748,6 +874,16 @@ mod tests {
                 spec.name.clone(),
                 (InstanceState::Created, spec.env.clone()),
             );
+            self.ports.lock().expect("lock").insert(
+                spec.name.clone(),
+                spec.ports
+                    .iter()
+                    .map(|port| temps_workload::PortBinding {
+                        host_port: Some(40000),
+                        ..port.clone()
+                    })
+                    .collect(),
+            );
             Ok(InstanceHandle {
                 driver: "docker".into(),
                 id: spec.name.clone(),
@@ -784,7 +920,16 @@ mod tests {
                 started_at: None,
                 finished_at: None,
                 address: None,
-                published_ports: Vec::new(),
+                published_ports: if state == InstanceState::Missing {
+                    Vec::new()
+                } else {
+                    self.ports
+                        .lock()
+                        .expect("lock")
+                        .get(&h.name)
+                        .cloned()
+                        .unwrap_or_default()
+                },
             })
         }
         async fn logs(&self, _: &InstanceHandle, _: LogQuery) -> Result<LogStream, DriverError> {
@@ -846,6 +991,7 @@ mod tests {
                     ("DATABASE_URL".into(), SEEDED_IMPORTED.into()),
                     ("MODE".into(), "batch".into()),
                 ],
+                secret_files: Vec::new(),
             })
         }
     }
@@ -910,6 +1056,7 @@ mod tests {
                 labels: Default::default(),
                 security: SecurityProfile::Trusted,
                 attachments: Attachments::default(),
+                long_running: false,
             },
         }
     }
@@ -1133,6 +1280,94 @@ mod tests {
         runtime.reconcile().await;
         assert!(docker.containers.lock().expect("lock").is_empty());
         assert_eq!(runtime.secrets.load("temps-job-3-a2").expect("read"), None);
+    }
+
+    /// A deployment replica on a worker: its ports bind to the node's
+    /// private address and are reported; a stop is reported as `Stopped`
+    /// on the same attempt; once removed after it ran it is never
+    /// recreated.
+    #[tokio::test]
+    async fn a_long_running_replica_is_reported_stopped_and_never_recreated_once_removed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, docker, _) = runtime(dir.path(), true);
+        let runtime = runtime.with_publish_host_ip(Arc::new(|| "10.0.0.5".to_string()));
+        let replica = |phase: &str| {
+            let mut replica = instance(21, 1, phase);
+            replica.template.long_running = true;
+            replica.template.ports = vec![temps_workload::PortBinding {
+                container_port: 3000,
+                protocol: temps_workload::PortProtocol::Tcp,
+                host_ip: "127.0.0.1".into(),
+                host_port: None,
+            }];
+            replica
+        };
+        runtime
+            .apply(full("100", vec![replica("pending")]))
+            .await
+            .expect("applied");
+        runtime.reconcile().await;
+        let reports = runtime.pending_reports().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].phase, "running");
+        assert_eq!(
+            reports[0].published_ports,
+            vec![temps_workload::PortBinding {
+                container_port: 3000,
+                protocol: temps_workload::PortProtocol::Tcp,
+                host_ip: "10.0.0.5".into(),
+                host_port: Some(40000),
+            }],
+            "bound to the private address, reported in the same report"
+        );
+        runtime.mark_sent(&reports);
+
+        // Its owner stops it: the same attempt, reported stopped, once.
+        docker
+            .containers
+            .lock()
+            .expect("lock")
+            .get_mut("temps-job-3-a1")
+            .expect("created")
+            .0 = InstanceState::Exited;
+        runtime.reconcile().await;
+        let reports = runtime.pending_reports().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].phase, "running", "not a finished attempt");
+        assert_eq!(reports[0].conditions[0].reason, "Stopped");
+        assert_eq!(reports[0].conditions[0].status, ConditionStatus::False);
+        runtime.mark_sent(&reports);
+        runtime.reconcile().await;
+        assert!(
+            runtime.pending_reports().await.is_empty(),
+            "a stopped replica is not re-reported on every pass"
+        );
+
+        // Removed after it ran (retired): reported, never recreated.
+        runtime
+            .apply(StateResponse {
+                node_id: 5,
+                watermark: "200".into(),
+                full: None,
+                changes: vec![StateChange::Upsert {
+                    object: StateObject::Instance(replica("running")),
+                }],
+                more: false,
+            })
+            .await
+            .expect("applied");
+        docker.containers.lock().expect("lock").clear();
+        for _ in 0..2 {
+            runtime.reconcile().await;
+            assert!(
+                docker.containers.lock().expect("lock").is_empty(),
+                "a retired replica must not come back"
+            );
+        }
+        let reports = runtime.pending_reports().await;
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].phase, "running");
+        assert_eq!(reports[0].conditions[0].reason, "InstanceRemoved");
     }
 
     #[tokio::test]

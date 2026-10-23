@@ -396,9 +396,6 @@ impl AgentApiDriver {
         if spec.user.is_some() {
             return Err(unsupported("a user override"));
         }
-        if !spec.ports.is_empty() {
-            return Err(unsupported("published ports"));
-        }
         let restart_policy = match spec.restart {
             temps_workload::RestartPolicy::Never => temps_deployer::RestartPolicy::Never,
             temps_workload::RestartPolicy::Always => temps_deployer::RestartPolicy::Always,
@@ -417,7 +414,21 @@ impl AgentApiDriver {
                 .iter()
                 .map(|file| (file.name.clone(), file.value.clone()))
                 .collect(),
-            port_mappings: Vec::new(),
+            // The agent binds them to its own private address and picks the
+            // host port; `inspect` reads back what it got.
+            port_mappings: spec
+                .ports
+                .iter()
+                .map(|port| temps_deployer::PortMapping {
+                    host_port: port.host_port.unwrap_or(0),
+                    container_port: port.container_port,
+                    protocol: match port.protocol {
+                        temps_workload::PortProtocol::Tcp => temps_deployer::Protocol::Tcp,
+                        temps_workload::PortProtocol::Udp => temps_deployer::Protocol::Udp,
+                    },
+                    host_ip: None,
+                })
+                .collect(),
             network_name: attach.network.primary.clone(),
             extra_networks: attach.network.required.clone(),
             resource_limits: ResourceLimits {
@@ -580,7 +591,20 @@ impl RuntimeDriver for AgentApiDriver {
                 started_at: None,
                 finished_at: None,
                 address: None,
-                published_ports: Vec::new(),
+                published_ports: info
+                    .ports
+                    .iter()
+                    .filter(|port| port.host_port != 0)
+                    .map(|port| temps_workload::PortBinding {
+                        container_port: port.container_port,
+                        protocol: match port.protocol {
+                            temps_deployer::Protocol::Tcp => temps_workload::PortProtocol::Tcp,
+                            temps_deployer::Protocol::Udp => temps_workload::PortProtocol::Udp,
+                        },
+                        host_ip: port.host_ip.clone().unwrap_or_default(),
+                        host_port: Some(port.host_port),
+                    })
+                    .collect(),
             }),
             Err(DeployerError::ContainerNotFound(_)) => Ok(InstanceStatus {
                 state: InstanceState::Missing,
@@ -859,6 +883,28 @@ impl AttemptPlacement for NodeWorkloadPlacement {
                 })
             }
         }
+    }
+
+    /// A deployment replica the deploy job already placed on `node_id`:
+    /// through the stream when the node advertises it, else (and for an
+    /// ADR-045 socket workload, which only `/agent/*` mounts) `/agent/*`.
+    async fn place_on(&self, workload: &WorkloadView, node_id: i32) -> Result<Placed, String> {
+        let targets = self.targets(workload).await?;
+        let node = self.node(node_id).await?;
+        let privileged = workload.spec.security == Some(SecurityProfile::HostPrivileged);
+        let driver = if advertises_state_stream(&node.capacity) && !privileged {
+            STREAM_DRIVER
+        } else {
+            AGENT_API_DRIVER
+        };
+        let driver = self
+            .build_driver(&node, driver, Some((targets.project_slug, privileged)))
+            .await?;
+        Ok(Placed::Node {
+            node_id,
+            node_name: node.name,
+            driver,
+        })
     }
 
     async fn driver_for(

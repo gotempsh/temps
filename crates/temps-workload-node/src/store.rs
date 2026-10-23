@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use temps_workload::stream::{DnsClaimObject, InstanceObject, InstanceReport, WorkloadObject};
+use temps_workload::SecretFile;
 use temps_workload_env::is_secret_variable;
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +151,33 @@ impl SnapshotStore {
     }
 }
 
+/// What a node keeps of one instance's create call: its variables and its
+/// secret files. `Debug` never shows a value.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KeptEnv {
+    pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_files: Vec<SecretFile>,
+}
+
+impl std::fmt::Debug for KeptEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeptEnv")
+            .field("variables", &self.env.len())
+            .field("secret_files", &self.secret_files.len())
+            .finish()
+    }
+}
+
+/// A kept file: the current shape, or the bare variable list written
+/// before secret files were kept.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredEnv {
+    Kept(KeptEnv),
+    Variables(Vec<(String, String)>),
+}
+
 /// Per-instance environment files, `<dir>/secrets/<instance>.env`.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
@@ -178,7 +206,7 @@ impl SecretStore {
     }
 
     /// Keep `env` for `instance`, mode 0400.
-    pub fn save(&self, instance: &str, env: &[(String, String)]) -> Result<(), StoreError> {
+    pub fn save(&self, instance: &str, env: &KeptEnv) -> Result<(), StoreError> {
         create_private_dir(&self.dir)?;
         let path = self.path_of(instance)?;
         let bytes = serde_json::to_vec(env).map_err(|e| StoreError::Decode {
@@ -189,11 +217,17 @@ impl SecretStore {
     }
 
     /// The kept environment of `instance`; `None` when its file is gone.
-    pub fn load(&self, instance: &str) -> Result<Option<Vec<(String, String)>>, StoreError> {
+    pub fn load(&self, instance: &str) -> Result<Option<KeptEnv>, StoreError> {
         let path = self.path_of(instance)?;
         match std::fs::read(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
-                .map(Some)
+                .map(|stored| match stored {
+                    StoredEnv::Kept(kept) => Some(kept),
+                    StoredEnv::Variables(env) => Some(KeptEnv {
+                        env,
+                        secret_files: Vec::new(),
+                    }),
+                })
                 .map_err(|e| StoreError::Decode {
                     path: path.display().to_string(),
                     reason: e.to_string(),
@@ -222,7 +256,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = SecretStore::new(dir.path());
         assert!(matches!(
-            store.save("../escape", &[]),
+            store.save("../escape", &KeptEnv::default()),
             Err(StoreError::UnsafeName { .. })
         ));
         assert!(matches!(
@@ -237,7 +271,13 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().expect("tempdir");
         let secrets = SecretStore::new(dir.path());
-        let env = vec![("A".to_string(), "1".to_string())];
+        let env = KeptEnv {
+            env: vec![("A".to_string(), "1".to_string())],
+            secret_files: vec![SecretFile {
+                name: "API_TOKEN".to_string(),
+                value: "kept-token".to_string(),
+            }],
+        };
         secrets.save("temps-job-1-a1", &env).expect("saved");
         // Saving again replaces a 0400 file.
         secrets.save("temps-job-1-a1", &env).expect("saved again");
@@ -247,6 +287,22 @@ mod tests {
         assert_eq!(secrets.load("temps-job-1-a1").expect("loaded"), Some(env));
         secrets.remove("temps-job-1-a1").expect("removed");
         assert_eq!(secrets.load("temps-job-1-a1").expect("loaded"), None);
+
+        // A file kept before secret files were: the bare variable list.
+        create_private_dir(&dir.path().join("secrets")).expect("dir");
+        write_atomic(
+            &dir.path().join("secrets/temps-job-1-a0.env"),
+            br#"[["A","1"]]"#,
+            0o400,
+        )
+        .expect("written");
+        assert_eq!(
+            secrets.load("temps-job-1-a0").expect("loaded"),
+            Some(KeptEnv {
+                env: vec![("A".to_string(), "1".to_string())],
+                secret_files: Vec::new(),
+            })
+        );
 
         let snapshots = SnapshotStore::new(dir.path());
         assert_eq!(snapshots.load().expect("empty"), NodeState::default());

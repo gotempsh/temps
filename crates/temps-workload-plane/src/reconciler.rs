@@ -699,19 +699,31 @@ impl WorkloadPlane {
     ) -> Result<Option<DateTime<Utc>>, PlaneError> {
         let mut status = view.status.clone();
         let ttl = Duration::seconds(i64::from(DEFAULT_JOB_TTL_SECS));
-        // Strict pinning (§8): this plane runs instances on the control
-        // plane only, so a replica pinned elsewhere stays unscheduled with
-        // the reason instead of quietly running on node 0.
-        if let Some(pinned) = view
-            .spec
-            .placement
-            .pinned_nodes()
-            .filter(|nodes| !nodes.contains(&crate::scheduler::CONTROL_PLANE_NODE_ID))
-        {
-            let message = format!(
-                "pinned to node(s) {pinned:?}, and this plane runs instances only on the control \
-                 plane (node 0); worker replicas are placed by the deployment, not the plane"
-            );
+        // Strict pinning (§8). A replica pinned to one worker (the deploy
+        // job placed it) runs there through the placement's driver for that
+        // node; one pinned anywhere this plane cannot reach stays
+        // unscheduled with the reason, never quietly on node 0.
+        let pinned = view.spec.placement.pinned_nodes();
+        let worker = match pinned.as_deref() {
+            Some([node_id]) if *node_id != crate::scheduler::CONTROL_PLANE_NODE_ID => {
+                Some(*node_id)
+            }
+            _ => None,
+        };
+        let unserved = match (&pinned, worker, &self.placement) {
+            (Some(nodes), None, _) if !nodes.contains(&crate::scheduler::CONTROL_PLANE_NODE_ID) => {
+                Some(format!(
+                    "pinned to node(s) {nodes:?}; a replica is pinned to exactly one node, and \
+                     this plane cannot choose among several"
+                ))
+            }
+            (_, Some(node_id), None) => Some(format!(
+                "pinned to node {node_id}, and this plane places nothing on workers (it has \
+                 no node placement)"
+            )),
+            _ => None,
+        };
+        if let Some(message) = unserved {
             status.set_condition(
                 ConditionKind::Scheduled,
                 ConditionStatus::False,
@@ -733,8 +745,23 @@ impl WorkloadPlane {
             }
             return Ok(None);
         }
-        let driver = match self.control_plane_driver() {
-            Ok(driver) => driver,
+        let latest = instances.last().cloned();
+        let placed = match (&latest, worker, &self.placement) {
+            // A live instance keeps the driver it was created by.
+            (Some(latest), _, _)
+                if latest.phase == PHASE_PENDING || latest.phase == PHASE_RUNNING =>
+            {
+                self.driver_of(latest).await.map(|d| (latest.node_id, d))
+            }
+            (_, Some(node_id), Some(placement)) => match placement.place_on(&view, node_id).await {
+                Ok(Placed::Node { driver, .. }) => Ok((Some(node_id), driver)),
+                Ok(Placed::ControlPlane) => self.control_plane_driver().map(|d| (None, d)),
+                Err(message) => Err(message),
+            },
+            _ => self.control_plane_driver().map(|d| (None, d)),
+        };
+        let (node_id, driver) = match placed {
+            Ok(placed) => placed,
             Err(message) => {
                 status.set_condition(
                     ConditionKind::Scheduled,
@@ -758,12 +785,12 @@ impl WorkloadPlane {
                     .await;
             }
         };
-        set_scheduled(&mut status, None, now);
+        set_scheduled(&mut status, node_id, now);
         set_limit_condition(&mut status, &view.spec.resources, &driver, now);
 
-        let Some(latest) = instances.last().cloned() else {
+        let Some(latest) = latest else {
             return self
-                .start_attempt(row, view, status, 1, None, ttl, &driver, None, now)
+                .start_attempt(row, view, status, 1, None, ttl, &driver, node_id, now)
                 .await;
         };
         let attempt = latest.attempt;
@@ -1157,7 +1184,8 @@ impl WorkloadPlane {
         );
         let security = template.security;
         let attach = template.attachments.clone();
-        let instance_spec = template.into_spec(prepared.local_ref.clone(), resolved.env);
+        let mut instance_spec = template.into_spec(prepared.local_ref.clone(), resolved.env);
+        instance_spec.secret_files = resolved.secret_files;
         let created = match driver.create(&instance_spec, &attach).await {
             Ok(created) => created,
             Err(error) => {
@@ -2341,6 +2369,10 @@ mod tests {
             .expect("scheduled");
         assert_eq!(scheduled.status, ConditionStatus::False);
         assert_eq!(scheduled.reason, "PinnedNodeNotServed");
-        assert!(scheduled.message.contains("[3]"), "{}", scheduled.message);
+        assert!(
+            scheduled.message.contains("node 3"),
+            "{}",
+            scheduled.message
+        );
     }
 }

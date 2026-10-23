@@ -3287,10 +3287,11 @@ impl DeployImageJob {
             None => None,
         };
 
-        // `enforce`: control-plane replicas are created through the plane;
-        // the product keeps the health check and blue/green around them.
+        // `enforce`: every replica is created through the plane, pinned to
+        // the node chosen here; the product keeps the health check and
+        // blue/green around them.
         let plane_deployer: Option<Arc<dyn ContainerDeployer>> = if enforce {
-            Some(self.plane_deployer(context)?)
+            Some(self.plane_deployer(context, self.container_deployer.clone(), None)?)
         } else {
             None
         };
@@ -3423,7 +3424,13 @@ impl DeployImageJob {
                     )
                     .await?;
 
-                    remote
+                    if enforce {
+                        // The worker's agent stays the deployer of every
+                        // operation after the create.
+                        self.plane_deployer(context, remote, assignment.node_id())?
+                    } else {
+                        remote
+                    }
                 }
             };
 
@@ -5061,10 +5068,14 @@ impl DeployImageJob {
         Ok((assignments, placed.socket_required, guard))
     }
 
-    /// The deployer `enforce` uses for control-plane replicas.
+    /// The deployer `enforce` uses for replicas on `node_id` (`None`: the
+    /// control plane), with `node_deployer` for every operation after the
+    /// create.
     fn plane_deployer(
         &self,
         context: &WorkflowContext,
+        node_deployer: Arc<dyn ContainerDeployer>,
+        node_id: Option<i32>,
     ) -> Result<Arc<dyn ContainerDeployer>, WorkflowError> {
         let plane = self
             .workload_plane
@@ -5076,14 +5087,16 @@ impl DeployImageJob {
                         .unwrap_or_else(|| "workload plane unavailable".to_string()),
                 )
             })?;
-        Ok(Arc::new(
-            crate::services::plane_deployer::PlaneContainerDeployer::new(
-                plane,
-                self.container_deployer.clone(),
-                context.deployment_id,
-                Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
-            ),
-        ))
+        let deployer = crate::services::plane_deployer::PlaneContainerDeployer::new(
+            plane,
+            node_deployer,
+            context.deployment_id,
+            Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
+        );
+        Ok(Arc::new(match node_id {
+            Some(node_id) => deployer.on_node(node_id),
+            None => deployer,
+        }))
     }
 }
 

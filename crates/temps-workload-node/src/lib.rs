@@ -23,6 +23,7 @@ pub mod runtime;
 pub mod store;
 
 pub use runtime::{
-    ControlPlaneLink, LinkError, NodeRuntime, NodeRuntimeError, ReconcileOutcome, SyncError,
+    ControlPlaneLink, LinkError, NodeRuntime, NodeRuntimeError, PublishHostIp, ReconcileOutcome,
+    SyncError,
 };
-pub use store::{SecretStore, SnapshotStore, StoreError};
+pub use store::{KeptEnv, SecretStore, SnapshotStore, StoreError};

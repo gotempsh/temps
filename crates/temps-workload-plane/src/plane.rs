@@ -207,7 +207,7 @@ pub struct WorkloadPlane {
 }
 
 /// Environments staged in this process, by key.
-pub(crate) type StagedEnvs = Arc<Mutex<HashMap<String, Vec<(String, String)>>>>;
+pub(crate) type StagedEnvs = Arc<Mutex<HashMap<String, crate::env::StagedEnv>>>;
 
 /// The import name of an environment staged with
 /// [`WorkloadPlane::stage_env`].
@@ -308,17 +308,32 @@ impl WorkloadPlane {
     /// guard drops; an instance recreated after a restart cannot read them
     /// and fails with `EnvironmentUnavailable`.
     pub fn stage_env(&self, key: &str, vars: Vec<(String, String)>) -> StagedEnvGuard {
+        self.stage_env_with_files(key, vars, Vec::new())
+    }
+
+    /// [`Self::stage_env`], with secret files delivered at
+    /// `/run/secrets/<name>` (the deployment's ADR-019 secrets). Their
+    /// values are held the same way: in memory only, never in a spec.
+    pub fn stage_env_with_files(
+        &self,
+        key: &str,
+        vars: Vec<(String, String)>,
+        secret_files: Vec<temps_workload::SecretFile>,
+    ) -> StagedEnvGuard {
         self.staged_env
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(key.to_string(), vars);
+            .insert(
+                key.to_string(),
+                crate::env::StagedEnv { vars, secret_files },
+            );
         StagedEnvGuard {
             staged: Arc::clone(&self.staged_env),
             key: key.to_string(),
         }
     }
 
-    pub(crate) fn staged(&self, import: &str) -> Option<Vec<(String, String)>> {
+    pub(crate) fn staged(&self, import: &str) -> Option<crate::env::StagedEnv> {
         let key = import.strip_prefix(STAGED_IMPORT_PREFIX)?;
         self.staged_env
             .lock()
@@ -439,9 +454,6 @@ impl WorkloadPlane {
         )>,
         PlaneError,
     > {
-        let Some(driver) = self.driver.0.clone() else {
-            return Ok(None);
-        };
         let latest = workload_instances::Entity::find()
             .filter(workload_instances::Column::WorkloadId.eq(id))
             .order_by_desc(workload_instances::Column::Attempt)
@@ -458,6 +470,22 @@ impl WorkloadPlane {
                 field: "instance handle",
                 reason: format!("instance {}: {e}", latest.id),
             })?;
+        // The driver of the node the instance is on: a worker's replica
+        // is answered from its node's reports, not the control plane.
+        let driver = match self.driver_of(&latest).await {
+            Ok(driver) => driver,
+            Err(reason) if latest.node_id.is_none() => {
+                tracing::debug!(workload_id = id, "no instance status: {reason}");
+                return Ok(None);
+            }
+            Err(reason) => {
+                return Err(PlaneError::NodeUnavailable {
+                    workload_id: id,
+                    node_id: latest.node_id.unwrap_or_default(),
+                    reason,
+                })
+            }
+        };
         let status = driver
             .inspect(&handle)
             .await

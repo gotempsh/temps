@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! A [`ContainerDeployer`] that creates a deployment's control-plane replica
-//! through the workload plane (ADR-055 Phase 5, `workload_mode = enforce`).
+//! A [`ContainerDeployer`] that creates a deployment's replicas through the
+//! workload plane (ADR-055 Phase 5, `workload_mode = enforce`): on the
+//! control plane, or pinned to the worker the deploy job placed it on.
 //!
 //! The deploy job keeps everything that makes a deployment a deployment:
 //! the health check, blue/green promotion, the `deployment_containers` row,
@@ -13,12 +14,14 @@
 //! container through the ordinary local deployer, exactly as for a legacy
 //! replica, so the product's lifecycle code needs no second path.
 //!
-//! The deployment's variables are staged in memory
-//! ([`WorkloadPlane::stage_env`]) and never written into the stored spec.
+//! The deployment's variables and secret files are staged in memory
+//! ([`WorkloadPlane::stage_env_with_files`]) and never written into the
+//! stored spec; the driver writes the files under the same secrets root the
+//! legacy deployer uses and mounts them read-only at `/run/secrets`.
 //!
-//! What the plane cannot yet deliver is refused up front with the reason,
-//! never dropped silently: secret files (`/run/secrets`) and the ADR-045
-//! Docker socket. Such an environment stays on `legacy` or `shadow`.
+//! The ADR-045 Docker socket is decided by admission, from this process's
+//! own grant: a granted project's replica is admitted `host_privileged` and
+//! gets exactly the socket bind, nothing else relaxed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -30,7 +33,8 @@ use temps_deployer::{
 };
 use temps_workload::{
     Artifact, ConditionKind, EnvSpec, Lifetime, NetworkSpec, PlacementSpec, PortProtocol, PortSpec,
-    Process, ResourceAmounts, Resources, WorkloadKind, WorkloadRef, WorkloadSpec,
+    Process, ResourceAmounts, Resources, SecretFile, SecurityProfile, WorkloadKind, WorkloadRef,
+    WorkloadSpec,
 };
 use temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID;
 use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
@@ -39,31 +43,15 @@ use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 pub const DEPLOYMENT_OWNER_KIND: &str = "deployment";
 
 /// The `Deployment` workload one replica's create request becomes: pinned
-/// to the control plane (the job already placed it there), long-running
+/// to `node_id` (the job already placed it there), long-running
 /// with the request's restart policy, its variables imported from
 /// `staged_import`, and its CPU/memory caps carried over as limits.
 pub fn deployment_workload_spec(
     request: &DeployRequest,
     deployment_id: i32,
+    node_id: i32,
     staged_import: String,
 ) -> Result<WorkloadSpec, DeployerError> {
-    if !request.secrets.is_empty() {
-        return Err(DeployerError::DeploymentFailed(format!(
-            "Container {} has {} secret file(s); the workload plane cannot deliver secret files \
-             yet. Set this environment's workload_mode back to legacy (or shadow) to deploy it",
-            request.container_name,
-            request.secrets.len()
-        )));
-    }
-    if request.control_plane_grants_socket {
-        return Err(DeployerError::DeploymentFailed(format!(
-            "Container {} is for project '{}', which is granted the host Docker socket (ADR 045); \
-             the workload plane does not mount it for deployments yet. Set this environment's \
-             workload_mode back to legacy (or shadow) to deploy it",
-            request.container_name,
-            request.project_slug.as_deref().unwrap_or("<unknown>")
-        )));
-    }
     let restart = match request.restart_policy {
         temps_deployer::RestartPolicy::Never => temps_workload::RestartPolicy::Never,
         temps_deployer::RestartPolicy::Always => temps_workload::RestartPolicy::Always,
@@ -123,7 +111,7 @@ pub fn deployment_workload_spec(
         },
         probes: Default::default(),
         placement: PlacementSpec {
-            nodes: Some(vec![CONTROL_PLANE_NODE_ID]),
+            nodes: Some(vec![node_id]),
             labels: None,
             spread: false,
             replicas: 1,
@@ -138,12 +126,15 @@ pub fn deployment_workload_spec(
     })
 }
 
-/// Creates one deployment's control-plane replicas through the plane.
+/// Creates one deployment's replicas on one node through the plane.
 pub struct PlaneContainerDeployer {
     plane: Arc<WorkloadPlane>,
-    /// The local deployer, for every operation after the create.
+    /// The deployer of the node the replicas run on (the local one, or the
+    /// worker's `/agent/*` client), for every operation after the create.
     local: Arc<dyn ContainerDeployer>,
     deployment_id: i32,
+    /// Where the replicas are pinned: the control plane by default.
+    node_id: i32,
     ready_timeout: Duration,
     /// Container id -> workload id, for retiring a replica through the
     /// plane. One deploy job's replicas: a handful of entries.
@@ -161,9 +152,17 @@ impl PlaneContainerDeployer {
             plane,
             local,
             deployment_id,
+            node_id: CONTROL_PLANE_NODE_ID,
             ready_timeout,
             workloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Pin the replicas to worker `node_id`; `local` must then be that
+    /// worker's deployer.
+    pub fn on_node(mut self, node_id: i32) -> Self {
+        self.node_id = node_id;
+        self
     }
 
     fn plane_error(&self, operation: &str, error: impl std::fmt::Display) -> DeployerError {
@@ -180,7 +179,7 @@ impl ContainerDeployer for PlaneContainerDeployer {
         &self,
         request: DeployRequest,
     ) -> Result<DeployResult, DeployerError> {
-        let staged = self.plane.stage_env(
+        let staged = self.plane.stage_env_with_files(
             &format!(
                 "deployment-{}-{}",
                 self.deployment_id, request.container_name
@@ -190,8 +189,17 @@ impl ContainerDeployer for PlaneContainerDeployer {
                 .iter()
                 .map(|(key, value)| (key.clone(), value.clone()))
                 .collect(),
+            request
+                .secrets
+                .iter()
+                .map(|(name, value)| SecretFile {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect(),
         );
-        let spec = deployment_workload_spec(&request, self.deployment_id, staged.import())?;
+        let spec =
+            deployment_workload_spec(&request, self.deployment_id, self.node_id, staged.import())?;
         let container_port = request
             .port_mappings
             .first()
@@ -234,6 +242,18 @@ impl ContainerDeployer for PlaneContainerDeployer {
         if let Ok(mut workloads) = self.workloads.lock() {
             workloads.insert(handle.id.clone(), view.id);
         }
+        let docker_socket_mounted = view.spec.security == Some(SecurityProfile::HostPrivileged);
+        if docker_socket_mounted {
+            // The same host-local record the legacy deployer writes (ADR 045).
+            tracing::warn!(
+                event = "docker_socket_mounted",
+                container_name = %handle.name,
+                project_slug = request.project_slug.as_deref().unwrap_or("<unknown>"),
+                "Mounted the host Docker socket into this container through the workload plane: \
+                 the project is named in {}. It is root-equivalent on this host.",
+                temps_core::docker_socket_grant::DOCKER_SOCKET_PROJECTS_ENV
+            );
+        }
         tracing::info!(
             deployment_id = self.deployment_id,
             workload_id = view.id,
@@ -246,7 +266,7 @@ impl ContainerDeployer for PlaneContainerDeployer {
             container_port,
             host_port,
             status: ContainerStatus::Running,
-            docker_socket_mounted: false,
+            docker_socket_mounted,
         })
     }
 
@@ -367,9 +387,17 @@ mod tests {
 
     #[test]
     fn a_replica_becomes_a_pinned_long_running_deployment_workload() {
-        let spec = deployment_workload_spec(&request(), 42, "staged:k".into()).unwrap();
+        let spec =
+            deployment_workload_spec(&request(), 42, CONTROL_PLANE_NODE_ID, "staged:k".into())
+                .unwrap();
         assert_eq!(spec.owner, WorkloadRef::new(WorkloadKind::Deployment, 42));
         assert_eq!(spec.placement.nodes, Some(vec![0]), "placed by the job");
+        let on_worker = deployment_workload_spec(&request(), 42, 7, "staged:k".into()).unwrap();
+        assert_eq!(
+            on_worker.placement.nodes,
+            Some(vec![7]),
+            "the worker the job chose"
+        );
         assert_eq!(
             spec.lifetime,
             Lifetime::LongRunning {
@@ -393,28 +421,20 @@ mod tests {
     }
 
     #[test]
-    fn what_the_plane_cannot_deliver_is_refused_with_the_way_back() {
-        let mut with_secret = request();
-        with_secret
+    fn secret_files_and_the_socket_never_reach_the_stored_spec() {
+        let mut with_both = request();
+        with_both
             .secrets
-            .insert("DATABASE_PASSWORD".into(), "x".into());
-        let error = deployment_workload_spec(&with_secret, 42, "staged:k".into()).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("app-production-42-1"), "{message}");
-        assert!(message.contains("legacy"), "{message}");
-        assert!(
-            !message.contains("DATABASE_PASSWORD"),
-            "never names a secret"
-        );
-
-        let mut with_socket = request();
-        with_socket.control_plane_grants_socket = true;
-        let message = deployment_workload_spec(&with_socket, 42, "staged:k".into())
-            .unwrap_err()
-            .to_string();
-        assert!(
-            message.contains("ADR 045") && message.contains("'shop'"),
-            "{message}"
-        );
+            .insert("DB_PASSWORD".into(), "seeded-secret-value".into());
+        with_both.control_plane_grants_socket = true;
+        let spec =
+            deployment_workload_spec(&with_both, 42, CONTROL_PLANE_NODE_ID, "staged:k".into())
+                .expect("built");
+        let stored = serde_json::to_string(&spec).expect("serialised");
+        assert!(!stored.contains("seeded-secret-value"), "{stored}");
+        assert_eq!(spec.env.imports, vec!["staged:k".to_string()]);
+        // Admission decides the profile from this host's own grant; the
+        // request cannot ask for the socket itself.
+        assert_eq!(spec.security, None);
     }
 }

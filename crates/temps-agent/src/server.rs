@@ -905,7 +905,11 @@ pub async fn start_agent_server_with(
     // the capability is not advertised and the control plane keeps using
     // `/agent/*` for this node.
     let node_runtime = match (&docker, options.state_stream) {
-        (Some(docker), true) => match crate::node_runtime::spawn(&config, docker.clone()) {
+        (Some(docker), true) => match crate::node_runtime::spawn(
+            &config,
+            docker.clone(),
+            network.host_bind_address.clone(),
+        ) {
             Ok(runtime) => Some(runtime),
             Err(e) => {
                 tracing::warn!(

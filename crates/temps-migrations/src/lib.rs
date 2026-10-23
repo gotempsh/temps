@@ -32,6 +32,10 @@ pub use migration::m20261022_000003_node_state_changes::{
     Migration as NodeStateChangesMigration, NODE_STATE_DNS_SQL, NODE_STATE_TABLES_SQL,
 };
 
+pub use migration::m20261023_000009_workload_instance_ports::{
+    Migration as WorkloadInstancePortsMigration, UP_SQL as WORKLOAD_INSTANCE_PORTS_SQL,
+};
+
 pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
 
 pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;

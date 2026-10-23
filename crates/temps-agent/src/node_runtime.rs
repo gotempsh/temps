@@ -171,18 +171,28 @@ pub fn node_runtime_dir(config: &AgentConfig) -> Result<std::path::PathBuf, Node
 pub fn spawn(
     config: &AgentConfig,
     docker: bollard::Docker,
+    bind_address: crate::network_sync::SharedBindAddress,
 ) -> Result<Arc<NodeRuntime>, NodeRuntimeStartError> {
     let dir = node_runtime_dir(config)?;
     let link: Arc<dyn ControlPlaneLink> = Arc::new(HttpControlPlaneLink::new(config)?);
     let driver: Arc<dyn temps_workload::RuntimeDriver> =
-        Arc::new(temps_workload_docker::DockerDriver::new(docker));
+        // Secret files live beside the snapshot, under the agent's data
+        // directory, so their bind mounts survive a reboot.
+        Arc::new(temps_workload_docker::DockerDriver::new(docker).with_secrets_root(dir.join("secret-files")));
     let runtime = Arc::new(
-        NodeRuntime::open(config.node_id, &dir, SCOPE, driver, link).map_err(|e| {
-            NodeRuntimeStartError::Open {
+        NodeRuntime::open(config.node_id, &dir, SCOPE, driver, link)
+            .map_err(|e| NodeRuntimeStartError::Open {
                 node_id: config.node_id,
                 reason: e.to_string(),
-            }
-        })?,
+            })?
+            // The same slot the legacy deployer binds published ports to:
+            // this node's private address, never every interface.
+            .with_publish_host_ip(Arc::new(move || {
+                bind_address
+                    .read()
+                    .map(|address| address.clone())
+                    .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            })),
     );
     let reconcile_now = Arc::new(tokio::sync::Notify::new());
     tokio::spawn(stream_loop(runtime.clone(), reconcile_now.clone()));
