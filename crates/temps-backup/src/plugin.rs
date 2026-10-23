@@ -25,6 +25,7 @@ use crate::{
         postgres_walg::{PostgresWalgDeps, PostgresWalgEngine},
         redis::{RedisDeps, RedisEngine},
         s3_mirror::{S3MirrorDeps, S3MirrorEngine},
+        workload_job::{PostgresWorkloadJobDeps, PostgresWorkloadJobEngine},
     },
     handlers::{self, create_backup_app_state, BackupAppState},
     managed_schedule::ManagedScheduleProvisioner,
@@ -134,6 +135,13 @@ impl TempsPlugin for BackupPlugin {
                     std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
                 });
 
+            // The workload plane, bound once `temps serve` starts it (the
+            // deployments plugin registers the slot). Backups and restores
+            // of databases on worker nodes run as jobs through it.
+            let plane_slot = context
+                .get_service::<temps_workload_plane::PlaneSlot>()
+                .unwrap_or_else(|| Arc::new(temps_workload_plane::PlaneSlot::new()));
+
             // Create RestoreService — orchestrates generic restore across all
             // engines via the ExternalService trait.
             let restore_service = Arc::new(
@@ -142,7 +150,8 @@ impl TempsPlugin for BackupPlugin {
                     external_service_manager.clone(),
                     encryption_service.clone(),
                 )
-                .with_telemetry(Arc::clone(&telemetry)),
+                .with_telemetry(Arc::clone(&telemetry))
+                .with_workload_plane(plane_slot.clone()),
             );
             context.register_service(restore_service.clone());
 
@@ -196,7 +205,18 @@ impl TempsPlugin for BackupPlugin {
                     db: db.clone(),
                     encryption_service: encryption_service.clone(),
                     config_service: config_service.clone(),
-                })));
+                })))
+                // ADR-055 Phase 9: databases on worker nodes, backed up by a
+                // job on their node through the workload plane. Needs no
+                // local Docker; it is only selected for an `enforce`
+                // database on a worker (see `engines::workload_job`).
+                .register_engine(Arc::new(PostgresWorkloadJobEngine::new(
+                    PostgresWorkloadJobDeps {
+                        db: db.clone(),
+                        encryption_service: encryption_service.clone(),
+                        plane: plane_slot.clone(),
+                    },
+                )));
 
             // Every other engine drives a local Docker container end to end
             // (dump/restore inside it, snapshot its volume, etc.), so there is

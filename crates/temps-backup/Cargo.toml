@@ -21,6 +21,9 @@ temps-entities = { path = "../temps-entities" }
 temps-notifications = { path = "../temps-notifications" }
 temps-providers = { path = "../temps-providers" }
 temps-logs = { path = "../temps-logs" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-plane = { path = "../temps-workload-plane" }
+temps-workload-volumes = { path = "../temps-workload-volumes" }
 serde = { workspace = true }
 tokio = { workspace = true }
 flate2 = { workspace = true }
@@ -79,4 +82,6 @@ sea-orm-migration = { workspace = true }
 testcontainers = { workspace = true }
 sqlx = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+temps-workload-env = { path = "../temps-workload-env" }
+temps-workload-docker = { path = "../temps-workload-docker" }
 tracing-subscriber = { workspace = true }

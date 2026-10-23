@@ -537,6 +537,10 @@ pub struct RestoreService {
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Cancellation signals for the restore workers this service spawned.
     cancellations: super::restore_cancel::RestoreCancellations,
+    /// The workload plane, once `temps serve` starts it. In-place restores
+    /// of a database on a worker node run as a job through it (ADR-055
+    /// Phase 9); an empty slot refuses them with the reason.
+    workload_plane: Arc<temps_workload_plane::PlaneSlot>,
 }
 
 impl RestoreService {
@@ -551,7 +555,14 @@ impl RestoreService {
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             cancellations: super::restore_cancel::RestoreCancellations::default(),
+            workload_plane: Arc::new(temps_workload_plane::PlaneSlot::new()),
         }
+    }
+
+    /// Restore databases on worker nodes through `plane` (ADR-055 Phase 9).
+    pub fn with_workload_plane(mut self, plane: Arc<temps_workload_plane::PlaneSlot>) -> Self {
+        self.workload_plane = plane;
+        self
     }
 
     /// Report restore outcomes as anonymous `restore_succeeded` /
@@ -1169,6 +1180,13 @@ impl RestoreService {
         // Target service: where the restored data goes.
         let target = self.load_service(target_service_id).await?;
 
+        // ADR-055 Phase 9: a database on a worker node is restored by a job
+        // on its node, which applies a dump in place. Refuse anything else
+        // now, not after the run started.
+        if crate::engines::workload_job::takes_job_path(&target) {
+            job_restore_supported(&target, &backup_location, &mode)?;
+        }
+
         // Engine-compat guard: refuse to restore a postgres backup onto a
         // redis target, etc.
         if let Some(engine) = &backup_engine_hint {
@@ -1317,12 +1335,13 @@ impl RestoreService {
         let mgr = self.external_service_manager.clone();
         let enc = self.encryption_service.clone();
         let telemetry = self.telemetry.clone();
+        let plane = self.workload_plane.clone();
         // Registered before the worker starts so a cancellation that arrives
         // immediately still reaches it.
         let registration = self.cancellations.register(run_id);
         tokio::spawn(async move {
             if let Err(e) =
-                run_restore_worker(db, mgr, enc, telemetry, run_id, mode, registration).await
+                run_restore_worker(db, mgr, enc, plane, telemetry, run_id, mode, registration).await
             {
                 error!("Restore run {} failed: {}", run_id, e);
             }
@@ -1767,10 +1786,12 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
 
 /// Worker: marks the run through phases, dispatches to the trait, and
 /// persists target_service_id (when applicable) on success.
+#[allow(clippy::too_many_arguments)]
 async fn run_restore_worker(
     db: Arc<DatabaseConnection>,
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
+    plane: Arc<temps_workload_plane::PlaneSlot>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     run_id: i32,
     mode: RestoreRequestMode,
@@ -1787,6 +1808,7 @@ async fn run_restore_worker(
         db.clone(),
         mgr,
         enc,
+        plane,
         run_id,
         mode,
         registration.token(),
@@ -1907,6 +1929,7 @@ async fn run_restore_inner(
     db: Arc<DatabaseConnection>,
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
+    plane: Arc<temps_workload_plane::PlaneSlot>,
     run_id: i32,
     mode: RestoreRequestMode,
     cancel: tokio_util::sync::CancellationToken,
@@ -1985,6 +2008,21 @@ async fn run_restore_inner(
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: run.source_service_id,
             })?;
+
+    // ADR-055 Phase 9: a database on a worker node is restored by a job on
+    // its node. Every other target takes the path below, unchanged.
+    if crate::engines::workload_job::takes_job_path(&target_service) {
+        return run_job_restore(
+            &db,
+            &enc,
+            &plane,
+            run_id,
+            &backup_model,
+            &target_service,
+            &mode,
+        )
+        .await;
+    }
 
     let service_type = ServiceType::from_str(&target_service.service_type).map_err(|e| {
         RestoreError::Validation {
@@ -3168,6 +3206,144 @@ async fn load_run_for_update(
         .ok_or(RestoreError::RestoreRunNotFound {
             restore_run_id: run_id,
         })
+}
+
+/// Whether a restore of `backup_location` onto `target`, a database whose
+/// backups and restores run as jobs on its worker node, is one a job can do:
+/// an in-place apply of a `pg_dumpall` dump.
+fn job_restore_supported(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    let node = crate::engines::workload_job::worker_node(target).unwrap_or_default();
+    if !matches!(mode, RestoreRequestMode::InPlace) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Database {} ('{}') runs on worker node {node}, where restores run as a job that                  applies a dump in place; restore mode '{}' is not available there. Restore in                  place, or move the database to the control plane first",
+                target.id,
+                target.name,
+                mode.as_str()
+            ),
+        });
+    }
+    if !crate::engines::workload_job::restore_takes_job_path(target, backup_location) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Database {} ('{}') runs on worker node {node}, where restores apply a pg_dumpall                  dump (`.sql.gz`); backup '{backup_location}' is not one",
+                target.id, target.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Restore `backup` in place into `target`, a database on a worker node, by
+/// a job on that node (ADR-055 Phase 9): `wal-g st cat | gunzip | psql`.
+async fn run_job_restore(
+    db: &Arc<DatabaseConnection>,
+    enc: &Arc<temps_core::EncryptionService>,
+    plane: &temps_workload_plane::PlaneSlot,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+    mode: &RestoreRequestMode,
+) -> Result<Option<i32>, RestoreError> {
+    use crate::engines::workload_job;
+    job_restore_supported(target, &backup.s3_location, mode)?;
+    let node_id = workload_job::worker_node(target).ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: database {} left its worker node",
+            target.id
+        ),
+    })?;
+    // A dump carries its origin's roles and their passwords; the target's
+    // stored credentials stay right only for its own backups.
+    if backup.id > 0 {
+        let origin = workload_job::backup_origin(db.as_ref(), backup.id).await?;
+        if origin.is_some_and(|origin| origin != target.id) {
+            return Err(RestoreError::Validation {
+                message: format!(
+                    "Backup {} was taken from another database; restores of database {} on                      worker node {node_id} apply only its own backups",
+                    backup.id, target.id
+                ),
+            });
+        }
+    }
+    let plane = plane.get().ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: database {} is on worker node {node_id}, and restoring it              needs the workload plane, which this process does not run",
+            target.id
+        ),
+    })?;
+    let config_json = enc
+        .decrypt_string(target.config.as_deref().unwrap_or("{}"))
+        .map_err(|e| RestoreError::Encryption {
+            reason: format!("decrypting the config of database {}: {e}", target.id),
+        })?;
+    let parameters: serde_json::Value =
+        serde_json::from_str(&config_json).unwrap_or_else(|_| serde_json::json!({}));
+    let (job_target, password) = workload_job::pg_target(target, node_id, &parameters);
+    let s3 = workload_job::s3_target(
+        db.as_ref(),
+        enc,
+        backup.s3_source_id,
+        target.id,
+        node_id,
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
+
+    // `wal-g st cat` reads keys relative to the bucket (`WALG_S3_PREFIX`).
+    let bucket_prefix = format!("s3://{}/", s3.bucket);
+    let object_key = backup
+        .s3_location
+        .strip_prefix(&bucket_prefix)
+        .unwrap_or(&backup.s3_location)
+        .trim_start_matches('/')
+        .to_string();
+    if object_key.starts_with("s3://") {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
+                backup.id, backup.s3_location, s3.bucket, backup.s3_source_id
+            ),
+        });
+    }
+
+    // The last safe point: once the job starts writing, the run can no
+    // longer be cancelled (`restore` is not a cancellable phase).
+    super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "restore").await?;
+    info!(
+        run_id,
+        service_id = target.id,
+        node_id,
+        backup_id = backup.id,
+        "restoring database {} in place by a job on its node",
+        target.id
+    );
+    workload_job::run_database_job(
+        &plane,
+        &job_target,
+        workload_job::JobPurpose::Restore {
+            restore_run_id: run_id,
+        },
+        workload_job::restore_script(&job_target, &object_key),
+        workload_job::job_env(&password, &s3),
+        // Past the safe point: nothing may interrupt the apply.
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
+    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
+        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
+    }
+    Ok(None)
 }
 
 async fn update_phase(
@@ -6195,6 +6371,64 @@ mod tests {
             cancel_requested_at: None,
             cancel_requested_by: None,
         }
+    }
+
+    fn worker_postgres() -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 11,
+            name: "orders".to_string(),
+            service_type: "postgres".to_string(),
+            node_id: Some(4),
+            workload_mode:
+                temps_entities::external_service_workload_mode::ServiceWorkloadMode::Enforce,
+            ..crashed_run_service()
+        }
+    }
+
+    /// ADR-055 Phase 9: a database on a worker restores by a job, in place,
+    /// from a `pg_dumpall` dump. Anything else is refused with the reason.
+    #[test]
+    fn a_worker_database_restores_only_in_place_from_a_dump() {
+        let target = worker_postgres();
+        let key = "external_services/postgres/orders/u/dump.sql.gz";
+        assert!(job_restore_supported(&target, key, &RestoreRequestMode::InPlace).is_ok());
+
+        let new_service = RestoreRequestMode::NewService {
+            name: "copy".into(),
+            parameter_overrides: serde_json::json!({}),
+        };
+        match job_restore_supported(&target, key, &new_service) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains("worker node 4"), "{message}");
+                assert!(message.contains("in place"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+
+        match job_restore_supported(
+            &target,
+            "s3://bucket/base_000001",
+            &RestoreRequestMode::InPlace,
+        ) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains(".sql.gz"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// A database on the control plane, or in legacy mode, never takes the
+    /// job path: its restore is unchanged.
+    #[test]
+    fn a_control_plane_or_legacy_database_keeps_the_local_restore() {
+        use crate::engines::workload_job::takes_job_path;
+        let mut local = worker_postgres();
+        local.node_id = None;
+        assert!(!takes_job_path(&local));
+        let mut legacy = worker_postgres();
+        legacy.workload_mode = Default::default();
+        assert!(!takes_job_path(&legacy));
+        assert!(takes_job_path(&worker_postgres()));
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {

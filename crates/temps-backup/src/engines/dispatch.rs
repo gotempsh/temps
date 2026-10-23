@@ -12,6 +12,7 @@
 //! | `service_type` | `topology`   | WAL-G available? | engine key          |
 //! |----------------|--------------|------------------|---------------------|
 //! | `"postgres"`   | `"cluster"`  | (always WAL-G)   | `"postgres_cluster"` |
+//! | `"postgres"`   | standalone, `enforce`, on a worker | – | `"postgres_workload_job"` |
 //! | `"postgres"`   | other        | yes              | `"postgres_walg"`   |
 //! | `"postgres"`   | other        | no               | `"postgres_pgdump"` |
 //! | `"redis"`      | any          | –                | `"redis"`           |
@@ -59,6 +60,12 @@ pub async fn resolve_engine_key(
         "postgres" | "postgresql" | "timescale" | "timescaledb" => {
             if service.topology.as_str() == "cluster" {
                 return Ok("postgres_cluster");
+            }
+            // ADR-055 Phase 9: a database on a worker node in `enforce` is
+            // backed up by a job on that node. Every other row resolves as
+            // before (the mode defaults to `legacy`).
+            if super::workload_job::takes_job_path(service) {
+                return Ok(super::workload_job::ENGINE_KEY);
             }
             // Probe for WAL-G in the running container. Container naming
             // must match the legacy provider's `get_container_name()` —
@@ -272,6 +279,38 @@ mod tests {
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
         }
+    }
+
+    #[test]
+    fn a_postgres_on_a_worker_in_enforce_is_backed_up_as_a_job() {
+        use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                // Connecting is lazy: the job path never probes Docker.
+                let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+                    return;
+                };
+                let mut svc = make_service("postgres", "standalone");
+                svc.node_id = Some(3);
+                svc.workload_mode = ServiceWorkloadMode::Enforce;
+                let result = resolve_engine_key(&svc, &docker).await;
+                assert!(
+                    matches!(result, Ok("postgres_workload_job")),
+                    "got: {:?}",
+                    result
+                );
+                // The default mode keeps today's engine selection.
+                svc.workload_mode = ServiceWorkloadMode::Legacy;
+                let result = resolve_engine_key(&svc, &docker).await;
+                assert!(
+                    matches!(result, Ok("postgres_walg") | Ok("postgres_pgdump")),
+                    "got: {:?}",
+                    result
+                );
+            });
     }
 
     #[test]
