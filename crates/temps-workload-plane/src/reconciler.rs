@@ -56,7 +56,9 @@ use crate::error::PlaneError;
 use crate::events;
 use crate::labels;
 use crate::node::Placed;
-use crate::plane::{decode_status, encode_status, view_from, WorkloadPlane, WorkloadView};
+use crate::plane::{
+    decode_status, encode_status, view_from, WorkloadPlane, WorkloadView, NO_CONTROL_PLANE_DRIVER,
+};
 
 /// Most workloads one pass reads. A pass that hits it asks for another.
 pub const PASS_LIMIT: u64 = 256;
@@ -242,8 +244,8 @@ impl WorkloadPlane {
             Err(error) => tracing::error!("reading the next workload expiry failed: {error}"),
         }
         if full {
-            if let Some(driver) = self.driver.0.clone() {
-                outcome.orphans_removed = self.sweep_orphans(&driver).await;
+            for driver in self.control_plane_drivers() {
+                outcome.orphans_removed += self.sweep_orphans(&driver).await;
             }
             match events::prune(self.db.as_ref(), now).await {
                 Ok(pruned) => outcome.events_pruned = pruned,
@@ -748,10 +750,16 @@ impl WorkloadPlane {
             }
             (_, Some(node_id), Some(placement)) => match placement.place_on(&view, node_id).await {
                 Ok(Placed::Node { driver, .. }) => Ok((Some(node_id), driver)),
-                Ok(Placed::ControlPlane) => self.control_plane_driver().map(|d| (None, d)),
+                Ok(Placed::ControlPlane) => self
+                    .control_plane_driver_for(view.spec.isolation)
+                    .map(|d| (None, d)),
                 Err(message) => Err(message),
             },
-            _ => self.control_plane_driver().map(|d| (None, d)),
+            // On the control plane, the driver of the isolation the spec
+            // asks for (a microVM through Firecracker, ADR-055 Phase 10).
+            _ => self
+                .control_plane_driver_for(view.spec.isolation)
+                .map(|d| (None, d)),
         };
         let (node_id, driver) = match placed {
             Ok(placed) => placed,
@@ -958,7 +966,7 @@ impl WorkloadPlane {
             ));
         }
         match placed {
-            Placed::ControlPlane => Ok((None, self.control_plane_driver()?)),
+            Placed::ControlPlane => Ok((None, self.control_plane_driver_for(view.spec.isolation)?)),
             Placed::Node {
                 node_id,
                 node_name,
@@ -1850,9 +1858,6 @@ impl WorkloadPlane {
     }
 }
 
-const NO_CONTROL_PLANE_DRIVER: &str = "0/1 nodes eligible: the control plane (node 0) has no \
-     runtime driver; the Docker daemon was not reachable when temps started";
-
 pub(crate) fn set_scheduled(status: &mut WorkloadStatus, node_id: Option<i32>, now: DateTime<Utc>) {
     let (reason, message) = match node_id {
         None => (
@@ -2298,6 +2303,80 @@ mod tests {
         assert!(driver.exists("another-planes-instance"));
         assert!(driver.exists(&tracked[0]));
         assert_eq!(plane.get(id).await.expect("read").attempt, 1);
+    }
+
+    /// ADR-055 Phase 10, Firecracker for deployments: a `micro_vm` replica
+    /// runs through the node-0 driver that provides it, never the primary
+    /// one; and is refused with the reason when none does.
+    #[tokio::test]
+    async fn a_micro_vm_replica_runs_on_the_driver_that_provides_it() {
+        let Some(db) = test_db().await else { return };
+        let primary = FakeDriver::new();
+        let vm = FakeDriver::with_isolation("fake-vm", temps_workload::Isolation::MicroVm);
+        let (plane_without_vm, _) = plane(&db, NodeDriver(Some(primary.clone())), Vec::new());
+        let audit = Arc::new(crate::testing::RecordingAudit::default());
+        let with_vm = Arc::new(
+            WorkloadPlane::new(
+                db.db.clone(),
+                NodeDriver(Some(primary.clone())),
+                Arc::new(crate::NoEnvSource),
+                audit,
+                crate::PlaneConfig::new(format!(
+                    "t{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                )),
+            )
+            .with_control_plane_driver(vm.clone()),
+        );
+        assert_eq!(
+            with_vm.control_plane_isolations(),
+            vec![
+                temps_workload::Isolation::Process,
+                temps_workload::Isolation::MicroVm
+            ]
+        );
+
+        let mut spec = deployment_spec("app:1");
+        spec.isolation = temps_workload::Isolation::MicroVm;
+        let id = with_vm
+            .apply(apply_request(42, "app-vm-r1", spec.clone()))
+            .await
+            .expect("applied");
+        with_vm.reconcile_at(Utc::now(), false).await;
+        assert_eq!(vm.running().len(), 1, "the microVM driver runs it");
+        assert!(primary.running().is_empty(), "never the container driver");
+        let view = with_vm.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Running);
+        // Later operations find the same driver by the instance's name.
+        let (handle, _) = with_vm
+            .instance_status(id)
+            .await
+            .expect("inspect")
+            .expect("an instance");
+        assert_eq!(handle.driver, "fake-vm");
+
+        let refused = plane_without_vm
+            .apply(apply_request(43, "app-vm-r2", spec))
+            .await
+            .expect("admitted: placement decides");
+        plane_without_vm.reconcile_at(Utc::now(), false).await;
+        let view = plane_without_vm.get(refused).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Failed);
+        let scheduled = view
+            .status
+            .condition(ConditionKind::Scheduled)
+            .expect("scheduled condition");
+        assert_eq!(scheduled.reason, "NoEligibleNode");
+        assert!(
+            scheduled.message.contains("micro_vm isolation")
+                && scheduled.message.contains("drivers: fake"),
+            "{}",
+            scheduled.message
+        );
+        assert!(
+            primary.created().is_empty(),
+            "nothing fell back to a container"
+        );
     }
 
     #[tokio::test]

@@ -324,11 +324,26 @@ fn validate(spec: &WorkloadSpec, name: &str) -> Result<(), String> {
             ));
         }
     }
-    if spec.isolation != Isolation::Process {
-        return Err(format!(
-            "isolation {:?} is not available; only process isolation runs",
-            spec.isolation
-        ));
+    match spec.isolation {
+        Isolation::Process => {}
+        // ADR-055 Phase 10: a deployment replica may ask for a microVM; the
+        // scheduler then places it only where a driver provides one.
+        Isolation::MicroVm if deployment => {
+            if !spec.network.extra_networks.is_empty() {
+                return Err(format!(
+                    "a micro_vm replica cannot join Docker networks {:?}: a microVM has its own \
+                     network device, not a container endpoint",
+                    spec.network.extra_networks
+                ));
+            }
+        }
+        other => {
+            return Err(format!(
+                "isolation {other:?} is not available for a {}; only deployment replicas may \
+                 request micro_vm, and nothing requests in_host",
+                spec.owner.kind
+            ));
+        }
     }
     if let Some(command) = &spec.process.command {
         if command.is_empty() {
@@ -814,6 +829,37 @@ mod tests {
             app_protocol: Default::default(),
         });
         spec
+    }
+
+    /// ADR-055 Phase 10: only a deployment replica may ask for a microVM,
+    /// and then without Docker networks it could never join.
+    #[test]
+    fn micro_vm_is_admitted_for_deployment_replicas_only() {
+        let owner = Owner::new("deployment", 42);
+        let mut vm = deployment_spec();
+        vm.isolation = Isolation::MicroVm;
+        let admitted =
+            admit(&AdmissionPolicy::default(), input(vm, &owner, None)).expect("admitted");
+        assert_eq!(admitted.isolation, Isolation::MicroVm);
+
+        let mut networked = deployment_spec();
+        networked.isolation = Isolation::MicroVm;
+        networked.network.extra_networks = vec!["shop_default".into()];
+        let refused =
+            admit(&AdmissionPolicy::default(), input(networked, &owner, None)).unwrap_err();
+        assert_eq!(refused.rule, AdmissionRule::Validation);
+        assert!(
+            refused.message.contains("shop_default"),
+            "{}",
+            refused.message
+        );
+
+        let cron = Owner::new("cron", 7);
+        let mut job = job_spec("app:1");
+        job.isolation = Isolation::MicroVm;
+        let refused = admit(&AdmissionPolicy::default(), input(job, &cron, None)).unwrap_err();
+        assert_eq!(refused.rule, AdmissionRule::Validation);
+        assert!(refused.message.contains("micro_vm"), "{}", refused.message);
     }
 
     #[test]

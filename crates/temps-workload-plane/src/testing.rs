@@ -327,6 +327,18 @@ impl FakeDriver {
         })
     }
 
+    /// A fake driver named `name` that provides `isolation` (a microVM
+    /// driver beside the primary one, ADR-055 Phase 10).
+    pub(crate) fn with_isolation(name: &str, isolation: Isolation) -> Arc<Self> {
+        let mut capabilities = Self::new().capabilities.clone();
+        capabilities.name = name.to_string();
+        capabilities.isolation = isolation;
+        Arc::new(Self {
+            capabilities,
+            state: Mutex::new(FakeState::default()),
+        })
+    }
+
     fn state(&self) -> std::sync::MutexGuard<'_, FakeState> {
         self.state.lock().expect("lock")
     }

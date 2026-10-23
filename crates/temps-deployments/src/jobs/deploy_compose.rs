@@ -24,6 +24,10 @@ use temps_deployer::compose::{
     ComposeCheckInput, ComposeDeployRequest, ComposeError, ComposeExecutor, ComposeOutputSink,
     EnvFileSource, ResolvedComposeConfiguration,
 };
+use temps_deployer::compose_translation::{
+    self, ComposeTranslation, ComposeTranslationInput, EnvFileContent,
+};
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
 use temps_logs::{LogLevel, LogService};
 use tracing::debug;
@@ -232,6 +236,11 @@ pub struct DeployComposeJob {
     /// Unique to this in-memory job construction, including a replay of the
     /// same durable deployment/workflow identifiers.
     secret_generation: String,
+    /// The environment's ADR-055 mode. `legacy` never translates; `shadow`
+    /// translates and logs how the result differs from the running stack;
+    /// `enforce` refuses a project the plane cannot express before the
+    /// running stack is touched.
+    workload_mode: EnvironmentWorkloadMode,
 }
 
 pub struct DeployComposeJobBuilder {
@@ -257,6 +266,7 @@ pub struct DeployComposeJobBuilder {
     download_job_id: Option<String>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    workload_mode: EnvironmentWorkloadMode,
 }
 
 impl Default for DeployComposeJobBuilder {
@@ -290,7 +300,14 @@ impl DeployComposeJobBuilder {
             download_job_id: None,
             log_id: None,
             log_service: None,
+            workload_mode: EnvironmentWorkloadMode::Legacy,
         }
+    }
+
+    /// The environment's ADR-055 workload mode (default `legacy`).
+    pub fn workload_mode(mut self, mode: EnvironmentWorkloadMode) -> Self {
+        self.workload_mode = mode;
+        self
     }
 
     pub fn job_id(mut self, id: String) -> Self {
@@ -434,6 +451,7 @@ impl DeployComposeJobBuilder {
                 deployment_id,
                 &uuid::Uuid::new_v4().simple().to_string(),
             ),
+            workload_mode: self.workload_mode,
         })
     }
 }
@@ -849,6 +867,186 @@ impl DeployComposeJob {
         }
         for note in &resolution.notes {
             let _ = self.log_service.log_info(log_id, note).await;
+        }
+    }
+
+    async fn log_line(&self, level: LogLevel, message: &str) {
+        let Some(ref log_id) = self.log_id else {
+            return;
+        };
+        let result = match level {
+            LogLevel::Error => self.log_service.log_error(log_id, message).await,
+            LogLevel::Warning => self.log_service.log_warning(log_id, message).await,
+            _ => self.log_service.log_info(log_id, message).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                deployment_id = self.deployment_id,
+                "could not write the deployment log: {e}"
+            );
+        }
+    }
+
+    /// ADR-055 §14: translate the checked model into one workload per
+    /// service. `legacy` does not translate. A refusal fails an `enforce`
+    /// deployment here, before the running stack is touched; in `shadow` it
+    /// is logged and the legacy deploy goes on.
+    #[allow(clippy::too_many_arguments)]
+    async fn plane_translation(
+        &self,
+        project_name: &str,
+        compose_file: &str,
+        content: &str,
+        override_content: Option<&str>,
+        repo_dir: Option<&Path>,
+        repository_env: Option<&str>,
+        labels: &HashMap<String, String>,
+    ) -> Result<Option<ComposeTranslation>, WorkflowError> {
+        if self.workload_mode == EnvironmentWorkloadMode::Legacy {
+            return Ok(None);
+        }
+        let mut env_files = std::collections::BTreeMap::new();
+        for plan in
+            ComposeExecutor::plan_env_files_for_compose_file(content, compose_file, repo_dir)
+        {
+            let file = match plan.source {
+                EnvFileSource::Repository(path) => match std::fs::read_to_string(&path) {
+                    Ok(text) => EnvFileContent::Dotenv(text),
+                    Err(e) => {
+                        let message = format!(
+                            "Compose translation could not read env file '{}' for project {}: {e}",
+                            plan.path, self.project_id
+                        );
+                        return self.translation_refused(message).await;
+                    }
+                },
+                EnvFileSource::ProjectEnvironment => EnvFileContent::ProjectEnvironment,
+            };
+            env_files.insert(plan.path, file);
+        }
+        let routed: Vec<String> = self
+            .public_ports
+            .iter()
+            .map(|port| port.service.clone())
+            .collect();
+        let result = compose_translation::translate(&ComposeTranslationInput {
+            project_name,
+            compose_file,
+            content,
+            override_content,
+            environment_vars: &self.environment_vars,
+            repository_env,
+            env_files: &env_files,
+            labels,
+            routed_services: &routed,
+            owner: temps_workload::WorkloadRef::new(
+                temps_workload::WorkloadKind::Deployment,
+                i64::from(self.deployment_id),
+            ),
+            temps_network: temps_core::NETWORK_NAME.as_str(),
+        });
+        match result {
+            Ok(translation) => {
+                let message = match self.workload_mode {
+                    EnvironmentWorkloadMode::Enforce => format!(
+                        "Compose translation (workload_mode: enforce) admitted {} service(s): {}. \
+                         The services run through the Docker Compose CLI.",
+                        translation.services.len(),
+                        translation.service_names().join(", ")
+                    ),
+                    _ => format!(
+                        "Compose translation (workload_mode: shadow) expresses {} service(s); \
+                         comparing with the running stack after deploy",
+                        translation.services.len()
+                    ),
+                };
+                self.log_line(LogLevel::Info, &message).await;
+                Ok(Some(translation))
+            }
+            Err(error) => self.translation_refused(error.to_string()).await,
+        }
+    }
+
+    async fn translation_refused(
+        &self,
+        reason: String,
+    ) -> Result<Option<ComposeTranslation>, WorkflowError> {
+        if self.workload_mode == EnvironmentWorkloadMode::Enforce {
+            let message = format!(
+                "The workload plane cannot run this Compose project (workload_mode: enforce): \
+                 {reason}. The running stack was not touched. Change the Compose file, or set \
+                 this environment's workload_mode back to legacy or shadow"
+            );
+            self.log_line(LogLevel::Error, &message).await;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
+        tracing::info!(
+            deployment_id = self.deployment_id,
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            reason = %reason,
+            "compose shadow: the workload plane could not express this project"
+        );
+        self.log_line(
+            LogLevel::Warning,
+            &format!("Compose shadow: the workload plane could not express this project: {reason}"),
+        )
+        .await;
+        Ok(None)
+    }
+
+    /// `shadow`: compare the translation with the containers the legacy
+    /// path started and log every difference (variable names, never
+    /// values). Never fails the deployment.
+    async fn log_shadow_differences(
+        &self,
+        project_name: &str,
+        translation: &ComposeTranslation,
+        services: &[temps_deployer::compose::ComposeServiceResult],
+    ) {
+        let observed = match self
+            .compose_executor
+            .observe_services(project_name, services)
+            .await
+        {
+            Ok(observed) => observed,
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = self.deployment_id,
+                    "compose shadow comparison skipped: {e}"
+                );
+                return;
+            }
+        };
+        let differences = compose_translation::shadow_diff(translation, &observed);
+        tracing::info!(
+            deployment_id = self.deployment_id,
+            project_id = self.project_id,
+            environment_id = self.environment_id,
+            services = translation.services.len(),
+            differences = differences.len(),
+            "compose shadow comparison"
+        );
+        if differences.is_empty() {
+            self.log_line(
+                LogLevel::Info,
+                &format!(
+                    "Compose shadow: the translation matches the running stack ({} service(s))",
+                    translation.services.len()
+                ),
+            )
+            .await;
+            return;
+        }
+        for difference in &differences {
+            tracing::info!(
+                deployment_id = self.deployment_id,
+                service = %difference.service,
+                field = difference.field,
+                "compose shadow difference: {difference}"
+            );
+            self.log_line(LogLevel::Info, &format!("Compose shadow: {difference}"))
+                .await;
         }
     }
 
@@ -1274,6 +1472,18 @@ impl DeployComposeJob {
                 }
             }
         }
+
+        let translation = self
+            .plane_translation(
+                &project_name,
+                compose_file_name,
+                &compose_content,
+                compose_override.as_deref(),
+                repo_path.as_deref(),
+                env_content.as_deref(),
+                &labels,
+            )
+            .await?;
 
         // Build the deploy request here so it is available to prepare_and_pull
         // BEFORE teardown. This is required for pull latency to fall outside the
@@ -1776,6 +1986,13 @@ impl DeployComposeJob {
                 .await;
         }
 
+        if self.workload_mode == EnvironmentWorkloadMode::Shadow {
+            if let Some(ref translation) = translation {
+                self.log_shadow_differences(&project_name, translation, &services)
+                    .await;
+            }
+        }
+
         // Cancellation may arrive while final service/log metadata is being
         // persisted after startup. This is the last await boundary before the
         // synchronous success return, so compensate here while the outer task
@@ -2117,6 +2334,95 @@ mod tests {
             .log_service(Arc::new(LogService::new(std::env::temp_dir())))
             .build()
             .expect("complete builder should produce a deployment job")
+    }
+
+    /// ADR-055 §14: `legacy` never translates; `shadow` translates and only
+    /// logs a refusal; `enforce` fails on a refusal, naming the service and
+    /// field, before anything touches the running stack.
+    #[tokio::test]
+    async fn the_compose_translation_gate_follows_the_workload_mode() {
+        let translatable = "services:\n  web:\n    image: nginx:1.27\n";
+        let refused = "services:\n  web:\n    image: nginx:1.27\n    pid: host\n";
+        let labels = HashMap::new();
+        let mut job = test_job_with_disabled_docker(test_db());
+
+        // legacy: nothing is translated, even what the plane would refuse.
+        job.workload_mode = EnvironmentWorkloadMode::Legacy;
+        let result = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // shadow: translated when expressible, a refusal is only logged.
+        job.workload_mode = EnvironmentWorkloadMode::Shadow;
+        let translated = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                translatable,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect("shadow translates")
+            .expect("a translation");
+        assert_eq!(translated.service_names(), vec!["web"]);
+        let result = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await;
+        assert!(matches!(result, Ok(None)), "{result:?}");
+
+        // enforce: a refusal fails the job and names the service and field.
+        job.workload_mode = EnvironmentWorkloadMode::Enforce;
+        let error = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                refused,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect_err("enforce refuses");
+        let message = error.to_string();
+        assert!(
+            message.contains("'web'") && message.contains("'pid'"),
+            "{message}"
+        );
+        assert!(message.contains("was not touched"), "{message}");
+        let admitted = job
+            .plane_translation(
+                "temps-2-3",
+                "docker-compose.yml",
+                translatable,
+                None,
+                None,
+                None,
+                &labels,
+            )
+            .await
+            .expect("enforce admits what it can express");
+        assert!(admitted.is_some());
     }
 
     /// The control-plane profile (no Docker client constructed at all) must

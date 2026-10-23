@@ -33,8 +33,8 @@ use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
 use temps_vm_agent::{
-    read_frame, relay, write_frame, Request, Response, AGENT_PORT, MAX_PTY_RELAYS, PTY_AGENT_BIN,
-    PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
+    read_frame, relay, write_frame, Request, Response, AGENT_PORT, DEFAULT_SPAWN_LOG,
+    MAX_PTY_RELAYS, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN, PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
 };
 
 /// `PATH` for processes this agent starts: PID 1's own environment is empty
@@ -602,6 +602,138 @@ fn handle_request(request: Request) -> Response {
             }
         }
         Request::Kill { pattern, signal } => kill_matching(&pattern, signal),
+        Request::Spawn {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+        } => spawn(cmd, env, cwd, uid, gid, log_path),
+        Request::ProcessStatus { pid } => process_status(pid),
+    }
+}
+
+// ── Spawn (a workload's main process) ───────────────────────────────────
+
+/// Processes started by [`spawn`], kept so their exit status can be read
+/// (this PID 1 does not reap every child). Bounded by
+/// [`MAX_SPAWNED_PROCESSES`].
+static SPAWNED: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+
+fn spawn(
+    cmd: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    log_path: Option<String>,
+) -> Response {
+    if cmd.is_empty() {
+        return Response::Err {
+            message: "spawn: empty command".to_string(),
+        };
+    }
+    let Ok(mut spawned) = SPAWNED.lock() else {
+        return Response::Err {
+            message: "spawn: process table is poisoned".to_string(),
+        };
+    };
+    // Forget processes that already exited and were read.
+    spawned.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+    if spawned.len() >= MAX_SPAWNED_PROCESSES {
+        return Response::Err {
+            message: format!(
+                "spawn {}: {} processes already run (limit {})",
+                cmd[0],
+                spawned.len(),
+                MAX_SPAWNED_PROCESSES
+            ),
+        };
+    }
+    let log_path = log_path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    if let Some(parent) = Path::new(&log_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(file) => file,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {}: open log {}: {}", cmd[0], log_path, e),
+            }
+        }
+    };
+    let stderr = match log.try_clone() {
+        Ok(file) => file,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {}: duplicate log handle: {}", cmd[0], e),
+            }
+        }
+    };
+    let cwd = cwd.unwrap_or_else(|| "/".to_string());
+    let mut command = std::process::Command::new(&cmd[0]);
+    command
+        .args(&cmd[1..])
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(stderr));
+    if !env.contains_key("PATH") {
+        command.env("PATH", DEFAULT_PATH);
+    }
+    for (k, v) in &env {
+        command.env(k, v);
+    }
+    {
+        use std::os::unix::process::CommandExt;
+        if let Some(gid) = gid.or(uid) {
+            command.gid(gid);
+        }
+        if let Some(uid) = uid {
+            command.uid(uid);
+        }
+    }
+    match command.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            spawned.push(child);
+            info("spawned", &[("pid", json!(pid)), ("cmd", json!(cmd[0]))]);
+            Response::Spawned { pid }
+        }
+        Err(e) => Response::Err {
+            message: format!("spawn {}: {}", cmd[0], e),
+        },
+    }
+}
+
+fn process_status(pid: u32) -> Response {
+    let Ok(mut spawned) = SPAWNED.lock() else {
+        return Response::Err {
+            message: "process status: process table is poisoned".to_string(),
+        };
+    };
+    let Some(child) = spawned.iter_mut().find(|child| child.id() == pid) else {
+        return Response::Err {
+            message: format!("process status: pid {pid} was not started by spawn"),
+        };
+    };
+    match child.try_wait() {
+        Ok(None) => Response::ProcessStatus {
+            running: true,
+            exit_code: None,
+        },
+        Ok(Some(status)) => Response::ProcessStatus {
+            running: false,
+            exit_code: Some(status.code().unwrap_or(-1)),
+        },
+        Err(e) => Response::Err {
+            message: format!("process status {pid}: {e}"),
+        },
     }
 }
 
@@ -798,6 +930,54 @@ mod tests {
     fn mount_rejects_an_argument_with_a_nul_byte_without_panicking() {
         let err = mount("tmpfs", "/run\0x", "tmpfs", None).unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument { .. }), "{err}");
+    }
+
+    #[test]
+    fn spawned_process_status_reports_running_then_its_exit_code() {
+        let dir = std::env::temp_dir().join(format!("temps-vm-agent-spawn-{}", std::process::id()));
+        let log = dir.join("out.log");
+        let response = spawn(
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "echo started; sleep 0.3; exit 7".into(),
+            ],
+            HashMap::new(),
+            None,
+            None,
+            None,
+            Some(log.display().to_string()),
+        );
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        assert!(matches!(
+            process_status(pid),
+            Response::ProcessStatus {
+                running: true,
+                exit_code: None
+            }
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let exit = loop {
+            match process_status(pid) {
+                Response::ProcessStatus {
+                    running: false,
+                    exit_code,
+                } => break exit_code,
+                _ if Instant::now() > deadline => panic!("process {pid} did not exit"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+        assert_eq!(exit, Some(7));
+        let output = std::fs::read_to_string(&log).expect("log written");
+        assert!(output.contains("started"), "{output}");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(process_status(999_999), Response::Err { .. }));
+        assert!(matches!(
+            spawn(Vec::new(), HashMap::new(), None, None, None, None),
+            Response::Err { .. }
+        ));
     }
 
     #[test]

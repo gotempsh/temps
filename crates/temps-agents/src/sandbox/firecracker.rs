@@ -888,6 +888,102 @@ impl FirecrackerSandboxProvider {
         comm.trim().starts_with("firecracker").then_some(pid)
     }
 
+    // ── Workload VMs (ADR-055 Phase 10: deployments in a microVM) ──
+
+    /// The VM name the provider gives a `container_name_override`.
+    pub(crate) fn vm_name_for(&self, id: &str) -> String {
+        format!("{}{}", FC_SANDBOX_NAME_PREFIX, id)
+    }
+
+    /// The VM's directory on the host (rootfs, sockets, persisted state).
+    pub(crate) fn vm_dir_of(&self, name: &str) -> PathBuf {
+        self.config.vm_dir(name)
+    }
+
+    /// Every VM directory under the provider's root.
+    pub(crate) fn vm_names(&self) -> Vec<String> {
+        std::fs::read_dir(self.config.vms_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The variables the VM was created with (its 0600 `env.json`).
+    pub(crate) fn workload_env(&self, name: &str) -> HashMap<String, String> {
+        self.base_env(name)
+    }
+
+    /// Whether the VM's VMM process runs.
+    pub(crate) fn vm_running(&self, name: &str) -> bool {
+        self.vm_pid(name).is_some()
+    }
+
+    /// The guest's IP on its TAP device, when it holds one.
+    pub(crate) fn guest_ip_of(&self, name: &str) -> Option<std::net::Ipv4Addr> {
+        let net = self.net_state()?;
+        let (idx, _) = self
+            .read_taps()
+            .into_iter()
+            .find(|(_, owner)| owner.as_str() == name)?;
+        Some(net.guest_ip(idx))
+    }
+
+    /// Start `cmd` in the guest without waiting for it; returns its pid.
+    pub(crate) async fn spawn_process(
+        &self,
+        name: &str,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
+        cwd: Option<String>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<u32, AgentError> {
+        let response = self
+            .rpc(
+                name,
+                &Request::Spawn {
+                    cmd,
+                    env,
+                    cwd,
+                    uid,
+                    gid,
+                    log_path: None,
+                },
+                Duration::from_secs(30),
+            )
+            .await?;
+        match response {
+            Response::Spawned { pid } => Ok(pid),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
+    /// Whether the guest process `pid` runs, and its exit code once it
+    /// exited.
+    pub(crate) async fn process_status(
+        &self,
+        name: &str,
+        pid: u32,
+    ) -> Result<(bool, Option<i32>), AgentError> {
+        match self
+            .rpc(
+                name,
+                &Request::ProcessStatus { pid },
+                Duration::from_secs(5),
+            )
+            .await?
+        {
+            Response::ProcessStatus { running, exit_code } => Ok((running, exit_code)),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
     // ── Vsock RPC client (hybrid Unix socket, one RPC per connection) ──
 
     async fn rpc(

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Admin API for deployments on the workload plane (ADR-055 Phase 5):
-//! an environment's `workload_mode`, each node's resource policy and
+//! an environment's `workload_mode` and `workload_isolation` (Phase 10),
+//! each node's resource policy and
 //! system reserve (node 0 is the control plane), the scheduler's read-only
 //! explanation for an environment, and the pinning recommendation.
 //!
@@ -24,12 +25,16 @@ use temps_core::{
     problemdetails::{self, Problem, ProblemDetails},
     AuditContext, AuditLogger, RequestMetadata,
 };
+use temps_entities::environment_workload_isolation::EnvironmentWorkloadIsolation;
 use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_entities::node_resource_settings::{NodeResourcePolicy, SystemReserved};
 use tracing::error;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-use crate::handlers::audit::{EnvironmentWorkloadModeChangedAudit, NodeResourcesChangedAudit};
+use crate::handlers::audit::{
+    EnvironmentWorkloadIsolationChangedAudit, EnvironmentWorkloadModeChangedAudit,
+    NodeResourcesChangedAudit,
+};
 use crate::services::workload_placement::{
     NodeResourceSettings, NodeResourceUpdate, WorkloadPlacementError, WorkloadPlacementService,
     DEFAULT_RECOMMENDATION_WINDOW_DAYS,
@@ -87,6 +92,24 @@ pub struct SetWorkloadModeRequest {
     /// unified-scheduler comparison) or `enforce` (control-plane replicas run
     /// through the workload plane). `legacy` is the rollback.
     pub workload_mode: EnvironmentWorkloadMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkloadIsolationResponse {
+    pub environment_id: i32,
+    pub workload_isolation: EnvironmentWorkloadIsolation,
+    /// Whether the setting takes effect: only `enforce` deployments run
+    /// through the plane, so `legacy` and `shadow` keep a container.
+    pub applies: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SetWorkloadIsolationRequest {
+    /// `process` (a container, the default and the rollback) or `micro_vm`
+    /// (a Firecracker microVM; placed only on a node whose runtime provides
+    /// it, refused with the scheduler's reason otherwise). Honoured only
+    /// when the environment's `workload_mode` is `enforce`.
+    pub workload_isolation: EnvironmentWorkloadIsolation,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -261,6 +284,93 @@ pub async fn admin_set_environment_workload_mode(
         environment_id,
         workload_mode: request.workload_mode,
     }))
+}
+
+async fn isolation_response(
+    state: &WorkloadPlacementAppState,
+    environment_id: i32,
+    workload_isolation: EnvironmentWorkloadIsolation,
+) -> Result<WorkloadIsolationResponse, Problem> {
+    let mode = state
+        .service
+        .environment_workload_mode(environment_id)
+        .await?;
+    Ok(WorkloadIsolationResponse {
+        environment_id,
+        workload_isolation,
+        applies: mode == EnvironmentWorkloadMode::Enforce,
+    })
+}
+
+#[utoipa::path(
+    tag = "Workload Placement", get,
+    path = "/internal/environments/{environment_id}/workload-isolation",
+    operation_id = "admin_get_environment_workload_isolation",
+    params(("environment_id" = i32, Path, description = "Environment ID")),
+    responses(
+        (status = 200, body = WorkloadIsolationResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Environment not found", body = ProblemDetails),
+        (status = 500, description = "Storage failed", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn admin_get_environment_workload_isolation(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<WorkloadPlacementAppState>>,
+    Path(environment_id): Path<i32>,
+) -> Result<Json<WorkloadIsolationResponse>, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let isolation = state
+        .service
+        .environment_workload_isolation(environment_id)
+        .await?;
+    Ok(Json(
+        isolation_response(&state, environment_id, isolation).await?,
+    ))
+}
+
+#[utoipa::path(
+    tag = "Workload Placement", put,
+    path = "/internal/environments/{environment_id}/workload-isolation",
+    operation_id = "admin_set_environment_workload_isolation",
+    params(("environment_id" = i32, Path, description = "Environment ID")),
+    request_body = SetWorkloadIsolationRequest,
+    responses(
+        (status = 200, body = WorkloadIsolationResponse),
+        (status = 400, description = "Invalid isolation", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Instance admin required", body = ProblemDetails),
+        (status = 404, description = "Environment not found", body = ProblemDetails),
+        (status = 500, description = "Storage failed", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn admin_set_environment_workload_isolation(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<WorkloadPlacementAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(environment_id): Path<i32>,
+    Json(request): Json<SetWorkloadIsolationRequest>,
+) -> Result<Json<WorkloadIsolationResponse>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    let previous = state
+        .service
+        .set_environment_workload_isolation(environment_id, request.workload_isolation)
+        .await?;
+    let audit = EnvironmentWorkloadIsolationChangedAudit {
+        context: audit_context(&auth, &metadata),
+        environment_id,
+        previous_isolation: previous.as_str().to_string(),
+        workload_isolation: request.workload_isolation.as_str().to_string(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(environment_id, error = %e, "workload isolation changed but the audit record failed");
+    }
+    Ok(Json(
+        isolation_response(&state, environment_id, request.workload_isolation).await?,
+    ))
 }
 
 #[utoipa::path(
@@ -449,6 +559,11 @@ pub fn configure_routes() -> Router<Arc<WorkloadPlacementAppState>> {
             get(admin_get_environment_workload_mode).put(admin_set_environment_workload_mode),
         )
         .route(
+            "/internal/environments/{environment_id}/workload-isolation",
+            get(admin_get_environment_workload_isolation)
+                .put(admin_set_environment_workload_isolation),
+        )
+        .route(
             "/internal/nodes/{node_id}/resources",
             get(admin_get_node_resources).put(admin_set_node_resources),
         )
@@ -467,6 +582,8 @@ pub fn configure_routes() -> Router<Arc<WorkloadPlacementAppState>> {
     paths(
         admin_get_environment_workload_mode,
         admin_set_environment_workload_mode,
+        admin_get_environment_workload_isolation,
+        admin_set_environment_workload_isolation,
         admin_get_node_resources,
         admin_set_node_resources,
         admin_explain_environment_placement,
@@ -475,6 +592,9 @@ pub fn configure_routes() -> Router<Arc<WorkloadPlacementAppState>> {
     components(schemas(
         WorkloadModeResponse,
         SetWorkloadModeRequest,
+        WorkloadIsolationResponse,
+        SetWorkloadIsolationRequest,
+        EnvironmentWorkloadIsolation,
         NodeResourcesResponse,
         SetNodeResourcesRequest,
         NodeRecommendationDto,
@@ -538,6 +658,12 @@ mod tests {
                 "/internal/environments/3/workload-mode",
                 Some(serde_json::json!({"workload_mode": "shadow"})),
             ),
+            ("GET", "/internal/environments/3/workload-isolation", None),
+            (
+                "PUT",
+                "/internal/environments/3/workload-isolation",
+                Some(serde_json::json!({"workload_isolation": "micro_vm"})),
+            ),
             ("GET", "/internal/nodes/0/resources", None),
             ("GET", "/internal/environments/3/placement/explain", None),
             (
@@ -570,6 +696,10 @@ mod tests {
                 (
                     "/internal/nodes/4/resources",
                     serde_json::json!({"resource_policy": "enforced"}),
+                ),
+                (
+                    "/internal/environments/3/workload-isolation",
+                    serde_json::json!({"workload_isolation": "micro_vm"}),
                 ),
             ] {
                 let audit = Arc::new(RecordingAuditLogger::default());
@@ -691,5 +821,93 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "an empty change is refused"
         );
+    }
+
+    fn isolation_row(
+        id: i32,
+        isolation: EnvironmentWorkloadIsolation,
+    ) -> temps_entities::environment_workload_isolation::Model {
+        temps_entities::environment_workload_isolation::Model {
+            id,
+            project_id: 7,
+            workload_mode: EnvironmentWorkloadMode::Enforce,
+            workload_isolation: isolation,
+            deleted_at: None,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_isolation_change_is_audited_with_the_previous_isolation() {
+        let db = mock_db()
+            .append_query_results(vec![vec![isolation_row(
+                3,
+                EnvironmentWorkloadIsolation::Process,
+            )]])
+            .append_query_results(vec![vec![isolation_row(
+                3,
+                EnvironmentWorkloadIsolation::MicroVm,
+            )]])
+            .append_query_results(vec![vec![environment(3, EnvironmentWorkloadMode::Shadow)]])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let (status, _, body) = send(
+            app(db, audit.clone()),
+            "PUT",
+            "/internal/environments/3/workload-isolation",
+            Some(serde_json::json!({"workload_isolation": "micro_vm"})),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["workload_isolation"], "micro_vm");
+        // Shadow keeps the legacy container: the response says so.
+        assert_eq!(body["applies"], false);
+        let records = audit.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].operation,
+            "ENVIRONMENT_WORKLOAD_ISOLATION_CHANGED"
+        );
+        assert!(
+            records[0]
+                .body
+                .contains("\"previous_isolation\":\"process\""),
+            "{}",
+            records[0].body
+        );
+        assert!(records[0]
+            .body
+            .contains("\"workload_isolation\":\"micro_vm\""));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_isolation_value_or_environment_is_refused_unaudited() {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let (status, _, _) = send(
+            app(mock_db().into_connection(), audit.clone()),
+            "PUT",
+            "/internal/environments/3/workload-isolation",
+            Some(serde_json::json!({"workload_isolation": "wasm"})),
+            Some(admin()),
+        )
+        .await;
+        assert!(status.is_client_error(), "{status}");
+        let db = mock_db()
+            .append_query_results(vec![Vec::<
+                temps_entities::environment_workload_isolation::Model,
+            >::new()])
+            .into_connection();
+        let (status, _, body) = send(
+            app(db, audit.clone()),
+            "PUT",
+            "/internal/environments/98/workload-isolation",
+            Some(serde_json::json!({"workload_isolation": "micro_vm"})),
+            Some(admin()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(body["detail"].as_str().unwrap_or_default().contains("98"));
+        assert!(audit.records().is_empty());
     }
 }

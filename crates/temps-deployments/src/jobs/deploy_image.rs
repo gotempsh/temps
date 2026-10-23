@@ -599,6 +599,10 @@ pub struct DeploymentJobConfig {
     pub volume_mounts: Vec<temps_workload::VolumeMount>,
     /// Where those volumes pin the replica, when any has a node yet.
     pub volume_pin: Option<temps_workload_volumes::VolumePin>,
+    /// What `enforce` replicas ask the plane for (ADR-055 Phase 10, the
+    /// environment's `workload_isolation`). `legacy` and `shadow` keep a
+    /// container whatever it says.
+    pub workload_isolation: temps_workload::Isolation,
 }
 
 /// One replica's placement, and the guarantee the scheduler attached to it.
@@ -652,6 +656,7 @@ impl Default for DeploymentJobConfig {
             workload_mode: Default::default(),
             volume_mounts: Vec::new(),
             volume_pin: None,
+            workload_isolation: temps_workload::Isolation::Process,
         }
     }
 }
@@ -5044,7 +5049,7 @@ impl DeployImageJob {
                 i64::from(context.deployment_id),
             ),
             artifact: temps_workload::Artifact::oci(image_output.image_tag.clone()),
-            isolation: Default::default(),
+            isolation: self.config.workload_isolation,
             process: Default::default(),
             env: Default::default(),
             resources: workload_resources(&self.config.resources),
@@ -5068,7 +5073,11 @@ impl DeployImageJob {
         };
         self.log(
             context,
-            "Placing replicas with the unified scheduler (workload_mode: enforce)".to_string(),
+            format!(
+                "Placing replicas with the unified scheduler (workload_mode: enforce, \
+                 isolation: {})",
+                temps_workload_plane::scheduler::isolation_name(self.config.workload_isolation)
+            ),
         )
         .await?;
         let name = format!("deployment-{}", context.deployment_id);
@@ -5148,7 +5157,8 @@ impl DeployImageJob {
         .with_volumes(
             self.config.volume_mounts.clone(),
             crate::services::workload_volumes::environment_volume_owner(context.environment_id),
-        );
+        )
+        .with_isolation(self.config.workload_isolation);
         Ok(Arc::new(match node_id {
             Some(node_id) => deployer.on_node(node_id),
             None => deployer,
@@ -5473,6 +5483,12 @@ impl DeployImageJobBuilder {
     ) -> Self {
         self.config.volume_mounts = mounts;
         self.config.volume_pin = pin;
+        self
+    }
+
+    /// The isolation `enforce` replicas request (ADR-055 Phase 10).
+    pub fn workload_isolation(mut self, isolation: temps_workload::Isolation) -> Self {
+        self.config.workload_isolation = isolation;
         self
     }
 

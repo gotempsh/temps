@@ -1191,7 +1191,9 @@ fn classify_compose_config_failure(stderr: &[u8]) -> (ComposeConfigFailureClass,
                 "The Docker Compose v2 CLI plugin is not installed on this host. Install Docker Compose v{MIN_COMPOSE_VERSION} or newer and verify it with `docker compose version`."
             ),
         )
-    } else if lower.contains("additional propert") && lower.contains("'required'") {
+    } else if (lower.contains("additional property") || lower.contains("additional properties"))
+        && lower.contains("'required'")
+    {
         (
             ComposeConfigFailureClass::UnsupportedComposeVersion,
             format!(
@@ -1639,6 +1641,63 @@ impl ComposeExecutor {
     /// failure part-way through.
     fn require_docker(&self) -> Result<Arc<Docker>, ComposeError> {
         self.docker.require().map_err(ComposeError::from)
+    }
+
+    /// What each container the legacy path started looks like, for the
+    /// ADR-055 shadow comparison: image, variable names (never values),
+    /// restart policy, networks and published container ports. One inspect
+    /// per service.
+    pub async fn observe_services(
+        &self,
+        project_name: &str,
+        services: &[ComposeServiceResult],
+    ) -> Result<Vec<crate::compose_translation::ObservedService>, ComposeError> {
+        let docker = self.require_docker()?;
+        let mut observed = Vec::with_capacity(services.len());
+        for service in services {
+            let inspect = docker
+                .inspect_container(&service.container_id, None)
+                .await
+                .map_err(|e| ComposeError::DiscoveryFailed {
+                    project: project_name.to_string(),
+                    reason: format!(
+                        "inspecting container {} of service '{}': {e}",
+                        service.container_id, service.service_name
+                    ),
+                })?;
+            let config = inspect.config.unwrap_or_default();
+            let host_config = inspect.host_config.unwrap_or_default();
+            let restart = host_config
+                .restart_policy
+                .and_then(|policy| policy.name)
+                .and_then(|name| serde_json::to_value(name).ok())
+                .and_then(|value| value.as_str().map(str::to_string));
+            let published_ports = host_config
+                .port_bindings
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(_, bindings)| bindings.as_ref().is_some_and(|b| !b.is_empty()))
+                .filter_map(|(port, _)| port.split('/').next()?.parse::<u16>().ok())
+                .collect();
+            observed.push(crate::compose_translation::ObservedService {
+                service: service.service_name.clone(),
+                image: config.image.unwrap_or_else(|| service.image_name.clone()),
+                env_names: config
+                    .env
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|entry| entry.split('=').next().unwrap_or_default().to_string())
+                    .collect(),
+                restart,
+                networks: inspect
+                    .network_settings
+                    .and_then(|settings| settings.networks)
+                    .map(|networks| networks.into_keys().collect())
+                    .unwrap_or_default(),
+                published_ports,
+            });
+        }
+        Ok(observed)
     }
 
     /// Probe the host's Compose CLI once (at startup): its version and
@@ -3037,7 +3096,7 @@ impl ComposeExecutor {
 
     // --- Internal methods ---
 
-    async fn write_compose_files(
+    pub(crate) async fn write_compose_files(
         &self,
         project_dir: &Path,
         request: &ComposeDeployRequest,
@@ -6238,7 +6297,7 @@ impl ComposeExecutor {
     /// keeping validation deterministic and interpolation-free. Compose's
     /// conventional k/m/g units are binary multiples; explicit `iB` and `B`
     /// suffixes are accepted as well.
-    fn parse_compose_byte_size(value: &YamlValue) -> Option<u64> {
+    pub(crate) fn parse_compose_byte_size(value: &YamlValue) -> Option<u64> {
         if let Some(bytes) = value.as_u64() {
             return (bytes > 0).then_some(bytes);
         }
@@ -6767,7 +6826,7 @@ impl ComposeExecutor {
     /// Lexically normalize a path: collapse `.` and resolve `..` without
     /// touching the filesystem. Relative `..` that escapes the base is kept as
     /// a leading `..` so callers can detect project-directory escape.
-    fn lexically_normalize(source: &str) -> String {
+    pub(crate) fn lexically_normalize(source: &str) -> String {
         let is_absolute = source.starts_with('/');
         let mut stack: Vec<&str> = Vec::new();
         for comp in source.split('/') {
@@ -7918,7 +7977,7 @@ impl ComposeExecutor {
     /// second: Compose lets a later `--env-file` override an earlier one, and
     /// project variables configured in Temps must win over repository
     /// defaults — the same order configuration resolution uses.
-    fn compose_input_args(project_dir: &Path, compose_file: &str) -> Vec<String> {
+    pub(crate) fn compose_input_args(project_dir: &Path, compose_file: &str) -> Vec<String> {
         let mut args = vec!["-f".to_string(), compose_file.to_string()];
         for generated in RESERVED_GENERATED_COMPOSE_FILES {
             if project_dir.join(generated).exists() {
@@ -8676,10 +8735,10 @@ impl ComposeExecutor {
     }
 
     /// Work out which services must stay running, from the compose file, the
-    /// inline override and the services Temps routes to. An unparseable
+    /// inline override and the services Temps routes to. An unparsable
     /// document falls back to requiring every service to run, which is the
     /// behaviour before one-shot tasks were recognised.
-    fn readiness_expectations(
+    pub(crate) fn readiness_expectations(
         compose_content: &str,
         compose_override: Option<&str>,
         routed_services: &[String],
@@ -9277,7 +9336,7 @@ impl ComposeExecutor {
     /// `build.args` declares (empty when it declares none, including the
     /// `build: ./dir` short form). Services without `build:` are absent.
     /// Handles both `args:` shapes: the sequence form (`- KEY=value` / bare
-    /// `- KEY`) and the mapping form (`KEY: value`). Unparseable YAML yields
+    /// `- KEY`) and the mapping form (`KEY: value`). Unparsable YAML yields
     /// an empty map, so no build args are injected rather than failing here.
     fn service_build_arg_keys(compose_content: &str) -> HashMap<String, HashSet<String>> {
         let mut result = HashMap::new();
@@ -9636,7 +9695,7 @@ impl ComposeExecutor {
         overrides
     }
 
-    fn rewrite_healthcheck_http_localhost(value: &mut YamlValue) -> bool {
+    pub(crate) fn rewrite_healthcheck_http_localhost(value: &mut YamlValue) -> bool {
         match value {
             YamlValue::String(text) => {
                 let normalized = Self::replace_http_localhost(text);
@@ -10091,7 +10150,7 @@ impl ComposeExecutor {
 
 /// Which services a Compose deployment needs running to be ready.
 #[derive(Debug, Clone, Default)]
-struct ReadinessExpectations {
+pub(crate) struct ReadinessExpectations {
     /// Every service must keep running (no service may exit, even with 0).
     all_long_running: bool,
     /// Services that must keep running, with the reason shown when one exits.
@@ -10108,7 +10167,7 @@ impl ReadinessExpectations {
 
     /// Why `service` must keep running, or `None` when a clean exit is a
     /// completed one-shot task.
-    fn why_long_running(&self, service: &str) -> Option<&'static str> {
+    pub(crate) fn why_long_running(&self, service: &str) -> Option<&'static str> {
         if self.all_long_running {
             return Some("is required to keep running");
         }
@@ -17688,7 +17747,7 @@ services:
             ComposeExecutor::classify_readiness_with(&[ps("task", "exited", 0)], &expectations),
             ComposeReadiness::Failed(_)
         ));
-        // Unparseable input keeps the strict behaviour.
+        // Unparsable input keeps the strict behaviour.
         let strict = ComposeExecutor::readiness_expectations("{{{", None, &[]);
         assert!(matches!(
             ComposeExecutor::classify_readiness_with(

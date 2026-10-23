@@ -61,6 +61,7 @@ pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpo
 pub use migration::m20261023_000010_workload_volumes::{
     Migration as WorkloadVolumesMigration, VOLUME_TABLES_SQL,
 };
+pub use migration::m20261023_000030_environment_workload_isolation::Migration as EnvironmentWorkloadIsolationMigration;
 
 pub use migration::m20261022_000004_external_services_workload_mode::Migration as ExternalServicesWorkloadModeMigration;
 pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;

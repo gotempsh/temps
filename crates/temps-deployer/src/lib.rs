@@ -32,6 +32,7 @@ pub mod build_verification;
 pub mod compose;
 pub mod compose_interpolation;
 mod compose_remote;
+pub mod compose_translation;
 pub mod runner_protocol;
 
 /// Callback function type for processing build logs in real-time

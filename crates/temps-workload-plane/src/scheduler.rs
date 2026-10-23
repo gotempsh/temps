@@ -225,7 +225,26 @@ pub struct NodeFacts {
     pub live_instances: u32,
 }
 
+/// The isolation as the API and the spec spell it (`micro_vm`).
+pub fn isolation_name(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::InHost => "in_host",
+        Isolation::Process => "process",
+        Isolation::MicroVm => "micro_vm",
+    }
+}
+
 impl NodeFacts {
+    /// Whether the node's runtime provides `isolation`. A node that reported
+    /// nothing runs Docker, which provides process isolation only: an
+    /// unreported list must never admit a microVM request.
+    pub fn provides(&self, isolation: Isolation) -> bool {
+        if self.isolations.is_empty() {
+            return isolation == Isolation::Process;
+        }
+        self.isolations.contains(&isolation)
+    }
+
     /// The control plane as `NodeScheduler` sees it: active, ordinary, no
     /// labels, and no capacity report.
     pub fn control_plane(architecture: Option<String>) -> Self {
@@ -591,6 +610,13 @@ pub enum ScheduleError {
         image_platforms: String,
         local_platform: String,
     },
+    /// ADR-055 Phase 10: every node was excluded because none has a driver
+    /// for the requested isolation (`micro_vm` with no Firecracker host).
+    #[error(
+        "no node can run {isolation} isolation: {excluded}. Provision a node whose runtime \
+         provides it, or set the environment's workload_isolation back to process"
+    )]
+    NoIsolationProvider { isolation: String, excluded: String },
     #[error("project '{project_slug}' needs the host Docker socket and {reason}")]
     DockerSocketNotSchedulable {
         project_slug: String,
@@ -619,8 +645,24 @@ impl ScheduleError {
             }
             ScheduleError::InsufficientCompatibleNodes { .. } => "InsufficientCompatibleNodes",
             ScheduleError::NoCompatibleNode { .. } => "NoCompatibleNode",
+            ScheduleError::NoIsolationProvider { .. } => "NoIsolationProvider",
             ScheduleError::DockerSocketNotSchedulable { .. } => "DockerSocketNotSchedulable",
             ScheduleError::InsufficientCapacity { .. } => "InsufficientCapacity",
+        }
+    }
+}
+
+/// A failed placement with the exclusions computed on the way.
+struct Rejected {
+    error: ScheduleError,
+    exclusions: Vec<NodeExclusion>,
+}
+
+impl Rejected {
+    fn new(exclusions: &[NodeExclusion], error: ScheduleError) -> Self {
+        Self {
+            error,
+            exclusions: exclusions.to_vec(),
         }
     }
 }
@@ -826,9 +868,9 @@ impl UnifiedScheduler {
                 }
             }
         }
-        if !node.isolations.is_empty() && !node.isolations.contains(&request.isolation) {
+        if !node.provides(request.isolation) {
             return Some(ExclusionReason::DriverUnsupported {
-                isolation: format!("{:?}", request.isolation).to_lowercase(),
+                isolation: isolation_name(request.isolation).to_string(),
             });
         }
         if let Some(gate) = &request.socket_gate {
@@ -850,6 +892,17 @@ impl UnifiedScheduler {
         nodes: &[NodeFacts],
         request: &ScheduleRequest<'_>,
     ) -> Result<Placement, ScheduleError> {
+        self.schedule_traced(nodes, request)
+            .map_err(|rejected| rejected.error)
+    }
+
+    /// `schedule`, keeping the per-node exclusions on failure so `explain`
+    /// can show why each node was refused.
+    fn schedule_traced(
+        &self,
+        nodes: &[NodeFacts],
+        request: &ScheduleRequest<'_>,
+    ) -> Result<Placement, Rejected> {
         let placement = request.placement;
         let replicas = placement.replicas.max(1);
         let pinned = placement.pinned_nodes();
@@ -974,11 +1027,9 @@ impl UnifiedScheduler {
                 .is_some_and(|allowed| !allowed.contains(&CONTROL_PLANE_NODE_ID))
             {
                 Some(ExclusionReason::NotAllowed)
-            } else if !control.isolations.is_empty()
-                && !control.isolations.contains(&request.isolation)
-            {
+            } else if !control.provides(request.isolation) {
                 Some(ExclusionReason::DriverUnsupported {
-                    isolation: format!("{:?}", request.isolation).to_lowercase(),
+                    isolation: isolation_name(request.isolation).to_string(),
                 })
             } else if control.resource_policy == NodeResourcePolicy::Enforced {
                 match enforced_headroom(control, need) {
@@ -1019,25 +1070,34 @@ impl UnifiedScheduler {
 
         if let Some(gate) = &request.socket_gate {
             if socket_survivors == 0 && !(local_enabled && local_grants_socket) {
-                return Err(ScheduleError::DockerSocketNotSchedulable {
-                    project_slug: gate.project_slug.clone(),
-                    reason: "no schedulable host grants it: the granting hosts are inactive, \
+                return Err(Rejected::new(
+                    &exclusions,
+                    ScheduleError::DockerSocketNotSchedulable {
+                        project_slug: gate.project_slug.clone(),
+                        reason: "no schedulable host grants it: the granting hosts are inactive, \
                              draining, dedicated to environments that pin them, or excluded by \
                              the requested node/label placement"
-                        .to_string(),
-                });
+                            .to_string(),
+                    },
+                ));
             }
         }
         if targets_control_plane && !self.config.local_workloads_enabled {
-            return Err(ScheduleError::LocalWorkloadsDisabled { replicas });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::LocalWorkloadsDisabled { replicas },
+            ));
         }
         if eligible.is_empty()
             && !include_local
             && hard.iter().any(|e| e.reason == ExclusionReason::Dedicated)
         {
-            return Err(ScheduleError::DedicatedNodesNotPinned {
-                excluded: join_exclusions(&hard),
-            });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::DedicatedNodesNotPinned {
+                    excluded: join_exclusions(&hard),
+                },
+            ));
         }
         let capacity_bound = hard.iter().any(|e| {
             matches!(
@@ -1047,12 +1107,15 @@ impl UnifiedScheduler {
             )
         });
         if eligible.is_empty() && !include_local && capacity_bound {
-            return Err(ScheduleError::InsufficientCapacity {
-                replicas,
-                placed: 0,
-                needed: need,
-                excluded: join_exclusions(&hard),
-            });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::InsufficientCapacity {
+                    replicas,
+                    placed: 0,
+                    needed: need,
+                    excluded: join_exclusions(&hard),
+                },
+            ));
         }
         if has_node_constraints && eligible.is_empty() && !include_local {
             let excluded = if hard.is_empty() {
@@ -1060,29 +1123,54 @@ impl UnifiedScheduler {
             } else {
                 join_exclusions(&hard)
             };
-            return Err(ScheduleError::PlacementConstraintsUnsatisfied { excluded });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::PlacementConstraintsUnsatisfied { excluded },
+            ));
         }
         let slots = usize::from(include_local) + eligible.len();
         if spread && !shortfall.is_empty() && (slots as u32) < replicas {
-            return Err(ScheduleError::InsufficientCompatibleNodes {
-                replicas,
-                available: slots,
-                cause: shortfall_cause(&shortfall).to_string(),
-                excluded: join_exclusions(&shortfall),
-            });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::InsufficientCompatibleNodes {
+                    replicas,
+                    available: slots,
+                    cause: shortfall_cause(&shortfall).to_string(),
+                    excluded: join_exclusions(&shortfall),
+                },
+            ));
         }
         if eligible.is_empty() && !include_local {
             if !self.config.local_workloads_enabled {
-                return Err(ScheduleError::LocalWorkloadsDisabled { replicas });
+                return Err(Rejected::new(
+                    &exclusions,
+                    ScheduleError::LocalWorkloadsDisabled { replicas },
+                ));
             }
-            return Err(ScheduleError::NoCompatibleNode {
-                image_platforms: request.image_platforms.join(", "),
-                local_platform: self
-                    .config
-                    .local_platform
-                    .clone()
-                    .unwrap_or_else(|| "unknown".to_string()),
-            });
+            if !hard.is_empty()
+                && hard
+                    .iter()
+                    .all(|e| matches!(e.reason, ExclusionReason::DriverUnsupported { .. }))
+            {
+                return Err(Rejected::new(
+                    &exclusions,
+                    ScheduleError::NoIsolationProvider {
+                        isolation: isolation_name(request.isolation).to_string(),
+                        excluded: join_exclusions(&hard),
+                    },
+                ));
+            }
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::NoCompatibleNode {
+                    image_platforms: request.image_platforms.join(", "),
+                    local_platform: self
+                        .config
+                        .local_platform
+                        .clone()
+                        .unwrap_or_else(|| "unknown".to_string()),
+                },
+            ));
         }
 
         let full_pool = || -> Vec<PoolEntry> {
@@ -1152,13 +1240,16 @@ impl UnifiedScheduler {
         };
         let placed = chosen.len() as u32;
         if placed < replicas {
-            return Err(ScheduleError::InsufficientCapacity {
-                replicas,
-                placed,
-                needed: need,
-                excluded: "the enforcing nodes in the pool filled up while placing replicas"
-                    .to_string(),
-            });
+            return Err(Rejected::new(
+                &exclusions,
+                ScheduleError::InsufficientCapacity {
+                    replicas,
+                    placed,
+                    needed: need,
+                    excluded: "the enforcing nodes in the pool filled up while placing replicas"
+                        .to_string(),
+                },
+            ));
         }
         let node_ids: Vec<i32> = chosen.iter().map(|i| nodes[pool[*i].node].id).collect();
         let warnings = spread_warning(&node_ids, spread).into_iter().collect();
@@ -1369,7 +1460,7 @@ pub fn explain(
 ) -> Explanation {
     // A throwaway scheduler, so a dry run never moves the real cursor.
     let dry = UnifiedScheduler::new(scheduler.config.clone());
-    let outcome = dry.schedule(nodes, request);
+    let traced = dry.schedule_traced(nodes, request);
     // The exclusions are recomputed with a single replica and no spread, so
     // the list is the same whether or not the placement succeeds.
     let single = PlacementSpec {
@@ -1381,12 +1472,14 @@ pub fn explain(
         placement: &single,
         ..request.clone()
     };
-    let probe_outcome = dry.schedule(nodes, &probe);
-    let excluded = match (&outcome, &probe_outcome) {
+    let probe_outcome = dry.schedule_traced(nodes, &probe);
+    let excluded = match (&traced, &probe_outcome) {
         (Ok(placement), _) => placement.exclusions.clone(),
         (Err(_), Ok(placement)) => placement.exclusions.clone(),
-        (Err(_), Err(_)) => Vec::new(),
+        // Neither places it: the probe's exclusions still say why per node.
+        (Err(_), Err(rejected)) => rejected.exclusions.clone(),
     };
+    let outcome = traced.map_err(|rejected| rejected.error);
     let excluded_ids: BTreeSet<i32> = excluded
         .iter()
         .filter(|e| e.excluded)
@@ -2006,5 +2099,84 @@ mod tests {
         .unwrap();
         assert_eq!(usage.cpu_cores, Some(4.0));
         assert_eq!(NodeUsage::from_capacity_json(&serde_json::json!({})), None);
+    }
+
+    /// Firecracker for deployments (ADR-055 Phase 10): a node that reports
+    /// nothing runs Docker, so it never takes a microVM request.
+    #[test]
+    fn unreported_isolations_mean_process_only() {
+        let mut silent = worker(1, "a-silent");
+        silent.isolations = Vec::new();
+        assert!(silent.provides(Isolation::Process));
+        assert!(!silent.provides(Isolation::MicroVm));
+        assert!(!silent.provides(Isolation::InHost));
+    }
+
+    #[test]
+    fn micro_vm_request_lands_on_a_node_that_offers_it() {
+        let mut silent = worker(1, "a-silent");
+        silent.isolations = Vec::new();
+        let mut vm = worker(2, "b-vm");
+        vm.isolations = vec![Isolation::Process, Isolation::MicroVm];
+        let nodes = vec![control(), silent, vm];
+        let placement = PlacementSpec::default();
+        let resources = Resources::default();
+        let mut req = request(&placement, &resources);
+        req.isolation = Isolation::MicroVm;
+        let outcome = scheduler().schedule(&nodes, &req).expect("placed");
+        assert_eq!(outcome.nodes, vec![2]);
+        let mut excluded = reasons(&outcome);
+        excluded.sort();
+        assert_eq!(
+            excluded,
+            vec![(0, "DriverUnsupported"), (1, "DriverUnsupported")]
+        );
+    }
+
+    #[test]
+    fn micro_vm_request_with_no_provider_is_refused_with_the_reason() {
+        let nodes = vec![control(), worker(1, "a-docker")];
+        let placement = PlacementSpec::default();
+        let resources = Resources::default();
+        let mut req = request(&placement, &resources);
+        req.isolation = Isolation::MicroVm;
+        let error = scheduler().schedule(&nodes, &req).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("has no runtime that provides micro_vm isolation"),
+            "{message}"
+        );
+        assert_eq!(error.reason(), "NoIsolationProvider");
+
+        // `explain` names the same reason for every node.
+        let explanation = explain(&scheduler(), &nodes, &req, &ExplainContext::default());
+        assert!(explanation.placement.is_none());
+        assert!(explanation.unschedulable.is_some());
+        let mut codes: Vec<(i32, &str)> = explanation
+            .excluded
+            .iter()
+            .map(|e| (e.node_id, e.reason.code()))
+            .collect();
+        codes.sort();
+        assert_eq!(
+            codes,
+            vec![(0, "DriverUnsupported"), (1, "DriverUnsupported")]
+        );
+    }
+
+    #[test]
+    fn control_plane_with_a_micro_vm_driver_takes_the_request() {
+        let mut control = control();
+        control.isolations = vec![Isolation::Process, Isolation::MicroVm];
+        let nodes = vec![control, worker(1, "a-docker")];
+        let placement = PlacementSpec {
+            nodes: Some(vec![CONTROL_PLANE_NODE_ID]),
+            ..PlacementSpec::default()
+        };
+        let resources = Resources::default();
+        let mut req = request(&placement, &resources);
+        req.isolation = Isolation::MicroVm;
+        let outcome = scheduler().schedule(&nodes, &req).expect("placed");
+        assert_eq!(outcome.nodes, vec![CONTROL_PLANE_NODE_ID]);
     }
 }

@@ -152,11 +152,17 @@ fn filter_agents_for_trigger(
 /// `sandbox_driver_mode` (see [`with_driver_modes`]): the providers below in
 /// `legacy` and `shadow`, the driver facade over the same backends in
 /// `enforce`.
+///
+/// When Firecracker is available, `workload_vm` receives the runtime driver
+/// that runs deployment replicas in microVMs (ADR-055 Phase 10), over the
+/// same provider instance, so sandboxes and replicas share one TAP pool and
+/// one rootfs cache lock.
 async fn build_sandbox_provider(
     docker_provider: Arc<DockerSandboxProvider>,
     docker: Arc<bollard::Docker>,
     settings: &temps_core::AgentSandboxSettings,
     db: Arc<sea_orm::DatabaseConnection>,
+    workload_vm: &mut Option<Arc<dyn temps_workload::RuntimeDriver>>,
 ) -> Arc<dyn SandboxProvider> {
     use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
     use crate::sandbox::routing::RoutingSandboxProvider;
@@ -169,9 +175,15 @@ async fn build_sandbox_provider(
 
     let firecracker = Arc::new(FirecrackerSandboxProvider::new(
         FirecrackerSandboxConfig::from_data_dir(data_dir.clone()),
-        docker,
+        docker.clone(),
     ));
     if firecracker.is_available().await {
+        *workload_vm = Some(Arc::new(
+            crate::sandbox::workload_vm::FirecrackerWorkloadDriver::new(
+                firecracker.clone(),
+                docker,
+            ),
+        ));
         backends.insert(SandboxBackend::Firecracker, firecracker);
     }
     if let Some(microsandbox) = microsandbox_provider(&data_dir) {
@@ -848,6 +860,7 @@ impl TempsPlugin for AgentsPlugin {
             // build on every boot. That work is deferred entirely to the
             // first agent run: `create()` pulls/builds the image lazily the
             // first time a sandbox is actually needed.
+            let mut workload_vm_driver: Option<Arc<dyn temps_workload::RuntimeDriver>> = None;
             let sandbox_provider: Arc<dyn SandboxProvider> =
                 match bollard::Docker::connect_with_local_defaults() {
                     Ok(docker) => {
@@ -884,6 +897,7 @@ impl TempsPlugin for AgentsPlugin {
                                     docker,
                                     &global_sandbox,
                                     db.clone(),
+                                    &mut workload_vm_driver,
                                 )
                                 .await
                             }
@@ -918,6 +932,18 @@ impl TempsPlugin for AgentsPlugin {
             // other plugins (e.g. workspace) can pick it up via the trait
             // without depending on temps-agents directly.
             context.register_service(sandbox_provider.clone());
+            // ADR-055 Phase 10: offered to the deployments plugin's workload
+            // plane, which runs `micro_vm` replicas on it. Absent when this
+            // host has no working Firecracker, and the plane then refuses
+            // such replicas with the reason.
+            if let Some(driver) = workload_vm_driver {
+                tracing::info!(
+                    "Firecracker is available: deployment replicas may request micro_vm isolation"
+                );
+                context.register_service(Arc::new(
+                    temps_deployments::services::plane_deployer::ControlPlaneMicroVmDriver(driver),
+                ));
+            }
 
             let sandbox_registry = Arc::new(SandboxRegistry::new(sandbox_provider));
             // Registered so the temps-sandbox plugin can inject its managed
