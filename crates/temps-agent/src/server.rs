@@ -340,6 +340,9 @@ fn spawn_sandbox_quarantine(
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
 const HEARTBEAT_MAX_RETRIES: u32 = 3;
+/// The shortest gap between a heartbeat and an early one sent because an
+/// instance report changed (ADR-055 §7).
+const EARLY_BEAT_MIN_GAP: Duration = Duration::from_secs(2);
 
 /// Base delay for exponential backoff between heartbeat retries (doubled each attempt).
 const HEARTBEAT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
@@ -369,6 +372,7 @@ fn spawn_heartbeat_loop(
     docker: Option<bollard::Docker>,
     dns_health: crate::network_sync::SharedDnsHealth,
     docker_socket_grant: DockerSocketGrant,
+    node_runtime: Option<Arc<temps_workload_node::NodeRuntime>>,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let heartbeat_client = crate::control_plane_client_builder(config);
@@ -405,10 +409,43 @@ fn spawn_heartbeat_loop(
         let mut inventory_sent = false;
         let mut beats_since_platform_check: u32 = 0;
 
-        loop {
-            interval.tick().await;
+        let mut last_beat: Option<tokio::time::Instant> = None;
 
-            let capacity = collect_capacity_metrics();
+        loop {
+            match &node_runtime {
+                // ADR-055 §7: a changed instance report is sent early
+                // rather than up to 30 s late, but never more often than
+                // once per `EARLY_BEAT_MIN_GAP`.
+                Some(runtime) => {
+                    tokio::select! {
+                        _ = interval.tick() => {}
+                        _ = runtime.reports_changed.notified() => {
+                            if let Some(last) = last_beat {
+                                let gap = last.elapsed();
+                                if gap < EARLY_BEAT_MIN_GAP {
+                                    tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    interval.tick().await;
+                }
+            }
+            last_beat = Some(tokio::time::Instant::now());
+
+            let mut capacity = collect_capacity_metrics();
+            // The node runtime's reports: only those that changed since the
+            // last accepted beat.
+            let instance_reports = match &node_runtime {
+                Some(runtime) => {
+                    capacity["node_capabilities"] =
+                        serde_json::json!([crate::node_runtime::STATE_STREAM_CAPABILITY]);
+                    runtime.pending_reports().await
+                }
+                None => Vec::new(),
+            };
 
             // Platform discovery can fail at startup — the agent often boots
             // alongside the Docker daemon — so retry here until it answers.
@@ -478,6 +515,16 @@ fn spawn_heartbeat_loop(
             }
             if let Some(ingress) = crate::public_ingress::health() {
                 body["public_ingress"] = serde_json::to_value(ingress).unwrap_or_default();
+            }
+            if !instance_reports.is_empty() {
+                match serde_json::to_value(&instance_reports) {
+                    Ok(v) => body["instances"] = v,
+                    Err(e) => tracing::warn!(
+                        node_id = node_id,
+                        error = %e,
+                        "Failed to serialize instance reports for heartbeat"
+                    ),
+                }
             }
 
             // DNS resolver health (ADR-024), published by the network-sync
@@ -560,6 +607,9 @@ fn spawn_heartbeat_loop(
                         succeeded = true;
                         if body.get("containers").is_some() {
                             inventory_sent = true;
+                        }
+                        if let (Some(runtime), Some(_)) = (&node_runtime, body.get("instances")) {
+                            runtime.mark_sent(&instance_reports);
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
@@ -734,6 +784,21 @@ fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentErro
     Ok(())
 }
 
+/// Options of [`start_agent_server_with`] that older callers do not set.
+#[derive(Debug, Clone)]
+pub struct AgentServerOptions {
+    /// Run the node runtime and advertise the `state_stream` capability
+    /// (ADR-055 §7). Off, the agent is driven through `/agent/*` only, as
+    /// before; `temps agent --disable-state-stream` is the rollback.
+    pub state_stream: bool,
+}
+
+impl Default for AgentServerOptions {
+    fn default() -> Self {
+        Self { state_stream: true }
+    }
+}
+
 /// Start the agent server. This blocks until the server shuts down.
 pub async fn start_agent_server(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -742,6 +807,28 @@ pub async fn start_agent_server(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+) -> Result<(), crate::AgentError> {
+    start_agent_server_with(
+        container_deployer,
+        image_builder,
+        docker,
+        config,
+        network,
+        docker_socket_grant,
+        AgentServerOptions::default(),
+    )
+    .await
+}
+
+/// [`start_agent_server`] with [`AgentServerOptions`].
+pub async fn start_agent_server_with(
+    container_deployer: Arc<dyn ContainerDeployer>,
+    image_builder: Arc<dyn ImageBuilder>,
+    docker: Option<bollard::Docker>,
+    config: AgentConfig,
+    network: SharedNetwork,
+    docker_socket_grant: DockerSocketGrant,
+    options: AgentServerOptions,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
 
@@ -784,6 +871,37 @@ pub async fn start_agent_server(
     // logs. Lives for the agent's process lifetime, same as `platform`.
     let dns_health: crate::network_sync::SharedDnsHealth = Arc::new(std::sync::RwLock::new(None));
 
+    // The node runtime (ADR-055 §7). Without it, or when it cannot start,
+    // the capability is not advertised and the control plane keeps using
+    // `/agent/*` for this node.
+    let node_runtime = match (&docker, options.state_stream) {
+        (Some(docker), true) => match crate::node_runtime::spawn(&config, docker.clone()) {
+            Ok(runtime) => Some(runtime),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = config.node_id,
+                    "The node runtime did not start; this node is driven through /agent/* \
+                     only: {e}"
+                );
+                None
+            }
+        },
+        (None, true) => {
+            tracing::info!(
+                node_id = config.node_id,
+                "No Docker daemon; the node runtime is not started"
+            );
+            None
+        }
+        (_, false) => {
+            tracing::info!(
+                node_id = config.node_id,
+                "The state stream is disabled; this node is driven through /agent/* only"
+            );
+            None
+        }
+    };
+
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
         &config,
@@ -792,6 +910,7 @@ pub async fn start_agent_server(
         docker,
         dns_health.clone(),
         docker_socket_grant,
+        node_runtime,
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the

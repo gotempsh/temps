@@ -111,4 +111,8 @@ pub mod runtime_health;
 
 pub mod workload_placement;
 pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
+pub mod node_state;
 pub mod plane_deployer;
+pub use node_state::{
+    AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,
+};

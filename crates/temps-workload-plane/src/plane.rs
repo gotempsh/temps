@@ -31,9 +31,11 @@ use crate::env::EnvSource;
 use crate::error::PlaneError;
 use crate::events;
 use crate::inventory::{InFlightGuard, InFlightLedger, NodeInventory, PlacementHints};
+use crate::node::Placement as AttemptPlacement;
 use crate::scheduler::{
     self, Explanation, Placement, ScheduleRequest, SchedulerConfig, UnifiedScheduler,
 };
+use crate::stream::StreamMetrics;
 
 /// The product object that owns a workload: `cron/7`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -199,6 +201,9 @@ pub struct WorkloadPlane {
     /// Environments staged for one create, by import name (`staged:<key>`):
     /// never stored in a spec.
     pub(crate) staged_env: StagedEnvs,
+    /// Where new attempts run. `None`: on the control plane (node 0).
+    pub(crate) placement: Option<Arc<dyn AttemptPlacement>>,
+    pub(crate) stream_metrics: StreamMetrics,
 }
 
 /// Environments staged in this process, by key.
@@ -237,6 +242,7 @@ impl fmt::Debug for WorkloadPlane {
             .field("scope", &self.config.scope)
             .field("driver", &self.driver)
             .field("finalizers", &self.finalizers.keys().collect::<Vec<_>>())
+            .field("placement", &self.placement.is_some())
             .finish()
     }
 }
@@ -268,7 +274,16 @@ impl WorkloadPlane {
             ))),
             in_flight: InFlightLedger::new(),
             staged_env: Arc::new(Mutex::new(HashMap::new())),
+            placement: None,
+            stream_metrics: StreamMetrics::default(),
         }
+    }
+
+    /// Place new attempts through `placement` (workers included) instead
+    /// of always on the control plane.
+    pub fn with_placement(mut self, placement: Arc<dyn AttemptPlacement>) -> Self {
+        self.placement = Some(placement);
+        self
     }
 
     /// Feed the scheduler from `inventory` (ADR-055 §8).

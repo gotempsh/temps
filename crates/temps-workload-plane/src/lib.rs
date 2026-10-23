@@ -35,9 +35,11 @@ pub mod env;
 pub mod error;
 pub mod events;
 pub mod inventory;
+pub mod node;
 pub mod plane;
 pub mod reconciler;
 pub mod scheduler;
+pub mod stream;
 
 #[cfg(test)]
 mod testing;
@@ -48,6 +50,7 @@ pub use admission::{
 };
 pub use env::{EnvSource, NoEnvSource};
 pub use error::{AdmissionError, PlaneError};
+pub use node::{Placed, Placement as AttemptPlacement, StreamNodeDriver, STREAM_DRIVER};
 pub use plane::{
     ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, ReconcilerHandle, WorkloadPlane,
     WorkloadView,
@@ -57,6 +60,7 @@ pub use scheduler::{
     NodeRecommendation, NodeRole, NodeUsage, PinningRecommendation, Placement, Reservation,
     ScheduleError, ScheduleRequest, SchedulerConfig, SocketGate, UnifiedScheduler,
 };
+pub use stream::{parse_cursor, StreamMetrics, StreamMetricsSnapshot, SweepOutcome};
 
 /// Labels the plane adds to every instance it creates, next to
 /// [`temps_workload::labels`].

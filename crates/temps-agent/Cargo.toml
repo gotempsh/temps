@@ -43,6 +43,10 @@ temps-wireguard = { path = "../temps-wireguard" }
 temps-dns-resolver = { path = "../temps-dns-resolver" }
 chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
+# The node runtime (ADR-055 §7).
+temps-workload = { path = "../temps-workload" }
+temps-workload-node = { path = "../temps-workload-node" }
+temps-workload-docker = { path = "../temps-workload-docker" }
 ipnet = "2.10"
 parking_lot = "0.12"
 rand = { workspace = true }

@@ -105,6 +105,26 @@ impl DeploymentsPlugin {
         config.network = Some(temps_core::NETWORK_NAME.clone());
         config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
         let placement = context.get_service::<crate::services::WorkloadPlacementService>();
+
+        // ADR-055 §7: a run is placed like a one-replica deployment of its
+        // environment, through the same scheduler policy as the deploy
+        // path. With no worker nodes that is always the control plane, as
+        // before.
+        let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
+        let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
+        let scheduler = Arc::new(
+            crate::services::NodeScheduler::new(node_service.clone())
+                .with_platform_source(image_builder.clone())
+                .with_local_workloads_enabled(local_workloads.local_workloads_enabled())
+                .with_docker_socket_grant(temps_core::docker_socket_grant::process_grant().clone()),
+        );
+        let attempt_placement = Arc::new(crate::services::NodeWorkloadPlacement::new(
+            db.clone(),
+            scheduler,
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<temps_core::EncryptionService>(),
+            Some(image_builder),
+        ));
         let mut plane = temps_workload_plane::WorkloadPlane::new(
             db.clone(),
             temps_workload_plane::NodeDriver(driver),
@@ -116,7 +136,8 @@ impl DeploymentsPlugin {
         )
         .with_finalizer(Arc::new(crate::services::cron_jobs::CronRunFinalizer::new(
             db,
-        )));
+        )))
+        .with_placement(attempt_placement);
         // ADR-055 §8: the plane schedules from the product's node inventory
         // with the same threshold and control-plane policy as NodeScheduler.
         if let Some(placement) = placement {
@@ -129,12 +150,18 @@ impl DeploymentsPlugin {
             // Dropping the handle leaves the reconciler running for the
             // life of the process.
             Ok(_handle) => {
+                let node_state = context.require_service::<crate::services::NodeStateService>();
+                node_state.set_plane(plane.clone());
+                node_state.start_retention(node_service);
                 cron_service.set_workload_plane(plane.clone());
                 // `enforce` environments start replicas through it.
                 if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
                     workflow.set_workload_plane(plane);
                 }
-                tracing::info!("Workload plane started; job crons are enabled");
+                tracing::info!(
+                    "Workload plane started; job crons are enabled and the node state stream \
+                     is served"
+                );
             }
             Err(e) => tracing::error!("Workload plane did not start: {e}"),
         }
@@ -224,6 +251,10 @@ impl TempsPlugin for DeploymentsPlugin {
             // Wire telemetry for deploy-funnel events (rollback_triggered).
             deployment_service.set_telemetry(telemetry.clone());
             context.register_service(deployment_service.clone());
+            // The node state stream (ADR-055 §7). Registered now so the
+            // node routes can be built; the plane is handed to it once it
+            // starts, in `initialize_plugin_services`.
+            context.register_service(Arc::new(crate::services::NodeStateService::new()));
             let runtime_resolver =
                 deployment_service.clone() as Arc<dyn temps_monitoring::ContainerRuntimeResolver>;
             context.register_service(runtime_resolver);
@@ -1221,6 +1252,13 @@ impl TempsPlugin for DeploymentsPlugin {
                 )),
             )
             .merge(
+                handlers::node_state::configure_status_routes().with_state(Arc::new(
+                    handlers::node_state::NodeStateStatusAppState {
+                        node_state: context.require_service::<crate::services::NodeStateService>(),
+                    },
+                )),
+            )
+            .merge(
                 handlers::runtime_health::routes()
                     .with_state(Arc::new(handlers::runtime_health::RuntimeHealthAppState {
                     service: context
@@ -1254,6 +1292,7 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_schema =
             <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        let node_state_schema = <handlers::node_state::NodeStateApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
         let traefik_discovery_schema =
@@ -1268,6 +1307,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                node_state_schema,
                 <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,

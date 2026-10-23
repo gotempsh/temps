@@ -12416,6 +12416,9 @@ dependencies = [
  "temps-runtime-health",
  "temps-vulnerability-scanner",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-node",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -15668,6 +15671,23 @@ dependencies = [
  "serde_json",
  "tar",
  "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-node"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-workload",
+ "temps-workload-env",
  "thiserror 2.0.21",
  "tokio",
  "tracing",

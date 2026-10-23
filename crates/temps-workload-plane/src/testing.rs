@@ -106,6 +106,27 @@ pub(crate) async fn test_db() -> Option<TestDatabase> {
             .await
             .unwrap_or_else(|e| panic!("creating the plane's tables failed at {statement}: {e}"));
     }
+    // The claims table as `m20261022_000001` creates it, then the node
+    // state change log and its triggers exactly as the migration does.
+    let claims = "CREATE TABLE IF NOT EXISTS dns_name_claims ( \
+                      fqdn TEXT PRIMARY KEY, \
+                      owner_kind TEXT NOT NULL, \
+                      owner_id BIGINT NOT NULL, \
+                      target_workload_id BIGINT NULL, \
+                      created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                      updated_at TIMESTAMPTZ NOT NULL DEFAULT now() \
+                  )";
+    let statements = std::iter::once(claims)
+        .chain(temps_migrations::NODE_STATE_TABLES_SQL.iter().copied())
+        .chain(temps_migrations::NODE_STATE_DNS_SQL.iter().copied());
+    for statement in statements {
+        db.db
+            .execute_unprepared(statement)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("creating the node state tables failed at {statement}: {e}")
+            });
+    }
     Some(db)
 }
 

@@ -1500,6 +1500,53 @@ impl WorkflowPlanner {
         SourceType::Manual
     }
 
+    /// The runtime variables `deployment`'s containers get, recomputed the
+    /// way planning computes them: the gathered variables without the
+    /// reserved BuildKit namespace, plus the deployment-owned ones, and on a
+    /// worker the cross-node rewrite of linked-service addresses.
+    ///
+    /// A worker's `/agent/*` API never returns a container's variables, so
+    /// a job cron run beside a container on a worker takes them from here
+    /// rather than from `docker inspect`. Carries secret values: never log
+    /// the result.
+    pub(crate) async fn runtime_environment_variables(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        on_worker: bool,
+    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let (mut env_vars, _) = self
+            .gather_environment_variables(project, environment, deployment)
+            .await?;
+        env_vars.remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG);
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
+        if on_worker {
+            if let Some(remote) = self
+                .build_remote_environment_variables(project, &env_vars)
+                .await
+                .variables
+            {
+                return Ok(remote);
+            }
+        }
+        Ok(env_vars)
+    }
+
     /// Plan jobs based on project configuration and source type
     ///
     /// Job workflows by source type:

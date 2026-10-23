@@ -43,13 +43,11 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
     Set,
 };
-use temps_core::docker_socket_grant::DOCKER_SOCKET_BIND;
 use temps_entities::{workload_instances, workloads};
 use temps_workload::{
-    labels as workload_labels, Attachments, ConditionKind, ConditionStatus, DriverError,
-    InstanceHandle, InstanceLimits, InstanceSpec, InstanceState, Lifetime, LimitSupport, LogQuery,
-    LogRotation, NetworkAttachment, PortBinding, Resources, RestartPolicy, RuntimeDriver,
-    SecurityProfile, WorkloadPhase, WorkloadStatus,
+    labels as workload_labels, ConditionKind, ConditionStatus, DriverError, InstanceHandle,
+    InstanceLimits, InstanceState, Lifetime, LimitSupport, LogQuery, Resources, RuntimeDriver,
+    WorkloadPhase, WorkloadStatus,
 };
 
 use crate::admission::DEFAULT_JOB_TTL_SECS;
@@ -57,6 +55,7 @@ use crate::env;
 use crate::error::PlaneError;
 use crate::events;
 use crate::labels;
+use crate::node::Placed;
 use crate::plane::{decode_status, encode_status, view_from, WorkloadPlane, WorkloadView};
 
 /// Most workloads one pass reads. A pass that hits it asks for another.
@@ -99,7 +98,7 @@ fn instance_name(scope: &str, kind: &str, workload_id: i64, attempt: u32) -> Str
     format!("{scope}-{kind}-{workload_id}-a{attempt}")
 }
 
-fn limits_from(resources: &Resources) -> InstanceLimits {
+pub(crate) fn limits_from(resources: &Resources) -> InstanceLimits {
     let Some(limits) = resources.limits else {
         return InstanceLimits::default();
     };
@@ -373,56 +372,55 @@ impl WorkloadPlane {
         let ttl = Duration::seconds(i64::from(
             ttl_secs_after_finished.unwrap_or(DEFAULT_JOB_TTL_SECS),
         ));
-        let Some(driver) = self.driver.0.clone() else {
-            let message = "0/1 nodes eligible: the control plane (node 0) has no runtime driver; \
-                           the Docker daemon was not reachable when temps started";
-            status.set_condition(
-                ConditionKind::Scheduled,
-                ConditionStatus::False,
-                "NoEligibleNode",
-                message,
-                now,
-            );
-            fail(&mut status, "NoEligibleNode", message, now);
-            events::record(
-                self.db.as_ref(),
-                row.id,
-                None,
-                "NoEligibleNode",
-                message,
-                now,
-            )
-            .await?;
-            return self
-                .conclude(row, view, instances, status, now, now + ttl, None)
-                .await;
-        };
-        status.set_condition(
-            ConditionKind::Scheduled,
-            ConditionStatus::True,
-            "ControlPlane",
-            "runs on the control plane (node 0)",
-            now,
-        );
-        set_limit_condition(&mut status, &view.spec.resources, &driver, now);
         let deadline = row.created_at + Duration::seconds(i64::from(timeout_secs));
+        if let Some(latest) = instances.last() {
+            set_scheduled(&mut status, latest.node_id, now);
+        }
 
         if now >= deadline {
             let mut tail = None;
             let attempt = instances.last().map(|i| i.attempt).unwrap_or(0);
             for instance in instances.iter().filter(|i| !is_finished(i)) {
                 let handle = handle_of(instance)?;
-                if tail.is_none() && !row.finalizers.is_empty() {
-                    tail = self.output_tail(&driver, &view, &handle).await;
+                match self.driver_of(instance).await {
+                    Ok(driver) => {
+                        if tail.is_none() && !row.finalizers.is_empty() {
+                            tail = self.output_tail(&driver, &view, &handle).await;
+                        }
+                        let stopped = driver
+                            .stop(&handle)
+                            .await
+                            .map_err(driver_error(row.id, "stop the instance past its deadline"));
+                        let removed = match stopped {
+                            Ok(()) => driver.remove(&handle, true).await.map_err(driver_error(
+                                row.id,
+                                "remove the instance past its deadline",
+                            )),
+                            Err(error) => Err(error),
+                        };
+                        if let Err(error) = removed {
+                            if instance.node_id.is_none() {
+                                return Err(error);
+                            }
+                            // A worker that cannot be reached is not a
+                            // reason to keep a run past its deadline: the
+                            // row fails, and the worker stops it when its
+                            // stream next delivers the row.
+                            tracing::warn!(
+                                workload_id = row.id,
+                                instance_id = instance.id,
+                                node_id = instance.node_id,
+                                "{error}"
+                            );
+                        }
+                    }
+                    Err(reason) => tracing::warn!(
+                        workload_id = row.id,
+                        instance_id = instance.id,
+                        node_id = instance.node_id,
+                        "the instance past its deadline could not be stopped: {reason}"
+                    ),
                 }
-                driver
-                    .stop(&handle)
-                    .await
-                    .map_err(driver_error(row.id, "stop the instance past its deadline"))?;
-                driver.remove(&handle, true).await.map_err(driver_error(
-                    row.id,
-                    "remove the instance past its deadline",
-                ))?;
                 self.finish_instance(instance.id, PHASE_FAILED, None, now)
                     .await?;
             }
@@ -455,12 +453,19 @@ impl WorkloadPlane {
 
         let Some(latest) = instances.last().cloned() else {
             return self
-                .start_attempt(row, view, status, 1, Some(deadline), ttl, &driver, now)
+                .place_and_start(row, view, instances, status, 1, deadline, ttl, now)
                 .await;
         };
         let attempt = u32::try_from(latest.attempt).unwrap_or(1);
         let (exit_code, finished_at) = match latest.phase.as_str() {
             PHASE_PENDING | PHASE_RUNNING => {
+                let driver = self.driver_of(&latest).await.map_err(|reason| {
+                    PlaneError::NodeUnavailable {
+                        workload_id: row.id,
+                        node_id: latest.node_id.unwrap_or(0),
+                        reason,
+                    }
+                })?;
                 let handle = handle_of(&latest)?;
                 let observed = driver
                     .inspect(&handle)
@@ -625,19 +630,33 @@ impl WorkloadPlane {
             // The failed attempt's container goes before the next starts:
             // a run holds one container at a time.
             let handle = handle_of(&latest)?;
-            driver
-                .remove(&handle, true)
-                .await
-                .map_err(driver_error(row.id, "remove the failed attempt"))?;
+            let removed = match self.driver_of(&latest).await {
+                Ok(driver) => driver
+                    .remove(&handle, true)
+                    .await
+                    .map_err(driver_error(row.id, "remove the failed attempt")),
+                Err(reason) => Err(PlaneError::NodeUnavailable {
+                    workload_id: row.id,
+                    node_id: latest.node_id.unwrap_or(0),
+                    reason,
+                }),
+            };
+            if let Err(error) = removed {
+                if latest.node_id.is_none() {
+                    return Err(error);
+                }
+                // A worker removes a replaced attempt itself.
+                tracing::warn!(workload_id = row.id, instance_id = latest.id, "{error}");
+            }
             return self
-                .start_attempt(
+                .place_and_start(
                     row,
                     view,
+                    Vec::new(),
                     status,
                     attempt + 1,
-                    Some(deadline),
+                    deadline,
                     ttl,
-                    &driver,
                     now,
                 )
                 .await;
@@ -714,42 +733,37 @@ impl WorkloadPlane {
             }
             return Ok(None);
         }
-        let Some(driver) = self.driver.0.clone() else {
-            let message = "0/1 nodes eligible: the control plane (node 0) has no runtime driver; \
-                           the Docker daemon was not reachable when temps started";
-            status.set_condition(
-                ConditionKind::Scheduled,
-                ConditionStatus::False,
-                "NoEligibleNode",
-                message,
-                now,
-            );
-            fail(&mut status, "NoEligibleNode", message, now);
-            events::record(
-                self.db.as_ref(),
-                row.id,
-                None,
-                "NoEligibleNode",
-                message,
-                now,
-            )
-            .await?;
-            return self
-                .conclude(row, view, instances, status, now, now + ttl, None)
-                .await;
+        let driver = match self.control_plane_driver() {
+            Ok(driver) => driver,
+            Err(message) => {
+                status.set_condition(
+                    ConditionKind::Scheduled,
+                    ConditionStatus::False,
+                    "NoEligibleNode",
+                    &message,
+                    now,
+                );
+                fail(&mut status, "NoEligibleNode", &message, now);
+                events::record(
+                    self.db.as_ref(),
+                    row.id,
+                    None,
+                    "NoEligibleNode",
+                    &message,
+                    now,
+                )
+                .await?;
+                return self
+                    .conclude(row, view, instances, status, now, now + ttl, None)
+                    .await;
+            }
         };
-        status.set_condition(
-            ConditionKind::Scheduled,
-            ConditionStatus::True,
-            "ControlPlane",
-            "runs on the control plane (node 0)",
-            now,
-        );
+        set_scheduled(&mut status, None, now);
         set_limit_condition(&mut status, &view.spec.resources, &driver, now);
 
         let Some(latest) = instances.last().cloned() else {
             return self
-                .start_attempt(row, view, status, 1, None, ttl, &driver, now)
+                .start_attempt(row, view, status, 1, None, ttl, &driver, None, now)
                 .await;
         };
         let attempt = latest.attempt;
@@ -869,6 +883,115 @@ impl WorkloadPlane {
         }
     }
 
+    /// The control plane's own driver, or why there is none.
+    fn control_plane_driver(&self) -> Result<Arc<dyn RuntimeDriver>, String> {
+        self.driver
+            .0
+            .clone()
+            .ok_or_else(|| NO_CONTROL_PLANE_DRIVER.to_string())
+    }
+
+    /// The driver of an instance already placed.
+    pub(crate) async fn driver_of(
+        &self,
+        instance: &workload_instances::Model,
+    ) -> Result<Arc<dyn RuntimeDriver>, String> {
+        match instance.node_id {
+            None => self.control_plane_driver(),
+            Some(node_id) => match &self.placement {
+                Some(placement) => placement.driver_for(node_id, &instance.driver).await,
+                None => Err(format!(
+                    "instance {} runs on node {node_id}, but this plane places nothing on \
+                     workers",
+                    instance.id
+                )),
+            },
+        }
+    }
+
+    /// The node of a new attempt and its driver.
+    async fn place(
+        &self,
+        view: &WorkloadView,
+    ) -> Result<(Option<i32>, Arc<dyn RuntimeDriver>), String> {
+        let placed = match &self.placement {
+            None => Placed::ControlPlane,
+            Some(placement) => placement.place(view).await?,
+        };
+        match placed {
+            Placed::ControlPlane => Ok((None, self.control_plane_driver()?)),
+            Placed::Node {
+                node_id,
+                node_name,
+                driver,
+            } => {
+                tracing::info!(
+                    workload_id = view.id,
+                    node_id,
+                    node = %node_name,
+                    driver = %driver.capabilities().name,
+                    "placed the workload's next attempt on a worker"
+                );
+                Ok((Some(node_id), driver))
+            }
+        }
+    }
+
+    /// Place attempt `attempt`, then start it; or fail the run with
+    /// `NoEligibleNode` and why.
+    #[allow(clippy::too_many_arguments)]
+    async fn place_and_start(
+        &self,
+        row: workloads::Model,
+        view: WorkloadView,
+        instances: Vec<workload_instances::Model>,
+        mut status: WorkloadStatus,
+        attempt: u32,
+        deadline: DateTime<Utc>,
+        ttl: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, PlaneError> {
+        match self.place(&view).await {
+            Ok((node_id, driver)) => {
+                set_scheduled(&mut status, node_id, now);
+                set_limit_condition(&mut status, &view.spec.resources, &driver, now);
+                self.start_attempt(
+                    row,
+                    view,
+                    status,
+                    attempt,
+                    Some(deadline),
+                    ttl,
+                    &driver,
+                    node_id,
+                    now,
+                )
+                .await
+            }
+            Err(message) => {
+                status.set_condition(
+                    ConditionKind::Scheduled,
+                    ConditionStatus::False,
+                    "NoEligibleNode",
+                    &message,
+                    now,
+                );
+                fail(&mut status, "NoEligibleNode", &message, now);
+                events::record(
+                    self.db.as_ref(),
+                    row.id,
+                    None,
+                    "NoEligibleNode",
+                    &message,
+                    now,
+                )
+                .await?;
+                self.conclude(row, view, instances, status, now, now + ttl, None)
+                    .await
+            }
+        }
+    }
+
     /// Insert attempt `attempt`'s row, then create and start it. The row
     /// comes first, so a crash between the two leaves a row the next pass
     /// finishes, never a container nothing tracks.
@@ -882,6 +1005,7 @@ impl WorkloadPlane {
         deadline: Option<DateTime<Utc>>,
         ttl: Duration,
         driver: &Arc<dyn RuntimeDriver>,
+        node_id: Option<i32>,
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, PlaneError> {
         let name = instance_name(
@@ -904,7 +1028,7 @@ impl WorkloadPlane {
             workload_id: Set(row.id),
             revision: Set(row.generation),
             attempt: Set(i32::try_from(attempt).unwrap_or(i32::MAX)),
-            node_id: Set(None),
+            node_id: Set(node_id),
             driver: Set(handle.driver.clone()),
             handle: Set(handle_json),
             phase: Set(PHASE_PENDING.to_string()),
@@ -976,8 +1100,12 @@ impl WorkloadPlane {
             ConditionStatus::True,
             "Prepared",
             format!(
-                "image '{}' is present on the control plane",
-                prepared.local_ref
+                "image '{}' is present on {}",
+                prepared.local_ref,
+                match instance.node_id {
+                    None => "the control plane".to_string(),
+                    Some(node_id) => format!("node {node_id}"),
+                }
             ),
             now,
         );
@@ -1020,76 +1148,16 @@ impl WorkloadPlane {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(row.id, resolved.redactor.clone());
 
-        let security = spec.security.unwrap_or(SecurityProfile::Trusted);
-        let mut instance_labels = spec.labels.clone();
-        instance_labels.extend(workload_labels::instance_labels(
-            spec.owner,
+        let template = self.instance_template(
+            spec,
             row.id,
-            row.generation,
-        ));
-        instance_labels.insert(labels::PLANE.to_string(), self.config.scope.clone());
-        instance_labels.insert(
-            labels::MANAGED_BY.to_string(),
-            labels::MANAGED_BY_VALUE.to_string(),
+            instance.revision,
+            u32::try_from(attempt).unwrap_or(0),
+            &handle.name,
         );
-        instance_labels.insert(labels::ATTEMPT.to_string(), attempt.to_string());
-        let instance_spec = InstanceSpec {
-            owner: spec.owner,
-            name: handle.name.clone(),
-            image: prepared.local_ref.clone(),
-            platform: None,
-            env: resolved.env,
-            secret_files: Vec::new(),
-            command: spec.process.command.clone(),
-            entrypoint: spec.process.entrypoint.clone(),
-            workdir: spec.process.workdir.clone(),
-            user: spec.process.user.clone(),
-            ports: match spec.lifetime {
-                Lifetime::LongRunning { .. } | Lifetime::ScaleToZero { .. } => spec
-                    .ports
-                    .iter()
-                    .map(|port| PortBinding {
-                        container_port: port.container_port,
-                        protocol: port.protocol,
-                        host_ip: self.config.publish_host_ip.clone(),
-                        host_port: None,
-                    })
-                    .collect(),
-                Lifetime::RunToCompletion { .. } => Vec::new(),
-            },
-            restart: match spec.lifetime {
-                // The runtime restarts a long-running instance in place, as
-                // the legacy deployer's containers are.
-                Lifetime::LongRunning { restart } => restart,
-                // The plane retries, not the runtime: a restarted container
-                // would hide the exit the retry limit counts.
-                Lifetime::RunToCompletion { .. } | Lifetime::ScaleToZero { .. } => {
-                    RestartPolicy::Never
-                }
-            },
-            limits: limits_from(&spec.resources),
-            log_rotation: Some(LogRotation {
-                max_size: "10m".to_string(),
-                max_file: 3,
-            }),
-            labels: instance_labels,
-            security,
-        };
-        let attach = Attachments {
-            network: NetworkAttachment {
-                primary: self.config.network.clone(),
-                required: spec.network.extra_networks.clone(),
-                optional: Vec::new(),
-                dns: None,
-            },
-            // Admission gave this profile only to an ADR-045 granted
-            // project; every other workload never gets the socket.
-            volumes: if security == SecurityProfile::HostPrivileged {
-                vec![DOCKER_SOCKET_BIND.to_string()]
-            } else {
-                Vec::new()
-            },
-        };
+        let security = template.security;
+        let attach = template.attachments.clone();
+        let instance_spec = template.into_spec(prepared.local_ref.clone(), resolved.env);
         let created = match driver.create(&instance_spec, &attach).await {
             Ok(created) => created,
             Err(error) => {
@@ -1359,23 +1427,45 @@ impl WorkloadPlane {
     ) -> Result<Option<DateTime<Utc>>, PlaneError> {
         let poll = Duration::from_std(self.config.poll_interval).unwrap_or(Duration::seconds(5));
         let mut tail = None;
-        if let Some(driver) = self.driver.0.clone() {
-            for instance in &instances {
-                let handle = handle_of(instance)?;
-                if tail.is_none()
-                    && !row.finalizers.is_empty()
-                    && instances.last() == Some(instance)
-                {
-                    tail = self.output_tail(&driver, &view, &handle).await;
+        for instance in &instances {
+            let driver = match self.driver_of(instance).await {
+                Ok(driver) => driver,
+                Err(reason) => {
+                    // Node 0 without a runtime has nothing to remove. A
+                    // worker removes the instance when its row goes.
+                    if let Some(node_id) = instance.node_id {
+                        tracing::warn!(
+                            workload_id = row.id,
+                            instance_id = instance.id,
+                            node_id,
+                            "the deleted workload's instance could not be removed now: {reason}"
+                        );
+                        if !is_finished(instance) {
+                            self.finish_instance(instance.id, PHASE_FAILED, None, now)
+                                .await?;
+                        }
+                    }
+                    continue;
                 }
-                driver.remove(&handle, true).await.map_err(driver_error(
-                    row.id,
-                    "remove the deleted workload's instance",
-                ))?;
-                if !is_finished(instance) {
-                    self.finish_instance(instance.id, PHASE_FAILED, None, now)
-                        .await?;
+            };
+            let handle = handle_of(instance)?;
+            if tail.is_none() && !row.finalizers.is_empty() && instances.last() == Some(instance) {
+                tail = self.output_tail(&driver, &view, &handle).await;
+            }
+            if let Err(error) = driver.remove(&handle, true).await {
+                let error = PlaneError::Driver {
+                    workload_id: row.id,
+                    operation: "remove the deleted workload's instance",
+                    source: error,
+                };
+                if instance.node_id.is_none() {
+                    return Err(error);
                 }
+                tracing::warn!(workload_id = row.id, instance_id = instance.id, "{error}");
+            }
+            if !is_finished(instance) {
+                self.finish_instance(instance.id, PHASE_FAILED, None, now)
+                    .await?;
             }
         }
         let mut status = decode_status(&row)?;
@@ -1434,11 +1524,14 @@ impl WorkloadPlane {
         view.finalizers = row.finalizers.clone();
         view.output_tail = match tail {
             Some(tail) => Some(tail),
-            None => match (self.driver.0.clone(), instances.last()) {
-                (Some(driver), Some(latest)) if row.deleted_at.is_none() => {
-                    let handle = handle_of(latest)?;
-                    self.output_tail(&driver, &view, &handle).await
-                }
+            None => match instances.last() {
+                Some(latest) if row.deleted_at.is_none() => match self.driver_of(latest).await {
+                    Ok(driver) => {
+                        let handle = handle_of(latest)?;
+                        self.output_tail(&driver, &view, &handle).await
+                    }
+                    Err(_) => None,
+                },
                 _ => None,
             },
         };
@@ -1714,6 +1807,26 @@ impl WorkloadPlane {
     }
 }
 
+const NO_CONTROL_PLANE_DRIVER: &str = "0/1 nodes eligible: the control plane (node 0) has no \
+     runtime driver; the Docker daemon was not reachable when temps started";
+
+fn set_scheduled(status: &mut WorkloadStatus, node_id: Option<i32>, now: DateTime<Utc>) {
+    let (reason, message) = match node_id {
+        None => (
+            "ControlPlane",
+            "runs on the control plane (node 0)".to_string(),
+        ),
+        Some(node_id) => ("Node", format!("runs on node {node_id}")),
+    };
+    status.set_condition(
+        ConditionKind::Scheduled,
+        ConditionStatus::True,
+        reason,
+        message,
+        now,
+    );
+}
+
 /// The lifetime of the stored spec, when it decodes.
 fn view_lifetime(row: &workloads::Model) -> Option<Lifetime> {
     serde_json::from_value::<temps_workload::WorkloadSpec>(row.spec.clone())
@@ -1799,6 +1912,7 @@ mod tests {
         FakeDriver, RecordingFinalizer,
     };
     use crate::NodeDriver;
+    use temps_workload::RestartPolicy;
 
     #[test]
     fn backoff_doubles_from_ten_seconds_to_six_minutes() {

@@ -22,6 +22,7 @@ pub mod labels;
 pub mod reference;
 pub mod resources;
 pub mod spec;
+pub mod stream;
 
 pub use condition::{
     Condition, ConditionKind, ConditionStatus, WorkloadEvent, WorkloadPhase, WorkloadStatus,

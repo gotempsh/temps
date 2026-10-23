@@ -31,6 +31,7 @@ mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
 pub(crate) mod m20261022_000001_dns_name_claims;
 pub(crate) mod m20261022_000002_workloads;
+pub(crate) mod m20261022_000003_node_state_changes;
 pub(crate) mod m20261022_000005_deployment_workload_mode;
 pub(crate) mod m20261022_000007_network_policy;
 pub(crate) mod m20261022_000008_ingress_endpoints;
@@ -818,6 +819,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261020_000002_create_autofix_incidents::Migration),
             Box::new(m20261022_000001_dns_name_claims::Migration),
             Box::new(m20261022_000002_workloads::Migration),
+            Box::new(m20261022_000003_node_state_changes::Migration),
             Box::new(m20261022_000005_deployment_workload_mode::Migration),
             Box::new(m20261022_000007_network_policy::Migration),
             Box::new(m20261022_000008_ingress_endpoints::Migration),
