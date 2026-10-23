@@ -185,16 +185,18 @@ impl NetworkPolicyService {
         Ok(row.is_some())
     }
 
-    /// Whether the product object behind a workload exists. Kinds without
-    /// a table yet (functions, jobs) are accepted.
+    /// Whether the product object behind a workload exists. Jobs have no
+    /// table of their own and are accepted.
     async fn workload_exists(&self, workload: WorkloadRef) -> Result<bool, NetworkPolicyError> {
-        let sql = match workload.kind {
-            WorkloadKind::Deployment => "SELECT 1 FROM environments WHERE id = $1",
-            WorkloadKind::Sandbox => "SELECT 1 FROM sandboxes WHERE id = $1",
-            WorkloadKind::Service => "SELECT 1 FROM external_services WHERE id = $1",
-            WorkloadKind::Function | WorkloadKind::Job => return Ok(true),
+        // `functions.id` is a BIGINT; the other tables key on INTEGER.
+        let (sql, int4_key) = match workload.kind {
+            WorkloadKind::Deployment => ("SELECT 1 FROM environments WHERE id = $1", true),
+            WorkloadKind::Sandbox => ("SELECT 1 FROM sandboxes WHERE id = $1", true),
+            WorkloadKind::Service => ("SELECT 1 FROM external_services WHERE id = $1", true),
+            WorkloadKind::Function => ("SELECT 1 FROM functions WHERE id = $1", false),
+            WorkloadKind::Job => return Ok(true),
         };
-        if workload.id > i64::from(i32::MAX) {
+        if int4_key && workload.id > i64::from(i32::MAX) {
             return Ok(false);
         }
         self.exists(sql, workload.id).await

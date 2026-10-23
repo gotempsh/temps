@@ -1305,6 +1305,7 @@ impl<'a> Context<'a> {
                 volume: resource.name.clone(),
                 mount_path: target,
                 read_only,
+                source: None,
             })
         };
         let bind_refusal = |source: &str| {
@@ -2606,12 +2607,14 @@ mod tests {
                 VolumeMount {
                     volume: format!("{PROJECT}_data"),
                     mount_path: "/var/lib/data".into(),
-                    read_only: true
+                    read_only: true,
+                    source: None,
                 },
                 VolumeMount {
                     volume: "shared-cache".into(),
                     mount_path: "/cache".into(),
-                    read_only: false
+                    read_only: false,
+                    source: None,
                 },
             ]
         );
@@ -3119,6 +3122,7 @@ volumes:
                                 .to_string(),
                             mount_path: target,
                             read_only: volume["read_only"].as_bool().unwrap_or(false),
+                            source: None,
                         }),
                         None => legacy_anonymous.push(target),
                     }

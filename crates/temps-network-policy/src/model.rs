@@ -142,15 +142,15 @@ pub fn parse_ports(start: Option<i32>, end: Option<i32>) -> Result<Option<PortRa
     }
 }
 
-/// A kind's default profiles (ADR-052 §4): a sandbox reaches only what a
-/// rule allows; every other kind is open, as today.
+/// A kind's default profiles (ADR-052 §4, ADR-055 §9): untrusted code (a
+/// sandbox, a function) reaches only what a rule allows; every other kind
+/// is open, as today.
 pub fn default_profiles(kind: WorkloadKind) -> (Profile, Profile) {
     match kind {
-        WorkloadKind::Sandbox => (Profile::Restricted, Profile::Open),
-        WorkloadKind::Deployment
-        | WorkloadKind::Service
-        | WorkloadKind::Function
-        | WorkloadKind::Job => (Profile::Open, Profile::Open),
+        WorkloadKind::Sandbox | WorkloadKind::Function => (Profile::Restricted, Profile::Open),
+        WorkloadKind::Deployment | WorkloadKind::Service | WorkloadKind::Job => {
+            (Profile::Open, Profile::Open)
+        }
     }
 }
 

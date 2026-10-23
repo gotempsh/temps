@@ -699,7 +699,7 @@ impl WorkloadPlane {
         // node; one pinned anywhere this plane cannot reach stays
         // unscheduled with the reason, never quietly on node 0.
         let pinned = view.spec.placement.pinned_nodes();
-        let worker = match pinned.as_deref() {
+        let worker = match pinned {
             Some([node_id]) if *node_id != crate::scheduler::CONTROL_PLANE_NODE_ID => {
                 Some(*node_id)
             }

@@ -383,9 +383,14 @@ impl WorkloadVolumeService {
             replicas,
             attached: attached.len(),
             active: !attached.is_empty() && blocker.is_none(),
-            setup_path: blocker
-                .as_ref()
-                .map(|_| format!("/environments/{environment_id}/settings")),
+            // The console's environment page, where the workload mode and
+            // replica count that block the mount are changed.
+            setup_path: blocker.as_ref().and(project.as_ref()).map(|p| {
+                format!(
+                    "/projects/{}/environments?environment={environment_id}",
+                    p.slug
+                )
+            }),
             reason: blocker,
         })
     }
