@@ -657,3 +657,54 @@ mod tests {
         assert!(serialized.contains("entity_category"));
     }
 }
+
+/// A resource alert (CPU / memory / disk) was created on a node.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeAlertRuleCreatedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub rule_id: i32,
+    pub metric_name: String,
+    pub comparator: String,
+    pub threshold: f64,
+    pub severity: String,
+}
+
+/// A node's resource alert was deleted.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeAlertRuleDeletedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub rule_id: i32,
+    pub metric_name: String,
+}
+
+macro_rules! impl_node_alert_rule_audit {
+    ($ty:ty, $operation:literal) => {
+        impl AuditOperation for $ty {
+            fn operation_type(&self) -> String {
+                $operation.to_string()
+            }
+
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
+            }
+
+            fn ip_address(&self) -> Option<String> {
+                self.context.ip_address.clone()
+            }
+
+            fn user_agent(&self) -> &str {
+                &self.context.user_agent
+            }
+
+            fn serialize(&self) -> Result<String> {
+                serde_json::to_string(self)
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+            }
+        }
+    };
+}
+
+impl_node_alert_rule_audit!(NodeAlertRuleCreatedAudit, "NODE_ALERT_RULE_CREATED");
+impl_node_alert_rule_audit!(NodeAlertRuleDeletedAudit, "NODE_ALERT_RULE_DELETED");

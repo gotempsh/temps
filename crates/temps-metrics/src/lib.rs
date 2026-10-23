@@ -3,6 +3,7 @@
 
 pub mod collector;
 pub mod error;
+pub mod node_capacity;
 pub mod node_sampler;
 pub mod scraper;
 pub mod store;

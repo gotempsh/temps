@@ -3903,7 +3903,9 @@ async fn update_service_resources(
         super::metrics_handlers::get_node_metrics_range,
         super::metrics_handlers::get_node_metrics_latest,
         super::metrics_handlers::list_node_alert_rules,
+        super::metrics_handlers::create_node_alert_rule,
         super::metrics_handlers::update_node_alert_rule,
+        super::metrics_handlers::delete_node_alert_rule,
     ),
     components(schemas(
         ServiceTypeInfo,
@@ -3972,6 +3974,7 @@ async fn update_service_resources(
         super::metrics_handlers::AlertRuleResponse,
         super::metrics_handlers::CreateAlertRuleRequest,
         super::metrics_handlers::UpdateAlertRuleRequest,
+        super::metrics_handlers::CreateNodeAlertRuleRequest,
         super::metrics_handlers::ToggleServiceMetricsRequest,
         super::metrics_handlers::ToggleDeploymentMetricsRequest,
     )),

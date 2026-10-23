@@ -14,6 +14,7 @@ import {
   isMetricsUnavailable,
   lastSampleOf,
   mergeSeries,
+  nodeMetricCapabilities,
   peakOf,
   diskProjectionCaption,
   projectDisk,
@@ -356,5 +357,21 @@ describe('currentDiskPercent', () => {
         current: [null, null, diskPct],
       })
     ).toBe(true)
+  })
+})
+
+describe('nodeMetricCapabilities', () => {
+  test('the control plane has I/O counters and a Docker daemon to query', () => {
+    expect(nodeMetricCapabilities(0)).toEqual({
+      ioCounters: true,
+      dockerUsage: true,
+    })
+  })
+
+  test('a worker only reports CPU, memory and disk, so those panels are left out', () => {
+    expect(nodeMetricCapabilities(3)).toEqual({
+      ioCounters: false,
+      dockerUsage: false,
+    })
   })
 })

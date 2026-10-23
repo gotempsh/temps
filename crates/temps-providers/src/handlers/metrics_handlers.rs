@@ -38,7 +38,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{get, patch, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
@@ -49,7 +49,7 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found, ErrorBuilder},
     problemdetails::Problem,
-    UtcDateTime,
+    AuditContext, RequestMetadata, UtcDateTime,
 };
 use temps_entities::{external_services, monitoring_alert_rules};
 use temps_metrics::{
@@ -59,10 +59,12 @@ use temps_metrics::{
 use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
+use super::audit::{NodeAlertRuleCreatedAudit, NodeAlertRuleDeletedAudit};
 use super::types::AppState;
 use crate::alert_rule_service::{
     insert_alert_rule_within_limit, AlertRuleCreateError, MAX_ALERT_RULES_PER_SERVICE,
 };
+use crate::node_alert_rule_service::{NewNodeAlertRule, NodeAlertRuleError, NodeAlertRuleService};
 
 // `is_monotonic_counter` / `range_to_step` live in `temps_metrics` (shared
 // with the deployment container metrics handlers) — imported below.
@@ -293,6 +295,30 @@ pub struct UpdateAlertRuleRequest {
     pub severity: Option<String>,
     pub for_duration_secs: Option<i32>,
     pub enabled: Option<bool>,
+}
+
+/// Request body for creating a resource alert on a node.
+///
+/// Only the usage percentages can be alerted on: `node.cpu_percent`,
+/// `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
+/// (0-100). A node has at most one rule per metric.
+#[derive(Debug, Deserialize, ToSchema)]
+#[schema(as = NodeCreateAlertRuleRequest)]
+pub struct CreateNodeAlertRuleRequest {
+    pub name: String,
+    /// One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+    pub metric_name: String,
+    /// Percentage between 0 and 100.
+    pub threshold: f64,
+    /// One of `>`, `<`, `>=`, `<=`.
+    pub comparator: String,
+    /// `"warning"` or `"critical"`.
+    pub severity: String,
+    /// Seconds the breach must persist before the alarm fires (0 = immediate).
+    #[serde(default)]
+    pub for_duration_secs: i32,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,6 +1584,196 @@ async fn update_node_alert_rule(
     Ok((StatusCode::OK, Json(AlertRuleResponse::from(updated))))
 }
 
+/// Create a resource alert (CPU / memory / disk) on a node.
+///
+/// Works for workers as well as the control plane (`0`). A worker's series is
+/// fed by its heartbeats, so a rule only starts evaluating once the node has
+/// reported at least once.
+#[utoipa::path(
+    post,
+    path = "/nodes/{id}/metrics/alert-rules",
+    operation_id = "NodeMetricsCreateAlertRule",
+    tag = "Metrics",
+    request_body = CreateNodeAlertRuleRequest,
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 201, description = "Alert rule created", body = AlertRuleResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Node not found"),
+        (status = 409, description = "The node already has a rule for this metric"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn create_node_alert_rule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+    Json(request): Json<CreateNodeAlertRuleRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    let rule = NodeAlertRuleService::new(state.db.clone())
+        .create(
+            id,
+            NewNodeAlertRule {
+                name: request.name,
+                metric_name: request.metric_name,
+                threshold: request.threshold,
+                comparator: request.comparator,
+                severity: request.severity,
+                for_duration_secs: request.for_duration_secs,
+                enabled: request.enabled,
+            },
+        )
+        .await
+        .map_err(|e| log_and_convert(id, e))?;
+
+    info!(
+        rule_id = rule.id,
+        node_id = id,
+        metric_name = %rule.metric_name,
+        threshold = rule.threshold,
+        "Node alert rule created"
+    );
+
+    let audit = NodeAlertRuleCreatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id: id,
+        rule_id: rule.id,
+        metric_name: rule.metric_name.clone(),
+        comparator: rule.comparator.clone(),
+        threshold: rule.threshold,
+        severity: rule.severity.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(node_id = id, rule_id = rule.id, error = %e, "Failed to create audit log for node alert rule creation");
+    }
+
+    Ok((StatusCode::CREATED, Json(AlertRuleResponse::from(rule))))
+}
+
+/// Delete a worker's resource alert.
+///
+/// Refused for the control plane (`0`): its default rules are re-created on
+/// every start, so use `PATCH` with `enabled: false` to silence one.
+#[utoipa::path(
+    delete,
+    path = "/nodes/{id}/metrics/alert-rules/{rule_id}",
+    operation_id = "NodeMetricsDeleteAlertRule",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID"),
+        ("rule_id" = i32, Path, description = "Alert rule ID"),
+    ),
+    responses(
+        (status = 204, description = "Alert rule deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alert rule not found on this node"),
+        (status = 409, description = "Control-plane default rules cannot be deleted"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn delete_node_alert_rule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((id, rule_id)): Path<(i32, i32)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    let deleted = NodeAlertRuleService::new(state.db.clone())
+        .delete(id, rule_id)
+        .await
+        .map_err(|e| log_and_convert(id, e))?;
+
+    info!(
+        rule_id,
+        node_id = id,
+        metric_name = %deleted.metric_name,
+        "Node alert rule deleted"
+    );
+
+    let audit = NodeAlertRuleDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        node_id: id,
+        rule_id,
+        metric_name: deleted.metric_name,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(node_id = id, rule_id, error = %e, "Failed to create audit log for node alert rule deletion");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Log a node alert-rule failure at the level its cause deserves, then convert.
+fn log_and_convert(node_id: i32, error: NodeAlertRuleError) -> Problem {
+    match &error {
+        NodeAlertRuleError::Database { .. } => {
+            error!(node_id, error = %error, "Node alert rule operation failed")
+        }
+        NodeAlertRuleError::NodeNotFound { .. }
+        | NodeAlertRuleError::RuleNotFound { .. }
+        | NodeAlertRuleError::AlreadyExists { .. }
+        | NodeAlertRuleError::ControlPlaneRuleProtected { .. }
+        | NodeAlertRuleError::Validation { .. } => {
+            info!(node_id, "Rejected node alert rule operation: {}", error)
+        }
+    }
+    Problem::from(error)
+}
+
+impl From<NodeAlertRuleError> for Problem {
+    fn from(error: NodeAlertRuleError) -> Self {
+        match &error {
+            NodeAlertRuleError::NodeNotFound { .. } => not_found()
+                .title("Node Not Found")
+                .detail(error.to_string())
+                .build(),
+            NodeAlertRuleError::RuleNotFound { .. } => not_found()
+                .title("Alert Rule Not Found")
+                .detail(error.to_string())
+                .build(),
+            NodeAlertRuleError::AlreadyExists { .. } => ErrorBuilder::new(StatusCode::CONFLICT)
+                .type_("https://temps.sh/probs/node-alert-rule-exists")
+                .title("Alert Rule Already Exists")
+                .detail(error.to_string())
+                .build(),
+            NodeAlertRuleError::ControlPlaneRuleProtected { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/control-plane-alert-rule-protected")
+                    .title("Control-Plane Rule Cannot Be Deleted")
+                    .detail(error.to_string())
+                    .build()
+            }
+            NodeAlertRuleError::Validation { .. } => bad_request()
+                .title("Invalid Alert Rule")
+                .detail(error.to_string())
+                .build(),
+            NodeAlertRuleError::Database { .. } => internal_server_error()
+                .title("Alert Rule Operation Failed")
+                .detail(error.to_string())
+                .build(),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
@@ -1971,11 +2187,11 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
         .route(
             "/nodes/{id}/metrics/alert-rules",
-            get(list_node_alert_rules),
+            get(list_node_alert_rules).post(create_node_alert_rule),
         )
         .route(
             "/nodes/{id}/metrics/alert-rules/{rule_id}",
-            patch(update_node_alert_rule),
+            patch(update_node_alert_rule).delete(delete_node_alert_rule),
         )
 }
 
@@ -2001,7 +2217,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_node_metrics_range,
         get_node_metrics_latest,
         list_node_alert_rules,
+        create_node_alert_rule,
         update_node_alert_rule,
+        delete_node_alert_rule,
     ),
     components(schemas(
         MetricDataPoint,
@@ -2012,6 +2230,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         AlertRuleResponse,
         CreateAlertRuleRequest,
         UpdateAlertRuleRequest,
+        CreateNodeAlertRuleRequest,
         ToggleServiceMetricsRequest,
         ToggleDeploymentMetricsRequest,
     )),
@@ -2570,7 +2789,9 @@ mod tests {
         let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
         for expected in [
             "NodeMetricsGetAlertRules (/nodes/{id}/metrics/alert-rules)",
+            "NodeMetricsCreateAlertRule (/nodes/{id}/metrics/alert-rules)",
             "NodeMetricsUpdateAlertRule (/nodes/{id}/metrics/alert-rules/{rule_id})",
+            "NodeMetricsDeleteAlertRule (/nodes/{id}/metrics/alert-rules/{rule_id})",
         ] {
             assert!(
                 served.contains(expected),

@@ -11,6 +11,7 @@ pub mod externalsvc;
 pub mod health_monitor;
 pub mod managed_names;
 pub mod mariadb_query;
+mod node_alert_rule_service;
 pub mod parameter_strategies;
 pub mod pg_stat_statements;
 pub mod postgres_lifecycle;

@@ -39917,6 +39917,47 @@
         ],
         "type": "object"
       },
+      "NodeCreateAlertRuleRequest": {
+        "description": "Request body for creating a resource alert on a node.\n\nOnly the usage percentages can be alerted on: `node.cpu_percent`,\n`node.memory_percent` and `node.disk_percent`. `threshold` is a percentage\n(0-100). A node has at most one rule per metric.",
+        "properties": {
+          "comparator": {
+            "description": "One of `>`, `<`, `>=`, `<=`.",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "for_duration_secs": {
+            "description": "Seconds the breach must persist before the alarm fires (0 = immediate).",
+            "format": "int32",
+            "type": "integer"
+          },
+          "metric_name": {
+            "description": "One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "severity": {
+            "description": "`\"warning\"` or `\"critical\"`.",
+            "type": "string"
+          },
+          "threshold": {
+            "description": "Percentage between 0 and 100.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "metric_name",
+          "threshold",
+          "comparator",
+          "severity"
+        ],
+        "type": "object"
+      },
       "NodeDnsStatusEntry": {
         "description": "Per-node DNS resolver health, as last reported by that node's heartbeat.\nPart of `GET /api/cluster/dns/status`.",
         "properties": {
@@ -108796,9 +108837,131 @@
           "Metrics"
         ],
         "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Works for workers as well as the control plane (`0`). A worker's series is\nfed by its heartbeats, so a rule only starts evaluating once the node has\nreported at least once.",
+        "operationId": "NodeMetricsCreateAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeCreateAlertRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "Alert rule created"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "The node already has a rule for this metric"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a resource alert (CPU / memory / disk) on a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/nodes/{id}/metrics/alert-rules/{rule_id}": {
+      "delete": {
+        "description": "Refused for the control plane (`0`): its default rules are re-created on\nevery start, so use `PATCH` with `enabled: false` to silence one.",
+        "operationId": "NodeMetricsDeleteAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Alert rule deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found on this node"
+          },
+          "409": {
+            "description": "Control-plane default rules cannot be deleted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a worker's resource alert.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      },
       "patch": {
         "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
         "operationId": "NodeMetricsUpdateAlertRule",

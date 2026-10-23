@@ -64,6 +64,11 @@ pub struct NodeAppState {
     /// Audit trail. A node's reported architecture decides where images are
     /// placed, so a change to it is recorded like any other write.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Where each heartbeat's CPU/memory/disk reading is stored as `node.*`
+    /// time series, so a worker is charted and alerted on exactly like the
+    /// control plane. `None` when metrics collection is not wired up; the
+    /// heartbeat itself is unaffected.
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
 }
 
 /// Fixed-window rate limiter for the public node-registration endpoint
@@ -2213,8 +2218,13 @@ async fn node_heartbeat(
     // Capture previous status before the heartbeat updates it
     let was_offline = node.status == "offline";
 
+    let capacity = request.capacity.unwrap_or(serde_json::json!({}));
+    // Kept aside for the metrics series: `capacity` is moved into the request
+    // below, and the store is optional, so only pay for the clone when set.
+    let metrics_capacity = app_state.metrics_store.as_ref().map(|_| capacity.clone());
+
     let heartbeat = HeartbeatRequest {
-        capacity: request.capacity.unwrap_or(serde_json::json!({})),
+        capacity,
         labels: request.labels,
         architecture: normalize_reported_platform(request.architecture.as_deref()),
         dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
@@ -2246,6 +2256,22 @@ async fn node_heartbeat(
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
+
+    // Only an accepted heartbeat (valid token, known node) reaches the store.
+    // Spawned so a slow metrics store can never delay the acknowledgement the
+    // agent is waiting on; at one task per node per beat it is bounded by the
+    // fleet size.
+    if let (Some(store), Some(capacity)) = (app_state.metrics_store.clone(), metrics_capacity) {
+        tokio::spawn(async move {
+            temps_metrics::node_capacity::record_capacity(
+                store.as_ref(),
+                node_id,
+                &capacity,
+                chrono::Utc::now(),
+            )
+            .await;
+        });
+    }
 
     // The architecture decides where images are placed and is supplied by the
     // node itself, so a change is an event an operator may need to explain
@@ -5351,6 +5377,7 @@ mod tests {
             )),
             alarm_service: None,
             audit_service: Arc::new(RecordingAuditLogger::default()),
+            metrics_store: None,
         });
         // The production router is served with connect info; tests use `oneshot`
         // (no peer address), so inject a mock so the `ConnectInfo` extractor

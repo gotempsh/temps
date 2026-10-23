@@ -413,6 +413,7 @@ fn spawn_heartbeat_loop(
         // Occupied ranges the control plane acknowledged last (ADR 056):
         // they are sent only when they differ.
         let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
+        let mut capacity_sampler = CapacitySampler::new();
 
         loop {
             tokio::select! {
@@ -429,7 +430,7 @@ fn spawn_heartbeat_loop(
                 }
             }
 
-            let mut capacity = collect_capacity_metrics();
+            let mut capacity = capacity_sampler.sample().await;
             // Where the agent API is served on the WireGuard mesh: what lets
             // the control plane call this node through the mesh (an agent
             // that never reports it keeps being called at its registered
@@ -734,30 +735,62 @@ pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> Option<S
     }
 }
 
-/// Collect system resource metrics for heartbeat capacity data.
-fn collect_capacity_metrics() -> serde_json::Value {
-    use sysinfo::{Disks, System};
+/// Shortest gap between two CPU refreshes that sysinfo reports meaningfully.
+/// Refreshing sooner returns the previous reading (or ~0).
+const CPU_MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
-    let mut sys = System::new();
-    sys.refresh_cpu_all();
-    sys.refresh_memory();
-    let disks = Disks::new_with_refreshed_list();
+/// Samples this host's CPU/memory/disk for the heartbeat `capacity` payload.
+///
+/// CPU usage is a delta between two refreshes, so the `System` must outlive a
+/// single reading: the previous implementation built a fresh `System` per beat
+/// and refreshed once, which always reported ~0% and made any CPU alert
+/// useless. Holding it across beats makes `cpu_percent` the average load over
+/// the heartbeat interval, which is also the right signal to alert on (a
+/// 30-second mean rather than an instantaneous spike).
+struct CapacitySampler {
+    sys: sysinfo::System,
+    last_cpu_refresh: std::time::Instant,
+}
 
-    // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = disks
-        .list()
-        .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
-        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
-        .unwrap_or((0, 0));
+impl CapacitySampler {
+    fn new() -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_all();
+        Self {
+            sys,
+            last_cpu_refresh: std::time::Instant::now(),
+        }
+    }
 
-    serde_json::json!({
-        "cpu_percent": sys.global_cpu_usage(),
-        "memory_used_bytes": sys.used_memory(),
-        "memory_total_bytes": sys.total_memory(),
-        "disk_used_bytes": disk_used,
-        "disk_total_bytes": disk_total,
-    })
+    /// Collect one reading. Waits out the remainder of
+    /// [`CPU_MIN_REFRESH_INTERVAL`] first, which only ever matters for the
+    /// very first beat (the heartbeat interval is far longer).
+    async fn sample(&mut self) -> serde_json::Value {
+        let since_last = self.last_cpu_refresh.elapsed();
+        if since_last < CPU_MIN_REFRESH_INTERVAL {
+            tokio::time::sleep(CPU_MIN_REFRESH_INTERVAL - since_last).await;
+        }
+        self.sys.refresh_cpu_usage();
+        self.last_cpu_refresh = std::time::Instant::now();
+        self.sys.refresh_memory();
+
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        // Use only the root mount point to avoid double-counting overlapping mounts
+        let (disk_used, disk_total) = disks
+            .list()
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"))
+            .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+            .unwrap_or((0, 0));
+
+        serde_json::json!({
+            "cpu_percent": self.sys.global_cpu_usage(),
+            "memory_used_bytes": self.sys.used_memory(),
+            "memory_total_bytes": self.sys.total_memory(),
+            "disk_used_bytes": disk_used,
+            "disk_total_bytes": disk_total,
+        })
+    }
 }
 
 fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentError> {
@@ -1106,6 +1139,36 @@ pub(crate) mod tests {
         let mut config = test_agent_config(false);
         config.control_plane_url = "http://10.0.0.1:3000".to_string();
         assert!(validate_agent_transport(&config).is_ok());
+    }
+
+    /// The heartbeat feeds CPU alerts, so every field must be present and
+    /// numeric, and CPU must be a valid percentage on every beat -- including
+    /// the first, which previously read a cold sample.
+    #[tokio::test]
+    async fn capacity_sampler_reports_numeric_fields_with_a_valid_cpu_percent() {
+        let mut sampler = CapacitySampler::new();
+
+        for _ in 0..2 {
+            let capacity = sampler.sample().await;
+            for key in [
+                "cpu_percent",
+                "memory_used_bytes",
+                "memory_total_bytes",
+                "disk_used_bytes",
+                "disk_total_bytes",
+            ] {
+                assert!(
+                    capacity.get(key).is_some_and(serde_json::Value::is_number),
+                    "capacity is missing numeric field '{key}': {capacity}"
+                );
+            }
+            let cpu = capacity["cpu_percent"].as_f64().unwrap_or(-1.0);
+            assert!(
+                (0.0..=100.0).contains(&cpu),
+                "cpu_percent out of range: {cpu}"
+            );
+            assert!(capacity["memory_total_bytes"].as_u64().unwrap_or(0) > 0);
+        }
     }
 
     /// With no Docker client we cannot know the daemon's architecture, and
