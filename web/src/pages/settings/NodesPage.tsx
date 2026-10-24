@@ -1467,9 +1467,8 @@ function NodeDetail({
         <BuilderLimitsPanel key={node.id} node={node} />
       )}
 
-      {/* Workload plane (ADR-055): sandbox drivers, scheduling resources,
-          network policy mode and the desired-state stream. Node 0 is the
-          control plane. */}
+      {/* Workload plane (ADR-055): scheduling resources, network policy
+          mode and the desired-state stream. Node 0 is the control plane. */}
       {(node.role === 'worker' || node.role === 'control-plane') && (
         <NodeWorkloadSettings
           key={`workload-${node.id}`}

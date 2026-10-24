@@ -3,7 +3,7 @@
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Boxes, Gauge, Loader2, Network } from 'lucide-react'
+import { Gauge, Loader2, Network } from 'lucide-react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
@@ -29,19 +29,14 @@ import {
 import {
   CONTROL_PLANE_NODE_ID,
   getNodeResources,
-  getSandboxDriverMode,
   nodeResourcesQueryKey,
   parseSystemReserved,
   resourcePolicySummary,
-  sandboxDriverModeQueryKey,
-  sandboxDriverModeSummary,
   setNodeResources,
-  setSandboxDriverMode,
   systemReservedDefaultsText,
   type NodeResourcePolicy,
   type NodeResources,
   type NodeResourcesUpdate,
-  type SandboxDriverMode,
 } from '@/lib/node-workload'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { cn } from '@/lib/utils'
@@ -52,26 +47,6 @@ interface ModeCard<T extends string> {
   title: string
   description: string
 }
-
-const SANDBOX_MODES: ModeCard<SandboxDriverMode>[] = [
-  {
-    value: 'legacy',
-    title: 'Legacy',
-    description: 'The sandbox providers serve every call exactly as before.',
-  },
-  {
-    value: 'shadow',
-    title: 'Shadow',
-    description:
-      'The providers still serve; the driver facade plans every create alongside and logs where it would differ.',
-  },
-  {
-    value: 'enforce',
-    title: 'Enforce',
-    description:
-      'The driver facade serves. On a worker it forwards terminals, the agent runtime and disk resize to the node.',
-  },
-]
 
 const RESOURCE_POLICIES: ModeCard<NodeResourcePolicy>[] = [
   {
@@ -171,83 +146,6 @@ function SectionSkeleton() {
       <Skeleton className="h-20 w-full" />
       <Skeleton className="h-4 w-2/3" />
     </div>
-  )
-}
-
-// ── Sandbox driver mode ─────────────────────────────────────────────────────
-
-const SANDBOX_TITLE = 'Sandbox drivers'
-const SANDBOX_DESCRIPTION =
-  "Choose which code path serves this node's sandboxes. Legacy is the rollback."
-
-function SandboxDriverModeSection({
-  nodeId,
-  canEdit,
-}: {
-  nodeId: number
-  canEdit: boolean
-}) {
-  const queryClient = useQueryClient()
-  const queryKey = sandboxDriverModeQueryKey(nodeId)
-  const query = useQuery({
-    queryKey,
-    queryFn: () => getSandboxDriverMode(nodeId),
-    meta: { errorTitle: 'Could not load the sandbox driver mode' },
-  })
-  const update = useMutation({
-    mutationFn: (mode: SandboxDriverMode) =>
-      setSandboxDriverMode(nodeId, { mode }),
-    meta: { errorTitle: 'Could not change the sandbox driver mode' },
-    onSuccess: (setting) => {
-      queryClient.setQueryData(queryKey, setting)
-      toast.success(`Sandbox driver mode set to ${setting.mode}`)
-    },
-    onError: (error) => {
-      toast.error('Could not change the sandbox driver mode', {
-        description: problemDetail(error, 'The server refused the change.'),
-      })
-    },
-  })
-
-  return (
-    <SettingsSection
-      title={SANDBOX_TITLE}
-      description={SANDBOX_DESCRIPTION}
-      icon={Boxes}
-    >
-      {query.isPending ? (
-        <SectionSkeleton />
-      ) : query.isError ? (
-        <ReadFailure
-          resource="Sandbox driver mode"
-          error={query.error}
-          embedded
-          onRetry={
-            isForbiddenRead(query.error)
-              ? undefined
-              : () => void query.refetch()
-          }
-          retrying={query.isFetching}
-        />
-      ) : (
-        <div className="space-y-4">
-          <ModeCards
-            label="Sandbox driver mode"
-            modes={SANDBOX_MODES}
-            current={query.data.mode}
-            disabled={!canEdit || update.isPending}
-            onSelect={(mode) => update.mutate(mode)}
-          />
-          <p className="text-sm text-muted-foreground" role="status">
-            {update.isPending ? (
-              <Loader2 className="mr-2 inline h-4 w-4 animate-spin" />
-            ) : null}
-            {sandboxDriverModeSummary(query.data)}
-          </p>
-          {canEdit ? null : <ReadOnlyNote />}
-        </div>
-      )}
-    </SettingsSection>
   )
 }
 
@@ -566,19 +464,16 @@ function NetworkPolicyModeSection({
 // ── Composite ───────────────────────────────────────────────────────────────
 
 /**
- * A node's workload-plane settings (ADR-055): sandbox drivers, scheduling
- * resources, network policy mode, and the desired-state stream it reads.
- * `nodeId` 0 is the control plane.
+ * A node's workload-plane settings (ADR-055): scheduling resources, network
+ * policy mode, and the desired-state stream it reads. `nodeId` 0 is the
+ * control plane.
  */
 export function NodeWorkloadSettings({
   nodeId,
   nodeName,
-  hostsSandboxes = true,
 }: {
   nodeId: number
   nodeName: string
-  /** Edge nodes do not host sandboxes; the server refuses their mode. */
-  hostsSandboxes?: boolean
 }) {
   const canEdit = useIsInstanceAdmin()
   return (
@@ -590,9 +485,6 @@ export function NodeWorkloadSettings({
             : 'Desired-state stream to workers'
         }
       />
-      {hostsSandboxes ? (
-        <SandboxDriverModeSection nodeId={nodeId} canEdit={canEdit} />
-      ) : null}
       <NodeResourcesSection nodeId={nodeId} canEdit={canEdit} />
       <NetworkPolicyModeSection
         nodeId={nodeId}

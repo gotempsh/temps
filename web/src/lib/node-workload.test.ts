@@ -8,24 +8,9 @@ import {
   nodeStateStreamSummary,
   parseSystemReserved,
   resourcePolicySummary,
-  sandboxDriverModeSummary,
   systemReservedDefaultsText,
   type NodeStateStatus,
-  type SandboxDriverModeSetting,
 } from './node-workload'
-
-function mode(
-  overrides: Partial<SandboxDriverModeSetting>
-): SandboxDriverModeSetting {
-  return {
-    node_id: 3,
-    node_name: 'worker-a',
-    mode: 'legacy',
-    uses_drivers: false,
-    propagation_secs: 5,
-    ...overrides,
-  }
-}
 
 function stream(overrides: Partial<NodeStateStatus>): NodeStateStatus {
   return {
@@ -38,29 +23,6 @@ function stream(overrides: Partial<NodeStateStatus>): NodeStateStatus {
     ...overrides,
   }
 }
-
-describe('sandboxDriverModeSummary', () => {
-  test('legacy on a worker lists what stays refused', () => {
-    const text = sandboxDriverModeSummary(mode({}))
-    expect(text).toContain('refuse terminals')
-    expect(text).toContain('snapshots')
-  })
-
-  test('enforce on a worker says snapshots and restore stay refused', () => {
-    const text = sandboxDriverModeSummary(
-      mode({ mode: 'enforce', uses_drivers: true })
-    )
-    expect(text).toContain('Snapshots and restore are still refused')
-  })
-
-  test('the control plane has no worker-only caveats', () => {
-    const text = sandboxDriverModeSummary(
-      mode({ node_id: 0, node_name: 'control-plane' })
-    )
-    expect(text).not.toContain('worker')
-    expect(text).toContain('within 5s')
-  })
-})
 
 describe('system reserve', () => {
   test('formats whole vCPU and GB', () => {

@@ -4,85 +4,18 @@
 import {
   adminGetNodeResources,
   adminSetNodeResources,
-  getNodeSandboxDriverMode,
   nodeStateStatus,
-  setNodeSandboxDriverMode,
 } from '@/api/client'
 import type {
   NodeResourcePolicy,
   NodeResourcesResponse,
   NodeStateStatusResponse,
-  SandboxDriverModeResponse,
   SetNodeResourcesRequest,
-  SetSandboxDriverModeRequest,
   SystemReserved,
 } from '@/api/client'
 
 /** Node `0` is the control plane in every per-node workload route. */
 export const CONTROL_PLANE_NODE_ID = 0
-
-// ── Sandbox driver mode (ADR-055 phase 6) ───────────────────────────────────
-
-/** Which code path serves a node's sandboxes. */
-export type SandboxDriverMode = 'legacy' | 'shadow' | 'enforce'
-
-/** A node's sandbox driver mode. Node `0` is the control plane. */
-export type SandboxDriverModeSetting = SandboxDriverModeResponse
-
-/** The mode to switch a node's sandboxes to. */
-export type SandboxDriverModeUpdate = SetSandboxDriverModeRequest & {
-  mode: SandboxDriverMode
-}
-
-export function sandboxDriverModeQueryKey(nodeId: number) {
-  return ['node-sandbox-driver-mode', nodeId] as const
-}
-
-export async function getSandboxDriverMode(
-  nodeId: number
-): Promise<SandboxDriverModeSetting> {
-  const { data } = await getNodeSandboxDriverMode({
-    path: { node_id: nodeId },
-    throwOnError: true,
-  })
-  return data
-}
-
-export async function setSandboxDriverMode(
-  nodeId: number,
-  update: SandboxDriverModeUpdate
-): Promise<SandboxDriverModeSetting> {
-  const { data } = await setNodeSandboxDriverMode({
-    path: { node_id: nodeId },
-    body: update,
-    throwOnError: true,
-  })
-  return data
-}
-
-/**
- * What a saved sandbox driver mode does right now, including what a worker
- * node still refuses, so the operator does not have to read the ADR.
- */
-export function sandboxDriverModeSummary(
-  setting: SandboxDriverModeSetting
-): string {
-  const controlPlane = setting.node_id === CONTROL_PLANE_NODE_ID
-  const delay = `Changes reach calls already in flight within ${setting.propagation_secs}s${
-    controlPlane ? '' : ' (a worker switches on its next sandbox call)'
-  }.`
-  if (setting.mode === 'legacy') {
-    return controlPlane
-      ? `The sandbox providers serve every call exactly as before. ${delay}`
-      : `The sandbox providers serve every call exactly as before, so sandboxes on this worker refuse terminals, the retained agent runtime, snapshots and disk resize. ${delay}`
-  }
-  if (setting.mode === 'shadow') {
-    return `The sandbox providers still serve; the driver facade plans every create next to them and logs where it would differ. ${delay}`
-  }
-  return controlPlane
-    ? `The driver facade serves: requests are filtered on the driver's capabilities and limits it cannot apply are reported. ${delay}`
-    : `The driver facade serves and forwards terminals, the retained agent runtime, disk resize, image identity and harness recovery to this worker. Snapshots and restore are still refused on worker nodes. ${delay}`
-}
 
 // ── Resource policy and system reserve (ADR-055 §5) ────────────────────────
 
