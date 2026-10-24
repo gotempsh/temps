@@ -1171,8 +1171,6 @@ impl TempsPlugin for DeploymentsPlugin {
         let data_dir = config_service.data_dir();
         // Create NodeService for admin node routes (list/get with session auth)
         let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
-        // ADR-055 phase 6: the sandbox driver mode routes get their own copy.
-        let sandbox_driver_mode_node_service = node_service.clone();
 
         // Same placement policy the deploy path uses, so the node capability
         // endpoint cannot report "schedulable" for a process that would then
@@ -1337,14 +1335,6 @@ impl TempsPlugin for DeploymentsPlugin {
         let traefik_discovery_routes =
             handlers::traefik_discovery::configure_routes().with_state(traefik_discovery_state);
 
-        let sandbox_driver_mode_routes = handlers::sandbox_driver_mode::configure_routes()
-            .with_state(Arc::new(
-                handlers::sandbox_driver_mode::SandboxDriverModeAppState {
-                    node_service: sandbox_driver_mode_node_service,
-                    audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
-                },
-            ));
-
         let compose_check_routes =
             handlers::compose_check::configure_routes()
                 .with_state(Arc::new(handlers::compose_check::ComposeCheckAppState {
@@ -1365,7 +1355,6 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(deployment_token_routes)
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)
-            .merge(sandbox_driver_mode_routes)
             .merge(
                 handlers::workload_placement::configure_routes().with_state(Arc::new(
                     handlers::workload_placement::WorkloadPlacementAppState {
@@ -1448,8 +1437,6 @@ impl TempsPlugin for DeploymentsPlugin {
                 <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
                 <handlers::workload_volumes::WorkloadVolumesApiDoc as UtoimaOpenApi>::openapi(),
-                <handlers::sandbox_driver_mode::SandboxDriverModeApiDoc as UtoimaOpenApi>::openapi(
-                ),
             ],
         ))
     }

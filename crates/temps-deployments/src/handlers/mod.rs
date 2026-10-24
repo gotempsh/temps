@@ -25,6 +25,3 @@ pub mod workload_volumes;
 pub mod ci_dispatch;
 
 pub mod runtime_health;
-
-// ADR-055 phase 6
-pub mod sandbox_driver_mode;

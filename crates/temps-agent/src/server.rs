@@ -305,7 +305,7 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
             "/agent/sandboxes/status",
             post(sandbox_handlers::sandbox_status),
         )
-        // ADR-055 phase 6: forwarded only for nodes in `enforce` mode.
+        // ADR-055 phase 6: driver operations the control plane forwards.
         .route(
             "/agent/sandboxes/resize-disk",
             post(sandbox_handlers::resize_sandbox_disk),

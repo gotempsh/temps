@@ -1161,7 +1161,8 @@ ADR-052's principles apply unchanged:
 
 Every mode column below takes `legacy | shadow | enforce` and defaults to
 `legacy`. Each is changed through the API by an administrator, and every
-change is audit-logged.
+change is audit-logged. Phase 6 is the exception: sandboxes have a single
+path, the driver facade, and no mode column.
 
 | Phase | Schema | Behaviour change for existing workloads | Proof before it merges | Rollback |
 |---|---|---|---|---|
@@ -1171,7 +1172,7 @@ change is audit-logged.
 | 3 | none | none; the stream runs beside the old endpoints | a mixed-version test (new control plane, old worker) creating a database, a deployment and a sandbox; the snapshot file contains no seeded secret | stop advertising the capability |
 | 4 | `external_services.workload_mode` | none in `legacy` or `shadow`. In `enforce`, a worker database gains the control-plane host config (pids cap, `no-new-privileges`, healthcheck, labels) **only when it is next recreated**, and the change is listed before the operator confirms the recreate | shadow mode computes the spec for every existing database and logs differences from what is running | set the database's mode back to `legacy`; the engines call the old code path |
 | 5 | `environments.workload_mode`, `nodes.resource_policy` (default `best_effort`), `nodes.system_reserved` (default per role) | none; current limits are carried over as limits, and pins as `PlacementSpec` | a shadow scheduler run comparing its placements with `NodeScheduler`'s for every environment | set the environment's mode back to `legacy` |
-| 6 | `nodes.sandbox_driver_mode` | none; previews, snapshots and PTY become available on remote sandboxes in `enforce` | the ADR-010 eval harness passes for every driver | set the node's mode back to `legacy`; sandbox calls return to the old providers |
+| 6 | none (`m20261022_000006` added `nodes.sandbox_driver_mode` and `network_config.control_plane_sandbox_driver_mode`; `m20261024_000001` drops them) | the driver facade serves every sandbox on every node, with no mode to choose: requests are filtered on the drivers' capabilities, a limit a driver cannot apply is reported on the handle, and terminals, the retained agent runtime, disk resize, image identity and harness recovery are forwarded to a worker's driver instead of refused | the ADR-010 eval harness passes for every driver | revert; there is deliberately no per-node switch back to the old providers, because the facade calls the same backend code they did |
 | 7 | per ADR-052 phase 3, plus `nodes.network_policy_mode` | none for deployments (`open`); sandboxes keep their internal network and add the shared proxy only in `enforce` | a two-node test that a restricted workload cannot reach an unlinked service, cannot spoof another workload's source address, and cannot resolve external names; the §17 end-to-end suite passing on Linux (`HostNft`) and on macOS (`DockerVmNft`); the egress-proxy reach measured at 50 sandboxes on the small target | set the node's mode back to `legacy`; sidecars remain available until the contract release |
 | 8 | endpoint and policy tables, `environments.ingress_mode` | none; existing routes compile to the same decisions | a differential test: every request in the proxy test corpus gets the same decision from the old and new evaluators | set the environment's mode back to `legacy` |
 | 9 | volume tables | none until a volume is added | a backup and restore of a database on a worker node | stop scheduling backup jobs; the local path is unchanged |

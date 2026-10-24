@@ -10,7 +10,6 @@ pub mod guest_agent_build;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;
-pub mod mode_routing;
 pub mod node_routing;
 pub mod pty_agent_bundle;
 pub mod remote;
@@ -167,9 +166,9 @@ pub struct SandboxHandle {
     /// What the driver facade found when it placed the sandbox (ADR-055
     /// §5, §6): `LimitEnforced = False` with the reason when a requested
     /// limit could not be applied, and `Scheduled` when the preferred
-    /// driver was passed over. Only the facade (`enforce` mode) sets it;
-    /// empty on every other path, and then omitted from the wire so legacy
-    /// requests and responses are byte for byte what they were.
+    /// driver was passed over. Only the facade sets it; empty on the
+    /// single-backend providers it wraps, and then omitted from the wire so
+    /// a handle without conditions serializes as it always did.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[schema(value_type = Vec<Object>)]
     pub conditions: Vec<temps_workload::Condition>,

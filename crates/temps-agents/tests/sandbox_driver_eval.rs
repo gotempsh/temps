@@ -4,7 +4,7 @@
 //! Sandbox driver eval harness (ADR-010, ADR-055 §6).
 //!
 //! One contract, run against every sandbox driver through the driver facade
-//! that `enforce` mode serves sandboxes with (`DriverSandboxProvider` over a
+//! that serves every sandbox (`DriverSandboxProvider` over a
 //! `SandboxBackendDriver`), so each backend is proven behind the same
 //! `SandboxProvider` seam its callers hold:
 //!
@@ -98,7 +98,7 @@ fn create_config(
     }
 }
 
-/// The facade `enforce` mode builds, over one driver.
+/// The facade the server builds, over one driver.
 fn facade(backend: SandboxBackend, inner: Arc<dyn SandboxProvider>) -> Arc<DriverSandboxProvider> {
     let driver: Arc<dyn SandboxExt> = Arc::new(SandboxBackendDriver::new(backend, inner.clone()));
     Arc::new(DriverSandboxProvider::new(vec![driver], backend, inner))

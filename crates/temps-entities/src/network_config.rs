@@ -64,10 +64,6 @@ pub struct Model {
     /// The control plane is the mesh hub. Never set together with
     /// `mesh_hub_node_id`.
     pub mesh_hub_control_plane: bool,
-    /// Which code path serves the control plane's own sandboxes (ADR-055
-    /// phase 6). Node 0 has no `nodes` row, so its mode lives here, next to
-    /// its other per-node settings.
-    pub control_plane_sandbox_driver_mode: super::sandbox_driver_mode::SandboxDriverMode,
     pub updated_at: DBDateTime,
 }
 

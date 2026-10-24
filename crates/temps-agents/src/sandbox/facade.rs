@@ -4,7 +4,7 @@
 //! `SandboxProvider` as the product facade over the runtime drivers
 //! (ADR-055 §6, §14, phase 6).
 //!
-//! In `enforce` mode every sandbox call on this host goes through
+//! Every sandbox call on this host goes through
 //! [`DriverSandboxProvider`]: it places a new sandbox by filtering the
 //! drivers on what the request needs ([`SandboxRequirements`]), then ranks
 //! the host's default driver first; every later call goes to the driver
@@ -147,7 +147,6 @@ impl DriverSandboxProvider {
     }
 
     /// Filter, rank and describe a placement without creating anything.
-    /// `shadow` mode logs it next to what the old path did.
     pub fn plan_create(&self, config: &SandboxCreateConfig) -> Result<CreatePlan, AgentError> {
         let sandbox = config
             .container_name_override

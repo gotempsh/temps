@@ -6,9 +6,9 @@
 //! [`SandboxBackendDriver`] presents one backend (Docker, Firecracker,
 //! microsandbox) as a [`RuntimeDriver`] + [`SandboxExt`], with a capability
 //! table that says truthfully what that backend can do. The backend's own
-//! code is unchanged: every operation is the backend call the old provider
-//! path makes, so a sandbox behaves the same whichever path serves it, and
-//! the legacy path (and its golden captures) is untouched.
+//! code is unchanged: every operation is the backend's own provider call,
+//! so the driver adds capability reporting without changing what a sandbox
+//! does.
 //!
 //! Errors keep their type across the boundary: a backend failure travels as
 //! [`DriverError::Backend`] with the [`AgentError`] inside, and

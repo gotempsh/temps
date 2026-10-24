@@ -1635,12 +1635,11 @@ pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusRe
     }))
 }
 
-// ── ADR-055 phase 6: driver operations forwarded by `enforce` nodes ──────
+// ── ADR-055 phase 6: driver operations forwarded by the control plane ────
 //
-// The control plane only calls these for a node whose sandbox driver mode
-// is `enforce`; in `legacy` it still refuses the operations itself (422)
-// without contacting the node. They replay one more `SandboxProvider` call
-// each, against the same handle re-resolution as every route above.
+// The control plane forwards these for every sandbox on this node. They
+// replay one more `SandboxProvider` call each, against the same handle
+// re-resolution as every route above.
 
 /// `POST /agent/sandboxes/resize-disk`
 #[utoipa::path(

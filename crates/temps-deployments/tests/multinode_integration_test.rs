@@ -60,7 +60,6 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         public_ingress_route_count: None,
         public_ingress_unsupported_route_count: None,
         public_ingress_unsupported_reasons: serde_json::json!([]),
-        sandbox_driver_mode: Default::default(),
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }

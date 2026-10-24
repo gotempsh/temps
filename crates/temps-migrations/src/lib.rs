@@ -65,7 +65,7 @@ pub use migration::m20261023_000030_environment_workload_isolation::Migration as
 
 pub use migration::m20261022_000004_external_services_workload_mode::Migration as ExternalServicesWorkloadModeMigration;
 pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;
-pub use migration::m20261022_000006_nodes_sandbox_driver_mode::{
-    Migration as NodesSandboxDriverModeMigration, DOWN_SQL as NODES_SANDBOX_DRIVER_MODE_DOWN_SQL,
-    UP_SQL as NODES_SANDBOX_DRIVER_MODE_UP_SQL,
+pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
+    Migration as DropSandboxDriverModeMigration, DOWN_SQL as DROP_SANDBOX_DRIVER_MODE_DOWN_SQL,
+    UP_SQL as DROP_SANDBOX_DRIVER_MODE_UP_SQL,
 };

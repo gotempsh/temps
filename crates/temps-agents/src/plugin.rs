@@ -148,10 +148,9 @@ fn filter_agents_for_trigger(
 /// `Arc<dyn SandboxProvider>`, per ADR-010. Registration is passive: this
 /// probes, it never downloads or mutates the host.
 ///
-/// ADR-055 phase 6: what is returned serves node 0's sandboxes by node 0's
-/// `sandbox_driver_mode` (see [`with_driver_modes`]): the providers below in
-/// `legacy` and `shadow`, the driver facade over the same backends in
-/// `enforce`.
+/// ADR-055 phase 6: what is returned is the driver facade over these
+/// backends (see [`driver_facade`]), which serves every one of node 0's
+/// sandboxes.
 ///
 /// When Firecracker is available, `workload_vm` receives the runtime driver
 /// that runs deployment replicas in microVMs (ADR-055 Phase 10), over the
@@ -161,7 +160,6 @@ async fn build_sandbox_provider(
     docker_provider: Arc<DockerSandboxProvider>,
     docker: Arc<bollard::Docker>,
     settings: &temps_core::AgentSandboxSettings,
-    db: Arc<sea_orm::DatabaseConnection>,
     workload_vm: &mut Option<Arc<dyn temps_workload::RuntimeDriver>>,
 ) -> Arc<dyn SandboxProvider> {
     use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
@@ -196,11 +194,10 @@ async fn build_sandbox_provider(
     });
     if backends.is_empty() {
         let docker_provider: Arc<dyn SandboxProvider> = docker_provider;
-        return with_driver_modes(
+        return driver_facade(
             docker_provider.clone(),
             vec![(SandboxBackend::Docker, docker_provider)],
             SandboxBackend::Docker,
-            db,
         );
     }
 
@@ -217,23 +214,24 @@ async fn build_sandbox_provider(
         .map(|(backend, provider)| (*backend, provider.clone()))
         .collect();
     drivers.sort_by_key(|(backend, _)| backend.to_string());
-    let legacy: Arc<dyn SandboxProvider> = Arc::new(RoutingSandboxProvider::new(backends, default));
-    with_driver_modes(legacy, drivers, default, db)
+    let product: Arc<dyn SandboxProvider> =
+        Arc::new(RoutingSandboxProvider::new(backends, default));
+    driver_facade(product, drivers, default)
 }
 
-/// Serve node 0's sandboxes by its `sandbox_driver_mode` (ADR-055 phase 6):
-/// `legacy` is `legacy` itself, unchanged; `enforce` is the driver facade
-/// over the same single-backend providers, so a sandbox created in one mode
-/// is served in the other.
-fn with_driver_modes(
-    legacy: Arc<dyn SandboxProvider>,
+/// Serve node 0's sandboxes through the driver facade (ADR-055 phase 6):
+/// each backend becomes a runtime driver, new sandboxes are placed by
+/// filtering those drivers on what the request needs, and every later call
+/// goes to the driver that owns the handle. `product` keeps the operations
+/// that are not about one sandbox (the sandbox image, the rootfs cache, the
+/// provider's name and availability).
+fn driver_facade(
+    product: Arc<dyn SandboxProvider>,
     backends: Vec<(crate::sandbox::SandboxBackend, Arc<dyn SandboxProvider>)>,
     default: crate::sandbox::SandboxBackend,
-    db: Arc<sea_orm::DatabaseConnection>,
 ) -> Arc<dyn SandboxProvider> {
     use crate::sandbox::driver::SandboxBackendDriver;
     use crate::sandbox::facade::DriverSandboxProvider;
-    use crate::sandbox::mode_routing::{DbControlPlaneDriverMode, ModeRoutingSandboxProvider};
 
     let drivers: Vec<Arc<dyn temps_workload::SandboxExt>> = backends
         .into_iter()
@@ -242,13 +240,7 @@ fn with_driver_modes(
                 as Arc<dyn temps_workload::SandboxExt>
         })
         .collect();
-    let facade = Arc::new(DriverSandboxProvider::new(drivers, default, legacy.clone()));
-    Arc::new(ModeRoutingSandboxProvider::new(
-        legacy,
-        facade,
-        default,
-        Arc::new(DbControlPlaneDriverMode::new(db)),
-    ))
+    Arc::new(DriverSandboxProvider::new(drivers, default, product))
 }
 
 /// Keep the guest agents each microVM backend injects in step with the ones
@@ -896,7 +888,6 @@ impl TempsPlugin for AgentsPlugin {
                                     provider,
                                     docker,
                                     &global_sandbox,
-                                    db.clone(),
                                     &mut workload_vm_driver,
                                 )
                                 .await

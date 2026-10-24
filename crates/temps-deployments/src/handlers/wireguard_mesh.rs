@@ -489,7 +489,6 @@ pub(crate) mod admin_test_support {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
-            control_plane_sandbox_driver_mode: Default::default(),
             updated_at: chrono::Utc::now(),
         }
     }
@@ -537,7 +536,6 @@ pub(crate) mod admin_test_support {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
-            sandbox_driver_mode: Default::default(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
