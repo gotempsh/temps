@@ -15,7 +15,11 @@
 //! 3. the backup job dumps the database into the bucket with the exact
 //!    script and environment the engine uses; the object must exist;
 //! 4. the table is dropped, the restore job applies the dump, and `42` must
-//!    be back.
+//!    be back;
+//! 5. a truncated copy of the dump fails its restore job with the corrupt
+//!    dump exit code, and the table is untouched;
+//! 6. a backup job whose waiter is dropped (the executor's timeout winning)
+//!    is stopped and removed by the plane.
 //!
 //! What this does **not** cover: the worker's own node runtime (the
 //! `StreamNodeDriver` + `temps agent` hop). That hop is the plane's
@@ -42,7 +46,9 @@ use bollard::Docker;
 use futures::{FutureExt, StreamExt};
 use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use temps_backup::engines::workload_job::{
-    backup_script, job_env, restore_script, run_database_job, JobPurpose, PgJobTarget, S3JobTarget,
+    backup_script, exit, job_env, restore_script, run_database_job, start_database_job,
+    stop_and_await_removal, DatabaseJobControl, DatabaseJobError, JobPurpose, JobState,
+    PgJobTarget, RemovalTiming, S3JobTarget,
 };
 use temps_core::{AuditLogger, AuditOperation};
 use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
@@ -275,6 +281,9 @@ async fn a_database_on_a_worker_is_backed_up_and_restored_by_jobs_on_its_node() 
     for statement in temps_migrations::WORKLOAD_TABLES_SQL
         .iter()
         .chain(temps_migrations::VOLUME_TABLES_SQL)
+        .chain(std::iter::once(
+            &temps_migrations::WORKLOAD_INSTANCE_PORTS_SQL,
+        ))
         .chain(std::iter::once(&claims))
         .chain(temps_migrations::NODE_STATE_TABLES_SQL)
         .chain(temps_migrations::NODE_STATE_DNS_SQL)
@@ -483,6 +492,91 @@ async fn scenario(docker: &Docker, db: &TestDatabase, fixture: &Fixture) {
         .await
         .expect("reading the restored table");
     assert_eq!(restored.trim(), "42", "the restore brought the row back");
+
+    // 5. A corrupt dump that S3 serves successfully fails the restore
+    //    before psql touches the database.
+    let corrupt_key = format!(
+        "external_services/postgres/proof-db/{}/corrupt.sql.gz",
+        fixture.scope
+    );
+    let mut corrupt = s3
+        .get_object()
+        .bucket(BUCKET)
+        .key(&key)
+        .send()
+        .await
+        .expect("reading the dump")
+        .body
+        .collect()
+        .await
+        .expect("reading the dump body")
+        .into_bytes()
+        .to_vec();
+    corrupt.truncate(corrupt.len() / 2);
+    s3.put_object()
+        .bucket(BUCKET)
+        .key(&corrupt_key)
+        .body(corrupt.into())
+        .send()
+        .await
+        .expect("uploading the truncated dump");
+    let refused = run_database_job(
+        &plane,
+        &target,
+        JobPurpose::Restore { restore_run_id: 2 },
+        restore_script(&target, &corrupt_key),
+        job_env(PG_PASSWORD, &bucket_target),
+        &CancellationToken::new(),
+    )
+    .await
+    .expect_err("a truncated dump must fail the restore");
+    assert!(
+        matches!(
+            refused,
+            DatabaseJobError::Failed {
+                exit_code: Some(exit::CORRUPT_DUMP),
+                ..
+            }
+        ),
+        "{refused}"
+    );
+    let untouched = psql(docker, &fixture.pg, "select x from proof;")
+        .await
+        .expect("the table is still there");
+    assert_eq!(untouched.trim(), "42", "nothing of the truncated dump ran");
+
+    // 6. A backup job whose waiter is dropped (the executor's timeout won)
+    //    is stopped and removed, never left dumping.
+    let job = start_database_job(
+        &plane,
+        &target,
+        JobPurpose::Backup { backup_id: 3 },
+        "sleep 600".to_string(),
+        job_env(PG_PASSWORD, &bucket_target),
+    )
+    .await
+    .expect("the job starts");
+    let abandoned = job.workload_id();
+    let dropped =
+        tokio::time::timeout(Duration::from_secs(5), job.wait(&CancellationToken::new())).await;
+    assert!(dropped.is_err(), "the job sleeps past the timeout");
+    stop_and_await_removal(
+        plane.as_ref(),
+        target.service_id,
+        "backup",
+        abandoned,
+        "proof: waiting for the abandoned job",
+        RemovalTiming {
+            timeout: Duration::from_secs(60),
+            poll: Duration::from_millis(500),
+        },
+    )
+    .await
+    .expect("the abandoned job is removed");
+    assert_eq!(
+        plane.job_state(abandoned).await.expect("state"),
+        JobState::Gone
+    );
 
     reconciler.abort();
 }
