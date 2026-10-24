@@ -216,8 +216,21 @@ pub fn identify(
     container_names: &HashMap<String, WorkloadRef>,
 ) -> Option<WorkloadRef> {
     let label = |key: &str| container.labels.get(key).map(String::as_str);
+    let environment = || {
+        label(ENVIRONMENT_LABEL)
+            .and_then(|id| id.parse::<i64>().ok())
+            .map(|id| WorkloadRef::new(WorkloadKind::Deployment, id))
+    };
     if let (Some(kind), Some(owner)) = (label(labels::KIND), label(labels::OWNER_ID)) {
         if let (Ok(kind), Ok(id)) = (kind.parse::<WorkloadKind>(), owner.parse::<i64>()) {
+            // Policy subjects `deployment/N` name environment N, while the
+            // plane stamps a replica's owner with its *deployment* id. The
+            // environment label decides; without one the owner id must not
+            // be read as an environment id (that would apply an unrelated
+            // environment's rules), so the replica stays unidentified.
+            if kind == WorkloadKind::Deployment {
+                return environment();
+            }
             return Some(WorkloadRef::new(kind, id));
         }
     }
@@ -226,9 +239,7 @@ pub fn identify(
     }
     // `sh.temps.kind` is also used by backup helpers with values that are
     // not workload kinds; those carry no environment label.
-    label(ENVIRONMENT_LABEL)
-        .and_then(|id| id.parse::<i64>().ok())
-        .map(|id| WorkloadRef::new(WorkloadKind::Deployment, id))
+    environment()
 }
 
 /// What one pass did.
@@ -269,6 +280,10 @@ pub struct NodePlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Installed {
+    /// A fresh process: a previous one may have left tables in the kernel
+    /// (rules outlive the process that applied them), so the first pass
+    /// that does not enforce clears them.
+    Unknown,
     Nothing,
     Shadow(u64),
     Enforced(u64),
@@ -311,7 +326,7 @@ impl NodeEnforcer {
             dns,
             egress,
             port_cache: HashMap::new(),
-            installed: Installed::Nothing,
+            installed: Installed::Unknown,
         }
     }
 
@@ -323,9 +338,13 @@ impl NodeEnforcer {
     pub async fn reconcile(&mut self) -> Result<PassOutcome, EnforcerError> {
         let mode = self.policies.mode().await?;
         if mode == NodeMode::Legacy {
-            if matches!(self.installed, Installed::Enforced(_)) {
-                self.remove(mode).await?;
-                return Ok(PassOutcome::Removed { mode });
+            match self.installed {
+                Installed::Enforced(_) => {
+                    self.remove(mode).await?;
+                    return Ok(PassOutcome::Removed { mode });
+                }
+                Installed::Unknown => self.clear_leftovers(mode).await?,
+                Installed::Nothing | Installed::Shadow(_) => {}
             }
             self.installed = Installed::Nothing;
             return Ok(PassOutcome::Legacy);
@@ -342,8 +361,10 @@ impl NodeEnforcer {
         match mode {
             NodeMode::Legacy => Ok(PassOutcome::Legacy),
             NodeMode::Shadow => {
-                if matches!(self.installed, Installed::Enforced(_)) {
-                    self.remove(mode).await?;
+                match self.installed {
+                    Installed::Enforced(_) => self.remove(mode).await?,
+                    Installed::Unknown => self.clear_leftovers(mode).await?,
+                    Installed::Nothing | Installed::Shadow(_) => {}
                 }
                 if self.installed == Installed::Shadow(plan.digest) {
                     return Ok(PassOutcome::Unchanged {
@@ -439,6 +460,24 @@ impl NodeEnforcer {
         self.dns.store(Arc::new(DnsPolicy::open()));
         self.egress.store(Arc::new(EgressTable::default()));
         info!(node = %self.node, table = %self.table, %mode, "network policy removed from the node");
+        self.installed = Installed::Nothing;
+        Ok(())
+    }
+
+    /// Clears tables a previous process may have left, once per process.
+    /// On failure the state stays [`Installed::Unknown`] and the next pass
+    /// retries, so a stale restriction is never silently kept.
+    async fn clear_leftovers(&mut self, mode: NodeMode) -> Result<(), EnforcerError> {
+        self.executor
+            .clear_leftover_tables(&self.table)
+            .await
+            .map_err(|source| EnforcerError::Apply {
+                node: self.node.clone(),
+                source,
+            })?;
+        self.dns.store(Arc::new(DnsPolicy::open()));
+        self.egress.store(Arc::new(EgressTable::default()));
+        info!(node = %self.node, table = %self.table, %mode, "cleared any network policy tables left by a previous process");
         self.installed = Installed::Nothing;
         Ok(())
     }
@@ -766,11 +805,19 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         applied: Mutex<Vec<String>>,
+        /// Makes the next apply fail once, as a missing helper would.
+        fail_next: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl NftExecutor for RecordingExecutor {
         async fn apply(&self, ruleset: &str) -> Result<(), NftError> {
+            if self.fail_next.swap(false, Ordering::Relaxed) {
+                return Err(NftError::Timeout {
+                    location: self.location(),
+                    timeout_secs: 1,
+                });
+            }
             self.applied.lock().await.push(ruleset.to_string());
             Ok(())
         }
@@ -967,9 +1014,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn plane_deployment_replicas_are_identified_by_their_environment() {
+        let names = HashMap::new();
+        // Revision 42 of environment 7, as the plane labels it: the policy
+        // subject is deployment/7, never deployment/42.
+        let replica = container(
+            1,
+            &[
+                (labels::KIND, "deployment"),
+                (labels::OWNER_ID, "42"),
+                (ENVIRONMENT_LABEL, "7"),
+            ],
+            "10.0.0.1",
+        );
+        assert_eq!(
+            identify(&replica, &names),
+            Some(WorkloadRef::new(WorkloadKind::Deployment, 7))
+        );
+        // Without an environment label the deployment id is not an
+        // environment id: no identity rather than someone else's rules.
+        let unlabelled = container(
+            2,
+            &[(labels::KIND, "deployment"), (labels::OWNER_ID, "42")],
+            "10.0.0.2",
+        );
+        assert_eq!(identify(&unlabelled, &names), None);
+        // A legacy deployment container carries only the environment label.
+        let legacy = container(3, &[(ENVIRONMENT_LABEL, "7")], "10.0.0.3");
+        assert_eq!(
+            identify(&legacy, &names),
+            Some(WorkloadRef::new(WorkloadKind::Deployment, 7))
+        );
+    }
+
     #[tokio::test]
-    async fn legacy_touches_nothing() {
+    async fn legacy_touches_nothing_after_clearing_leftovers() {
         let mut h = harness(NodeMode::Legacy);
+        // The first pass of a process clears what a previous one may have
+        // left (see a_restarted_legacy_node_clears_tables_a_previous_process_left).
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        h.executor.applied.lock().await.clear();
         assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
         assert!(h.executor.applied.lock().await.is_empty());
         assert_eq!(
@@ -990,9 +1075,37 @@ mod tests {
         assert_eq!(summary.local_workloads, 3);
         assert_eq!(summary.enforced_policies, 1);
         assert_eq!(summary.bindings, 3);
-        assert!(h.executor.applied.lock().await.is_empty());
+        assert_eq!(
+            h.executor.applied.lock().await.as_slice(),
+            [node_removal_ruleset(h.enforcer.table())].as_slice(),
+            "shadow only ever removes (leftovers here), never applies policy"
+        );
         assert_eq!(h.dns.load().restricted_sources(), 0);
         assert!(h.egress.load().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_linked_service_on_another_node_is_allowed_by_its_remote_address() {
+        let mut h = harness(NodeMode::Enforce);
+        // service/5 runs only on a worker: no local container, one address
+        // the control plane recorded for it.
+        if let Ok(mut containers) = h.instances.containers.lock() {
+            containers.retain(|c| c.name != "app-2");
+        }
+        let mut snapshot = h.policies.snapshot().await.unwrap();
+        snapshot.container_names.clear();
+        snapshot.remote = IdentityMap::new().with(service(5), "172.20.5.42".parse().unwrap());
+        h.policies.set_snapshot(snapshot);
+        assert!(matches!(
+            h.enforcer.reconcile().await.unwrap(),
+            PassOutcome::Applied(_)
+        ));
+        let applied = h.executor.applied.lock().await;
+        assert!(
+            applied[0].contains("172.20.5.42"),
+            "the remote service's address backs the link allow: {}",
+            applied[0]
+        );
     }
 
     #[tokio::test]
@@ -1067,6 +1180,51 @@ mod tests {
         assert_eq!(h.dns.load().restricted_sources(), 0);
         drop(applied);
         assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+    }
+
+    #[tokio::test]
+    async fn a_restarted_legacy_node_clears_tables_a_previous_process_left() {
+        // The previous process enforced; this one starts with the node
+        // already switched back to legacy and must not keep its rules.
+        let mut h = harness(NodeMode::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        {
+            let applied = h.executor.applied.lock().await;
+            assert_eq!(
+                applied.as_slice(),
+                [node_removal_ruleset(h.enforcer.table())].as_slice(),
+                "the first legacy pass clears both tables"
+            );
+        }
+        // Later legacy passes do not touch the kernel again.
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.executor.applied.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_leftover_clear_is_retried_on_the_next_pass() {
+        let mut h = harness(NodeMode::Legacy);
+        h.executor.fail_next.store(true, Ordering::Relaxed);
+        assert!(h.enforcer.reconcile().await.is_err());
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(
+            h.executor.applied.lock().await.as_slice(),
+            [node_removal_ruleset(h.enforcer.table())].as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_shadow_node_clears_leftover_tables_before_shadowing() {
+        let mut h = harness(NodeMode::Shadow);
+        assert!(matches!(
+            h.enforcer.reconcile().await.unwrap(),
+            PassOutcome::Shadowed(_)
+        ));
+        let applied = h.executor.applied.lock().await;
+        assert_eq!(
+            applied.as_slice(),
+            [node_removal_ruleset(h.enforcer.table())].as_slice()
+        );
     }
 
     #[tokio::test]

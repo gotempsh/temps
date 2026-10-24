@@ -7,9 +7,12 @@ import {
   describePorts,
   describeSubject,
   effectivePolicyEnforcementText,
+  HOST_RULES_UNAVAILABLE,
+  networkPolicyModeUnavailableReason,
   profileUpdate,
   nodeNetworkPolicyMode,
   ruleDeleteBlockedReason,
+  ruleNotEnforcedReason,
   rulesQuery,
   type EffectivePolicy,
   type NetworkPolicyRule,
@@ -21,8 +24,8 @@ function form(overrides: Partial<RuleFormValues>): RuleFormValues {
     subject_kind: 'sandbox',
     subject_id: '42',
     direction: 'egress',
-    peer_kind: 'host',
-    peer_ref: 'registry.example.test',
+    peer_kind: 'cidr',
+    peer_ref: '10.20.0.0/16',
     port_start: '',
     port_end: '',
     protocol: 'tcp',
@@ -51,6 +54,7 @@ function rule(overrides: Partial<NetworkPolicyRule>): NetworkPolicyRule {
     created_by: 1,
     created_at: '2026-01-01T00:00:00Z',
     updated_at: '2026-01-01T00:00:00Z',
+    enforceable: true,
     ...overrides,
   }
 }
@@ -74,8 +78,8 @@ describe('buildCreateRuleRequest', () => {
         subject_kind: 'sandbox',
         subject_id: 42,
         direction: 'egress',
-        peer_kind: 'host',
-        peer_ref: 'registry.example.test',
+        peer_kind: 'cidr',
+        peer_ref: '10.20.0.0/16',
         protocol: 'tcp',
         action: 'allow',
       },
@@ -99,9 +103,21 @@ describe('buildCreateRuleRequest', () => {
     })
   })
 
-  test('refuses a host peer on ingress', () => {
-    const result = buildCreateRuleRequest(form({ direction: 'ingress' }))
-    expect(result.ok).toBe(false)
+  test('refuses a hostname peer until something enforces it', () => {
+    for (const direction of ['egress', 'ingress'] as const) {
+      const result = buildCreateRuleRequest(
+        form({
+          direction,
+          peer_kind: 'host',
+          peer_ref: 'registry.example.test',
+        })
+      )
+      expect(result).toEqual({
+        ok: false,
+        error: HOST_RULES_UNAVAILABLE,
+        field: 'peer_kind',
+      })
+    }
   })
 
   test('refuses a last port without a first, and bad ranges', () => {
@@ -155,11 +171,48 @@ describe('display helpers', () => {
           role: 'control',
           status: 'online',
           mode: 'shadow',
+          supports_enforcement: true,
+          enforcement_unavailable_reason: null,
         },
       ],
     }
     expect(nodeNetworkPolicyMode(list, 0)?.mode).toBe('shadow')
     expect(nodeNetworkPolicyMode(list, 5)).toBeUndefined()
+  })
+
+  test('stored hostname rules are flagged as not enforced', () => {
+    expect(ruleNotEnforcedReason(rule({}))).toBeNull()
+    expect(
+      ruleNotEnforcedReason(rule({ peer_kind: 'host', enforceable: false }))
+    ).toContain('egress proxy')
+  })
+
+  test('workers offer only Legacy, with the reason', () => {
+    const worker = {
+      node_id: 3,
+      name: 'worker-3',
+      role: 'worker',
+      status: 'online',
+      mode: 'enforce',
+      supports_enforcement: false,
+      enforcement_unavailable_reason: 'No enforcer runs on worker nodes yet.',
+    }
+    expect(networkPolicyModeUnavailableReason(worker, 'legacy')).toBeNull()
+    expect(networkPolicyModeUnavailableReason(worker, 'shadow')).toBe(
+      'No enforcer runs on worker nodes yet.'
+    )
+    expect(
+      networkPolicyModeUnavailableReason(
+        { ...worker, enforcement_unavailable_reason: null },
+        'enforce'
+      )
+    ).toContain('cannot')
+    expect(
+      networkPolicyModeUnavailableReason(
+        { ...worker, node_id: 0, supports_enforcement: true },
+        'enforce'
+      )
+    ).toBeNull()
   })
 
   test('enforcement text names the nodes', () => {

@@ -49,6 +49,11 @@ export interface NetworkPolicyRule {
   created_by: number | null
   created_at: string
   updated_at: string
+  /**
+   * False for a `host` rule: hostname rules are applied only by the egress
+   * proxy, which no node runs yet, so such a rule is shown but not enforced.
+   */
+  enforceable: boolean
 }
 
 /** Mirrors `NetworkPolicyRuleListResponse`. */
@@ -118,6 +123,10 @@ export interface NodeNetworkPolicyModeEntry {
   role: string
   status: string
   mode: string
+  /** Whether this node can run Shadow or Enforce: only the control plane today. */
+  supports_enforcement: boolean
+  /** Why Shadow and Enforce are unavailable, when `supports_enforcement` is false. */
+  enforcement_unavailable_reason: string | null
 }
 
 /** Mirrors `NodeNetworkPolicyModeListResponse`. */
@@ -269,6 +278,13 @@ export interface RuleFormValues {
 }
 
 /**
+ * Why a hostname peer cannot be chosen. The server refuses such rules (409)
+ * because nothing would enforce them; the form says so before sending.
+ */
+export const HOST_RULES_UNAVAILABLE =
+  'Hostname rules are not available yet: no node runs the egress proxy that would enforce them. Use a CIDR block for the addresses instead.'
+
+/**
  * Turn the create form into the request body, or the sentence explaining
  * what is wrong. The server validates again and its detail is shown verbatim.
  */
@@ -292,13 +308,8 @@ export function buildCreateRuleRequest(
   if (peerRef === '') {
     return { ok: false, error: peerRefHint(form.peer_kind), field: 'peer_ref' }
   }
-  if (form.peer_kind === 'host' && form.direction !== 'egress') {
-    return {
-      ok: false,
-      error:
-        'A host peer only applies to egress: the egress proxy enforces it.',
-      field: 'peer_kind',
-    }
+  if (form.peer_kind === 'host') {
+    return { ok: false, error: HOST_RULES_UNAVAILABLE, field: 'peer_kind' }
   }
   const startText = form.port_start.trim()
   const endText = form.port_end.trim()
@@ -404,6 +415,28 @@ export function ruleDeleteBlockedReason(
     return 'This rule was created by a link; remove the link to remove it.'
   }
   return null
+}
+
+/** Why a stored rule is shown but not enforced, or `null` when it is. */
+export function ruleNotEnforcedReason(rule: NetworkPolicyRule): string | null {
+  return rule.enforceable
+    ? null
+    : 'Not enforced: hostname rules need the egress proxy, which no node runs yet.'
+}
+
+/**
+ * Why `mode` cannot be selected on this node, or `null` when it can. Legacy
+ * is always selectable, so a stale stored mode can be cleared.
+ */
+export function networkPolicyModeUnavailableReason(
+  entry: NodeNetworkPolicyModeEntry,
+  mode: NodeNetworkPolicyMode
+): string | null {
+  if (mode === 'legacy' || entry.supports_enforcement) return null
+  return (
+    entry.enforcement_unavailable_reason ??
+    'This node cannot compute or apply network policies.'
+  )
 }
 
 /** The node's network policy mode from the list, or `undefined`. */

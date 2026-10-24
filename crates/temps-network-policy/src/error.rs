@@ -24,6 +24,22 @@ pub enum NetworkPolicyError {
         link_id: i64,
     },
 
+    #[error(
+        "Cannot create the hostname rule for '{host}' on {subject}: hostname rules are enforced \
+         only by the shared egress proxy, and no node runs it yet. Packet rules (nftables) \
+         cannot match hostnames, so the rule would be accepted without being enforced. Use a \
+         'cidr' rule for the destination's addresses, or the workload's egress profile, instead"
+    )]
+    HostRuleNotEnforceable { subject: String, host: String },
+
+    #[error(
+        "Cannot set node {node_id} to '{mode}': no network policy enforcer runs on worker nodes \
+         yet, so the mode would be reported without any policy being computed or applied there. \
+         Only the control plane (node 0) supports 'shadow' and 'enforce'; set worker nodes to \
+         'legacy'"
+    )]
+    WorkerEnforcementUnavailable { node_id: i32, mode: String },
+
     #[error("Stored network policy rule {rule_id} is invalid: {reason}")]
     InvalidStoredRule { rule_id: i64, reason: String },
 

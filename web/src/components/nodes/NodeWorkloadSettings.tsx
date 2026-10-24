@@ -20,6 +20,7 @@ import {
   networkPolicyKeys,
   isNodeNetworkPolicyMode,
   listNodeNetworkPolicyModes,
+  networkPolicyModeUnavailableReason,
   nodeNetworkPolicyMode,
   setNodeNetworkPolicyMode,
   type NodeNetworkPolicyMode,
@@ -113,12 +114,15 @@ function ModeCards<T extends string>({
   disabled,
   onSelect,
   label,
+  unavailable,
 }: {
   modes: ModeCard<T>[]
   current: T | string
   disabled: boolean
   onSelect: (value: T) => void
   label: string
+  /** Modes this node cannot run; shown, but not selectable. */
+  unavailable?: (value: T) => boolean
 }) {
   return (
     <div
@@ -133,7 +137,7 @@ function ModeCards<T extends string>({
         <button
           key={mode.value}
           type="button"
-          disabled={disabled}
+          disabled={disabled || (unavailable?.(mode.value) ?? false)}
           aria-pressed={current === mode.value}
           onClick={() => {
             if (current !== mode.value) onSelect(mode.value)
@@ -495,11 +499,23 @@ function NetworkPolicyModeSection({
             modes={NETWORK_MODES}
             current={entry.mode}
             disabled={!canEdit || update.isPending}
+            unavailable={(mode) =>
+              networkPolicyModeUnavailableReason(entry, mode) !== null
+            }
             onSelect={(mode) => {
               if (mode === 'enforce') setConfirmEnforce(true)
               else update.mutate(mode)
             }}
           />
+          {entry.supports_enforcement ? null : (
+            <p className="text-sm text-muted-foreground">
+              Shadow and Enforce are unavailable on this node.{' '}
+              {networkPolicyModeUnavailableReason(entry, 'enforce')}
+              {entry.mode === 'legacy'
+                ? null
+                : ` Its stored mode “${entry.mode}” is not applied; select Legacy to clear it.`}
+            </p>
+          )}
           {isNodeNetworkPolicyMode(entry.mode) ? null : (
             <p className="text-sm text-warning-strong">
               The server reports an unknown mode &ldquo;{entry.mode}&rdquo;.

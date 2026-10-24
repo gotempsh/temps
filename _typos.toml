@@ -50,6 +50,11 @@ mis = "mis"
 # (crates/temps-ai-gateway/src/handlers/gateway.rs); typos reads the "caf"
 # before the escape as a misspelling of "calf".
 caf = "caf"
+# nftables ICMPv6 neighbour-discovery type names (`nd-router-solicit`,
+# `nd-neighbor-advert`, ...) in the bridge anti-spoofing chain
+# (crates/temps-workload-netpol/src/binding.rs). typos "corrects" the `nd`
+# prefix to "and", which produces a ruleset nft refuses to load.
+nd = "nd"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

@@ -30,6 +30,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use tracing::{debug, info};
 
+use crate::binding::node_removal_ruleset;
 use crate::nft::{removal_ruleset, TableName};
 
 /// Where the kernel says whether bridged frames reach netfilter.
@@ -77,8 +78,26 @@ pub trait NftExecutor: Send + Sync {
     /// `nft list table inet <table>`, or `None` when it does not exist.
     async fn list(&self, table: &TableName) -> Result<Option<String>, NftError>;
 
+    /// Removes both node tables (`inet` and `bridge`) that a previous
+    /// process may have left behind, e.g. one that enforced and was
+    /// restarted after the node was switched back to legacy. Idempotent.
+    ///
+    /// Implementations succeed without touching the kernel when they can
+    /// tell nothing was ever installed through them (no `nft` program on the
+    /// host, no privilege to change the ruleset, no helper image in the
+    /// VM), so a node that never enforced pays nothing for the check.
+    async fn clear_leftover_tables(&self, table: &TableName) -> Result<(), NftError> {
+        self.apply(&node_removal_ruleset(table)).await
+    }
+
     /// Where the rules land, for logs and errors.
     fn location(&self) -> String;
+}
+
+/// Whether nft refused for lack of privilege: a process that cannot change
+/// the ruleset cannot have installed tables through this executor either.
+fn not_permitted(output: &str) -> bool {
+    output.contains("Operation not permitted") || output.contains("Permission denied")
 }
 
 /// The executor for where the daemon runs (ADR-055 §17): the host's own
@@ -184,6 +203,27 @@ impl NftExecutor for HostNft {
         listing(self.location(), status, output)
     }
 
+    async fn clear_leftover_tables(&self, table: &TableName) -> Result<(), NftError> {
+        let result = self
+            .run(&["-f", "-"], Some(&node_removal_ruleset(table)))
+            .await;
+        match result {
+            // No nft program: nothing can have been installed through it.
+            Err(NftError::Spawn { reason, .. })
+                if reason.contains("No such file") || reason.contains("not found") =>
+            {
+                debug!(program = %self.program, table = %table, "no nft program; no leftover network policy tables to clear");
+                Ok(())
+            }
+            Err(e) => Err(e),
+            Ok((status, output)) if status != 0 && not_permitted(&output) => {
+                debug!(table = %table, %output, "nft not permitted; no leftover network policy tables can exist");
+                Ok(())
+            }
+            Ok((status, output)) => rejected_unless_ok(self.location(), status, output),
+        }
+    }
+
     fn location(&self) -> String {
         "this host".to_string()
     }
@@ -255,7 +295,7 @@ impl DockerVmNft {
         }
         info!(image = %self.image, "building the nft helper image in the Docker VM");
         let name = helper_name("build");
-        let (status, output) = self
+        let run = self
             .run_container(
                 &name,
                 &self.base_image,
@@ -263,8 +303,17 @@ impl DockerVmNft {
                 HelperMode::Plain,
                 None,
             )
-            .await
-            .map_err(|e| image_error(e.to_string()))?;
+            .await;
+        let (status, output) = match run {
+            Ok(done) => done,
+            Err(e) => {
+                // A failed or timed-out build leaves its container behind,
+                // still running after a timeout: remove it (force stops it)
+                // so retries do not accumulate containers.
+                self.remove_container(&name).await;
+                return Err(image_error(e.to_string()));
+            }
+        };
         let result = if status == 0 {
             let (repo, tag) = self
                 .image
@@ -486,6 +535,23 @@ impl NftExecutor for DockerVmNft {
         let script = format!("exec nft list table inet {table}");
         let (status, output) = self.run_nft(&script, None).await?;
         listing(self.location(), status, output)
+    }
+
+    async fn clear_leftover_tables(&self, table: &TableName) -> Result<(), NftError> {
+        // Every ruleset reaches the VM through the helper image, so a VM
+        // without it never received one: skip building it just to clear
+        // nothing.
+        if self.docker.inspect_image(&self.image).await.is_err() {
+            debug!(image = %self.image, table = %table, "no nft helper image in the Docker VM; no leftover network policy tables to clear");
+            return Ok(());
+        }
+        let (status, output) = self
+            .run_nft(
+                "exec nft -f /netpol.nft",
+                Some(&node_removal_ruleset(table)),
+            )
+            .await?;
+        rejected_unless_ok(self.location(), status, output)
     }
 
     fn location(&self) -> String {

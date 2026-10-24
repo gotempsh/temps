@@ -19,13 +19,17 @@
 //!     type filter hook prerouting priority -300; policy accept;
 //!     iifname "veth1a2b3c4" ether type ip ip saddr != @port_sandbox_1_v4 counter drop
 //!     iifname "veth1a2b3c4" ether type arp arp saddr ip != @port_sandbox_1_v4 counter drop
+//!     iifname "veth1a2b3c4" ether type ip6 ip6 saddr { ::, fe80::/10 } icmpv6 type { nd-router-solicit, … } accept
 //!     iifname "veth1a2b3c4" ether type ip6 ip6 saddr != @port_sandbox_1_v6 counter drop
 //!   }
 //! }
 //! ```
 //!
-//! IPv6 link-local (`fe80::/10`) and the unspecified address stay allowed so
-//! neighbour discovery keeps working; neither ever appears in a policy set.
+//! IPv6 link-local (`fe80::/10`) and the unspecified address are accepted
+//! only for neighbour discovery (ICMPv6 types 133–137) and the MLDv2 listener
+//! reports duplicate address detection sends: neither address ever appears in
+//! a policy set, so any other traffic from them (link-local TCP or UDP to a
+//! neighbour or the host) would otherwise bypass every policy chain.
 //! A port with no bound address in a family drops that family entirely.
 //!
 //! The port is the host-side interface of the instance's veth pair, found by
@@ -39,6 +43,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use temps_workload::WorkloadRef;
 
 use crate::nft::TableName;
+
+/// ICMPv6 types accepted from the link-local and unspecified addresses:
+/// router/neighbour solicitation and advertisement, redirect (133–137) and
+/// MLDv2 listener reports (143), which DAD sends from `::`.
+const LINK_LOCAL_ICMPV6_TYPES: &str = "nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect, mld2-listener-report";
 
 /// Priority of the anti-spoofing chain: the earliest bridge hook, before
 /// connection tracking and before any policy.
@@ -137,20 +146,17 @@ pub fn compile_bindings(
             binding.workload.id
         );
         let v4: Vec<String> = binding.v4.iter().map(|a| a.to_string()).collect();
-        let mut v6: Vec<String> = binding.v6.iter().map(|a| a.to_string()).collect();
+        let v6: Vec<String> = binding.v6.iter().map(|a| a.to_string()).collect();
         let _ = write!(sets, "\tset {base}_v4 {{\n\t\ttype ipv4_addr;\n");
         if !v4.is_empty() {
             let _ = writeln!(sets, "\t\telements = {{ {} }}", v4.join(", "));
         }
         let _ = writeln!(sets, "\t}}");
-        // Neighbour discovery and duplicate address detection.
-        v6.push("::".to_string());
-        v6.push("fe80::/10".to_string());
-        let _ = writeln!(
-            sets,
-            "\tset {base}_v6 {{\n\t\ttype ipv6_addr;\n\t\tflags interval;\n\t\telements = {{ {} }}\n\t}}",
-            v6.join(", ")
-        );
+        let _ = write!(sets, "\tset {base}_v6 {{\n\t\ttype ipv6_addr;\n");
+        if !v6.is_empty() {
+            let _ = writeln!(sets, "\t\telements = {{ {} }}", v6.join(", "));
+        }
+        let _ = writeln!(sets, "\t}}");
         let port = &binding.port;
         let _ = writeln!(
             rules,
@@ -159,6 +165,12 @@ pub fn compile_bindings(
         let _ = writeln!(
             rules,
             "\t\tiifname \"{port}\" ether type arp arp saddr ip != @{base}_v4 counter drop"
+        );
+        // Neighbour discovery and duplicate address detection only: the
+        // link-local and unspecified sources never carry anything else.
+        let _ = writeln!(
+            rules,
+            "\t\tiifname \"{port}\" ether type ip6 ip6 saddr {{ ::, fe80::/10 }} icmpv6 type {{ {LINK_LOCAL_ICMPV6_TYPES} }} accept"
         );
         let _ = writeln!(
             rules,
@@ -210,8 +222,40 @@ mod tests {
             "{rules}"
         );
         assert!(rules.contains("arp saddr ip != @port_sandbox_1_0_v4"));
-        assert!(rules.contains("elements = { ::, fe80::/10 }"), "{rules}");
+        assert!(
+            !rules.contains("elements = { ::, fe80::/10 }"),
+            "link-local is not a bound source address: {rules}"
+        );
+        assert!(
+            rules.contains(
+                "iifname \"veth1a2b3c4\" ether type ip6 ip6 saddr { ::, fe80::/10 } icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert, nd-redirect, mld2-listener-report } accept"
+            ),
+            "{rules}"
+        );
         assert!(rules.contains("hook prerouting priority -300"));
+    }
+
+    #[test]
+    fn link_local_is_accepted_only_for_neighbour_discovery_and_before_the_drop() {
+        let rules = compile_bindings(
+            &TableName::default_table(),
+            &[PortBinding::new(sandbox(1), "veth1")
+                .with("172.20.0.5".parse().unwrap())
+                .with("fd00::5".parse().unwrap())],
+        )
+        .unwrap();
+        let nd = rules
+            .find("saddr { ::, fe80::/10 } icmpv6 type")
+            .expect("the neighbour discovery exception is present");
+        let drop = rules
+            .find("ip6 saddr != @port_sandbox_1_0_v6 counter drop")
+            .expect("the IPv6 drop is present");
+        assert!(nd < drop, "the exception must precede the drop: {rules}");
+        // The only rule mentioning link-local is the ICMPv6 one: no rule or
+        // set admits link-local TCP or UDP.
+        assert_eq!(rules.matches("fe80::/10").count(), 1, "{rules}");
+        assert!(!rules.contains("echo-request"), "{rules}");
+        assert!(rules.contains("elements = { fd00::5 }"), "{rules}");
     }
 
     #[test]

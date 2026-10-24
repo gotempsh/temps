@@ -42,8 +42,7 @@ use bollard::models::{
     IpamConfig, NetworkCreateRequest, NetworkingConfig,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, ListContainersOptions, ListNetworksOptions, LogsOptions,
-    RemoveContainerOptions, WaitContainerOptions,
+    CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use futures::{FutureExt, StreamExt};
@@ -64,10 +63,8 @@ const IMAGE: &str = "alpine:3.21";
 const TEST_LABEL: &str = "sh.temps.test";
 const TEST_VALUE: &str = "adr055-p7";
 const NODE_LABEL: &str = "sh.temps.test.node";
-const RULE_COMMENT: &str = "adr055-p7-two-node";
+const RUN_LABEL: &str = "sh.temps.test.run";
 
-const NET_A: &str = "temps-p7-node-a";
-const NET_B: &str = "temps-p7-node-b";
 const SUBNET_A: &str = "10.237.11.0/24";
 const SUBNET_B: &str = "10.237.12.0/24";
 
@@ -80,6 +77,18 @@ const RESOLVER_IP: &str = "10.237.11.53"; // node A's resolver
 const S1_IP: &str = "10.237.12.10"; // service linked to R (5432)
 const S2_IP: &str = "10.237.12.11"; // service not linked to R; ingress only from V
 const PUBLIC_IP: &str = "10.237.12.54"; // stands in for a public resolver
+
+/// This run's id. It scopes every label, container, network, nft table and
+/// rule comment the run creates, so concurrent runs (two checkouts, a CI
+/// retry) never observe or remove each other's objects, and cleanup touches
+/// only what this run recorded.
+fn run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}{:04x}", std::process::id(), nanos & 0xffff)
+}
 
 fn bin_path() -> PathBuf {
     let arch = std::env::consts::ARCH;
@@ -248,6 +257,7 @@ fn resolver_config() -> ServeConfig {
 struct NodeInstances {
     inner: DockerInstanceSource,
     node: &'static str,
+    run: String,
 }
 
 #[async_trait]
@@ -260,6 +270,7 @@ impl InstanceSource for NodeInstances {
             .into_iter()
             .filter(|c| {
                 c.labels.get(TEST_LABEL).map(String::as_str) == Some(TEST_VALUE)
+                    && c.labels.get(RUN_LABEL) == Some(&self.run)
                     && c.labels.get(NODE_LABEL).map(String::as_str) == Some(self.node)
             })
             .collect())
@@ -271,6 +282,7 @@ impl InstanceSource for NodeInstances {
 
 struct Lab {
     docker: Docker,
+    run: String,
     containers: Vec<String>,
     networks: Vec<String>,
     config_dir: PathBuf,
@@ -301,69 +313,44 @@ impl Lab {
             );
             return None;
         }
-        let config_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/musl/two-node-config");
+        let run = run_id();
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/musl/two-node-config-{run}"));
         if std::fs::create_dir_all(&config_dir).is_err() {
             println!("cannot create {}, skipping", config_dir.display());
             return None;
         }
-        let lab = Lab {
+        Some(Lab {
             docker,
+            run,
             containers: Vec::new(),
             networks: Vec::new(),
             config_dir,
             enforcers: Vec::new(),
             routed: false,
-        };
-        lab.remove_leftovers().await;
-        Some(lab)
+        })
     }
 
-    /// Removes what a crashed earlier run left behind: only objects with
-    /// this test's label.
-    async fn remove_leftovers(&self) {
-        let filter = HashMap::from([(
-            "label".to_string(),
-            vec![format!("{TEST_LABEL}={TEST_VALUE}")],
-        )]);
-        if let Ok(list) = self
-            .docker
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters: Some(filter.clone()),
-                ..Default::default()
-            }))
-            .await
-        {
-            for c in list {
-                if let Some(id) = c.id {
-                    let _ = self
-                        .docker
-                        .remove_container(
-                            &id,
-                            Some(RemoveContainerOptions {
-                                force: true,
-                                ..Default::default()
-                            }),
-                        )
-                        .await;
-                }
-            }
-        }
-        if let Ok(list) = self
-            .docker
-            .list_networks(Some(ListNetworksOptions {
-                filters: Some(filter),
-            }))
-            .await
-        {
-            for n in list {
-                if let Some(name) = n.name.filter(|n| n == NET_A || n == NET_B) {
-                    let _ = self.docker.remove_network(&name).await;
-                }
-            }
-        }
-        let _ = self.vm_shell(&remove_route_script()).await;
+    /// A container's full name in this run.
+    fn full(&self, name: &str) -> String {
+        format!("temps-p7-{}-{name}", self.run)
+    }
+
+    /// A simulated node's network in this run.
+    fn net(&self, node: &str) -> String {
+        format!("temps-p7-{}-node-{node}", self.run)
+    }
+
+    /// The comment on this run's DOCKER-USER route rules.
+    fn rule_comment(&self) -> String {
+        format!("adr055-p7-two-node-{}", self.run)
+    }
+
+    fn run_labels(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (TEST_LABEL.to_string(), TEST_VALUE.to_string()),
+            (RUN_LABEL.to_string(), self.run.clone()),
+        ])
     }
 
     async fn network(&mut self, name: &str, subnet: &str) {
@@ -390,14 +377,17 @@ impl Lab {
                         "nat-unprotected".to_string(),
                     ),
                 ])),
-                labels: Some(HashMap::from([(
-                    TEST_LABEL.to_string(),
-                    TEST_VALUE.to_string(),
-                )])),
+                labels: Some(self.run_labels()),
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|e| panic!("create network {name} ({subnet}): {e}"));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "create network {name} ({subnet}): {e}. The subnets are fixed, so this \
+                     fails while another run, or one that was killed, holds them; list those \
+                     with `docker network ls --filter label={TEST_LABEL}={TEST_VALUE}`"
+                )
+            });
         self.networks.push(name.to_string());
     }
 
@@ -412,16 +402,14 @@ impl Lab {
         cap_add: Vec<String>,
         dns: Option<&str>,
     ) {
-        let network = if node == "a" { NET_A } else { NET_B };
-        let mut container_labels = HashMap::from([
-            (TEST_LABEL.to_string(), TEST_VALUE.to_string()),
-            (NODE_LABEL.to_string(), node.to_string()),
-        ]);
+        let network = self.net(node);
+        let mut container_labels = self.run_labels();
+        container_labels.insert(NODE_LABEL.to_string(), node.to_string());
         if let Some(workload) = workload {
             container_labels.insert(labels::KIND.to_string(), workload.kind.as_str().to_string());
             container_labels.insert(labels::OWNER_ID.to_string(), workload.id.to_string());
         }
-        let full = format!("temps-p7-{name}");
+        let full = self.full(name);
         self.docker
             .create_container(
                 Some(CreateContainerOptionsBuilder::new().name(&full).build()),
@@ -430,7 +418,7 @@ impl Lab {
                     cmd: Some(cmd),
                     labels: Some(container_labels),
                     host_config: Some(HostConfig {
-                        network_mode: Some(network.to_string()),
+                        network_mode: Some(network.clone()),
                         binds: Some(vec![
                             format!("{}:/probe:ro", bin_path().display()),
                             format!("{}:/config:ro", self.config_dir.display()),
@@ -447,7 +435,7 @@ impl Lab {
                     }),
                     networking_config: Some(NetworkingConfig {
                         endpoints_config: Some(HashMap::from([(
-                            network.to_string(),
+                            network,
                             EndpointSettings {
                                 ipam_config: Some(EndpointIpamConfig {
                                     ipv4_address: Some(address.to_string()),
@@ -470,7 +458,7 @@ impl Lab {
     }
 
     async fn exec(&self, name: &str, script: &str) -> String {
-        let full = format!("temps-p7-{name}");
+        let full = self.full(name);
         let exec = self
             .docker
             .create_exec(
@@ -505,7 +493,7 @@ impl Lab {
     }
 
     async fn logs(&self, name: &str) -> String {
-        let full = format!("temps-p7-{name}");
+        let full = self.full(name);
         let mut stream = self.docker.logs(
             &full,
             Some(LogsOptions {
@@ -524,7 +512,7 @@ impl Lab {
     /// Runs `script` on the Docker VM's network namespace with
     /// `NET_ADMIN` (the nft helper image).
     async fn vm_shell(&self, script: &str) -> Result<String, String> {
-        let name = format!("temps-p7-vm-shell-{}", std::process::id());
+        let name = self.full("vm-shell");
         let _ = self
             .docker
             .remove_container(
@@ -542,10 +530,7 @@ impl Lab {
                     image: Some(HELPER_IMAGE.to_string()),
                     entrypoint: Some(vec!["sh".into(), "-c".into()]),
                     cmd: Some(vec![script.to_string()]),
-                    labels: Some(HashMap::from([(
-                        TEST_LABEL.to_string(),
-                        TEST_VALUE.to_string(),
-                    )])),
+                    labels: Some(self.run_labels()),
                     host_config: Some(HostConfig {
                         network_mode: Some("host".to_string()),
                         cap_drop: Some(vec!["ALL".to_string()]),
@@ -591,8 +576,8 @@ impl Lab {
     }
 
     async fn enforcer(&mut self, node: &'static str) {
-        let table =
-            TableName::new(format!("temps_p7_node_{node}")).unwrap_or_else(|e| panic!("{e}"));
+        let table = TableName::new(format!("temps_p7_{}_{node}", self.run))
+            .unwrap_or_else(|e| panic!("{e}"));
         let daemon_is_local = std::env::var("DOCKER_HOST")
             .map(|h| h.starts_with("unix://"))
             .unwrap_or(true);
@@ -603,6 +588,7 @@ impl Lab {
         let instances = Arc::new(NodeInstances {
             inner: DockerInstanceSource::new(format!("node-{node}"), self.docker.clone()),
             node,
+            run: self.run.clone(),
         });
         let source = Arc::new(StaticPolicySource::new(
             NodeMode::Legacy,
@@ -662,7 +648,9 @@ impl Lab {
                 .await;
         }
         if self.routed {
-            let _ = self.vm_shell(&remove_route_script()).await;
+            let _ = self
+                .vm_shell(&remove_route_script(&self.rule_comment()))
+                .await;
         }
         for name in &self.containers {
             let _ = self
@@ -683,16 +671,16 @@ impl Lab {
     }
 }
 
-fn add_route_script() -> String {
+fn add_route_script(comment: &str) -> String {
     format!(
-        "nft insert rule ip filter DOCKER-USER ip saddr {SUBNET_A} ip daddr {SUBNET_B} accept comment \\\"{RULE_COMMENT}\\\" && \
-         nft insert rule ip filter DOCKER-USER ip saddr {SUBNET_B} ip daddr {SUBNET_A} accept comment \\\"{RULE_COMMENT}\\\" && echo routed"
+        "nft insert rule ip filter DOCKER-USER ip saddr {SUBNET_A} ip daddr {SUBNET_B} accept comment \\\"{comment}\\\" && \
+         nft insert rule ip filter DOCKER-USER ip saddr {SUBNET_B} ip daddr {SUBNET_A} accept comment \\\"{comment}\\\" && echo routed"
     )
 }
 
-fn remove_route_script() -> String {
+fn remove_route_script(comment: &str) -> String {
     format!(
-        "for h in $(nft -a list chain ip filter DOCKER-USER 2>/dev/null | grep '{RULE_COMMENT}' | sed 's/.*# handle //'); do \
+        "for h in $(nft -a list chain ip filter DOCKER-USER 2>/dev/null | grep '{comment}' | sed 's/.*# handle //'); do \
            nft delete rule ip filter DOCKER-USER handle $h; done; true"
     )
 }
@@ -725,9 +713,13 @@ async fn udp_seen(lab: &Lab, payload: &str) -> Option<String> {
 }
 
 async fn run(lab: &mut Lab) {
-    lab.network(NET_A, SUBNET_A).await;
-    lab.network(NET_B, SUBNET_B).await;
-    let routed = lab.vm_shell(&add_route_script()).await.unwrap_or_default();
+    let (net_a, net_b) = (lab.net("a"), lab.net("b"));
+    lab.network(&net_a, SUBNET_A).await;
+    lab.network(&net_b, SUBNET_B).await;
+    let routed = lab
+        .vm_shell(&add_route_script(&lab.rule_comment()))
+        .await
+        .unwrap_or_default();
     assert!(
         routed.contains("routed"),
         "DOCKER-USER route between the nodes: {routed}"

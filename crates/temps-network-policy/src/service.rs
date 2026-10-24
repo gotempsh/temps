@@ -18,7 +18,8 @@ use temps_entities::{
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::NamedWorkload;
 use temps_workload_netpol::{
-    Action, Direction, L4Protocol, NodeMode, PolicySnapshot, PortRange, Profile, SystemContainer,
+    Action, Direction, IdentityMap, L4Protocol, NodeMode, PolicySnapshot, PortRange, Profile,
+    SystemContainer,
 };
 
 use crate::error::NetworkPolicyError;
@@ -79,7 +80,23 @@ pub struct NodeModeEntry {
     pub name: String,
     pub role: String,
     pub status: String,
+    /// The stored mode. On a worker anything but `legacy` is stale (see
+    /// [`node_supports_enforcement`]) and is never counted as enforcing.
     pub mode: NodeMode,
+}
+
+/// Whether a node runs a network policy enforcer. Only the control plane
+/// does today: nothing delivers policies to workers or applies them there.
+pub fn node_supports_enforcement(node_id: i32) -> bool {
+    node_id == CONTROL_PLANE_NODE_ID
+}
+
+/// Why `shadow`/`enforce` is unavailable on a node, for the console.
+pub fn enforcement_unavailable_reason(node_id: i32) -> Option<&'static str> {
+    (!node_supports_enforcement(node_id)).then_some(
+        "No network policy enforcer runs on worker nodes yet; only the control plane \
+         (node 0) can compute or apply policies.",
+    )
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -100,6 +117,37 @@ struct MemberRow {
     service_id: i32,
     container_name: String,
 }
+
+/// An address of a workload instance on another node, recorded by the
+/// control plane (overlay IPs of service members, A/AAAA name records).
+#[derive(Debug, FromQueryResult)]
+struct RemoteAddressRow {
+    kind: String,
+    owner_id: i64,
+    ip: String,
+}
+
+/// Every worker-hosted address the database knows, in one query: service
+/// members' overlay IPs and the A/AAAA records of members and environments
+/// pinned to a worker. Stopped or failed members are left out, since their
+/// addresses may already belong to someone else.
+const REMOTE_ADDRESSES_SQL: &str = "\
+    SELECT 'service' AS kind, sm.service_id::bigint AS owner_id, sm.compute_ip AS ip \
+    FROM service_members sm \
+    WHERE sm.node_id IS NOT NULL AND sm.node_id <> 0 \
+      AND sm.compute_ip IS NOT NULL AND sm.status NOT IN ('stopped', 'failed') \
+    UNION ALL \
+    SELECT CASE WHEN se.owner_kind = 'environment' THEN 'deployment' ELSE 'service' END AS kind, \
+           CASE WHEN se.owner_kind = 'environment' THEN se.owner_id ELSE sm.service_id::bigint END AS owner_id, \
+           se.target_ip AS ip \
+    FROM service_endpoints se \
+    LEFT JOIN service_members sm \
+      ON se.owner_kind = 'service_member' AND sm.id = se.owner_id \
+    WHERE se.node_id IS NOT NULL AND se.node_id <> 0 \
+      AND se.record_type IN ('A', 'AAAA') AND se.target_ip IS NOT NULL \
+      AND (se.owner_kind = 'environment' \
+           OR (se.owner_kind = 'service_member' AND sm.id IS NOT NULL \
+               AND sm.status NOT IN ('stopped', 'failed')))";
 
 #[derive(Debug, FromQueryResult)]
 struct NameRow {
@@ -217,6 +265,15 @@ impl NetworkPolicyService {
             return Err(NetworkPolicyError::validation(
                 "a host rule is egress only: incoming connections carry no hostname",
             ));
+        }
+        // Hostname rules compile only into the egress proxy's table, and no
+        // running component consumes it yet: accepting one would report a
+        // restriction (a deny in particular) that nothing enforces.
+        if let PeerSpec::Host(host) = &rule.peer {
+            return Err(NetworkPolicyError::HostRuleNotEnforceable {
+                subject: rule.subject.to_string(),
+                host: host.as_str().to_string(),
+            });
         }
         if let Some(ports) = rule.ports {
             if !ports.is_valid() {
@@ -435,11 +492,12 @@ impl NetworkPolicyService {
             .map_err(NetworkPolicyError::db(
                 "read the links that point at a subject",
             ))?;
+        // A worker's stored `enforce` is never real: no enforcer runs there.
         let enforcing_nodes = self
             .node_modes()
             .await?
             .into_iter()
-            .filter(|n| n.mode == NodeMode::Enforce)
+            .filter(|n| n.mode == NodeMode::Enforce && node_supports_enforcement(n.node_id))
             .map(|n| n.node_id)
             .collect();
         Ok(EffectivePolicy {
@@ -549,6 +607,13 @@ impl NetworkPolicyService {
             .await
             .map_err(NetworkPolicyError::db("read a node's network policy mode"))?
             .ok_or(NetworkPolicyError::NodeNotFound { node_id })?;
+        // `legacy` stays accepted so a stale stored mode can be cleared.
+        if mode != NodeMode::Legacy && !node_supports_enforcement(node_id) {
+            return Err(NetworkPolicyError::WorkerEnforcementUnavailable {
+                node_id,
+                mode: mode.as_str().to_string(),
+            });
+        }
         let previous = parse_mode(node_id, &node.network_policy_mode)?;
         let mut active: node_network_policy_modes::ActiveModel = node.into();
         active.network_policy_mode = Set(mode.as_str().to_string());
@@ -658,6 +723,13 @@ impl NetworkPolicyService {
                 WorkloadRef::new(WorkloadKind::Service, i64::from(member.service_id)),
             );
         }
+        let remote_rows: Vec<RemoteAddressRow> = self
+            .query(
+                "list worker-hosted workload addresses",
+                REMOTE_ADDRESSES_SQL,
+            )
+            .await?;
+        let remote = remote_identities(remote_rows);
         let named = names
             .into_iter()
             .filter_map(|row| {
@@ -687,6 +759,7 @@ impl NetworkPolicyService {
             egress: compiled.egress,
             names: named,
             container_names,
+            remote,
             system_containers: vec![SystemContainer {
                 name_prefix: SANDBOX_SIDECAR_PREFIX.to_string(),
                 ports: Some(PortRange::single(SANDBOX_SIDECAR_PORT)),
@@ -694,6 +767,82 @@ impl NetworkPolicyService {
             }],
             ..Default::default()
         })
+    }
+}
+
+/// Worker-hosted addresses as identities. Rows that do not parse (an
+/// unknown kind, a value that is not an IP literal) are skipped with a
+/// warning: one bad row must not stop the node from enforcing the rest.
+fn remote_identities(rows: Vec<RemoteAddressRow>) -> IdentityMap {
+    let mut remote = IdentityMap::new();
+    for row in rows {
+        let kind = match row.kind.as_str() {
+            "service" => WorkloadKind::Service,
+            "deployment" => WorkloadKind::Deployment,
+            other => {
+                tracing::warn!(
+                    kind = other,
+                    owner_id = row.owner_id,
+                    "unknown remote workload kind; address skipped"
+                );
+                continue;
+            }
+        };
+        match row.ip.trim().parse::<std::net::IpAddr>() {
+            Ok(addr) => {
+                remote.insert(WorkloadRef::new(kind, row.owner_id), addr);
+            }
+            Err(e) => tracing::warn!(
+                kind = kind.as_str(),
+                owner_id = row.owner_id,
+                ip = %row.ip,
+                error = %e,
+                "worker-hosted workload address is not an IP literal; skipped"
+            ),
+        }
+    }
+    remote
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    fn row(kind: &str, owner_id: i64, ip: &str) -> RemoteAddressRow {
+        RemoteAddressRow {
+            kind: kind.to_string(),
+            owner_id,
+            ip: ip.to_string(),
+        }
+    }
+
+    #[test]
+    fn remote_rows_become_identities_and_bad_rows_are_skipped() {
+        let remote = remote_identities(vec![
+            row("service", 5, "172.20.5.42"),
+            row("deployment", 7, " fd00::7 "),
+            row("service", 5, "orders.internal"),
+            row("sandbox", 1, "172.20.5.9"),
+        ]);
+        let service: Vec<String> = remote
+            .addresses(&WorkloadRef::new(WorkloadKind::Service, 5))
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(service, vec!["172.20.5.42".to_string()]);
+        let environment: Vec<String> = remote
+            .addresses(&WorkloadRef::new(WorkloadKind::Deployment, 7))
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(environment, vec!["fd00::7".to_string()]);
+        assert_eq!(remote.workloads().count(), 2, "unknown kinds are skipped");
+    }
+
+    #[test]
+    fn only_the_control_plane_supports_enforcement() {
+        assert!(node_supports_enforcement(CONTROL_PLANE_NODE_ID));
+        assert!(enforcement_unavailable_reason(CONTROL_PLANE_NODE_ID).is_none());
+        assert!(!node_supports_enforcement(3));
+        assert!(enforcement_unavailable_reason(3).is_some_and(|r| r.contains("worker")));
     }
 }
 
@@ -844,11 +993,30 @@ mod tests {
 
         // Operator rules: validated, then stored.
         let host_peer = PeerSpec::parse("host", "registry.example.test").unwrap();
+        // Hostname rules are refused until something enforces them: an
+        // accepted deny would otherwise be reported but never applied.
+        for action in [Action::Allow, Action::Deny] {
+            let refused = service
+                .create_rule(
+                    NewRule {
+                        action,
+                        ..rule(sandbox_ref, Direction::Egress, host_peer.clone())
+                    },
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(NetworkPolicyError::HostRuleNotEnforceable { host, .. })
+                        if host == "registry.example.test"
+                ),
+                "{refused:?}"
+            );
+        }
+        let cidr_peer = PeerSpec::parse("cidr", "10.20.0.0/16").unwrap();
         let host = service
-            .create_rule(
-                rule(sandbox_ref, Direction::Egress, host_peer.clone()),
-                None,
-            )
+            .create_rule(rule(sandbox_ref, Direction::Egress, cidr_peer), None)
             .await
             .unwrap();
         assert_eq!(host.origin, "operator");
@@ -905,7 +1073,11 @@ mod tests {
             .rules
             .iter()
             .any(|r| r.peer == Peer::Workload(db_ref)));
-        assert_eq!(snapshot.egress.len(), 1, "the host rule goes to the proxy");
+        assert_eq!(
+            snapshot.egress.len(),
+            1,
+            "the CIDR rule goes to the proxy too"
+        );
         assert_eq!(
             snapshot.container_names.get("temps-sandbox-abc123"),
             Some(&sandbox_ref)
@@ -930,18 +1102,84 @@ mod tests {
         )
         .await as i32;
         assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
+        // No enforcer runs on workers: shadow and enforce are refused, and
+        // legacy stays settable so a stale mode can be cleared.
+        for mode in [NodeMode::Enforce, NodeMode::Shadow] {
+            let refused = service.set_node_mode(worker, mode).await;
+            assert!(
+                matches!(
+                    &refused,
+                    Err(NetworkPolicyError::WorkerEnforcementUnavailable { node_id, .. })
+                        if *node_id == worker
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(service.node_mode(worker).await.unwrap(), NodeMode::Legacy);
         service
-            .set_node_mode(worker, NodeMode::Enforce)
+            .set_node_mode(worker, NodeMode::Legacy)
             .await
             .unwrap();
+        // A worker `enforce` stored before the refusal is never reported
+        // as enforcing; the control plane is.
+        c.execute_unprepared(&format!(
+            "UPDATE nodes SET network_policy_mode = 'enforce' WHERE id = {worker}"
+        ))
+        .await
+        .unwrap();
+        assert!(service
+            .effective(sandbox_ref)
+            .await
+            .unwrap()
+            .enforcing_nodes
+            .is_empty());
+        service.set_node_mode(0, NodeMode::Enforce).await.unwrap();
         assert_eq!(
             service
                 .effective(sandbox_ref)
                 .await
                 .unwrap()
                 .enforcing_nodes,
-            vec![worker]
+            vec![0]
         );
+        service.set_node_mode(0, NodeMode::Shadow).await.unwrap();
+
+        // Worker-hosted addresses reach the snapshot, so a link to a
+        // service running on a worker is an effective allow on node 0.
+        c.execute_unprepared(&format!(
+            "INSERT INTO service_members (service_id, node_id, role, container_name, \
+                 compute_ip, status, ordinal) \
+             VALUES ({db_id}, {worker}, 'primary', 'postgres-orders-0', '172.20.5.42', 'running', 0), \
+                    ({db_id}, {worker}, 'replica', 'postgres-orders-1', '172.20.5.43', 'stopped', 1)"
+        ))
+        .await
+        .unwrap();
+        c.execute_unprepared(&format!(
+            "INSERT INTO service_endpoints (fqdn, record_type, target_ip, owner_kind, owner_id, \
+                 node_id, generation) \
+             SELECT 'orders-0.orders.temps.local', 'A', '172.20.5.44', 'service_member', id, \
+                 {worker}, 1 \
+             FROM service_members WHERE container_name = 'postgres-orders-0'"
+        ))
+        .await
+        .unwrap();
+        let snapshot = source.snapshot().await.unwrap();
+        let mut remote: Vec<String> = snapshot
+            .remote
+            .addresses(&db_ref)
+            .map(|a| a.to_string())
+            .collect();
+        remote.sort();
+        assert_eq!(
+            remote,
+            vec!["172.20.5.42".to_string(), "172.20.5.44".to_string()],
+            "the running member's overlay IP and its name record; never the stopped member"
+        );
+        assert!(snapshot
+            .policies
+            .iter()
+            .find(|p| p.subject == sandbox_ref)
+            .is_some_and(|p| p.rules.iter().any(|r| r.peer == Peer::Workload(db_ref))));
         assert!(matches!(
             service.set_node_mode(987_654, NodeMode::Enforce).await,
             Err(NetworkPolicyError::NodeNotFound { node_id: 987_654 })

@@ -49,6 +49,7 @@ import {
   listNodeNetworkPolicyModes,
   networkPolicyKeys,
   ruleDeleteBlockedReason,
+  ruleNotEnforcedReason,
   SUBJECT_KINDS,
   type ListRulesParams,
   type NetworkPolicyRule,
@@ -91,8 +92,9 @@ function NodeModesSummary() {
       <h2 className="text-base font-semibold">Where it applies</h2>
       <p className="text-sm text-muted-foreground">
         Rules take effect only on nodes in Enforce mode. Shadow computes and
-        logs the policy without applying it. Change a node&apos;s mode on its
-        page.
+        logs the policy without applying it. Only the control plane can run
+        either today: no enforcer runs on worker nodes yet. Change a node&apos;s
+        mode on its page.
       </p>
       {query.isPending ? (
         <Skeleton className="h-6 w-2/3" />
@@ -117,7 +119,16 @@ function NodeModesSummary() {
                 className="inline-flex items-center gap-2 rounded-md border px-2.5 py-1 text-sm hover:bg-muted/50"
               >
                 <span className="font-medium">{node.name}</span>
-                <Badge variant={modeVariant(node.mode)}>{node.mode}</Badge>
+                {node.supports_enforcement ? (
+                  <Badge variant={modeVariant(node.mode)}>{node.mode}</Badge>
+                ) : (
+                  <Badge
+                    variant="neutral-subtle"
+                    title={node.enforcement_unavailable_reason ?? undefined}
+                  >
+                    cannot enforce
+                  </Badge>
+                )}
               </Link>
             </li>
           ))}
@@ -140,6 +151,7 @@ function RuleRows({
     <>
       {rules.map((rule) => {
         const blocked = ruleDeleteBlockedReason(rule)
+        const notEnforced = ruleNotEnforcedReason(rule)
         return (
           <TableRow key={rule.id}>
             <TableCell className="font-mono text-xs">#{rule.id}</TableCell>
@@ -174,6 +186,11 @@ function RuleRows({
               <span className="break-all font-mono text-xs">
                 {rule.peer_ref}
               </span>
+              {notEnforced ? (
+                <div className="mt-1 text-xs text-warning-strong">
+                  {notEnforced}
+                </div>
+              ) : null}
             </TableCell>
             <TableCell className="whitespace-nowrap text-sm">
               {describePorts(rule)}

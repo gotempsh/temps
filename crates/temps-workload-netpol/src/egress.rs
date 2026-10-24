@@ -207,6 +207,19 @@ impl Refusal {
     }
 }
 
+/// How [`CompiledRules::check_host`] admitted a destination, which decides
+/// what [`CompiledRules::check_addresses`] must then prove.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Admission {
+    /// An allow rule named the destination (a host pattern, or a CIDR that
+    /// contains the literal) on this port: every address must be public or
+    /// inside an allowed CIDR.
+    ByRule,
+    /// No rule named the hostname, but the workload has CIDR allows: every
+    /// resolved address must fall inside an allowed CIDR on this port.
+    ByAddress,
+}
+
 /// Rules of one workload, compiled for lookup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompiledRules {
@@ -229,7 +242,7 @@ impl CompiledRules {
 
     /// Whether the name may be asked for at all, before resolving it.
     /// `host` is lower case; it may be an address literal.
-    pub fn check_host(&self, host: &str, port: u16) -> Result<(), Refusal> {
+    pub fn check_host(&self, host: &str, port: u16) -> Result<Admission, Refusal> {
         let literal: Option<IpAddr> = host.parse().ok();
         let matches = |rule: &EgressRule| match (&rule.target, literal) {
             (EgressTarget::Host(pattern), None) => pattern.matches(host),
@@ -242,23 +255,32 @@ impl CompiledRules {
         }
         let allowed: Vec<&EgressRule> = self.allow.iter().filter(|r| matches(r)).collect();
         if allowed.is_empty() {
-            // A CIDR allow decides by address, after resolution.
-            if literal.is_none()
-                || !self
-                    .allow
-                    .iter()
-                    .any(|r| matches!(r.target, EgressTarget::Cidr(_)))
-            {
+            // A literal was already compared against every CIDR allow above,
+            // so nothing admits it. A hostname may still resolve into an
+            // allowed CIDR; that is decided per address after resolution,
+            // and only a CIDR match (never "is public") admits it then.
+            let has_cidr_allow = self
+                .allow
+                .iter()
+                .any(|r| matches!(r.target, EgressTarget::Cidr(_)));
+            if literal.is_some() || !has_cidr_allow {
                 return Err(Refusal::NotAllowed);
             }
-        } else if !allowed.iter().any(|r| r.port_matches(port)) {
+            return Ok(Admission::ByAddress);
+        }
+        if !allowed.iter().any(|r| r.port_matches(port)) {
             return Err(Refusal::Port);
         }
-        Ok(())
+        Ok(Admission::ByRule)
     }
 
     /// Whether every resolved address may be connected to.
-    pub fn check_addresses(&self, addrs: &[IpAddr], port: u16) -> Result<(), Refusal> {
+    pub fn check_addresses(
+        &self,
+        addrs: &[IpAddr],
+        port: u16,
+        admission: Admission,
+    ) -> Result<(), Refusal> {
         if addrs.is_empty() {
             return Err(Refusal::Unresolved);
         }
@@ -273,6 +295,9 @@ impl CompiledRules {
             }
             if self.allow.iter().any(|r| in_cidr(&r)) {
                 continue;
+            }
+            if admission == Admission::ByAddress {
+                return Err(Refusal::NotAllowed);
             }
             if !is_public(addr) {
                 return Err(Refusal::Private);
@@ -859,10 +884,13 @@ impl EgressProxy {
                 "egress proxy refused"
             );
         };
-        if let Err(refusal) = rules.check_host(host, port) {
-            refuse(refusal);
-            return None;
-        }
+        let admission = match rules.check_host(host, port) {
+            Ok(admission) => admission,
+            Err(refusal) => {
+                refuse(refusal);
+                return None;
+            }
+        };
         let addrs: Vec<IpAddr> = match host.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
             Err(_) => {
@@ -877,7 +905,7 @@ impl EgressProxy {
                 }
             }
         };
-        if let Err(refusal) = rules.check_addresses(&addrs, port) {
+        if let Err(refusal) = rules.check_addresses(&addrs, port, admission) {
             refuse(refusal);
             return None;
         }
@@ -1227,8 +1255,14 @@ mod tests {
                 host_rule(2, "*.blocked.test", Action::Deny),
             ],
         });
-        assert_eq!(rules.check_host("registry.npmjs.org", 443), Ok(()));
-        assert_eq!(rules.check_host("registry.npmjs.org", 80), Ok(()));
+        assert_eq!(
+            rules.check_host("registry.npmjs.org", 443),
+            Ok(Admission::ByRule)
+        );
+        assert_eq!(
+            rules.check_host("registry.npmjs.org", 80),
+            Ok(Admission::ByRule)
+        );
         assert_eq!(
             rules.check_host("registry.npmjs.org", 22),
             Err(Refusal::Port)
@@ -1266,20 +1300,78 @@ mod tests {
         });
         let public: IpAddr = "93.184.216.34".parse().unwrap();
         let private: IpAddr = "10.0.0.5".parse().unwrap();
-        assert_eq!(rules.check_addresses(&[public], 443), Ok(()));
         assert_eq!(
-            rules.check_addresses(&[public, private], 443),
+            rules.check_addresses(&[public], 443, Admission::ByRule),
+            Ok(())
+        );
+        assert_eq!(
+            rules.check_addresses(&[public, private], 443, Admission::ByRule),
             Err(Refusal::Private),
             "one private answer refuses the whole name (DNS rebinding)"
         );
-        assert_eq!(rules.check_addresses(&[], 443), Err(Refusal::Unresolved));
-        let allowed: IpAddr = "10.237.9.4".parse().unwrap();
-        assert_eq!(rules.check_host("10.237.9.4", 8080), Ok(()));
-        assert_eq!(rules.check_addresses(&[allowed], 8080), Ok(()));
         assert_eq!(
-            rules.check_addresses(&[allowed], 9090),
+            rules.check_addresses(&[], 443, Admission::ByRule),
+            Err(Refusal::Unresolved)
+        );
+        let allowed: IpAddr = "10.237.9.4".parse().unwrap();
+        assert_eq!(rules.check_host("10.237.9.4", 8080), Ok(Admission::ByRule));
+        assert_eq!(
+            rules.check_addresses(&[allowed], 8080, Admission::ByRule),
+            Ok(())
+        );
+        assert_eq!(
+            rules.check_addresses(&[allowed], 9090, Admission::ByRule),
             Err(Refusal::Private),
             "the CIDR allow names one port"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_cidr_allow_does_not_open_public_literals() {
+        let rules = CompiledRules::new(&EgressPolicy {
+            subject: sandbox(1),
+            rules: vec![cidr_rule(1, "10.20.0.0/16", Some(443), Action::Allow)],
+        });
+        assert_eq!(
+            rules.check_host("93.184.216.34", 22),
+            Err(Refusal::NotAllowed),
+            "a literal outside every allowed CIDR is refused, whatever the port"
+        );
+        assert_eq!(
+            rules.check_host("93.184.216.34", 443),
+            Err(Refusal::NotAllowed)
+        );
+        assert_eq!(
+            rules.check_host("10.20.3.4", 22),
+            Err(Refusal::Port),
+            "the CIDR allow names one port"
+        );
+        assert_eq!(rules.check_host("10.20.3.4", 443), Ok(Admission::ByRule));
+
+        // A hostname with no host rule is decided by its addresses, and only
+        // an allowed CIDR admits them: a public answer is not enough.
+        assert_eq!(
+            rules.check_host("internal.example", 443),
+            Ok(Admission::ByAddress)
+        );
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let inside: IpAddr = "10.20.3.4".parse().unwrap();
+        assert_eq!(
+            rules.check_addresses(&[public], 443, Admission::ByAddress),
+            Err(Refusal::NotAllowed)
+        );
+        assert_eq!(
+            rules.check_addresses(&[inside], 443, Admission::ByAddress),
+            Ok(())
+        );
+        assert_eq!(
+            rules.check_addresses(&[inside], 22, Admission::ByAddress),
+            Err(Refusal::NotAllowed)
+        );
+        assert_eq!(
+            rules.check_addresses(&[inside, public], 443, Admission::ByAddress),
+            Err(Refusal::NotAllowed),
+            "one answer outside the allowed CIDRs refuses the whole name"
         );
     }
 
@@ -1293,7 +1385,7 @@ mod tests {
             ],
         });
         assert_eq!(
-            rules.check_addresses(&["93.184.216.34".parse().unwrap()], 443),
+            rules.check_addresses(&["93.184.216.34".parse().unwrap()], 443, Admission::ByRule),
             Err(Refusal::Denied)
         );
     }

@@ -29,7 +29,10 @@ use crate::model::{
     parse_action, parse_direction, parse_profile, parse_protocol, parse_subject, profile_str,
     PeerSpec, Profiles,
 };
-use crate::service::{EffectivePolicy, NetworkPolicyService, NewRule, NodeModeEntry, RuleFilter};
+use crate::service::{
+    enforcement_unavailable_reason, node_supports_enforcement, EffectivePolicy,
+    NetworkPolicyService, NewRule, NodeModeEntry, RuleFilter,
+};
 
 #[derive(Clone)]
 pub struct NetworkPolicyAppState {
@@ -101,6 +104,16 @@ impl From<NetworkPolicyError> for Problem {
             NetworkPolicyError::LinkOwned { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Rule Owned By A Link")
                 .with_detail(error.to_string()),
+            NetworkPolicyError::HostRuleNotEnforceable { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Hostname Rules Not Enforceable Yet")
+                    .with_detail(error.to_string())
+            }
+            NetworkPolicyError::WorkerEnforcementUnavailable { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Network Policy Not Available On Worker Nodes")
+                    .with_detail(error.to_string())
+            }
             NetworkPolicyError::InvalidStoredRule { .. }
             | NetworkPolicyError::InvalidStoredProfile { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -161,11 +174,16 @@ pub struct NetworkPolicyRuleResponse {
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = DateTime)]
     pub updated_at: UtcDateTime,
+    /// False for a `host` rule: hostname rules are enforced only by the
+    /// shared egress proxy, which no node runs yet, so such a rule (stored
+    /// before new ones were refused) is shown but never enforced.
+    pub enforceable: bool,
 }
 
 impl From<network_policy_rules::Model> for NetworkPolicyRuleResponse {
     fn from(rule: network_policy_rules::Model) -> Self {
         Self {
+            enforceable: rule.peer_kind != "host",
             id: rule.id,
             subject_kind: rule.subject_kind,
             subject_id: rule.subject_id,
@@ -217,8 +235,9 @@ pub struct CreateNetworkPolicyRuleRequest {
     /// `egress` or `ingress`.
     #[schema(example = "egress")]
     pub direction: String,
-    /// `service` (by id), `workload` (`<kind>/<id>`), `cidr`, or `host`
-    /// (egress only, enforced by the egress proxy).
+    /// `service` (by id), `workload` (`<kind>/<id>`) or `cidr`. `host`
+    /// parses but is refused with 409 until a node runs the shared egress
+    /// proxy that enforces hostname rules.
     #[schema(example = "host")]
     pub peer_kind: String,
     #[schema(example = "registry.example.test")]
@@ -331,11 +350,21 @@ pub struct NodeNetworkPolicyModeResponse {
     /// applied) or `enforce`.
     #[schema(example = "legacy")]
     pub mode: String,
+    /// Whether this node can run `shadow` or `enforce`. False on workers:
+    /// no enforcer runs there yet, and a stored non-legacy mode on a worker
+    /// is never counted as enforcing.
+    pub supports_enforcement: bool,
+    /// Why `shadow`/`enforce` is unavailable, when `supports_enforcement`
+    /// is false.
+    pub enforcement_unavailable_reason: Option<String>,
 }
 
 impl From<NodeModeEntry> for NodeNetworkPolicyModeResponse {
     fn from(n: NodeModeEntry) -> Self {
         Self {
+            supports_enforcement: node_supports_enforcement(n.node_id),
+            enforcement_unavailable_reason: enforcement_unavailable_reason(n.node_id)
+                .map(str::to_string),
             node_id: n.node_id,
             name: n.name,
             role: n.role,
@@ -808,12 +837,69 @@ mod tests {
                 },
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
+            (
+                NetworkPolicyError::HostRuleNotEnforceable {
+                    subject: "sandbox/1".into(),
+                    host: "registry.example.test".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                NetworkPolicyError::WorkerEnforcementUnavailable {
+                    node_id: 3,
+                    mode: "enforce".into(),
+                },
+                StatusCode::CONFLICT,
+            ),
         ];
         for (error, status) in cases {
             let message = error.to_string();
             let problem = Problem::from(error);
             assert_eq!(problem.status_code, status, "{message}");
         }
+    }
+
+    #[test]
+    fn stored_host_rules_are_reported_as_not_enforceable() {
+        let now = chrono::Utc::now();
+        let stored = |peer_kind: &str| network_policy_rules::Model {
+            id: 1,
+            subject_kind: "sandbox".into(),
+            subject_id: 1,
+            direction: "egress".into(),
+            peer_kind: peer_kind.into(),
+            peer_ref: "registry.example.test".into(),
+            port_start: None,
+            port_end: None,
+            protocol: "tcp".into(),
+            action: "deny".into(),
+            origin: "operator".into(),
+            link_table: None,
+            link_id: None,
+            description: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+        };
+        assert!(!NetworkPolicyRuleResponse::from(stored("host")).enforceable);
+        assert!(NetworkPolicyRuleResponse::from(stored("cidr")).enforceable);
+    }
+
+    #[test]
+    fn worker_nodes_report_why_enforcement_is_unavailable() {
+        let entry = |node_id| NodeModeEntry {
+            node_id,
+            name: "n".into(),
+            role: "worker".into(),
+            status: "active".into(),
+            mode: NodeMode::Legacy,
+        };
+        let worker = NodeNetworkPolicyModeResponse::from(entry(3));
+        assert!(!worker.supports_enforcement);
+        assert!(worker.enforcement_unavailable_reason.is_some());
+        let control = NodeNetworkPolicyModeResponse::from(entry(0));
+        assert!(control.supports_enforcement);
+        assert!(control.enforcement_unavailable_reason.is_none());
     }
 
     #[test]

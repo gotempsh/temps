@@ -37,8 +37,7 @@ use bollard::models::{
     IpamConfig, NetworkConnectRequest, NetworkCreateRequest, NetworkingConfig,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, ListContainersOptions, ListNetworksOptions, LogsOptions,
-    RemoveContainerOptions, StatsOptions,
+    CreateContainerOptionsBuilder, LogsOptions, RemoveContainerOptions, StatsOptions,
 };
 use bollard::Docker;
 use futures::{FutureExt, StreamExt};
@@ -64,8 +63,6 @@ const TEST_LABEL: &str = "sh.temps.test";
 const TEST_VALUE: &str = "adr055-p7";
 const SCOPE_LABEL: &str = "sh.temps.test.scope";
 const SCOPE: &str = "egress-scale";
-const PREFIX: &str = "temps-p7-scale";
-const SHARED_NET: &str = "temps-p7-scale-shared";
 const SHARED_SUBNET: &str = "10.237.150.0/24";
 const PROXY_IP: &str = "10.237.150.2";
 const TARGET_IP: &str = "10.237.150.3";
@@ -79,6 +76,18 @@ fn sidecar_script() -> Option<&'static str> {
     let open = body.find("r#\"")? + 3;
     let close = body[open..].find("\"#;")?;
     Some(&body[open..open + close])
+}
+
+/// This run's id. It scopes every label, container, network, nft table and
+/// rule comment the run creates, so concurrent runs (two checkouts, a CI
+/// retry) never observe or remove each other's objects, and cleanup touches
+/// only what this run recorded.
+fn run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    format!("{}{:04x}", std::process::id(), nanos & 0xffff)
 }
 
 fn bin_path() -> PathBuf {
@@ -109,6 +118,7 @@ struct Usage {
 
 struct Scale {
     docker: Docker,
+    run: String,
     sidecar_image: String,
     config_dir: PathBuf,
     containers: Vec<String>,
@@ -151,61 +161,43 @@ impl Scale {
             );
             return None;
         }
-        let config_dir =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/musl/egress-scale-config");
+        let run = run_id();
+        let config_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../../target/musl/egress-scale-config-{run}"));
         if std::fs::create_dir_all(&config_dir).is_err() {
             return None;
         }
-        let scale = Scale {
+        Some(Scale {
             docker,
+            run,
             sidecar_image,
             config_dir,
             containers: Vec::new(),
             networks: Vec::new(),
             tables: Vec::new(),
-        };
-        scale.remove_leftovers().await;
-        Some(scale)
+        })
+    }
+
+    /// This run's scope label value: only its containers are enforced on.
+    fn scope(&self) -> String {
+        format!("{SCOPE}-{}", self.run)
+    }
+
+    /// The prefix of every container and network name in this run.
+    fn prefix(&self) -> String {
+        format!("temps-p7-scale-{}", self.run)
     }
 
     fn labels(&self, workload: Option<WorkloadRef>) -> HashMap<String, String> {
         let mut map = HashMap::from([
             (TEST_LABEL.to_string(), TEST_VALUE.to_string()),
-            (SCOPE_LABEL.to_string(), SCOPE.to_string()),
+            (SCOPE_LABEL.to_string(), self.scope()),
         ]);
         if let Some(w) = workload {
             map.insert(labels::KIND.to_string(), w.kind.as_str().to_string());
             map.insert(labels::OWNER_ID.to_string(), w.id.to_string());
         }
         map
-    }
-
-    async fn remove_leftovers(&self) {
-        let filter = HashMap::from([("label".to_string(), vec![format!("{SCOPE_LABEL}={SCOPE}")])]);
-        if let Ok(list) = self
-            .docker
-            .list_containers(Some(ListContainersOptions {
-                all: true,
-                filters: Some(filter.clone()),
-                ..Default::default()
-            }))
-            .await
-        {
-            for c in list.into_iter().filter_map(|c| c.id) {
-                self.remove_container(&c).await;
-            }
-        }
-        if let Ok(list) = self
-            .docker
-            .list_networks(Some(ListNetworksOptions {
-                filters: Some(filter),
-            }))
-            .await
-        {
-            for n in list.into_iter().filter_map(|n| n.name) {
-                let _ = self.docker.remove_network(&n).await;
-            }
-        }
     }
 
     async fn remove_container(&self, name: &str) {
@@ -238,7 +230,13 @@ impl Scale {
                 ..Default::default()
             })
             .await
-            .unwrap_or_else(|e| panic!("create network {name} ({subnet}): {e}"));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "create network {name} ({subnet}): {e}. The subnets are fixed, so this \
+                     fails while another run, or one that was killed, holds them; list those \
+                     with `docker network ls --filter label={TEST_LABEL}={TEST_VALUE}`"
+                )
+            });
         self.networks.push(name.to_string());
     }
 
@@ -449,7 +447,8 @@ fn proxy_config(identities: Vec<(WorkloadRef, IpAddr)>) -> ServeConfig {
 
 /// The shared layout's node: its sandboxes' egress is restricted to the
 /// proxy, which is what blocks member-to-member traffic.
-struct ScaleInstances(DockerInstanceSource);
+/// Observes only this run's containers (the `String` is its scope).
+struct ScaleInstances(DockerInstanceSource, String);
 
 #[async_trait]
 impl InstanceSource for ScaleInstances {
@@ -459,7 +458,7 @@ impl InstanceSource for ScaleInstances {
             .observe()
             .await?
             .into_iter()
-            .filter(|c| c.labels.get(SCOPE_LABEL).map(String::as_str) == Some(SCOPE))
+            .filter(|c| c.labels.get(SCOPE_LABEL) == Some(&self.1))
             .collect())
     }
     async fn pid(&self, id: &str) -> Result<Option<i64>, EnforcerError> {
@@ -470,18 +469,20 @@ impl InstanceSource for ScaleInstances {
 async fn measure(scale: &mut Scale) {
     let mut report: Vec<String> = Vec::new();
     let script = sidecar_script().unwrap_or_default().to_string();
+    let prefix = scale.prefix();
+    let shared_net = format!("{prefix}-shared");
     let idle = vec!["sleep".to_string(), "900".to_string()];
 
     // ---- 1. Sidecars ----
     let started = Instant::now();
     for i in 0..SANDBOXES {
-        let net = format!("{PREFIX}-net-{i}");
+        let net = format!("{prefix}-net-{i}");
         scale
             .network(&net, &format!("10.237.{}.0/24", 100 + i))
             .await;
         scale
             .container(
-                &format!("{PREFIX}-sb-{i}"),
+                &format!("{prefix}-sb-{i}"),
                 IMAGE,
                 Some(sandbox(i)),
                 &net,
@@ -495,7 +496,7 @@ async fn measure(scale: &mut Scale) {
         let image = scale.sidecar_image.clone();
         scale
             .container(
-                &format!("{PREFIX}-sidecar-{i}"),
+                &format!("{prefix}-sidecar-{i}"),
                 &image,
                 None,
                 &net,
@@ -513,7 +514,7 @@ async fn measure(scale: &mut Scale) {
     let mut sidecar_cpu = 0u64;
     let mut sidecars_up = 0;
     for i in 0..SANDBOXES {
-        let usage = scale.usage(&format!("{PREFIX}-sidecar-{i}")).await;
+        let usage = scale.usage(&format!("{prefix}-sidecar-{i}")).await;
         if usage.memory > 0 {
             sidecars_up += 1;
         }
@@ -543,13 +544,13 @@ async fn measure(scale: &mut Scale) {
     std::fs::write(scale.config_dir.join("joined.json"), config)
         .unwrap_or_else(|e| panic!("write the joined config: {e}"));
     for i in 0..SANDBOXES {
-        let net = format!("{PREFIX}-net-{i}");
+        let net = format!("{prefix}-net-{i}");
         scale
             .network(&net, &format!("10.237.{}.0/24", 100 + i))
             .await;
         scale
             .container(
-                &format!("{PREFIX}-sb-{i}"),
+                &format!("{prefix}-sb-{i}"),
                 IMAGE,
                 Some(sandbox(i)),
                 &net,
@@ -562,13 +563,13 @@ async fn measure(scale: &mut Scale) {
             .await;
     }
     let started = Instant::now();
-    let joined = format!("{PREFIX}-rust-joined");
+    let joined = format!("{prefix}-rust-joined");
     scale
         .container(
             &joined,
             IMAGE,
             None,
-            &format!("{PREFIX}-net-0"),
+            &format!("{prefix}-net-0"),
             Some("10.237.100.2".to_string()),
             None,
             vec![
@@ -584,7 +585,7 @@ async fn measure(scale: &mut Scale) {
         scale
             .docker
             .connect_network(
-                &format!("{PREFIX}-net-{i}"),
+                &format!("{prefix}-net-{i}"),
                 NetworkConnectRequest {
                     container: joined.clone(),
                     endpoint_config: Some(EndpointSettings {
@@ -605,7 +606,7 @@ async fn measure(scale: &mut Scale) {
     let last = SANDBOXES - 1;
     let probe = scale
         .exec(
-            &format!("{PREFIX}-sb-{last}"),
+            &format!("{prefix}-sb-{last}"),
             &format!("nc -z -w 2 10.237.{}.2 3128; echo rc=$?", 100 + last),
         )
         .await;
@@ -634,14 +635,14 @@ async fn measure(scale: &mut Scale) {
     std::fs::write(scale.config_dir.join("shared.json"), config)
         .unwrap_or_else(|e| panic!("write the shared config: {e}"));
     let started = Instant::now();
-    scale.network(SHARED_NET, SHARED_SUBNET).await;
-    let shared = format!("{PREFIX}-rust-shared");
+    scale.network(&shared_net, SHARED_SUBNET).await;
+    let shared = format!("{prefix}-rust-shared");
     scale
         .container(
             &shared,
             IMAGE,
             None,
-            SHARED_NET,
+            &shared_net,
             Some(PROXY_IP.into()),
             None,
             vec![
@@ -656,10 +657,10 @@ async fn measure(scale: &mut Scale) {
     let shared_wired = started.elapsed();
     scale
         .container(
-            &format!("{PREFIX}-target"),
+            &format!("{prefix}-target"),
             IMAGE,
             None,
-            SHARED_NET,
+            &shared_net,
             Some(TARGET_IP.into()),
             None,
             vec!["/probe".into(), "sink".into(), "-".into(), "8080".into()],
@@ -670,10 +671,10 @@ async fn measure(scale: &mut Scale) {
     for i in 0..SANDBOXES {
         scale
             .container(
-                &format!("{PREFIX}-sb-{i}"),
+                &format!("{prefix}-sb-{i}"),
                 IMAGE,
                 Some(sandbox(i)),
-                SHARED_NET,
+                &shared_net,
                 Some(shared_ip(i)),
                 None,
                 vec!["/probe".into(), "sink".into(), "-".into(), "7000".into()],
@@ -684,7 +685,7 @@ async fn measure(scale: &mut Scale) {
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     let member = |_from: usize, to: usize| format!("nc -z -w 2 {} 7000; echo rc=$?", shared_ip(to));
-    let control = scale.exec(&format!("{PREFIX}-sb-0"), &member(0, 1)).await;
+    let control = scale.exec(&format!("{prefix}-sb-0"), &member(0, 1)).await;
     assert!(
         control.contains("rc=0"),
         "control: members reach each other before enforcement: {control}"
@@ -694,7 +695,8 @@ async fn measure(scale: &mut Scale) {
     let daemon_is_local = std::env::var("DOCKER_HOST")
         .map(|h| h.starts_with("unix://"))
         .unwrap_or(true);
-    let table = TableName::new("temps_p7_scale").unwrap_or_else(|e| panic!("{e}"));
+    let table =
+        TableName::new(format!("temps_p7_scale_{}", scale.run)).unwrap_or_else(|e| panic!("{e}"));
     scale.tables.push(table.clone());
     let source: Arc<StaticPolicySource> = Arc::new(StaticPolicySource::new(
         NodeMode::Enforce,
@@ -722,10 +724,10 @@ async fn measure(scale: &mut Scale) {
         table,
         Arc::from(choose_executor(scale.docker.clone(), daemon_is_local)),
         Arc::from(choose_port_resolver(scale.docker.clone(), daemon_is_local)),
-        Arc::new(ScaleInstances(DockerInstanceSource::new(
-            "scale",
-            scale.docker.clone(),
-        ))),
+        Arc::new(ScaleInstances(
+            DockerInstanceSource::new("scale", scale.docker.clone()),
+            scale.scope(),
+        )),
         source.clone(),
         Arc::new(ArcSwap::from_pointee(DnsPolicy::open())),
         Arc::new(ArcSwap::from_pointee(EgressTable::default())),
@@ -739,14 +741,14 @@ async fn measure(scale: &mut Scale) {
     let PassOutcome::Applied(summary) = outcome else {
         panic!("the scale node did not apply: {outcome:?}");
     };
-    let blocked = scale.exec(&format!("{PREFIX}-sb-0"), &member(0, 1)).await;
+    let blocked = scale.exec(&format!("{prefix}-sb-0"), &member(0, 1)).await;
     assert!(
         blocked.contains("rc=1"),
         "members cannot reach each other on the shared network: {blocked}"
     );
     let direct = scale
         .exec(
-            &format!("{PREFIX}-sb-0"),
+            &format!("{prefix}-sb-0"),
             &format!("nc -z -w 2 {TARGET_IP} 8080; echo rc=$?"),
         )
         .await;
@@ -759,7 +761,7 @@ async fn measure(scale: &mut Scale) {
         "ok=0; for i in $(seq {REQUESTS_EACH}); do wget -q -O - -Y on http://{TARGET_IP}:8080/ 2>/dev/null | grep -q ok && ok=$((ok+1)); done; echo ok=$ok"
     );
     let runs = (0..SANDBOXES).map(|i| {
-        let name = format!("{PREFIX}-sb-{i}");
+        let name = format!("{prefix}-sb-{i}");
         let load = load.clone();
         let scale = &*scale;
         async move { scale.exec(&name, &load).await }
@@ -820,7 +822,7 @@ async fn measure(scale: &mut Scale) {
             mode: NodeMode::Legacy
         }
     );
-    let restored = scale.exec(&format!("{PREFIX}-sb-0"), &member(0, 1)).await;
+    let restored = scale.exec(&format!("{prefix}-sb-0"), &member(0, 1)).await;
     assert!(
         restored.contains("rc=0"),
         "legacy restores member-to-member traffic: {restored}"

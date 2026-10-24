@@ -20,21 +20,24 @@ use crate::service::{NetworkPolicyService, CONTROL_PLANE_NODE_ID};
 /// How often node 0 re-checks its mode and, outside `legacy`, its policy.
 pub const PASS_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Reads one node's mode every pass, and rebuilds the snapshot only when
-/// the database revision moved.
+/// Reads one node's mode every pass and, outside `legacy`, rebuilds the
+/// snapshot every pass too.
+///
+/// It is not cached by `network_policy_state.revision`: that revision only
+/// moves with rules and profiles, while the snapshot also depends on live
+/// sandboxes, service members, name records and worker-hosted addresses. A
+/// revision-keyed cache kept serving a removed member's address, and never
+/// saw a new one. The enforcer compares the compiled ruleset and touches the
+/// kernel only when it changed, so a rebuild costs a few bounded queries
+/// every [`PASS_INTERVAL`] on node 0.
 pub struct DbPolicySource {
     service: Arc<NetworkPolicyService>,
     node_id: i32,
-    cache: ArcSwap<Option<(i64, Arc<PolicySnapshot>)>>,
 }
 
 impl DbPolicySource {
     pub fn new(service: Arc<NetworkPolicyService>, node_id: i32) -> Self {
-        Self {
-            service,
-            node_id,
-            cache: ArcSwap::from_pointee(None),
-        }
+        Self { service, node_id }
     }
 
     fn node(&self) -> String {
@@ -55,20 +58,13 @@ impl PolicySource for DbPolicySource {
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
-        let source = |e: crate::error::NetworkPolicyError| EnforcerError::Source {
-            node: self.node(),
-            reason: e.to_string(),
-        };
-        let revision = self.service.revision().await.map_err(source)?;
-        if let Some((cached, snapshot)) = self.cache.load().as_ref() {
-            if *cached == revision {
-                return Ok(snapshot.as_ref().clone());
-            }
-        }
-        let snapshot = Arc::new(self.service.snapshot().await.map_err(source)?);
-        self.cache
-            .store(Arc::new(Some((revision, snapshot.clone()))));
-        Ok(snapshot.as_ref().clone())
+        self.service
+            .snapshot()
+            .await
+            .map_err(|e| EnforcerError::Source {
+                node: self.node(),
+                reason: e.to_string(),
+            })
     }
 }
 

@@ -38,6 +38,7 @@ import {
   buildCreateRuleRequest,
   createNetworkPolicyRule,
   networkPolicyKeys,
+  HOST_RULES_UNAVAILABLE,
   PEER_KINDS,
   peerRefHint,
   SUBJECT_KINDS,
@@ -87,7 +88,7 @@ const PEER_LABELS: Record<RuleFormValues['peer_kind'], string> = {
   service: 'Service (by ID)',
   workload: 'Workload (kind/id)',
   cidr: 'CIDR block',
-  host: 'Hostname (egress only)',
+  host: 'Hostname (not available yet)',
 }
 
 function defaults(
@@ -97,7 +98,7 @@ function defaults(
     subject_kind: subject?.subject_kind ?? 'sandbox',
     subject_id: subject?.subject_id ?? '',
     direction: 'egress',
-    peer_kind: 'host',
+    peer_kind: 'cidr',
     peer_ref: '',
     port_start: '',
     port_end: '',
@@ -270,12 +271,17 @@ export function CreateRuleDialog({
                       </FormControl>
                       <SelectContent>
                         {PEER_KINDS.map((kind) => (
-                          <SelectItem key={kind} value={kind}>
+                          <SelectItem
+                            key={kind}
+                            value={kind}
+                            disabled={kind === 'host'}
+                          >
                             {PEER_LABELS[kind]}
                           </SelectItem>
                         ))}
                       </SelectContent>
                     </Select>
+                    <FormDescription>{HOST_RULES_UNAVAILABLE}</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
