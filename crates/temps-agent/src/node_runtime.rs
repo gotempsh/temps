@@ -167,19 +167,40 @@ pub fn node_runtime_dir(config: &AgentConfig) -> Result<std::path::PathBuf, Node
     Ok(data_dir.join("node-runtime"))
 }
 
+/// The node runtime's driver: Docker, with secret files under `dir`, and
+/// every new instance joined to the cross-worker overlay with its peer
+/// routes installed, as the legacy worker deployer does
+/// ([`crate::overlay_driver`]). A no-op on a worker without an overlay.
+fn node_driver(
+    docker: bollard::Docker,
+    dir: &std::path::Path,
+    overlay_peers: crate::network_sync::SharedPeers,
+) -> Arc<dyn temps_workload::RuntimeDriver> {
+    // Secret files live beside the snapshot, under the agent's data
+    // directory, so their bind mounts survive a reboot.
+    let docker_driver = Arc::new(
+        temps_workload_docker::DockerDriver::new(docker.clone())
+            .with_secrets_root(dir.join("secret-files")),
+    );
+    Arc::new(crate::overlay_driver::OverlayDriver::new(
+        docker_driver,
+        docker,
+        temps_network::NetworkConfig::default().docker_network_name,
+        overlay_peers,
+    ))
+}
+
 /// Open the node runtime and start its stream and reconcile loops.
 pub fn spawn(
     config: &AgentConfig,
     docker: bollard::Docker,
     bind_address: crate::network_sync::SharedBindAddress,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    overlay_peers: crate::network_sync::SharedPeers,
 ) -> Result<Arc<NodeRuntime>, NodeRuntimeStartError> {
     let dir = node_runtime_dir(config)?;
     let link: Arc<dyn ControlPlaneLink> = Arc::new(HttpControlPlaneLink::new(config)?);
-    let driver: Arc<dyn temps_workload::RuntimeDriver> =
-        // Secret files live beside the snapshot, under the agent's data
-        // directory, so their bind mounts survive a reboot.
-        Arc::new(temps_workload_docker::DockerDriver::new(docker).with_secrets_root(dir.join("secret-files")));
+    let driver = node_driver(docker, &dir, overlay_peers);
     let runtime = Arc::new(
         NodeRuntime::open(config.node_id, &dir, SCOPE, driver, link)
             .map_err(|e| NodeRuntimeStartError::Open {
