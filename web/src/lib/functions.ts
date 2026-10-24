@@ -1,9 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
+import {
+  createFunction as createFunctionOperation,
+  deleteFunction as deleteFunctionOperation,
+  getCapability,
+  getFunction as getFunctionOperation,
+  listFunctions as listFunctionsOperation,
+  sleepFunction as sleepFunctionOperation,
+  wakeFunction as wakeFunctionOperation,
+} from '@/api/client'
+import type {
+  CreateFunctionRequest,
+  FunctionListResponse,
+  FunctionResponse,
+  FunctionsCapabilityResponse,
+  RuntimeAvailabilityResponse,
+  SleepFunctionResponse,
+} from '@/api/client'
 
 /** Where the server's `setup_path` points (`temps_functions::SETUP_PATH`). */
 export const FUNCTIONS_SETUP_PATH = '/settings/functions'
@@ -18,71 +32,23 @@ export const MAX_FUNCTION_NAME_LENGTH = 40
 export type FunctionState =
   'asleep' | 'waking' | 'awake' | 'sleeping' | 'unregistered'
 
-/** Mirrors `FunctionResponse`. */
-export interface FunctionRecord {
-  id: number
-  project_id: number
-  name: string
-  /** `wasm` or `oci`. */
-  artifact_kind: string
-  image_reference: string | null
-  wasm_digest: string | null
-  wasm_size_bytes: number | null
-  port: number
-  idle_timeout_seconds: number
-  wake_timeout_seconds: number
-  memory_limit_mb: number | null
-  /** Requests to this hostname reach the function. */
-  hostname: string
-  workload_id: number | null
-  state: string
-  ready_reason: string | null
-  ready_message: string | null
-  created_at: string
-  updated_at: string
-}
+/** A function, as the server returns it. */
+export type FunctionRecord = FunctionResponse
 
-/** Mirrors `FunctionListResponse`. */
-export interface FunctionList {
-  functions: FunctionRecord[]
-  total: number
-  page: number
-  page_size: number
-  total_pages: number
-}
+/** A page of a project's functions. */
+export type FunctionList = FunctionListResponse
 
-/** Mirrors `RuntimeAvailabilityResponse`. */
-export interface RuntimeAvailability {
-  available: boolean
-  reason: string | null
-}
+/** Whether one runtime can run functions on this instance, and why not. */
+export type RuntimeAvailability = RuntimeAvailabilityResponse
 
-/** Mirrors `FunctionsCapabilityResponse`. */
-export interface FunctionsCapability {
-  configured: boolean
-  wasm: RuntimeAvailability
-  oci: RuntimeAvailability
-  reason: string | null
-  setup_path: string | null
-}
+/** Whether functions are set up, per runtime. */
+export type FunctionsCapability = FunctionsCapabilityResponse
 
-/** Mirrors `SleepFunctionResponse`. */
-export interface SleepFunctionResult {
-  function: FunctionRecord
-  /** Whether it was running and is now stopped. */
-  slept: boolean
-}
+/** The function after a sleep, and whether it was running. */
+export type SleepFunctionResult = SleepFunctionResponse
 
-/** Mirrors `CreateFunctionRequest`: exactly one of `wasm_base64` and `image`. */
-export interface CreateFunctionRequest {
-  name: string
-  wasm_base64?: string
-  image?: string
-  port?: number
-  idle_timeout_seconds?: number
-  wake_timeout_seconds?: number
-  memory_limit_mb?: number
-}
+/** Exactly one of `wasm_base64` and `image`. */
+export type { CreateFunctionRequest }
 
 export const functionsKeys = {
   capability: ['functions', 'capability'] as const,
@@ -94,11 +60,7 @@ export const functionsKeys = {
 }
 
 export async function getFunctionsCapability(): Promise<FunctionsCapability> {
-  const { data } = await client.get<FunctionsCapability, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/functions/capability',
-    throwOnError: true,
-  })
+  const { data } = await getCapability({ throwOnError: true })
   return data
 }
 
@@ -107,9 +69,8 @@ export async function listFunctions(
   page: number,
   pageSize: number
 ): Promise<FunctionList> {
-  const { data } = await client.get<FunctionList, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions`,
+  const { data } = await listFunctionsOperation({
+    path: { project_id: projectId },
     query: { page, page_size: pageSize },
     throwOnError: true,
   })
@@ -120,9 +81,8 @@ export async function getFunction(
   projectId: number,
   functionId: number
 ): Promise<FunctionRecord> {
-  const { data } = await client.get<FunctionRecord, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions/${functionId}`,
+  const { data } = await getFunctionOperation({
+    path: { project_id: projectId, function_id: functionId },
     throwOnError: true,
   })
   return data
@@ -132,11 +92,9 @@ export async function createFunction(
   projectId: number,
   request: CreateFunctionRequest
 ): Promise<FunctionRecord> {
-  const { data } = await client.post<FunctionRecord, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions`,
+  const { data } = await createFunctionOperation({
+    path: { project_id: projectId },
     body: request,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
@@ -146,9 +104,8 @@ export async function deleteFunction(
   projectId: number,
   functionId: number
 ): Promise<void> {
-  await client.delete<unknown, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions/${functionId}`,
+  await deleteFunctionOperation({
+    path: { project_id: projectId, function_id: functionId },
     throwOnError: true,
   })
 }
@@ -157,9 +114,8 @@ export async function wakeFunction(
   projectId: number,
   functionId: number
 ): Promise<FunctionRecord> {
-  const { data } = await client.post<FunctionRecord, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions/${functionId}/wake`,
+  const { data } = await wakeFunctionOperation({
+    path: { project_id: projectId, function_id: functionId },
     throwOnError: true,
   })
   return data
@@ -169,9 +125,8 @@ export async function sleepFunction(
   projectId: number,
   functionId: number
 ): Promise<SleepFunctionResult> {
-  const { data } = await client.post<SleepFunctionResult, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/functions/${functionId}/sleep`,
+  const { data } = await sleepFunctionOperation({
+    path: { project_id: projectId, function_id: functionId },
     throwOnError: true,
   })
   return data

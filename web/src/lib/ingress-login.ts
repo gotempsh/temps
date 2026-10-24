@@ -1,29 +1,21 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import { createIngressLoginGrant as createIngressLoginGrantOperation } from '@/api/client'
+import type {
+  CreateIngressLoginGrantRequest,
+  IngressLoginGrantResponse,
+} from '@/api/client'
 
 /**
  * The proxy's signed request to sign a visitor in to an environment that
  * requires a Temps login (ADR-055 §11), as it arrives in `/ingress/login`'s
- * query string. Mirrors `CreateIngressLoginGrantRequest` on the server.
+ * query string.
  */
-export interface IngressLoginRequest {
-  owner_kind: string
-  owner_id: number
-  scheme: string
-  host: string
-  next?: string
-  ts: number
-  sig: string
-}
+export type IngressLoginRequest = CreateIngressLoginGrantRequest
 
-/** Mirrors `IngressLoginGrantResponse`. */
-export interface IngressLoginGrant {
-  redirect_url: string
-  grant_id: number
-  expires_at: string
-}
+/** The grant the console mints, and where to send the browser with it. */
+export type IngressLoginGrant = IngressLoginGrantResponse
 
 /**
  * Reads the login request from the page's query string, or `null` when a
@@ -60,16 +52,11 @@ export function parseIngressLoginRequest(
   }
 }
 
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
-
 export async function createIngressLoginGrant(
   request: IngressLoginRequest
 ): Promise<IngressLoginGrant> {
-  const { data } = await client.post<IngressLoginGrant, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/ingress/login-grants',
+  const { data } = await createIngressLoginGrantOperation({
     body: request,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data

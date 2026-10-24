@@ -18,6 +18,7 @@ mod email_templates;
 pub mod handlers;
 #[cfg(test)]
 mod http_test_support;
+pub mod ingress_grants;
 mod last_used_throttle;
 mod macros;
 mod mfa_guard;

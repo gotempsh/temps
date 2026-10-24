@@ -3058,7 +3058,12 @@ impl CachedPeerTable {
 
         // Ingress endpoints (ADR-055 §11). Same carry-forward as path routes:
         // a failed read keeps the previous compiled endpoints, so an
-        // enforcing environment keeps the access it had rather than none.
+        // enforcing environment keeps the access policy it had. Before any
+        // load succeeds the previous snapshot is the default one, which
+        // reports itself not loaded; the proxy refuses an enforcing
+        // environment's requests against it (and against any environment
+        // the kept snapshot has no endpoint for) rather than read the
+        // missing policy as "no restrictions".
         let ingress = match crate::ingress::load_ingress_snapshot(
             self.db.as_ref(),
             &app_settings.rate_limiting,
