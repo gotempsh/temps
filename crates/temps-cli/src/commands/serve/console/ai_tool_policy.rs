@@ -76,6 +76,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "removes monitoring silently, so a human must do it (same rule as delete_alert)",
         &[
             "ExternalServiceMetricsDeleteAlertRule",
+            "NodeMetricsDeleteAlertRule",
             "delete_alert",
             "delete_alert_rule",
         ],

@@ -3317,6 +3317,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "DeploymentMetricsToggle",
         "ExternalServiceMetricsCreateAlertRule",
         "ExternalServiceMetricsUpdateAlertRule",
+        "NodeMetricsCreateAlertRule",
         "NodeMetricsUpdateAlertRule",
         "kv_enable",
         "kv_update",
