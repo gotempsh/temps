@@ -424,7 +424,7 @@ impl WorkloadPlane {
                 u32::try_from(attempt).unwrap_or(0),
                 &handle.name,
             );
-            let attach = template.attachments.clone();
+            let attach = self.local_attachments(&template.attachments);
             let instance_spec = template.into_spec(prepared.local_ref.clone(), resolved.env);
             let created = driver
                 .create(&instance_spec, &attach)

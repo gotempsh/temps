@@ -584,6 +584,30 @@ pub struct WorkloadPlacementService {
     /// workload plane is built (ADR-055 Phase 10). Unset means a plain
     /// container host: `process` only.
     control_plane_isolations: std::sync::OnceLock<Vec<Isolation>>,
+    /// The control plane's own capacity: it sends no heartbeat, so its
+    /// host is sampled in-process (see [`host_control_plane_usage`]).
+    control_plane_usage: ControlPlaneUsage,
+}
+
+/// Reads the control plane's (node 0) capacity, in the shape a worker's
+/// heartbeat reports it.
+pub type ControlPlaneUsage = Arc<dyn Fn() -> Option<NodeUsage> + Send + Sync>;
+
+/// The control plane host's capacity from the health loop's sample, sampled
+/// now when the loop has not run yet (or ran before core counts were
+/// recorded). `None` only when the host reports nothing.
+pub fn host_control_plane_usage() -> Option<NodeUsage> {
+    let recorded = crate::jobs::node_health_check::latest_control_plane_metrics()
+        .map(|(capacity, _)| capacity)
+        .filter(|capacity| capacity.get("cpu_cores").is_some());
+    let capacity = match recorded {
+        Some(capacity) => capacity,
+        None => {
+            crate::jobs::node_health_check::refresh_control_plane_metrics();
+            crate::jobs::node_health_check::latest_control_plane_metrics()?.0
+        }
+    };
+    NodeUsage::from_capacity_json(&capacity)
 }
 
 /// The plane's isolation for an environment's setting.
@@ -631,7 +655,14 @@ impl WorkloadPlacementService {
             socket_grant: legacy.docker_socket_grant().clone(),
             heartbeat_threshold_secs: legacy.heartbeat_threshold_secs(),
             control_plane_isolations: std::sync::OnceLock::new(),
+            control_plane_usage: Arc::new(host_control_plane_usage),
         }
+    }
+
+    /// Read the control plane's capacity from `usage` instead of this host.
+    pub fn with_control_plane_usage(mut self, usage: ControlPlaneUsage) -> Self {
+        self.control_plane_usage = usage;
+        self
     }
 
     /// Record what the control plane's drivers provide, so the explain
@@ -767,6 +798,17 @@ impl WorkloadPlacementService {
             NodeResourcePolicy::BestEffort
         };
         control_plane.system_reserved = Self::control_plane_reserved(&control);
+        // Its capacity: without it an enforced node 0 could place nothing
+        // that reserves CPU or memory (`CapacityUnknown`). Only the capacity,
+        // not the live load, so node 0 is never dropped by the load threshold
+        // (as it never was before it reported anything).
+        control_plane.usage = (self.control_plane_usage)()
+            .map(|usage| NodeUsage {
+                cpu_percent: None,
+                memory_used_bytes: None,
+                ..usage
+            })
+            .filter(|usage| usage.cpu_cores.is_some() || usage.memory_total_bytes.is_some());
         if let Some(isolations) = self.control_plane_isolations.get() {
             control_plane.isolations = isolations.clone();
         }
@@ -1037,6 +1079,31 @@ impl WorkloadPlacementService {
             Self::validate_reserved(reserved)?;
         }
         let previous = self.node_resources(node_id).await?;
+        if node_id == CONTROL_PLANE_NODE_ID
+            && update.resource_policy == Some(NodeResourcePolicy::Enforced)
+        {
+            let usage = (self.control_plane_usage)();
+            let missing: Vec<&str> = [
+                ("CPU core count", usage.and_then(|u| u.cpu_cores).is_none()),
+                (
+                    "total memory",
+                    usage.and_then(|u| u.memory_total_bytes).is_none(),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(what, missing)| missing.then_some(what))
+            .collect();
+            if !missing.is_empty() {
+                return Err(WorkloadPlacementError::Validation {
+                    message: format!(
+                        "Cannot enforce reservations on the control plane (node 0): its host \
+                         does not report its {}, so every reserving workload would be \
+                         unschedulable. Keep node 0 on best_effort",
+                        missing.join(" or ")
+                    ),
+                });
+            }
+        }
         if node_id == CONTROL_PLANE_NODE_ID {
             let mut settings = self.config_service.get_settings().await.map_err(|e| {
                 WorkloadPlacementError::Settings {
@@ -1519,6 +1586,87 @@ mod tests {
         assert!(facts.grants_socket);
         assert_eq!(facts.resource_policy, NodeResourcePolicy::Enforced);
         assert_eq!(facts.system_reserved.memory_mb, 2048);
+    }
+
+    #[tokio::test]
+    async fn an_enforced_control_plane_with_room_schedules_a_deployment() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Postgres unavailable, skipping the enforced node 0 test: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let node_service = Arc::new(NodeService::new(db.clone()));
+        let legacy = NodeScheduler::new(node_service.clone());
+        let unknown = WorkloadPlacementService::new(
+            db.clone(),
+            node_service.clone(),
+            proof_config_service(db.clone()),
+            &legacy,
+        )
+        .with_control_plane_usage(Arc::new(|| None));
+        let enforce = NodeResourceUpdate {
+            resource_policy: Some(NodeResourcePolicy::Enforced),
+            system_reserved: None,
+        };
+        let refused = unknown
+            .set_node_resources(CONTROL_PLANE_NODE_ID, enforce)
+            .await
+            .expect_err("no capacity, no enforcement");
+        assert!(
+            matches!(&refused, WorkloadPlacementError::Validation { message }
+                if message.contains("CPU core count") && message.contains("node 0")),
+            "{refused}"
+        );
+
+        // A 4-core, 16 GB single-node install with nothing running.
+        let service = WorkloadPlacementService::new(
+            db.clone(),
+            node_service,
+            proof_config_service(db.clone()),
+            &legacy,
+        )
+        .with_control_plane_usage(Arc::new(|| {
+            Some(NodeUsage {
+                cpu_percent: Some(10.0),
+                memory_used_bytes: Some(2.0 * 1024.0 * 1024.0 * 1024.0),
+                memory_total_bytes: Some(16.0 * 1024.0 * 1024.0 * 1024.0),
+                cpu_cores: Some(4.0),
+            })
+        }));
+        service
+            .set_node_resources(CONTROL_PLANE_NODE_ID, enforce)
+            .await
+            .expect("enforced");
+        let nodes = service.node_facts(None).await.expect("facts");
+        let control_plane = &nodes[0];
+        assert_eq!(control_plane.id, CONTROL_PLANE_NODE_ID);
+        assert_eq!(control_plane.resource_policy, NodeResourcePolicy::Enforced);
+        assert_eq!(control_plane.usage.and_then(|u| u.cpu_cores), Some(4.0));
+
+        let placement_spec = temps_workload::PlacementSpec::default();
+        let resources = temps_workload::Resources::default();
+        let placement = temps_workload_plane::scheduler::UnifiedScheduler::new(
+            service.scheduler_config().clone(),
+        )
+        .schedule(
+            &nodes,
+            &temps_workload_plane::scheduler::ScheduleRequest {
+                kind: temps_workload::WorkloadKind::Deployment,
+                placement: &placement_spec,
+                resources: &resources,
+                isolation: Isolation::Process,
+                image_platforms: &[],
+                socket_gate: None,
+                exclude_node_ids: &[],
+                exclude_control_plane: false,
+                affinity_nodes: &[],
+            },
+        )
+        .expect("an ordinary deployment fits an enforced node 0 with room");
+        assert_eq!(placement.nodes, vec![CONTROL_PLANE_NODE_ID]);
     }
 
     fn facts(id: i32, name: &str, cpu: f64, mem_used_gb: f64) -> NodeFacts {
