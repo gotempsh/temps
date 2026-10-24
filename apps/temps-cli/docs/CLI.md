@@ -1769,10 +1769,10 @@ Add a new DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, namecheap, gcp, azure, manual) | - | No |
+| `-t, --type <type>` | Provider type (cloudflare, bunny, route53, digitalocean, desec, namecheap, gcp, azure, manual) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-d, --description <description>` | Provider description | - | No |
-| `--api-token <token>` | API token (Cloudflare, DigitalOcean; prefer --api-token-stdin to keep it out of shell history) | - | No |
+| `--api-token <token>` | API token (Cloudflare, DigitalOcean, deSEC; prefer --api-token-stdin to keep it out of shell history) | - | No |
 | `--api-token-stdin` | Read the API token from stdin | - | No |
 | `--account-id <id>` | Cloudflare account ID (optional) | - | No |
 | `--access-key-id <key>` | AWS access key ID | - | No |

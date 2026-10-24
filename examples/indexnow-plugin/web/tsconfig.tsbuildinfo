@@ -1,1 +1,1 @@
-{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/router.ts","./src/types.ts","./src/vite-env.d.ts","./src/components/settings.tsx","./src/components/submissions.tsx","./src/components/suggestions.tsx"],"version":"5.7.3"}
+{"root":["./src/App.tsx","./src/api.ts","./src/main.tsx","./src/router.ts","./src/types.ts","./src/vite-env.d.ts","./src/components/Settings.tsx","./src/components/Submissions.tsx","./src/components/Suggestions.tsx"],"version":"5.7.3"}

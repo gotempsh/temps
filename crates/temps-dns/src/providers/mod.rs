@@ -10,6 +10,7 @@ pub mod azure;
 pub mod bunny;
 pub mod cloudflare;
 pub mod credentials;
+pub mod desec;
 pub mod digitalocean;
 pub mod gcp;
 pub mod namecheap;
@@ -22,10 +23,11 @@ pub use azure::AzureProvider;
 pub use bunny::BunnyProvider;
 pub use cloudflare::CloudflareProvider;
 pub use credentials::{
-    AzureCredentials, BunnyCredentials, CloudflareCredentials, DigitalOceanCredentials,
-    GcpCredentials, NamecheapCredentials, PebbleCredentials, ProviderCredentials,
-    Route53Credentials,
+    AzureCredentials, BunnyCredentials, CloudflareCredentials, DeSecCredentials,
+    DigitalOceanCredentials, GcpCredentials, NamecheapCredentials, PebbleCredentials,
+    ProviderCredentials, Route53Credentials,
 };
+pub use desec::DeSecProvider;
 pub use digitalocean::DigitalOceanProvider;
 pub use gcp::GcpProvider;
 pub use namecheap::NamecheapProvider;

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Globe } from 'lucide-react'
+import { Globe, Umbrella } from 'lucide-react'
 import {
   BunnyIcon,
   CloudflareIcon,
@@ -33,6 +33,8 @@ export function getDnsProviderIcon(
       return <DigitalOceanIcon className={className} />
     case 'namecheap':
       return <NamecheapIcon className={className} />
+    case 'desec':
+      return <Umbrella className={className} />
     default:
       return <Globe className={className} />
   }

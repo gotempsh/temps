@@ -29,6 +29,8 @@ pub enum DnsProviderType {
     Route53,
     /// DigitalOcean DNS (API Token)
     DigitalOcean,
+    /// deSEC DNS (API Token)
+    DeSec,
     /// Google Cloud DNS (Service Account)
     Gcp,
     /// Azure DNS (Service Principal)
@@ -50,6 +52,7 @@ impl std::fmt::Display for DnsProviderType {
             DnsProviderType::Namecheap => write!(f, "namecheap"),
             DnsProviderType::Route53 => write!(f, "route53"),
             DnsProviderType::DigitalOcean => write!(f, "digitalocean"),
+            DnsProviderType::DeSec => write!(f, "desec"),
             DnsProviderType::Gcp => write!(f, "gcp"),
             DnsProviderType::Azure => write!(f, "azure"),
             DnsProviderType::Manual => write!(f, "manual"),
@@ -67,6 +70,7 @@ impl DnsProviderType {
             "namecheap" | "nc" => Ok(DnsProviderType::Namecheap),
             "route53" | "aws" | "r53" => Ok(DnsProviderType::Route53),
             "digitalocean" | "do" => Ok(DnsProviderType::DigitalOcean),
+            "desec" => Ok(DnsProviderType::DeSec),
             "gcp" | "google" | "googlecloud" | "google-cloud" => Ok(DnsProviderType::Gcp),
             "azure" | "az" => Ok(DnsProviderType::Azure),
             "manual" => Ok(DnsProviderType::Manual),
@@ -83,6 +87,7 @@ impl DnsProviderType {
             DnsProviderType::Namecheap => vec!["api_user", "api_key"],
             DnsProviderType::Route53 => vec!["access_key_id", "secret_access_key"],
             DnsProviderType::DigitalOcean => vec!["api_token"],
+            DnsProviderType::DeSec => vec!["api_token"],
             DnsProviderType::Gcp => vec!["service_account_email", "private_key", "project_id"],
             DnsProviderType::Azure => {
                 vec![
@@ -106,6 +111,7 @@ impl DnsProviderType {
             DnsProviderType::Namecheap => vec!["client_ip", "sandbox"],
             DnsProviderType::Route53 => vec!["session_token", "region"],
             DnsProviderType::DigitalOcean => vec![],
+            DnsProviderType::DeSec => vec![],
             DnsProviderType::Gcp => vec![],
             DnsProviderType::Azure => vec![],
             DnsProviderType::Manual => vec![],
@@ -134,6 +140,7 @@ impl DnsProviderType {
             | DnsProviderType::Bunny
             | DnsProviderType::Route53
             | DnsProviderType::DigitalOcean
+            | DnsProviderType::DeSec
             | DnsProviderType::Gcp
             | DnsProviderType::Azure
             | DnsProviderType::Pebble => true,
@@ -886,6 +893,10 @@ mod tests {
             DnsProviderType::DigitalOcean
         );
         assert_eq!(
+            DnsProviderType::from_str("deSEC").unwrap(),
+            DnsProviderType::DeSec
+        );
+        assert_eq!(
             DnsProviderType::from_str("gcp").unwrap(),
             DnsProviderType::Gcp
         );
@@ -971,6 +982,7 @@ mod tests {
         assert_eq!(DnsProviderType::Namecheap.to_string(), "namecheap");
         assert_eq!(DnsProviderType::Route53.to_string(), "route53");
         assert_eq!(DnsProviderType::DigitalOcean.to_string(), "digitalocean");
+        assert_eq!(DnsProviderType::DeSec.to_string(), "desec");
         assert_eq!(DnsProviderType::Gcp.to_string(), "gcp");
         assert_eq!(DnsProviderType::Azure.to_string(), "azure");
         assert_eq!(DnsProviderType::Manual.to_string(), "manual");
@@ -993,6 +1005,10 @@ mod tests {
         );
         assert_eq!(
             DnsProviderType::DigitalOcean.required_credentials(),
+            vec!["api_token"]
+        );
+        assert_eq!(
+            DnsProviderType::DeSec.required_credentials(),
             vec!["api_token"]
         );
         assert_eq!(
@@ -1033,6 +1049,7 @@ mod tests {
         assert!(DnsProviderType::DigitalOcean
             .optional_credentials()
             .is_empty());
+        assert!(DnsProviderType::DeSec.optional_credentials().is_empty());
         assert!(DnsProviderType::Gcp.optional_credentials().is_empty());
         assert!(DnsProviderType::Azure.optional_credentials().is_empty());
         assert!(DnsProviderType::Manual.optional_credentials().is_empty());
@@ -1683,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_keeps_unparseable_addresses_trimmed_and_distinct() {
+    fn canonical_keeps_unparsable_addresses_trimmed_and_distinct() {
         let invalid = DnsRecordContent::AAAA {
             address: " 2001:db8::zz ".to_string(),
         };
@@ -1811,6 +1828,7 @@ mod tests {
             DnsProviderType::Bunny,
             DnsProviderType::Route53,
             DnsProviderType::DigitalOcean,
+            DnsProviderType::DeSec,
             DnsProviderType::Gcp,
             DnsProviderType::Azure,
             DnsProviderType::Pebble,
