@@ -213,6 +213,36 @@ Authenticated clients use Temps endpoints under `/api/projects/{project_id}/cron
 
 ---
 
+## Server and Worker Resource Usage
+
+The machine running the control plane and every worker node report CPU, memory and disk usage, and the console draws them the same way.
+
+- **Control plane**: **Monitoring → Server**. The node sampler also records network and block I/O and Docker disk usage.
+- **Worker**: **Settings → Nodes**, then open the worker. The **Resource usage** section shows CPU, memory and disk over 1 hour, 6 hours, 24 hours or 7 days. Samples arrive with the agent's heartbeat, about every 30 seconds, so a newly joined worker fills in within a minute. Network and block I/O are not reported by workers.
+
+Workers do not need an agent upgrade for this: the control plane stores the capacity figures that every `temps agent` heartbeat already carries. An agent that includes this release also measures CPU over the heartbeat interval rather than at a single instant, so older agents report a CPU figure that is usually close to zero.
+
+### Alerts on disk, memory and CPU
+
+Each node (the control plane or a worker) can have one alert rule per metric on `node.cpu_percent`, `node.memory_percent` and `node.disk_percent`, with a threshold between 0 and 100. Add them from the **Alert rules** card on the node, or press **Add recommended alerts** to create CPU above 90%, memory above 90% and disk above 85%, each for 5 minutes as a warning. Nothing is created until you press it. A firing rule raises an alarm like any other metric alert and notifies through your configured notification routes.
+
+```bash
+# Current values and history for a worker (node id 3)
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/latest"
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics?metric=node.disk_percent&range=24h"
+
+# Alert when the worker's disk is more than 90% full for 10 minutes
+curl -X POST -H "Authorization: Bearer $TEMPS_API_TOKEN" -H "Content-Type: application/json" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/alert-rules" \
+  -d '{"name":"Disk almost full","metric_name":"node.disk_percent","comparator":">","threshold":90,"severity":"critical","for_duration_secs":600}'
+```
+
+Removing a worker also removes its alert rules. The control plane's own rules are re-seeded on every start, so deleting one is refused; disable it instead.
+
+---
+
 ## Health Checks
 
 Configure health checks to automatically monitor your application's availability:

@@ -18617,6 +18617,38 @@ export type NodeCostInfo = {
 };
 
 /**
+ * Request body for creating a resource alert on a node.
+ *
+ * Only the usage percentages can be alerted on: `node.cpu_percent`,
+ * `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
+ * (0-100). A node has at most one rule per metric.
+ */
+export type NodeCreateAlertRuleRequest = {
+    /**
+     * One of `>`, `<`, `>=`, `<=`.
+     */
+    comparator: string;
+    enabled?: boolean;
+    /**
+     * Seconds the breach must persist before the alarm fires (0 = immediate).
+     */
+    for_duration_secs?: number;
+    /**
+     * One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+     */
+    metric_name: string;
+    name: string;
+    /**
+     * `"warning"` or `"critical"`.
+     */
+    severity: string;
+    /**
+     * Percentage between 0 and 100.
+     */
+    threshold: number;
+};
+
+/**
  * Per-node DNS resolver health, as last reported by that node's heartbeat.
  * Part of `GET /api/cluster/dns/status`.
  */
@@ -56070,6 +56102,102 @@ export type NodeMetricsGetAlertRulesResponses = {
 };
 
 export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsCreateAlertRuleData = {
+    body: NodeCreateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsCreateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * The node already has a rule for this metric
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsCreateAlertRuleResponses = {
+    /**
+     * Alert rule created
+     */
+    201: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsCreateAlertRuleResponse = NodeMetricsCreateAlertRuleResponses[keyof NodeMetricsCreateAlertRuleResponses];
+
+export type NodeMetricsDeleteAlertRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsDeleteAlertRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found on this node
+     */
+    404: unknown;
+    /**
+     * Control-plane default rules cannot be deleted
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsDeleteAlertRuleResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type NodeMetricsDeleteAlertRuleResponse = NodeMetricsDeleteAlertRuleResponses[keyof NodeMetricsDeleteAlertRuleResponses];
 
 export type NodeMetricsUpdateAlertRuleData = {
     body: ServiceUpdateAlertRuleRequest;

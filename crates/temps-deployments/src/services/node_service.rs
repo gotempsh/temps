@@ -13,7 +13,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use temps_entities::{
-    deployment_containers, deployments, environments, nodes, projects, sandboxes,
+    deployment_containers, deployments, environments, monitoring_alert_rules, nodes, projects,
+    sandboxes,
 };
 
 /// `deployment_containers.status` for a container Temps confirmed is gone from
@@ -2302,6 +2303,15 @@ impl NodeService {
             .await?
             .rows_affected;
 
+        // `monitoring_alert_rules.node_id` has no foreign key (node 0, the
+        // control plane, has no row), so nothing cascades. Node IDs are never
+        // reused, which makes a leftover rule permanently dead weight: the
+        // evaluator would query a series that can never receive another point.
+        monitoring_alert_rules::Entity::delete_many()
+            .filter(monitoring_alert_rules::Column::NodeId.eq(node_id))
+            .exec(&txn)
+            .await?;
+
         nodes::Entity::delete_by_id(node_id).exec(&txn).await?;
         txn.commit().await?;
 
@@ -3563,6 +3573,11 @@ mod tests {
             .append_query_results(vec![Vec::<environments::Model>::new()])
             .append_query_results(vec![Vec::<projects::Model>::new()])
             // orphan any unconfirmed containers (none here)
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            // drop the node's alert rules (none here)
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
