@@ -379,9 +379,11 @@ impl ContainerDeployer for PlaneContainerDeployer {
             ),
         );
         let handed_over = self
-            .await_replica(workload_id, &request.container_name)
+            .await_replica(workload_id, &request.container_name, container_port)
             .await;
-        // The values were only needed for the create.
+        // The values were only needed for the create, which is done: on a
+        // worker, its node fetched them before it reported the replica
+        // running, and `await_replica` waits for that report.
         drop(staged);
         let (view, handle, status) = match handed_over {
             Ok(replica) => {
@@ -602,13 +604,24 @@ impl ContainerDeployer for PlaneContainerDeployer {
     }
 }
 
+/// How often a handoff rereads a worker's replica while it waits for the
+/// node's report of its published port.
+const REPORT_POLL: Duration = Duration::from_millis(500);
+
 impl PlaneContainerDeployer {
     /// Wait for workload `workload_id`'s replica to run, then read its
     /// instance: everything between the apply and the handoff that can fail.
+    ///
+    /// The handoff needs what the node itself reported: the instance
+    /// running and, on a worker, the host port it published for
+    /// `container_port` (what the control-plane proxy dials). A worker's
+    /// node fetches the staged environment when it creates the container,
+    /// so the caller may drop it only after this returns.
     async fn await_replica(
         &self,
         workload_id: i64,
         container_name: &str,
+        container_port: u16,
     ) -> Result<
         (
             temps_workload_plane::WorkloadView,
@@ -617,6 +630,7 @@ impl PlaneContainerDeployer {
         ),
         DeployerError,
     > {
+        let started = tokio::time::Instant::now();
         let view = self
             .plane
             .wait_for(workload_id, ConditionKind::Running, self.ready_timeout)
@@ -627,18 +641,51 @@ impl PlaneContainerDeployer {
                     e,
                 )
             })?;
-        let (handle, status) = self
-            .plane
-            .instance_status(view.id)
-            .await
-            .map_err(|e| self.plane_error("inspect the started replica", e))?
-            .ok_or_else(|| {
-                self.plane_error(
-                    "find the started replica",
-                    format!("workload {} reports Running but has no instance", view.id),
-                )
-            })?;
-        Ok((view, handle, status))
+        // On the control plane the runtime answers directly, as before.
+        let on_worker = self.node_id != CONTROL_PLANE_NODE_ID;
+        let needs_port = on_worker && container_port != 0;
+        loop {
+            let (handle, status) = self
+                .plane
+                .instance_status(view.id)
+                .await
+                .map_err(|e| self.plane_error("inspect the started replica", e))?
+                .ok_or_else(|| {
+                    self.plane_error(
+                        "find the started replica",
+                        format!("workload {} reports Running but has no instance", view.id),
+                    )
+                })?;
+            let published = status.published_ports.iter().any(|binding| {
+                binding.container_port == container_port && binding.host_port.is_some()
+            });
+            if !on_worker
+                || (status.state == temps_workload::InstanceState::Running
+                    && (published || !needs_port))
+            {
+                return Ok((view, handle, status));
+            }
+            if started.elapsed() >= self.ready_timeout {
+                return Err(self.plane_error(
+                    &format!("hand over {container_name} (workload {workload_id})"),
+                    format!(
+                        "after {}s its instance '{}' on node {} is {:?}{}",
+                        self.ready_timeout.as_secs(),
+                        handle.name,
+                        self.node_id,
+                        status.state,
+                        if needs_port && !published {
+                            format!(
+                                " with no host port published for container port {container_port}"
+                            )
+                        } else {
+                            String::new()
+                        }
+                    ),
+                ));
+            }
+            tokio::time::sleep(REPORT_POLL).await;
+        }
     }
 
     async fn retire(&self, workload_id: i64, container_id: &str) -> Result<(), DeployerError> {
@@ -713,6 +760,7 @@ fn micro_vm_container_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_workload as tw;
 
     fn request() -> DeployRequest {
         DeployRequest {
@@ -958,6 +1006,238 @@ mod tests {
         assert!(
             rows[0].deleted_at.is_some(),
             "and retired, so the reconciler removes whatever it created"
+        );
+    }
+
+    /// Places every attempt on a worker that reads the node state stream.
+    struct StreamWorker {
+        db: Arc<sea_orm::DatabaseConnection>,
+    }
+
+    #[async_trait]
+    impl temps_workload_plane::AttemptPlacement for StreamWorker {
+        async fn place(
+            &self,
+            _: &temps_workload_plane::WorkloadView,
+        ) -> Result<temps_workload_plane::Placed, String> {
+            Err("replicas are pinned by the deploy job".into())
+        }
+
+        async fn place_on(
+            &self,
+            _: &temps_workload_plane::WorkloadView,
+            node_id: i32,
+        ) -> Result<temps_workload_plane::Placed, String> {
+            Ok(temps_workload_plane::Placed::Node {
+                node_id,
+                node_name: format!("worker-{node_id}"),
+                driver: self
+                    .driver_for(node_id, temps_workload_plane::STREAM_DRIVER)
+                    .await?,
+            })
+        }
+
+        async fn driver_for(
+            &self,
+            node_id: i32,
+            _: &str,
+        ) -> Result<Arc<dyn temps_workload::RuntimeDriver>, String> {
+            // Nothing listens at the agent's address: the image is taken as
+            // already on the node, and the handoff never reads output.
+            let remote = temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused-token".into(),
+                format!("worker-{node_id}"),
+            )
+            .map_err(|e| e.to_string())?;
+            let rpc = ImageOnNode(crate::services::node_state::AgentApiDriver::new(
+                node_id,
+                format!("worker-{node_id}"),
+                Arc::new(remote),
+                None,
+            ));
+            Ok(Arc::new(
+                temps_workload_plane::StreamNodeDriver::new(
+                    self.db.clone(),
+                    node_id,
+                    Arc::new(rpc),
+                )
+                .with_poll_interval(Duration::from_millis(100)),
+            ))
+        }
+    }
+
+    /// A worker's agent API whose image is already on the node.
+    struct ImageOnNode(crate::services::node_state::AgentApiDriver);
+
+    #[async_trait]
+    impl tw::RuntimeDriver for ImageOnNode {
+        fn capabilities(&self) -> &tw::DriverCapabilities {
+            self.0.capabilities()
+        }
+        async fn prepare(
+            &self,
+            artifact: &tw::Artifact,
+        ) -> Result<tw::PreparedArtifact, tw::DriverError> {
+            Ok(tw::PreparedArtifact {
+                artifact: artifact.clone(),
+                local_ref: "image-on-node".into(),
+            })
+        }
+        async fn create(
+            &self,
+            spec: &tw::InstanceSpec,
+            attach: &tw::Attachments,
+        ) -> Result<tw::InstanceHandle, tw::DriverError> {
+            self.0.create(spec, attach).await
+        }
+        async fn start(&self, handle: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            self.0.start(handle).await
+        }
+        async fn stop(&self, handle: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            self.0.stop(handle).await
+        }
+        async fn remove(
+            &self,
+            handle: &tw::InstanceHandle,
+            purge: bool,
+        ) -> Result<(), tw::DriverError> {
+            self.0.remove(handle, purge).await
+        }
+        async fn inspect(
+            &self,
+            handle: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStatus, tw::DriverError> {
+            self.0.inspect(handle).await
+        }
+        async fn logs(
+            &self,
+            handle: &tw::InstanceHandle,
+            query: tw::LogQuery,
+        ) -> Result<tw::LogStream, tw::DriverError> {
+            self.0.logs(handle, query).await
+        }
+        async fn stats(
+            &self,
+            handle: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStats, tw::DriverError> {
+            self.0.stats(handle).await
+        }
+    }
+
+    fn report(instance_id: i64, host_port: Option<u16>) -> temps_workload::stream::InstanceReport {
+        temps_workload::stream::InstanceReport {
+            instance_id,
+            phase: "running".into(),
+            exit_code: None,
+            started_at: Some(chrono::Utc::now()),
+            finished_at: None,
+            conditions: Vec::new(),
+            published_ports: host_port
+                .map(|port| temps_workload::PortBinding {
+                    container_port: 3000,
+                    protocol: temps_workload::PortProtocol::Tcp,
+                    host_ip: "10.0.0.7".into(),
+                    host_port: Some(port),
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// A replica on a stream worker is handed over only once its node
+    /// reported it running with the deployment's port published, and the
+    /// staged environment the node creates it from outlives that wait.
+    #[tokio::test]
+    async fn a_worker_handoff_waits_for_the_node_report_and_its_published_port() {
+        use sea_orm::EntityTrait;
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-worker-handoff"),
+            )
+            .with_placement(Arc::new(StreamWorker { db: db.clone() })),
+        );
+        let deployer = Arc::new(
+            PlaneContainerDeployer::new(
+                plane.clone(),
+                Arc::new(UnusedDeployer),
+                42,
+                Duration::from_secs(30),
+            )
+            .on_node(7),
+        );
+        let handoff = tokio::spawn({
+            let deployer = deployer.clone();
+            async move { deployer.deploy_container(request()).await }
+        });
+
+        let mut instance = None;
+        for _ in 0..200 {
+            plane.reconcile_at(chrono::Utc::now(), false).await;
+            instance = temps_entities::workload_instances::Entity::find()
+                .one(db.as_ref())
+                .await
+                .expect("read the instances");
+            if instance.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let instance = instance.expect("the replica was assigned to the worker");
+        assert_eq!(instance.node_id, Some(7));
+        let workload = temps_entities::workloads::Entity::find()
+            .one(db.as_ref())
+            .await
+            .expect("read the workload");
+        assert_eq!(
+            instance.phase, "pending",
+            "nothing has run it yet: {instance:?} of {workload:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!handoff.is_finished(), "no report, no handoff");
+        let env = plane
+            .instance_env(7, instance.id)
+            .await
+            .expect("the node can still fetch the staged environment");
+        assert!(env.env.contains(&("PORT".into(), "3000".into())));
+
+        // Running, but the port the proxy dials is not published yet.
+        plane
+            .ingest_node_reports(7, &[report(instance.id, None)])
+            .await
+            .expect("ingested");
+        plane.reconcile_at(chrono::Utc::now(), false).await;
+        tokio::time::sleep(REPORT_POLL * 3).await;
+        assert!(
+            !handoff.is_finished(),
+            "running without its published port is not handed over"
+        );
+
+        plane
+            .ingest_node_reports(7, &[report(instance.id, Some(40000))])
+            .await
+            .expect("ingested");
+        plane.reconcile_at(chrono::Utc::now(), false).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), handoff)
+            .await
+            .expect("handed over after the report")
+            .expect("joined")
+            .expect("deployed");
+        assert_eq!(result.container_port, 3000);
+        assert_eq!(result.host_port, 40000);
+        assert!(
+            plane.instance_env(7, instance.id).await.is_err(),
+            "the staged environment is dropped after the handoff"
         );
     }
 }

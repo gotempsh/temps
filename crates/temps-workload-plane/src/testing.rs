@@ -287,6 +287,8 @@ struct FakeState {
     instances: BTreeMap<String, FakeInstance>,
     created: Vec<(InstanceSpec, Attachments)>,
     fail_prepare: bool,
+    /// `stop` and `remove` fail, as an unreachable node's would.
+    unreachable: bool,
     output: String,
 }
 
@@ -357,6 +359,10 @@ impl FakeDriver {
 
     pub(crate) fn fail_prepare(&self, fail: bool) {
         self.state().fail_prepare = fail;
+    }
+
+    pub(crate) fn set_unreachable(&self, unreachable: bool) {
+        self.state().unreachable = unreachable;
     }
 
     pub(crate) fn set_output(&self, output: &str) {
@@ -499,7 +505,14 @@ impl RuntimeDriver for FakeDriver {
     }
 
     async fn stop(&self, handle: &InstanceHandle) -> Result<(), DriverError> {
-        if let Some(instance) = self.state().instances.get_mut(&handle.id) {
+        let mut state = self.state();
+        if state.unreachable {
+            return Err(DriverError::Unavailable {
+                driver: self.capabilities.name.clone(),
+                reason: format!("node unreachable while stopping '{}'", handle.name),
+            });
+        }
+        if let Some(instance) = state.instances.get_mut(&handle.id) {
             if instance.state == InstanceState::Running {
                 instance.state = InstanceState::Exited;
                 instance.exit_code = Some(137);
@@ -510,12 +523,25 @@ impl RuntimeDriver for FakeDriver {
     }
 
     async fn remove(&self, handle: &InstanceHandle, _purge: bool) -> Result<(), DriverError> {
-        self.state().instances.remove(&handle.id);
+        let mut state = self.state();
+        if state.unreachable {
+            return Err(DriverError::Unavailable {
+                driver: self.capabilities.name.clone(),
+                reason: format!("node unreachable while removing '{}'", handle.name),
+            });
+        }
+        state.instances.remove(&handle.id);
         Ok(())
     }
 
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let state = self.state();
+        if state.unreachable {
+            return Err(DriverError::Unavailable {
+                driver: self.capabilities.name.clone(),
+                reason: format!("node unreachable while inspecting '{}'", handle.name),
+            });
+        }
         let (state, exit_code, finished_at, published_ports) = match state.instances.get(&handle.id)
         {
             Some(i) => (i.state, i.exit_code, i.finished_at, i.ports.clone()),

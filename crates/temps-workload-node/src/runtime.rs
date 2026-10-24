@@ -1387,6 +1387,39 @@ mod tests {
         );
         runtime.mark_sent(&reports);
 
+        // The control plane keeps the row pending until it ingests that
+        // report: a delta delivering it pending again must not create a
+        // second container, nor lose the running one.
+        runtime
+            .apply(StateResponse {
+                node_id: 5,
+                watermark: "150".into(),
+                full: None,
+                changes: vec![StateChange::Upsert {
+                    object: StateObject::Instance(replica("pending")),
+                }],
+                more: false,
+            })
+            .await
+            .expect("applied");
+        runtime.reconcile().await;
+        {
+            let containers = docker.containers.lock().expect("lock");
+            assert_eq!(containers.len(), 1, "created once");
+            assert_eq!(
+                containers.get("temps-job-3-a1").map(|c| c.0),
+                Some(InstanceState::Running)
+            );
+        }
+        assert!(
+            runtime
+                .pending_reports()
+                .await
+                .iter()
+                .all(|r| r.phase == "running"),
+            "still reported running"
+        );
+
         // Its owner stops it: the same attempt, reported stopped, once.
         docker
             .containers

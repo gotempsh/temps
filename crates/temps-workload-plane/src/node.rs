@@ -86,6 +86,15 @@ pub trait Placement: Send + Sync {
         node_id: i32,
         driver: &str,
     ) -> Result<Arc<dyn RuntimeDriver>, String>;
+
+    /// Whether worker `node_id` is still registered. The reconciler keeps
+    /// retrying the removal of an instance whose driver acts only when
+    /// called (not [`RuntimeDriver::reconciled_by_node`]) until it
+    /// succeeds, except on a node that no longer exists, where nothing can
+    /// remove it any more. The default never gives up.
+    async fn node_exists(&self, _node_id: i32) -> Result<bool, String> {
+        Ok(true)
+    }
 }
 
 fn stream_capabilities() -> DriverCapabilities {
@@ -178,6 +187,12 @@ impl StreamNodeDriver {
 impl RuntimeDriver for StreamNodeDriver {
     fn capabilities(&self) -> &DriverCapabilities {
         &self.capabilities
+    }
+
+    /// The worker's node runtime creates, stops and removes from its
+    /// stream, and only its report moves an instance to running.
+    fn reconciled_by_node(&self) -> bool {
+        true
     }
 
     async fn prepare(&self, artifact: &Artifact) -> Result<PreparedArtifact, DriverError> {
@@ -696,6 +711,7 @@ mod tests {
             .expect("an instance row");
         assert_eq!(row.node_id, Some(5));
         assert_eq!(row.driver, STREAM_DRIVER);
+        assert_eq!(row.phase, "pending", "running only once the worker says so");
         let view = plane.get(id).await.expect("read");
         let scheduled = view
             .status
@@ -750,6 +766,12 @@ mod tests {
                 .expect("ingested"),
             0,
             "an unchanged report writes nothing"
+        );
+        plane.reconcile_at(Utc::now(), false).await;
+        assert_eq!(
+            plane.get(id).await.expect("read").status.phase,
+            WorkloadPhase::Running,
+            "the worker's report made it running"
         );
         assert_eq!(
             plane
@@ -811,6 +833,35 @@ mod tests {
         assert_eq!(row.node_id, Some(7), "on the pinned worker");
         assert_eq!(row.driver, STREAM_DRIVER);
 
+        // Nothing has run yet: the worker has not even read the row. It
+        // stays pending, so the worker creates it when its stream delivers
+        // it, and nobody waiting for the replica is told it runs.
+        assert_eq!(row.phase, "pending");
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Pending);
+        let running = view
+            .status
+            .condition(ConditionKind::Running)
+            .expect("running condition");
+        assert_eq!(running.status, ConditionStatus::False);
+        assert_eq!(running.reason, "WaitingForNode");
+        assert!(matches!(
+            plane
+                .wait_for(id, ConditionKind::Running, StdDuration::from_millis(200))
+                .await,
+            Err(PlaneError::WaitTimedOut { .. })
+        ));
+        // A second pass before the report changes nothing.
+        plane.reconcile_at(Utc::now(), false).await;
+        let state = plane.read_node_state(7, 0).await.expect("read");
+        assert!(state.changes.iter().any(|c| matches!(
+            c,
+            StateChange::Upsert { object: StateObject::Instance(i) }
+                if i.id == row.id && i.phase == "pending"
+        )));
+        // What the worker fetches when it creates the container.
+        assert!(plane.instance_env(7, row.id).await.is_ok());
+
         let published = temps_workload::PortBinding {
             container_port: 3000,
             protocol: temps_workload::PortProtocol::Tcp,
@@ -833,6 +884,13 @@ mod tests {
                 .expect("ingested"),
             1
         );
+        // The report, not the create, makes it running.
+        plane.reconcile_at(Utc::now(), false).await;
+        let view = plane
+            .wait_for(id, ConditionKind::Running, StdDuration::from_secs(1))
+            .await
+            .expect("running after the report");
+        assert_eq!(view.status.phase, WorkloadPhase::Running);
         let (_, status) = plane
             .instance_status(id)
             .await
