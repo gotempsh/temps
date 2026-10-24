@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use tokio::sync::Semaphore;
@@ -125,6 +126,15 @@ pub async fn record_capacity(
 /// small enough to be a rounding error on a 4 GB host.
 pub const MAX_IN_FLIGHT_CAPACITY_WRITES: usize = 32;
 
+/// Longest a single capacity write may hold one of those slots.
+///
+/// Neither metrics backend is guaranteed to enforce a deadline of its own, so
+/// without this a store that accepts the connection and then stalls would
+/// keep every slot occupied forever and every later sample would be skipped.
+/// A write takes milliseconds when the store is healthy; the next heartbeat
+/// arrives 30 s later, so 10 s leaves ample room before it matters.
+pub const CAPACITY_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Samples skipped because the cap was reached, since the process started.
 static SKIPPED_CAPACITY_WRITES: AtomicU64 = AtomicU64::new(0);
 
@@ -139,7 +149,9 @@ fn write_limit() -> &'static Arc<Semaphore> {
 /// [`MAX_IN_FLIGHT_CAPACITY_WRITES`] writes are already running. Skipping is
 /// the saturation policy: the node's next heartbeat, 30 s later, supersedes
 /// the lost sample, so the cost is at worst a one-point gap in a chart, and
-/// the alternative (queueing) would grow memory without bound. Skips are
+/// the alternative (queueing) would grow memory without bound. A write that
+/// outlives [`CAPACITY_WRITE_TIMEOUT`] is abandoned and its slot freed, so a
+/// stalled store cannot hold the cap indefinitely. Skips are
 /// counted and logged on a doubling schedule (1st, 2nd, 4th, 8th, ...) so a
 /// stalled store does not also flood the log.
 ///
@@ -158,6 +170,16 @@ fn spawn_record_capacity_with(
     node_id: i32,
     capacity: serde_json::Value,
 ) -> bool {
+    spawn_record_capacity_bounded(limit, CAPACITY_WRITE_TIMEOUT, store, node_id, capacity)
+}
+
+fn spawn_record_capacity_bounded(
+    limit: Arc<Semaphore>,
+    deadline: Duration,
+    store: Arc<dyn MetricsStore>,
+    node_id: i32,
+    capacity: serde_json::Value,
+) -> bool {
     let Ok(permit) = limit.try_acquire_owned() else {
         let skipped = SKIPPED_CAPACITY_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
         if skipped.is_power_of_two() {
@@ -172,9 +194,19 @@ fn spawn_record_capacity_with(
         return false;
     };
     tokio::spawn(async move {
-        // Held for the whole write; released when the task ends.
+        // Held for the whole write; released when the task ends, including
+        // when the deadline abandons a write the store never completes.
         let _permit = permit;
-        record_capacity(store.as_ref(), node_id, &capacity, Utc::now()).await;
+        let write = record_capacity(store.as_ref(), node_id, &capacity, Utc::now());
+        if tokio::time::timeout(deadline, write).await.is_err() {
+            warn!(
+                node_id,
+                timeout_ms = deadline.as_millis() as u64,
+                "Abandoned the heartbeat metrics write for node {node_id}: the metrics store did not \
+                 answer within {}s, so this sample is lost and its slot was freed",
+                deadline.as_secs_f32()
+            );
+        }
     });
     true
 }
@@ -521,5 +553,49 @@ mod tests {
             json!({ "cpu_percent": 5.0 })
         ));
         eventually(|| limit.available_permits() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn a_hung_write_is_abandoned_and_frees_its_slot() {
+        // The gate is never opened, so the store never answers.
+        let (store, _gate) = gated_store();
+        let dyn_store: Arc<dyn MetricsStore> = store.clone();
+        let limit = Arc::new(Semaphore::new(1));
+        let beat = json!({ "cpu_percent": 5.0 });
+
+        assert!(spawn_record_capacity_bounded(
+            limit.clone(),
+            Duration::from_millis(50),
+            dyn_store.clone(),
+            1,
+            beat.clone()
+        ));
+        assert!(
+            !spawn_record_capacity_bounded(
+                limit.clone(),
+                Duration::from_millis(50),
+                dyn_store.clone(),
+                1,
+                beat.clone()
+            ),
+            "the hung write still holds the slot until its deadline"
+        );
+
+        eventually(|| limit.available_permits() == 1).await;
+
+        assert!(
+            spawn_record_capacity_bounded(
+                limit.clone(),
+                Duration::from_millis(50),
+                dyn_store,
+                1,
+                beat
+            ),
+            "a timed-out write must free its slot for the next heartbeat"
+        );
+        assert!(
+            store.written.lock().expect("spy store mutex").is_empty(),
+            "nothing was written by the abandoned writes"
+        );
     }
 }
