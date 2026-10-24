@@ -425,10 +425,26 @@ impl AuthService {
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .exec(&txn)
             .await?;
+        // Every session is gone, so the ingress login grants minted from
+        // them go too (signing out of the console signs out of protected
+        // environments), in the same transaction.
+        let revoked_grants = crate::ingress_grants::revoke_for_user(&txn, user_id)
+            .await
+            .map_err(|e| AuthError::DatabaseError {
+                reason: format!(
+                    "Failed to revoke the ingress login grants of user {} while logging out: {}",
+                    user_id, e
+                ),
+            })?;
 
         txn.commit()
             .await
             .map_err(|e| AuthError::GenericError(e.to_string()))?;
+        info!(
+            user_id,
+            revoked_ingress_grants = revoked_grants,
+            "User logged out; sessions and ingress login grants revoked"
+        );
         Ok(())
     }
 
@@ -755,14 +771,15 @@ impl AuthService {
                         )
                         .await
                         .map_err(|source| MfaChallengeError::Database {
-                            operation: "revoke sessions that predate MFA enrolment",
+                            operation: "revoke sessions and ingress login grants that predate MFA enrolment",
                             user_id: Some(user_id),
                             source,
                         })?;
                         info!(
                             user_id,
-                            revoked_sessions = revoked,
-                            "MFA enabled at sign-in; other sessions revoked"
+                            revoked_sessions = revoked.sessions,
+                            revoked_ingress_grants = revoked.ingress_grants,
+                            "MFA enabled at sign-in; other sessions and ingress login grants revoked"
                         );
                     }
 
@@ -1176,7 +1193,20 @@ impl AuthService {
                     user_update.password_reset_expires = Set(None);
                     user_update.must_change_password = Set(false);
                     user_update.updated_at = Set(Utc::now());
-                    user_update.update(transaction).await.map_err(Into::into)
+                    let updated = user_update.update(transaction).await?;
+
+                    // An email reset is how a user recovers an account whose
+                    // password they lost or suspect is known. Ingress login
+                    // grants outlive the password that minted them for up to
+                    // twelve hours, so end them with the old password.
+                    let revoked_grants =
+                        crate::ingress_grants::revoke_for_user(transaction, updated.id).await?;
+                    info!(
+                        user_id = updated.id,
+                        revoked_ingress_grants = revoked_grants,
+                        "Password reset by email; ingress login grants revoked"
+                    );
+                    Ok(updated)
                 })
             })
             .await
@@ -1278,6 +1308,18 @@ impl AuthService {
     /// in `current_session_token` so we can preserve that one session when
     /// `revoke_other_sessions` is true. The decrypted form is stored in the
     /// `sessions` table; the handler decrypts before passing it in.
+    ///
+    /// Every live Temps-login ingress grant of the user is revoked whatever
+    /// `revoke_other_sessions` says. A grant is an independent credential:
+    /// the proxy honours its cookie for up to twelve hours without looking at
+    /// the console session again, so someone who obtained one keeps access
+    /// across a password change unless it is revoked here. A grant records
+    /// no link to the session that minted it, so the current browser's grants
+    /// cannot be spared; it signs in to the environment again through the
+    /// same redirect. The password update, the session sweep and the grant
+    /// revocation commit in one transaction: if any part fails the password
+    /// is left unchanged and the caller gets the error, rather than a rotated
+    /// password with the old credentials still working.
     pub async fn change_password_self(
         &self,
         user_id: i32,
@@ -1372,35 +1414,68 @@ impl AuthService {
             .map_err(|e| AuthError::EncryptionError(format!("password hash failed: {}", e)))?
             .to_string();
 
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(|e| AuthError::DatabaseError {
+                reason: format!(
+                    "Failed to begin the password-change transaction for user {}: {}",
+                    user_id, e
+                ),
+            })?;
+
         let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
         user_update.password_hash = Set(Some(new_hash));
         user_update.updated_at = Set(Utc::now());
-        let updated = user_update.update(self.db.as_ref()).await?;
+        let updated = user_update.update(&txn).await?;
 
         // 7. Optional session sweep. Drops every session for this user
         // EXCEPT the current one (kept so the user's tab keeps working).
         // When current_session_token is None — e.g. called from a non-
         // browser context — we drop everything to be safe.
+        let mut revoked_sessions = 0;
         if revoke_other_sessions {
-            use sea_orm::QueryFilter;
             let mut q = temps_entities::sessions::Entity::delete_many()
                 .filter(temps_entities::sessions::Column::UserId.eq(user_id));
             if let Some(tok) = current_session_token {
                 q = q.filter(temps_entities::sessions::Column::SessionToken.ne(tok));
             }
-            if let Err(e) = q.exec(self.db.as_ref()).await {
-                // Don't fail the whole operation — the password is already
-                // rotated. Log loudly so an operator notices.
-                error!(
-                    "Failed to revoke other sessions for user {} after password change: {}",
-                    user_id, e
-                );
-            }
+            revoked_sessions = q
+                .exec(&txn)
+                .await
+                .map_err(|e| AuthError::DatabaseError {
+                    reason: format!(
+                        "Failed to revoke the other sessions of user {} while changing the password: {}",
+                        user_id, e
+                    ),
+                })?
+                .rows_affected;
         }
 
+        // 8. Ingress login grants, always (see the doc comment).
+        let revoked_grants = crate::ingress_grants::revoke_for_user(&txn, user_id)
+            .await
+            .map_err(|e| AuthError::DatabaseError {
+                reason: format!(
+                    "Failed to revoke the ingress login grants of user {} while changing the password: {}",
+                    user_id, e
+                ),
+            })?;
+
+        txn.commit().await.map_err(|e| AuthError::DatabaseError {
+            reason: format!(
+                "Failed to commit the password change for user {}: {}",
+                user_id, e
+            ),
+        })?;
+
         info!(
-            "Password changed for user {} (revoke_other_sessions={})",
-            user_id, revoke_other_sessions
+            user_id,
+            revoke_other_sessions,
+            revoked_sessions,
+            revoked_ingress_grants = revoked_grants,
+            "Password changed"
         );
         Ok(updated)
     }
@@ -2276,6 +2351,7 @@ mod tests {
 
         // Create session
         let session_token = auth_service.create_session(user.id).await.unwrap();
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         // Logout
         let headers = HeaderMap::new();
@@ -2289,6 +2365,81 @@ mod tests {
             .unwrap();
 
         assert!(session.is_none());
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "logging out ends every session, so the ingress grants minted from them end too"
+        );
+    }
+
+    /// A stolen console session can mint an ingress login grant. Changing the
+    /// password and revoking other sessions must end that grant as well, or
+    /// the attacker keeps the protected environment for up to twelve hours.
+    #[tokio::test]
+    async fn change_password_revoking_other_sessions_revokes_ingress_grants() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "rotate@example.com", "Original123!").await;
+        let current = auth_service.create_session(user.id).await.unwrap();
+        let stolen = auth_service.create_session(user.id).await.unwrap();
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+
+        auth_service
+            .change_password_self(
+                user.id,
+                "Original123!",
+                "Rotated456!x",
+                None,
+                true,
+                Some(&current),
+            )
+            .await
+            .expect("password change succeeds");
+
+        assert!(auth_service.verify_session(&current).await.is_ok());
+        assert!(auth_service.verify_session(&stolen).await.is_err());
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "the ingress grant must not outlive the sessions swept with the password change"
+        );
+    }
+
+    /// A grant is an independent credential, so a password change revokes it
+    /// even when the user keeps their other console sessions.
+    #[tokio::test]
+    async fn change_password_keeping_other_sessions_still_revokes_ingress_grants() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "keep-sessions@example.com", "Original123!").await;
+        let other = auth_service.create_session(user.id).await.unwrap();
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+        let bystander = create_test_user(&db.db, "bystander@example.com", "Original123!").await;
+        let bystander_grant =
+            crate::ingress_grants::test_support::live_grant(&db.db, bystander.id).await;
+
+        auth_service
+            .change_password_self(user.id, "Original123!", "Rotated456!x", None, false, None)
+            .await
+            .expect("password change succeeds");
+
+        assert!(auth_service.verify_session(&other).await.is_ok());
+        assert!(crate::ingress_grants::test_support::is_revoked(&db.db, grant).await);
+        assert!(
+            !crate::ingress_grants::test_support::is_revoked(&db.db, bystander_grant).await,
+            "only the changing user's grants are revoked"
+        );
+    }
+
+    /// A rejected password change leaves the grants alone: nothing changed.
+    #[tokio::test]
+    async fn rejected_password_change_leaves_ingress_grants_alone() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "wrong-current@example.com", "Original123!").await;
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+
+        let result = auth_service
+            .change_password_self(user.id, "NotIt123!", "Rotated456!x", None, true, None)
+            .await;
+
+        assert!(matches!(result, Err(AuthError::InvalidCurrentPassword)));
+        assert!(!crate::ingress_grants::test_support::is_revoked(&db.db, grant).await);
     }
 
     // User Registration Tests
@@ -2476,6 +2627,7 @@ mod tests {
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
         user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         // Reset password
         let request = ResetPasswordRequest {
@@ -2484,6 +2636,10 @@ mod tests {
         };
 
         auth_service.reset_password(request).await.unwrap();
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an email reset ends the ingress grants minted under the old password"
+        );
 
         // Verify password was changed and token cleared
         let updated_user = users::Entity::find_by_id(user.id)
@@ -4369,6 +4525,7 @@ mod tests {
         let user = mfa_user_with_recovery(&db.db, "enrol@example.com", false, &[]).await;
         let pre_mfa_session = auth_service.create_session(user.id).await.unwrap();
         assert!(auth_service.verify_session(&pre_mfa_session).await.is_ok());
+        let pre_mfa_grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         let challenge = auth_service
             .create_mfa_session(user.id, "password")
@@ -4386,6 +4543,10 @@ mod tests {
                 Err(AuthError::NotFound(_))
             ),
             "a session established before MFA existed must stop authenticating"
+        );
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, pre_mfa_grant).await,
+            "an ingress grant minted before MFA existed must stop admitting"
         );
     }
 

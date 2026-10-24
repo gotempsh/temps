@@ -408,19 +408,42 @@ where
     Ok((permit, result?))
 }
 
-/// Delete every session (full or pending) for `user_id` except `keep`.
-/// Returns how many rows were removed.
+/// What [`revoke_sessions_except`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RevokedAccess {
+    /// Console sessions (full or pending) deleted.
+    pub sessions: u64,
+    /// Temps-login ingress grants revoked.
+    pub ingress_grants: u64,
+}
+
+/// Delete every session (full or pending) for `user_id` except `keep`, and
+/// revoke every live Temps-login ingress grant the user holds.
+///
+/// The grants go too because each was minted from one of those console
+/// sessions and is honoured by the proxy for hours without consulting the
+/// session again: a sweep that left them in place would let a session it
+/// just ended keep opening protected environments. A grant records no link
+/// to the session that minted it, so the one belonging to `keep` cannot be
+/// spared; that browser signs in to the environment again through the same
+/// redirect. Run it inside the caller's transaction so the sweep and the
+/// change that warranted it commit together.
 pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
     conn: &C,
     user_id: i32,
     keep: Option<i32>,
-) -> Result<u64, sea_orm::DbErr> {
+) -> Result<RevokedAccess, sea_orm::DbErr> {
     let mut query = temps_entities::sessions::Entity::delete_many()
         .filter(temps_entities::sessions::Column::UserId.eq(user_id));
     if let Some(keep) = keep {
         query = query.filter(temps_entities::sessions::Column::Id.ne(keep));
     }
-    Ok(query.exec(conn).await?.rows_affected)
+    let sessions = query.exec(conn).await?.rows_affected;
+    let ingress_grants = crate::ingress_grants::revoke_for_user(conn, user_id).await?;
+    Ok(RevokedAccess {
+        sessions,
+        ingress_grants,
+    })
 }
 
 impl UserService {
@@ -1245,8 +1268,9 @@ impl UserService {
 
         info!(
             user_id,
-            revoked_sessions = revoked,
-            "MFA enabled; other sessions revoked"
+            revoked_sessions = revoked.sessions,
+            revoked_ingress_grants = revoked.ingress_grants,
+            "MFA enabled; other sessions and ingress login grants revoked"
         );
         Ok(())
     }
@@ -2020,6 +2044,7 @@ mod tests {
             .unwrap();
             ids.push(session.id);
         }
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
         let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
@@ -2027,6 +2052,10 @@ mod tests {
             .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
             .await
             .expect("valid enrolment code enables MFA");
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted before enrolment must not outlive the session sweep"
+        );
 
         let remaining: Vec<i32> = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::UserId.eq(user.id))
