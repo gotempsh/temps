@@ -67,11 +67,11 @@ impl IngressMode {
 }
 
 /// Who may open a sandbox's preview URLs (ADR-055 §11: sandboxes default to
-/// `TempsLogin`).
+/// `TempsLogin`, never anonymous by default).
 ///
-/// Stored on the sandbox row (`sandboxes.preview_access`). Rows that existed
-/// before the column are `Legacy`, so no running sandbox changes behaviour;
-/// rows created afterwards get the database default, `TempsLogin`.
+/// Stored on the sandbox row (`sandboxes.preview_access`). The sandbox's IP
+/// allow-list (`sandboxes.preview_allowed_cidrs`) is checked before any of
+/// these, so `Public` plus an allow-list means "anyone from these networks".
 #[derive(
     Debug,
     Clone,
@@ -89,33 +89,32 @@ impl IngressMode {
 #[sea_orm(rs_type = "String", db_type = "Text")]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxPreviewAccess {
-    /// Before ADR-055: the preview password when one is set, otherwise
-    /// anyone who can reach the unguessable hostname.
-    #[sea_orm(string_value = "legacy")]
-    Legacy,
-    /// The preview password when one is set, otherwise a Temps login by a
-    /// user who may use the sandbox.
+    /// A Temps user who may use the sandbox, proven by a grant the console
+    /// signs for the preview host. The default.
     #[default]
     #[sea_orm(string_value = "temps_login")]
     TempsLogin,
-    /// Anyone who can reach the hostname, even with no password set.
+    /// Whoever knows the preview password. Only valid while a password is
+    /// set: setting one selects this mode, clearing it returns to
+    /// `TempsLogin`, and the database refuses the mode without a hash.
+    #[sea_orm(string_value = "password")]
+    Password,
+    /// Anyone who can reach the hostname (and passes the IP allow-list).
     #[sea_orm(string_value = "public")]
     Public,
 }
 
 impl SandboxPreviewAccess {
+    /// The permission a `TempsLogin` grant for a sandbox preview carries:
+    /// the console signs one only for a user who may read the sandbox.
+    pub const LOGIN_PERMISSION: &'static str = "sandboxes:read";
+
     pub fn as_str(&self) -> &'static str {
         match self {
-            SandboxPreviewAccess::Legacy => "legacy",
             SandboxPreviewAccess::TempsLogin => "temps_login",
+            SandboxPreviewAccess::Password => "password",
             SandboxPreviewAccess::Public => "public",
         }
-    }
-
-    /// The value of a row from before the column: `Legacy`, so reading an
-    /// older serialized row never changes who may open its preview.
-    pub fn unchanged() -> Self {
-        SandboxPreviewAccess::Legacy
     }
 }
 
@@ -140,8 +139,8 @@ mod tests {
         assert!(IngressMode::Shadow.compiles());
         assert!(IngressMode::Enforce.compiles());
         for access in [
-            SandboxPreviewAccess::Legacy,
             SandboxPreviewAccess::TempsLogin,
+            SandboxPreviewAccess::Password,
             SandboxPreviewAccess::Public,
         ] {
             assert_eq!(

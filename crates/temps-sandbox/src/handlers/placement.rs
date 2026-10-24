@@ -342,6 +342,7 @@ pub async fn list_node_sandboxes(
                 SandboxResponse::with_template(entry.summary, template, &parts).sandbox;
             if entry.owner_user_id != Some(caller) {
                 sandbox.preview_password_hint = None;
+                sandbox.preview_allowed_cidrs = Vec::new();
                 sandbox.source_repo_url = None;
             }
             NodeSandboxEntry {

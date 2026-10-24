@@ -466,6 +466,46 @@ impl AuditOperation for IngressLoginGrantIssuedAudit {
     }
 }
 
+/// A user was issued a Temps login grant for a sandbox preview host. The
+/// grant token itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct SandboxPreviewLoginGrantIssuedAudit {
+    pub context: AuditContext,
+    /// The sandbox's public id (`sbx_...`).
+    pub sandbox_id: String,
+    pub project_id: Option<i32>,
+    pub grant_id: i64,
+    pub host: String,
+    pub permission: String,
+}
+
+impl AuditOperation for SandboxPreviewLoginGrantIssuedAudit {
+    fn operation_type(&self) -> String {
+        "SANDBOX_PREVIEW_LOGIN_GRANT_ISSUED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to serialize preview login grant audit for sandbox {}: {error}",
+                self.sandbox_id
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

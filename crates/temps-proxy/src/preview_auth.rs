@@ -4,13 +4,21 @@
 //! Preview gateway authentication for Pingora.
 //!
 //! When a request hits a hostname matching
-//! `ws-<sandbox_hex>-<port>.<preview_domain>`, the proxy looks up the sandbox,
-//! checks for a valid preview cookie, and (on success) forwards the request
-//! to the local preview gateway at `127.0.0.1:8090`.
+//! `ws-<sandbox_hex>-<port>.<preview_domain>`, the proxy looks up the
+//! sandbox's [`PreviewGate`], checks the request against it (see
+//! [`check_preview_auth`]), and on success forwards the request to the local
+//! preview gateway at `127.0.0.1:8090` (or the worker preview relay).
 //!
-//! Unauthenticated requests are redirected to a form-based login page at
-//! `/__temps/preview/login` (handled in [`crate::handler::preview_wall`] and
-//! `proxy.rs`). HTTP Basic auth is **not** supported — browsers cache Basic
+//! Every sandbox's preview access is one of `temps_login` (the default: a
+//! signed-in Temps user who may open the sandbox), `password` or `public`,
+//! always behind its optional IP allow-list.
+//!
+//! In `password` access, unauthenticated requests are redirected to a
+//! form-based login page at `/__temps/preview/login` (handled in
+//! [`crate::handler::preview_wall`] and `proxy.rs`). In `temps_login`
+//! access, a page load is redirected to the console's `/ingress/login`,
+//! which sends the visitor back with an exchange grant the proxy trades for
+//! a host-only session cookie. HTTP Basic auth is **not** supported — browsers cache Basic
 //! credentials unpredictably across subdomains and some clients refuse to
 //! send them over plain HTTP. Cookie + form is the only supported flow.
 //!
@@ -162,18 +170,29 @@ pub fn parse_preview_host(host: &str, preview_domain: &str) -> Option<PreviewHos
 /// Outcome of preview auth processing.
 #[derive(Debug)]
 pub enum PreviewAuthOutcome {
-    /// Auth succeeded — forward the request to [`PREVIEW_GATEWAY_PEER`].
-    Allow { host: PreviewHost },
-    /// No valid cookie — reply with 303 redirect to the login form.
+    /// Auth succeeded — forward the request to the preview gateway, or to
+    /// the worker preview relay when `on_worker`.
+    Allow { host: PreviewHost, on_worker: bool },
+    /// `password` access and no valid cookie — reply with 303 redirect to
+    /// the login form.
     LoginRequired { host: PreviewHost },
     /// Too many failed attempts — reply with 429.
     RateLimited { host: PreviewHost },
     /// Target sandbox does not exist (or DB lookup failed).
     NotFound { host: PreviewHost },
-    /// The sandbox has no password and its preview access asks for a Temps
-    /// login ([`PreviewSandboxLookup::TempsLoginUnavailable`]): reply 403
-    /// with instructions rather than serve it to anyone holding the URL.
-    TempsLoginUnavailable { host: PreviewHost },
+    /// The sandbox has an IP allow-list and the client address is not on
+    /// it, or is unknown: reply 403 naming the address and how to change
+    /// the list. Checked before every access mode.
+    IpDenied {
+        host: PreviewHost,
+        client_ip: Option<IpAddr>,
+    },
+    /// `password` access with no password hash stored: never served. The
+    /// database refuses this state; the proxy fails closed if it sees it.
+    PasswordMissing { host: PreviewHost },
+    /// `temps_login` access and no valid session grant: send a browser to
+    /// the console login, answer anything else 401.
+    TempsLoginRequired { host: PreviewHost, sandbox_id: i32 },
 }
 
 /// SHA-256 of the full argon2 PHC hash, truncated to 16 hex chars. Folded
@@ -527,31 +546,121 @@ pub fn verify_argon2(plaintext: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-/// Outcome of looking up a sandbox for preview auth. Distinguishes the
-/// states that drive routing: doesn't exist, exists with a configured
-/// password, exists with no password and URL-only access, exists with no
-/// password and a Temps-login requirement the preview host cannot meet.
+/// How a live sandbox's preview is gated, resolved from its row once, when
+/// the lookup cache is filled: a request then does no parsing, locking or
+/// I/O to decide. The same decision as the sandbox's compiled endpoint
+/// ([`temps_routes::ingress::sandbox_endpoint`]): the IP allow-list first,
+/// then the access mode.
+#[derive(Debug)]
+pub struct PreviewGate {
+    /// `sandboxes.id`: the owner a Temps-login grant is signed for.
+    pub sandbox_id: i32,
+    /// Whether the sandbox runs on a worker node: its previews then go to
+    /// the worker preview relay instead of the gateway.
+    pub on_worker: bool,
+    /// `preview_allowed_cidrs`, parsed. Consulted only when `restricted`.
+    allowed: Vec<ipnetwork::IpNetwork>,
+    /// Whether the stored allow-list has any entry, readable or not. An
+    /// entry the proxy cannot parse narrows the list; it never opens it.
+    restricted: bool,
+    pub access: PreviewGateAccess,
+}
+
+/// The access mode part of a [`PreviewGate`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreviewGateAccess {
+    /// Anyone holding the URL (and passing the allow-list).
+    Public,
+    /// A cookie minted against this argon2 hash by the password form.
+    Password { password_hash: String },
+    /// `password` access with no hash stored. The database refuses this
+    /// state; if the proxy sees it anyway it serves nobody.
+    PasswordMissing,
+    /// A Temps session grant for this sandbox and host.
+    TempsLogin,
+}
+
+impl PreviewGate {
+    /// The gate for a live sandbox row.
+    pub fn from_row(row: temps_entities::sandboxes::Model) -> Self {
+        use temps_entities::ingress_mode::SandboxPreviewAccess;
+        let mut allowed = Vec::with_capacity(row.preview_allowed_cidrs.len());
+        for entry in &row.preview_allowed_cidrs {
+            match entry.parse::<ipnetwork::IpNetwork>() {
+                Ok(network) => allowed.push(network),
+                Err(error) => warn!(
+                    sandbox = %row.public_id,
+                    entry = %entry,
+                    error = %error,
+                    "preview-auth: ignoring an unreadable preview allow-list entry; \
+                     the allow-list still applies"
+                ),
+            }
+        }
+        let access = match (row.preview_access, row.preview_password_hash) {
+            (SandboxPreviewAccess::Public, _) => PreviewGateAccess::Public,
+            (SandboxPreviewAccess::Password, Some(password_hash)) => {
+                PreviewGateAccess::Password { password_hash }
+            }
+            (SandboxPreviewAccess::Password, None) => PreviewGateAccess::PasswordMissing,
+            (SandboxPreviewAccess::TempsLogin, _) => PreviewGateAccess::TempsLogin,
+        };
+        Self {
+            sandbox_id: row.id,
+            on_worker: row.node_id.is_some(),
+            restricted: !row.preview_allowed_cidrs.is_empty(),
+            allowed,
+            access,
+        }
+    }
+
+    /// Whether `client_ip` passes the allow-list. An empty list admits
+    /// every address; a non-empty one refuses an unknown address.
+    /// IPv4-mapped IPv6 addresses are compared as IPv4.
+    pub fn admits_ip(&self, client_ip: Option<IpAddr>) -> bool {
+        if !self.restricted {
+            return true;
+        }
+        let Some(ip) = client_ip else {
+            return false;
+        };
+        let ip = ip.to_canonical();
+        self.allowed.iter().any(|network| network.contains(ip))
+    }
+
+    /// The password hash a `password` gate checks cookies against.
+    pub fn password_hash(&self) -> Option<&str> {
+        match &self.access {
+            PreviewGateAccess::Password { password_hash } => Some(password_hash),
+            _ => None,
+        }
+    }
+}
+
+/// Outcome of looking up a sandbox for preview auth.
 #[derive(Debug, Clone)]
 pub enum PreviewSandboxLookup {
-    /// Sandbox exists and is live, with a password configured. The
-    /// gateway should require a valid cookie or redirect to login.
-    Protected { password_hash: String },
-    /// Sandbox exists and is live, has no password, and its preview access
-    /// is `legacy` or `public` — the unguessable hex public_id is the only
-    /// gate. Forward traffic directly.
-    Open,
-    /// Sandbox exists and is live, has no password, and its preview access
-    /// is `temps_login` (ADR-055 §11). Preview hosts have no Temps-login
-    /// hand-off yet, so the gateway refuses instead of treating the URL as
-    /// the gate.
-    TempsLoginUnavailable,
-    /// Sandbox does not exist (or is destroyed).
+    /// Sandbox exists and is not destroyed.
+    Found(Arc<PreviewGate>),
+    /// Sandbox does not exist, is destroyed, or could not be loaded.
     NotFound,
 }
 
-/// Load a sandbox's existence and preview password hash. The result drives
-/// three-way routing in `check_preview_auth`: missing → 404, unprotected →
-/// Allow, protected → require cookie/login.
+impl PreviewSandboxLookup {
+    pub fn gate(&self) -> Option<&PreviewGate> {
+        match self {
+            PreviewSandboxLookup::Found(gate) => Some(gate),
+            PreviewSandboxLookup::NotFound => None,
+        }
+    }
+
+    /// The password hash when the sandbox is in `password` access.
+    pub fn password_hash(&self) -> Option<&str> {
+        self.gate().and_then(PreviewGate::password_hash)
+    }
+}
+
+/// Load a sandbox's preview gate by the hex suffix of its public id.
 ///
 /// `"stopped"` (paused) sandboxes still resolve so the gateway can surface
 /// a 502 from the dev-server side rather than a 404 from the auth side.
@@ -559,15 +668,6 @@ pub async fn lookup_sandbox(
     db: &Arc<DbConnection>,
     public_id_suffix: &str,
 ) -> PreviewSandboxLookup {
-    lookup_placed_sandbox(db, public_id_suffix).await.0
-}
-
-/// [`lookup_sandbox`], plus whether the sandbox runs on a worker node: its
-/// previews then go to the worker preview relay instead of the gateway.
-pub async fn lookup_placed_sandbox(
-    db: &Arc<DbConnection>,
-    public_id_suffix: &str,
-) -> (PreviewSandboxLookup, bool) {
     use sea_orm::{ColumnTrait, QueryFilter};
     use temps_entities::sandboxes;
 
@@ -578,17 +678,14 @@ pub async fn lookup_placed_sandbox(
         .one(db.as_ref())
         .await
     {
-        Ok(Some(row)) if row.status == "destroyed" => (PreviewSandboxLookup::NotFound, false),
-        Ok(Some(row)) => {
-            let on_worker = row.node_id.is_some();
-            (preview_lookup_for(row), on_worker)
-        }
+        Ok(Some(row)) if row.status == "destroyed" => PreviewSandboxLookup::NotFound,
+        Ok(Some(row)) => PreviewSandboxLookup::Found(Arc::new(PreviewGate::from_row(row))),
         Ok(None) => {
             debug!(
                 public_id = %full_public_id,
                 "preview-auth: sandbox not found"
             );
-            (PreviewSandboxLookup::NotFound, false)
+            PreviewSandboxLookup::NotFound
         }
         Err(e) => {
             warn!(
@@ -596,62 +693,133 @@ pub async fn lookup_placed_sandbox(
                 error = %e,
                 "preview-auth: failed to load sandbox"
             );
-            (PreviewSandboxLookup::NotFound, false)
+            PreviewSandboxLookup::NotFound
         }
     }
 }
 
-/// How a live sandbox row is gated: the same decision as
-/// its compiled endpoint ([`temps_routes::ingress::sandbox_endpoint`]). A
-/// preview password wins whatever the access setting; without one `legacy`
-/// and `public` leave the hostname as the gate and `temps_login` asks for
-/// a Temps login.
-pub fn preview_lookup_for(row: temps_entities::sandboxes::Model) -> PreviewSandboxLookup {
-    use temps_entities::ingress_mode::SandboxPreviewAccess;
-    match (row.preview_password_hash, row.preview_access) {
-        (Some(password_hash), _) => PreviewSandboxLookup::Protected { password_hash },
-        (None, SandboxPreviewAccess::Legacy | SandboxPreviewAccess::Public) => {
-            PreviewSandboxLookup::Open
-        }
-        (None, SandboxPreviewAccess::TempsLogin) => PreviewSandboxLookup::TempsLoginUnavailable,
-    }
-}
-
-/// The body of the 403 a [`PreviewSandboxLookup::TempsLoginUnavailable`]
-/// sandbox answers with: what is wrong and how to open the preview.
-pub fn temps_login_unavailable_message(sandbox_hex: &str) -> String {
+/// The body of the 403 for a client outside a sandbox's preview allow-list:
+/// the address the proxy saw and how to change the list.
+pub fn ip_denied_message(sandbox_hex: &str, client_ip: Option<IpAddr>) -> String {
+    let seen = match client_ip {
+        Some(ip) => format!("your address {} is not on it", ip.to_canonical()),
+        None => "the proxy could not determine your address".to_string(),
+    };
     format!(
-        "This preview of sandbox sbx_{sandbox_hex} requires a Temps login, which \
-         sandbox preview URLs do not support yet, so it is not served to anyone \
-         holding the URL.\n\
-         To open it, set a preview password on the sandbox: on its page in the \
-         Temps console (Preview password), or with \
+        "This preview of sandbox sbx_{sandbox_hex} only accepts requests from its IP \
+         allow-list, and {seen}.\n\
+         To change the list, edit Preview access on the sandbox's page in the Temps \
+         console, or call PUT /v1/sandboxes/sbx_{sandbox_hex}/preview-access with the \
+         addresses or CIDR ranges to allow (an empty list allows every address).\n"
+    )
+}
+
+/// The body of the 403 for a `password` sandbox with no password stored.
+pub fn password_missing_message(sandbox_hex: &str) -> String {
+    format!(
+        "This preview of sandbox sbx_{sandbox_hex} requires a password, but none is \
+         set, so it is not served.\n\
+         Set one on the sandbox's page in the Temps console, or with \
          PUT /v1/sandboxes/sbx_{sandbox_hex}/preview-password.\n"
     )
 }
 
-/// TTL for sandbox lookup cache entries (both `Protected` and `NotFound`).
+/// The body of the 401 a `temps_login` sandbox answers a request that is
+/// not a page load with (a fetch, a websocket, an API client): it is not
+/// redirected, since it could not follow a login page.
+pub fn temps_login_required_message(sandbox_hex: &str) -> String {
+    format!(
+        "This preview of sandbox sbx_{sandbox_hex} requires signing in to Temps.\n\
+         Open it in a browser to sign in; only page loads are sent to the login.\n"
+    )
+}
+
+/// The body of the 403 a `temps_login` sandbox answers a page load with when
+/// the instance has no external URL to send the visitor to.
+pub fn temps_login_unconfigured_message(sandbox_hex: &str) -> String {
+    format!(
+        "This preview of sandbox sbx_{sandbox_hex} requires signing in to Temps, but \
+         this Temps instance has no external URL configured, so the proxy cannot send \
+         you to the login page.\n\
+         An administrator can set the external URL in the Temps console settings. \
+         Alternatively set a preview password (PUT /v1/sandboxes/sbx_{sandbox_hex}/preview-password) \
+         or change the access with PUT /v1/sandboxes/sbx_{sandbox_hex}/preview-access.\n"
+    )
+}
+
+/// Whether a request is a browser loading a page, which a Temps-login
+/// challenge may redirect to the console. Fetches, websockets and API
+/// clients get a 401 instead: a redirect to an HTML login page is useless
+/// to them, and following it from a subresource would loop.
+///
+/// `Sec-Fetch-Mode` decides when the browser sends it; otherwise a `GET`
+/// or `HEAD` that accepts `text/html` counts as a page load.
+pub fn is_page_navigation(
+    method: &str,
+    sec_fetch_mode: Option<&str>,
+    accept: Option<&str>,
+    is_websocket: bool,
+) -> bool {
+    if is_websocket || !(method == "GET" || method == "HEAD") {
+        return false;
+    }
+    if let Some(mode) = sec_fetch_mode {
+        return mode.trim().eq_ignore_ascii_case("navigate");
+    }
+    accept.is_some_and(|accept| {
+        accept.split(',').any(|media| {
+            media
+                .split(';')
+                .next()
+                .is_some_and(|media| media.trim().eq_ignore_ascii_case("text/html"))
+        })
+    })
+}
+
+/// `cookie_header` without any `name` cookie, or `None` when it carries
+/// none, which is the common case: nothing to rewrite, nothing allocated.
+/// `Some("")` means no cookie is left and the header should be removed.
+pub fn cookie_header_without(cookie_header: &str, name: &str) -> Option<String> {
+    let named = |pair: &str| {
+        pair.trim()
+            .split_once('=')
+            .is_some_and(|(key, _)| key == name)
+    };
+    if !cookie_header.split(';').any(named) {
+        return None;
+    }
+    Some(
+        cookie_header
+            .split(';')
+            .filter(|pair| !named(pair) && !pair.trim().is_empty())
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// TTL for sandbox lookup cache entries (found and not found alike).
 ///
 /// A 30-second window is acceptable because password rotation already
 /// invalidates cookies cryptographically (the cookie payload contains a
 /// SHA-256 fingerprint of the argon2 PHC hash — see `verify_preview_cookie_subject`).
-/// The only effect of a stale cache entry is that a brand-new login attempt
-/// for a sandbox whose password was just changed may verify against the old
-/// hash for up to 30 s; existing cookies are unaffected.
+/// A change of access mode or allow-list takes effect within this window
+/// on each proxy process.
 const SANDBOX_LOOKUP_CACHE_TTL: Duration = Duration::from_secs(30);
 
 /// Maximum number of sandbox lookup results to cache concurrently.
 const SANDBOX_LOOKUP_CACHE_MAX_CAPACITY: u64 = 10_000;
 
-/// In-memory cache for `lookup_sandbox` results on the proxy hot path.
+/// In-memory cache of [`PreviewGate`]s on the proxy hot path.
 ///
 /// Every request to a `ws-<hex>-<port>.<preview_domain>` host previously
 /// issued a `SELECT` against the `sandboxes` table. This cache eliminates
-/// that query for the common case of a sandbox the proxy has seen recently.
+/// that query for the common case of a sandbox the proxy has seen recently,
+/// and parses the IP allow-list once per fill instead of once per request.
 ///
-/// Both `Protected { password_hash }` and `NotFound` are cached. Caching
-/// `NotFound` is important for sandboxes that no longer exist — without it,
-/// repeated requests keep hitting Postgres even for destroyed sandboxes.
+/// Both found and `NotFound` are cached. Caching `NotFound` is important
+/// for sandboxes that no longer exist — without it, repeated requests keep
+/// hitting Postgres even for destroyed sandboxes.
 ///
 /// # Password rotation
 ///
@@ -663,9 +831,8 @@ const SANDBOX_LOOKUP_CACHE_MAX_CAPACITY: u64 = 10_000;
 /// unaffected because the fingerprint in the cookie no longer matches.
 pub struct SandboxLookupCache {
     db: Arc<DbConnection>,
-    /// `sandbox_hex → (PreviewSandboxLookup, runs on a worker)`. TTL 30 s,
-    /// cap 10 k.
-    cache: Cache<String, (PreviewSandboxLookup, bool)>,
+    /// `sandbox_hex → PreviewSandboxLookup`. TTL 30 s, cap 10 k.
+    cache: Cache<String, PreviewSandboxLookup>,
 }
 
 impl SandboxLookupCache {
@@ -688,21 +855,17 @@ impl SandboxLookupCache {
         Self { db, cache }
     }
 
+    /// Seed an entry without a database round trip.
+    #[cfg(test)]
+    async fn seed(&self, hex: &str, lookup: PreviewSandboxLookup) {
+        self.cache.insert(hex.to_string(), lookup).await;
+    }
+
     /// Look up a sandbox by its hex suffix, using the in-memory cache.
     ///
     /// Both hit and miss results are cached so repeated requests for the same
     /// sandbox — including non-existent ones — never amplify into DB load.
     pub async fn lookup(&self, hex: &str) -> PreviewSandboxLookup {
-        self.lookup_placed(hex).await.0
-    }
-
-    /// Whether the sandbox runs on a worker node, from the same cache entry
-    /// [`Self::lookup`] filled while authenticating the request.
-    pub async fn on_worker(&self, hex: &str) -> bool {
-        self.lookup_placed(hex).await.1
-    }
-
-    async fn lookup_placed(&self, hex: &str) -> (PreviewSandboxLookup, bool) {
         let key = hex.to_string();
 
         // Fast path: previous lookup already resolved this hex.
@@ -712,25 +875,26 @@ impl SandboxLookupCache {
         }
 
         // Cache miss: query the database.
-        let result = lookup_placed_sandbox(&self.db, hex).await;
+        let result = lookup_sandbox(&self.db, hex).await;
         debug!(
             hex,
-            found = !matches!(result.0, PreviewSandboxLookup::NotFound),
-            on_worker = result.1,
+            found = result.gate().is_some(),
+            on_worker = result.gate().is_some_and(|gate| gate.on_worker),
             "sandbox DB lookup; caching result"
         );
         self.cache.insert(key, result.clone()).await;
         result
     }
 
-    /// Bypass a possibly stale password-hash entry and replace it with the
-    /// current database value. Used only after a presented cookie fails the
-    /// cached fingerprint check, so the normal authenticated hot path remains
-    /// cache-only while freshly rotated/reconciled cookies work immediately.
+    /// Bypass a possibly stale entry and replace it with the current
+    /// database value. Used after a presented password cookie fails the
+    /// cached fingerprint check, and for a Temps-login exchange, so the
+    /// normal authenticated hot path remains cache-only while freshly
+    /// rotated or switched sandboxes work immediately.
     pub async fn lookup_fresh(&self, hex: &str) -> PreviewSandboxLookup {
-        let result = lookup_placed_sandbox(&self.db, hex).await;
+        let result = lookup_sandbox(&self.db, hex).await;
         self.cache.insert(hex.to_string(), result.clone()).await;
-        result.0
+        result
     }
 
     /// Validate a share-link grant and return the current password hash used
@@ -739,6 +903,7 @@ impl SandboxLookupCache {
     /// Random or malformed public input is rejected by authenticated envelope
     /// validation before the uncached lookup. A cryptographically valid grant
     /// then checks the fresh row so password rotation revokes it immediately.
+    /// Only a sandbox in `password` access honours one.
     pub async fn verify_session_grant(
         &self,
         crypto: &CookieCrypto,
@@ -753,26 +918,49 @@ impl SandboxLookupCache {
         if !validate_preview_session_grant_envelope(crypto, grant, &subject, now) {
             return None;
         }
-        match self.lookup_fresh(hex).await {
-            PreviewSandboxLookup::Protected { password_hash }
-                if verify_preview_session_grant(crypto, grant, &subject, &password_hash, now) =>
-            {
-                Some(password_hash)
-            }
-            _ => None,
-        }
+        let fresh = self.lookup_fresh(hex).await;
+        let password_hash = fresh.password_hash()?;
+        verify_preview_session_grant(crypto, grant, &subject, password_hash, now)
+            .then(|| password_hash.to_string())
     }
 }
 
-/// Run the preview auth check for a parsed preview host (cookie-only).
+/// What [`check_preview_auth`] reads from a request.
+#[derive(Clone, Copy)]
+pub struct PreviewRequest<'a> {
+    /// The client address, `None` when the proxy could not determine it:
+    /// an allow-list then refuses the request.
+    pub client_ip: Option<IpAddr>,
+    /// Every `Cookie` header field, joined.
+    pub cookie_header: Option<&'a str>,
+    /// What a Temps-login session grant is checked against: the grant
+    /// master key, revocations, this exact host and the time.
+    pub grants: crate::ingress::GrantFacts<'a>,
+}
+
+impl PreviewRequest<'_> {
+    /// The key the password limiter counts failures under. An unknown
+    /// address shares one bucket rather than escaping the limit.
+    fn limiter_ip(&self) -> IpAddr {
+        self.client_ip
+            .unwrap_or_else(|| IpAddr::from([127, 0, 0, 1]))
+    }
+}
+
+/// Run the preview access check for a parsed preview host.
 ///
-/// Order of operations:
-/// 1. Look up the sandbox row.
-/// 2. If missing → NotFound; if unprotected → Allow; if it asks for a
-///    Temps login the preview host cannot hand off → TempsLoginUnavailable.
-/// 3. Rate-limit gate.
-/// 4. If a valid `temps_preview_sbx_<hex>` cookie is present → Allow.
-/// 5. Otherwise → LoginRequired (caller issues a 303 to the login form).
+/// The decision, in order:
+///
+/// 1. No such sandbox (or destroyed) → [`PreviewAuthOutcome::NotFound`].
+/// 2. A non-empty IP allow-list that does not contain the client address,
+///    or an unknown address → [`PreviewAuthOutcome::IpDenied`].
+/// 3. `public` → Allow.
+/// 4. `password`: rate limited → RateLimited; a valid
+///    `temps_preview_sbx_<hex>` cookie → Allow; otherwise LoginRequired
+///    (the caller redirects to the password form). With no hash stored →
+///    PasswordMissing.
+/// 5. `temps_login`: a valid `temps_preview_login` session grant for this
+///    sandbox and host → Allow; otherwise TempsLoginRequired.
 ///
 /// Note: this does NOT record a rate-limit failure for missing cookies —
 /// only the login POST records failures (via [`PreviewAuthLimiter::record_failure`])
@@ -782,39 +970,56 @@ pub async fn check_preview_auth(
     crypto: &CookieCrypto,
     limiter: &PreviewAuthLimiter,
     host: PreviewHost,
-    client_ip: IpAddr,
-    cookie_header: Option<&str>,
+    request: &PreviewRequest<'_>,
 ) -> PreviewAuthOutcome {
-    let stored_hash = match cache.lookup(&host.hex).await {
-        PreviewSandboxLookup::NotFound => {
-            return PreviewAuthOutcome::NotFound { host };
+    let lookup = cache.lookup(&host.hex).await;
+    let Some(gate) = lookup.gate() else {
+        return PreviewAuthOutcome::NotFound { host };
+    };
+    let on_worker = gate.on_worker;
+    if !gate.admits_ip(request.client_ip) {
+        return PreviewAuthOutcome::IpDenied {
+            host,
+            client_ip: request.client_ip,
+        };
+    }
+    let stored_hash = match &gate.access {
+        PreviewGateAccess::Public => return PreviewAuthOutcome::Allow { host, on_worker },
+        PreviewGateAccess::PasswordMissing => return PreviewAuthOutcome::PasswordMissing { host },
+        PreviewGateAccess::TempsLogin => {
+            return if crate::ingress::preview_session_admits(
+                request.cookie_header,
+                gate.sandbox_id,
+                &request.grants,
+            ) {
+                PreviewAuthOutcome::Allow { host, on_worker }
+            } else {
+                PreviewAuthOutcome::TempsLoginRequired {
+                    sandbox_id: gate.sandbox_id,
+                    host,
+                }
+            };
         }
-        PreviewSandboxLookup::Open => {
-            return PreviewAuthOutcome::Allow { host };
-        }
-        PreviewSandboxLookup::TempsLoginUnavailable => {
-            return PreviewAuthOutcome::TempsLoginUnavailable { host };
-        }
-        PreviewSandboxLookup::Protected { password_hash } => {
-            if limiter.is_blocked(client_ip, &host.hex) {
+        PreviewGateAccess::Password { password_hash } => {
+            if limiter.is_blocked(request.limiter_ip(), &host.hex) {
                 return PreviewAuthOutcome::RateLimited { host };
             }
-            password_hash
+            password_hash.as_str()
         }
     };
 
     let subject = format!("sbx_{}", host.hex);
     let cookie_name = format!("{}{}", PREVIEW_SANDBOX_COOKIE_PREFIX, host.hex);
 
-    if let Some(header) = cookie_header {
+    if let Some(header) = request.cookie_header {
         let values = extract_cookie_values(header, &cookie_name);
         if !values.is_empty() {
             let now = SystemTime::now();
             if values.iter().any(|value| {
-                verify_preview_cookie_subject(crypto, value, &subject, &stored_hash, now)
+                verify_preview_cookie_subject(crypto, value, &subject, stored_hash, now)
             }) {
-                limiter.record_success(client_ip, &host.hex);
-                return PreviewAuthOutcome::Allow { host };
+                limiter.record_success(request.limiter_ip(), &host.hex);
+                return PreviewAuthOutcome::Allow { host, on_worker };
             }
 
             // Password reconciliation can mint a cookie against a new hash
@@ -822,14 +1027,26 @@ pub async fn check_preview_auth(
             // short-lived lookup cache. Refresh only on fingerprint failure;
             // without this, a successful login can redirect straight back to
             // the password wall until that cache expires.
-            if let PreviewSandboxLookup::Protected { password_hash } =
-                cache.lookup_fresh(&host.hex).await
-            {
-                if values.iter().any(|value| {
-                    verify_preview_cookie_subject(crypto, value, &subject, &password_hash, now)
-                }) {
-                    limiter.record_success(client_ip, &host.hex);
-                    return PreviewAuthOutcome::Allow { host };
+            let fresh = cache.lookup_fresh(&host.hex).await;
+            if let Some(fresh_gate) = fresh.gate() {
+                if let Some(password_hash) = fresh_gate.password_hash() {
+                    if fresh_gate.admits_ip(request.client_ip)
+                        && values.iter().any(|value| {
+                            verify_preview_cookie_subject(
+                                crypto,
+                                value,
+                                &subject,
+                                password_hash,
+                                now,
+                            )
+                        })
+                    {
+                        limiter.record_success(request.limiter_ip(), &host.hex);
+                        return PreviewAuthOutcome::Allow {
+                            host,
+                            on_worker: fresh_gate.on_worker,
+                        };
+                    }
                 }
             }
 
@@ -1237,9 +1454,14 @@ mod tests {
 
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_entities::ingress_mode::SandboxPreviewAccess;
     use temps_entities::sandboxes;
+    use temps_workload_ingress::grant::{self, GrantKey, GrantUse, Revocations};
 
-    /// Build a minimal sandboxes::Model for use in MockDatabase results.
+    const HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// Build a minimal sandboxes::Model for use in MockDatabase results: in
+    /// `password` access when it has a hash, `public` otherwise.
     fn sandbox_model(
         public_id: &str,
         status: &str,
@@ -1264,7 +1486,12 @@ mod tests {
             expires_at: now,
             preview_password_hash: password_hash.map(|s| s.to_string()),
             preview_password_hint: None,
-            preview_access: temps_entities::ingress_mode::SandboxPreviewAccess::Legacy,
+            preview_access: if password_hash.is_some() {
+                SandboxPreviewAccess::Password
+            } else {
+                SandboxPreviewAccess::Public
+            },
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -1331,10 +1558,38 @@ mod tests {
         );
     }
 
+    /// A share-link grant only opens a sandbox in `password` access: once
+    /// it is switched to a Temps login, the grant minted against the
+    /// still-stored hash no longer works.
+    #[tokio::test]
+    async fn a_share_link_grant_needs_password_access() {
+        let model = sandboxes::Model {
+            preview_access: SandboxPreviewAccess::TempsLogin,
+            ..sandbox_model("sbx_7702c56bfb804b49", "running", Some("argon2-current"))
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model]])
+            .into_connection();
+        let cache = SandboxLookupCache::new(Arc::new(db));
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            "argon2-current",
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+        assert!(cache
+            .verify_session_grant(&crypto, &grant, "7702c56bfb804b49", now)
+            .await
+            .is_none());
+    }
+
     #[tokio::test]
     async fn sandbox_cache_hit_avoids_second_db_call() {
-        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let model = sandbox_model("sbx_7702c56bfb804b49", "running", Some(hash));
+        let model = sandbox_model("sbx_7702c56bfb804b49", "running", Some(HASH));
 
         // Exactly ONE result queued — a second DB call would panic.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1345,27 +1600,18 @@ mod tests {
 
         // First call: cache miss → 1 DB query.
         let first = cache.lookup("7702c56bfb804b49").await;
-        assert!(
-            matches!(first, PreviewSandboxLookup::Protected { .. }),
-            "expected Protected, got {:?}",
-            first
-        );
+        assert_eq!(first.password_hash(), Some(HASH), "{first:?}");
 
         // Second call: cache hit → 0 DB queries (MockDatabase would panic if queried).
         let second = cache.lookup("7702c56bfb804b49").await;
-        assert!(
-            matches!(second, PreviewSandboxLookup::Protected { .. }),
-            "expected cached Protected, got {:?}",
-            second
-        );
+        assert_eq!(second.password_hash(), Some(HASH), "{second:?}");
     }
 
     /// A sandbox on a worker node is gated exactly like one on the control
-    /// plane, and the cache remembers where it runs so the proxy can hand
+    /// plane, and the gate remembers where it runs so the proxy can hand
     /// its previews to the worker relay.
     #[tokio::test]
     async fn worker_node_sandboxes_are_gated_like_local_ones_and_marked() {
-        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let on_worker = |password: Option<&str>| sandboxes::Model {
             node_id: Some(3),
             ..sandbox_model("sbx_aabbccdd11223344", "running", password)
@@ -1374,102 +1620,61 @@ mod tests {
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![
                     vec![on_worker(None)],
-                    vec![on_worker(Some(hash))],
+                    vec![on_worker(Some(HASH))],
                     vec![sandbox_model("sbx_aabbccdd11223344", "running", None)],
                     vec![on_worker(None)],
                 ])
                 .into_connection(),
         );
 
-        let (open, open_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
-        assert!(matches!(open, PreviewSandboxLookup::Open), "{open:?}");
-        assert!(open_on_worker);
-        let (protected, protected_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
-        assert!(
-            matches!(protected, PreviewSandboxLookup::Protected { .. }),
-            "{protected:?}"
-        );
-        assert!(protected_on_worker);
-        let (local, local_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
-        assert!(matches!(local, PreviewSandboxLookup::Open), "{local:?}");
-        assert!(!local_on_worker);
+        let open = lookup_sandbox(&db, "aabbccdd11223344").await;
+        let gate = open.gate().expect("found");
+        assert_eq!(gate.access, PreviewGateAccess::Public);
+        assert!(gate.on_worker);
+        let protected = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert_eq!(protected.password_hash(), Some(HASH));
+        assert!(protected.gate().is_some_and(|gate| gate.on_worker));
+        let local = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert!(local.gate().is_some_and(|gate| !gate.on_worker));
 
         // Authentication and routing read one cache entry: one query.
         let cache = SandboxLookupCache::new(db);
-        assert!(matches!(
-            cache.lookup("aabbccdd11223344").await,
-            PreviewSandboxLookup::Open
-        ));
-        assert!(cache.on_worker("aabbccdd11223344").await);
-    }
-
-    /// ADR-055 §11: `sandboxes.preview_access` decides a passwordless
-    /// sandbox. `temps_login` is never served to anyone holding the URL; a
-    /// password still gates every setting.
-    #[tokio::test]
-    async fn a_passwordless_temps_login_sandbox_is_not_served_anonymously() {
-        use temps_entities::ingress_mode::SandboxPreviewAccess;
-        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        let with = |access: SandboxPreviewAccess, password: Option<&str>| sandboxes::Model {
-            preview_access: access,
-            ..sandbox_model("sbx_aabbccdd11223344", "running", password)
-        };
-        assert!(matches!(
-            preview_lookup_for(with(SandboxPreviewAccess::TempsLogin, None)),
-            PreviewSandboxLookup::TempsLoginUnavailable
-        ));
-        for access in [SandboxPreviewAccess::Legacy, SandboxPreviewAccess::Public] {
-            assert!(
-                matches!(
-                    preview_lookup_for(with(access, None)),
-                    PreviewSandboxLookup::Open
-                ),
-                "{access:?}"
-            );
-        }
-        for access in [
-            SandboxPreviewAccess::Legacy,
-            SandboxPreviewAccess::TempsLogin,
-            SandboxPreviewAccess::Public,
-        ] {
-            assert!(
-                matches!(
-                    preview_lookup_for(with(access, Some(hash))),
-                    PreviewSandboxLookup::Protected { .. }
-                ),
-                "{access:?}"
-            );
-        }
-
-        // End to end through the gateway check, with no cookie at all.
-        let db = Arc::new(
-            MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results(vec![vec![with(SandboxPreviewAccess::TempsLogin, None)]])
-                .into_connection(),
-        );
-        let cache = SandboxLookupCache::new(db);
-        let crypto = CookieCrypto::new("0123456789abcdef0123456789abcdef").expect("crypto");
         let outcome = check_preview_auth(
             &cache,
-            &crypto,
+            &test_crypto(),
             &PreviewAuthLimiter::new(),
-            parse_preview_host(
-                "ws-aabbccdd11223344-3000.preview.example.test",
-                "preview.example.test",
-            )
-            .expect("preview host"),
-            IpAddr::from([127, 0, 0, 1]),
-            None,
+            preview_host(),
+            &request(Some(ip("203.0.113.9")), None, &Revocations::default(), T0),
         )
         .await;
         assert!(
-            matches!(outcome, PreviewAuthOutcome::TempsLoginUnavailable { .. }),
+            matches!(
+                outcome,
+                PreviewAuthOutcome::Allow {
+                    on_worker: true,
+                    ..
+                }
+            ),
             "{outcome:?}"
         );
+    }
 
-        let message = temps_login_unavailable_message("aabbccdd11223344");
-        assert!(message.contains("sbx_aabbccdd11223344"));
-        assert!(message.contains("/v1/sandboxes/sbx_aabbccdd11223344/preview-password"));
+    /// A destroyed sandbox resolves to NotFound, like a missing one.
+    #[tokio::test]
+    async fn destroyed_sandboxes_are_not_found() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![sandbox_model(
+                    "sbx_aabbccdd11223344",
+                    "destroyed",
+                    None,
+                )]])
+                .into_connection(),
+        );
+        assert!(matches!(
+            lookup_sandbox(&db, "aabbccdd11223344").await,
+            PreviewSandboxLookup::NotFound
+        ));
     }
 
     /// A missing sandbox resolves to NotFound which is also cached so repeated
@@ -1498,12 +1703,11 @@ mod tests {
     /// After the TTL expires the cache retries the DB.
     #[tokio::test]
     async fn sandbox_cache_retries_after_ttl_expiry() {
-        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        // Two results queued: first=NotFound, second=Protected.
+        // Two results queued: first=NotFound, second=password-protected.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![
                 Vec::<sandboxes::Model>::new(), // first call: not found
-                vec![sandbox_model("sbx_aabbccdd11223344", "running", Some(hash))], // second call after TTL
+                vec![sandbox_model("sbx_aabbccdd11223344", "running", Some(HASH))], // second call after TTL
             ])
             .into_connection();
 
@@ -1518,10 +1722,466 @@ mod tests {
 
         // Second call after expiry — DB queried again.
         let second = cache.lookup("aabbccdd11223344").await;
-        assert!(
-            matches!(second, PreviewSandboxLookup::Protected { .. }),
-            "expected Protected after TTL expiry, got {:?}",
-            second
+        assert_eq!(
+            second.password_hash(),
+            Some(HASH),
+            "expected password access after TTL expiry, got {second:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The access decision
+    // -----------------------------------------------------------------------
+
+    const T0: u64 = 1_800_000_000;
+    const MASTER: [u8; 32] = [7u8; 32];
+    const HEX: &str = "aabbccdd11223344";
+    const HOST: &str = "ws-aabbccdd11223344-3000.preview.example.test";
+
+    fn test_crypto() -> CookieCrypto {
+        CookieCrypto::new("0123456789abcdef0123456789abcdef").expect("crypto")
+    }
+
+    fn ip(value: &str) -> IpAddr {
+        value.parse().expect("ip literal")
+    }
+
+    fn preview_host() -> PreviewHost {
+        parse_preview_host(HOST, "preview.example.test").expect("preview host")
+    }
+
+    fn request<'a>(
+        client_ip: Option<IpAddr>,
+        cookie_header: Option<&'a str>,
+        revocations: &'a Revocations,
+        now_secs: u64,
+    ) -> PreviewRequest<'a> {
+        PreviewRequest {
+            client_ip,
+            cookie_header,
+            grants: crate::ingress::GrantFacts {
+                master: &MASTER,
+                revocations,
+                host: Some(HOST),
+                now_secs,
+            },
+        }
+    }
+
+    fn gate_row(
+        access: SandboxPreviewAccess,
+        password_hash: Option<&str>,
+        allowed_cidrs: &[&str],
+    ) -> sandboxes::Model {
+        sandboxes::Model {
+            id: 42,
+            preview_access: access,
+            preview_password_hash: password_hash.map(str::to_string),
+            preview_allowed_cidrs: allowed_cidrs.iter().map(|c| c.to_string()).collect(),
+            ..sandbox_model("sbx_aabbccdd11223344", "running", None)
+        }
+    }
+
+    /// A cache already holding `row`'s gate, over a database with nothing
+    /// queued: any query (a fresh lookup) reads as not found.
+    async fn seeded(row: sandboxes::Model) -> SandboxLookupCache {
+        let cache = SandboxLookupCache::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        cache
+            .seed(
+                HEX,
+                PreviewSandboxLookup::Found(Arc::new(PreviewGate::from_row(row))),
+            )
+            .await;
+        cache
+    }
+
+    /// A `temps_preview_login` session grant cookie for sandbox 42 on HOST.
+    fn login_cookie(sandbox_id: i32, host: &str, grant_id: i64, expires_at: u64) -> String {
+        let owner = crate::ingress::sandbox_owner(sandbox_id);
+        let token = grant::mint(
+            &GrantKey::derive(&MASTER, owner),
+            &grant::GrantClaims {
+                grant_id,
+                usage: GrantUse::Session,
+                owner,
+                host,
+                permission: SandboxPreviewAccess::LOGIN_PERMISSION,
+                user_id: 4,
+                expires_at,
+            },
+        )
+        .expect("mint");
+        format!("theme=dark; temps_preview_login={token}")
+    }
+
+    async fn decide(
+        row: sandboxes::Model,
+        client_ip: Option<IpAddr>,
+        cookie_header: Option<&str>,
+        revocations: &Revocations,
+    ) -> PreviewAuthOutcome {
+        let cache = seeded(row).await;
+        check_preview_auth(
+            &cache,
+            &test_crypto(),
+            &PreviewAuthLimiter::new(),
+            preview_host(),
+            &request(client_ip, cookie_header, revocations, T0),
+        )
+        .await
+    }
+
+    #[test]
+    fn a_gate_reads_the_mode_and_parses_the_allow_list_once() {
+        use SandboxPreviewAccess::*;
+        let cases = [
+            (Public, None, PreviewGateAccess::Public),
+            (Public, Some(HASH), PreviewGateAccess::Public),
+            (
+                Password,
+                Some(HASH),
+                PreviewGateAccess::Password {
+                    password_hash: HASH.to_string(),
+                },
+            ),
+            (Password, None, PreviewGateAccess::PasswordMissing),
+            (TempsLogin, None, PreviewGateAccess::TempsLogin),
+            (TempsLogin, Some(HASH), PreviewGateAccess::TempsLogin),
+        ];
+        for (access, hash, expected) in cases {
+            let gate = PreviewGate::from_row(gate_row(access, hash, &[]));
+            assert_eq!(gate.access, expected, "{access:?} {hash:?}");
+            assert_eq!(gate.sandbox_id, 42);
+        }
+
+        let gate = PreviewGate::from_row(gate_row(
+            Public,
+            None,
+            &["10.0.0.0/8", "203.0.113.7/32", "2001:db8::/32"],
+        ));
+        assert!(gate.admits_ip(Some(ip("10.1.2.3"))));
+        assert!(gate.admits_ip(Some(ip("203.0.113.7"))));
+        assert!(gate.admits_ip(Some(ip("::ffff:10.9.9.9"))), "mapped IPv4");
+        assert!(gate.admits_ip(Some(ip("2001:db8::1"))));
+        assert!(!gate.admits_ip(Some(ip("203.0.113.8"))));
+        assert!(!gate.admits_ip(Some(ip("2001:db9::1"))));
+        assert!(!gate.admits_ip(None), "an unknown address is refused");
+
+        let open = PreviewGate::from_row(gate_row(Public, None, &[]));
+        assert!(open.admits_ip(None), "no allow-list admits everyone");
+
+        // An unreadable stored entry never opens the list.
+        let unreadable = PreviewGate::from_row(gate_row(Public, None, &["not-a-cidr"]));
+        assert!(!unreadable.admits_ip(Some(ip("10.1.2.3"))));
+        let mixed = PreviewGate::from_row(gate_row(Public, None, &["not-a-cidr", "10.0.0.0/8"]));
+        assert!(mixed.admits_ip(Some(ip("10.1.2.3"))));
+        assert!(!mixed.admits_ip(Some(ip("192.0.2.1"))));
+    }
+
+    /// The decision table, end to end through `check_preview_auth`.
+    #[tokio::test]
+    async fn the_preview_decision_table() {
+        use SandboxPreviewAccess::*;
+        let none = Revocations::default();
+        let inside = Some(ip("10.1.2.3"));
+        let outside = Some(ip("192.0.2.1"));
+        let session = login_cookie(42, HOST, 9, T0 + 600);
+
+        // Public: anyone, unless the allow-list says otherwise.
+        assert!(matches!(
+            decide(gate_row(Public, None, &[]), outside, None, &none).await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            decide(gate_row(Public, None, &["10.0.0.0/8"]), inside, None, &none).await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+        for client_ip in [outside, None] {
+            let outcome = decide(
+                gate_row(Public, None, &["10.0.0.0/8"]),
+                client_ip,
+                None,
+                &none,
+            )
+            .await;
+            assert!(
+                matches!(&outcome, PreviewAuthOutcome::IpDenied { client_ip: seen, .. } if *seen == client_ip),
+                "{outcome:?}"
+            );
+        }
+
+        // The allow-list comes first in every mode, even with valid
+        // credentials.
+        for row in [
+            gate_row(Password, Some(HASH), &["10.0.0.0/8"]),
+            gate_row(Password, None, &["10.0.0.0/8"]),
+            gate_row(TempsLogin, None, &["10.0.0.0/8"]),
+        ] {
+            let outcome = decide(row, outside, Some(&session), &none).await;
+            assert!(
+                matches!(outcome, PreviewAuthOutcome::IpDenied { .. }),
+                "{outcome:?}"
+            );
+        }
+
+        // Password: no cookie → the form; no hash → never served.
+        assert!(matches!(
+            decide(gate_row(Password, Some(HASH), &[]), outside, None, &none).await,
+            PreviewAuthOutcome::LoginRequired { .. }
+        ));
+        assert!(matches!(
+            decide(
+                gate_row(Password, None, &[]),
+                outside,
+                Some(&session),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::PasswordMissing { .. }
+        ));
+        // A Temps login session does not open a password sandbox.
+        assert!(matches!(
+            decide(
+                gate_row(Password, Some(HASH), &[]),
+                outside,
+                Some(&session),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::LoginRequired { .. }
+        ));
+
+        // Temps login: a session grant for this sandbox and host.
+        assert!(matches!(
+            decide(
+                gate_row(TempsLogin, None, &[]),
+                outside,
+                Some(&session),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+        assert!(matches!(
+            decide(
+                gate_row(TempsLogin, None, &["10.0.0.0/8"]),
+                inside,
+                Some(&session),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+        let refused = [
+            ("no cookie", None),
+            ("another sandbox", Some(login_cookie(43, HOST, 9, T0 + 600))),
+            (
+                "another port",
+                Some(login_cookie(
+                    42,
+                    "ws-aabbccdd11223344-3001.preview.example.test",
+                    9,
+                    T0 + 600,
+                )),
+            ),
+            ("expired", Some(login_cookie(42, HOST, 9, T0))),
+            ("garbage", Some("temps_preview_login=tg1.nope".to_string())),
+        ];
+        for (case, cookie) in refused {
+            let outcome = decide(
+                gate_row(TempsLogin, None, &[]),
+                outside,
+                cookie.as_deref(),
+                &none,
+            )
+            .await;
+            assert!(
+                matches!(
+                    outcome,
+                    PreviewAuthOutcome::TempsLoginRequired { sandbox_id: 42, .. }
+                ),
+                "{case}: {outcome:?}"
+            );
+        }
+        // A revoked grant is refused.
+        let revoked = Revocations::new([9]);
+        assert!(matches!(
+            decide(
+                gate_row(TempsLogin, None, &[]),
+                outside,
+                Some(&session),
+                &revoked
+            )
+            .await,
+            PreviewAuthOutcome::TempsLoginRequired { .. }
+        ));
+        // A password cookie does not open a Temps-login sandbox.
+        let crypto = test_crypto();
+        let password_cookie =
+            encode_preview_cookie_subject(&crypto, "sbx_aabbccdd11223344", HASH, SystemTime::now())
+                .expect("cookie");
+        let header = format!("temps_preview_sbx_{HEX}={password_cookie}");
+        assert!(matches!(
+            decide(
+                gate_row(TempsLogin, Some(HASH), &[]),
+                outside,
+                Some(&header),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::TempsLoginRequired { .. }
+        ));
+        // ...but opens the same sandbox in password access.
+        assert!(matches!(
+            decide(
+                gate_row(Password, Some(HASH), &[]),
+                outside,
+                Some(&header),
+                &none
+            )
+            .await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+
+        // A missing sandbox is not found.
+        let empty = SandboxLookupCache::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<sandboxes::Model>::new()])
+                .into_connection(),
+        ));
+        assert!(matches!(
+            check_preview_auth(
+                &empty,
+                &test_crypto(),
+                &PreviewAuthLimiter::new(),
+                preview_host(),
+                &request(outside, None, &none, T0),
+            )
+            .await,
+            PreviewAuthOutcome::NotFound { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_client_gets_429_on_a_password_sandbox_only() {
+        let limiter = PreviewAuthLimiter::new();
+        let client = ip("192.0.2.1");
+        for _ in 0..MAX_FAILURES {
+            limiter.record_failure(client, HEX);
+        }
+        let none = Revocations::default();
+        let password = seeded(gate_row(SandboxPreviewAccess::Password, Some(HASH), &[])).await;
+        assert!(matches!(
+            check_preview_auth(
+                &password,
+                &test_crypto(),
+                &limiter,
+                preview_host(),
+                &request(Some(client), None, &none, T0),
+            )
+            .await,
+            PreviewAuthOutcome::RateLimited { .. }
+        ));
+        let public = seeded(gate_row(SandboxPreviewAccess::Public, None, &[])).await;
+        assert!(matches!(
+            check_preview_auth(
+                &public,
+                &test_crypto(),
+                &limiter,
+                preview_host(),
+                &request(Some(client), None, &none, T0),
+            )
+            .await,
+            PreviewAuthOutcome::Allow { .. }
+        ));
+    }
+
+    #[test]
+    fn refusal_messages_name_the_sandbox_the_address_and_the_fix() {
+        let denied = ip_denied_message(HEX, Some(ip("::ffff:192.0.2.1")));
+        assert!(denied.contains("sbx_aabbccdd11223344"));
+        assert!(denied.contains("192.0.2.1 is not on it"), "{denied}");
+        assert!(denied.contains("PUT /v1/sandboxes/sbx_aabbccdd11223344/preview-access"));
+        let unknown = ip_denied_message(HEX, None);
+        assert!(unknown.contains("could not determine your address"));
+
+        assert!(password_missing_message(HEX)
+            .contains("/v1/sandboxes/sbx_aabbccdd11223344/preview-password"));
+        assert!(temps_login_required_message(HEX).contains("Open it in a browser"));
+        assert!(temps_login_unconfigured_message(HEX).contains("no external URL"));
+    }
+
+    #[test]
+    fn only_page_loads_are_sent_to_the_console_login() {
+        // Browsers that send Sec-Fetch-Mode: only navigations.
+        assert!(is_page_navigation(
+            "GET",
+            Some("navigate"),
+            Some("*/*"),
+            false
+        ));
+        assert!(!is_page_navigation(
+            "GET",
+            Some("cors"),
+            Some("text/html"),
+            false
+        ));
+        assert!(!is_page_navigation("GET", Some("no-cors"), None, false));
+        // Without it: a GET or HEAD that accepts HTML.
+        assert!(is_page_navigation(
+            "GET",
+            None,
+            Some("text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"),
+            false
+        ));
+        assert!(is_page_navigation("HEAD", None, Some("TEXT/HTML"), false));
+        assert!(!is_page_navigation(
+            "GET",
+            None,
+            Some("application/json"),
+            false
+        ));
+        assert!(!is_page_navigation("GET", None, None, false));
+        // Never a write or a websocket upgrade.
+        assert!(!is_page_navigation(
+            "POST",
+            Some("navigate"),
+            Some("text/html"),
+            false
+        ));
+        assert!(!is_page_navigation(
+            "GET",
+            Some("navigate"),
+            Some("text/html"),
+            true
+        ));
+    }
+
+    #[test]
+    fn the_login_cookie_is_stripped_before_forwarding_and_others_kept() {
+        assert_eq!(
+            cookie_header_without("a=1; b=2", "temps_preview_login"),
+            None
+        );
+        assert_eq!(
+            cookie_header_without("a=1; temps_preview_login=x; b=2", "temps_preview_login")
+                .as_deref(),
+            Some("a=1; b=2")
+        );
+        assert_eq!(
+            cookie_header_without(
+                "temps_preview_login=x;temps_preview_login=y",
+                "temps_preview_login"
+            )
+            .as_deref(),
+            Some("")
+        );
+        // A cookie whose name merely starts the same is someone else's.
+        assert_eq!(
+            cookie_header_without("temps_preview_login_x=1", "temps_preview_login"),
+            None
         );
     }
 }

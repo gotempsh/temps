@@ -97,10 +97,9 @@ pub struct Model {
     pub expires_at: DBDateTime,
 
     /// Optional argon2 PHC hash of a user-supplied password that protects
-    /// the sandbox's preview URLs. When null, the gateway allows any
-    /// request that can reach the sandbox's unguessable hex hostname.
-    /// When set, Pingora presents a login form and expects a cookie
-    /// minted against this hash.
+    /// the sandbox's preview URLs while `preview_access` is `password`:
+    /// Pingora then presents a login form and expects a cookie minted
+    /// against this hash. Ignored in the other modes.
     pub preview_password_hash: Option<String>,
 
     /// Last 4 characters of the plaintext password. Safe to surface in
@@ -108,12 +107,19 @@ pub struct Model {
     /// full plaintext anywhere.
     pub preview_password_hint: Option<String>,
 
-    /// Who may open the preview URLs when no password is set (ADR-055
-    /// §11). Sandboxes created before the column are `legacy` (anyone who
-    /// can reach the hostname); new ones default to `temps_login`. A
-    /// serialized row from before the column reads as `legacy`, unchanged.
-    #[serde(default = "super::ingress_mode::SandboxPreviewAccess::unchanged")]
+    /// Who may open the preview URLs (ADR-055 §11): `temps_login` (the
+    /// default), `password` (only while a password is set) or `public`. A
+    /// serialized row without the field reads as `temps_login`, the mode
+    /// that never admits an anonymous visitor.
+    #[serde(default)]
     pub preview_access: super::ingress_mode::SandboxPreviewAccess,
+
+    /// Client networks allowed to open the preview URLs, as normalised
+    /// CIDRs (`203.0.113.0/24`, `2001:db8::/32`; a single address is a
+    /// `/32` or `/128`). Checked before `preview_access`, whatever the
+    /// mode. Empty = any client address.
+    #[serde(default)]
+    pub preview_allowed_cidrs: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

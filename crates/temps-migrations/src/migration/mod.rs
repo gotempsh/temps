@@ -43,6 +43,7 @@ pub(crate) mod m20261023_000020_functions;
 pub(crate) mod m20261023_000030_environment_workload_isolation;
 pub(crate) mod m20261023_000031_workload_instance_handle_id_index;
 pub(crate) mod m20261024_000001_drop_sandbox_driver_mode;
+pub(crate) mod m20261024_000010_sandbox_preview_access;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -839,6 +840,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261023_000030_environment_workload_isolation::Migration),
             Box::new(m20261023_000031_workload_instance_handle_id_index::Migration),
             Box::new(m20261024_000001_drop_sandbox_driver_mode::Migration),
+            Box::new(m20261024_000010_sandbox_preview_access::Migration),
         ]
     }
 }

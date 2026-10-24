@@ -93,6 +93,7 @@ mod tests {
             preview_password_hash: None,
             preview_password_hint: None,
             preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

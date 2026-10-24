@@ -801,6 +801,28 @@ pub fn exchange_grant(
     let permission = endpoint
         .login_permission()
         .ok_or(ExchangeError::NotLoginProtected { owner })?;
+    let traded = trade_exchange_grant(owner, permission, grants, consumed, query)?;
+    let set_cookie = format!(
+        "{SESSION_COOKIE_NAME}={}; Path={}; Max-Age={}; HttpOnly; SameSite=Lax{}",
+        traded.session,
+        session_cookie_path(cookie_path),
+        grant::SESSION_GRANT_TTL_SECS,
+        if secure { "; Secure" } else { "" }
+    );
+    Ok(traded.into_exchange(set_cookie))
+}
+
+/// Verifies the exchange grant in `query` for `owner` and `permission`,
+/// records it as traded and mints the session grant that replaces it. The
+/// session grant keeps the exchange grant's id, so revoking the grant row
+/// revokes both.
+fn trade_exchange_grant(
+    owner: ProductRef,
+    permission: &str,
+    grants: &GrantFacts<'_>,
+    consumed: &ConsumedExchanges,
+    query: Option<&str>,
+) -> Result<TradedSession, ExchangeError> {
     let host = grants.host.ok_or(ExchangeError::UnusableHost { owner })?;
     let mut token = None;
     let mut next = None;
@@ -840,18 +862,109 @@ pub fn exchange_grant(
         },
     )
     .map_err(|source| ExchangeError::Refused { owner, source })?;
-    let set_cookie = format!(
-        "{SESSION_COOKIE_NAME}={session}; Path={}; Max-Age={}; HttpOnly; SameSite=Lax{}",
-        session_cookie_path(cookie_path),
-        grant::SESSION_GRANT_TTL_SECS,
-        if secure { "; Secure" } else { "" }
-    );
-    Ok(SessionExchange {
-        set_cookie,
+    Ok(TradedSession {
+        session,
         location: sanitize_next(next.as_deref().unwrap_or("/")).to_string(),
         grant_id: claims.grant_id,
         user_id: claims.user_id,
     })
+}
+
+/// Cookie carrying a session grant for a `temps_login` sandbox preview
+/// (`ws-<hex>-<port>.<preview_domain>`). Host-only, and the grant inside
+/// names the exact preview host, so it opens one port of one sandbox. The
+/// proxy strips it before forwarding, so the sandbox never sees it.
+pub const PREVIEW_LOGIN_COOKIE_NAME: &str = "temps_preview_login";
+
+/// The grant owner a sandbox's preview login is signed for.
+pub fn sandbox_owner(sandbox_id: i32) -> ProductRef {
+    ProductRef {
+        kind: ProductKind::Sandbox,
+        id: i64::from(sandbox_id),
+    }
+}
+
+/// Trades the exchange grant in the query of a request to
+/// [`GRANT_EXCHANGE_PATH`] on a `temps_login` sandbox preview host for a
+/// [`PREVIEW_LOGIN_COOKIE_NAME`] cookie.
+///
+/// The grant must be signed with the sandbox's key, for this exact host and
+/// the sandbox preview permission, unexpired, not revoked and not traded
+/// before. The cookie is host-only and `SameSite=Lax` (`Secure` over TLS):
+/// the console redirect that delivers the grant is a top-level navigation,
+/// which carries and accepts it. Runs once per sign-in, never per request.
+pub fn exchange_preview_grant(
+    sandbox_id: i32,
+    grants: &GrantFacts<'_>,
+    consumed: &ConsumedExchanges,
+    query: Option<&str>,
+    secure: bool,
+) -> Result<SessionExchange, ExchangeError> {
+    let traded = trade_exchange_grant(
+        sandbox_owner(sandbox_id),
+        temps_entities::ingress_mode::SandboxPreviewAccess::LOGIN_PERMISSION,
+        grants,
+        consumed,
+        query,
+    )?;
+    let set_cookie = format!(
+        "{PREVIEW_LOGIN_COOKIE_NAME}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax{}",
+        traded.session,
+        grant::SESSION_GRANT_TTL_SECS,
+        if secure { "; Secure" } else { "" }
+    );
+    Ok(traded.into_exchange(set_cookie))
+}
+
+/// Whether `cookie_header` carries a [`PREVIEW_LOGIN_COOKIE_NAME`] session
+/// grant for `sandbox_id` on this host: signed with the sandbox's key,
+/// unexpired, not revoked. Every candidate is tried, since a browser may
+/// send a stale value beside a fresh one. No allocation and no I/O: one key
+/// derivation and an HMAC per candidate.
+pub fn preview_session_admits(
+    cookie_header: Option<&str>,
+    sandbox_id: i32,
+    grants: &GrantFacts<'_>,
+) -> bool {
+    let (Some(header), Some(host)) = (cookie_header, grants.host) else {
+        return false;
+    };
+    let owner = sandbox_owner(sandbox_id);
+    let key = GrantKey::derive(grants.master, owner);
+    let expected = GrantExpectation {
+        owner,
+        host,
+        permission: temps_entities::ingress_mode::SandboxPreviewAccess::LOGIN_PERMISSION,
+        usage: GrantUse::Session,
+        now: grants.now_secs,
+    };
+    header
+        .split(';')
+        .filter_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            (key == PREVIEW_LOGIN_COOKIE_NAME).then_some(value.trim_matches('"'))
+        })
+        .any(|token| grant::admits(&key, token, &expected, grants.revocations))
+}
+
+/// A session grant traded for an exchange grant, before it is put in a
+/// cookie.
+struct TradedSession {
+    session: String,
+    location: String,
+    grant_id: i64,
+    user_id: i64,
+}
+
+impl TradedSession {
+    fn into_exchange(self, set_cookie: String) -> SessionExchange {
+        SessionExchange {
+            set_cookie,
+            location: self.location,
+            grant_id: self.grant_id,
+            user_id: self.user_id,
+        }
+    }
 }
 
 /// The host as a grant names it: lowercase ASCII, no port, no trailing dot.
@@ -1556,6 +1669,240 @@ mod tests {
                 None
             ),
             Err(ExchangeError::NotLoginProtected { .. })
+        ));
+    }
+
+    const PREVIEW_HOST: &str = "ws-aabbccdd11223344-3000.preview.example.test";
+
+    fn preview_token(
+        master: &[u8; 32],
+        owner: ProductRef,
+        usage: GrantUse,
+        host: &str,
+        permission: &str,
+        expires_at: u64,
+    ) -> String {
+        grant::mint(
+            &GrantKey::derive(master, owner),
+            &grant::GrantClaims {
+                grant_id: 31,
+                usage,
+                owner,
+                host,
+                permission,
+                user_id: 4,
+                expires_at,
+            },
+        )
+        .expect("mint")
+    }
+
+    #[test]
+    fn a_sandbox_preview_exchange_buys_a_host_only_cookie_the_preview_admits() {
+        let master = [9u8; 32];
+        let none = Revocations::default();
+        let facts = GrantFacts {
+            master: &master,
+            revocations: &none,
+            host: Some(PREVIEW_HOST),
+            now_secs: T0,
+        };
+        let token = preview_token(
+            &master,
+            sandbox_owner(5),
+            GrantUse::Exchange,
+            PREVIEW_HOST,
+            "sandboxes:read",
+            T0 + 60,
+        );
+        let consumed = ConsumedExchanges::default();
+        let query = format!("grant={token}&next=%2Fapp%3Fx%3D1");
+        let exchange =
+            exchange_preview_grant(5, &facts, &consumed, Some(&query), true).expect("exchange");
+        assert_eq!(exchange.location, "/app?x=1");
+        assert_eq!((exchange.grant_id, exchange.user_id), (31, 4));
+        assert!(exchange.set_cookie.starts_with("temps_preview_login=tg1."));
+        assert!(exchange
+            .set_cookie
+            .ends_with("; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax; Secure"));
+        assert!(!exchange.set_cookie.contains("Domain="));
+
+        let pair = exchange.set_cookie.split(';').next().expect("cookie pair");
+        let header = format!("other=1; {pair}");
+        assert!(preview_session_admits(Some(&header), 5, &facts));
+        // Another sandbox, another port of the same sandbox, a later time,
+        // a revoked grant and a missing header are all refused.
+        assert!(!preview_session_admits(Some(&header), 6, &facts));
+        let other_port = GrantFacts {
+            host: Some("ws-aabbccdd11223344-3001.preview.example.test"),
+            ..facts
+        };
+        assert!(!preview_session_admits(Some(&header), 5, &other_port));
+        let later = GrantFacts {
+            now_secs: T0 + grant::SESSION_GRANT_TTL_SECS + 1,
+            ..facts
+        };
+        assert!(!preview_session_admits(Some(&header), 5, &later));
+        let revoked = Revocations::new([31]);
+        let revoked_facts = GrantFacts {
+            revocations: &revoked,
+            ..facts
+        };
+        assert!(!preview_session_admits(Some(&header), 5, &revoked_facts));
+        assert!(!preview_session_admits(None, 5, &facts));
+        // The environment session cookie name does not count.
+        let renamed = header.replace("temps_preview_login=", "_temps_ingress=");
+        assert!(!preview_session_admits(Some(&renamed), 5, &facts));
+
+        // An exchange grant is traded once; plain HTTP drops `Secure`.
+        assert!(matches!(
+            exchange_preview_grant(5, &facts, &consumed, Some(&query), true),
+            Err(ExchangeError::AlreadyUsed { grant_id: 31, .. })
+        ));
+        let plain = exchange_preview_grant(
+            5,
+            &facts,
+            &ConsumedExchanges::default(),
+            Some(&format!("grant={token}&next=%2F%2Fevil.example.test")),
+            false,
+        )
+        .expect("exchange over http");
+        assert!(!plain.set_cookie.contains("Secure"));
+        assert_eq!(plain.location, "/");
+    }
+
+    #[test]
+    fn a_sandbox_preview_exchange_refuses_other_owners_hosts_permissions_and_expired_grants() {
+        let master = [9u8; 32];
+        let none = Revocations::default();
+        let facts = GrantFacts {
+            master: &master,
+            revocations: &none,
+            host: Some(PREVIEW_HOST),
+            now_secs: T0,
+        };
+        let consumed = ConsumedExchanges::default();
+        let exchange = |token: &str| {
+            exchange_preview_grant(5, &facts, &consumed, Some(&format!("grant={token}")), true)
+        };
+        let refused_with = |token: &str| match exchange(token) {
+            Err(ExchangeError::Refused { source, .. }) => Some(source),
+            _ => None,
+        };
+
+        let other_host = preview_token(
+            &master,
+            sandbox_owner(5),
+            GrantUse::Exchange,
+            "ws-aabbccdd11223344-3001.preview.example.test",
+            "sandboxes:read",
+            T0 + 60,
+        );
+        assert!(matches!(
+            refused_with(&other_host),
+            Some(grant::GrantError::WrongHost { .. })
+        ));
+        let expired = preview_token(
+            &master,
+            sandbox_owner(5),
+            GrantUse::Exchange,
+            PREVIEW_HOST,
+            "sandboxes:read",
+            T0,
+        );
+        assert!(matches!(
+            refused_with(&expired),
+            Some(grant::GrantError::Expired { .. })
+        ));
+        let other_permission = preview_token(
+            &master,
+            sandbox_owner(5),
+            GrantUse::Exchange,
+            PREVIEW_HOST,
+            "projects:read",
+            T0 + 60,
+        );
+        assert!(matches!(
+            refused_with(&other_permission),
+            Some(grant::GrantError::WrongPermission { .. })
+        ));
+        // A grant for another sandbox, or for an environment with the same
+        // id, is signed with another key.
+        for owner in [
+            sandbox_owner(6),
+            ProductRef {
+                kind: ProductKind::Environment,
+                id: 5,
+            },
+        ] {
+            let token = preview_token(
+                &master,
+                owner,
+                GrantUse::Exchange,
+                PREVIEW_HOST,
+                "sandboxes:read",
+                T0 + 60,
+            );
+            assert!(
+                matches!(refused_with(&token), Some(grant::GrantError::BadSignature)),
+                "{owner}"
+            );
+        }
+        let session = preview_token(
+            &master,
+            sandbox_owner(5),
+            GrantUse::Session,
+            PREVIEW_HOST,
+            "sandboxes:read",
+            T0 + 60,
+        );
+        assert!(matches!(
+            refused_with(&session),
+            Some(grant::GrantError::WrongUse { .. })
+        ));
+        assert!(matches!(
+            exchange_preview_grant(5, &facts, &consumed, Some("next=%2F"), true),
+            Err(ExchangeError::MissingGrant { .. })
+        ));
+    }
+
+    #[test]
+    fn a_sandbox_login_redirect_names_the_sandbox_and_is_signed_with_its_key() {
+        let master = [9u8; 32];
+        let url = login_redirect_url(
+            "https://console.example.test/",
+            &master,
+            sandbox_owner(5),
+            LoginScheme::Https,
+            "WS-AABBCCDD11223344-3000.preview.example.test:443",
+            "/app?x=1",
+            T0,
+        )
+        .expect("redirect url");
+        let parsed = url::Url::parse(&url).expect("absolute url");
+        assert_eq!(parsed.path(), "/ingress/login");
+        let pairs: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
+        assert_eq!(pairs["owner_kind"], "sandbox");
+        assert_eq!(pairs["owner_id"], "5");
+        assert_eq!(pairs["host"], PREVIEW_HOST);
+        assert_eq!(pairs["next"], "/app?x=1");
+        let issued_at: u64 = pairs["ts"].parse().expect("ts");
+        assert!(grant::login_request_valid(
+            &GrantKey::derive(&master, sandbox_owner(5)),
+            LoginScheme::Https,
+            PREVIEW_HOST,
+            issued_at,
+            &pairs["sig"],
+            T0,
+        ));
+        assert!(!grant::login_request_valid(
+            &GrantKey::derive(&master, sandbox_owner(6)),
+            LoginScheme::Https,
+            PREVIEW_HOST,
+            issued_at,
+            &pairs["sig"],
+            T0,
         ));
     }
 

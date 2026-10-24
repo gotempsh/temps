@@ -6,6 +6,7 @@
 //! No business logic lives here.
 
 pub mod placement;
+pub mod preview_access;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod terminal;
@@ -93,6 +94,7 @@ pub struct SandboxAppState {
         sandboxes::set_preview_password,
         sandboxes::create_preview_link,
         sandboxes::clear_preview_password,
+        preview_access::update_preview_access,
         sandboxes::resize_sandbox,
         sandboxes::list_events,
         sandboxes::rootfs_report,
@@ -142,6 +144,9 @@ pub struct SandboxAppState {
         sandboxes::PreviewShareLinkBody,
         sandboxes::PreviewShareLinkResponse,
         sandboxes::SetPreviewPasswordResponse,
+        preview_access::UpdatePreviewAccessBody,
+        preview_access::PreviewAccessResponse,
+        temps_entities::ingress_mode::SandboxPreviewAccess,
         sandboxes::ResizeSandboxBody,
         sandboxes::SandboxEvent,
         sandboxes::SandboxEventsResponse,
@@ -292,6 +297,7 @@ mod tests {
             "/v1/sandboxes/{id}/domain",
             "/v1/sandboxes/{id}/preview-password",
             "/v1/sandboxes/{id}/preview-link",
+            "/v1/sandboxes/{id}/preview-access",
             "/v1/sandboxes/{id}/events",
             "/v1/sandboxes/{id}/resize",
             "/v1/sandboxes/{id}/terminal",

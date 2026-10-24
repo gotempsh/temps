@@ -20,11 +20,11 @@ use sea_orm::{
     Set, TransactionTrait,
 };
 use temps_entities::ingress_access_policies::StoredPolicy;
-use temps_entities::ingress_mode::IngressMode;
+use temps_entities::ingress_mode::{IngressMode, SandboxPreviewAccess};
 use temps_entities::{
-    environments, ingress_access_policies, ingress_endpoints, ingress_login_grants,
+    environments, ingress_access_policies, ingress_endpoints, ingress_login_grants, sandboxes,
 };
-use temps_workload_ingress::AccessPolicy;
+use temps_workload_ingress::{AccessPolicy, ProductKind};
 use thiserror::Error;
 
 /// The permission a `TempsLogin` on an environment asks for: seeing the
@@ -57,6 +57,59 @@ pub enum IngressError {
         #[source]
         source: DbErr,
     },
+
+    #[error("Sandbox {sandbox_id} not found or destroyed")]
+    SandboxNotFound { sandbox_id: i32 },
+
+    #[error(
+        "Sandbox {public_id} does not ask for a Temps login: its preview access is '{access}'"
+    )]
+    SandboxNotLoginProtected {
+        public_id: String,
+        access: &'static str,
+    },
+
+    #[error("Ingress {operation} for sandbox {sandbox_id} failed: {source}")]
+    SandboxDatabase {
+        sandbox_id: i32,
+        operation: &'static str,
+        #[source]
+        source: DbErr,
+    },
+}
+
+/// What a Temps-login grant for a sandbox preview is checked against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxLoginTarget {
+    pub sandbox_id: i32,
+    pub public_id: String,
+    pub owner_user_id: Option<i32>,
+    pub project_id: Option<i32>,
+}
+
+impl SandboxLoginTarget {
+    /// The first DNS label every preview host of this sandbox starts with:
+    /// `ws-<hex>-` (followed by the port).
+    pub fn preview_label_prefix(&self) -> String {
+        let hex = self
+            .public_id
+            .strip_prefix("sbx_")
+            .unwrap_or(&self.public_id);
+        format!("ws-{hex}-")
+    }
+
+    /// Whether `host` is one of this sandbox's preview hosts:
+    /// `ws-<hex>-<port>.<preview domain>`.
+    pub fn owns_preview_host(&self, host: &str) -> bool {
+        let Some((label, rest)) = host.split_once('.') else {
+            return false;
+        };
+        let prefix = self.preview_label_prefix();
+        !rest.is_empty()
+            && label
+                .strip_prefix(&prefix)
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    }
 }
 
 /// An environment's ingress settings.
@@ -283,18 +336,95 @@ impl IngressService {
         permission: &str,
         expires_at: DateTime<Utc>,
     ) -> Result<IssuedLoginGrant, IngressError> {
+        self.insert_login_grant(
+            user_id,
+            ProductKind::Environment,
+            i64::from(environment_id),
+            host,
+            permission,
+            expires_at,
+        )
+        .await
+        .map_err(Self::db_error(environment_id, "login grant insert"))
+    }
+
+    /// A live sandbox whose preview asks for a Temps login, for a login
+    /// request that names it. Destroyed sandboxes are not found; a sandbox
+    /// in another access mode is [`IngressError::SandboxNotLoginProtected`].
+    pub async fn sandbox_login_target(
+        &self,
+        sandbox_id: i32,
+    ) -> Result<SandboxLoginTarget, IngressError> {
+        let sandbox = sandboxes::Entity::find_by_id(sandbox_id)
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| IngressError::SandboxDatabase {
+                sandbox_id,
+                operation: "sandbox lookup",
+                source,
+            })?
+            .ok_or(IngressError::SandboxNotFound { sandbox_id })?;
+        if sandbox.preview_access != SandboxPreviewAccess::TempsLogin {
+            return Err(IngressError::SandboxNotLoginProtected {
+                public_id: sandbox.public_id,
+                access: sandbox.preview_access.as_str(),
+            });
+        }
+        Ok(SandboxLoginTarget {
+            sandbox_id: sandbox.id,
+            public_id: sandbox.public_id,
+            owner_user_id: sandbox.user_id,
+            project_id: sandbox.project_id,
+        })
+    }
+
+    /// Records a grant for `user_id` to open `host`, a preview host of the
+    /// sandbox.
+    pub async fn record_sandbox_login_grant(
+        &self,
+        user_id: i32,
+        sandbox_id: i32,
+        host: &str,
+        permission: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<IssuedLoginGrant, IngressError> {
+        self.insert_login_grant(
+            user_id,
+            ProductKind::Sandbox,
+            i64::from(sandbox_id),
+            host,
+            permission,
+            expires_at,
+        )
+        .await
+        .map_err(|source| IngressError::SandboxDatabase {
+            sandbox_id,
+            operation: "login grant insert",
+            source,
+        })
+    }
+
+    async fn insert_login_grant(
+        &self,
+        user_id: i32,
+        owner_kind: ProductKind,
+        owner_id: i64,
+        host: &str,
+        permission: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<IssuedLoginGrant, DbErr> {
         let row = ingress_login_grants::ActiveModel {
             user_id: Set(user_id),
-            owner_kind: Set("environment".to_string()),
-            owner_id: Set(i64::from(environment_id)),
+            owner_kind: Set(owner_kind.as_str().to_string()),
+            owner_id: Set(owner_id),
             host: Set(host.to_ascii_lowercase()),
             permission: Set(permission.to_string()),
             expires_at: Set(expires_at),
             ..Default::default()
         }
         .insert(self.db.as_ref())
-        .await
-        .map_err(Self::db_error(environment_id, "login grant insert"))?;
+        .await?;
         Ok(IssuedLoginGrant {
             grant_id: row.id,
             expires_at: row.expires_at,
@@ -341,6 +471,103 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn sandbox_row(access: SandboxPreviewAccess) -> sandboxes::Model {
+        let now = Utc::now();
+        sandboxes::Model {
+            id: 11,
+            public_id: "sbx_0123456789abcdef".into(),
+            user_id: Some(4),
+            agent_run_id: None,
+            name: "sbx-11".into(),
+            status: "running".into(),
+            lifecycle: "ephemeral".into(),
+            project_id: Some(3),
+            source_repo_url: None,
+            image: None,
+            work_dir: "/workspace".into(),
+            timeout_secs: 600,
+            metadata: None,
+            backend: None,
+            node_id: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: None,
+            preview_password_hint: None,
+            preview_access: access,
+            preview_allowed_cidrs: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_temps_login_sandbox_is_a_login_target() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::TempsLogin)]])
+            .into_connection();
+        let service = IngressService::new(Arc::new(db));
+        let target = service.sandbox_login_target(11).await.unwrap();
+        assert_eq!(
+            target,
+            SandboxLoginTarget {
+                sandbox_id: 11,
+                public_id: "sbx_0123456789abcdef".into(),
+                owner_user_id: Some(4),
+                project_id: Some(3),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn sandboxes_in_other_modes_or_missing_get_no_login_grant() {
+        for access in [SandboxPreviewAccess::Public, SandboxPreviewAccess::Password] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![sandbox_row(access)]])
+                .into_connection();
+            let error = IngressService::new(Arc::new(db))
+                .sandbox_login_target(11)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "Sandbox sbx_0123456789abcdef does not ask for a Temps login: its preview access is '{}'",
+                    access.as_str()
+                )
+            );
+        }
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .into_connection();
+        let error = IngressService::new(Arc::new(db))
+            .sandbox_login_target(12)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IngressError::SandboxNotFound { sandbox_id: 12 }
+        ));
+    }
+
+    #[test]
+    fn a_sandbox_owns_only_its_own_preview_hosts() {
+        let target = SandboxLoginTarget {
+            sandbox_id: 11,
+            public_id: "sbx_0123456789abcdef".into(),
+            owner_user_id: Some(4),
+            project_id: None,
+        };
+        assert!(target.owns_preview_host("ws-0123456789abcdef-3000.preview.example.test"));
+        for host in [
+            "ws-0123456789abcdee-3000.preview.example.test",
+            "ws-0123456789abcdef-.preview.example.test",
+            "ws-0123456789abcdef-30x0.preview.example.test",
+            "ws-0123456789abcdef-3000",
+            "app.example.test",
+        ] {
+            assert!(!target.owns_preview_host(host), "{host}");
+        }
     }
 
     async fn test_database() -> Option<TestDatabase> {

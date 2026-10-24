@@ -10,6 +10,7 @@ pub mod expiration_sweeper;
 pub mod fs;
 pub mod job_tracker;
 pub mod placement;
+pub mod preview_access;
 pub mod preview_password;
 pub mod preview_urls;
 pub mod public_id;

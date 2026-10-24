@@ -28,6 +28,7 @@ use temps_agents::error::AgentError;
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
+use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
     agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
     external_services, project_services, projects, sandbox_events, sandbox_services, sandboxes,
@@ -39,6 +40,7 @@ use crate::error::{from_agent_error, SandboxError};
 use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
 use crate::services::placement;
+use crate::services::preview_access::access_after_clearing_password;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::{StandaloneSandboxRegistry, VmProbe};
@@ -687,6 +689,15 @@ pub struct NodeSandboxes {
     pub page_size: u64,
 }
 
+/// The outcome of [`SandboxService::set_preview_access`]: the updated row
+/// plus what it replaced, for the caller's audit record.
+#[derive(Debug, Clone)]
+pub struct PreviewAccessChange {
+    pub previous_access: SandboxPreviewAccess,
+    pub previous_allowed_cidrs: Vec<String>,
+    pub sandbox: sandboxes::Model,
+}
+
 /// Output DTO — what the service returns to handlers and what handlers
 /// serialize into the response JSON. Wraps the DB model to keep internal
 /// columns out of the public surface.
@@ -705,6 +716,11 @@ pub struct SandboxSummary {
     /// last 4 chars of the plaintext — safe to display in the UI so
     /// users can tell two passwords apart.
     pub preview_password_hint: Option<String>,
+    /// Who may open the preview URLs: `temps_login` | `password` | `public`.
+    pub preview_access: SandboxPreviewAccess,
+    /// Client networks allowed to open the preview URLs (normalised CIDRs).
+    /// Empty = any address. Checked before `preview_access`.
+    pub preview_allowed_cidrs: Vec<String>,
     /// Ports the sandbox advertises (read from the `metadata` JSON
     /// column). Empty when the sandbox was created without declaring
     /// any ports.
@@ -749,6 +765,8 @@ impl From<&sandboxes::Model> for SandboxSummary {
             created_at: m.created_at,
             expires_at: m.expires_at,
             preview_password_hint: m.preview_password_hint.clone(),
+            preview_access: m.preview_access,
+            preview_allowed_cidrs: m.preview_allowed_cidrs.clone(),
             ports: ports_from_metadata(m.metadata.as_ref()),
             backend: m.backend.clone(),
             disk_size_mb: m
@@ -1621,7 +1639,7 @@ impl SandboxService {
             created_at: Set(now),
             last_activity_at: Set(now),
             expires_at: Set(now + chrono::Duration::seconds(timeout as i64)),
-            preview_access: Set(NEW_SANDBOX_PREVIEW_ACCESS),
+            preview_access: Set(crate::services::preview_access::initial_access(false)),
             ..Default::default()
         };
         let row = active.insert(self.db.as_ref()).await?;
@@ -2250,7 +2268,9 @@ impl SandboxService {
             expires_at: Set(expires_at),
             preview_password_hash: Set(preview.as_ref().map(|p| p.hash.clone())),
             preview_password_hint: Set(preview.as_ref().map(|p| p.hint.clone())),
-            preview_access: Set(NEW_SANDBOX_PREVIEW_ACCESS),
+            preview_access: Set(crate::services::preview_access::initial_access(
+                preview.is_some(),
+            )),
             lifecycle: Set(lifecycle.as_str().to_string()),
             project_id: Set(req.project_id),
             source_repo_url: Set(source_repo_url),
@@ -5145,35 +5165,113 @@ TEMPS_ASKPASS_EOF\n\
             }
         })?;
         let sandbox_id = row.id;
+        let previous_access = row.preview_access;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(Some(hp.hash));
         active.preview_password_hint = Set(Some(hp.hint.clone()));
+        // Setting a password is choosing the password wall.
+        active.preview_access = Set(SandboxPreviewAccess::Password);
         active.update(self.db.as_ref()).await?;
-        self.record_event(sandbox_id, "preview_password_set", None)
-            .await;
+        self.record_event(
+            sandbox_id,
+            "preview_password_set",
+            Some(serde_json::json!({
+                "previous_access": previous_access.as_str(),
+                "access": SandboxPreviewAccess::Password.as_str(),
+            })),
+        )
+        .await;
         Ok(hp.hint)
     }
 
-    /// Remove the preview password. Subsequent preview requests fall back
-    /// to URL-only protection (the unguessable hex public_id). Idempotent —
-    /// clearing an already-unset password is a no-op, not an error.
+    /// Remove the preview password. A sandbox in `password` mode returns to
+    /// `temps_login` -- never to an open preview. Idempotent: clearing an
+    /// already-unset password is a no-op, not an error. Returns the access
+    /// mode the sandbox has afterwards.
     pub async fn clear_preview_password(
         &self,
         public_id_value: &str,
         user_id: i32,
-    ) -> Result<(), SandboxError> {
+    ) -> Result<SandboxPreviewAccess, SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
         let had_password = row.preview_password_hash.is_some();
+        let previous_access = row.preview_access;
+        let access = access_after_clearing_password(previous_access);
         let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(None);
         active.preview_password_hint = Set(None);
+        active.preview_access = Set(access);
         active.update(self.db.as_ref()).await?;
         if had_password {
-            self.record_event(sandbox_id, "preview_password_cleared", None)
-                .await;
+            self.record_event(
+                sandbox_id,
+                "preview_password_cleared",
+                Some(serde_json::json!({
+                    "previous_access": previous_access.as_str(),
+                    "access": access.as_str(),
+                })),
+            )
+            .await;
         }
-        Ok(())
+        Ok(access)
+    }
+
+    /// Change who may open the sandbox's preview URLs and from which
+    /// networks.
+    ///
+    /// `allowed_cidrs` replaces the stored allow-list (empty = any address)
+    /// after validation and normalisation. `password` is refused while no
+    /// preview password is set: the mode would admit nobody, and the caller
+    /// almost certainly meant to set one first. The proxy picks a change up
+    /// within its sandbox lookup cache TTL (30 s).
+    pub async fn set_preview_access(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        access: SandboxPreviewAccess,
+        allowed_cidrs: &[String],
+    ) -> Result<PreviewAccessChange, SandboxError> {
+        let allowed_cidrs = crate::services::preview_access::normalize_allowed_cidrs(allowed_cidrs)
+            .map_err(|message| SandboxError::Validation {
+                message: format!(
+                    "Invalid preview allow-list for sandbox {public_id_value}: {message}"
+                ),
+            })?;
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if access == SandboxPreviewAccess::Password && row.preview_password_hash.is_none() {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "Sandbox {public_id_value} has no preview password, so `password` access \
+                     would admit nobody. Set one first with PUT \
+                     /v1/sandboxes/{public_id_value}/preview-password (which also switches \
+                     the sandbox to `password` access)."
+                ),
+            });
+        }
+        let previous_access = row.preview_access;
+        let previous_cidrs = row.preview_allowed_cidrs.clone();
+        let sandbox_id = row.id;
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.preview_access = Set(access);
+        active.preview_allowed_cidrs = Set(allowed_cidrs.clone());
+        let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(
+            sandbox_id,
+            "preview_access_changed",
+            Some(serde_json::json!({
+                "previous_access": previous_access.as_str(),
+                "access": access.as_str(),
+                "previous_allowed_cidrs": previous_cidrs,
+                "allowed_cidrs": allowed_cidrs,
+            })),
+        )
+        .await;
+        Ok(PreviewAccessChange {
+            previous_access,
+            previous_allowed_cidrs: previous_cidrs,
+            sandbox: updated,
+        })
     }
 
     // ── Helpers shared with the exec/fs modules ──────────────────────────
@@ -5639,14 +5737,17 @@ TEMPS_ASKPASS_EOF\n\
         }
         // No wake: minting a share link reads the row's password hash.
         let (row, _) = self.resolve_id_no_wake(public_id_value, user_id).await?;
-        let password_hash =
-            row.preview_password_hash
-                .as_deref()
-                .ok_or_else(|| SandboxError::InvalidState {
-                    sandbox_id: public_id_value.to_string(),
-                    state: "preview password disabled".into(),
-                    operation: "mint an expiring preview link; set a preview password first".into(),
-                })?;
+        // A share link stands in for the password, so it only exists while
+        // the password wall is the sandbox's access mode.
+        let password_hash = row
+            .preview_password_hash
+            .as_deref()
+            .filter(|_| row.preview_access == SandboxPreviewAccess::Password)
+            .ok_or_else(|| SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: "preview password disabled".into(),
+                operation: "mint an expiring preview link; set a preview password first".into(),
+            })?;
 
         let now = SystemTime::now();
         let (grant, expires_at) = temps_core::encode_preview_session_grant(
@@ -6079,18 +6180,6 @@ fn source_import_aggregate_bounds_script(work_dir: &str, staging_dir: &str) -> S
         max_bytes = SOURCE_IMPORT_MAX_BYTES,
     )
 }
-
-/// The preview access a sandbox is created with, written explicitly so the
-/// stored setting is the one the proxy enforces and the console describes.
-///
-/// ADR-055 §11 defaults sandboxes to `temps_login` (the column's database
-/// default), but preview hosts have no Temps-login hand-off yet: the proxy
-/// refuses a passwordless `temps_login` preview outright rather than serve
-/// it to anyone holding the URL. Until that hand-off exists, new sandboxes
-/// keep `legacy` -- the preview password when one is set, otherwise the
-/// unguessable hostname, exactly as the sandbox page says.
-pub const NEW_SANDBOX_PREVIEW_ACCESS: temps_entities::ingress_mode::SandboxPreviewAccess =
-    temps_entities::ingress_mode::SandboxPreviewAccess::Legacy;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -6529,6 +6618,7 @@ pub(crate) mod tests {
             preview_password_hash: None,
             preview_password_hint: None,
             preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "workspace".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -6700,18 +6790,6 @@ pub(crate) mod tests {
         assert_eq!(r.preview_password.as_deref(), Some("hunter2secret"));
     }
 
-    /// The proxy refuses a passwordless `temps_login` preview (ADR-055
-    /// §11) until preview hosts can hand off a Temps login, so sandboxes
-    /// must not be created with it, or every one created without a
-    /// password would be unreachable while the console calls it open.
-    #[test]
-    fn new_sandboxes_get_a_preview_access_the_proxy_serves() {
-        assert_eq!(
-            NEW_SANDBOX_PREVIEW_ACCESS,
-            temps_entities::ingress_mode::SandboxPreviewAccess::Legacy
-        );
-    }
-
     /// Destroy must actually target the directory create allocated —
     /// nothing removed it before, so every create/destroy cycle left the
     /// full working tree (node_modules, build output, cloned repos) on the
@@ -6821,6 +6899,7 @@ pub(crate) mod tests {
             preview_password_hash: None,
             preview_password_hint: None,
             preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -6832,7 +6911,147 @@ pub(crate) mod tests {
         row.user_id = Some(user_id);
         row.preview_password_hash = Some("argon2-current".into());
         row.preview_password_hint = Some("rent".into());
+        row.preview_access = SandboxPreviewAccess::Password;
         row
+    }
+
+    fn statements_of(service: SandboxService, db: Arc<DatabaseConnection>) -> String {
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service owns no database references after drop")
+            .into_transaction_log();
+        format!("{log:?}")
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_normalises_the_allow_list_and_records_an_event() {
+        let row = agent_run_row(None);
+        let mut updated = row.clone();
+        updated.preview_access = SandboxPreviewAccess::Public;
+        updated.preview_allowed_cidrs = vec!["192.0.2.0/24".into(), "2001:db8::1/128".into()];
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated.clone()]]);
+
+        let got = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::Public,
+                &["192.0.2.9/24".into(), "2001:db8::1".into()],
+            )
+            .await
+            .expect("owner may change preview access");
+        assert_eq!(got.sandbox, updated);
+        assert_eq!(got.previous_access, SandboxPreviewAccess::TempsLogin);
+        assert!(got.previous_allowed_cidrs.is_empty());
+
+        let statements = statements_of(service, db);
+        assert!(statements.contains("192.0.2.0/24"), "log: {statements}");
+        assert!(statements.contains("2001:db8::1/128"), "log: {statements}");
+        assert!(
+            statements.contains("preview_access_changed"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_refuses_password_mode_without_a_password() {
+        let (service, _) = preview_test_service(vec![vec![agent_run_row(None)]]);
+        let error = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::Password,
+                &[],
+            )
+            .await
+            .expect_err("password mode needs a password");
+        assert!(matches!(error, SandboxError::Validation { .. }));
+        let message = error.to_string();
+        assert!(message.contains("sbx_deadbeef01234567"), "{message}");
+        assert!(
+            message.contains("/v1/sandboxes/sbx_deadbeef01234567/preview-password"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_rejects_a_bad_cidr_before_touching_the_database() {
+        let (service, _) = preview_test_service(Vec::new());
+        let error = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::TempsLogin,
+                &["10.0.0.0/8".into(), "10.0.0.0/40".into()],
+            )
+            .await
+            .expect_err("an invalid CIDR is a validation error");
+        assert!(matches!(error, SandboxError::Validation { .. }));
+        assert!(error.to_string().contains("allowed_cidrs[1]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_hides_other_users_sandboxes() {
+        let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+        let error = service
+            .set_preview_access("sbx_deadbeef01234567", 1, SandboxPreviewAccess::Public, &[])
+            .await
+            .expect_err("a non-owner must not change preview access");
+        assert!(matches!(error, SandboxError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn setting_a_preview_password_selects_password_access() {
+        let row = agent_run_row(None);
+        let updated = protected_preview_row(1);
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated]]);
+        service
+            .set_preview_password("sbx_deadbeef01234567", 1, "correct horse battery")
+            .await
+            .expect("owner may set a password");
+        let statements = statements_of(service, db);
+        assert!(statements.contains("\"password\""), "log: {statements}");
+        assert!(
+            statements.contains("preview_password_set"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_preview_password_returns_to_temps_login() {
+        let row = protected_preview_row(1);
+        let mut updated = agent_run_row(None);
+        updated.preview_access = SandboxPreviewAccess::TempsLogin;
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated]]);
+        let access = service
+            .clear_preview_password("sbx_deadbeef01234567", 1)
+            .await
+            .expect("owner may clear the password");
+        assert_eq!(access, SandboxPreviewAccess::TempsLogin);
+        let statements = statements_of(service, db);
+        assert!(statements.contains("\"temps_login\""), "log: {statements}");
+        assert!(
+            statements.contains("preview_password_cleared"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_requires_password_access_even_with_a_hash() {
+        let mut row = protected_preview_row(1);
+        row.preview_access = SandboxPreviewAccess::TempsLogin;
+        let (service, _) = preview_test_service(vec![vec![row]]);
+        let error = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("a share link only exists in password mode");
+        assert!(matches!(error, SandboxError::InvalidState { .. }));
     }
 
     #[tokio::test]
@@ -7044,6 +7263,7 @@ pub(crate) mod tests {
             preview_password_hash: None,
             preview_password_hint: None,
             preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -7505,6 +7725,7 @@ mod storage_cleanup_tests {
             preview_password_hash: None,
             preview_password_hint: None,
             preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

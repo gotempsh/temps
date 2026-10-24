@@ -47,8 +47,8 @@ use temps_workload_ingress::{
 use tracing::{error, warn};
 
 /// The permission a `TempsLogin` grant for a sandbox preview carries: the
-/// console signs it only for a user who may use the sandbox.
-pub const SANDBOX_PREVIEW_PERMISSION: &str = "sandboxes:use";
+/// console signs it only for a user who may read the sandbox.
+pub const SANDBOX_PREVIEW_PERMISSION: &str = SandboxPreviewAccess::LOGIN_PERMISSION;
 
 /// The permission a `TempsLogin` grant for an environment carries when the
 /// policy does not name one.
@@ -378,26 +378,40 @@ pub fn environment_endpoint(
 /// A sandbox preview's endpoint (its id is the sandbox id; previews are
 /// compiled per lookup, never into the route snapshot).
 ///
-/// - a preview password, whatever the access setting, keeps the password
-///   wall (and the share links that already bypass it);
-/// - otherwise `legacy` and `public` are open to anyone who can reach the
-///   unguessable hostname, and `temps_login` asks for a Temps login by a
-///   user who may use the sandbox.
+/// - the IP allow-list comes first, whatever the mode: a non-empty list
+///   admits only the listed networks and refuses an unresolved client;
+/// - `public` is open to anyone who passes it;
+/// - `password` is the password wall, and without a hash nobody passes (the
+///   database refuses that row; this is the belt to its braces);
+/// - `temps_login` asks for a Temps login by a user who may read the
+///   sandbox.
 pub fn sandbox_endpoint(sandbox: &sandboxes::Model) -> Endpoint {
-    let access = if sandbox.preview_password_hash.is_some() {
-        vec![AccessPolicy::Password {
-            password_ref: i64::from(sandbox.id),
-        }]
-    } else {
-        match sandbox.preview_access {
-            SandboxPreviewAccess::Legacy | SandboxPreviewAccess::Public => {
-                vec![AccessPolicy::Public]
+    let mut access = Vec::with_capacity(2);
+    if !sandbox.preview_allowed_cidrs.is_empty() {
+        access.push(AccessPolicy::IpRules {
+            rules: sandbox
+                .preview_allowed_cidrs
+                .iter()
+                .map(|cidr| IpRule {
+                    cidr: cidr.clone(),
+                    allow: true,
+                })
+                .collect(),
+            unresolved: UnresolvedClient::Deny,
+        });
+    }
+    access.push(match sandbox.preview_access {
+        SandboxPreviewAccess::Public => AccessPolicy::Public,
+        SandboxPreviewAccess::Password if sandbox.preview_password_hash.is_some() => {
+            AccessPolicy::Password {
+                password_ref: i64::from(sandbox.id),
             }
-            SandboxPreviewAccess::TempsLogin => vec![AccessPolicy::TempsLogin {
-                permission: SANDBOX_PREVIEW_PERMISSION.to_string(),
-            }],
         }
-    };
+        SandboxPreviewAccess::Password => deny_everyone(),
+        SandboxPreviewAccess::TempsLogin => AccessPolicy::TempsLogin {
+            permission: SANDBOX_PREVIEW_PERMISSION.to_string(),
+        },
+    });
     Endpoint {
         id: i64::from(sandbox.id),
         owner: sandbox_owner(sandbox.id),
@@ -832,7 +846,8 @@ mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
-            preview_access: SandboxPreviewAccess::Legacy,
+            preview_access: SandboxPreviewAccess::TempsLogin,
+            preview_allowed_cidrs: Vec::new(),
         }
     }
 
@@ -968,26 +983,50 @@ mod tests {
     }
 
     #[test]
-    fn sandboxes_default_to_a_temps_login_when_they_have_no_password() {
+    fn sandbox_endpoints_follow_the_access_mode_after_the_allow_list() {
         let mut sandbox = sandbox(5);
-        sandbox.preview_access = SandboxPreviewAccess::TempsLogin;
+        assert_eq!(SANDBOX_PREVIEW_PERMISSION, "sandboxes:read");
         assert_eq!(
             sandbox_endpoint(&sandbox).access,
             vec![AccessPolicy::TempsLogin {
                 permission: SANDBOX_PREVIEW_PERMISSION.into()
             }]
         );
-        sandbox.preview_access = SandboxPreviewAccess::Legacy;
+        sandbox.preview_access = SandboxPreviewAccess::Public;
         assert_eq!(
             sandbox_endpoint(&sandbox).access,
             vec![AccessPolicy::Public]
         );
+        // A password only protects in `password` mode; without a hash the
+        // mode admits nobody.
+        sandbox.preview_access = SandboxPreviewAccess::Password;
+        assert_eq!(sandbox_endpoint(&sandbox).access, vec![deny_everyone()]);
         sandbox.preview_password_hash = Some("$argon2id$hash".into());
-        sandbox.preview_access = SandboxPreviewAccess::TempsLogin;
         assert_eq!(
             sandbox_endpoint(&sandbox).access,
             vec![AccessPolicy::Password { password_ref: 5 }]
         );
+        // The allow-list is evaluated first and fails closed on an unknown
+        // client.
+        sandbox.preview_allowed_cidrs = vec!["192.0.2.0/24".into(), "2001:db8::/32".into()];
+        let access = sandbox_endpoint(&sandbox).access;
+        assert_eq!(
+            access[0],
+            AccessPolicy::IpRules {
+                rules: vec![
+                    IpRule {
+                        cidr: "192.0.2.0/24".into(),
+                        allow: true
+                    },
+                    IpRule {
+                        cidr: "2001:db8::/32".into(),
+                        allow: true
+                    },
+                ],
+                unresolved: UnresolvedClient::Deny,
+            }
+        );
+        assert_eq!(access[1], AccessPolicy::Password { password_ref: 5 });
     }
 
     #[test]

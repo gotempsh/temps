@@ -24,7 +24,7 @@ use axum::{
         IntoResponse,
     },
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::stream::{self, Stream, StreamExt};
@@ -38,6 +38,7 @@ use utoipa::ToSchema;
 use temps_auth::{permissions::Permission, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::secret_string::SecretString;
+use temps_entities::ingress_mode::SandboxPreviewAccess;
 
 use crate::error::SandboxError;
 use crate::handlers::SandboxAppState;
@@ -723,6 +724,13 @@ pub struct SandboxInner {
     pub preview_url_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_password_hint: Option<String>,
+    /// Who may open the preview URLs: `temps_login` (a signed-in Temps user
+    /// who may read this sandbox; the default), `password` (whoever knows the
+    /// preview password) or `public` (anyone).
+    pub preview_access: SandboxPreviewAccess,
+    /// Client networks allowed to open the preview URLs, as normalised
+    /// CIDRs. Checked before `preview_access`; empty = any address.
+    pub preview_allowed_cidrs: Vec<String>,
     /// Agent run this sandbox executes (autofixer / workflow agent).
     /// `None` for sandboxes created via this API.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -802,6 +810,8 @@ impl SandboxResponse {
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
+                preview_access: s.preview_access,
+                preview_allowed_cidrs: s.preview_allowed_cidrs,
                 agent_run_id: s.agent_run_id,
                 lifecycle: s.lifecycle,
                 project_id: s.project_id,
@@ -2706,14 +2716,21 @@ pub struct SetPreviewPasswordResponse {
 pub async fn set_preview_password(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(id): Path<String>,
     Json(body): Json<SetPreviewPasswordBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    let user_id = auth.user_id();
     let hint = state
         .sandbox_service
-        .set_preview_password(&id, auth.user_id(), body.password.expose())
+        .set_preview_password(&id, user_id, body.password.expose())
         .await?;
+    let event = super::preview_access::SandboxPreviewPasswordAudit::set(
+        super::preview_access::audit_context(user_id, &metadata),
+        &id,
+    );
+    super::preview_access::write_audit(&state, &event, &id).await;
     Ok(Json(SetPreviewPasswordResponse {
         preview_password_hint: hint,
     }))
@@ -2724,7 +2741,7 @@ pub async fn set_preview_password(
     delete,
     path = "/v1/sandboxes/{id}/preview-password",
     responses(
-        (status = 204, description = "Preview password removed (sandbox is now URL-only protected)"),
+        (status = 204, description = "Preview password removed; a sandbox in `password` access returns to `temps_login`"),
         (status = 404, description = "Sandbox not found")
     ),
     security(("bearer_auth" = []))
@@ -2732,13 +2749,21 @@ pub async fn set_preview_password(
 pub async fn clear_preview_password(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
-    state
+    let user_id = auth.user_id();
+    let access = state
         .sandbox_service
-        .clear_preview_password(&id, auth.user_id())
+        .clear_preview_password(&id, user_id)
         .await?;
+    let event = super::preview_access::SandboxPreviewPasswordAudit::cleared(
+        super::preview_access::audit_context(user_id, &metadata),
+        &id,
+        access,
+    );
+    super::preview_access::write_audit(&state, &event, &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2972,6 +2997,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route(
             "/v1/sandboxes/{id}/preview-password",
             put(set_preview_password).delete(clear_preview_password),
+        )
+        .route(
+            "/v1/sandboxes/{id}/preview-access",
+            put(super::preview_access::update_preview_access),
         )
         .route("/v1/sandboxes/{id}/preview-link", post(create_preview_link))
 }
@@ -3229,6 +3258,8 @@ mod tests {
             created_at: now,
             expires_at: now,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             ports: vec![],
             backend: None,
             disk_size_mb: None,
@@ -3262,6 +3293,8 @@ mod tests {
             created_at: now,
             expires_at: now,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             ports: vec![3000, 5173],
             backend: None,
             disk_size_mb: None,
