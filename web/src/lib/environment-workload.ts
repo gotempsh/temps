@@ -2,149 +2,81 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { z } from 'zod'
-import { client } from '@/api/client/client.gen'
+import {
+  adminAttachEnvironmentVolume,
+  adminCreateEnvironmentVolume,
+  adminDeleteEnvironmentVolume,
+  adminDetachEnvironmentVolume,
+  adminEnvironmentPinningRecommendation,
+  adminEnvironmentVolumeStatus,
+  adminExplainEnvironmentPlacement,
+  adminGetEnvironmentWorkloadIsolation,
+  adminGetEnvironmentWorkloadMode,
+  adminListEnvironmentVolumes,
+  adminSetEnvironmentWorkloadIsolation,
+  adminSetEnvironmentWorkloadMode,
+} from '@/api/client'
+import type {
+  AttachEnvironmentVolumeRequest,
+  CreateEnvironmentVolumeRequest,
+  DeletedEnvironmentVolumeResponse,
+  EnvironmentVolumeListResponse,
+  EnvironmentVolumeResponse,
+  EnvironmentVolumeStatusResponse,
+  EnvironmentWorkloadIsolation,
+  EnvironmentWorkloadMode,
+  NodeExclusionDto,
+  NodeRecommendationDto,
+  PinningRecommendationResponse,
+  PlacementExplanationResponse,
+  VolumeAttachmentDto,
+  WorkloadIsolationResponse,
+  WorkloadModeResponse,
+} from '@/api/client'
 import { httpStatusOf } from '@/lib/http-error-status'
 
-/**
- * Which scheduler places an environment's deployments (ADR-055 Phase 5).
- * Mirrors `EnvironmentWorkloadMode` (serde `snake_case`).
- */
-export type EnvironmentWorkloadMode = 'legacy' | 'shadow' | 'enforce'
+/** Which scheduler places an environment's deployments (ADR-055 Phase 5). */
+export type { EnvironmentWorkloadMode }
 
-/**
- * The isolation an environment's plane-run deployments request (ADR-055
- * Phase 10). Mirrors `EnvironmentWorkloadIsolation` (serde `snake_case`).
- */
-export type EnvironmentWorkloadIsolation = 'process' | 'micro_vm'
+/** The isolation an environment's plane-run deployments request (Phase 10). */
+export type { EnvironmentWorkloadIsolation }
 
-/** Mirrors `WorkloadModeResponse` in `workload_placement.rs`. */
-export interface EnvironmentWorkloadModeSettings {
-  environment_id: number
-  workload_mode: EnvironmentWorkloadMode
-}
+/** An environment's workload mode. */
+export type EnvironmentWorkloadModeSettings = WorkloadModeResponse
 
-/** Mirrors `WorkloadIsolationResponse`. */
-export interface EnvironmentWorkloadIsolationSettings {
-  environment_id: number
-  workload_isolation: EnvironmentWorkloadIsolation
-  /** Only `enforce` deployments run through the plane and honour it. */
-  applies: boolean
-}
+/** An environment's isolation; only `enforce` deployments honour it. */
+export type EnvironmentWorkloadIsolationSettings = WorkloadIsolationResponse
 
-/** Mirrors `NodeRecommendationDto`. */
-export interface NodeRecommendation {
-  node_id: number
-  node_name: string
-  score: number
-  reasons: string[]
-}
+/** An eligible node and why. */
+export type NodeRecommendation = NodeRecommendationDto
 
-/** Mirrors `NodeExclusionDto`. */
-export interface NodeExclusion {
-  node_id: number
-  node_name: string
-  /** The `Scheduled` condition reason, e.g. `NodeDraining`. */
-  reason: string
-  message: string
-  /** `false` when the node was kept with a warning. */
-  excluded: boolean
-}
+/** A node left out (or kept with a warning when `excluded` is false). */
+export type NodeExclusion = NodeExclusionDto
 
-/** Mirrors `PlacementExplanationResponse`. */
-export interface PlacementExplanation {
-  environment_id: number
-  /** Eligible nodes, best first. */
-  recommended: NodeRecommendation[]
-  excluded: NodeExclusion[]
-  /** Where each replica would go now (`0` = the control plane). */
-  placement: number[] | null
-  unschedulable: string | null
-  unschedulable_reason: string | null
-  warnings: string[]
-  /** Why the environment is pinned by its volumes, `null` without any. */
-  pinned_by: string | null
-}
+/** Where the environment's replicas would go now, and why. */
+export type PlacementExplanation = PlacementExplanationResponse
 
-/** Mirrors `PinningRecommendationResponse`. */
-export interface PinningRecommendation {
-  environment_id: number
-  window_days: number
-  nodes_used: number[]
-  moved_between_nodes: boolean
-  /** The recommended `target_nodes`. Recommended, never applied. */
-  recommended_nodes: number[]
-  reasons: string[]
-  current_nodes: number[]
-  changes_placement: boolean
-}
+/** The recommended `target_nodes`. Recommended, never applied. */
+export type PinningRecommendation = PinningRecommendationResponse
 
-/** Mirrors `VolumeAttachmentDto` in `workload_volumes.rs`. */
-export interface VolumeAttachment {
-  mount_path: string
-  read_only: boolean
-}
+/** Where a volume is mounted. */
+export type VolumeAttachment = VolumeAttachmentDto
 
-/** Mirrors `EnvironmentVolumeResponse`. */
-export interface EnvironmentVolume {
-  id: number
-  environment_id: number
-  name: string
-  /** `named` (a Docker named volume). */
-  backing: string
-  /** `null` until first created, `0` for the control plane. */
-  node_id: number | null
-  size_mb: number | null
-  retain_on_delete: boolean
-  /** `null` when detached. */
-  attachment: VolumeAttachment | null
-  pin_reason: string | null
-  created_at: string
-  updated_at: string
-}
+/** An environment volume; `attachment` is absent when detached. */
+export type EnvironmentVolume = EnvironmentVolumeResponse
 
-/** Mirrors `EnvironmentVolumeListResponse`. */
-export interface EnvironmentVolumeList {
-  volumes: EnvironmentVolume[]
-  total: number
-  page: number
-  page_size: number
-}
+/** A page of an environment's volumes. */
+export type EnvironmentVolumeList = EnvironmentVolumeListResponse
 
-/** Mirrors `CreateEnvironmentVolumeRequest`. */
-export interface CreateEnvironmentVolume {
-  name: string
-  size_mb?: number | null
-  retain_on_delete?: boolean
-}
+export type CreateEnvironmentVolume = CreateEnvironmentVolumeRequest
 
-/** Mirrors `AttachEnvironmentVolumeRequest`. */
-export interface AttachEnvironmentVolume {
-  mount_path: string
-  read_only?: boolean
-}
+export type AttachEnvironmentVolume = AttachEnvironmentVolumeRequest
 
-/** Mirrors `EnvironmentVolumeStatusResponse`. */
-export interface EnvironmentVolumeStatus {
-  environment_id: number
-  workload_mode: EnvironmentWorkloadMode
-  replicas: number
-  attached: number
-  /** Whether the next deploy mounts the attached volumes. */
-  active: boolean
-  /** Why they would not be mounted (the next deploy fails with it). */
-  reason: string | null
-  setup_path: string | null
-}
+/** Whether the next deploy mounts the attached volumes, and why not. */
+export type EnvironmentVolumeStatus = EnvironmentVolumeStatusResponse
 
-/** Mirrors `DeletedEnvironmentVolumeResponse`. */
-export interface DeletedEnvironmentVolume {
-  volume: EnvironmentVolume
-  backing_removed: boolean
-  backing_kept_reason: string | null
-}
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
-const JSON_HEADERS = { 'Content-Type': 'application/json' }
+/** The deleted volume, and whether its backing data was removed. */
+export type DeletedEnvironmentVolume = DeletedEnvironmentVolumeResponse
 
 /** The control plane's node id in every placement response. */
 export const CONTROL_PLANE_NODE_ID = 0
@@ -154,11 +86,7 @@ export const DEFAULT_RECOMMENDATION_WINDOW_DAYS = 7
 /** DOM id of the workload-plane section, so other cards can link to it. */
 export const WORKLOAD_PLANE_SECTION_ID = 'environment-workload-plane'
 
-// ── URLs and query keys ─────────────────────────────────────────────────────
-
-export function environmentWorkloadUrl(environmentId: number): string {
-  return `/internal/environments/${environmentId}`
-}
+// ── Query keys ──────────────────────────────────────────────────────────────
 
 export function workloadModeQueryKey(environmentId: number) {
   return ['environment-workload-mode', environmentId] as const
@@ -205,13 +133,8 @@ export function environmentVolumeStatusQueryKey(environmentId: number) {
 export async function getWorkloadMode(
   environmentId: number
 ): Promise<EnvironmentWorkloadModeSettings> {
-  const { data } = await client.get<
-    EnvironmentWorkloadModeSettings,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/workload-mode`,
+  const { data } = await adminGetEnvironmentWorkloadMode({
+    path: { environment_id: environmentId },
     throwOnError: true,
   })
   return data
@@ -221,15 +144,9 @@ export async function setWorkloadMode(
   environmentId: number,
   workloadMode: EnvironmentWorkloadMode
 ): Promise<EnvironmentWorkloadModeSettings> {
-  const { data } = await client.put<
-    EnvironmentWorkloadModeSettings,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/workload-mode`,
+  const { data } = await adminSetEnvironmentWorkloadMode({
+    path: { environment_id: environmentId },
     body: { workload_mode: workloadMode },
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data
@@ -238,13 +155,8 @@ export async function setWorkloadMode(
 export async function getWorkloadIsolation(
   environmentId: number
 ): Promise<EnvironmentWorkloadIsolationSettings> {
-  const { data } = await client.get<
-    EnvironmentWorkloadIsolationSettings,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/workload-isolation`,
+  const { data } = await adminGetEnvironmentWorkloadIsolation({
+    path: { environment_id: environmentId },
     throwOnError: true,
   })
   return data
@@ -254,15 +166,9 @@ export async function setWorkloadIsolation(
   environmentId: number,
   workloadIsolation: EnvironmentWorkloadIsolation
 ): Promise<EnvironmentWorkloadIsolationSettings> {
-  const { data } = await client.put<
-    EnvironmentWorkloadIsolationSettings,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/workload-isolation`,
+  const { data } = await adminSetEnvironmentWorkloadIsolation({
+    path: { environment_id: environmentId },
     body: { workload_isolation: workloadIsolation },
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data
@@ -271,9 +177,8 @@ export async function setWorkloadIsolation(
 export async function explainPlacement(
   environmentId: number
 ): Promise<PlacementExplanation> {
-  const { data } = await client.get<PlacementExplanation, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/placement/explain`,
+  const { data } = await adminExplainEnvironmentPlacement({
+    path: { environment_id: environmentId },
     throwOnError: true,
   })
   return data
@@ -283,9 +188,8 @@ export async function getPinningRecommendation(
   environmentId: number,
   windowDays: number = DEFAULT_RECOMMENDATION_WINDOW_DAYS
 ): Promise<PinningRecommendation> {
-  const { data } = await client.get<PinningRecommendation, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/placement/recommendation`,
+  const { data } = await adminEnvironmentPinningRecommendation({
+    path: { environment_id: environmentId },
     query: { window_days: windowDays },
     throwOnError: true,
   })
@@ -297,9 +201,8 @@ export async function listEnvironmentVolumes(
   page: number,
   pageSize: number
 ): Promise<EnvironmentVolumeList> {
-  const { data } = await client.get<EnvironmentVolumeList, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/volumes`,
+  const { data } = await adminListEnvironmentVolumes({
+    path: { environment_id: environmentId },
     query: { page, page_size: pageSize },
     throwOnError: true,
   })
@@ -309,9 +212,8 @@ export async function listEnvironmentVolumes(
 export async function getEnvironmentVolumeStatus(
   environmentId: number
 ): Promise<EnvironmentVolumeStatus> {
-  const { data } = await client.get<EnvironmentVolumeStatus, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/volumes/status`,
+  const { data } = await adminEnvironmentVolumeStatus({
+    path: { environment_id: environmentId },
     throwOnError: true,
   })
   return data
@@ -321,11 +223,9 @@ export async function createEnvironmentVolume(
   environmentId: number,
   request: CreateEnvironmentVolume
 ): Promise<EnvironmentVolume> {
-  const { data } = await client.post<EnvironmentVolume, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/volumes`,
+  const { data } = await adminCreateEnvironmentVolume({
+    path: { environment_id: environmentId },
     body: createVolumeBody(request),
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data
@@ -336,14 +236,12 @@ export async function attachEnvironmentVolume(
   volumeId: number,
   request: AttachEnvironmentVolume
 ): Promise<EnvironmentVolume> {
-  const { data } = await client.put<EnvironmentVolume, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/volumes/${volumeId}/attachment`,
+  const { data } = await adminAttachEnvironmentVolume({
+    path: { environment_id: environmentId, volume_id: volumeId },
     body: {
       mount_path: request.mount_path.trim(),
       read_only: request.read_only ?? false,
     },
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data
@@ -353,9 +251,8 @@ export async function detachEnvironmentVolume(
   environmentId: number,
   volumeId: number
 ): Promise<EnvironmentVolume> {
-  const { data } = await client.delete<EnvironmentVolume, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${environmentWorkloadUrl(environmentId)}/volumes/${volumeId}/attachment`,
+  const { data } = await adminDetachEnvironmentVolume({
+    path: { environment_id: environmentId, volume_id: volumeId },
     throwOnError: true,
   })
   return data
@@ -365,13 +262,10 @@ export async function deleteEnvironmentVolume(
   environmentId: number,
   volumeId: number
 ): Promise<DeletedEnvironmentVolume> {
-  const { data } = await client.delete<DeletedEnvironmentVolume, unknown, true>(
-    {
-      security: [...BEARER_SECURITY],
-      url: `${environmentWorkloadUrl(environmentId)}/volumes/${volumeId}`,
-      throwOnError: true,
-    }
-  )
+  const { data } = await adminDeleteEnvironmentVolume({
+    path: { environment_id: environmentId, volume_id: volumeId },
+    throwOnError: true,
+  })
   return data
 }
 
@@ -578,7 +472,7 @@ export type AttachVolumeFormValues = z.infer<typeof attachVolumeFormSchema>
 
 /** Where a volume's data lives, for a sentence. */
 export function volumeLocation(volume: EnvironmentVolume): string {
-  if (volume.node_id === null) return 'not created on a node yet'
+  if (volume.node_id == null) return 'not created on a node yet'
   return volume.node_id === CONTROL_PLANE_NODE_ID
     ? 'on the control plane'
     : `on node ${volume.node_id}`
@@ -595,7 +489,7 @@ export function volumeDeleteConsequence(volume: EnvironmentVolume): string {
   if (volume.retain_on_delete) {
     return `The volume record is removed, but its data is retained (retain on delete is set) and stays ${volumeLocation(volume)}.${mounted}`
   }
-  if (volume.node_id === null) {
+  if (volume.node_id == null) {
     return `The volume was never created on a node, so there is no data to remove.${mounted}`
   }
   if (volume.node_id === CONTROL_PLANE_NODE_ID) {

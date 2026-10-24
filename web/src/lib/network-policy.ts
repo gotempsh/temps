@@ -1,9 +1,27 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
+import {
+  createRule,
+  deleteRule,
+  getEffectivePolicy as getEffectivePolicyOperation,
+  getRule,
+  listNodeModes,
+  listRules,
+  setNodeMode,
+  setProfile,
+} from '@/api/client'
+import type {
+  CreateNetworkPolicyRuleRequest as CreateNetworkPolicyRuleBody,
+  EffectivePolicyResponse,
+  ListRulesData,
+  NetworkPolicyRuleListResponse,
+  NetworkPolicyRuleResponse,
+  NodeNetworkPolicyModeListResponse,
+  NodeNetworkPolicyModeResponse,
+  ProfileResponse,
+  SetProfileRequest as SetProfileBody,
+} from '@/api/client'
 
 /** What a rule is attached to (ADR-052 §4 / ADR-055 §9). */
 export type SubjectKind =
@@ -29,37 +47,16 @@ export type RuleOrigin = 'link' | 'operator' | 'system'
 export type Profile = 'open' | 'restricted' | 'none'
 export type NodeNetworkPolicyMode = 'legacy' | 'shadow' | 'enforce'
 
-/** Mirrors `NetworkPolicyRuleResponse` (enums arrive as plain strings). */
-export interface NetworkPolicyRule {
-  id: number
-  subject_kind: string
-  subject_id: number
-  direction: string
-  peer_kind: string
-  peer_ref: string
-  port_start: number | null
-  port_end: number | null
-  protocol: string
-  action: string
-  /** `link` rules are removed by unlinking, not deleted directly. */
-  origin: string
-  link_table: string | null
-  link_id: number | null
-  description: string | null
-  created_by: number | null
-  created_at: string
-  updated_at: string
-}
+/**
+ * A rule, as the server returns it (enums arrive as plain strings). `link`
+ * rules are removed by unlinking, not deleted directly.
+ */
+export type NetworkPolicyRule = NetworkPolicyRuleResponse
 
-/** Mirrors `NetworkPolicyRuleListResponse`. */
-export interface NetworkPolicyRuleList {
-  items: NetworkPolicyRule[]
-  total: number
-  page: number
-  page_size: number
-}
+/** A page of rules. */
+export type NetworkPolicyRuleList = NetworkPolicyRuleListResponse
 
-/** Mirrors `ListRulesQuery`. `subject_kind` and `subject_id` go together. */
+/** The list filters. `subject_kind` and `subject_id` go together. */
 export interface ListRulesParams {
   subject_kind?: SubjectKind
   subject_id?: number
@@ -68,62 +65,32 @@ export interface ListRulesParams {
   page_size?: number
 }
 
-/** Mirrors `CreateNetworkPolicyRuleRequest`. */
-export interface CreateNetworkPolicyRuleRequest {
+/** The create request, with its enum fields narrowed to the known values. */
+export type CreateNetworkPolicyRuleRequest = CreateNetworkPolicyRuleBody & {
   subject_kind: SubjectKind
-  subject_id: number
   direction: Direction
   peer_kind: PeerKind
-  peer_ref: string
-  port_start?: number
-  port_end?: number
   protocol?: Protocol
   action: RuleAction
-  description?: string
 }
 
-/** Mirrors `ProfileResponse`. */
-export interface ProfileSettings {
-  egress: string
-  ingress: string
-  /** `default` (the kind's) or `override`. */
-  egress_source: string
-  ingress_source: string
-}
+/** A subject's profile per direction, and whether it is the kind's default. */
+export type ProfileSettings = ProfileResponse
 
-/** Mirrors `EffectivePolicyResponse`. */
-export interface EffectivePolicy {
-  subject_kind: string
-  subject_id: number
-  profile: ProfileSettings
-  rules: NetworkPolicyRule[]
-  /** Link rules of other workloads that name this one. */
-  inbound_links: NetworkPolicyRule[]
-  /** Nodes whose mode is `enforce`; empty means enforced nowhere yet. */
-  enforcing_nodes: number[]
-  enforced: boolean
-}
+/** Everything that applies to one subject. */
+export type EffectivePolicy = EffectivePolicyResponse
 
-/** Mirrors `SetProfileRequest`: omit a field for the kind's default. */
-export interface SetProfileRequest {
+/** Omit a direction for the kind's default. */
+export type SetProfileRequest = SetProfileBody & {
   egress?: Profile
   ingress?: Profile
 }
 
-/** Mirrors `NodeNetworkPolicyModeResponse`. */
-export interface NodeNetworkPolicyModeEntry {
-  /** 0 is the control plane. */
-  node_id: number
-  name: string
-  role: string
-  status: string
-  mode: string
-}
+/** One node's enforcement mode. Node 0 is the control plane. */
+export type NodeNetworkPolicyModeEntry = NodeNetworkPolicyModeResponse
 
-/** Mirrors `NodeNetworkPolicyModeListResponse`. */
-export interface NodeNetworkPolicyModeList {
-  nodes: NodeNetworkPolicyModeEntry[]
-}
+/** Every node's enforcement mode. */
+export type NodeNetworkPolicyModeList = NodeNetworkPolicyModeListResponse
 
 // ── Query keys ─────────────────────────────────────────────────────────────
 
@@ -142,8 +109,8 @@ export const networkPolicyKeys = {
 /** The query object sent for a list; empty filters are omitted. */
 export function rulesQuery(
   params: ListRulesParams
-): Record<string, string | number> {
-  const query: Record<string, string | number> = {}
+): NonNullable<ListRulesData['query']> {
+  const query: NonNullable<ListRulesData['query']> = {}
   if (params.subject_kind && params.subject_id !== undefined) {
     query.subject_kind = params.subject_kind
     query.subject_id = params.subject_id
@@ -157,9 +124,7 @@ export function rulesQuery(
 export async function listNetworkPolicyRules(
   params: ListRulesParams
 ): Promise<NetworkPolicyRuleList> {
-  const { data } = await client.get<NetworkPolicyRuleList, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/network-policy/rules',
+  const { data } = await listRules({
     query: rulesQuery(params),
     throwOnError: true,
   })
@@ -169,9 +134,8 @@ export async function listNetworkPolicyRules(
 export async function getNetworkPolicyRule(
   ruleId: number
 ): Promise<NetworkPolicyRule> {
-  const { data } = await client.get<NetworkPolicyRule, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/network-policy/rules/${ruleId}`,
+  const { data } = await getRule({
+    path: { rule_id: ruleId },
     throwOnError: true,
   })
   return data
@@ -180,31 +144,20 @@ export async function getNetworkPolicyRule(
 export async function createNetworkPolicyRule(
   request: CreateNetworkPolicyRuleRequest
 ): Promise<NetworkPolicyRule> {
-  const { data } = await client.post<NetworkPolicyRule, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/network-policy/rules',
-    body: request,
-    headers: { 'Content-Type': 'application/json' },
-    throwOnError: true,
-  })
+  const { data } = await createRule({ body: request, throwOnError: true })
   return data
 }
 
 export async function deleteNetworkPolicyRule(ruleId: number): Promise<void> {
-  await client.delete<unknown, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/network-policy/rules/${ruleId}`,
-    throwOnError: true,
-  })
+  await deleteRule({ path: { rule_id: ruleId }, throwOnError: true })
 }
 
 export async function getEffectivePolicy(
   subjectKind: SubjectKind,
   subjectId: number
 ): Promise<EffectivePolicy> {
-  const { data } = await client.get<EffectivePolicy, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/network-policy/subjects/${subjectKind}/${subjectId}`,
+  const { data } = await getEffectivePolicyOperation({
+    path: { subject_kind: subjectKind, subject_id: subjectId },
     throwOnError: true,
   })
   return data
@@ -215,22 +168,16 @@ export async function setSubjectProfile(
   subjectId: number,
   request: SetProfileRequest
 ): Promise<ProfileSettings> {
-  const { data } = await client.put<ProfileSettings, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/network-policy/subjects/${subjectKind}/${subjectId}/profile`,
+  const { data } = await setProfile({
+    path: { subject_kind: subjectKind, subject_id: subjectId },
     body: request,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
 }
 
 export async function listNodeNetworkPolicyModes(): Promise<NodeNetworkPolicyModeList> {
-  const { data } = await client.get<NodeNetworkPolicyModeList, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/network-policy/nodes',
-    throwOnError: true,
-  })
+  const { data } = await listNodeModes({ throwOnError: true })
   return data
 }
 
@@ -238,15 +185,9 @@ export async function setNodeNetworkPolicyMode(
   nodeId: number,
   mode: NodeNetworkPolicyMode
 ): Promise<NodeNetworkPolicyModeEntry> {
-  const { data } = await client.patch<
-    NodeNetworkPolicyModeEntry,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `/network-policy/nodes/${nodeId}`,
+  const { data } = await setNodeMode({
+    path: { node_id: nodeId },
     body: { mode },
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
@@ -374,18 +315,18 @@ export function peerRefHint(kind: PeerKind): string {
 
 /** "every port", "443", "8000-8100", with the protocol. */
 export function describePorts(rule: {
-  port_start: number | null
-  port_end: number | null
+  port_start?: number | null
+  port_end?: number | null
   protocol: string
   peer_kind?: string
 }): string {
   const protocol = rule.protocol === 'any' ? '' : `/${rule.protocol}`
-  if (rule.port_start === null) {
+  if (rule.port_start == null) {
     return rule.peer_kind === 'host'
       ? `80, 443${protocol}`
       : `every port${protocol}`
   }
-  if (rule.port_end === null || rule.port_end === rule.port_start) {
+  if (rule.port_end == null || rule.port_end === rule.port_start) {
     return `${rule.port_start}${protocol}`
   }
   return `${rule.port_start}-${rule.port_end}${protocol}`

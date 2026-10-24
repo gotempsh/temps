@@ -1,28 +1,24 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import {
+  getIngressSettings as getIngressSettingsOperation,
+  updateIngressSettings as updateIngressSettingsOperation,
+} from '@/api/client'
+import type {
+  IngressMode,
+  IngressSettingsResponse,
+  UpdateIngressSettingsRequest,
+} from '@/api/client'
 
 /** Which evaluator decides an environment's requests (ADR-055 §11). */
-export type IngressMode = 'legacy' | 'shadow' | 'enforce'
+export type { IngressMode }
 
-/** Mirrors `IngressSettingsResponse` on the server. */
-export interface IngressSettings {
-  project_id: number
-  environment_id: number
-  mode: IngressMode
-  require_login: boolean
-  login_permission: string | null
-  login_enforced: boolean
-}
+/** An environment's ingress settings, as the server returns them. */
+export type IngressSettings = IngressSettingsResponse
 
-/** Mirrors `UpdateIngressSettingsRequest`. */
-export interface IngressSettingsUpdate {
-  mode?: IngressMode
-  require_login?: boolean
-}
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
+/** A partial update: a field left out keeps its current value. */
+export type IngressSettingsUpdate = UpdateIngressSettingsRequest
 
 export function ingressSettingsQueryKey(
   projectId: number,
@@ -35,9 +31,8 @@ export async function getIngressSettings(
   projectId: number,
   environmentId: number
 ): Promise<IngressSettings> {
-  const { data } = await client.get<IngressSettings, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/environments/${environmentId}/ingress`,
+  const { data } = await getIngressSettingsOperation({
+    path: { project_id: projectId, env_id: environmentId },
     throwOnError: true,
   })
   return data
@@ -48,11 +43,9 @@ export async function updateIngressSettings(
   environmentId: number,
   update: IngressSettingsUpdate
 ): Promise<IngressSettings> {
-  const { data } = await client.put<IngressSettings, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/projects/${projectId}/environments/${environmentId}/ingress`,
+  const { data } = await updateIngressSettingsOperation({
+    path: { project_id: projectId, env_id: environmentId },
     body: update,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data

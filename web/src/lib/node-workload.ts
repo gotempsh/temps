@@ -1,32 +1,36 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import {
+  adminGetNodeResources,
+  adminSetNodeResources,
+  getNodeSandboxDriverMode,
+  nodeStateStatus,
+  setNodeSandboxDriverMode,
+} from '@/api/client'
+import type {
+  NodeResourcePolicy,
+  NodeResourcesResponse,
+  NodeStateStatusResponse,
+  SandboxDriverModeResponse,
+  SetNodeResourcesRequest,
+  SetSandboxDriverModeRequest,
+  SystemReserved,
+} from '@/api/client'
 
 /** Node `0` is the control plane in every per-node workload route. */
 export const CONTROL_PLANE_NODE_ID = 0
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
 
 // ── Sandbox driver mode (ADR-055 phase 6) ───────────────────────────────────
 
 /** Which code path serves a node's sandboxes. */
 export type SandboxDriverMode = 'legacy' | 'shadow' | 'enforce'
 
-/** Mirrors `SandboxDriverModeResponse`. */
-export interface SandboxDriverModeSetting {
-  /** `0` is the control plane. */
-  node_id: number
-  node_name: string
-  mode: SandboxDriverMode
-  /** Whether the driver facade serves this node's sandboxes (only `enforce`). */
-  uses_drivers: boolean
-  /** Longest delay before a change reaches calls already being served. */
-  propagation_secs: number
-}
+/** A node's sandbox driver mode. Node `0` is the control plane. */
+export type SandboxDriverModeSetting = SandboxDriverModeResponse
 
-/** Mirrors `SetSandboxDriverModeRequest`. */
-export interface SandboxDriverModeUpdate {
+/** The mode to switch a node's sandboxes to. */
+export type SandboxDriverModeUpdate = SetSandboxDriverModeRequest & {
   mode: SandboxDriverMode
 }
 
@@ -37,9 +41,8 @@ export function sandboxDriverModeQueryKey(nodeId: number) {
 export async function getSandboxDriverMode(
   nodeId: number
 ): Promise<SandboxDriverModeSetting> {
-  const { data } = await client.get<SandboxDriverModeSetting, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/internal/nodes/${nodeId}/sandbox-driver-mode`,
+  const { data } = await getNodeSandboxDriverMode({
+    path: { node_id: nodeId },
     throwOnError: true,
   })
   return data
@@ -49,11 +52,9 @@ export async function setSandboxDriverMode(
   nodeId: number,
   update: SandboxDriverModeUpdate
 ): Promise<SandboxDriverModeSetting> {
-  const { data } = await client.put<SandboxDriverModeSetting, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/internal/nodes/${nodeId}/sandbox-driver-mode`,
+  const { data } = await setNodeSandboxDriverMode({
+    path: { node_id: nodeId },
     body: update,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
@@ -86,29 +87,16 @@ export function sandboxDriverModeSummary(
 // ── Resource policy and system reserve (ADR-055 §5) ────────────────────────
 
 /** Whether the scheduler counts reservations against a node's capacity. */
-export type NodeResourcePolicy = 'best_effort' | 'enforced'
+export type { NodeResourcePolicy }
 
-/** Mirrors `SystemReserved`: what Temps keeps for itself on a node. */
-export interface SystemReserved {
-  cpu_millis: number
-  memory_mb: number
-}
+/** What Temps keeps for itself on a node. */
+export type { SystemReserved }
 
-/** Mirrors `NodeResourcesResponse`. */
-export interface NodeResources {
-  /** `0` is the control plane. */
-  node_id: number
-  resource_policy: NodeResourcePolicy
-  system_reserved: SystemReserved
-  /** Whether `system_reserved` is the default for the node's role. */
-  system_reserved_is_default: boolean
-}
+/** A node's resource policy and system reserve. Node `0` is the control plane. */
+export type NodeResources = NodeResourcesResponse
 
-/** Mirrors `SetNodeResourcesRequest`; at least one field must be set. */
-export interface NodeResourcesUpdate {
-  resource_policy?: NodeResourcePolicy
-  system_reserved?: SystemReserved
-}
+/** At least one field must be set. */
+export type NodeResourcesUpdate = SetNodeResourcesRequest
 
 /** Upper bounds the server validates against (`MAX_RESERVED_*`). */
 export const MAX_RESERVED_CPU_MILLIS = 256_000
@@ -126,9 +114,8 @@ export function nodeResourcesQueryKey(nodeId: number) {
 }
 
 export async function getNodeResources(nodeId: number): Promise<NodeResources> {
-  const { data } = await client.get<NodeResources, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/internal/nodes/${nodeId}/resources`,
+  const { data } = await adminGetNodeResources({
+    path: { node_id: nodeId },
     throwOnError: true,
   })
   return data
@@ -138,11 +125,9 @@ export async function setNodeResources(
   nodeId: number,
   update: NodeResourcesUpdate
 ): Promise<NodeResources> {
-  const { data } = await client.put<NodeResources, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/internal/nodes/${nodeId}/resources`,
+  const { data } = await adminSetNodeResources({
+    path: { node_id: nodeId },
     body: update,
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
@@ -215,27 +200,16 @@ export function resourcePolicySummary(resources: NodeResources): string {
 
 // ── Node state stream (ADR-055 §7) ─────────────────────────────────────────
 
-/** Mirrors `NodeStateStatusResponse`. */
-export interface NodeStateStatus {
-  /** Whether the workload plane (and so the stream) runs in this process. */
-  configured: boolean
-  /** Why not, when `configured` is false. */
-  reason: string | null
-  /** How far the visibility watermark lags behind, in milliseconds. */
-  watermark_lag_ms: number
-  reads: number
-  full_snapshots: number
-  markers_swept: number
-}
+/**
+ * Whether the node state stream runs in this process (`reason` says why
+ * not), and how far its visibility watermark lags behind.
+ */
+export type NodeStateStatus = NodeStateStatusResponse
 
 export const nodeStateStatusQueryKey = ['node-state-status'] as const
 
 export async function getNodeStateStatus(): Promise<NodeStateStatus> {
-  const { data } = await client.get<NodeStateStatus, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `/node-state/status`,
-    throwOnError: true,
-  })
+  const { data } = await nodeStateStatus({ throwOnError: true })
   return data
 }
 

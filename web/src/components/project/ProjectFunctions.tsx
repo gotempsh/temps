@@ -87,7 +87,7 @@ function artifactText(fn: FunctionRecord): string {
   if (fn.artifact_kind === 'oci') return fn.image_reference ?? 'OCI image'
   const digest = fn.wasm_digest ? fn.wasm_digest.slice(0, 19) : 'WASM module'
   const size =
-    fn.wasm_size_bytes !== null
+    fn.wasm_size_bytes != null
       ? ` · ${(fn.wasm_size_bytes / 1024).toFixed(0)} KB`
       : ''
   return `${digest}${size}`

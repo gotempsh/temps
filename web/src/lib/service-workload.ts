@@ -2,77 +2,66 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { client } from '@/api/client/client.gen'
+import {
+  getWorkloadPendingChanges,
+  recreateFromWorkloadSpec,
+} from '@/api/client'
+import type {
+  PendingChanges,
+  RecreateFromWorkloadSpecRequest,
+  RecreateFromWorkloadSpecResponse,
+  RecreateStatus,
+  ServiceWorkloadMode,
+  WorkloadChange,
+  WorkloadSupport,
+} from '@/api/client'
+
+/** How a database's container is built (ADR-055 Phase 4). */
+export type { ServiceWorkloadMode }
+
+/** Whether a database can leave `legacy`, and why not. */
+export type ServiceWorkloadSupport = WorkloadSupport
 
 /**
- * How a database's container is built (ADR-055 Phase 4). Mirrors
- * `ServiceWorkloadMode` (serde `snake_case`).
+ * Mirrors `ServiceWorkloadModeResponse` in `workload_handlers.rs`.
+ *
+ * Hand-written until the client is regenerated from a server that has the
+ * schema under that name: it used to share the name `WorkloadModeResponse`
+ * with the environment workload mode, which replaced it in the OpenAPI
+ * document, so the generated type for this operation has the wrong shape.
  */
-export type ServiceWorkloadMode = 'legacy' | 'shadow' | 'enforce'
-
-/** Mirrors `WorkloadSupport` in `temps-providers/src/workload/mod.rs`. */
-export interface ServiceWorkloadSupport {
-  supported: boolean
-  /** Why the database stays on its engine's own path; omitted when supported. */
-  reason?: string
-}
-
-/** Mirrors `WorkloadModeResponse` in `workload_handlers.rs`. */
 export interface ServiceWorkloadModeStatus {
   service_id: number
   service_name: string
   service_type: string
   mode: ServiceWorkloadMode
   /** Omitted when the database runs on the control plane. */
-  node_id?: number
+  node_id?: number | null
   support: ServiceWorkloadSupport
 }
 
-/** Mirrors `WorkloadChange`. */
-export interface ServiceWorkloadChange {
-  /** `labels`, `restart_policy`, `pids_limit`, `healthcheck`, ... */
-  field: string
-  /** What the running container has. Secrets are shown as `***`. */
-  current: string
-  /** What the container will have once recreated from its spec. */
-  after_recreate: string
-}
+/** One field a recreate from the spec would change. Secrets are `***`. */
+export type ServiceWorkloadChange = WorkloadChange
 
-/** Mirrors `PendingChanges`. */
-export interface ServiceWorkloadPendingChanges {
-  service_id: number
-  service_name: string
-  mode: ServiceWorkloadMode
-  /** Omitted for the control plane. */
-  node_id?: number
-  container_name?: string
-  support: ServiceWorkloadSupport
-  /** Whether the database's container exists to compare against. */
-  container_found: boolean
-  changes: ServiceWorkloadChange[]
-  /** Identifies `changes`: sent back to confirm a recreate. */
-  fingerprint: string
-  computed_at: string
-}
+/** The changes a recreate would apply; `fingerprint` confirms them. */
+export type ServiceWorkloadPendingChanges = PendingChanges
 
-/** Mirrors `WorkloadModeChangeResponse`. */
+/**
+ * Mirrors `WorkloadModeChangeResponse`. Hand-written for the same reason
+ * as [`ServiceWorkloadModeStatus`], which it embeds.
+ */
 export interface ServiceWorkloadModeChange {
   previous_mode: ServiceWorkloadMode
   workload: ServiceWorkloadModeStatus
   /** Omitted in `legacy`, or when the container could not be read. */
-  pending_changes?: ServiceWorkloadPendingChanges
+  pending_changes?: ServiceWorkloadPendingChanges | null
 }
 
-/** Mirrors `RecreateStatus` (serde `snake_case`). */
-export type ServiceRecreateStatus = 'confirmation_required' | 'recreated'
+/** Whether a recreate needs confirmation or happened. */
+export type ServiceRecreateStatus = RecreateStatus
 
-/** Mirrors `RecreateFromWorkloadSpecResponse`. */
-export interface ServiceRecreateResult {
-  status: ServiceRecreateStatus
-  /** The changes to confirm, or the changes that were applied. */
-  pending_changes: ServiceWorkloadPendingChanges
-  /** After a recreate: what still differs (empty when it worked). */
-  remaining_changes?: ServiceWorkloadPendingChanges
-}
+/** The changes to confirm, or those applied and what still differs. */
+export type ServiceRecreateResult = RecreateFromWorkloadSpecResponse
 
 const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
@@ -117,13 +106,8 @@ export async function setServiceWorkloadMode(
 export async function getServiceWorkloadPendingChanges(
   serviceId: number
 ): Promise<ServiceWorkloadPendingChanges> {
-  const { data } = await client.get<
-    ServiceWorkloadPendingChanges,
-    unknown,
-    true
-  >({
-    security: [...BEARER_SECURITY],
-    url: `${serviceWorkloadUrl(serviceId)}/pending-changes`,
+  const { data } = await getWorkloadPendingChanges({
+    path: { id: serviceId },
     throwOnError: true,
   })
   return data
@@ -138,26 +122,24 @@ export async function recreateServiceFromWorkloadSpec(
   serviceId: number,
   confirmedFingerprint: string
 ): Promise<ServiceRecreateResult> {
-  const { data } = await client.post<ServiceRecreateResult, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: `${serviceWorkloadUrl(serviceId)}/recreate`,
+  const { data } = await recreateFromWorkloadSpec({
+    path: { id: serviceId },
     body: recreateBody(confirmedFingerprint),
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data
 }
 
 /** The body that confirms a recreate of exactly the changes shown. */
-export function recreateBody(confirmedFingerprint: string): {
-  confirmed_fingerprint: string
-} {
+export function recreateBody(
+  confirmedFingerprint: string
+): RecreateFromWorkloadSpecRequest & { confirmed_fingerprint: string } {
   return { confirmed_fingerprint: confirmedFingerprint }
 }
 
 /** Where the database runs, for a sentence. */
-export function serviceLocation(nodeId: number | undefined): string {
-  return nodeId === undefined ? 'the control plane' : `node ${nodeId}`
+export function serviceLocation(nodeId: number | null | undefined): string {
+  return nodeId == null ? 'the control plane' : `node ${nodeId}`
 }
 
 /** What the saved mode does right now. */

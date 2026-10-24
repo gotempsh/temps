@@ -549,7 +549,7 @@ export function EnvironmentVolumesCard({
         requireTypedName={
           deleteTarget !== null &&
           !deleteTarget.retain_on_delete &&
-          deleteTarget.node_id !== null
+          deleteTarget.node_id != null
         }
         isPending={remove.isPending}
         onConfirm={() => {
@@ -679,7 +679,7 @@ function VolumeRow({
           {volume.retain_on_delete ? (
             <Badge variant="outline">Data kept on delete</Badge>
           ) : null}
-          {volume.size_mb !== null ? (
+          {volume.size_mb != null ? (
             <Badge variant="outline">{volume.size_mb} MB</Badge>
           ) : null}
         </div>
