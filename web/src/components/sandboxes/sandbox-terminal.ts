@@ -101,15 +101,10 @@ export function computeTerminalSize(
 /** Why the terminal cannot be attached right now, or `null` when it can. */
 export function terminalUnavailableReason(sandbox: {
   status: string
-  node_id: number | null
-  node_name: string
   lifecycle?: string
 }): string | null {
   if (sandbox.status === 'destroyed') {
     return 'This sandbox has been destroyed.'
-  }
-  if (sandbox.node_id != null) {
-    return `Terminals are not available yet for sandboxes on worker nodes. This sandbox runs on ${sandbox.node_name}; create one on the control plane to use a terminal.`
   }
   if (sandbox.status === 'stopped' && sandbox.lifecycle !== 'workspace') {
     return 'This sandbox is stopped. Resume it to open a terminal.'

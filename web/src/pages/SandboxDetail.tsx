@@ -607,22 +607,6 @@ export default function SandboxDetail() {
         </p>
       </CardContent>
     </Card>
-  ) : sandbox.node_id != null ? (
-    // Worker sandboxes get no preview URL yet (ADR-048 phase 2); say so
-    // instead of silently dropping the card.
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-medium">Preview URLs</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <p className="text-xs text-muted-foreground">
-          Preview URLs are not available yet for sandboxes on worker nodes. This
-          sandbox runs on {sandbox.node_name}; create one with{' '}
-          <code className="font-mono">--node control-plane</code> to preview its
-          ports.
-        </p>
-      </CardContent>
-    </Card>
   ) : null
 
   const aside =
@@ -1107,7 +1091,6 @@ export default function SandboxDetail() {
               running={running}
               destroyed={destroyed}
               configured={Boolean(sandbox.preview_url_template)}
-              onWorkerNode={sandbox.node_id != null}
             />
             {Boolean(sandbox.preview_url_template) && (
               <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4">

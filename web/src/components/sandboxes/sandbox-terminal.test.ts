@@ -123,14 +123,11 @@ describe('sizes', () => {
 })
 
 describe('terminalUnavailableReason', () => {
-  const base = { status: 'running', node_id: null, node_name: 'control-plane' }
-  test('is null for a running control-plane sandbox', () => {
+  const base = { status: 'running' }
+  test('is null for a running sandbox, wherever it is placed', () => {
     expect(terminalUnavailableReason(base)).toBeNull()
   })
-  test('explains worker-node, stopped and destroyed sandboxes', () => {
-    expect(
-      terminalUnavailableReason({ ...base, node_id: 3, node_name: 'worker-1' })
-    ).toContain('worker-1')
+  test('explains stopped and destroyed sandboxes', () => {
     expect(terminalUnavailableReason({ ...base, status: 'stopped' })).toContain(
       'Resume'
     )

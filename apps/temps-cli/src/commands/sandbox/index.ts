@@ -1196,8 +1196,8 @@ export function controlPlaneExclusionWarning(
   }
   return (
     'The control plane will no longer take new sandboxes: sandboxes created without --node go to ' +
-    'the allowed worker with the fewest sandboxes. On worker nodes the terminal, the agent runtime ' +
-    '(Fleet), snapshots, preview URLs, disk resize and volumes are not available yet. ' +
+    'the allowed worker with the fewest sandboxes. On worker nodes the agent runtime (Fleet), ' +
+    'snapshots, disk resize and volumes are not available yet. ' +
     'Managed AI application workspaces still always run on the control plane.'
   )
 }
