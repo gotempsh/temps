@@ -34,8 +34,11 @@ import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import {
   CPU_LIMIT_RANGE,
   MEMORY_LIMIT_RANGE,
+  SANDBOX_API_LIMIT_FIELDS,
   WORKSPACE_FILE_LIMIT_FIELDS,
+  validateSandboxApiLimits,
   validateSandboxLimits,
+  type SandboxApiLimitsDraft,
   type WorkspaceFileLimitsDraft,
 } from './sandbox-limits'
 import { SandboxNodesCard } from '@/components/sandboxes/SandboxNodesCard'
@@ -116,6 +119,13 @@ const DEFAULT_WORKSPACE_FILE_LIMITS: WorkspaceFileLimitsDraft = {
   max_download_size_mb: 32,
 }
 
+const NO_API_LIMITS: SandboxApiLimitsDraft = {
+  max_cpu_limit: undefined,
+  max_memory_limit_mb: undefined,
+  max_pids_limit: undefined,
+  max_sandboxes_per_user: undefined,
+}
+
 function getResourcePresetLabel(cpu: number, memory: number): string {
   const match = RESOURCE_PRESETS.find(
     (p) => p.cpu === cpu && p.memory === memory
@@ -139,6 +149,8 @@ export function AgentSandboxSandboxPage() {
   const [sandboxBackend, setSandboxBackend] = useState('docker')
   const [workspaceFileLimits, setWorkspaceFileLimits] =
     useState<WorkspaceFileLimitsDraft>(DEFAULT_WORKSPACE_FILE_LIMITS)
+  const [apiLimits, setApiLimits] =
+    useState<SandboxApiLimitsDraft>(NO_API_LIMITS)
   const [isDirty, setIsDirty] = useState(false)
 
   const [rebuilding, setRebuilding] = useState(false)
@@ -171,6 +183,12 @@ export function AgentSandboxSandboxPage() {
       setMemoryLimitMb(s.memory_limit_mb)
       setResourcePreset(getResourcePresetLabel(s.cpu_limit, s.memory_limit_mb))
       setSandboxBackend(s.sandbox_backend || 'docker')
+      setApiLimits({
+        max_cpu_limit: s.max_cpu_limit ?? undefined,
+        max_memory_limit_mb: s.max_memory_limit_mb ?? undefined,
+        max_pids_limit: s.max_pids_limit ?? undefined,
+        max_sandboxes_per_user: s.max_sandboxes_per_user ?? undefined,
+      })
     }
     if (settings?.ai_config) {
       setGlobalConfigRepo(settings.ai_config.config_repo || '')
@@ -257,6 +275,11 @@ export function AgentSandboxSandboxPage() {
       toast.error(limits.message)
       return
     }
+    const apiLimitValues = validateSandboxApiLimits(apiLimits)
+    if (!apiLimitValues.ok) {
+      toast.error(apiLimitValues.message)
+      return
+    }
     try {
       // Per-provider credentials live on /agent-sandbox/providers/:id —
       // this mutation only touches platform-wide sandbox knobs. We pass
@@ -279,6 +302,7 @@ export function AgentSandboxSandboxPage() {
           auth_type: settings?.agent_sandbox?.auth_type ?? '',
           providers: settings?.agent_sandbox?.providers ?? {},
           sandbox_backend: sandboxBackend,
+          ...apiLimitValues.limits,
         },
         ai_config: {
           ...(settings?.ai_config ?? {}),
@@ -466,6 +490,47 @@ export function AgentSandboxSandboxPage() {
               A file must fit both the per-file and upload-batch limit. Raster
               image previews support PNG, JPEG, GIF, and WebP; SVG remains a
               downloadable file and is never rendered inline.
+            </p>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Sandbox API limits</CardTitle>
+            <CardDescription>
+              Ceilings for sandboxes created through the API or SDK, whatever
+              the caller asks for. The CPU and memory above are only the
+              defaults for requests that leave them out. Leave a box empty for
+              the built-in maximum. For example, with 4096 MB as the memory
+              maximum, a request for 8192 MB is refused with a 400.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            {SANDBOX_API_LIMIT_FIELDS.map((field) => (
+              <div className="space-y-2" key={field.key}>
+                <Label htmlFor={`api-limit-${field.key}`}>{field.label}</Label>
+                <NumberInput
+                  id={`api-limit-${field.key}`}
+                  max={field.max}
+                  min={field.min}
+                  inputMode={field.integer ? 'numeric' : 'decimal'}
+                  placeholder={field.empty}
+                  onValueChange={(value) => {
+                    setApiLimits((current) => ({
+                      ...current,
+                      [field.key]: value,
+                    }))
+                    setIsDirty(true)
+                  }}
+                  value={apiLimits[field.key]}
+                />
+              </div>
+            ))}
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              On the control plane a sandbox also cannot be given more memory
+              than the host has. Sandboxes already created are not changed, and
+              the per-user cap counts a user&apos;s sandboxes that are not
+              destroyed; AI application workspaces and agent runs are exempt.
             </p>
           </CardContent>
         </Card>

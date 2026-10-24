@@ -673,6 +673,33 @@ export type AgentSandboxSettings = {
      */
     enabled?: boolean;
     /**
+     * Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.
+     * `cpu_limit` above only sets the default for requests that omit the
+     * field; this is the ceiling. `None` = the built-in ceiling (16 cores).
+     * A value above the built-in ceiling has no effect.
+     */
+    max_cpu_limit?: number | null;
+    /**
+     * Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.
+     * `None` = the built-in ceiling (32768 MB). On the control plane the
+     * host's physical memory is an additional ceiling.
+     */
+    max_memory_limit_mb?: number | null;
+    /**
+     * Highest `pids_limit` a `POST /sandboxes` request may ask for.
+     * `None` = the built-in ceiling (4096).
+     */
+    max_pids_limit?: number | null;
+    /**
+     * Most sandboxes (not destroyed) one user may have created through
+     * `POST /sandboxes` at a time; a create over the cap is refused.
+     * `None` = unlimited. AI application workspaces, agent runs and the
+     * sandboxes the platform creates for AI chat or autofix do not count
+     * and are not refused. Sandboxes created before this setting existed
+     * are not counted either.
+     */
+    max_sandboxes_per_user?: number | null;
+    /**
      * Memory limit in MB for sandbox containers
      */
     memory_limit_mb?: number;
@@ -715,6 +742,22 @@ export type AgentSandboxSettingsMasked = {
     custom_image: string;
     default_provider: string;
     enabled: boolean;
+    /**
+     * Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.
+     */
+    max_cpu_limit?: number | null;
+    /**
+     * Operator ceiling for `memory_limit_mb`; `null` = built-in.
+     */
+    max_memory_limit_mb?: number | null;
+    /**
+     * Operator ceiling for `pids_limit`; `null` = built-in.
+     */
+    max_pids_limit?: number | null;
+    /**
+     * Most live sandboxes per user; `null` = unlimited.
+     */
+    max_sandboxes_per_user?: number | null;
     memory_limit_mb: number;
     network_mode: string;
     providers: {
@@ -8000,10 +8043,14 @@ export type CreateSandboxBody = {
      * isolation.
      */
     backend?: string | null;
+    /**
+     * CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
+     * Omit for the operator's default.
+     */
     cpu_limit?: number | null;
     /**
-     * Root disk size in MB (Firecracker only; Docker ignores it). Omit for
-     * the platform default (1 GiB).
+     * Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
+     * it). Omit for the platform default (1 GiB).
      */
     disk_size_mb?: number | null;
     /**
@@ -8038,6 +8085,10 @@ export type CreateSandboxBody = {
      * to work on this repo"; leave it unset for throwaway sandboxes.
      */
     lifecycle?: string | null;
+    /**
+     * Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,
+     * and never more than the host has). Omit for the operator's default.
+     */
     memory_limit_mb?: number | null;
     name?: string | null;
     networkPolicy?: unknown;
@@ -8050,6 +8101,11 @@ export type CreateSandboxBody = {
      * with 422 — it never silently falls back to another node.
      */
     node?: string | null;
+    /**
+     * Max processes, `[1, 4096]` (lower if an administrator set a maximum);
+     * `0`/negative (unlimited) is rejected. Omit for the platform default
+     * (512).
+     */
     pids_limit?: number | null;
     /**
      * Ports the sandbox will listen on. Each port becomes a `routes[]`
@@ -80741,7 +80797,7 @@ export type CreateSandboxData = {
 
 export type CreateSandboxErrors = {
     /**
-     * Validation error
+     * Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum
      */
     400: unknown;
     /**
@@ -80749,7 +80805,7 @@ export type CreateSandboxErrors = {
      */
     401: unknown;
     /**
-     * Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible
+     * Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows
      */
     422: unknown;
     /**

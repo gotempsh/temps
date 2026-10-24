@@ -2407,6 +2407,18 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         matches!(backend, super::SandboxBackend::Firecracker)
     }
 
+    fn default_resource_limits(
+        &self,
+        _backend: Option<super::SandboxBackend>,
+    ) -> super::DefaultResourceLimits {
+        super::DefaultResourceLimits {
+            cpu_limit: Some(f64::from(self.config.default_vcpus)),
+            memory_limit_mb: Some(self.config.default_memory_mib),
+            pids_limit: None,
+            cpu_whole_cores: true,
+        }
+    }
+
     fn name(&self) -> &str {
         "firecracker"
     }

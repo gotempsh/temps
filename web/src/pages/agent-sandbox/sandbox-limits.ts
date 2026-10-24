@@ -98,3 +98,81 @@ export function validateSandboxLimits(
     workspaceFileLimits,
   }
 }
+
+/**
+ * Operator ceilings for sandboxes created through the API: setting key, label,
+ * allowed range, whether fractions are allowed and what an empty box means.
+ * The ranges are the server's (`validate_sandbox_limits`) and its built-in
+ * ceilings; a value above a built-in ceiling would have no effect.
+ */
+export const SANDBOX_API_LIMIT_FIELDS = [
+  {
+    key: 'max_cpu_limit',
+    label: 'Max CPU cores per sandbox',
+    min: 0.01,
+    max: 16,
+    integer: false,
+    empty: 'Built-in maximum (16)',
+  },
+  {
+    key: 'max_memory_limit_mb',
+    label: 'Max memory per sandbox (MB)',
+    min: 6,
+    max: 32768,
+    integer: true,
+    empty: 'Built-in maximum (32768)',
+  },
+  {
+    key: 'max_pids_limit',
+    label: 'Max processes per sandbox',
+    min: 1,
+    max: 4096,
+    integer: true,
+    empty: 'Built-in maximum (4096)',
+  },
+  {
+    key: 'max_sandboxes_per_user',
+    label: 'Max sandboxes per user',
+    min: 1,
+    max: 100000,
+    integer: true,
+    empty: 'No cap',
+  },
+] as const
+
+export type SandboxApiLimitKey =
+  (typeof SANDBOX_API_LIMIT_FIELDS)[number]['key']
+
+/** What the form holds while editing: an empty box means "no operator limit". */
+export type SandboxApiLimitsDraft = Record<
+  SandboxApiLimitKey,
+  number | undefined
+>
+
+/** What is saved: `null` clears the limit. */
+export type SandboxApiLimits = Record<SandboxApiLimitKey, number | null>
+
+export type SandboxApiLimitsResult =
+  { ok: true; limits: SandboxApiLimits } | { ok: false; message: string }
+
+/** Unlike the resource boxes above, an empty box here is valid. */
+export function validateSandboxApiLimits(
+  draft: SandboxApiLimitsDraft
+): SandboxApiLimitsResult {
+  const limits = {} as SandboxApiLimits
+  for (const field of SANDBOX_API_LIMIT_FIELDS) {
+    const value = draft[field.key]
+    if (value !== undefined) {
+      const error = rangeError(
+        field.label,
+        value,
+        field.min,
+        field.max,
+        field.integer
+      )
+      if (error) return { ok: false, message: error }
+    }
+    limits[field.key] = value ?? null
+  }
+  return { ok: true, limits }
+}

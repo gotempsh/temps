@@ -84,6 +84,12 @@ export interface AgentSandboxSettings {
   memory_limit_mb: number
   network_mode: string
   sandbox_backend?: string
+  /// Operator ceilings for `POST /sandboxes`; `null` = the built-in ceiling
+  /// (`max_sandboxes_per_user`: no cap).
+  max_cpu_limit?: number | null
+  max_memory_limit_mb?: number | null
+  max_pids_limit?: number | null
+  max_sandboxes_per_user?: number | null
 }
 
 export interface PreviewGatewaySettings {

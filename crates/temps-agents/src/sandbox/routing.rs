@@ -357,6 +357,15 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.backends.contains_key(&backend)
     }
 
+    fn default_resource_limits(
+        &self,
+        backend: Option<SandboxBackend>,
+    ) -> super::DefaultResourceLimits {
+        self.get(backend.unwrap_or(self.default))
+            .map(|provider| provider.default_resource_limits(backend))
+            .unwrap_or_default()
+    }
+
     fn name(&self) -> &str {
         "routing"
     }

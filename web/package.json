@@ -111,7 +111,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@happy-dom/global-registrator": "^21.0.3",
+    "@happy-dom/global-registrator": "^21.0.4",
     "@hey-api/client-fetch": "^0.13.1",
     "@hey-api/openapi-ts": "0.99.0",
     "@playwright/test": "^1.64.1",
@@ -136,7 +136,7 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.7",
     "eslint-plugin-unused-imports": "^4.4.1",
-    "happy-dom": "^21.0.3",
+    "happy-dom": "^21.0.4",
     "prettier": "^3.9.10",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.71.2"
@@ -146,7 +146,7 @@
     "browserslist": "^4.28.8",
     "d3-color": "^3.1.0",
     "defu": "^6.1.5",
-    "dompurify": "^3.4.16",
+    "dompurify": "^3.4.17",
     "flatted": "^3.4.2",
     "handlebars": "^4.7.9",
     "js-yaml": "^5.4.3",

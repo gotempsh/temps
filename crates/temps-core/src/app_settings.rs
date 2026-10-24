@@ -1198,6 +1198,33 @@ pub struct AgentSandboxSettings {
     /// update preserves the stored value.
     #[serde(default)]
     pub allowed_node_ids: Option<Vec<i32>>,
+    /// Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.
+    /// `cpu_limit` above only sets the default for requests that omit the
+    /// field; this is the ceiling. `None` = the built-in ceiling (16 cores).
+    /// A value above the built-in ceiling has no effect.
+    #[serde(default)]
+    #[schema(example = 4.0, minimum = 0.01)]
+    pub max_cpu_limit: Option<f64>,
+    /// Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.
+    /// `None` = the built-in ceiling (32768 MB). On the control plane the
+    /// host's physical memory is an additional ceiling.
+    #[serde(default)]
+    #[schema(example = 8192, minimum = 6)]
+    pub max_memory_limit_mb: Option<u64>,
+    /// Highest `pids_limit` a `POST /sandboxes` request may ask for.
+    /// `None` = the built-in ceiling (4096).
+    #[serde(default)]
+    #[schema(example = 1024, minimum = 1)]
+    pub max_pids_limit: Option<i64>,
+    /// Most sandboxes (not destroyed) one user may have created through
+    /// `POST /sandboxes` at a time; a create over the cap is refused.
+    /// `None` = unlimited. AI application workspaces, agent runs and the
+    /// sandboxes the platform creates for AI chat or autofix do not count
+    /// and are not refused. Sandboxes created before this setting existed
+    /// are not counted either.
+    #[serde(default)]
+    #[schema(example = 10, minimum = 1)]
+    pub max_sandboxes_per_user: Option<u32>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -1247,6 +1274,10 @@ impl Default for AgentSandboxSettings {
             network_mode: "full".to_string(),
             sandbox_backend: None,
             allowed_node_ids: None,
+            max_cpu_limit: None,
+            max_memory_limit_mb: None,
+            max_pids_limit: None,
+            max_sandboxes_per_user: None,
         }
     }
 }

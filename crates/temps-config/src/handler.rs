@@ -937,6 +937,18 @@ pub struct AgentSandboxSettingsMasked {
     pub memory_limit_mb: u64,
     pub network_mode: String,
     pub sandbox_backend: String,
+    /// Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.
+    #[schema(minimum = 0.01)]
+    pub max_cpu_limit: Option<f64>,
+    /// Operator ceiling for `memory_limit_mb`; `null` = built-in.
+    #[schema(minimum = 6)]
+    pub max_memory_limit_mb: Option<u64>,
+    /// Operator ceiling for `pids_limit`; `null` = built-in.
+    #[schema(minimum = 1)]
+    pub max_pids_limit: Option<i64>,
+    /// Most live sandboxes per user; `null` = unlimited.
+    #[schema(minimum = 1)]
+    pub max_sandboxes_per_user: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1101,6 +1113,10 @@ impl From<AppSettings> for AppSettingsResponse {
                     .agent_sandbox
                     .sandbox_backend
                     .unwrap_or_else(|| "docker".to_string()),
+                max_cpu_limit: settings.agent_sandbox.max_cpu_limit,
+                max_memory_limit_mb: settings.agent_sandbox.max_memory_limit_mb,
+                max_pids_limit: settings.agent_sandbox.max_pids_limit,
+                max_sandboxes_per_user: settings.agent_sandbox.max_sandboxes_per_user,
             },
             ai_config: settings.ai_config,
             preview_gateway: PreviewGatewaySettingsMasked {
@@ -2967,6 +2983,48 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
     Ok(())
 }
 
+/// Operator ceilings for sandbox create requests. A ceiling below what the
+/// runtime can enforce (a CPU quota that truncates to none, memory under
+/// Docker's 6 MB floor) or a per-user cap of zero would make every create
+/// fail, so the save is refused instead of storing a setting that only
+/// breaks the next request.
+fn validate_sandbox_limits(sandbox: &temps_core::AgentSandboxSettings) -> Result<(), Problem> {
+    let reject = |detail: String| {
+        Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Sandbox Limit")
+            .detail(detail)
+            .build())
+    };
+    if let Some(cpu) = sandbox.max_cpu_limit {
+        if !cpu.is_finite() || cpu < 0.01 {
+            return reject(format!(
+                "agent_sandbox.max_cpu_limit must be at least 0.01 cores, or null for the built-in ceiling (got {cpu})"
+            ));
+        }
+    }
+    if let Some(memory) = sandbox.max_memory_limit_mb {
+        if memory < 6 {
+            return reject(format!(
+                "agent_sandbox.max_memory_limit_mb must be at least 6 MB, or null for the built-in ceiling (got {memory})"
+            ));
+        }
+    }
+    if let Some(pids) = sandbox.max_pids_limit {
+        if pids < 1 {
+            return reject(format!(
+                "agent_sandbox.max_pids_limit must be at least 1, or null for the built-in ceiling (got {pids})"
+            ));
+        }
+    }
+    if sandbox.max_sandboxes_per_user == Some(0) {
+        return reject(
+            "agent_sandbox.max_sandboxes_per_user must be at least 1, or null for no cap"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Host-default sandbox backend accepted in platform settings. Selecting a
 /// backend this host can't run is allowed (the settings page shows its
 /// onboarding state); the agents plugin only routes to registered backends.
@@ -3524,6 +3582,7 @@ async fn update_settings(
     }
 
     validate_sandbox_backend(settings.agent_sandbox.sandbox_backend.as_deref())?;
+    validate_sandbox_limits(&settings.agent_sandbox)?;
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
@@ -4651,6 +4710,71 @@ mod tests {
         };
         let response = serde_json::to_value(AppSettingsResponse::from(settings)).unwrap();
         assert_eq!(response["public_ingress_url"], "https://hooks.example.com");
+    }
+
+    #[test]
+    fn sandbox_limit_settings_reject_values_that_would_break_every_create() {
+        let ok = AgentSandboxSettings::default();
+        assert!(validate_sandbox_limits(&ok).is_ok());
+        let ok = AgentSandboxSettings {
+            max_cpu_limit: Some(2.0),
+            max_memory_limit_mb: Some(4096),
+            max_pids_limit: Some(256),
+            max_sandboxes_per_user: Some(5),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_limits(&ok).is_ok());
+
+        let bad = [
+            (
+                "max_cpu_limit",
+                AgentSandboxSettings {
+                    max_cpu_limit: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_cpu_limit",
+                AgentSandboxSettings {
+                    max_cpu_limit: Some(f64::NAN),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_memory_limit_mb",
+                AgentSandboxSettings {
+                    max_memory_limit_mb: Some(5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_pids_limit",
+                AgentSandboxSettings {
+                    max_pids_limit: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_sandboxes_per_user",
+                AgentSandboxSettings {
+                    max_sandboxes_per_user: Some(0),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, settings) in bad {
+            let problem = validate_sandbox_limits(&settings).expect_err(field);
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{field}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            assert!(
+                detail.contains(field),
+                "{field}: detail must name the setting, got {detail:?}"
+            );
+        }
     }
 
     #[test]
@@ -6110,6 +6234,10 @@ mod tests {
                 network_mode: "restricted".into(),
                 sandbox_backend: None,
                 allowed_node_ids: None,
+                max_cpu_limit: None,
+                max_memory_limit_mb: None,
+                max_pids_limit: None,
+                max_sandboxes_per_user: None,
             },
             ..Default::default()
         };

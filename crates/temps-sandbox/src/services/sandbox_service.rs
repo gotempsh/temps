@@ -20,8 +20,9 @@ use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
 use sea_orm::{
-    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection,
-    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, TransactionTrait,
+    sea_query::Expr, ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait,
+    DatabaseBackend, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Statement, TransactionTrait,
 };
 
 use temps_agents::error::AgentError;
@@ -36,6 +37,7 @@ use temps_entities::{
 use temps_git::GitProviderManager;
 
 use crate::error::{from_agent_error, SandboxError};
+use crate::services::create_policy;
 use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
 use crate::services::placement;
@@ -202,6 +204,12 @@ pub struct CreateSandboxRequest {
     /// automatic placement. Resolved against the operator allow-list by
     /// [`crate::services::placement`].
     pub node: Option<String>,
+    /// Check the request against the operator's sandbox limits
+    /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
+    /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
+    /// handler. Internal callers (application workspaces, agent runs) leave
+    /// it `false`: they choose their own limits and are not the abuse case.
+    pub enforce_operator_limits: bool,
 }
 
 /// First-class sandbox identity for a durable AI application workspace.
@@ -329,6 +337,13 @@ pub struct ApplicationWorkspaceUsage {
 }
 
 const APPLICATION_WORKSPACE_NAME_PREFIX: &str = "ai-application:";
+
+/// `metadata.source` of a sandbox created through `POST /sandboxes`.
+const API_SANDBOX_SOURCE: &str = "api";
+
+/// First key of the two-key Postgres advisory lock serializing the per-user
+/// sandbox cap (the second key is the user id).
+const USER_SANDBOX_CAP_LOCK_NAMESPACE: i32 = 0x7365_6263;
 const SOURCE_IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_IMPORT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(130);
 const SOURCE_IMPORT_MAX_FILES: usize = 5_000;
@@ -1809,6 +1824,27 @@ impl SandboxService {
         Ok(workers)
     }
 
+    /// Sandboxes `user_id` created through the API that are not destroyed.
+    /// Agent runs, managed application workspaces and the sandboxes the
+    /// platform creates for AI chat or autofix are not marked as API-created
+    /// and belong to the platform, not to the user's quota. Sandboxes created
+    /// before the mark existed are not counted.
+    async fn live_standalone_sandboxes<C: ConnectionTrait>(
+        conn: &C,
+        user_id: i32,
+    ) -> Result<u64, SandboxError> {
+        sandboxes::Entity::find()
+            .filter(sandboxes::Column::UserId.eq(user_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .filter(Expr::cust_with_values(
+                "\"sandboxes\".\"metadata\"->>'source' = $1",
+                [API_SANDBOX_SOURCE],
+            ))
+            .count(conn)
+            .await
+            .map_err(SandboxError::from)
+    }
+
     /// Node a new sandbox runs on: `None` = control plane.
     async fn place_sandbox(&self, req: &CreateSandboxRequest) -> Result<Option<i32>, SandboxError> {
         let requested = req.node.as_deref().map(placement::RequestedNode::parse);
@@ -2068,7 +2104,7 @@ impl SandboxService {
     pub async fn create_sandbox(
         &self,
         user_id: i32,
-        req: CreateSandboxRequest,
+        mut req: CreateSandboxRequest,
     ) -> Result<sandboxes::Model, SandboxError> {
         let lifecycle = match req.lifecycle.as_deref() {
             None => SandboxLifecycle::default(),
@@ -2148,6 +2184,48 @@ impl SandboxService {
         // created. Explicit requests are validated against the operator
         // allow-list and never fall back to another node.
         let node_id = self.place_sandbox(&req).await?;
+
+        // Operator limits (HTTP create path only). The settings are read once
+        // and fail closed: an unreadable section must not turn into "no
+        // limits". Host memory is only known for the control plane.
+        let operator_limits = if req.enforce_operator_limits {
+            let settings = self
+                .platform_config
+                .get_agent_sandbox_settings()
+                .await
+                .map_err(|source| SandboxError::LimitSettings { user_id, source })?;
+            let host_memory_mb = if node_id.is_none() {
+                create_policy::control_plane_memory_mb()
+            } else {
+                None
+            };
+            // On the control plane the provider says what it defaults to; a
+            // worker applies the control plane's configured sandbox
+            // defaults (Docker only, ADR-048) and Docker's PID default.
+            let defaults = if node_id.is_none() {
+                self.registry
+                    .provider_arc()
+                    .default_resource_limits(backend)
+            } else {
+                temps_agents::sandbox::DefaultResourceLimits {
+                    cpu_limit: Some(settings.cpu_limit),
+                    memory_limit_mb: Some(settings.memory_limit_mb),
+                    pids_limit: Some(temps_agents::sandbox::docker::DEFAULT_PIDS_LIMIT),
+                    cpu_whole_cores: false,
+                }
+            };
+            // The host-memory check sees only what the caller sent; the
+            // clamp then fills in omitted limits, and the maximums are
+            // checked against the result.
+            create_policy::check_host_memory(&req, host_memory_mb)?;
+            create_policy::clamp_omitted_limits(&mut req, &settings, defaults);
+            create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
+            create_policy::check_requested_limits(&req, &settings, defaults)?;
+            Some(settings)
+        } else {
+            None
+        };
+
         if node_id.is_some() {
             if req.from_snapshot_artifact.is_some() {
                 return Err(SandboxError::Validation {
@@ -2212,6 +2290,12 @@ impl SandboxService {
             if let Some(disk) = req.disk_size_mb {
                 meta.insert("disk_size_mb".into(), serde_json::json!(disk));
             }
+            // Marks the sandboxes a caller asked for through the API, the
+            // only ones the per-user cap counts. Sandboxes the platform
+            // creates on a user's behalf (AI chat, autofix) carry no mark.
+            if req.enforce_operator_limits {
+                meta.insert("source".into(), serde_json::json!(API_SANDBOX_SOURCE));
+            }
             if let Some(application_id) = managed_application_id {
                 meta.insert(
                     "managed_application_id".into(),
@@ -2225,6 +2309,29 @@ impl SandboxService {
                 }
             }
             (!meta.is_empty()).then_some(serde_json::Value::Object(meta))
+        };
+        // Per-user cap: count and insert in one transaction holding a
+        // per-user advisory lock, so a burst of simultaneous creates cannot
+        // overshoot it, on this control plane or on another replica sharing
+        // the database. The lock is released when the transaction ends.
+        let cap_txn = match operator_limits
+            .as_ref()
+            .filter(|settings| settings.max_sandboxes_per_user.is_some())
+        {
+            Some(settings) => {
+                let txn = self.db.begin().await?;
+                txn.execute(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT pg_advisory_xact_lock($1, $2)",
+                    [USER_SANDBOX_CAP_LOCK_NAMESPACE.into(), user_id.into()],
+                ))
+                .await?;
+                let live = Self::live_standalone_sandboxes(&txn, user_id).await?;
+                // Returning here drops the transaction, which rolls it back.
+                create_policy::check_user_sandbox_cap(user_id, live, settings)?;
+                Some(txn)
+            }
+            None => None,
         };
         let active = sandboxes::ActiveModel {
             public_id: Set(public_id_value.clone()),
@@ -2254,7 +2361,14 @@ impl SandboxService {
             node_id: Set(node_id),
             ..Default::default()
         };
-        let mut row = active.insert(self.db.as_ref()).await.map_err(|e| {
+        let inserted = match cap_txn {
+            Some(txn) => match active.insert(&txn).await {
+                Ok(row) => txn.commit().await.map(|()| row),
+                Err(e) => Err(e),
+            },
+            None => active.insert(self.db.as_ref()).await,
+        };
+        let mut row = inserted.map_err(|e| {
             // The chosen node was removed between placement and insert.
             if node_id.is_some()
                 && matches!(
@@ -9527,6 +9641,39 @@ mod storage_cleanup_tests {
         );
         drop(held);
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The per-user cap counts what the user created through the API and
+    /// nothing else: not destroyed rows, not agent-run sandboxes, not managed
+    /// application workspaces.
+    #[tokio::test]
+    async fn the_user_cap_counts_only_live_standalone_sandboxes() {
+        let data_root = unique_data_root("cap-count");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::from(4i64),
+            )])]])
+            .into_connection();
+        let db = Arc::new(db);
+        let (service, registry) = build_service_shared(db.clone(), FakeProvider::new(), data_root);
+
+        let live = SandboxService::live_standalone_sandboxes(service.db.as_ref(), 7)
+            .await
+            .expect("count query");
+
+        assert_eq!(live, 4);
+        drop((service, registry));
+        let log = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("service still holds the connection"))
+            .into_transaction_log();
+        let sql = format!("{log:?}").replace("\\\"", "\"");
+        assert!(sql.contains("\"sandboxes\".\"user_id\" = $1"), "{sql}");
+        assert!(sql.contains("\"sandboxes\".\"status\" <> $2"), "{sql}");
+        assert!(
+            sql.contains("\"sandboxes\".\"metadata\"->>'source' = $3"),
+            "{sql}"
+        );
     }
 
     /// A malformed allow-list must stop placement, not read as "every node

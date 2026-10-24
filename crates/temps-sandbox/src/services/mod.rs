@@ -5,6 +5,7 @@
 //! here; HTTP handlers are thin wrappers that call into these services.
 
 pub mod agent_run_bridge;
+pub mod create_policy;
 pub mod exec;
 pub mod expiration_sweeper;
 pub mod fs;

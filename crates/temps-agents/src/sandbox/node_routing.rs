@@ -25,9 +25,9 @@ use tokio::sync::RwLock;
 
 use super::remote::{RemoteSandboxDefaults, RemoteSandboxProvider};
 use super::{
-    KillSignal, OnStreamEventCallback, PtyAttachment, RootfsGcReport, RootfsReport,
-    RuntimeCompatibility, SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
-    SandboxProvider, SnapshotArtifact,
+    DefaultResourceLimits, KillSignal, OnStreamEventCallback, PtyAttachment, RootfsGcReport,
+    RootfsReport, RuntimeCompatibility, SandboxBackend, SandboxCreateConfig, SandboxExecResult,
+    SandboxHandle, SandboxProvider, SnapshotArtifact,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -367,6 +367,10 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
 
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         self.local.supports_backend(backend)
+    }
+
+    fn default_resource_limits(&self, backend: Option<SandboxBackend>) -> DefaultResourceLimits {
+        self.local.default_resource_limits(backend)
     }
 
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
