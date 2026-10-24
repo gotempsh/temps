@@ -11,32 +11,21 @@ import {
 import { Network, Plus, Search, Trash2, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-import { CreateRuleDialog } from '@/components/network-policy/CreateRuleDialog'
-import { SubjectPolicyPanel } from '@/components/network-policy/SubjectPolicyPanel'
-import { PageHeader } from '@/components/layout/PageContainer'
-import { Badge } from '@/components/ui/badge'
-import { Button } from '@/components/ui/button'
-import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
-import { EmptyState } from '@/components/ui/empty-state'
-import { Input } from '@/components/ui/input'
-import { ReadFailure } from '@/components/ui/read-failure'
-import { ResponsivePagination } from '@/components/ui/responsive-pagination'
+import { Button, Ledger, PageState, type LedgerColumn } from '@temps-sdk/ds'
 import {
+  Badge,
+  Input,
   Select,
   SelectContent,
   SelectItem,
   SelectTrigger,
   SelectValue,
-} from '@/components/ui/select'
-import { Skeleton } from '@/components/ui/skeleton'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+  Skeleton,
+} from '@temps-sdk/ui'
+import { CreateRuleDialog } from '@/components/network-policy/CreateRuleDialog'
+import { SubjectPolicyPanel } from '@/components/network-policy/SubjectPolicyPanel'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -88,8 +77,13 @@ function NodeModesSummary() {
     meta: { errorTitle: 'Could not load the network policy modes' },
   })
   return (
-    <div className="space-y-2 rounded-lg border bg-card p-4 text-card-foreground">
-      <h2 className="text-base font-semibold">Where it applies</h2>
+    <section
+      aria-labelledby="np-where-it-applies"
+      className="space-y-2 rounded-lg border bg-card p-4 text-card-foreground"
+    >
+      <h2 id="np-where-it-applies" className="text-base font-semibold">
+        Where it applies
+      </h2>
       <p className="text-sm text-muted-foreground">
         Rules take effect only on nodes in Enforce mode. Shadow computes and
         logs the policy without applying it. Only the control plane can run
@@ -134,107 +128,112 @@ function NodeModesSummary() {
           ))}
         </ul>
       )}
-    </div>
+    </section>
   )
 }
 
-function RuleRows({
-  rules,
-  canEdit,
-  onDelete,
-}: {
-  rules: NetworkPolicyRule[]
-  canEdit: boolean
+/** The rule table's columns; the last one holds the delete control. */
+function ruleColumns(
+  canEdit: boolean,
   onDelete: (rule: NetworkPolicyRule) => void
-}) {
-  return (
-    <>
-      {rules.map((rule) => {
-        const blocked = ruleDeleteBlockedReason(rule)
+): LedgerColumn<NetworkPolicyRule>[] {
+  return [
+    {
+      key: 'rule',
+      header: 'Rule',
+      className: 'font-mono text-xs',
+      render: (rule) => `#${rule.id}`,
+    },
+    {
+      key: 'workload',
+      header: 'Workload',
+      render: (rule) => (
+        <>
+          <div className="font-medium">
+            {describeSubject(rule.subject_kind, rule.subject_id)}
+          </div>
+          {rule.description ? (
+            <div className="max-w-[240px] truncate text-xs text-muted-foreground">
+              {rule.description}
+            </div>
+          ) : null}
+        </>
+      ),
+    },
+    {
+      key: 'action',
+      header: 'Action',
+      render: (rule) => (
+        <>
+          <Badge
+            variant={
+              rule.action === 'allow' ? 'success-subtle' : 'destructive-subtle'
+            }
+          >
+            {rule.action}
+          </Badge>{' '}
+          <span className="text-sm text-muted-foreground">
+            {rule.direction}
+          </span>
+        </>
+      ),
+    },
+    {
+      key: 'peer',
+      header: 'Peer',
+      className: 'min-w-0',
+      render: (rule) => {
         const notEnforced = ruleNotEnforcedReason(rule)
         return (
-          <TableRow key={rule.id}>
-            <TableCell className="font-mono text-xs">#{rule.id}</TableCell>
-            <TableCell>
-              <div className="font-medium">
-                {describeSubject(rule.subject_kind, rule.subject_id)}
+          <>
+            <span className="text-xs text-muted-foreground">
+              {rule.peer_kind}
+            </span>{' '}
+            <span className="break-all font-mono text-xs">{rule.peer_ref}</span>
+            {notEnforced ? (
+              <div className="mt-1 text-xs text-warning-strong">
+                {notEnforced}
               </div>
-              {rule.description ? (
-                <div className="max-w-[240px] truncate text-xs text-muted-foreground">
-                  {rule.description}
-                </div>
-              ) : null}
-            </TableCell>
-            <TableCell>
-              <Badge
-                variant={
-                  rule.action === 'allow'
-                    ? 'success-subtle'
-                    : 'destructive-subtle'
-                }
-              >
-                {rule.action}
-              </Badge>{' '}
-              <span className="text-sm text-muted-foreground">
-                {rule.direction}
-              </span>
-            </TableCell>
-            <TableCell className="min-w-0">
-              <span className="text-xs text-muted-foreground">
-                {rule.peer_kind}
-              </span>{' '}
-              <span className="break-all font-mono text-xs">
-                {rule.peer_ref}
-              </span>
-              {notEnforced ? (
-                <div className="mt-1 text-xs text-warning-strong">
-                  {notEnforced}
-                </div>
-              ) : null}
-            </TableCell>
-            <TableCell className="whitespace-nowrap text-sm">
-              {describePorts(rule)}
-            </TableCell>
-            <TableCell>
-              <Badge variant="outline">{rule.origin}</Badge>
-            </TableCell>
-            <TableCell className="text-right">
-              {!canEdit ? null : blocked ? (
-                <span className="text-xs text-muted-foreground" title={blocked}>
-                  Managed by a link
-                </span>
-              ) : (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  aria-label={`Delete rule #${rule.id}`}
-                  onClick={() => onDelete(rule)}
-                >
-                  <Trash2 className="h-4 w-4" />
-                </Button>
-              )}
-            </TableCell>
-          </TableRow>
+            ) : null}
+          </>
         )
-      })}
-    </>
-  )
-}
-
-function SkeletonRows() {
-  return (
-    <>
-      {[0, 1, 2].map((row) => (
-        <TableRow key={row}>
-          {[0, 1, 2, 3, 4, 5, 6].map((cell) => (
-            <TableCell key={cell}>
-              <Skeleton className="h-4 w-full max-w-[120px]" />
-            </TableCell>
-          ))}
-        </TableRow>
-      ))}
-    </>
-  )
+      },
+    },
+    {
+      key: 'ports',
+      header: 'Ports',
+      className: 'whitespace-nowrap text-sm',
+      render: (rule) => describePorts(rule),
+    },
+    {
+      key: 'origin',
+      header: 'Origin',
+      render: (rule) => <Badge variant="outline">{rule.origin}</Badge>,
+    },
+    {
+      key: 'actions',
+      header: <span className="sr-only">Actions</span>,
+      className: 'text-right',
+      render: (rule) => {
+        if (!canEdit) return null
+        const blocked = ruleDeleteBlockedReason(rule)
+        return blocked ? (
+          <span className="text-xs text-muted-foreground" title={blocked}>
+            Managed by a link
+          </span>
+        ) : (
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label={`Delete rule #${rule.id}`}
+            onClick={() => onDelete(rule)}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        )
+      },
+    },
+  ]
 }
 
 /**
@@ -318,223 +317,167 @@ export function NetworkPolicyPage() {
     },
   })
 
+  const rules = rulesQuery.data?.items ?? []
   const total = rulesQuery.data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   const filtered = origin !== undefined || subject !== undefined
+  const addRuleButton = (
+    <Button onClick={() => setCreateOpen(true)}>
+      <Plus className="mr-2 h-4 w-4" />
+      Add rule
+    </Button>
+  )
 
   return (
-    <div className="w-full min-w-0 space-y-6">
-      <PageHeader
+    <>
+      {/* SettingsLayout already owns the PageContainer padding, so the
+          Ledger's own shell drops it instead of padding the page twice. */}
+      <Ledger<NetworkPolicyRule>
+        className="p-0 sm:p-0 lg:p-0"
         title="Network policy"
         description="What each workload may reach: allow and deny rules per sandbox, service, function, job or deployment, plus the links that create them."
-        actions={
-          canEdit ? (
-            <Button onClick={() => setCreateOpen(true)}>
-              <Plus className="mr-2 h-4 w-4" />
-              Add rule
-            </Button>
-          ) : null
-        }
-      />
-
-      <NodeModesSummary />
-
-      <form
-        className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end"
-        onSubmit={(event) => {
-          event.preventDefault()
-          const id = positiveInt(draftId, 0)
-          if (id === 0) {
-            toast.error('Enter a workload ID', {
-              description:
-                draftKind === 'deployment'
-                  ? 'For a deployment, use the environment ID.'
-                  : `Use the ${draftKind}'s numeric ID.`,
-            })
-            return
-          }
-          updateParams((next) => {
-            next.set('kind', draftKind)
-            next.set('id', String(id))
-            next.delete('page')
-          })
-        }}
-      >
-        <div className="w-full space-y-1.5 sm:w-[180px]">
-          <label htmlFor="np-kind" className="text-sm font-medium">
-            Workload kind
-          </label>
-          <Select
-            value={draftKind}
-            onValueChange={(value) => setDraftKind(value as SubjectKind)}
-          >
-            <SelectTrigger id="np-kind">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {SUBJECT_KINDS.map((kind) => (
-                <SelectItem key={kind} value={kind}>
-                  {kind}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="w-full space-y-1.5 sm:w-[160px]">
-          <label htmlFor="np-id" className="text-sm font-medium">
-            {draftKind === 'deployment' ? 'Environment ID' : 'Workload ID'}
-          </label>
-          <Input
-            id="np-id"
-            inputMode="numeric"
-            placeholder="42"
-            value={draftId}
-            onChange={(event) => setDraftId(event.target.value)}
-          />
-        </div>
-        <Button type="submit" variant="outline">
-          <Search className="mr-2 h-4 w-4" />
-          Inspect workload
-        </Button>
-        <div className="w-full space-y-1.5 sm:ml-auto sm:w-[180px]">
-          <label htmlFor="np-origin" className="text-sm font-medium">
-            Origin
-          </label>
-          <Select
-            value={origin ?? ALL_ORIGINS}
-            onValueChange={(value) =>
-              updateParams((next) => {
-                if (value === ALL_ORIGINS) next.delete('origin')
-                else next.set('origin', value)
-                next.delete('page')
-              })
-            }
-          >
-            <SelectTrigger id="np-origin">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value={ALL_ORIGINS}>All origins</SelectItem>
-              <SelectItem value="operator">Operator</SelectItem>
-              <SelectItem value="link">Link</SelectItem>
-              <SelectItem value="system">System</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-      </form>
-
-      {subject ? (
-        <div className="space-y-2">
-          <div className="flex justify-end">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() =>
+        actions={canEdit ? addRuleButton : undefined}
+        toolbar={
+          <>
+            <NodeModesSummary />
+            <RuleFilters
+              draftKind={draftKind}
+              draftId={draftId}
+              origin={origin}
+              onDraftKindChange={setDraftKind}
+              onDraftIdChange={setDraftId}
+              onInspect={(kind, id) =>
                 updateParams((next) => {
-                  next.delete('kind')
-                  next.delete('id')
+                  next.set('kind', kind)
+                  next.set('id', String(id))
                   next.delete('page')
                 })
               }
-            >
-              <X className="mr-2 h-4 w-4" />
-              Show every workload
-            </Button>
-          </div>
-          <SubjectPolicyPanel
-            key={`${subject.kind}-${subject.id}`}
-            subjectKind={subject.kind}
-            subjectId={subject.id}
-            canEdit={canEdit}
-          />
-        </div>
-      ) : null}
-
-      <div className="rounded-lg border bg-card text-card-foreground">
-        {rulesQuery.isError && !rulesQuery.data ? (
-          <div className="p-4">
-            <ReadFailure
-              resource="Network policy rules"
-              error={rulesQuery.error}
-              embedded
-              onRetry={
-                isForbiddenRead(rulesQuery.error)
-                  ? undefined
-                  : () => void rulesQuery.refetch()
+              onOriginChange={(value) =>
+                updateParams((next) => {
+                  if (value === undefined) next.delete('origin')
+                  else next.set('origin', value)
+                  next.delete('page')
+                })
               }
-              retrying={rulesQuery.isFetching}
             />
-          </div>
-        ) : !rulesQuery.isPending && total === 0 ? (
-          <EmptyState
-            size="compact"
-            icon={Network}
-            title={
-              filtered ? 'No matching rules' : 'No network policy rules yet'
-            }
-            description={
-              filtered
-                ? 'No rule matches the selected workload or origin. Clear the filters to see every rule.'
-                : 'Without rules, deployments, services, functions and jobs reach anything, and sandboxes reach only what a link allows.'
-            }
-            action={
-              canEdit && !filtered ? (
-                <Button onClick={() => setCreateOpen(true)}>
-                  <Plus className="mr-2 h-4 w-4" />
-                  Add rule
-                </Button>
-              ) : undefined
-            }
-          />
-        ) : (
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Rule</TableHead>
-                <TableHead>Workload</TableHead>
-                <TableHead>Action</TableHead>
-                <TableHead>Peer</TableHead>
-                <TableHead>Ports</TableHead>
-                <TableHead>Origin</TableHead>
-                <TableHead className="text-right">
-                  <span className="sr-only">Actions</span>
-                </TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {rulesQuery.isPending ? (
-                <SkeletonRows />
-              ) : (
-                <RuleRows
-                  rules={rulesQuery.data?.items ?? []}
+            {subject ? (
+              <div className="space-y-2">
+                <div className="flex justify-end">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() =>
+                      updateParams((next) => {
+                        next.delete('kind')
+                        next.delete('id')
+                        next.delete('page')
+                      })
+                    }
+                  >
+                    <X className="mr-2 h-4 w-4" />
+                    Show every workload
+                  </Button>
+                </div>
+                <SubjectPolicyPanel
+                  key={`${subject.kind}-${subject.id}`}
+                  subjectKind={subject.kind}
+                  subjectId={subject.id}
                   canEdit={canEdit}
-                  onDelete={setToDelete}
                 />
-              )}
-            </TableBody>
-          </Table>
-        )}
-      </div>
-
-      {total > 0 ? (
-        <ResponsivePagination
-          page={page}
-          pageSize={pageSize}
-          total={total}
-          totalPages={totalPages}
-          pageSizeOptions={PAGE_SIZE_OPTIONS}
-          onPageChange={(next) =>
-            updateParams((params) => params.set('page', String(next)))
-          }
-          onPageSizeChange={(size) =>
-            updateParams((params) => {
-              params.set('page_size', String(size))
-              params.delete('page')
-            })
-          }
-          ariaLabel="Network policy rules pagination"
-        />
-      ) : null}
+              </div>
+            ) : null}
+          </>
+        }
+        columns={ruleColumns(canEdit, setToDelete)}
+        rows={rules}
+        rowKey={(rule) => rule.id}
+        isLoading={rulesQuery.isPending}
+        empty={
+          rulesQuery.isError ? (
+            <div className="rounded-md border p-4">
+              <ReadFailure
+                resource="Network policy rules"
+                error={rulesQuery.error}
+                embedded
+                onRetry={
+                  isForbiddenRead(rulesQuery.error)
+                    ? undefined
+                    : () => void rulesQuery.refetch()
+                }
+                retrying={rulesQuery.isFetching}
+              />
+            </div>
+          ) : total > 0 ? (
+            <PageState
+              variant="empty"
+              size="compact"
+              icon={Network}
+              title="No rules on this page"
+              description={`There are ${total} rule(s), on ${totalPages} page(s).`}
+              action={
+                <Button
+                  variant="outline"
+                  onClick={() => updateParams((next) => next.delete('page'))}
+                >
+                  First page
+                </Button>
+              }
+            />
+          ) : filtered ? (
+            <PageState
+              variant="empty"
+              size="compact"
+              icon={Network}
+              title="No matching rules"
+              description="No rule matches the selected workload or origin. Clear the filters to see every rule."
+              action={
+                <Button
+                  variant="outline"
+                  onClick={() =>
+                    updateParams((next) => {
+                      next.delete('kind')
+                      next.delete('id')
+                      next.delete('origin')
+                      next.delete('page')
+                    })
+                  }
+                >
+                  Clear filters
+                </Button>
+              }
+            />
+          ) : (
+            <PageState
+              variant="empty"
+              size="compact"
+              icon={Network}
+              title="No network policy rules yet"
+              description="Without rules, deployments, services, functions and jobs reach anything, and sandboxes reach only what a link allows."
+              action={canEdit ? addRuleButton : undefined}
+            />
+          )
+        }
+        pagination={
+          total > 0
+            ? {
+                page,
+                pageSize,
+                total,
+                totalPages,
+                pageSizeOptions: PAGE_SIZE_OPTIONS,
+                onPageChange: (next) =>
+                  updateParams((params) => params.set('page', String(next))),
+                onPageSizeChange: (size) =>
+                  updateParams((params) => {
+                    params.set('page_size', String(size))
+                    params.delete('page')
+                  }),
+                ariaLabel: 'Network policy rules pagination',
+              }
+            : undefined
+        }
+      />
 
       <CreateRuleDialog
         key={subject ? `${subject.kind}-${subject.id}` : 'any'}
@@ -571,6 +514,103 @@ export function NetworkPolicyPage() {
           if (toDelete) remove.mutate(toDelete)
         }}
       />
-    </div>
+    </>
+  )
+}
+
+/** The workload inspector and the origin filter above the rule table. */
+function RuleFilters({
+  draftKind,
+  draftId,
+  origin,
+  onDraftKindChange,
+  onDraftIdChange,
+  onInspect,
+  onOriginChange,
+}: {
+  draftKind: SubjectKind
+  draftId: string
+  origin: RuleOrigin | undefined
+  onDraftKindChange: (kind: SubjectKind) => void
+  onDraftIdChange: (id: string) => void
+  onInspect: (kind: SubjectKind, id: number) => void
+  onOriginChange: (origin: RuleOrigin | undefined) => void
+}) {
+  return (
+    <form
+      className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end"
+      onSubmit={(event) => {
+        event.preventDefault()
+        const id = positiveInt(draftId, 0)
+        if (id === 0) {
+          toast.error('Enter a workload ID', {
+            description:
+              draftKind === 'deployment'
+                ? 'For a deployment, use the environment ID.'
+                : `Use the ${draftKind}'s numeric ID.`,
+          })
+          return
+        }
+        onInspect(draftKind, id)
+      }}
+    >
+      <div className="w-full space-y-1.5 sm:w-[180px]">
+        <label htmlFor="np-kind" className="text-sm font-medium">
+          Workload kind
+        </label>
+        <Select
+          value={draftKind}
+          onValueChange={(value) => onDraftKindChange(value as SubjectKind)}
+        >
+          <SelectTrigger id="np-kind">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {SUBJECT_KINDS.map((kind) => (
+              <SelectItem key={kind} value={kind}>
+                {kind}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="w-full space-y-1.5 sm:w-[160px]">
+        <label htmlFor="np-id" className="text-sm font-medium">
+          {draftKind === 'deployment' ? 'Environment ID' : 'Workload ID'}
+        </label>
+        <Input
+          id="np-id"
+          inputMode="numeric"
+          placeholder="42"
+          value={draftId}
+          onChange={(event) => onDraftIdChange(event.target.value)}
+        />
+      </div>
+      <Button type="submit" variant="outline">
+        <Search className="mr-2 h-4 w-4" />
+        Inspect workload
+      </Button>
+      <div className="w-full space-y-1.5 sm:ml-auto sm:w-[180px]">
+        <label htmlFor="np-origin" className="text-sm font-medium">
+          Origin
+        </label>
+        <Select
+          value={origin ?? ALL_ORIGINS}
+          onValueChange={(value) =>
+            onOriginChange(isOrigin(value) ? value : undefined)
+          }
+        >
+          <SelectTrigger id="np-origin">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={ALL_ORIGINS}>All origins</SelectItem>
+            <SelectItem value="operator">Operator</SelectItem>
+            <SelectItem value="link">Link</SelectItem>
+            <SelectItem value="system">System</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </form>
   )
 }
