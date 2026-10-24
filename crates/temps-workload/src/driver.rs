@@ -174,6 +174,37 @@ pub struct NetworkAttachment {
     pub dns: Option<Vec<String>>,
 }
 
+/// Answers the resolvers a new instance should use, read at each create:
+/// the node's cluster DNS resolver (ADR-024) and its public fallbacks, or
+/// `None` while that resolver is not up (the runtime's default then).
+#[derive(Clone)]
+pub struct ResolverSource(std::sync::Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>);
+
+impl ResolverSource {
+    pub fn new(resolvers: impl Fn() -> Option<Vec<String>> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(resolvers))
+    }
+
+    pub fn resolvers(&self) -> Option<Vec<String>> {
+        (self.0)()
+    }
+
+    /// Fill `network.dns` unless the template already chose resolvers.
+    pub fn apply(&self, network: &mut NetworkAttachment) {
+        if network.dns.is_none() {
+            network.dns = self.resolvers();
+        }
+    }
+}
+
+impl fmt::Debug for ResolverSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("ResolverSource")
+            .field(&self.resolvers())
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachments {
     pub network: NetworkAttachment,

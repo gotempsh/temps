@@ -909,6 +909,7 @@ pub async fn start_agent_server_with(
             &config,
             docker.clone(),
             network.host_bind_address.clone(),
+            network.overlay_bridge_address.clone(),
         ) {
             Ok(runtime) => Some(runtime),
             Err(e) => {

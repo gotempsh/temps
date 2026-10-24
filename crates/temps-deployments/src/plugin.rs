@@ -66,7 +66,7 @@ impl DeploymentsPlugin {
     /// `NoEligibleNode` instead of the cron silently doing nothing. With no
     /// audit logger the plane is not started (its refusals must be
     /// audited) and `job` crons are recorded as failed with that reason.
-    fn start_workload_plane(&self, context: &PluginContext) {
+    async fn start_workload_plane(&self, context: &PluginContext) {
         let Some(cron_service) =
             context.get_service::<crate::services::DatabaseCronConfigService>()
         else {
@@ -108,6 +108,35 @@ impl DeploymentsPlugin {
         let mut config = temps_workload_plane::PlaneConfig::new("temps");
         config.network = Some(temps_core::NETWORK_NAME.clone());
         config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
+        // ADR-024: the same opt-in and proxy-owned resolver slot the legacy
+        // deployer injects, so a replica the plane starts here resolves
+        // `*.temps.local` exactly as a legacy one does. Off (Docker's
+        // embedded DNS) unless the operator enabled cluster DNS.
+        if local_workloads.local_workloads_enabled() {
+            let enabled = match context
+                .require_service::<temps_config::ConfigService>()
+                .get_settings()
+                .await
+            {
+                Ok(settings) => settings.cluster_dns.enabled,
+                Err(e) => {
+                    tracing::warn!(
+                        "Could not read settings ({e}); workloads the plane starts on this \
+                         host keep Docker's embedded DNS until restart"
+                    );
+                    false
+                }
+            };
+            if enabled {
+                match context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>() {
+                    Some(slot) => config.cluster_dns = Some(cluster_dns_resolver(slot)),
+                    None => tracing::warn!(
+                        "cluster DNS enabled but no proxy resolver slot is registered; \
+                         workloads the plane starts keep Docker's embedded DNS"
+                    ),
+                }
+            }
+        }
         let placement = context.get_service::<crate::services::WorkloadPlacementService>();
 
         // ADR-055 §7: a run is placed like a one-replica deployment of its
@@ -205,6 +234,20 @@ impl DeploymentsPlugin {
             Err(e) => tracing::error!("Workload plane did not start: {e}"),
         }
     }
+}
+
+/// The resolvers the legacy deployer gives a container, read from the
+/// proxy's slot at each create: its address with public fallbacks, or
+/// Docker's default while the proxy's resolver is not listening.
+fn cluster_dns_resolver(
+    slot: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+) -> temps_workload::ResolverSource {
+    temps_workload::ResolverSource::new(move || {
+        slot.read()
+            .ok()
+            .and_then(|ip| ip.map(|ip| vec![ip.to_string()]))
+            .map(temps_deployer::docker::dns_with_fallback)
+    })
 }
 
 /// The control plane's Docker volume provider, when this process has a
@@ -917,7 +960,7 @@ impl TempsPlugin for DeploymentsPlugin {
             // not at registration, because it audit-logs its admission
             // refusals and the audit logger is only resolvable now. Started
             // once per process. `http` crons never touch it.
-            self.start_workload_plane(context);
+            self.start_workload_plane(context).await;
 
             // Wire auditing for deploy-path security events — currently the
             // ADR-045 record that a deployment received the host Docker
@@ -1412,6 +1455,21 @@ impl TempsPlugin for DeploymentsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plane_resolver_follows_the_proxy_slot() {
+        let slot = Arc::new(std::sync::RwLock::new(None));
+        let resolver = cluster_dns_resolver(slot.clone());
+        assert_eq!(resolver.resolvers(), None, "no listener, Docker's default");
+
+        *slot.write().expect("slot") = Some(std::net::IpAddr::from([10, 0, 0, 53]));
+        let resolvers = resolver.resolvers().expect("the slot's resolver");
+        assert_eq!(resolvers.first().map(String::as_str), Some("10.0.0.53"));
+        assert!(
+            resolvers.len() > 1,
+            "public fallbacks follow: {resolvers:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_deployments_plugin_name() {

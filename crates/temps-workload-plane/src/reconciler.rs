@@ -73,6 +73,17 @@ pub(crate) const PHASE_RUNNING: &str = "running";
 pub(crate) const PHASE_SUCCEEDED: &str = "succeeded";
 pub(crate) const PHASE_FAILED: &str = "failed";
 
+/// Where a pass's batch ended in the ring of workloads that need work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// Full, and rows with higher ids remain.
+    Continues,
+    /// Full after wrapping to the lowest ids; rows remain after it.
+    Wrapped,
+    /// Every row that needs work was read.
+    Complete,
+}
+
 /// What a pass did, and when the next one is due.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PassOutcome {
@@ -200,8 +211,8 @@ impl WorkloadPlane {
     pub async fn reconcile_at(&self, now: DateTime<Utc>, full: bool) -> PassOutcome {
         let poll = Duration::from_std(self.config.poll_interval).unwrap_or(Duration::seconds(5));
         let mut outcome = PassOutcome::default();
-        let rows = match self.rows_needing_work(now).await {
-            Ok(rows) => rows,
+        let (rows, batch) = match self.rows_needing_work(now).await {
+            Ok(read) => read,
             Err(error) => {
                 tracing::error!(scope = %self.config.scope, "reconcile pass could not read workloads: {error}");
                 outcome.failed += 1;
@@ -209,8 +220,15 @@ impl WorkloadPlane {
                 return outcome;
             }
         };
-        if rows.len() as u64 >= PASS_LIMIT {
-            outcome.requeue_at = Some(now);
+        match batch {
+            // More rows after this batch: read them now.
+            Batch::Continues => outcome.requeue_at = Some(now),
+            // The batch wrapped past the highest id and more remain: the
+            // next batch is due within a poll interval, not immediately, so
+            // a plane with more stable workloads than one batch does not
+            // re-read them in a hot loop.
+            Batch::Wrapped => outcome.requeue_at = Some(now + poll),
+            Batch::Complete => {}
         }
         let mut instances = match self.instances_of(&rows).await {
             Ok(instances) => instances,
@@ -256,12 +274,55 @@ impl WorkloadPlane {
     }
 
     /// Live unfinished workloads, workloads holding finalizers, expired
-    /// ones and deleted ones: each through its partial index.
+    /// ones and deleted ones: each through its partial index. Reads at most
+    /// [`crate::PlaneConfig::pass_limit`] rows, starting after the pass
+    /// cursor and wrapping to the lowest ids, so every row is reached even
+    /// when more than one batch needs work.
     async fn rows_needing_work(
         &self,
         now: DateTime<Utc>,
+    ) -> Result<(Vec<workloads::Model>, Batch), PlaneError> {
+        let limit = self.config.pass_limit.max(1);
+        let after = self.pass_cursor.load(Ordering::Relaxed);
+        let mut rows = self
+            .rows_in(now, workloads::Column::Id.gt(after), limit)
+            .await?;
+        if rows.len() as u64 >= limit {
+            self.pass_cursor
+                .store(rows.last().map_or(0, |row| row.id), Ordering::Relaxed);
+            return Ok((rows, Batch::Continues));
+        }
+        if after == 0 {
+            return Ok((rows, Batch::Complete));
+        }
+        // The tail of the ring was short: top the batch up from the start.
+        let room = limit - rows.len() as u64;
+        let head = self
+            .rows_in(now, workloads::Column::Id.lte(after), room)
+            .await?;
+        let filled = head.len() as u64 >= room;
+        let head_last = head.last().map(|row| row.id);
+        rows.extend(head);
+        match (filled, head_last) {
+            (true, Some(last)) if last < after => {
+                self.pass_cursor.store(last, Ordering::Relaxed);
+                Ok((rows, Batch::Wrapped))
+            }
+            _ => {
+                self.pass_cursor.store(0, Ordering::Relaxed);
+                Ok((rows, Batch::Complete))
+            }
+        }
+    }
+
+    async fn rows_in(
+        &self,
+        now: DateTime<Utc>,
+        range: sea_orm::sea_query::SimpleExpr,
+        limit: u64,
     ) -> Result<Vec<workloads::Model>, PlaneError> {
         workloads::Entity::find()
+            .filter(range)
             .filter(
                 Condition::any()
                     .add(
@@ -280,7 +341,7 @@ impl WorkloadPlane {
                     .add(workloads::Column::DeletedAt.is_not_null()),
             )
             .order_by_asc(workloads::Column::Id)
-            .limit(PASS_LIMIT)
+            .limit(limit)
             .all(self.db.as_ref())
             .await
             .map_err(PlaneError::db("reading the workloads that need work", "*"))
@@ -372,7 +433,14 @@ impl WorkloadPlane {
             set_scheduled(&mut status, latest.node_id, now);
         }
 
-        if now >= deadline {
+        // A pass that runs late (after an outage, or behind a slow pull) may
+        // find an attempt that already exited inside its deadline: that run
+        // is observed below with its real result, not failed for the delay.
+        let exited_in_time = match instances.last() {
+            Some(latest) if now >= deadline => self.exited_by(row.id, latest, deadline).await,
+            _ => false,
+        };
+        if now >= deadline && !exited_in_time {
             let mut tail = None;
             let attempt = instances.last().map(|i| i.attempt).unwrap_or(0);
             for instance in instances.iter().filter(|i| !is_finished(i)) {
@@ -592,6 +660,35 @@ impl WorkloadPlane {
             Some(code) => format!("exited {code}"),
             None => "was lost".to_string(),
         };
+        if attempt <= retry_limit && now >= deadline {
+            // The attempt ended inside the deadline, but no time is left for
+            // another one.
+            let message = format!(
+                "attempt {attempt} {exited}; its maximum run time of {timeout_secs}s left no \
+                 time for attempt {}",
+                attempt + 1
+            );
+            status.set_condition(
+                ConditionKind::Running,
+                ConditionStatus::False,
+                "DeadlineExceeded",
+                &message,
+                now,
+            );
+            fail(&mut status, "DeadlineExceeded", &message, now);
+            events::record(
+                self.db.as_ref(),
+                row.id,
+                Some(latest.id),
+                "DeadlineExceeded",
+                &message,
+                now,
+            )
+            .await?;
+            return self
+                .conclude(row, view, instances, status, now, finished_at + ttl, None)
+                .await;
+        }
         if attempt <= retry_limit {
             let retry_at = finished_at + backoff(attempt);
             if now < retry_at {
@@ -677,6 +774,38 @@ impl WorkloadPlane {
         .await?;
         self.conclude(row, view, instances, status, now, finished_at + ttl, None)
             .await
+    }
+
+    /// Whether `instance`, unfinished in its row, already exited at or before
+    /// `deadline` according to its runtime. Anything it cannot prove (the
+    /// node is unreachable, the runtime reports no exit time) is `false`, so
+    /// the deadline applies.
+    async fn exited_by(
+        &self,
+        workload_id: i64,
+        instance: &workload_instances::Model,
+        deadline: DateTime<Utc>,
+    ) -> bool {
+        if is_finished(instance) {
+            return false;
+        }
+        let (Ok(driver), Ok(handle)) = (self.driver_of(instance).await, handle_of(instance)) else {
+            return false;
+        };
+        match driver.inspect(&handle).await {
+            Ok(observed) => {
+                matches!(observed.state, InstanceState::Exited)
+                    && observed.finished_at.is_some_and(|at| at <= deadline)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    workload_id,
+                    instance_id = instance.id,
+                    "inspecting the instance past its deadline failed: {error}"
+                );
+                false
+            }
+        }
     }
 
     /// A long-running workload (one deployment replica, ADR-055 Phase 5):
@@ -1203,7 +1332,7 @@ impl WorkloadPlane {
             &handle.name,
         );
         let security = template.security;
-        let attach = template.attachments.clone();
+        let attach = self.local_attachments(&template.attachments);
         let mut instance_spec = template.into_spec(prepared.local_ref.clone(), resolved.env);
         instance_spec.secret_files = resolved.secret_files;
         let created = match driver.create(&instance_spec, &attach).await {
@@ -2139,6 +2268,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_that_exited_in_time_is_not_failed_by_a_late_pass() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let id = plane
+            .apply(apply_request(
+                16,
+                "cron-run",
+                job_spec_with("app:1", 60, 0, None),
+            ))
+            .await
+            .expect("applied");
+        let created_at = plane.get(id).await.expect("read").created_at;
+        plane.reconcile_at(Utc::now(), false).await;
+        let running = driver.running();
+        assert_eq!(running.len(), 1);
+        // Exits 0 while no pass runs (Temps is stopped); the next pass comes
+        // after the deadline.
+        driver.exit(&running[0], 0);
+        plane
+            .reconcile_at(created_at + Duration::seconds(70), false)
+            .await;
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Succeeded);
+        assert_eq!(view.status.exit_code, Some(0));
+        let completed = view
+            .status
+            .condition(ConditionKind::Completed)
+            .expect("completed");
+        assert_eq!(completed.reason, "Succeeded");
+        assert!(driver.exists(&running[0]), "kept for its logs");
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_with_no_time_left_is_not_retried_past_the_deadline() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let id = plane
+            .apply(apply_request(
+                17,
+                "late-retry",
+                job_spec_with("app:1", 60, 2, None),
+            ))
+            .await
+            .expect("applied");
+        let created_at = plane.get(id).await.expect("read").created_at;
+        plane.reconcile_at(Utc::now(), false).await;
+        let running = driver.running();
+        driver.exit(&running[0], 3);
+        plane
+            .reconcile_at(created_at + Duration::seconds(70), false)
+            .await;
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Failed);
+        assert_eq!(view.status.exit_code, Some(3), "the real exit is kept");
+        let completed = view
+            .status
+            .condition(ConditionKind::Completed)
+            .expect("completed");
+        assert_eq!(completed.reason, "DeadlineExceeded");
+        assert!(
+            completed.message.contains("exited 3"),
+            "{}",
+            completed.message
+        );
+        assert_eq!(driver.created().len(), 1, "no attempt past the deadline");
+    }
+
+    #[tokio::test]
     async fn without_a_driver_the_run_fails_with_no_eligible_node() {
         let Some(db) = test_db().await else { return };
         let (plane, _audit) = plane(&db, NodeDriver(None), Vec::new());
@@ -2377,6 +2574,109 @@ mod tests {
             primary.created().is_empty(),
             "nothing fell back to a container"
         );
+    }
+
+    #[tokio::test]
+    async fn instances_created_here_get_the_cluster_resolver() {
+        let Some(db) = test_db().await else { return };
+        let driver = FakeDriver::new();
+        let resolver = Arc::new(std::sync::RwLock::new(None::<String>));
+        let slot = resolver.clone();
+        let (plane, _audit) = crate::testing::plane_configured(
+            &db,
+            NodeDriver(Some(driver.clone())),
+            Vec::new(),
+            move |config| {
+                config.cluster_dns = Some(temps_workload::ResolverSource::new(move || {
+                    slot.read()
+                        .ok()
+                        .and_then(|ip| ip.clone())
+                        .map(|ip| vec![ip, "1.1.1.1".to_string()])
+                }))
+            },
+        );
+
+        // Before the resolver is up the runtime's default is kept.
+        plane
+            .apply(apply_request(201, "before-dns", deployment_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        *resolver.write().expect("slot") = Some("10.0.0.53".to_string());
+        plane
+            .apply(apply_request(202, "after-dns", deployment_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+
+        let resolvers: Vec<Option<Vec<String>>> = driver
+            .created()
+            .into_iter()
+            .map(|(_, attach)| attach.network.dns)
+            .collect();
+        assert_eq!(
+            resolvers,
+            vec![
+                None,
+                Some(vec!["10.0.0.53".to_string(), "1.1.1.1".to_string()])
+            ],
+            "the resolver is read at each create"
+        );
+    }
+
+    #[tokio::test]
+    async fn workloads_past_a_full_batch_of_running_replicas_are_still_driven() {
+        let Some(db) = test_db().await else { return };
+        let driver = FakeDriver::new();
+        let (plane, _audit) = crate::testing::plane_configured(
+            &db,
+            NodeDriver(Some(driver.clone())),
+            Vec::new(),
+            |config| config.pass_limit = 3,
+        );
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let id = plane
+                .apply(apply_request(
+                    100 + n,
+                    &format!("replica-{n}"),
+                    deployment_spec("app:1"),
+                ))
+                .await
+                .expect("applied");
+            ids.push(id);
+        }
+        let now = Utc::now();
+        let first = plane.reconcile_at(now, false).await;
+        assert_eq!(driver.running().len(), 3, "one batch started");
+        assert_eq!(first.requeue_at, Some(now), "a full batch asks for more");
+
+        let second = plane.reconcile_at(now, false).await;
+        assert_eq!(
+            driver.running().len(),
+            5,
+            "the rows after the first batch are created"
+        );
+        assert!(
+            second.requeue_at.is_some_and(|at| at > now),
+            "a wrapped batch of stable replicas is not re-read at once: {second:?}"
+        );
+
+        // Deleting the highest id, behind a full batch of running replicas,
+        // is reached within one round.
+        let last = *ids.last().expect("five ids");
+        plane
+            .delete(last, "Retired", "the deployment was replaced")
+            .await
+            .expect("deleted");
+        for _ in 0..3 {
+            plane.reconcile_at(now, false).await;
+        }
+        assert_eq!(driver.running().len(), 4, "the deleted replica stopped");
+        assert!(matches!(
+            plane.get(last).await,
+            Err(PlaneError::NotFound { workload_id }) if workload_id == last
+        ));
     }
 
     #[tokio::test]

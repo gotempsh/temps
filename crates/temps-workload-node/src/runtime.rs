@@ -97,6 +97,9 @@ pub struct NodeRuntime {
     /// The host address published ports bind to (this node's private
     /// address), read at each create; `None` keeps the template's.
     publish_host_ip: Option<PublishHostIp>,
+    /// This node's cluster DNS resolver (ADR-024), read at each create;
+    /// `None` keeps the template's (the runtime's default).
+    cluster_dns: Option<temps_workload::ResolverSource>,
 }
 
 /// Answers this node's current private address.
@@ -181,6 +184,7 @@ impl NodeRuntime {
             sent: Mutex::new(BTreeMap::new()),
             reports_changed: Arc::new(tokio::sync::Notify::new()),
             publish_host_ip: None,
+            cluster_dns: None,
         })
     }
 
@@ -188,6 +192,13 @@ impl NodeRuntime {
     /// time, never the control plane's (ADR-045's private-address rule).
     pub fn with_publish_host_ip(mut self, host_ip: PublishHostIp) -> Self {
         self.publish_host_ip = Some(host_ip);
+        self
+    }
+
+    /// Point new instances at this node's resolver, as the legacy agent
+    /// does for the containers it starts, so `*.temps.local` resolves.
+    pub fn with_cluster_dns(mut self, resolvers: temps_workload::ResolverSource) -> Self {
+        self.cluster_dns = Some(resolvers);
         self
     }
 
@@ -630,7 +641,10 @@ impl NodeRuntime {
                 });
             }
         };
-        let attach = instance.template.attachments.clone();
+        let mut attach = instance.template.attachments.clone();
+        if let Some(dns) = &self.cluster_dns {
+            dns.apply(&mut attach.network);
+        }
         let mut spec = instance
             .template
             .clone()
@@ -837,6 +851,8 @@ mod tests {
         containers: Mutex<HashMap<String, FakeContainer>>,
         /// What each container published: Docker picks port 40000.
         ports: Mutex<HashMap<String, Vec<temps_workload::PortBinding>>>,
+        /// The resolvers each container was created with.
+        dns: Mutex<HashMap<String, Option<Vec<String>>>>,
     }
 
     fn caps() -> &'static DriverCapabilities {
@@ -868,8 +884,12 @@ mod tests {
         async fn create(
             &self,
             spec: &InstanceSpec,
-            _: &Attachments,
+            attach: &Attachments,
         ) -> Result<InstanceHandle, DriverError> {
+            self.dns
+                .lock()
+                .expect("lock")
+                .insert(spec.name.clone(), attach.network.dns.clone());
             self.containers.lock().expect("lock").insert(
                 spec.name.clone(),
                 (InstanceState::Created, spec.env.clone()),
@@ -1280,6 +1300,51 @@ mod tests {
         runtime.reconcile().await;
         assert!(docker.containers.lock().expect("lock").is_empty());
         assert_eq!(runtime.secrets.load("temps-job-3-a2").expect("read"), None);
+    }
+
+    /// A worker's instances get its cluster resolver, read at each create:
+    /// the runtime's default before the resolver is up, its address after.
+    #[tokio::test]
+    async fn instances_get_the_node_resolver_once_it_is_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (runtime, docker, _) = runtime(dir.path(), true);
+        let slot = Arc::new(std::sync::RwLock::new(None::<String>));
+        let read = slot.clone();
+        let runtime = runtime.with_cluster_dns(temps_workload::ResolverSource::new(move || {
+            read.read()
+                .ok()
+                .and_then(|ip| ip.clone())
+                .map(|ip| vec![ip])
+        }));
+        // Distinct attempts, so distinct container names.
+        let replica = |id: i64, attempt: i32| {
+            let mut replica = instance(id, attempt, "pending");
+            replica.template.long_running = true;
+            replica
+        };
+        runtime
+            .apply(full("100", vec![replica(31, 1)]))
+            .await
+            .expect("applied");
+        runtime.reconcile().await;
+        *slot.write().expect("slot") = Some("10.0.0.53".to_string());
+        runtime
+            .apply(full("101", vec![replica(31, 1), replica(32, 2)]))
+            .await
+            .expect("applied");
+        runtime.reconcile().await;
+
+        let mut dns: Vec<_> = docker
+            .dns
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|(name, dns)| (name.clone(), dns.clone()))
+            .collect();
+        dns.sort();
+        assert_eq!(dns.len(), 2, "{dns:?}");
+        assert_eq!(dns[0].1, None, "created before the resolver was up");
+        assert_eq!(dns[1].1, Some(vec!["10.0.0.53".to_string()]));
     }
 
     /// A deployment replica on a worker: its ports bind to the node's

@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,16 @@ pub struct PlaneConfig {
     /// (the runtime picks the port). Never `0.0.0.0`: the proxy reaches the
     /// instance over loopback or the node's private address.
     pub publish_host_ip: String,
+    /// Most workloads one pass reads ([`crate::reconciler::PASS_LIMIT`]).
+    /// A pass that fills it resumes after the last id it read, so rows past
+    /// the first batch are always reached.
+    pub pass_limit: u64,
+    /// Resolvers for instances this plane creates on the control plane:
+    /// the proxy's cluster DNS resolver (ADR-024) when cluster DNS is
+    /// enabled, so `*.temps.local` names resolve as they do for legacy
+    /// deployments. Worker nodes use their own resolver (the node
+    /// runtime's), never this one.
+    pub cluster_dns: Option<temps_workload::ResolverSource>,
 }
 
 impl PlaneConfig {
@@ -111,6 +121,8 @@ impl PlaneConfig {
             poll_interval: Duration::from_secs(5),
             output_tail_lines: 50,
             publish_host_ip: "127.0.0.1".to_string(),
+            pass_limit: crate::reconciler::PASS_LIMIT,
+            cluster_dns: None,
         }
     }
 }
@@ -216,6 +228,79 @@ pub struct WorkloadPlane {
     /// [`WorkloadPlane::with_local_driver`] and
     /// [`WorkloadPlane::with_control_plane_driver`].
     pub(crate) local_drivers: Vec<Arc<dyn RuntimeDriver>>,
+    /// The last workload id the previous pass read when it filled
+    /// [`PlaneConfig::pass_limit`]; `0` starts from the lowest id.
+    pub(crate) pass_cursor: AtomicI64,
+}
+
+/// Retires a workload when dropped, unless disarmed. A caller that applies a
+/// workload and then waits on it (a deployment handing a replica over) holds
+/// one, so a wait that fails, times out or is cancelled never leaves a
+/// workload, and its container, that no caller knows about.
+#[must_use = "dropping the guard retires the workload at once"]
+pub struct RetireOnDrop {
+    plane: Arc<WorkloadPlane>,
+    workload_id: i64,
+    reason: &'static str,
+    message: String,
+    armed: bool,
+}
+
+impl RetireOnDrop {
+    pub fn workload_id(&self) -> i64 {
+        self.workload_id
+    }
+
+    /// The handoff succeeded: keep the workload.
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    /// Retire the workload now, with `message` as why.
+    pub async fn retire(mut self, message: &str) -> Result<(), PlaneError> {
+        self.armed = false;
+        self.plane
+            .delete(self.workload_id, self.reason, message)
+            .await
+    }
+}
+
+impl fmt::Debug for RetireOnDrop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RetireOnDrop")
+            .field("workload_id", &self.workload_id)
+            .field("armed", &self.armed)
+            .finish()
+    }
+}
+
+impl Drop for RetireOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let plane = self.plane.clone();
+        let workload_id = self.workload_id;
+        let reason = self.reason;
+        let message = std::mem::take(&mut self.message);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    if let Err(error) = plane.delete(workload_id, reason, &message).await {
+                        tracing::error!(
+                            workload_id,
+                            "retiring abandoned workload {workload_id} failed: {error}"
+                        );
+                    }
+                });
+            }
+            Err(_) => tracing::error!(
+                workload_id,
+                "workload {workload_id} was abandoned outside a runtime and could not be \
+                 retired; the next delete of its owner removes it"
+            ),
+        }
+    }
 }
 
 /// The plane, bound once it starts. Plugins that register before
@@ -329,6 +414,7 @@ impl WorkloadPlane {
             stream_metrics: StreamMetrics::default(),
             volume_provider: None,
             local_drivers: Vec::new(),
+            pass_cursor: AtomicI64::new(0),
         }
     }
 
@@ -1186,6 +1272,36 @@ impl WorkloadPlane {
         events::list(self.db.as_ref(), id).await
     }
 
+    /// The attachments for an instance created on the control plane: the
+    /// template's, with the cluster resolver filled in when one is set.
+    pub(crate) fn local_attachments(
+        &self,
+        attachments: &temps_workload::Attachments,
+    ) -> temps_workload::Attachments {
+        let mut attachments = attachments.clone();
+        if let Some(dns) = &self.config.cluster_dns {
+            dns.apply(&mut attachments.network);
+        }
+        attachments
+    }
+
+    /// A guard that retires workload `id` with `reason` and `message` when
+    /// dropped, unless [`RetireOnDrop::disarm`]ed.
+    pub fn retire_on_drop(
+        self: &Arc<Self>,
+        id: i64,
+        reason: &'static str,
+        message: impl Into<String>,
+    ) -> RetireOnDrop {
+        RetireOnDrop {
+            plane: self.clone(),
+            workload_id: id,
+            reason,
+            message: message.into(),
+            armed: true,
+        }
+    }
+
     /// Delete workload `id`: its instances are stopped and removed, its
     /// finalizers run, then the row goes. An unfinished workload fails
     /// with `reason`. Deleting a deleted workload is a no-op.
@@ -1334,7 +1450,57 @@ pub(crate) fn view_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{apply_request, job_spec, job_spec_with, plane_with, test_db};
+    use crate::testing::{
+        apply_request, deployment_spec, job_spec, job_spec_with, plane_with, test_db,
+    };
+
+    #[tokio::test]
+    async fn an_abandoned_handoff_retires_its_workload_and_a_disarmed_one_keeps_it() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let abandoned = plane
+            .apply(apply_request(31, "replica-a", deployment_spec("app:1")))
+            .await
+            .expect("applied");
+        let kept = plane
+            .apply(apply_request(32, "replica-b", deployment_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert_eq!(driver.running().len(), 2);
+        let abandoned_instance = driver
+            .running()
+            .into_iter()
+            .find(|name| name.ends_with(&format!("-{abandoned}-a1")))
+            .expect("the abandoned replica's instance");
+
+        // The caller gave up (its wait failed or it was cancelled).
+        drop(plane.retire_on_drop(abandoned, "HandoffFailed", "the wait timed out"));
+        plane
+            .retire_on_drop(kept, "HandoffFailed", "unused")
+            .disarm();
+        let mut deleted = false;
+        for _ in 0..100 {
+            if plane
+                .get(abandoned)
+                .await
+                .map_or(true, |view| view.deleted_at.is_some())
+            {
+                deleted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(deleted, "the abandoned workload is deleted");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(
+            !driver.exists(&abandoned_instance),
+            "and its container removed"
+        );
+        let view = plane.get(kept).await.expect("the disarmed workload stays");
+        assert!(view.deleted_at.is_none());
+        assert_eq!(driver.running().len(), 1);
+    }
 
     #[tokio::test]
     async fn applying_the_same_spec_twice_is_one_workload() {

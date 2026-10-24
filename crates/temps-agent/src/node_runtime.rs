@@ -172,6 +172,7 @@ pub fn spawn(
     config: &AgentConfig,
     docker: bollard::Docker,
     bind_address: crate::network_sync::SharedBindAddress,
+    overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) -> Result<Arc<NodeRuntime>, NodeRuntimeStartError> {
     let dir = node_runtime_dir(config)?;
     let link: Arc<dyn ControlPlaneLink> = Arc::new(HttpControlPlaneLink::new(config)?);
@@ -192,6 +193,17 @@ pub fn spawn(
                     .read()
                     .map(|address| address.clone())
                     .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+            }))
+            // The resolver the legacy handlers give their containers: this
+            // node's Hickory resolver once `network_sync` has the bridge up,
+            // with public fallbacks so a stopped resolver never takes DNS
+            // down for every instance on the node.
+            .with_cluster_dns(temps_workload::ResolverSource::new(move || {
+                overlay_bridge_address
+                    .read()
+                    .ok()
+                    .and_then(|slot| slot.map(|ip| vec![ip.to_string()]))
+                    .map(temps_deployer::docker::dns_with_fallback)
             })),
     );
     let reconcile_now = Arc::new(tokio::sync::Notify::new());

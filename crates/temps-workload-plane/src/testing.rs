@@ -238,14 +238,26 @@ pub(crate) fn plane(
     driver: NodeDriver,
     finalizers: Vec<Arc<RecordingFinalizer>>,
 ) -> (Arc<WorkloadPlane>, Arc<RecordingAudit>) {
+    plane_configured(db, driver, finalizers, |_| {})
+}
+
+/// [`plane`], with `configure` applied to its config first.
+pub(crate) fn plane_configured(
+    db: &TestDatabase,
+    driver: NodeDriver,
+    finalizers: Vec<Arc<RecordingFinalizer>>,
+    configure: impl FnOnce(&mut PlaneConfig),
+) -> (Arc<WorkloadPlane>, Arc<RecordingAudit>) {
     let audit = Arc::new(RecordingAudit::default());
     let scope = format!("t{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let mut config = PlaneConfig::new(scope);
+    configure(&mut config);
     let mut plane = WorkloadPlane::new(
         db.db.clone(),
         driver,
         Arc::new(NoEnvSource),
         audit.clone(),
-        PlaneConfig::new(scope),
+        config,
     );
     for finalizer in finalizers {
         plane = plane.with_finalizer(finalizer);

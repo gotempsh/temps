@@ -349,12 +349,8 @@ impl ContainerDeployer for PlaneContainerDeployer {
         let start = |e: temps_workload_plane::PlaneError| {
             self.plane_error(&format!("start {}", request.container_name), e)
         };
-        let view = match self.volume_owner.as_ref() {
-            None => self
-                .plane
-                .apply_and_wait(apply, ConditionKind::Running, self.ready_timeout)
-                .await
-                .map_err(start)?,
+        let workload_id = match self.volume_owner.as_ref() {
+            None => self.plane.apply(apply).await.map_err(start)?,
             Some(owner) => {
                 let applied = self
                     .plane
@@ -368,29 +364,42 @@ impl ContainerDeployer for PlaneContainerDeployer {
                         "deployment replica {pin}"
                     );
                 }
-                self.plane
-                    .wait_for(
-                        applied.workload_id,
-                        ConditionKind::Running,
-                        self.ready_timeout,
-                    )
-                    .await
-                    .map_err(start)?
+                applied.workload_id
             }
         };
+        // Until the replica is handed back, a failed, timed-out or cancelled
+        // wait retires the workload: the reconciler may still be creating
+        // its container, which nothing would otherwise track or remove.
+        let guard = self.plane.retire_on_drop(
+            workload_id,
+            "HandoffFailed",
+            format!(
+                "deployment {} stopped waiting for container {}",
+                self.deployment_id, request.container_name
+            ),
+        );
+        let handed_over = self
+            .await_replica(workload_id, &request.container_name)
+            .await;
         // The values were only needed for the create.
         drop(staged);
-        let (handle, status) = self
-            .plane
-            .instance_status(view.id)
-            .await
-            .map_err(|e| self.plane_error("inspect the started replica", e))?
-            .ok_or_else(|| {
-                self.plane_error(
-                    "find the started replica",
-                    format!("workload {} reports Running but has no instance", view.id),
-                )
-            })?;
+        let (view, handle, status) = match handed_over {
+            Ok(replica) => {
+                guard.disarm();
+                replica
+            }
+            Err(error) => {
+                if let Err(retire_error) = guard.retire(&error.to_string()).await {
+                    tracing::error!(
+                        deployment_id = self.deployment_id,
+                        workload_id,
+                        "retiring workload {workload_id} after its failed handoff failed: \
+                         {retire_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let host_port = status
             .published_ports
             .iter()
@@ -594,6 +603,44 @@ impl ContainerDeployer for PlaneContainerDeployer {
 }
 
 impl PlaneContainerDeployer {
+    /// Wait for workload `workload_id`'s replica to run, then read its
+    /// instance: everything between the apply and the handoff that can fail.
+    async fn await_replica(
+        &self,
+        workload_id: i64,
+        container_name: &str,
+    ) -> Result<
+        (
+            temps_workload_plane::WorkloadView,
+            temps_workload::InstanceHandle,
+            temps_workload::InstanceStatus,
+        ),
+        DeployerError,
+    > {
+        let view = self
+            .plane
+            .wait_for(workload_id, ConditionKind::Running, self.ready_timeout)
+            .await
+            .map_err(|e| {
+                self.plane_error(
+                    &format!("start {container_name} (workload {workload_id})"),
+                    e,
+                )
+            })?;
+        let (handle, status) = self
+            .plane
+            .instance_status(view.id)
+            .await
+            .map_err(|e| self.plane_error("inspect the started replica", e))?
+            .ok_or_else(|| {
+                self.plane_error(
+                    "find the started replica",
+                    format!("workload {} reports Running but has no instance", view.id),
+                )
+            })?;
+        Ok((view, handle, status))
+    }
+
     async fn retire(&self, workload_id: i64, container_id: &str) -> Result<(), DeployerError> {
         self.plane
             .delete(
@@ -803,6 +850,114 @@ mod tests {
         assert!(
             message.contains("ADR 045") && message.contains("'shop'"),
             "{message}"
+        );
+    }
+
+    /// The node's deployer, which a handoff that never completes never calls.
+    struct UnusedDeployer;
+
+    fn unused(operation: &str) -> DeployerError {
+        DeployerError::DeploymentFailed(format!("the test deployer does not {operation}"))
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for UnusedDeployer {
+        async fn deploy_container(&self, _: DeployRequest) -> Result<DeployResult, DeployerError> {
+            Err(unused("deploy"))
+        }
+        async fn exec_in_container(
+            &self,
+            _: &str,
+            _: Vec<String>,
+            _: Duration,
+        ) -> Result<temps_deployer::ExecResult, DeployerError> {
+            Err(unused("exec"))
+        }
+        async fn start_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("start"))
+        }
+        async fn stop_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("stop"))
+        }
+        async fn pause_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("pause"))
+        }
+        async fn resume_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("resume"))
+        }
+        async fn remove_container(&self, _: &str) -> Result<(), DeployerError> {
+            Err(unused("remove"))
+        }
+        async fn get_container_info(&self, _: &str) -> Result<ContainerInfo, DeployerError> {
+            Err(unused("inspect"))
+        }
+        async fn get_container_stats(
+            &self,
+            _: &str,
+        ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+            Err(unused("read stats"))
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            Ok(Vec::new())
+        }
+        async fn get_container_logs(&self, _: &str) -> Result<String, DeployerError> {
+            Err(unused("read logs"))
+        }
+        async fn stream_container_logs(
+            &self,
+            _: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+            Err(unused("stream logs"))
+        }
+    }
+
+    struct AcceptingAudit;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for AcceptingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_handoff_that_times_out_retires_the_applied_workload() {
+        use sea_orm::EntityTrait;
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        // No reconciler runs, so the replica never reports Running.
+        let plane = Arc::new(WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-handoff-test"),
+        ));
+        let deployer = PlaneContainerDeployer::new(
+            plane,
+            Arc::new(UnusedDeployer),
+            42,
+            Duration::from_millis(300),
+        );
+        let error = deployer
+            .deploy_container(request())
+            .await
+            .expect_err("the wait times out");
+        assert!(error.to_string().contains("app-production-42-1"), "{error}");
+        let rows = temps_entities::workloads::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("workloads");
+        assert_eq!(rows.len(), 1, "one workload was applied");
+        assert!(
+            rows[0].deleted_at.is_some(),
+            "and retired, so the reconciler removes whatever it created"
         );
     }
 }
