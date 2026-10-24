@@ -68,7 +68,8 @@ pub enum AccessOutcome {
     LoginRequired,
     /// Refused for a reason with no legacy equivalent (country, signed link).
     Forbidden,
-    /// The environment enforces an endpoint that did not compile.
+    /// The environment enforces, but no compiled policy decides this
+    /// request (see [`MissingPolicy`]); refused rather than let through.
     Unavailable,
 }
 
@@ -501,6 +502,56 @@ impl EndpointRequest<'_> {
     }
 }
 
+/// Why an enforcing environment's request has no compiled endpoint to
+/// decide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingPolicy {
+    /// No ingress load has completed yet (the snapshot is the empty
+    /// default), so no environment's policy is known.
+    NotLoaded,
+    /// One of the environment's endpoints did not compile, or stores a
+    /// policy kind this phase does not enforce.
+    Broken,
+    /// The snapshot has no endpoint of this environment covering the path:
+    /// a failed reload kept an older snapshot from before it enforced, or
+    /// no endpoint row covers the path.
+    NoEndpoint,
+}
+
+impl MissingPolicy {
+    /// A stable label for logs.
+    pub fn label(&self) -> &'static str {
+        match self {
+            MissingPolicy::NotLoaded => "ingress_snapshot_not_loaded",
+            MissingPolicy::Broken => "endpoint_broken",
+            MissingPolicy::NoEndpoint => "no_endpoint",
+        }
+    }
+}
+
+/// The endpoint that decides an enforcing environment's request at `path`.
+///
+/// Enforce never falls back to the legacy chain: a stored policy such as a
+/// Temps login exists only in the compiled endpoint, so any state that
+/// cannot produce the environment's endpoint refuses the request. A broken
+/// environment refuses even where another of its endpoints compiled: the
+/// broken one may be the more specific path prefix this request belongs to.
+pub fn enforcing_endpoint<'s>(
+    snapshot: &'s temps_routes::ingress::IngressSnapshot,
+    environment_id: i32,
+    path: &str,
+) -> Result<&'s CompiledEndpoint, MissingPolicy> {
+    if !snapshot.is_loaded() {
+        return Err(MissingPolicy::NotLoaded);
+    }
+    if snapshot.is_broken(environment_id) {
+        return Err(MissingPolicy::Broken);
+    }
+    snapshot
+        .environment_endpoint(environment_id, path)
+        .ok_or(MissingPolicy::NoEndpoint)
+}
+
 /// The enforcing evaluation, counting against `limiter`, from policy
 /// `start`. `captcha_passed` is the completion the caller read after a
 /// [`Step::NeedsCaptcha`].
@@ -706,8 +757,32 @@ impl ConsumedExchanges {
     }
 }
 
+/// The `Path` attribute of a session cookie: `prefix` (a path route's, so
+/// the target's cookie sits beside the host's own instead of replacing it)
+/// when it is a plain absolute path, `/` otherwise. Never lets a prefix
+/// inject another cookie attribute.
+pub fn session_cookie_path(prefix: Option<&str>) -> &str {
+    match prefix {
+        Some(prefix)
+            if prefix.starts_with('/')
+                && prefix.len() <= 512
+                && prefix.bytes().all(|b| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~' | b'%')
+                }) =>
+        {
+            prefix
+        }
+        _ => "/",
+    }
+}
+
 /// Trades the exchange grant in the query of a request to
 /// [`GRANT_EXCHANGE_PATH`] for a session grant cookie (ADR-055 §11).
+///
+/// `cookie_path` scopes the cookie: the path route's prefix when the
+/// exchange is for a path-routed target, so signing in to it does not
+/// overwrite the session of the host's own environment.
 ///
 /// The exchange grant must be signed by the endpoint owner's key, for this
 /// host and the endpoint's `TempsLogin` permission, unexpired and not
@@ -720,6 +795,7 @@ pub fn exchange_grant(
     consumed: &ConsumedExchanges,
     query: Option<&str>,
     secure: bool,
+    cookie_path: Option<&str>,
 ) -> Result<SessionExchange, ExchangeError> {
     let owner = endpoint.owner;
     let permission = endpoint
@@ -765,7 +841,8 @@ pub fn exchange_grant(
     )
     .map_err(|source| ExchangeError::Refused { owner, source })?;
     let set_cookie = format!(
-        "{SESSION_COOKIE_NAME}={session}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax{}",
+        "{SESSION_COOKIE_NAME}={session}; Path={}; Max-Age={}; HttpOnly; SameSite=Lax{}",
+        session_cookie_path(cookie_path),
         grant::SESSION_GRANT_TTL_SECS,
         if secure { "; Secure" } else { "" }
     );
@@ -821,6 +898,100 @@ mod tests {
             access,
         })
         .expect("test endpoint compiles")
+    }
+
+    fn raw_endpoint(
+        id: i64,
+        environment_id: i64,
+        path_prefix: Option<&str>,
+        access: Vec<AccessPolicy>,
+    ) -> Endpoint {
+        Endpoint {
+            id,
+            owner: ProductRef {
+                kind: ProductKind::Environment,
+                id: environment_id,
+            },
+            target: EndpointTarget::Product,
+            hosts: Vec::new(),
+            path_prefix: path_prefix.map(str::to_string),
+            protocol: EndpointProtocol::Http,
+            server_requires_tls: false,
+            access,
+        }
+    }
+
+    fn login() -> AccessPolicy {
+        AccessPolicy::TempsLogin {
+            permission: temps_routes::ingress::ENVIRONMENT_LOGIN_PERMISSION.into(),
+        }
+    }
+
+    fn built(endpoints: Vec<Endpoint>) -> temps_routes::ingress::IngressSnapshot {
+        temps_routes::ingress::IngressSnapshot::build(
+            endpoints,
+            std::collections::HashMap::new(),
+            Revocations::default(),
+        )
+    }
+
+    #[test]
+    fn enforcing_refuses_before_any_ingress_load_succeeded() {
+        // What the route table publishes when the first ingress load fails:
+        // the default snapshot, which must not read as "no restrictions".
+        let snapshot = temps_routes::ingress::IngressSnapshot::default();
+        assert_eq!(
+            enforcing_endpoint(&snapshot, 7, "/").err(),
+            Some(MissingPolicy::NotLoaded)
+        );
+    }
+
+    #[test]
+    fn enforcing_refuses_an_environment_the_snapshot_has_no_endpoint_for() {
+        // A kept snapshot from before environment 9 enforced: 7 is covered,
+        // 9 is not, and must be refused rather than run the legacy chain.
+        let snapshot = built(vec![raw_endpoint(1, 7, None, vec![login()])]);
+        assert!(enforcing_endpoint(&snapshot, 7, "/").is_ok());
+        assert_eq!(
+            enforcing_endpoint(&snapshot, 9, "/").err(),
+            Some(MissingPolicy::NoEndpoint)
+        );
+    }
+
+    #[test]
+    fn enforcing_refuses_a_path_no_endpoint_covers() {
+        let snapshot = built(vec![raw_endpoint(1, 7, Some("/api"), vec![login()])]);
+        assert!(enforcing_endpoint(&snapshot, 7, "/api/users").is_ok());
+        assert_eq!(
+            enforcing_endpoint(&snapshot, 7, "/").err(),
+            Some(MissingPolicy::NoEndpoint)
+        );
+    }
+
+    #[test]
+    fn a_broken_endpoint_refuses_its_environment_even_where_another_compiled() {
+        // The `/api` endpoint does not compile; the whole-host one does.
+        // `/api` must not fall through to the whole-host endpoint.
+        let snapshot = built(vec![
+            raw_endpoint(1, 7, None, vec![AccessPolicy::Public]),
+            raw_endpoint(
+                2,
+                7,
+                Some("/api"),
+                vec![AccessPolicy::Geo {
+                    allow: vec!["not-a-country".into()],
+                    deny: vec![],
+                }],
+            ),
+        ]);
+        assert_eq!(
+            enforcing_endpoint(&snapshot, 7, "/api/users").err(),
+            Some(MissingPolicy::Broken)
+        );
+        assert_eq!(
+            enforcing_endpoint(&snapshot, 7, "/").err(),
+            Some(MissingPolicy::Broken)
+        );
     }
 
     fn no_password(_: i64) -> bool {
@@ -1164,7 +1335,7 @@ mod tests {
         let query = format!("grant={token}&next=%2Fdashboard%3Ftab%3D1");
         let consumed = ConsumedExchanges::default();
         let exchange =
-            exchange_grant(&ep, &facts, &consumed, Some(&query), true).expect("exchange");
+            exchange_grant(&ep, &facts, &consumed, Some(&query), true, None).expect("exchange");
         assert_eq!(exchange.location, "/dashboard?tab=1");
         assert_eq!((exchange.grant_id, exchange.user_id), (12, 4));
         assert!(exchange.set_cookie.starts_with("_temps_ingress=tg1."));
@@ -1185,7 +1356,7 @@ mod tests {
 
         // The same grant cannot be traded again: its URL may have leaked.
         assert!(matches!(
-            exchange_grant(&ep, &facts, &consumed, Some(&query), true),
+            exchange_grant(&ep, &facts, &consumed, Some(&query), true, None),
             Err(ExchangeError::AlreadyUsed { grant_id: 12, .. })
         ));
 
@@ -1197,10 +1368,62 @@ mod tests {
             &ConsumedExchanges::default(),
             Some(&query),
             false,
+            None,
         )
         .expect("exchange");
         assert_eq!(exchange.location, "/");
         assert!(!exchange.set_cookie.contains("Secure"));
+    }
+
+    #[test]
+    fn a_path_routed_exchange_scopes_its_cookie_to_the_route_prefix() {
+        let master = [9u8; 32];
+        let none = Revocations::default();
+        let facts = GrantFacts {
+            master: &master,
+            revocations: &none,
+            host: Some("app.example.test"),
+            now_secs: T0,
+        };
+        let ep = login_endpoint();
+        let token = exchange_token(
+            &master,
+            GrantUse::Exchange,
+            "app.example.test",
+            "projects:read",
+            T0 + 60,
+        );
+        let query = format!("grant={token}&next=%2Fapi%2Fusers");
+        let exchange = exchange_grant(
+            &ep,
+            &facts,
+            &ConsumedExchanges::default(),
+            Some(&query),
+            true,
+            Some("/api"),
+        )
+        .expect("exchange");
+        assert_eq!(exchange.location, "/api/users");
+        assert!(exchange.set_cookie.contains("; Path=/api; "));
+    }
+
+    #[test]
+    fn a_cookie_path_never_carries_another_attribute() {
+        assert_eq!(session_cookie_path(None), "/");
+        assert_eq!(session_cookie_path(Some("/api")), "/api");
+        assert_eq!(
+            session_cookie_path(Some("/api/v1-beta_2")),
+            "/api/v1-beta_2"
+        );
+        for hostile in [
+            "api",
+            "/api; Domain=evil.example.test",
+            "/api\r\nSet-Cookie: x=1",
+            "/a b",
+            "",
+        ] {
+            assert_eq!(session_cookie_path(Some(hostile)), "/", "{hostile:?}");
+        }
     }
 
     #[test]
@@ -1221,7 +1444,14 @@ mod tests {
         let ep = login_endpoint();
         let consumed = ConsumedExchanges::default();
         let exchange = |token: &str, facts: &GrantFacts<'_>| {
-            exchange_grant(&ep, facts, &consumed, Some(&format!("grant={token}")), true)
+            exchange_grant(
+                &ep,
+                facts,
+                &consumed,
+                Some(&format!("grant={token}")),
+                true,
+                None,
+            )
         };
         let host = Some("app.example.test");
         let session = exchange_token(
@@ -1311,7 +1541,8 @@ mod tests {
                 &facts(host, none_ref),
                 &consumed,
                 Some("next=%2F"),
-                true
+                true,
+                None
             ),
             Err(ExchangeError::MissingGrant { .. })
         ));
@@ -1321,7 +1552,8 @@ mod tests {
                 &facts(host, none_ref),
                 &consumed,
                 Some(&format!("grant={valid}")),
-                true
+                true,
+                None
             ),
             Err(ExchangeError::NotLoginProtected { .. })
         ));

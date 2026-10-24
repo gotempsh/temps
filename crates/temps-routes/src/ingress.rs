@@ -30,12 +30,15 @@ use std::net::IpAddr;
 use std::str::FromStr;
 
 use ipnetwork::IpNetwork;
-use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{
+    ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, JoinType, QueryFilter,
+    QueryOrder, QuerySelect, RelationTrait,
+};
 use temps_core::RateLimitSettings;
 use temps_entities::ingress_mode::{IngressMode, SandboxPreviewAccess};
 use temps_entities::{
     environments, ingress_access_policies, ingress_endpoints, ingress_login_grants,
-    project_ip_access_rules, projects, sandboxes,
+    project_ip_access_rules, projects, sandboxes, users,
 };
 use temps_workload_ingress::{
     AccessPolicy, CompiledEndpoint, CompiledRoutes, Endpoint, EndpointProtocol, EndpointTarget,
@@ -417,6 +420,11 @@ pub struct IngressSnapshot {
     /// Non-legacy environments whose endpoint did not compile. An enforcing
     /// proxy refuses their requests rather than guessing.
     broken: HashSet<i32>,
+    /// Whether this snapshot was built from a completed load. The default
+    /// (before the first load succeeds) is not: it knows no environment's
+    /// policy, so an enforcing proxy must refuse rather than read its
+    /// emptiness as "no restrictions".
+    loaded: bool,
 }
 
 impl IngressSnapshot {
@@ -464,7 +472,13 @@ impl IngressSnapshot {
             passwords,
             revocations,
             broken,
+            loaded: true,
         }
+    }
+
+    /// Whether this snapshot came from a completed load (see `loaded`).
+    pub fn is_loaded(&self) -> bool {
+        self.loaded
     }
 
     /// The endpoint an environment's request at `path` is decided by.
@@ -502,16 +516,29 @@ impl IngressSnapshot {
     }
 }
 
-/// Grants revoked before they expired.
+/// Grants that must no longer admit anyone, among those not yet expired:
+/// the ones revoked explicitly, and every grant of a deleted user. The
+/// writes that remove access revoke explicitly; the deleted-user arm also
+/// covers a deletion that bypassed them (a manual `UPDATE users`), as of
+/// the next reload.
 pub async fn load_revocations(db: &DatabaseConnection) -> Result<Revocations, IngressLoadError> {
-    let ids = ingress_login_grants::Entity::find()
-        .filter(ingress_login_grants::Column::RevokedAt.is_not_null())
+    let ids: Vec<i64> = ingress_login_grants::Entity::find()
+        .select_only()
+        .column(ingress_login_grants::Column::Id)
+        .join(
+            JoinType::InnerJoin,
+            ingress_login_grants::Relation::User.def(),
+        )
         .filter(ingress_login_grants::Column::ExpiresAt.gt(chrono::Utc::now()))
+        .filter(
+            Condition::any()
+                .add(ingress_login_grants::Column::RevokedAt.is_not_null())
+                .add(users::Column::DeletedAt.is_not_null()),
+        )
+        .into_tuple()
         .all(db)
         .await
-        .map_err(db_err("revoked login grants"))?
-        .into_iter()
-        .map(|grant| grant.id);
+        .map_err(db_err("revoked login grants"))?;
     Ok(Revocations::new(ids))
 }
 
@@ -996,6 +1023,85 @@ mod tests {
         assert!(snapshot.environment_endpoint(8, "/").is_none());
         assert!(snapshot.is_broken(8));
         assert!(!snapshot.is_broken(7));
+    }
+
+    #[tokio::test]
+    async fn revocations_cover_revoked_grants_and_grants_of_deleted_users() {
+        use sea_orm::{ActiveModelTrait, Set};
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+                    && temps_database::test_utils::is_container_runtime_unavailable(
+                        &error.to_string(),
+                    ) =>
+            {
+                println!("Docker not available, skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("test database failed to start: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let now = chrono::Utc::now();
+        let user = |email: &str, deleted: bool| users::ActiveModel {
+            name: Set(email.to_string()),
+            email: Set(email.to_string()),
+            deleted_at: Set(deleted.then_some(now)),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        };
+        let active = user("active@example.test", false)
+            .insert(db)
+            .await
+            .expect("insert active user")
+            .id;
+        let deleted = user("deleted@example.test", true)
+            .insert(db)
+            .await
+            .expect("insert deleted user")
+            .id;
+        let grant = |user_id: i32, revoked: bool, expires_in_hours: i64| {
+            ingress_login_grants::ActiveModel {
+                user_id: Set(user_id),
+                owner_kind: Set("environment".to_string()),
+                owner_id: Set(1),
+                host: Set("app.example.test".to_string()),
+                permission: Set(ENVIRONMENT_LOGIN_PERMISSION.to_string()),
+                expires_at: Set(now + chrono::Duration::hours(expires_in_hours)),
+                revoked_at: Set(revoked.then_some(now)),
+                created_at: Set(now),
+                ..Default::default()
+            }
+        };
+        let live = grant(active, false, 12).insert(db).await.expect("grant").id;
+        let revoked = grant(active, true, 12).insert(db).await.expect("grant").id;
+        let of_deleted = grant(deleted, false, 12)
+            .insert(db)
+            .await
+            .expect("grant")
+            .id;
+        let expired_of_deleted = grant(deleted, false, -1)
+            .insert(db)
+            .await
+            .expect("grant")
+            .id;
+
+        let revocations = load_revocations(db).await.expect("load revocations");
+        assert!(!revocations.contains(live));
+        assert!(revocations.contains(revoked));
+        assert!(revocations.contains(of_deleted));
+        // Expired grants admit nobody; the snapshot need not carry them.
+        assert!(!revocations.contains(expired_of_deleted));
+        assert_eq!(revocations.len(), 2);
+    }
+
+    #[test]
+    fn only_a_built_snapshot_counts_as_loaded() {
+        assert!(!IngressSnapshot::default().is_loaded());
+        let built = IngressSnapshot::build(Vec::new(), HashMap::new(), Revocations::default());
+        assert!(built.is_loaded());
+        assert!(built.is_empty());
     }
 
     #[test]

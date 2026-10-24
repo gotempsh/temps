@@ -170,6 +170,10 @@ pub enum PreviewAuthOutcome {
     RateLimited { host: PreviewHost },
     /// Target sandbox does not exist (or DB lookup failed).
     NotFound { host: PreviewHost },
+    /// The sandbox has no password and its preview access asks for a Temps
+    /// login ([`PreviewSandboxLookup::TempsLoginUnavailable`]): reply 403
+    /// with instructions rather than serve it to anyone holding the URL.
+    TempsLoginUnavailable { host: PreviewHost },
 }
 
 /// SHA-256 of the full argon2 PHC hash, truncated to 16 hex chars. Folded
@@ -524,16 +528,23 @@ pub fn verify_argon2(plaintext: &str, hash: &str) -> bool {
 }
 
 /// Outcome of looking up a sandbox for preview auth. Distinguishes the
-/// three states that drive routing: doesn't exist, exists with no
-/// password (URL-only), exists with a configured password.
+/// states that drive routing: doesn't exist, exists with a configured
+/// password, exists with no password and URL-only access, exists with no
+/// password and a Temps-login requirement the preview host cannot meet.
 #[derive(Debug, Clone)]
 pub enum PreviewSandboxLookup {
     /// Sandbox exists and is live, with a password configured. The
     /// gateway should require a valid cookie or redirect to login.
     Protected { password_hash: String },
-    /// Sandbox exists and is live but has no password — the unguessable
-    /// hex public_id is the only gate. Forward traffic directly.
+    /// Sandbox exists and is live, has no password, and its preview access
+    /// is `legacy` or `public` — the unguessable hex public_id is the only
+    /// gate. Forward traffic directly.
     Open,
+    /// Sandbox exists and is live, has no password, and its preview access
+    /// is `temps_login` (ADR-055 §11). Preview hosts have no Temps-login
+    /// hand-off yet, so the gateway refuses instead of treating the URL as
+    /// the gate.
+    TempsLoginUnavailable,
     /// Sandbox does not exist (or is destroyed).
     NotFound,
 }
@@ -571,12 +582,7 @@ pub async fn lookup_sandbox(
             );
             PreviewSandboxLookup::NotFound
         }
-        Ok(Some(row)) => match row.preview_password_hash {
-            Some(hash) => PreviewSandboxLookup::Protected {
-                password_hash: hash,
-            },
-            None => PreviewSandboxLookup::Open,
-        },
+        Ok(Some(row)) => preview_lookup_for(row),
         Ok(None) => {
             debug!(
                 public_id = %full_public_id,
@@ -593,6 +599,35 @@ pub async fn lookup_sandbox(
             PreviewSandboxLookup::NotFound
         }
     }
+}
+
+/// How a live, control-plane sandbox row is gated: the same decision as
+/// its compiled endpoint ([`temps_routes::ingress::sandbox_endpoint`]). A
+/// preview password wins whatever the access setting; without one `legacy`
+/// and `public` leave the hostname as the gate and `temps_login` asks for
+/// a Temps login.
+pub fn preview_lookup_for(row: temps_entities::sandboxes::Model) -> PreviewSandboxLookup {
+    use temps_entities::ingress_mode::SandboxPreviewAccess;
+    match (row.preview_password_hash, row.preview_access) {
+        (Some(password_hash), _) => PreviewSandboxLookup::Protected { password_hash },
+        (None, SandboxPreviewAccess::Legacy | SandboxPreviewAccess::Public) => {
+            PreviewSandboxLookup::Open
+        }
+        (None, SandboxPreviewAccess::TempsLogin) => PreviewSandboxLookup::TempsLoginUnavailable,
+    }
+}
+
+/// The body of the 403 a [`PreviewSandboxLookup::TempsLoginUnavailable`]
+/// sandbox answers with: what is wrong and how to open the preview.
+pub fn temps_login_unavailable_message(sandbox_hex: &str) -> String {
+    format!(
+        "This preview of sandbox sbx_{sandbox_hex} requires a Temps login, which \
+         sandbox preview URLs do not support yet, so it is not served to anyone \
+         holding the URL.\n\
+         To open it, set a preview password on the sandbox: on its page in the \
+         Temps console (Preview password), or with \
+         PUT /v1/sandboxes/sbx_{sandbox_hex}/preview-password.\n"
+    )
 }
 
 /// TTL for sandbox lookup cache entries (both `Protected` and `NotFound`).
@@ -721,7 +756,8 @@ impl SandboxLookupCache {
 ///
 /// Order of operations:
 /// 1. Look up the sandbox row.
-/// 2. If missing → NotFound; if unprotected → Allow.
+/// 2. If missing → NotFound; if unprotected → Allow; if it asks for a
+///    Temps login the preview host cannot hand off → TempsLoginUnavailable.
 /// 3. Rate-limit gate.
 /// 4. If a valid `temps_preview_sbx_<hex>` cookie is present → Allow.
 /// 5. Otherwise → LoginRequired (caller issues a 303 to the login form).
@@ -743,6 +779,9 @@ pub async fn check_preview_auth(
         }
         PreviewSandboxLookup::Open => {
             return PreviewAuthOutcome::Allow { host };
+        }
+        PreviewSandboxLookup::TempsLoginUnavailable => {
+            return PreviewAuthOutcome::TempsLoginUnavailable { host };
         }
         PreviewSandboxLookup::Protected { password_hash } => {
             if limiter.is_blocked(client_ip, &host.hex) {
@@ -1213,7 +1252,7 @@ mod tests {
             expires_at: now,
             preview_password_hash: password_hash.map(|s| s.to_string()),
             preview_password_hint: None,
-            preview_access: Default::default(),
+            preview_access: temps_entities::ingress_mode::SandboxPreviewAccess::Legacy,
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -1341,6 +1380,75 @@ mod tests {
         // The same sandbox on the control plane is still served.
         let local = lookup_sandbox(&db, "aabbccdd11223344").await;
         assert!(matches!(local, PreviewSandboxLookup::Open), "{local:?}");
+    }
+
+    /// ADR-055 §11: `sandboxes.preview_access` decides a passwordless
+    /// sandbox. `temps_login` is never served to anyone holding the URL; a
+    /// password still gates every setting.
+    #[tokio::test]
+    async fn a_passwordless_temps_login_sandbox_is_not_served_anonymously() {
+        use temps_entities::ingress_mode::SandboxPreviewAccess;
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let with = |access: SandboxPreviewAccess, password: Option<&str>| sandboxes::Model {
+            preview_access: access,
+            ..sandbox_model("sbx_aabbccdd11223344", "running", password)
+        };
+        assert!(matches!(
+            preview_lookup_for(with(SandboxPreviewAccess::TempsLogin, None)),
+            PreviewSandboxLookup::TempsLoginUnavailable
+        ));
+        for access in [SandboxPreviewAccess::Legacy, SandboxPreviewAccess::Public] {
+            assert!(
+                matches!(
+                    preview_lookup_for(with(access, None)),
+                    PreviewSandboxLookup::Open
+                ),
+                "{access:?}"
+            );
+        }
+        for access in [
+            SandboxPreviewAccess::Legacy,
+            SandboxPreviewAccess::TempsLogin,
+            SandboxPreviewAccess::Public,
+        ] {
+            assert!(
+                matches!(
+                    preview_lookup_for(with(access, Some(hash))),
+                    PreviewSandboxLookup::Protected { .. }
+                ),
+                "{access:?}"
+            );
+        }
+
+        // End to end through the gateway check, with no cookie at all.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![with(SandboxPreviewAccess::TempsLogin, None)]])
+                .into_connection(),
+        );
+        let cache = SandboxLookupCache::new(db);
+        let crypto = CookieCrypto::new("0123456789abcdef0123456789abcdef").expect("crypto");
+        let outcome = check_preview_auth(
+            &cache,
+            &crypto,
+            &PreviewAuthLimiter::new(),
+            parse_preview_host(
+                "ws-aabbccdd11223344-3000.preview.example.test",
+                "preview.example.test",
+            )
+            .expect("preview host"),
+            IpAddr::from([127, 0, 0, 1]),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(outcome, PreviewAuthOutcome::TempsLoginUnavailable { .. }),
+            "{outcome:?}"
+        );
+
+        let message = temps_login_unavailable_message("aabbccdd11223344");
+        assert!(message.contains("sbx_aabbccdd11223344"));
+        assert!(message.contains("/v1/sandboxes/sbx_aabbccdd11223344/preview-password"));
     }
 
     /// A missing sandbox resolves to NotFound which is also cached so repeated

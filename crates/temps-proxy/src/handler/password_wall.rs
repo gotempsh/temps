@@ -144,6 +144,15 @@ pub fn environment_has_password_wall(environment: &temps_entities::environments:
 /// goes to the reserved [`PASSWORD_VERIFY_PATH`], which never matches a path
 /// route; it is matched by the routed path it carries instead, and only
 /// kept when the proxy will handle it for the target ([`keep_path_route_for_verify`]).
+///
+/// The Temps-login exchange is the same shape: the console sends the
+/// browser back to the reserved [`GRANT_EXCHANGE_PATH`](crate::ingress::GRANT_EXCHANGE_PATH)
+/// on the host, which never matches a path route either. It is matched by
+/// the `next` path the sign-in started from, and only kept when the target
+/// enforces its ingress endpoint ([`keep_path_route_for_exchange`]), so the
+/// grant is traded for the environment that asked for the login. Client
+/// input only selects among the prefixes this host already serves, and a
+/// grant minted for one environment never validates for another.
 pub fn resolve_request_path_route(
     method: &str,
     path: &str,
@@ -155,7 +164,41 @@ pub fn resolve_request_path_route(
             .and_then(|routed_path| match_route(&routed_path))
             .and_then(keep_path_route_for_verify);
     }
+    if method == "GET" && path == crate::ingress::GRANT_EXCHANGE_PATH {
+        return exchange_next_path(query)
+            .and_then(|routed_path| match_route(&routed_path))
+            .and_then(keep_path_route_for_exchange);
+    }
     match_route(path)
+}
+
+/// The path (no query) a Temps-login exchange returns the browser to, read
+/// from its `next` parameter. `None` when absent, not a same-origin path, or
+/// `/` (which no path route matches).
+pub fn exchange_next_path(query: Option<&str>) -> Option<String> {
+    let value = url::form_urlencoded::parse(query?.as_bytes())
+        .find(|(key, _)| key == "next")
+        .map(|(_, value)| value.into_owned())?;
+    let path = crate::ingress::sanitize_next(&value);
+    let path = path.split(['?', '#']).next().unwrap_or("/");
+    (path != "/").then(|| path.to_string())
+}
+
+/// Keep a path route found for a login exchange only when the proxy will
+/// answer that exchange for the target: the target enforces its ingress
+/// endpoint (only an enforced endpoint asks for a Temps login), or it is
+/// asleep and must be woken before it can be decided. Anything else leaves
+/// the exchange with the host's own environment, as before.
+pub fn keep_path_route_for_exchange(
+    route: temps_routes::PathRoute,
+) -> Option<temps_routes::PathRoute> {
+    let keep = match route.target.as_ref() {
+        Some(target) => target.environment.as_deref().is_some_and(|environment| {
+            environment.ingress_mode == temps_entities::ingress_mode::IngressMode::Enforce
+        }),
+        None => route.sleeping_environment_id.is_some(),
+    };
+    keep.then_some(route)
 }
 
 /// Keep a path route found for a verify POST only when the proxy will
@@ -689,6 +732,89 @@ mod tests {
             let route = route_to(Some(walled_environment(enabled)), None);
             assert!(keep_path_route_for_verify(route).is_none(), "{enabled:?}");
         }
+    }
+
+    fn enforcing_environment() -> temps_entities::environments::Model {
+        let mut environment = walled_environment(None);
+        environment.ingress_mode = temps_entities::ingress_mode::IngressMode::Enforce;
+        environment
+    }
+
+    #[test]
+    fn a_login_exchange_resolves_the_routed_target_it_was_minted_for() {
+        let table = table_routing_api_to(enforcing_environment());
+        let lookup = |path: &str| table.match_path_route("web.example.com", path);
+
+        let route = resolve_request_path_route(
+            "GET",
+            crate::ingress::GRANT_EXCHANGE_PATH,
+            Some("grant=tg1.x&next=%2Fapi%2Fusers%3Ftab%3D1"),
+            lookup,
+        )
+        .expect("the exchange for a routed next resolves to the target");
+        assert_eq!(route.prefix, "/api");
+        assert_eq!(
+            route
+                .target
+                .and_then(|target| target.environment)
+                .map(|environment| environment.id),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn a_login_exchange_stays_with_the_host_unless_next_selects_an_enforcing_route() {
+        let enforcing = table_routing_api_to(enforcing_environment());
+        let lookup = |path: &str| enforcing.match_path_route("web.example.com", path);
+        for query in [
+            None,
+            Some("grant=tg1.x"),
+            Some("grant=tg1.x&next=%2Fother"),
+            Some("grant=tg1.x&next=%2F"),
+            Some("grant=tg1.x&next=%2F%2Fevil.example.test%2Fapi"),
+            Some("grant=tg1.x&next=https%3A%2F%2Fevil.example.test%2Fapi"),
+            // `pr` is the password wall's selector, not the exchange's.
+            Some("grant=tg1.x&pr=%2Fapi"),
+        ] {
+            assert!(
+                resolve_request_path_route(
+                    "GET",
+                    crate::ingress::GRANT_EXCHANGE_PATH,
+                    query,
+                    lookup
+                )
+                .is_none(),
+                "{query:?}"
+            );
+        }
+        // Only the exchange GET is rerouted by `next`.
+        assert!(resolve_request_path_route(
+            "POST",
+            crate::ingress::GRANT_EXCHANGE_PATH,
+            Some("next=%2Fapi"),
+            lookup
+        )
+        .is_none());
+
+        // A target that does not enforce its endpoint never asked for a login.
+        let legacy = table_routing_api_to(walled_environment(None));
+        let lookup = |path: &str| legacy.match_path_route("web.example.com", path);
+        assert!(resolve_request_path_route(
+            "GET",
+            crate::ingress::GRANT_EXCHANGE_PATH,
+            Some("next=%2Fapi%2Fusers"),
+            lookup
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn a_login_exchange_wakes_a_sleeping_target_and_drops_an_undeployed_one() {
+        assert!(keep_path_route_for_exchange(route_to(None, Some(20))).is_some());
+        assert!(keep_path_route_for_exchange(route_to(None, None)).is_none());
+        assert!(
+            keep_path_route_for_exchange(route_to(Some(enforcing_environment()), None)).is_some()
+        );
     }
 
     #[test]

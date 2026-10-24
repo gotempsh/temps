@@ -1621,6 +1621,7 @@ impl SandboxService {
             created_at: Set(now),
             last_activity_at: Set(now),
             expires_at: Set(now + chrono::Duration::seconds(timeout as i64)),
+            preview_access: Set(NEW_SANDBOX_PREVIEW_ACCESS),
             ..Default::default()
         };
         let row = active.insert(self.db.as_ref()).await?;
@@ -2249,6 +2250,7 @@ impl SandboxService {
             expires_at: Set(expires_at),
             preview_password_hash: Set(preview.as_ref().map(|p| p.hash.clone())),
             preview_password_hint: Set(preview.as_ref().map(|p| p.hint.clone())),
+            preview_access: Set(NEW_SANDBOX_PREVIEW_ACCESS),
             lifecycle: Set(lifecycle.as_str().to_string()),
             project_id: Set(req.project_id),
             source_repo_url: Set(source_repo_url),
@@ -6078,6 +6080,18 @@ fn source_import_aggregate_bounds_script(work_dir: &str, staging_dir: &str) -> S
     )
 }
 
+/// The preview access a sandbox is created with, written explicitly so the
+/// stored setting is the one the proxy enforces and the console describes.
+///
+/// ADR-055 §11 defaults sandboxes to `temps_login` (the column's database
+/// default), but preview hosts have no Temps-login hand-off yet: the proxy
+/// refuses a passwordless `temps_login` preview outright rather than serve
+/// it to anyone holding the URL. Until that hand-off exists, new sandboxes
+/// keep `legacy` -- the preview password when one is set, otherwise the
+/// unguessable hostname, exactly as the sandbox page says.
+pub const NEW_SANDBOX_PREVIEW_ACCESS: temps_entities::ingress_mode::SandboxPreviewAccess =
+    temps_entities::ingress_mode::SandboxPreviewAccess::Legacy;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -6684,6 +6698,18 @@ pub(crate) mod tests {
             ..Default::default()
         };
         assert_eq!(r.preview_password.as_deref(), Some("hunter2secret"));
+    }
+
+    /// The proxy refuses a passwordless `temps_login` preview (ADR-055
+    /// §11) until preview hosts can hand off a Temps login, so sandboxes
+    /// must not be created with it, or every one created without a
+    /// password would be unreachable while the console calls it open.
+    #[test]
+    fn new_sandboxes_get_a_preview_access_the_proxy_serves() {
+        assert_eq!(
+            NEW_SANDBOX_PREVIEW_ACCESS,
+            temps_entities::ingress_mode::SandboxPreviewAccess::Legacy
+        );
     }
 
     /// Destroy must actually target the directory create allocated —

@@ -1938,6 +1938,13 @@ impl From<UserServiceError> for Problem {
                 retry_after_seconds,
                 ..
             } => mfa_locked_problem(retry_after_seconds),
+            e @ UserServiceError::IngressGrantRevocation { .. } => {
+                let message = e.to_string();
+                error!("{}", message);
+                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Access Revocation Failed")
+                    .with_detail(message)
+            }
             UserServiceError::PasswordResetOnDeletedUser { user_id } => {
                 problem_new(StatusCode::CONFLICT)
                     .with_title("User Deleted")

@@ -1215,6 +1215,33 @@ pub struct LoadBalancer {
 const CLIENT_CLOSED_REQUEST: u16 = 499;
 
 /// Project outages share a key; unscoped routes use their actual upstream.
+/// Refuse a preview of a passwordless sandbox whose preview access asks for
+/// a Temps login (ADR-055 §11), which preview hosts cannot hand off yet:
+/// 403 with what to do, instead of serving it to anyone holding the URL.
+async fn write_preview_temps_login_unavailable(
+    session: &mut PingoraSession,
+    ctx: &mut ProxyContext,
+    sandbox_hex: &str,
+) -> Result<bool> {
+    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+    response.insert_header("Cache-Control", "no-store")?;
+    response.insert_header("X-Request-ID", &ctx.request_id)?;
+    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+    session
+        .write_response_header(Box::new(response), false)
+        .await?;
+    session
+        .write_response_body(
+            Some(Bytes::from(
+                crate::preview_auth::temps_login_unavailable_message(sandbox_hex),
+            )),
+            true,
+        )
+        .await?;
+    ctx.routing_status = "preview_temps_login_unavailable".to_string();
+    Ok(true)
+}
+
 fn upstream_failure_key(
     project_id: Option<i32>,
     environment_id: Option<i32>,
@@ -4078,6 +4105,12 @@ const HTTPS_REQUIRED_HTML: &str = r#"<!DOCTYPE html>
 static INGRESS_SHADOW_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
     crate::ip_access::DenyLogLimiter::new(10, 20);
 
+/// Caps "enforcing environment has no compiled endpoint" log lines at 20
+/// per 10 seconds, process-wide: a missing snapshot refuses every request
+/// of every enforcing environment, which must not become a log flood.
+static INGRESS_UNAVAILABLE_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
+    crate::ip_access::DenyLogLimiter::new(10, 20);
+
 /// The request facts [`LoadBalancer::decide_environment_access`] reads.
 /// Plain borrows, so the decision can await the captcha cache without
 /// holding the request context.
@@ -4110,9 +4143,11 @@ impl LoadBalancer {
     /// The access decision for an environment request (ADR-055 §11).
     ///
     /// `legacy` runs the legacy chain. `enforce` runs the environment's
-    /// compiled endpoint when the route snapshot has one, refuses when its
-    /// endpoint did not compile, and otherwise (a reload in flight) runs
-    /// the legacy chain. `shadow` decides with the legacy chain and also
+    /// compiled endpoint, and refuses whenever the route snapshot cannot
+    /// provide it (never loaded, the endpoint did not compile, or no
+    /// endpoint covers the path): a stored policy such as a Temps login
+    /// lives only in the endpoint, so falling back to the legacy chain
+    /// would drop it. `shadow` decides with the legacy chain and also
     /// evaluates the endpoint from the facts the chain recorded, counting
     /// every disagreement.
     ///
@@ -4130,8 +4165,9 @@ impl LoadBalancer {
         access: AccessRequest<'_>,
     ) -> crate::ingress::AccessOutcome {
         use crate::ingress::{
-            enforce_step, grant_host, legacy_access, legacy_after_captcha, shadow_step,
-            AccessOutcome, EndpointRequest, GrantFacts, LegacyFacts, LegacyRequest, Step,
+            enforce_step, enforcing_endpoint, grant_host, legacy_access, legacy_after_captcha,
+            shadow_step, AccessOutcome, EndpointRequest, GrantFacts, LegacyFacts, LegacyRequest,
+            Step,
         };
         use temps_entities::ingress_mode::IngressMode;
 
@@ -4160,17 +4196,31 @@ impl LoadBalancer {
         } else {
             None
         };
-        let endpoint = snapshot
+        // Shadow and enforce read the same endpoint: what enforcing would
+        // decide with, or why it would refuse.
+        let enforcing = snapshot
             .as_deref()
-            .and_then(|snapshot| snapshot.environment_endpoint(environment_id, access.path));
-        let broken = snapshot
-            .as_deref()
-            .is_some_and(|snapshot| snapshot.is_broken(environment_id));
+            .map(|snapshot| enforcing_endpoint(snapshot, environment_id, access.path));
         let mut host_buffer = [0u8; 256];
         let host = grant_host(access.host, &mut host_buffer);
 
         if mode == IngressMode::Enforce {
-            if let (Some(snapshot), Some(endpoint)) = (snapshot.as_deref(), endpoint) {
+            if let (Some(snapshot), Some(enforcing)) = (snapshot.as_deref(), enforcing) {
+                let endpoint = match enforcing {
+                    Ok(endpoint) => endpoint,
+                    Err(missing) => {
+                        if let Some(suppressed) = INGRESS_UNAVAILABLE_LOG_LIMITER.admit(now_secs) {
+                            warn!(
+                                environment_id,
+                                project_id = project_ctx.project.id,
+                                reason = missing.label(),
+                                suppressed_since_last_log = suppressed,
+                                "Environment enforces an ingress endpoint the route snapshot cannot provide; refusing the request"
+                            );
+                        }
+                        return AccessOutcome::Unavailable;
+                    }
+                };
                 let request = EndpointRequest {
                     request: access.request,
                     environment_id,
@@ -4208,9 +4258,6 @@ impl LoadBalancer {
                     }
                 };
             }
-            if broken {
-                return AccessOutcome::Unavailable;
-            }
         }
 
         let legacy = LegacyRequest {
@@ -4236,8 +4283,8 @@ impl LoadBalancer {
         };
 
         if mode == IngressMode::Shadow {
-            let shadow = match (snapshot.as_deref(), endpoint) {
-                (Some(snapshot), Some(endpoint)) => {
+            let shadow = match (snapshot.as_deref(), enforcing) {
+                (Some(snapshot), Some(Ok(endpoint))) => {
                     let request = EndpointRequest {
                         request: access.request,
                         environment_id,
@@ -4255,8 +4302,9 @@ impl LoadBalancer {
                     Some((endpoint.id, shadow_step(endpoint, &request, &facts)))
                 }
                 // Enforcing would refuse this request.
-                _ if broken => Some((0, AccessOutcome::Unavailable)),
-                // No endpoint yet (a reload in flight): nothing to compare.
+                (Some(_), Some(Err(_))) => Some((0, AccessOutcome::Unavailable)),
+                // The snapshot is not consulted (a plugin request policy or
+                // IP gate decides): nothing to compare.
                 _ => None,
             };
             if let Some((endpoint_id, shadow)) = shadow {
@@ -4290,6 +4338,7 @@ impl LoadBalancer {
         host: &str,
         query: Option<&str>,
         secure: bool,
+        cookie_path: Option<&str>,
     ) -> Result<crate::ingress::SessionExchange, crate::ingress::ExchangeError> {
         let owner = temps_workload_ingress::ProductRef {
             kind: temps_workload_ingress::ProductKind::Environment,
@@ -4315,7 +4364,14 @@ impl LoadBalancer {
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         };
-        crate::ingress::exchange_grant(endpoint, &grants, &self.consumed_exchanges, query, secure)
+        crate::ingress::exchange_grant(
+            endpoint,
+            &grants,
+            &self.consumed_exchanges,
+            query,
+            secure,
+            cookie_path,
+        )
     }
 }
 
@@ -5639,6 +5695,9 @@ impl ProxyHttp for LoadBalancer {
                             ctx.routing_status = "preview_login_not_required".to_string();
                             return Ok(true);
                         }
+                        PreviewSandboxLookup::TempsLoginUnavailable => {
+                            return write_preview_temps_login_unavailable(session, ctx, &hex).await;
+                        }
                         PreviewSandboxLookup::NotFound => {
                             let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
                             response.insert_header("Cache-Control", "no-store")?;
@@ -6096,6 +6155,14 @@ impl ProxyHttp for LoadBalancer {
                         ctx.routing_status = "preview_not_found".to_string();
                         return Ok(true);
                     }
+                    PreviewAuthOutcome::TempsLoginUnavailable { host } => {
+                        debug!(
+                            target = %host.label(),
+                            "preview-auth: passwordless sandbox requires a Temps login"
+                        );
+                        return write_preview_temps_login_unavailable(session, ctx, &host.hex)
+                            .await;
+                    }
                 }
             }
         }
@@ -6293,8 +6360,11 @@ impl ProxyHttp for LoadBalancer {
         // route; `resolve_request_path_route` matches it by the routed path
         // the form carries, so the password is checked (and the cookie
         // issued) for the target environment the form was rendered for,
-        // never the host's own. Client input only selects among the
-        // prefixes this host already serves.
+        // never the host's own. The Temps-login exchange callback is matched
+        // the same way, by the `next` path its sign-in started from, so the
+        // grant is traded (and the cookie scoped) for the routed target.
+        // Client input only selects among the prefixes this host already
+        // serves.
         if ctx.preview_route.is_none() {
             ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
                 &ctx.method,
@@ -6808,11 +6878,7 @@ impl ProxyHttp for LoadBalancer {
                     return Ok(true);
                 }
                 crate::ingress::AccessOutcome::Unavailable => {
-                    warn!(
-                        project_id = project_ctx.project.id,
-                        environment_id = project_ctx.environment.id,
-                        "Environment enforces an ingress endpoint that did not compile; refusing the request"
-                    );
+                    // Logged (rate-limited, with the reason) where it was decided.
                     let mut response =
                         ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
                     response.insert_header("Cache-Control", "no-store")?;
@@ -6823,7 +6889,9 @@ impl ProxyHttp for LoadBalancer {
                         .await?;
                     session
                         .write_response_body(
-                            Some(Bytes::from_static(b"Service unavailable\n")),
+                            Some(Bytes::from_static(
+                                b"Service unavailable: this environment's access policy is not available\n",
+                            )),
                             true,
                         )
                         .await?;
@@ -6834,11 +6902,14 @@ impl ProxyHttp for LoadBalancer {
                     if ctx.path == crate::ingress::GRANT_EXCHANGE_PATH =>
                 {
                     let secure = self.is_https_request(session);
+                    // A path-routed target (resolved from the exchange's
+                    // `next`) gets a cookie scoped to its prefix.
                     let exchange = self.exchange_ingress_grant(
                         project_ctx.environment.id,
                         &ctx.host,
                         ctx.query_string.as_deref(),
                         secure,
+                        ctx.path_route.as_ref().map(|route| route.prefix.as_str()),
                     );
                     // The query holds the grant: keep it out of the proxy
                     // log, which outlives the grant and is readable by

@@ -101,7 +101,10 @@ impl From<ServiceWorkloadError> for Problem {
 }
 
 /// A database's workload mode.
+// Named apart from the environment's `WorkloadModeResponse`: both are in
+// the merged OpenAPI document, where the later one replaced this schema.
 #[derive(Debug, Clone, Serialize, ToSchema)]
+#[schema(as = ServiceWorkloadModeResponse)]
 pub struct WorkloadModeResponse {
     pub service_id: i32,
     pub service_name: String,

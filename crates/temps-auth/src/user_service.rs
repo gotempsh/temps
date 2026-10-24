@@ -134,6 +134,15 @@ pub enum UserServiceError {
         retry_after_seconds: i64,
     },
 
+    #[error(
+        "Failed to revoke the ingress login grants of user {user_id} while {operation}: {reason}"
+    )]
+    IngressGrantRevocation {
+        user_id: i32,
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -871,11 +880,23 @@ impl UserService {
         user_update.deleted_at = Set(Some(now));
         user_update.email = Set(deleted_email);
 
-        let deleted_user = user_update.update(self.db.as_ref()).await?;
+        // The soft delete and the revocation of the user's Temps-login
+        // ingress grants commit together: a deleted user must not keep
+        // opening protected environments on a cookie minted earlier.
+        let transaction = self.db.begin().await?;
+        let deleted_user = user_update.update(&transaction).await?;
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "deleting the user",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
 
         info!(
-            "Soft deleted user with id: {}, email changed to prevent duplicates",
-            user_id
+            "Soft deleted user with id: {}, email changed to prevent duplicates; revoked {} ingress login grant(s)",
+            user_id, revoked
         );
         Ok(deleted_user)
     }
@@ -894,11 +915,14 @@ impl UserService {
                 UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
             })?;
 
-        // Delete the user_role entry
+        // Delete the user_role entry. Losing a role can take away the
+        // permission a Temps-login ingress grant was minted on, so the
+        // user's grants are revoked in the same transaction.
+        let transaction = self.db.begin().await?;
         let delete_result = temps_entities::user_roles::Entity::delete_many()
             .filter(temps_entities::user_roles::Column::UserId.eq(user_id_val))
             .filter(temps_entities::user_roles::Column::RoleId.eq(role.id))
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await?;
 
         if delete_result.rows_affected == 0 {
@@ -909,10 +933,20 @@ impl UserService {
             )));
         }
 
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id_val)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id: user_id_val,
+                operation: "removing a role",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
+
         info!(
-            "Removed role {} from user {}",
+            "Removed role {} from user {}; revoked {} ingress login grant(s)",
             role_type.as_str(),
-            user_id_val
+            user_id_val,
+            revoked
         );
         Ok(())
     }
@@ -997,11 +1031,20 @@ impl UserService {
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .exec(&transaction)
             .await?;
+        // Ingress login grants are minted from those sessions; a reset that
+        // assumes the old credentials are compromised ends them too.
+        crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "resetting the password",
+                reason: e.to_string(),
+            })?;
 
         transaction.commit().await?;
 
         info!(
-            "Temporary password issued for user {}; existing sessions revoked",
+            "Temporary password issued for user {}; existing sessions and ingress login grants revoked",
             user_id
         );
         Ok((updated_user, temporary_password))

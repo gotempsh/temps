@@ -513,10 +513,30 @@ impl TeamService for DefaultTeamService {
             }
         }
 
+        // Read before the cascade removes them: every member may lose the
+        // projects this team gated, so their ingress login grants go too.
+        let member_ids: Vec<i32> = team_members::Entity::find()
+            .filter(team_members::Column::TeamId.eq(team_id))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|member| member.user_id)
+            .collect();
+
         let result = teams::Entity::delete_by_id(team_id).exec(&txn).await?;
         if result.rows_affected == 0 {
             return Err(TeamError::NotFound { team_id });
         }
+
+        temps_auth::ingress_grants::revoke_for_users(&txn, &member_ids)
+            .await
+            .map_err(|e| TeamError::IngressGrantRevocation {
+                scope: format!(
+                    "the {} member(s) of deleted team {team_id}",
+                    member_ids.len()
+                ),
+                reason: e.to_string(),
+            })?;
 
         txn.commit().await?;
 
@@ -634,14 +654,25 @@ impl TeamService for DefaultTeamService {
     }
 
     async fn remove_member(&self, team_id: i32, user_id: i32) -> Result<(), TeamError> {
+        let txn = self.db.begin().await?;
         let result = team_members::Entity::delete_many()
             .filter(team_members::Column::TeamId.eq(team_id))
             .filter(team_members::Column::UserId.eq(user_id))
-            .exec(self.db.as_ref())
+            .exec(&txn)
             .await?;
         if result.rows_affected == 0 {
             return Err(TeamError::MemberNotFound { team_id, user_id });
         }
+        // Leaving the team can take away projects it gated, which a
+        // Temps-login ingress grant may still open; revoke in the same
+        // transaction so the removal and the revocation land together.
+        temps_auth::ingress_grants::revoke_for_user(&txn, user_id)
+            .await
+            .map_err(|e| TeamError::IngressGrantRevocation {
+                scope: format!("user {user_id} (removed from team {team_id})"),
+                reason: e.to_string(),
+            })?;
+        txn.commit().await?;
         // The user is no longer a member of `team_id`, which may have
         // withdrawn their access to one or more team-gated projects.
         if let Some(ref checker) = self.checker {
@@ -666,7 +697,17 @@ impl TeamService for DefaultTeamService {
         let mut active: team_members::ActiveModel = existing.into();
         active.role = Set(req.role.to_string());
         active.updated_at = Set(Utc::now());
-        let member = active.update(self.db.as_ref()).await?;
+        // A demotion can drop the permission an ingress login grant was
+        // minted on; revoke the member's grants with the role change.
+        let txn = self.db.begin().await?;
+        let member = active.update(&txn).await?;
+        temps_auth::ingress_grants::revoke_for_user(&txn, user_id)
+            .await
+            .map_err(|e| TeamError::IngressGrantRevocation {
+                scope: format!("user {user_id} (role changed in team {team_id})"),
+                reason: e.to_string(),
+            })?;
+        txn.commit().await?;
 
         // The checker's permissions cache is keyed on exactly what this
         // call just changed — the member's `role` — so a stale
@@ -805,6 +846,20 @@ impl TeamService for DefaultTeamService {
             .exec_with_returning(&txn)
             .await?;
 
+        // Gating a previously open project locks out everyone outside the
+        // team, and replacing a team's role can demote its members; either
+        // way grants minted under the old access are revoked. Adding a team
+        // to an already gated project only widens access.
+        let replaces_role = grants.iter().any(|g| g.team_id == req.team_id);
+        if grants.is_empty() || replaces_role {
+            temps_auth::ingress_grants::revoke_for_project(&txn, project_id)
+                .await
+                .map_err(|e| TeamError::IngressGrantRevocation {
+                    scope: format!("project {project_id} (team access changed)"),
+                    reason: e.to_string(),
+                })?;
+        }
+
         txn.commit().await?;
 
         // Granting access changes which users may reach this project.
@@ -921,6 +976,15 @@ impl TeamService for DefaultTeamService {
                 team_id,
             });
         }
+
+        // Members of `team_id` lose the project; their ingress login grants
+        // on it must not outlive that.
+        temps_auth::ingress_grants::revoke_for_project(&txn, project_id)
+            .await
+            .map_err(|e| TeamError::IngressGrantRevocation {
+                scope: format!("project {project_id} (team {team_id} access revoked)"),
+                reason: e.to_string(),
+            })?;
 
         txn.commit().await?;
         // All users who were allowed via `team_id` must now be denied.
@@ -1085,6 +1149,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // The team's cascaded grants are read first; this team holds none.
             .append_query_results(vec![Vec::<project_team_access::Model>::new()])
+            // Its members are read for ingress-grant revocation; none here.
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 0,
@@ -1131,6 +1197,7 @@ mod tests {
                 grant_row(1, 7, TeamRole::Admin),
                 grant_row(2, 9, TeamRole::Owner),
             ]])
+            .append_query_results(vec![Vec::<team_members::Model>::new()])
             .append_exec_results(vec![MockExecResult {
                 last_insert_id: 0,
                 rows_affected: 1,
