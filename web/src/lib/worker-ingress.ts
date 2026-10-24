@@ -87,7 +87,9 @@ export type AddressScope = 'public' | 'private' | 'cgnat' | 'local'
 
 /** Who can reach an address; mirrors `temps_core::worker_ingress::address_scope`. */
 export function addressScope(address: string): AddressScope | undefined {
-  const v4 = address.trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  const v4 = address
+    .trim()
+    .match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
   if (v4) {
     const [a, b, c] = v4.slice(1, 4).map(Number)
     if (v4.slice(1).some((part) => Number(part) > 255)) return undefined
@@ -147,3 +149,35 @@ export const ALLOW_INGRESS_COMMANDS = {
   delegated: 'temps agent ingress delegated',
   fixed: 'temps agent ingress fixed --listen auto',
 } as const
+
+/** How visitors get into a worker, at a glance: the node list and header. */
+export type WorkerIngressWay =
+  | { kind: 'tunnel'; providers: string[] }
+  | { kind: 'direct'; running: boolean }
+  | { kind: 'none' }
+
+/**
+ * Tunnels first: with one carrying the worker, open ports are a second way
+ * in. `connectors` is every tunnel in the cluster (`allTunnelsOptions`).
+ */
+export function workerIngressWay(
+  node: {
+    id: number
+    public_ingress_enabled: boolean
+    public_ingress_running?: boolean | null
+  },
+  connectors: { provider: string; nodes: { node_id: number }[] }[]
+): WorkerIngressWay {
+  const providers = [
+    ...new Set(
+      connectors
+        .filter((c) => c.nodes.some((n) => n.node_id === node.id))
+        .map((c) => c.provider)
+    ),
+  ]
+  if (providers.length > 0) return { kind: 'tunnel', providers }
+  if (node.public_ingress_enabled) {
+    return { kind: 'direct', running: node.public_ingress_running === true }
+  }
+  return { kind: 'none' }
+}

@@ -345,6 +345,17 @@ pub struct AgentConfig {
     /// [`AgentConfig::local_ingress`].
     #[serde(default)]
     pub ingress: Option<temps_core::worker_ingress::LocalIngress>,
+    /// The control-plane address `temps join` was given. Differs from
+    /// `control_plane_url` when the node registered over the mesh; a later
+    /// `temps join` compares against both to tell a rejoin of the same
+    /// cluster from a move to another (ADR 059).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_url: Option<String>,
+    /// The overlay network name `temps join` asked the control plane for
+    /// because the host already had the default one (ADR 059). Informational:
+    /// the control plane's answer is what the agent runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_network_name: Option<String>,
 }
 
 impl AgentConfig {
@@ -858,6 +869,8 @@ mod tests {
             wg_endpoint: None,
             control_plane_trust: Some(ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();

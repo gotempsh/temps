@@ -19,7 +19,10 @@ use temps_network::allocator::AllocatorError;
 use tracing::error;
 use utoipa::ToSchema;
 
-use crate::handlers::audit::{ClusterComputePoolChangedAudit, ClusterComputePoolConfirmedAudit};
+use crate::handlers::audit::{
+    ClusterComputePoolChangedAudit, ClusterComputePoolConfirmedAudit,
+    ClusterOverlayNetworkNameChangedAudit,
+};
 use crate::services::cluster_network::{reassignments, ClusterNetworkError, ClusterNetworkService};
 pub use crate::services::cluster_network::{
     ClusterNetworkChangeResponse, ClusterNetworkControlPlane, ClusterNetworkNode,
@@ -41,6 +44,13 @@ pub struct UpdateClusterNetworkRequest {
     pub compute_pool_cidr: String,
     /// Prefix of each node's subnet; keeps the current one when omitted.
     pub subnet_prefix_len: Option<u8>,
+    /// New cluster overlay network name (ADR 059); keeps the current one
+    /// when omitted. At most 9 characters: a lowercase letter, then lowercase
+    /// letters, digits, `-` or `_`. Hosts build the renamed network beside
+    /// the old one, which Temps never removes; containers move onto it as
+    /// they are redeployed.
+    #[serde(default)]
+    pub overlay_network_name: Option<String>,
 }
 
 pub(crate) fn problem(error: ClusterNetworkError) -> Problem {
@@ -51,6 +61,11 @@ pub(crate) fn problem(error: ClusterNetworkError) -> Problem {
     };
     match error {
         ClusterNetworkError::InvalidCidr { .. } => invalid(error.to_string()),
+        ClusterNetworkError::InvalidOverlayNetworkName(detail) => {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Overlay Network Name")
+                .with_detail(detail)
+        }
         ClusterNetworkError::Allocator(error) => match error {
             AllocatorError::InvalidConfig { .. } | AllocatorError::PoolExhausted { .. } => {
                 invalid(error.to_string())
@@ -125,7 +140,7 @@ pub async fn get_cluster_network(
     request_body = UpdateClusterNetworkRequest,
     responses(
         (status = 200, description = "Pool changed", body = ClusterNetworkChangeResponse),
-        (status = 400, description = "Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range"),
+        (status = 400, description = "Invalid pool or overlay network name, or the pool collides with the mesh pool, a node's address or a node's occupied range"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 409, description = "The pool is in use"),
@@ -151,6 +166,15 @@ pub async fn update_cluster_network(
     let prefix_len = request
         .subnet_prefix_len
         .unwrap_or(before.subnet_prefix_len);
+    // Checked before anything changes, so an invalid name leaves the pool
+    // untouched too.
+    if let Some(name) = request.overlay_network_name.as_deref() {
+        temps_network::overlay_name::validate_overlay_network_name(name.trim()).map_err(|e| {
+            problem(ClusterNetworkError::InvalidOverlayNetworkName(
+                e.to_string(),
+            ))
+        })?;
+    }
     let (change, first_confirmation) = state
         .service
         .change_pool(&request.compute_pool_cidr, prefix_len)
@@ -162,6 +186,23 @@ pub async fn update_cluster_network(
         ip_address: Some(metadata.ip_address.clone()),
         user_agent: metadata.user_agent.clone(),
     };
+    if let Some(name) = request.overlay_network_name.as_deref() {
+        let previous = state
+            .service
+            .change_overlay_network_name(name)
+            .await
+            .map_err(problem)?;
+        if previous != name.trim() {
+            let audit = ClusterOverlayNetworkNameChangedAudit {
+                context: context.clone(),
+                from: previous,
+                to: name.trim().to_owned(),
+            };
+            if let Err(error) = state.audit_service.create_audit_log(&audit).await {
+                error!(%error, "cluster overlay network name changed but audit record failed");
+            }
+        }
+    }
     let pool = format!(
         "{}/{}",
         change.config.compute_pool_cidr, change.config.subnet_prefix_len
@@ -244,6 +285,7 @@ mod tests {
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
             compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
             updated_at: chrono::Utc::now(),
         }
     }
@@ -295,6 +337,7 @@ mod tests {
                 .map(|_| "overlay subnet 172.20.0.0/24 ... Fix: ...".to_owned()),
             overlay_ready_cidr: ready_cidr.map(str::to_owned),
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: now,
             updated_at: now,
         }

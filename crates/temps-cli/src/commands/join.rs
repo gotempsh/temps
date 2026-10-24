@@ -105,6 +105,21 @@ pub struct JoinCommand {
     /// With `--ingress fixed`: local port for public HTTPS.
     #[arg(long, default_value_t = 443)]
     pub ingress_https_port: u16,
+
+    /// Join even though this machine is already joined to another control
+    /// plane, replacing its agent config.
+    #[arg(long)]
+    pub force: bool,
+
+    /// The control-plane address given on the command line, kept for
+    /// `agent.json` after a mesh join replaces `target` with the mesh address.
+    #[arg(skip)]
+    join_url: Option<String>,
+
+    /// The overlay network name to ask for when this machine already has the
+    /// default one (ADR 059); decided by the preflight.
+    #[arg(skip)]
+    overlay_network_name: Option<String>,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,8 +241,16 @@ impl RelayRegistrationTrust {
 /// the control plane hands out an overlay subnet it does not already use.
 /// `None` (field omitted) when they cannot be listed: the agent's heartbeat
 /// reports them, and the control plane moves an unapplied colliding subnet.
-async fn occupied_ranges_for_registration() -> Option<Vec<temps_network::occupied::OccupiedRange>> {
-    let config = temps_network::NetworkConfig::default();
+///
+/// `overlay` is the overlay this node will run: a network of another name,
+/// another cluster's `temps0` included, is reported as occupied.
+async fn occupied_ranges_for_registration(
+    overlay: Option<&str>,
+) -> Option<Vec<temps_network::occupied::OccupiedRange>> {
+    let names = overlay
+        .and_then(|name| temps_network::OverlayNames::new(name).ok())
+        .unwrap_or_default();
+    let config = temps_network::NetworkConfig::default().with_overlay_names(&names);
     let docker = bollard::Docker::connect_with_local_defaults().ok();
     let owned_devices = [
         config.bridge_name.as_str(),
@@ -782,6 +805,7 @@ impl JoinCommand {
             .unwrap_or_else(|| gethostname().unwrap_or_else(|| "worker".to_string()));
 
         println!("Joining Temps cluster as '{}'...", node_name);
+        self.preflight().await?;
 
         // Report the container platform at join time so the control plane can
         // schedule correctly from the very first deploy, instead of waiting up
@@ -829,6 +853,47 @@ impl JoinCommand {
             }
         }
 
+        Ok(())
+    }
+
+    /// Check the host before anything spends the join token (ADR 059): stop
+    /// when the join cannot work or would take this machine from another
+    /// control plane, pick a free overlay network name when the default one
+    /// is taken, and warn about held ports.
+    async fn preflight(&mut self) -> anyhow::Result<()> {
+        use super::host_preflight::{assess, gather, Purpose};
+
+        self.join_url = self.target.clone();
+        let saved = load_saved_agent_config();
+        let facts = gather(saved.as_ref()).await;
+        // Relay mode's target is a cluster id and a pairing code carries no
+        // address: neither compares with the saved control plane.
+        let target = match self.mode() {
+            JoinMode::Direct(_) | JoinMode::Outbound => self.target.clone(),
+            JoinMode::Paired(_) | JoinMode::Relay(_) => None,
+        };
+        let mut ports = vec![80, 443];
+        if self.ingress == Some(IngressFlag::Fixed) {
+            ports.extend([self.ingress_http_port, self.ingress_https_port]);
+        }
+        ports.sort_unstable();
+        ports.dedup();
+        let assessment = assess(
+            &facts,
+            Purpose::Join {
+                target: target.as_deref(),
+            },
+            &ports,
+        );
+        for finding in &assessment.findings {
+            if !finding.blocks_join(self.force) {
+                eprintln!("Warning: {}", finding.message());
+            }
+        }
+        if let Some(blocking) = assessment.blocking(self.force) {
+            anyhow::bail!("{}", blocking.message());
+        }
+        self.overlay_network_name = assessment.overlay_network_name;
         Ok(())
     }
 
@@ -1019,7 +1084,13 @@ impl JoinCommand {
             "edge_public_key": public_ingress_public_key,
             // ADR 056: the control plane allocates this node's overlay
             // subnet around what it already uses.
-            "occupied_ranges": occupied_ranges_for_registration().await,
+            "occupied_ranges": occupied_ranges_for_registration(
+                self.overlay_network_name.as_deref(),
+            )
+            .await,
+            // ADR 059: absent unless this machine already has the default
+            // overlay name for another network.
+            "overlay_network_name": self.overlay_network_name,
         });
 
         let response = control_plane
@@ -1077,6 +1148,8 @@ impl JoinCommand {
             wg_endpoint: wg_endpoint.map(|endpoint| endpoint.to_string()),
             control_plane_trust: Some(control_plane.trust),
             control_plane_legacy_cert_path: None,
+            join_url: self.join_url.clone(),
+            overlay_network_name: self.overlay_network_name.clone(),
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -1224,6 +1297,8 @@ impl JoinCommand {
             // Only brings the mesh up; it never calls the control plane.
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         };
         let cidr = ipnet::Ipv4Net::new(code.node_address, code.prefix_len)?.trunc();
         temps_agent::network_sync::bootstrap_mesh(
@@ -1457,6 +1532,8 @@ impl JoinCommand {
             // Only brings the mesh up; it never calls the control plane.
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         };
         let cidr = ipnet::Ipv4Net::new(node_address, answer.prefix_len)?.trunc();
         temps_agent::network_sync::bootstrap_mesh(
@@ -1662,7 +1739,13 @@ impl JoinCommand {
             "edge_public_key": public_ingress_public_key,
             // ADR 056: the control plane allocates this node's overlay
             // subnet around what it already uses.
-            "occupied_ranges": occupied_ranges_for_registration().await,
+            "occupied_ranges": occupied_ranges_for_registration(
+                self.overlay_network_name.as_deref(),
+            )
+            .await,
+            // ADR 059: absent unless this machine already has the default
+            // overlay name for another network.
+            "overlay_network_name": self.overlay_network_name,
         });
 
         let response = register_client
@@ -1725,6 +1808,8 @@ impl JoinCommand {
             wg_endpoint: None,
             control_plane_trust: Some(trust.agent_trust()),
             control_plane_legacy_cert_path: None,
+            join_url: self.join_url.clone(),
+            overlay_network_name: self.overlay_network_name.clone(),
         };
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
@@ -2289,6 +2374,8 @@ mod tests {
             wg_endpoint: None,
             control_plane_trust: Some(temps_agent::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         }
     }
 

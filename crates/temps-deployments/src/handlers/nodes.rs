@@ -174,6 +174,12 @@ pub struct RegisterNodeApiRequest {
     /// allocation avoids them. Absent from older CLIs.
     #[serde(default)]
     pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
+    /// The overlay network name this node uses instead of the cluster's
+    /// (ADR 059). `temps join` sends one when the host already has a network
+    /// of the cluster's name it does not own. Absent keeps the node's current
+    /// name; older CLIs never send it.
+    #[serde(default)]
+    pub overlay_network_name: Option<String>,
 }
 
 /// One IPv4 range a node already uses outside Temps (ADR 056).
@@ -1536,6 +1542,22 @@ async fn register_node_inner(
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     check_enrollment_rate(&app_state, addr.ip(), &request.name)?;
+    // Rejected before the enrollment token is touched, so a corrected
+    // request can still use it.
+    let overlay_network_name = request
+        .overlay_network_name
+        .as_deref()
+        .map(str::trim)
+        .map(|name| {
+            temps_network::overlay_name::validate_overlay_network_name(name)
+                .map(|()| name.to_owned())
+                .map_err(|e| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Overlay Network Name")
+                        .with_detail(e.to_string())
+                })
+        })
+        .transpose()?;
     let settings = enrollment_settings(&app_state).await?;
     let authorized = authorize_enrollment(
         &app_state,
@@ -1770,6 +1792,9 @@ async fn register_node_inner(
     .await;
     // ADR 056: record what the machine already uses first, so the allocation
     // below avoids it, and move an existing never-applied allocation off it.
+    if let Some(name) = overlay_network_name.as_deref() {
+        persist_overlay_network_name(app_state.db.as_ref(), node.id, name).await;
+    }
     if let Some(reports) = request.occupied_ranges {
         let ranges = occupied_ranges_from_report(Some(node.id), reports);
         if let Err(error) = app_state
@@ -2107,6 +2132,33 @@ fn mesh_enroll_problem(error: temps_network::mesh::MeshError) -> Problem {
 /// this one over the overlay. Best-effort: failures are logged and
 /// swallowed because the operator can fix manually and the agent will
 /// pick up the change on its next poll.
+/// Record the overlay network name a joining node chose because its host
+/// already had the cluster's (ADR 059). Best-effort like the underlay: if it
+/// is lost, the agent reports the name conflict with the fix.
+async fn persist_overlay_network_name(db: &sea_orm::DatabaseConnection, node_id: i32, name: &str) {
+    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
+    use temps_entities::nodes;
+
+    let result = nodes::Entity::update_many()
+        .col_expr(nodes::Column::OverlayNetworkName, Expr::value(name))
+        .filter(nodes::Column::Id.eq(node_id))
+        .exec(db)
+        .await;
+    match result {
+        Ok(_) => info!(
+            node_id,
+            overlay_network_name = name,
+            "overlay network name set"
+        ),
+        Err(e) => warn!(
+            node_id,
+            "failed to set the overlay network name; the node's agent will report the name \
+             conflict: {}",
+            e
+        ),
+    }
+}
+
 async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32, underlay: &str) {
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
@@ -5246,6 +5298,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

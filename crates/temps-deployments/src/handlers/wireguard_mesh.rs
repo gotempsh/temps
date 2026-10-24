@@ -490,6 +490,7 @@ pub(crate) mod admin_test_support {
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
             compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
             updated_at: chrono::Utc::now(),
         }
     }
@@ -542,6 +543,7 @@ pub(crate) mod admin_test_support {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

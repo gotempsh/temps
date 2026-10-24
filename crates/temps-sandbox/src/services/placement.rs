@@ -688,6 +688,7 @@ pub(crate) mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: now,
             updated_at: now,
         }

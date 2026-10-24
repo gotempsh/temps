@@ -1073,6 +1073,8 @@ pub(crate) mod tests {
             wg_endpoint: None,
             control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         }
     }
 

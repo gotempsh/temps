@@ -77,6 +77,11 @@ pub struct Model {
     /// When an operator confirmed the compute pool. The console asks once
     /// before adding the first node; nothing on the join path reads it.
     pub compute_pool_confirmed_at: Option<DBDateTime>,
+    /// The cluster's overlay network name (ADR 059): the Docker network
+    /// `<name>`, bridge `br-<name>` and VXLAN device `vxlan-<name>` on every
+    /// host. `temps0` unless an operator changes it; a node may override it
+    /// with `nodes.overlay_network_name`.
+    pub docker_network_name: String,
     pub updated_at: DBDateTime,
 }
 

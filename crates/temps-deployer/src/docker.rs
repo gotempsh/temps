@@ -1133,8 +1133,10 @@ pub struct DockerRuntime {
     /// When set, every container is additionally connected to this network
     /// after creation. Skipped silently when the network doesn't exist —
     /// that's the legitimate "overlay not yet bootstrapped on this node"
-    /// state, not an error. Set via [`Self::with_overlay_network`].
-    overlay_network: Option<String>,
+    /// state, not an error. Set via [`Self::with_overlay_network`] or
+    /// [`Self::with_current_overlay_network`]; read through
+    /// [`Self::overlay_network_name`].
+    overlay_network: Option<OverlayNetwork>,
     /// Operator-level dependency networks that every app container must join
     /// before start. Unlike the optional overlay network, these are required:
     /// missing or failing attachments fail the deploy because the app is
@@ -1432,6 +1434,16 @@ fn signal_name_from_exit_code(code: i64) -> Option<&'static str> {
         15 => Some("SIGTERM"),
         _ => None,
     }
+}
+
+/// Which overlay network a runtime attaches containers to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlayNetwork {
+    /// A fixed name.
+    Named(String),
+    /// Whatever this process's overlay is currently called (ADR 059): the
+    /// agent's network sync records it once the control plane names it.
+    Current,
 }
 
 fn normalize_extra_networks(
@@ -2282,19 +2294,33 @@ impl DockerRuntime {
     /// no `compute_cidr` allocated), the dual-attach is skipped silently
     /// — the container still boots normally on the primary network.
     pub fn with_overlay_network(mut self, name: impl Into<String>) -> Self {
-        self.overlay_network = Some(name.into());
+        self.overlay_network = Some(OverlayNetwork::Named(name.into()));
         self
+    }
+
+    /// Like [`Self::with_overlay_network`], following the overlay network
+    /// name this process reconciles (`temps_network::overlay_name::current`),
+    /// which the control plane may change (ADR 059).
+    pub fn with_current_overlay_network(mut self) -> Self {
+        self.overlay_network = Some(OverlayNetwork::Current);
+        self
+    }
+
+    /// The overlay network new containers join, if one is configured.
+    pub fn overlay_network_name(&self) -> Option<String> {
+        match self.overlay_network.as_ref()? {
+            OverlayNetwork::Named(name) => Some(name.clone()),
+            OverlayNetwork::Current => Some(temps_network::overlay_name::current().docker_network),
+        }
     }
 
     /// Configure required dependency networks for all containers created by
     /// this runtime. Blank entries, duplicates, the primary network, and the
     /// optional overlay network are ignored.
     pub fn with_extra_networks(mut self, networks: Vec<String>) -> Self {
-        self.extra_networks = normalize_extra_networks(
-            networks,
-            &self.network_name,
-            self.overlay_network.as_deref(),
-        );
+        let overlay = self.overlay_network_name();
+        self.extra_networks =
+            normalize_extra_networks(networks, &self.network_name, overlay.as_deref());
         self
     }
 
@@ -2302,9 +2328,10 @@ impl DockerRuntime {
     /// returns `Ok(())` when the overlay isn't configured or doesn't
     /// exist; only true bollard errors propagate.
     async fn maybe_attach_overlay(&self, container_id: &str) -> Result<(), DeployerError> {
-        let Some(overlay) = self.overlay_network.as_deref() else {
+        let Some(overlay) = self.overlay_network_name() else {
             return Ok(());
         };
+        let overlay = overlay.as_str();
 
         let docker = self.require_docker()?;
 
@@ -2366,10 +2393,11 @@ impl DockerRuntime {
         container_id: &str,
         request_networks: &[String],
     ) -> Result<(), DeployerError> {
+        let overlay = self.overlay_network_name();
         let requested = normalize_extra_networks(
             request_networks.to_vec(),
             &self.network_name,
-            self.overlay_network.as_deref(),
+            overlay.as_deref(),
         );
 
         let docker = self.require_docker()?;
@@ -2424,11 +2452,7 @@ impl DockerRuntime {
 
         let mut networks = self.extra_networks.clone();
         networks.extend(requested);
-        let networks = normalize_extra_networks(
-            networks,
-            &self.network_name,
-            self.overlay_network.as_deref(),
-        );
+        let networks = normalize_extra_networks(networks, &self.network_name, overlay.as_deref());
         if networks.is_empty() {
             return Ok(());
         }
@@ -2437,7 +2461,7 @@ impl DockerRuntime {
         // (its ID, or its ID when configured by name). `normalize_extra_networks`
         // can only compare the raw strings it was given.
         let reserved: HashSet<String> = std::iter::once(self.network_name.as_str())
-            .chain(self.overlay_network.as_deref())
+            .chain(overlay.as_deref())
             .filter_map(canonical)
             .collect();
 
@@ -2533,11 +2557,11 @@ impl DockerRuntime {
     /// Best-effort: any failure is logged and swallowed so a flaky
     /// route install doesn't break the deploy.
     pub async fn install_overlay_peer_routes(&self, container_id: &str) {
-        let Some(overlay) = self.overlay_network.as_deref() else {
+        let Some(overlay) = self.overlay_network_name() else {
             return;
         };
         if let Err(e) = self
-            .install_overlay_peer_routes_inner(container_id, overlay)
+            .install_overlay_peer_routes_inner(container_id, &overlay)
             .await
         {
             tracing::warn!(
@@ -6627,7 +6651,10 @@ mod docker_tests {
         match create_test_docker_runtime().await {
             Ok(runtime) => {
                 let runtime = runtime.with_overlay_network("temps-overlay".to_string());
-                assert_eq!(runtime.overlay_network.as_deref(), Some("temps-overlay"));
+                assert_eq!(
+                    runtime.overlay_network_name().as_deref(),
+                    Some("temps-overlay")
+                );
             }
             Err(e) => {
                 println!("🔧 Docker not available: {}", e);

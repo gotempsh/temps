@@ -147,13 +147,11 @@ impl AgentCommand {
             // sync loop has run for the first time). Operators who really
             // need to disable can override via TEMPS_OVERLAY_NETWORK="".
             //
-            // The default must match the network name `temps-network`
-            // actually creates (`NetworkConfig::default().docker_network_name`),
-            // which is `temps0`. The previous default `temps-overlay`
-            // never matched any real network on the worker so app
-            // containers were silently single-host attached.
-            let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK")
-                .unwrap_or_else(|_| temps_network::NetworkConfig::default().docker_network_name);
+            // Unset, the runtime follows the overlay network name the
+            // network sync loop reconciles (`temps0` unless the control
+            // plane names another, ADR 059), so containers join the
+            // network `temps-network` actually created on this host.
+            let overlay_network = std::env::var("TEMPS_OVERLAY_NETWORK").ok();
             // Shared peer-list slot. The agent's network_sync loop
             // refreshes it on every poll; both the deployer (for app
             // containers) and the agent's service handlers (for
@@ -241,10 +239,18 @@ impl AgentCommand {
             .with_host_bind_slot(host_bind_slot.clone())
             .with_docker_socket_grant(docker_socket_grant.clone())
             .with_overlay_dns_slot(overlay_bridge_address.clone());
-            if !overlay_network.is_empty() {
-                runtime_builder = runtime_builder
-                    .with_overlay_network(overlay_network)
-                    .with_overlay_peers(overlay_peers.clone());
+            match overlay_network {
+                Some(name) if name.is_empty() => {}
+                Some(name) => {
+                    runtime_builder = runtime_builder
+                        .with_overlay_network(name)
+                        .with_overlay_peers(overlay_peers.clone());
+                }
+                None => {
+                    runtime_builder = runtime_builder
+                        .with_current_overlay_network()
+                        .with_overlay_peers(overlay_peers.clone());
+                }
             }
             let docker_runtime = Arc::new(runtime_builder);
 
@@ -289,6 +295,17 @@ impl AgentCommand {
             // global notifier passed below; if the agent server exits,
             // the client stops on the next round.
             let route_sync_shutdown = Arc::new(tokio::sync::Notify::new());
+
+            // Cloud-metadata egress guard: installed at start rather than on
+            // the first deploy, so a rebooted node never runs containers
+            // without it, and re-asserted periodically after firewall flushes.
+            tokio::spawn(
+                temps_deployer::metadata_egress::maintain_metadata_egress_block(
+                    std::time::Duration::from_secs(60),
+                    route_sync_shutdown.clone(),
+                ),
+            );
+
             match temps_agent::route_sync_client::RouteSyncClient::new_with_ca(
                 config.control_plane_url.clone(),
                 config.node_id,
@@ -380,11 +397,12 @@ impl AgentCommand {
                             break ip;
                         }
                         // Fallback path: the bridge IP is also visible
-                        // in the kernel as the `br-temps0` interface
+                        // in the kernel as the overlay bridge's interface
                         // address. Read it directly so the proxy can
                         // bind without waiting for CP to confirm the
                         // allocation.
-                        if let Some(ip) = read_bridge_ip_from_kernel("br-temps0").await {
+                        let bridge = temps_network::overlay_name::current().bridge;
+                        if let Some(ip) = read_bridge_ip_from_kernel(&bridge).await {
                             tracing::info!(
                                 bridge = %ip,
                                 "using kernel-derived bridge IP (CP slot not yet populated)"
@@ -623,6 +641,10 @@ impl AgentCommand {
             control_plane_legacy_cert_path: saved
                 .as_ref()
                 .and_then(|config| config.control_plane_legacy_cert_path.clone()),
+            join_url: saved.as_ref().and_then(|config| config.join_url.clone()),
+            overlay_network_name: saved
+                .as_ref()
+                .and_then(|config| config.overlay_network_name.clone()),
             control_plane_trust: saved
                 .as_ref()
                 .map(|config| config.effective_control_plane_trust()),

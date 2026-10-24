@@ -2167,7 +2167,7 @@ async fn attach_to_overlay_if_present(
     docker: &bollard::Docker,
     container_id: &str,
 ) -> std::result::Result<(), bollard::errors::Error> {
-    let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+    let overlay_name = temps_network::overlay_name::current().docker_network;
 
     // Cheap existence probe — if the overlay isn't here, skip silently.
     let networks = docker
@@ -2245,7 +2245,7 @@ async fn install_overlay_peer_routes_after_start(
         .filter(|p| *p > 0)
         .ok_or_else(|| "container PID not yet available".to_string())? as i32;
 
-    let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+    let overlay_name = temps_network::overlay_name::current().docker_network;
     let gateway = inspect
         .network_settings
         .as_ref()
@@ -2274,10 +2274,10 @@ async fn install_overlay_peer_routes_after_start(
 /// payload doesn't carry network settings yet (rare, transient post-start).
 ///
 /// We deliberately don't hard-code the network name — the agent's overlay
-/// uses `temps_network::NetworkConfig::default().docker_network_name`, so
-/// reading it from there keeps both call sites agreeing on the spelling.
+/// is whatever `temps_network::overlay_name::current()` names (`temps0`
+/// unless the control plane chose another, ADR 059).
 fn extract_overlay_ip(info: &bollard::models::ContainerInspectResponse) -> Option<String> {
-    let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+    let overlay_name = temps_network::overlay_name::current().docker_network;
     let networks = info.network_settings.as_ref()?.networks.as_ref()?;
     let entry = networks.get(&overlay_name)?;
     let ip = entry.ip_address.as_deref()?.trim();
@@ -2320,7 +2320,7 @@ mod overlay_ip_tests {
 
     #[test]
     fn returns_ip_when_overlay_present() {
-        let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+        let overlay_name = temps_network::overlay_name::current().docker_network;
         let mut nets = HashMap::new();
         nets.insert(
             overlay_name,
@@ -2337,7 +2337,7 @@ mod overlay_ip_tests {
 
     #[test]
     fn returns_none_for_empty_ip_string() {
-        let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+        let overlay_name = temps_network::overlay_name::current().docker_network;
         let mut nets = HashMap::new();
         nets.insert(
             overlay_name,

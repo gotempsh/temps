@@ -344,6 +344,14 @@ pub struct ClusterComputePoolChangedAudit {
     pub reassigned: Vec<String>,
 }
 
+/// An operator changed the cluster's overlay network name (ADR 059).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterOverlayNetworkNameChangedAudit {
+    pub context: AuditContext,
+    pub from: String,
+    pub to: String,
+}
+
 /// An operator confirmed the cluster compute pool for the first time
 /// (ADR 056), whether or not they changed it.
 #[derive(Debug, Clone, Serialize)]
@@ -562,6 +570,10 @@ impl_audit_operation!(
 impl_audit_operation!(
     ClusterComputePoolConfirmedAudit,
     "CLUSTER_COMPUTE_POOL_CONFIRMED"
+);
+impl_audit_operation!(
+    ClusterOverlayNetworkNameChangedAudit,
+    "CLUSTER_OVERLAY_NETWORK_NAME_CHANGED"
 );
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");

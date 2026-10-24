@@ -261,6 +261,15 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   // With a tunnel already carrying this worker, open ports are a second,
   // optional way in: keep their settings folded away unless asked for.
   const showDirectSettings = directOpen ?? (enabled && !tunnelHere)
+  // A worker with no way in is not a finished state: lead with the choices
+  // instead of a summary that says nothing works.
+  const unconfigured =
+    !!settings &&
+    !workerOff &&
+    connectorsQuery.isSuccess &&
+    !tunnelHere &&
+    !enabled
+  const showEditor = editing || unconfigured
 
   const tunnels = (
     <section className="space-y-3" aria-labelledby={`tunnels-${node.id}`}>
@@ -292,14 +301,19 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   )
 
   return (
-    <Card className="shadow-none" id="public-ingress">
+    <Card
+      className={
+        unconfigured ? 'border-amber-500/40 shadow-none' : 'shadow-none'
+      }
+      id="public-ingress"
+    >
       <CardContent className="space-y-4 p-4">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2 text-sm font-medium">
               <Globe className="h-4 w-4" /> How visitors reach this worker
             </div>
-            {editing && (
+            {showEditor && (
               <p className="text-sm text-muted-foreground">
                 Take application traffic on this worker and forward it to
                 containers on any worker in the cluster. Apps&apos; hostnames
@@ -311,7 +325,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
               </p>
             )}
           </div>
-          {settings && (
+          {settings && !unconfigured && (
             <Button
               size="sm"
               variant={editing ? 'default' : 'outline'}
@@ -336,7 +350,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           </div>
         )}
 
-        {settings && !editing && (
+        {settings && !showEditor && (
           <WorkerIngressSummary
             node={node}
             settings={settings}
@@ -344,8 +358,18 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           />
         )}
 
-        {settings && draft && editing && (
+        {settings && draft && showEditor && (
           <div className="space-y-4">
+            {unconfigured && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertDescription className="text-amber-700 dark:text-amber-300">
+                  Visitors can&apos;t reach apps through this worker yet. Pick
+                  one way in: a tunnel works from anywhere, with no public IP or
+                  open port; open ports need a public IP that sends 80 and 443
+                  here.
+                </AlertDescription>
+              </Alert>
+            )}
             {!settings.agent_reports && (
               <Alert>
                 <AlertDescription>
@@ -673,7 +697,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
             </Alert>
           )}
 
-        {editing && (
+        {showEditor && (
           <Collapsible>
             <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
               <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />

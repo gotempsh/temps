@@ -131,6 +131,10 @@ pub struct Model {
     pub overlay_ready_cidr: Option<String>,
     /// The last automatic re-allocation of `compute_cidr` and why.
     pub overlay_remediation: Option<String>,
+    /// This node's overlay network name when it differs from the cluster's
+    /// (`network_config.docker_network_name`), ADR 059. Set when the node
+    /// joined on a host that already had a network of the cluster's name.
+    pub overlay_network_name: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -263,6 +267,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: now,
             updated_at: now,
         }

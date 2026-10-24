@@ -197,6 +197,32 @@ pub async fn teardown(config: &NetworkConfig) -> crate::Result<()> {
     Ok(())
 }
 
+/// Release the parts of an overlay that a renamed overlay on this host needs
+/// for itself: the VXLAN device, which holds the cluster's VNI and UDP port,
+/// and the peer routes through the old bridge, which would shadow the new
+/// bridge's. The bridge and its Docker network stay, with whatever containers
+/// are attached; they keep local connectivity until they are redeployed onto
+/// the new overlay. Idempotent.
+pub async fn release_transport(
+    config: &NetworkConfig,
+    peer_cidrs: &[ipnet::Ipv4Net],
+) -> crate::Result<()> {
+    let (handle, _conn) = open_handle().await?;
+    for cidr in peer_cidrs {
+        route::remove_via_dev(&handle, *cidr, &config.bridge_name).await?;
+    }
+    if let Transport::Vxlan { .. } = config.transport {
+        vxlan::remove(&handle, &config.vxlan_dev_name).await?;
+    }
+    info!(
+        bridge = %config.bridge_name,
+        vxlan = %config.vxlan_dev_name,
+        routes = peer_cidrs.len(),
+        "released the previous overlay's VXLAN device and peer routes"
+    );
+    Ok(())
+}
+
 /// Auto-detect the underlay device from the host's IPv4 default route. See
 /// [`route::default_route_device`] for why this replaces a hardcoded
 /// `eth0` guess.

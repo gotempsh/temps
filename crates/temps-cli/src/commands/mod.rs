@@ -17,6 +17,7 @@ pub mod doctor;
 pub mod domain;
 pub mod edge;
 pub mod firecracker;
+pub mod host_preflight;
 pub mod join;
 pub mod microsandbox;
 pub mod migrate;

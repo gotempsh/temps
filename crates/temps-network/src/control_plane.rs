@@ -677,12 +677,19 @@ pub async fn setup(
                 });
             }
         }
+        // The control plane runs the cluster's own overlay name (ADR 059).
+        let names = crate::OverlayNames::new(&persisted.docker_network_name).map_err(|e| {
+            ControlPlaneSetupError::InvalidVxlanConfig {
+                reason: e.to_string(),
+            }
+        })?;
         let config = NetworkConfig {
             transport,
             underlay_mtu: detected_mtu.min(configured_mtu),
             underlay_dev,
             ..NetworkConfig::default()
-        };
+        }
+        .with_overlay_names(&names);
         let routed = routed_subnets(&alloc, &peers);
         crate::preflight_compute_routes(&config, &routed).await?;
         crate::docker::preflight_network_for_subnets(docker, &config, &alloc, &routed).await?;
@@ -693,6 +700,16 @@ pub async fn setup(
         privileged_setup_started = true;
         manager.bootstrap(alloc.clone(), peers.clone()).await?;
         crate::docker::ensure_network_for_subnets(docker, &config, &alloc, &routed).await?;
+        if let Some(previous) = crate::overlay_name::set_current(names) {
+            tracing::warn!(
+                previous_network = %previous.docker_network,
+                network = %config.docker_network_name,
+                "the cluster's overlay network name changed; the control plane now runs '{}'. \
+                 '{}' is left in place with its containers until they are redeployed",
+                config.docker_network_name,
+                previous.docker_network,
+            );
+        }
         Ok::<_, ControlPlaneSetupError>((alloc, peers, config, manager))
     }
     .await;

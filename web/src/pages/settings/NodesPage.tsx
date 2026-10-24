@@ -27,7 +27,10 @@ import {
 } from '@/components/ui/collapsible'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
+import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { workerIngressWay } from '@/lib/worker-ingress'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
@@ -611,6 +614,7 @@ function NodeTable({
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
+            <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
             {showOverlay && <TableHead>Cross-node</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
@@ -660,6 +664,9 @@ function NodeTable({
                   <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
                     {node.private_address}
                   </span>
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <WorkerIngressBadge node={node} />
                 </TableCell>
                 {showMesh && (
                   <TableCell>
@@ -1369,6 +1376,7 @@ function NodeDetail({
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
+            <WorkerIngressBadge node={node} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
@@ -1930,10 +1938,24 @@ export function NodesPage() {
   )
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
+  const { data: tunnels } = useQuery(allTunnelsOptions())
+  // Without local workloads the control plane serves no app traffic, so a
+  // cluster whose workers all lack a way in serves nobody.
+  const activeWorkers = nodes.filter(
+    (node) => node.role !== 'control-plane' && node.status === 'active'
+  )
+  const noWayIn =
+    capability?.local_workloads === false &&
+    tunnels !== undefined &&
+    activeWorkers.length > 0 &&
+    activeWorkers.every(
+      (node) => workerIngressWay(node, tunnels).kind === 'none'
+    )
   const nodeCount = nodes.length
   // The list always includes this server itself; only workers count here.
-  const workerCount = nodes.filter((node) => node.role !== 'control-plane')
-    .length
+  const workerCount = nodes.filter(
+    (node) => node.role !== 'control-plane'
+  ).length
   // "No nodes" means two very different things. With local workloads the
   // control plane runs everything itself and worker nodes are optional
   // scale-out; without them nothing can run at all and this page is the
@@ -2009,6 +2031,30 @@ export function NodesPage() {
               <Plus className="mr-1 h-4 w-4" />
               Add a worker node
             </Button>
+          )}
+
+          {noWayIn && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                Visitors can&apos;t reach your apps yet
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  No worker takes traffic from the internet. Deployments run,
+                  but their domains don&apos;t answer until a worker does,
+                  through a tunnel (no public IP needed) or open ports on a
+                  public IP.
+                </p>
+                <Button asChild size="sm">
+                  <Link
+                    to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
+                  >
+                    Set up ingress on {activeWorkers[0].name}
+                  </Link>
+                </Button>
+              </AlertDescription>
+            </Alert>
           )}
 
           {stranded.length > 0 && (

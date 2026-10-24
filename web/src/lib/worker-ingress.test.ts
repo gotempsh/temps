@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { workerIngressStatus, type WorkerIngressState } from './worker-ingress'
+import {
+  workerIngressStatus,
+  workerIngressWay,
+  type WorkerIngressState,
+} from './worker-ingress'
 
 const now = Date.parse('2026-09-21T12:00:00Z')
 const running: WorkerIngressState = {
@@ -71,5 +75,47 @@ describe('worker ingress status', () => {
         now
       ).label
     ).toBe('Some routes unavailable')
+  })
+})
+
+describe('workerIngressWay', () => {
+  const worker = { id: 7, public_ingress_enabled: false }
+  const cloudflare = { provider: 'cloudflare', nodes: [{ node_id: 7 }] }
+  const elsewhere = { provider: 'cloudflare', nodes: [{ node_id: 8 }] }
+
+  test('a worker with no tunnel and no open ports has no way in', () => {
+    expect(workerIngressWay(worker, [elsewhere])).toEqual({ kind: 'none' })
+  })
+
+  test('a tunnel carrying the worker wins over open ports', () => {
+    expect(
+      workerIngressWay({ ...worker, public_ingress_enabled: true }, [
+        cloudflare,
+        { ...cloudflare },
+      ])
+    ).toEqual({ kind: 'tunnel', providers: ['cloudflare'] })
+  })
+
+  test('open ports report whether their listeners run', () => {
+    expect(
+      workerIngressWay(
+        {
+          ...worker,
+          public_ingress_enabled: true,
+          public_ingress_running: null,
+        },
+        []
+      )
+    ).toEqual({ kind: 'direct', running: false })
+    expect(
+      workerIngressWay(
+        {
+          ...worker,
+          public_ingress_enabled: true,
+          public_ingress_running: true,
+        },
+        []
+      )
+    ).toEqual({ kind: 'direct', running: true })
   })
 })
