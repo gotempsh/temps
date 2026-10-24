@@ -554,11 +554,20 @@ impl OidcService {
             ))
             .await?;
 
+        // The Temps-login ingress grants those sessions minted would keep
+        // opening protected environments for up to twelve hours otherwise.
+        // Same user set as the session delete above (pending MFA challenges
+        // never mint a grant, so the `mfa_pending_origin` arm has no
+        // counterpart here).
+        let grants_revoked =
+            crate::ingress_grants::revoke_for_oidc_provider(conn, provider_id).await?;
+
         tracing::info!(
             target: "temps_auth::oidc",
             provider_id = provider_id,
             sessions_revoked = result.rows_affected(),
-            "Revoked SSO sessions for provider"
+            ingress_grants_revoked = grants_revoked,
+            "Revoked SSO sessions and ingress login grants for provider"
         );
 
         Ok(())
@@ -2969,11 +2978,31 @@ mod tests {
         .insert(db.db.as_ref())
         .await
         .expect("test session must insert");
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+        let local_user = users::ActiveModel {
+            name: Set("Local User".to_string()),
+            email: Set("local-user@example.com".to_string()),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("local user must insert");
+        let local_grant =
+            crate::ingress_grants::test_support::live_grant(&db.db, local_user.id).await;
 
         assert!(service
             .revoke_managed_cloud_provider()
             .await
             .expect("revoke must succeed"));
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted from a session of the revoked provider must end with it"
+        );
+        assert!(
+            !crate::ingress_grants::test_support::is_revoked(&db.db, local_grant).await,
+            "users who do not sign in through the provider keep their grants"
+        );
 
         let remaining = sessions::Entity::find()
             .filter(sessions::Column::UserId.eq(user.id))

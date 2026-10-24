@@ -22,7 +22,7 @@
 use chrono::Utc;
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter};
-use temps_entities::{environments, ingress_login_grants, sandboxes};
+use temps_entities::{environments, ingress_login_grants, sandboxes, users};
 
 /// Revokes every live grant held by `user_id`. Returns how many it revoked.
 pub async fn revoke_for_user<C: ConnectionTrait>(conn: &C, user_id: i32) -> Result<u64, DbErr> {
@@ -41,6 +41,32 @@ pub async fn revoke_for_users<C: ConnectionTrait>(
     let result = ingress_login_grants::Entity::update_many()
         .col_expr(ingress_login_grants::Column::RevokedAt, Expr::value(now))
         .filter(ingress_login_grants::Column::UserId.is_in(user_ids.iter().copied()))
+        .filter(ingress_login_grants::Column::RevokedAt.is_null())
+        .filter(ingress_login_grants::Column::ExpiresAt.gt(now))
+        .exec(conn)
+        .await?;
+    Ok(result.rows_affected)
+}
+
+/// Revokes every live grant held by a user who signs in through OIDC provider
+/// `provider_id`. Mirrors the user set whose console sessions
+/// `OidcService::revoke_sessions_for_provider` deletes: removing or revoking
+/// the provider ends those sessions, so the ingress cookies minted from them
+/// must end with them.
+pub async fn revoke_for_oidc_provider<C: ConnectionTrait>(
+    conn: &C,
+    provider_id: i32,
+) -> Result<u64, DbErr> {
+    let now = Utc::now();
+    let provider_users = Query::select()
+        .column(users::Column::Id)
+        .from(users::Entity)
+        .and_where(Expr::col(users::Column::OidcProviderId).eq(provider_id))
+        .and_where(Expr::col(users::Column::DeletedAt).is_null())
+        .to_owned();
+    let result = ingress_login_grants::Entity::update_many()
+        .col_expr(ingress_login_grants::Column::RevokedAt, Expr::value(now))
+        .filter(Expr::col(ingress_login_grants::Column::UserId).in_subquery(provider_users))
         .filter(ingress_login_grants::Column::RevokedAt.is_null())
         .filter(ingress_login_grants::Column::ExpiresAt.gt(now))
         .exec(conn)
@@ -80,6 +106,44 @@ pub async fn revoke_for_project<C: ConnectionTrait>(
         .exec(conn)
         .await?;
     Ok(result.rows_affected)
+}
+
+/// Fixtures for tests elsewhere in the crate that prove a session- or
+/// credential-invalidation path also ends the user's ingress grants.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use sea_orm::{ActiveModelTrait, Set};
+
+    /// Inserts a grant for `user_id` that stays live for twelve hours, as the
+    /// console mints it on a Temps-login redirect.
+    pub(crate) async fn live_grant(db: &sea_orm::DatabaseConnection, user_id: i32) -> i64 {
+        ingress_login_grants::ActiveModel {
+            user_id: Set(user_id),
+            owner_kind: Set("environment".to_string()),
+            owner_id: Set(1),
+            host: Set("app.example.test".to_string()),
+            permission: Set("environments:read".to_string()),
+            expires_at: Set(Utc::now() + chrono::Duration::hours(12)),
+            revoked_at: Set(None),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert ingress login grant")
+        .id
+    }
+
+    pub(crate) async fn is_revoked(db: &sea_orm::DatabaseConnection, grant_id: i64) -> bool {
+        ingress_login_grants::Entity::find_by_id(grant_id)
+            .one(db)
+            .await
+            .expect("read ingress login grant")
+            .expect("ingress login grant exists")
+            .revoked_at
+            .is_some()
+    }
 }
 
 #[cfg(test)]

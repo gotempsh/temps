@@ -3976,7 +3976,8 @@ mod tests {
             let mut enabled = pending.clone();
             enabled.mfa_enabled = true;
             // Lock the user, read the (empty) guard, upsert it, persist
-            // `mfa_enabled`, then revoke the user's other sessions.
+            // `mfa_enabled`, then revoke the user's other sessions and their
+            // ingress login grants.
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending]])
                 .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
@@ -3989,6 +3990,10 @@ mod tests {
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 2,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
                     },
                 ])
                 .into_connection();
