@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use chrono::{DateTime, Utc};
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
+    TransactionTrait,
 };
 use temps_entities::{workload_instances, workloads};
 use temps_workload::stream::{
@@ -172,6 +173,39 @@ impl WorkloadPlane {
         self.stream_metrics.reads.fetch_add(1, Ordering::Relaxed);
         let window = self.stream_window().await?;
         self.observe_lag(window.watermark).await;
+        self.read_in_window(node_id, since, window).await
+    }
+
+    /// The retention horizon now.
+    async fn retention_horizon(&self, node_id: i32) -> Result<u64, PlaneError> {
+        let row = self
+            .db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT COALESCE((SELECT horizon::text FROM node_state_retention WHERE id = 1), \
+                 '0') AS horizon"
+                    .to_string(),
+            ))
+            .await
+            .map_err(PlaneError::db(
+                "rechecking the retention horizon",
+                format!("node {node_id}"),
+            ))?
+            .ok_or_else(|| PlaneError::Database {
+                operation: "rechecking the retention horizon",
+                workload: format!("node {node_id}"),
+                source: sea_orm::DbErr::RecordNotFound("no horizon row".to_string()),
+            })?;
+        text_u64(&row, "horizon")
+    }
+
+    /// [`Self::read_node_state`] from a window already read.
+    async fn read_in_window(
+        &self,
+        node_id: i32,
+        since: u64,
+        window: Window,
+    ) -> Result<StateResponse, PlaneError> {
         let full = if since == 0 {
             Some(FullReason::Initial)
         } else if since < window.horizon {
@@ -229,6 +263,17 @@ impl WorkloadPlane {
                 format!("node {node_id}"),
             ))?;
             markers.push((kind, id, text_u64(row, "xid")?));
+        }
+        // The window's horizon was read before the scan. A sweep that
+        // committed in between deleted markers this scan no longer sees
+        // (it raises the horizon in the same transaction as the delete),
+        // so a delta from here could skip a removal and move the cursor
+        // past it for good. Read the horizon again: a cursor it overtook
+        // gets the whole view instead.
+        if since < self.retention_horizon(node_id).await? {
+            return self
+                .full_state(node_id, window.watermark, FullReason::BelowHorizon)
+                .await;
         }
         let mut watermark = window.watermark;
         let mut more = false;
@@ -557,8 +602,16 @@ impl WorkloadPlane {
         let min_ack = min_ack.unwrap_or(0);
         let mut deleted = 0u64;
         loop {
-            let row = self
+            // The delete and the horizon that covers it commit together: a
+            // reader that no longer sees a marker also sees the horizon past
+            // it (it reads the horizon again after its scan), so it never
+            // takes a delta across a deleted marker.
+            let txn = self
                 .db
+                .begin()
+                .await
+                .map_err(PlaneError::db("starting a stream marker sweep", "*"))?;
+            let row = txn
                 .query_one(Statement::from_sql_and_values(
                     DatabaseBackend::Postgres,
                     "WITH doomed AS ( \
@@ -578,7 +631,10 @@ impl WorkloadPlane {
                 ))
                 .await
                 .map_err(PlaneError::db("sweeping stream markers", "*"))?;
-            let Some(row) = row else { break };
+            let Some(row) = row else {
+                // Nothing written: dropping the transaction rolls it back.
+                break;
+            };
             let count: i64 = row
                 .try_get("", "deleted")
                 .map_err(PlaneError::db("sweeping stream markers", "*"))?;
@@ -594,16 +650,18 @@ impl WorkloadPlane {
                 .map(|t| t.saturating_add(1))
                 .unwrap_or(0);
             let horizon = min_ack.max(top_plus_one);
-            self.db
-                .execute(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    "UPDATE node_state_retention \
-                     SET horizon = GREATEST(horizon, $1::text::xid8), swept_at = now() \
-                     WHERE id = 1",
-                    vec![horizon.to_string().into()],
-                ))
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE node_state_retention \
+                 SET horizon = GREATEST(horizon, $1::text::xid8), swept_at = now() \
+                 WHERE id = 1",
+                vec![horizon.to_string().into()],
+            ))
+            .await
+            .map_err(PlaneError::db("moving the retention horizon", "*"))?;
+            txn.commit()
                 .await
-                .map_err(PlaneError::db("moving the retention horizon", "*"))?;
+                .map_err(PlaneError::db("committing a stream marker sweep", "*"))?;
             if count < SWEEP_BATCH {
                 break;
             }
@@ -709,7 +767,6 @@ fn workload_object(row: &workloads::Model) -> Result<WorkloadObject, PlaneError>
 mod tests {
     use super::*;
     use crate::testing::{job_spec, plane_with, test_db};
-    use sea_orm::TransactionTrait;
     use std::time::Duration;
 
     async fn seed<C: ConnectionTrait>(conn: &C, node_id: Option<i32>, name: &str) -> (i64, i64) {
@@ -1003,6 +1060,78 @@ mod tests {
         let answer = plane.read_node_state(8, stale).await.expect("read");
         assert_eq!(answer.full, Some(FullReason::BelowHorizon));
         assert!(has_upsert(&answer.changes, ObjectKind::Instance, instance));
+    }
+
+    /// A sweep that commits between a read's window and its scan: the
+    /// removal of an instance (its marker aged past 24 h and deleted) must
+    /// not be skipped by a delta that a newer, retained marker carries
+    /// past it. The read resnapshots instead, and the deleted instance is
+    /// absent from the snapshot, so the node removes it.
+    #[tokio::test]
+    async fn a_sweep_between_the_window_and_the_scan_gets_a_full_snapshot() {
+        let Some(db) = test_db().await else { return };
+        let (plane, _, _) = plane_with(&db);
+        let since = cursor(&plane, 15).await;
+        let (_, gone) = seed(db.db.as_ref(), Some(15), "deleted-while-away").await;
+        exec(
+            db.db.as_ref(),
+            "DELETE FROM workload_instances WHERE id = $1",
+            vec![gone.into()],
+        )
+        .await;
+        // Every marker so far, the removal among them, is past 24 h.
+        exec(
+            db.db.as_ref(),
+            "UPDATE node_state_changes SET created_at = now() - interval '25 hours'",
+            vec![],
+        )
+        .await;
+        // A newer change the sweep keeps.
+        let (_, kept) = seed(db.db.as_ref(), Some(15), "newer").await;
+        let kept_xid: u64 = db
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT max(xid)::text AS xid FROM node_state_changes \
+                 WHERE object_kind = 'instance' AND object_id = $1",
+                vec![kept.into()],
+            ))
+            .await
+            .expect("read")
+            .expect("a row")
+            .try_get::<String>("", "xid")
+            .expect("an xid")
+            .parse()
+            .expect("a number");
+
+        // The reader's window: the old horizon, and a watermark past the
+        // retained change (other tests can hold it back for a moment).
+        let mut window = plane.stream_window().await.expect("window");
+        for _ in 0..300 {
+            if window.watermark > kept_xid {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            window = plane.stream_window().await.expect("window");
+        }
+        assert!(window.watermark > kept_xid, "the watermark never passed");
+        assert!(window.horizon <= since, "the window predates the sweep");
+
+        // The sweep commits after the window was read, before the scan.
+        let swept = plane
+            .sweep_node_state(&[], Utc::now())
+            .await
+            .expect("swept");
+        assert!(swept.deleted >= 1, "the aged removal marker is deleted");
+
+        let answer = plane.read_in_window(15, since, window).await.expect("read");
+        assert_eq!(
+            answer.full,
+            Some(FullReason::BelowHorizon),
+            "a delta here would carry the node past the removal it never saw"
+        );
+        assert!(!has_upsert(&answer.changes, ObjectKind::Instance, gone));
+        assert!(has_upsert(&answer.changes, ObjectKind::Instance, kept));
     }
 
     #[tokio::test]

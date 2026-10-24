@@ -462,27 +462,33 @@ impl WorkloadPlane {
                             Err(error) => Err(error),
                         };
                         if let Err(error) = removed {
-                            if instance.node_id.is_none() {
-                                return Err(error);
-                            }
-                            // A worker that cannot be reached is not a
-                            // reason to keep a run past its deadline: the
-                            // row fails, and the worker stops it when its
-                            // stream next delivers the row.
+                            // A worker that reads its stream stops the
+                            // instance when it next delivers the failed
+                            // row; any other runtime keeps the run past
+                            // its deadline until the removal succeeds.
+                            self.removal_left_to_node(instance, Some(&driver), error)
+                                .await?;
+                        }
+                    }
+                    Err(reason) => {
+                        let error = PlaneError::NodeUnavailable {
+                            workload_id: row.id,
+                            node_id: instance.node_id.unwrap_or(0),
+                            reason: format!(
+                                "the instance past its deadline could not be stopped: {reason}"
+                            ),
+                        };
+                        if instance.node_id.is_some() {
+                            self.removal_left_to_node(instance, None, error).await?;
+                        } else {
+                            // Node 0 without a runtime has nothing to stop.
                             tracing::warn!(
                                 workload_id = row.id,
                                 instance_id = instance.id,
-                                node_id = instance.node_id,
                                 "{error}"
                             );
                         }
                     }
-                    Err(reason) => tracing::warn!(
-                        workload_id = row.id,
-                        instance_id = instance.id,
-                        node_id = instance.node_id,
-                        "the instance past its deadline could not be stopped: {reason}"
-                    ),
                 }
                 self.finish_instance(instance.id, PHASE_FAILED, None, now)
                     .await?;
@@ -540,6 +546,12 @@ impl WorkloadPlane {
                         // the previous process stopped before creating it.
                         return self
                             .launch(row, view, status, latest, Some(deadline), ttl, &driver, now)
+                            .await;
+                    }
+                    InstanceState::Created if driver.reconciled_by_node() => {
+                        // Assigned to a node that has not reported it yet.
+                        return self
+                            .await_node(row, status, &latest, &handle, Some(deadline), now)
                             .await;
                     }
                     InstanceState::Created => {
@@ -776,10 +788,14 @@ impl WorkloadPlane {
             .await
     }
 
-    /// Whether `instance`, unfinished in its row, already exited at or before
-    /// `deadline` according to its runtime. Anything it cannot prove (the
-    /// node is unreachable, the runtime reports no exit time) is `false`, so
-    /// the deadline applies.
+    /// Whether `instance` already exited at or before `deadline`. A finished
+    /// row answers from its recorded `finished_at`: the instance's result
+    /// is persisted before the workload's conclusion, so a crash between
+    /// the two writes, or a node's exit report ingested while no pass ran,
+    /// leaves a finished row under a running workload, and its result must
+    /// stand. An unfinished row asks its runtime. Anything it cannot prove
+    /// (the node is unreachable, no exit time is known) is `false`, so the
+    /// deadline applies.
     async fn exited_by(
         &self,
         workload_id: i64,
@@ -787,7 +803,9 @@ impl WorkloadPlane {
         deadline: DateTime<Utc>,
     ) -> bool {
         if is_finished(instance) {
-            return false;
+            // Strictly before: the deadline path itself finishes an
+            // instance at the pass time, which can equal the deadline.
+            return instance.finished_at.is_some_and(|at| at < deadline);
         }
         let (Ok(driver), Ok(handle)) = (self.driver_of(instance).await, handle_of(instance)) else {
             return false;
@@ -938,6 +956,11 @@ impl WorkloadPlane {
         match observed.state {
             InstanceState::Missing if latest.phase == PHASE_PENDING => {
                 self.launch(row, view, status, latest, None, ttl, &driver, now)
+                    .await
+            }
+            InstanceState::Created if driver.reconciled_by_node() => {
+                // Assigned to a node that has not reported it yet.
+                self.await_node(row, status, &latest, &handle, None, now)
                     .await
             }
             InstanceState::Created => {
@@ -1386,6 +1409,27 @@ impl WorkloadPlane {
                 )
                 .await;
         }
+        if driver.reconciled_by_node() {
+            // The create was desired state only: the node has not even read
+            // the row yet. Its report, not this call, makes it running.
+            events::record(
+                self.db.as_ref(),
+                row.id,
+                Some(instance.id),
+                "Assigned",
+                &format!(
+                    "attempt {attempt} was assigned to {} as '{}' ({})",
+                    node_label(instance.node_id),
+                    created.name,
+                    security.as_str()
+                ),
+                now,
+            )
+            .await?;
+            return self
+                .await_node(row, status, &instance, &created, deadline, now)
+                .await;
+        }
         events::record(
             self.db.as_ref(),
             row.id,
@@ -1447,6 +1491,47 @@ impl WorkloadPlane {
         .await?;
         self.conclude(row, view, instances, status, now, now + ttl, None)
             .await
+    }
+
+    /// `instance` is assigned to a node whose runtime does the driver's
+    /// work (ADR-055 §7) and has not reported it running yet. The row
+    /// stays `pending`, so the node creates it when its stream delivers
+    /// it, and the workload says what it waits for. The node's report
+    /// moves the row to running (with its published ports) and wakes the
+    /// reconciler, whose next pass marks the workload running.
+    async fn await_node(
+        &self,
+        row: workloads::Model,
+        mut status: WorkloadStatus,
+        instance: &workload_instances::Model,
+        handle: &InstanceHandle,
+        deadline: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, PlaneError> {
+        let message = format!(
+            "attempt {} ('{}') is assigned to {}; waiting for that node to report it running",
+            instance.attempt,
+            handle.name,
+            node_label(instance.node_id)
+        );
+        status.set_condition(
+            ConditionKind::Running,
+            ConditionStatus::False,
+            "WaitingForNode",
+            &message,
+            now,
+        );
+        status.ready_instances = 0;
+        status.exit_code = None;
+        status.phase = WorkloadPhase::Pending;
+        self.write_status(&row, &status, None).await?;
+        // The report's ingest wakes the reconciler; the poll bounds a
+        // report it missed.
+        let poll = Duration::from_std(self.config.poll_interval).unwrap_or(Duration::seconds(5));
+        Ok(Some(match deadline {
+            Some(deadline) => deadline.min(now + poll),
+            None => now + poll,
+        }))
     }
 
     /// The instance runs: record it and wait for its exit.
@@ -1612,14 +1697,23 @@ impl WorkloadPlane {
                 Ok(driver) => driver,
                 Err(reason) => {
                     // Node 0 without a runtime has nothing to remove. A
-                    // worker removes the instance when its row goes.
+                    // worker's instance goes with its row only when the
+                    // worker reads its stream; otherwise the cleanup waits
+                    // for the worker's driver.
                     if let Some(node_id) = instance.node_id {
-                        tracing::warn!(
-                            workload_id = row.id,
-                            instance_id = instance.id,
-                            node_id,
-                            "the deleted workload's instance could not be removed now: {reason}"
-                        );
+                        self.removal_left_to_node(
+                            instance,
+                            None,
+                            PlaneError::NodeUnavailable {
+                                workload_id: row.id,
+                                node_id,
+                                reason: format!(
+                                    "the deleted workload's instance could not be removed: \
+                                     {reason}"
+                                ),
+                            },
+                        )
+                        .await?;
                         if !is_finished(instance) {
                             self.finish_instance(instance.id, PHASE_FAILED, None, now)
                                 .await?;
@@ -1638,10 +1732,11 @@ impl WorkloadPlane {
                     operation: "remove the deleted workload's instance",
                     source: error,
                 };
-                if instance.node_id.is_none() {
-                    return Err(error);
-                }
-                tracing::warn!(workload_id = row.id, instance_id = instance.id, "{error}");
+                // Deleting the workload cascades to its instance rows: only
+                // a worker that reads its stream learns of the removal from
+                // that, so any other runtime's cleanup is retried first.
+                self.removal_left_to_node(instance, Some(&driver), error)
+                    .await?;
             }
             if !is_finished(instance) {
                 self.finish_instance(instance.id, PHASE_FAILED, None, now)
@@ -1822,6 +1917,78 @@ impl WorkloadPlane {
         Ok(())
     }
 
+    /// `instance` could not be stopped or removed (`error`): whether the
+    /// caller may go ahead and fail or delete its row anyway (`Ok`), or
+    /// must keep it and retry on a later pass (`Err(error)`).
+    ///
+    /// Only a worker whose node runtime reads the instance rows (the
+    /// stream, [`RuntimeDriver::reconciled_by_node`]) acts on the row
+    /// itself: it stops a failed instance and removes one whose row is
+    /// gone. Any other runtime (node 0, a worker driven through its
+    /// `/agent/*` API) never sees the row again, so going ahead would leave
+    /// its instance running forever. `driver` is `None` when the worker's
+    /// driver cannot be built now; the row then says which driver created
+    /// the instance. The one bounded give-up: a worker that no longer
+    /// exists cannot remove anything, so its instance is forgotten, and
+    /// that is logged.
+    async fn removal_left_to_node(
+        &self,
+        instance: &workload_instances::Model,
+        driver: Option<&Arc<dyn RuntimeDriver>>,
+        error: PlaneError,
+    ) -> Result<(), PlaneError> {
+        let Some(node_id) = instance.node_id else {
+            return Err(error);
+        };
+        let streamed = match driver {
+            Some(driver) => driver.reconciled_by_node(),
+            None => instance.driver == crate::node::STREAM_DRIVER,
+        };
+        if streamed {
+            tracing::warn!(
+                workload_id = instance.workload_id,
+                instance_id = instance.id,
+                node_id,
+                "{error}; node {node_id} reads its state stream and acts on the instance row \
+                 itself"
+            );
+            return Ok(());
+        }
+        // Without a placement nothing here can tell; keep retrying.
+        let exists = match &self.placement {
+            Some(placement) => placement.node_exists(node_id).await.map_err(|reason| {
+                PlaneError::NodeUnavailable {
+                    workload_id: instance.workload_id,
+                    node_id,
+                    reason: format!(
+                        "{error}; and whether node {node_id} still exists could not be read: \
+                         {reason}"
+                    ),
+                }
+            })?,
+            None => true,
+        };
+        if !exists {
+            tracing::warn!(
+                workload_id = instance.workload_id,
+                instance_id = instance.id,
+                node_id,
+                "{error}; node {node_id} no longer exists, so nothing can remove instance {} \
+                 there and it is forgotten",
+                instance.id
+            );
+            return Ok(());
+        }
+        tracing::warn!(
+            workload_id = instance.workload_id,
+            instance_id = instance.id,
+            node_id,
+            "{error}; node {node_id} does not read its state stream, so the instance row is \
+             kept and its removal retried on a later pass"
+        );
+        Err(error)
+    }
+
     /// Wait for the instance's exit in the background and wake the
     /// reconciler when it happens. One watcher per instance.
     fn watch(&self, driver: &Arc<dyn RuntimeDriver>, instance_id: i64, handle: InstanceHandle) {
@@ -1984,6 +2151,14 @@ impl WorkloadPlane {
             }
         }
         removed
+    }
+}
+
+/// Where an instance runs, for messages.
+fn node_label(node_id: Option<i32>) -> String {
+    match node_id {
+        None => "the control plane".to_string(),
+        Some(node_id) => format!("node {node_id}"),
     }
 }
 
@@ -2788,6 +2963,302 @@ mod tests {
             scheduled.message.contains("node 3"),
             "{}",
             scheduled.message
+        );
+    }
+
+    /// ADR-055 §2: the instance's success is persisted before the
+    /// workload's conclusion. A process that dies between the two writes
+    /// leaves a running workload with a succeeded instance; a pass after
+    /// the deadline must conclude it Succeeded, not DeadlineExceeded.
+    #[tokio::test]
+    async fn a_success_persisted_before_a_crash_is_kept_by_a_pass_past_the_deadline() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let id = plane
+            .apply(apply_request(
+                18,
+                "crashed-conclude",
+                job_spec_with("app:1", 60, 2, None),
+            ))
+            .await
+            .expect("applied");
+        let created_at = plane.get(id).await.expect("read").created_at;
+        plane.reconcile_at(Utc::now(), false).await;
+        assert_eq!(driver.running().len(), 1);
+        let instance = workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.eq(id))
+            .one(&*db.db)
+            .await
+            .expect("read")
+            .expect("an instance");
+        // `finish_instance` ran (a worker's exit report writes the same
+        // row), then the process stopped before `conclude`.
+        plane
+            .finish_instance(
+                instance.id,
+                PHASE_SUCCEEDED,
+                Some(0),
+                created_at + Duration::seconds(30),
+            )
+            .await
+            .expect("finished");
+        assert_eq!(
+            plane.get(id).await.expect("read").status.phase,
+            WorkloadPhase::Running
+        );
+
+        plane
+            .reconcile_at(created_at + Duration::seconds(90), false)
+            .await;
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Succeeded);
+        assert_eq!(view.status.exit_code, Some(0));
+        let completed = view
+            .status
+            .condition(ConditionKind::Completed)
+            .expect("completed");
+        assert_eq!(completed.reason, "Succeeded");
+        assert_eq!(driver.created().len(), 1, "no retry of a succeeded run");
+    }
+
+    /// Places every attempt on worker 5. `stream` picks how the worker is
+    /// driven: through its state stream, or through a runtime that acts
+    /// only when called (a worker without the `state_stream` capability).
+    struct OnWorkerFive {
+        rpc: Arc<FakeDriver>,
+        stream: bool,
+        db: Arc<sea_orm::DatabaseConnection>,
+        reachable: std::sync::atomic::AtomicBool,
+        registered: std::sync::atomic::AtomicBool,
+    }
+
+    impl OnWorkerFive {
+        fn new(db: &temps_database::test_utils::TestDatabase, stream: bool) -> Arc<Self> {
+            Arc::new(Self {
+                rpc: FakeDriver::new(),
+                stream,
+                db: db.db.clone(),
+                reachable: std::sync::atomic::AtomicBool::new(true),
+                registered: std::sync::atomic::AtomicBool::new(true),
+            })
+        }
+
+        fn plane(
+            self: &Arc<Self>,
+            db: &temps_database::test_utils::TestDatabase,
+        ) -> Arc<WorkloadPlane> {
+            Arc::new(
+                WorkloadPlane::new(
+                    db.db.clone(),
+                    NodeDriver(Some(FakeDriver::new())),
+                    Arc::new(crate::NoEnvSource),
+                    Arc::new(crate::testing::RecordingAudit::default()),
+                    crate::PlaneConfig::new(format!(
+                        "t{}",
+                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                    )),
+                )
+                .with_placement(self.clone()),
+            )
+        }
+
+        fn driver(&self) -> Arc<dyn RuntimeDriver> {
+            if self.stream {
+                Arc::new(crate::node::StreamNodeDriver::new(
+                    self.db.clone(),
+                    5,
+                    self.rpc.clone(),
+                ))
+            } else {
+                self.rpc.clone()
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::node::Placement for OnWorkerFive {
+        async fn place(&self, _: &WorkloadView) -> Result<Placed, String> {
+            Ok(Placed::Node {
+                node_id: 5,
+                node_name: "worker-5".into(),
+                driver: self.driver(),
+            })
+        }
+
+        async fn driver_for(
+            &self,
+            node_id: i32,
+            _: &str,
+        ) -> Result<Arc<dyn RuntimeDriver>, String> {
+            if self.reachable.load(Ordering::Relaxed) {
+                Ok(self.driver())
+            } else {
+                Err(format!("node {node_id}'s agent client could not be built"))
+            }
+        }
+
+        async fn node_exists(&self, _: i32) -> Result<bool, String> {
+            Ok(self.registered.load(Ordering::Relaxed))
+        }
+    }
+
+    async fn instance_rows(db: &temps_database::test_utils::TestDatabase, id: i64) -> usize {
+        workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.eq(id))
+            .all(&*db.db)
+            .await
+            .expect("read")
+            .len()
+    }
+
+    /// A worker driven through calls never sees the instance row again
+    /// once the workload is deleted: a removal that failed is retried, and
+    /// the workload and its instance row are kept until it succeeds.
+    #[tokio::test]
+    async fn a_failed_removal_on_a_worker_without_the_stream_keeps_the_deletion_pending() {
+        let Some(db) = test_db().await else { return };
+        let worker = OnWorkerFive::new(&db, false);
+        let plane = worker.plane(&db);
+        let id = plane
+            .apply(apply_request(19, "rpc-run", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        let running = worker.rpc.running();
+        assert_eq!(running.len(), 1, "the worker's runtime created it");
+
+        worker.rpc.set_unreachable(true);
+        plane
+            .delete(id, "Replaced", "a newer run replaced this one")
+            .await
+            .expect("deleted");
+        for _ in 0..2 {
+            let outcome = plane.reconcile_at(Utc::now(), false).await;
+            assert!(outcome.failed >= 1, "the failed removal is reported");
+            assert!(worker.rpc.exists(&running[0]), "still on the worker");
+            let view = plane.get(id).await.expect("kept, pending deletion");
+            assert!(view.deleted_at.is_some());
+            assert_eq!(instance_rows(&db, id).await, 1, "the row is kept");
+        }
+
+        worker.rpc.set_unreachable(false);
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(!worker.rpc.exists(&running[0]), "removed on the retry");
+        assert!(matches!(
+            plane.get(id).await,
+            Err(PlaneError::NotFound { .. })
+        ));
+        assert_eq!(instance_rows(&db, id).await, 0);
+    }
+
+    /// The same when the worker's driver cannot be built at all, until the
+    /// node itself is deleted: then nothing can remove the instance, and
+    /// the deletion goes ahead (the one bounded give-up).
+    #[tokio::test]
+    async fn an_unreachable_worker_without_the_stream_holds_the_deletion_until_deregistered() {
+        let Some(db) = test_db().await else { return };
+        let worker = OnWorkerFive::new(&db, false);
+        let plane = worker.plane(&db);
+        let id = plane
+            .apply(apply_request(20, "rpc-gone", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert_eq!(worker.rpc.running().len(), 1);
+
+        worker.reachable.store(false, Ordering::Relaxed);
+        plane
+            .delete(id, "Replaced", "a newer run replaced this one")
+            .await
+            .expect("deleted");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(plane.get(id).await.is_ok(), "kept while the node exists");
+        assert_eq!(instance_rows(&db, id).await, 1);
+
+        worker.registered.store(false, Ordering::Relaxed);
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(matches!(
+            plane.get(id).await,
+            Err(PlaneError::NotFound { .. })
+        ));
+    }
+
+    /// A worker that reads its stream removes the instance when its row
+    /// goes, so the deletion never waits for its driver.
+    #[tokio::test]
+    async fn a_stream_worker_learns_of_the_deletion_from_the_row() {
+        let Some(db) = test_db().await else { return };
+        let worker = OnWorkerFive::new(&db, true);
+        let plane = worker.plane(&db);
+        let id = plane
+            .apply(apply_request(21, "stream-run", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert_eq!(instance_rows(&db, id).await, 1);
+
+        worker.reachable.store(false, Ordering::Relaxed);
+        plane
+            .delete(id, "Replaced", "a newer run replaced this one")
+            .await
+            .expect("deleted");
+        plane.reconcile_at(Utc::now(), false).await;
+        assert!(matches!(
+            plane.get(id).await,
+            Err(PlaneError::NotFound { .. })
+        ));
+        assert_eq!(instance_rows(&db, id).await, 0);
+    }
+
+    /// Past its deadline, a run on a worker driven through calls stays
+    /// unfinished until its instance is actually stopped and removed.
+    #[tokio::test]
+    async fn a_run_past_its_deadline_on_a_worker_without_the_stream_waits_for_the_removal() {
+        let Some(db) = test_db().await else { return };
+        let worker = OnWorkerFive::new(&db, false);
+        let plane = worker.plane(&db);
+        let id = plane
+            .apply(apply_request(
+                22,
+                "rpc-slow",
+                job_spec_with("app:1", 60, 0, None),
+            ))
+            .await
+            .expect("applied");
+        let created_at = plane.get(id).await.expect("read").created_at;
+        plane.reconcile_at(Utc::now(), false).await;
+        let running = worker.rpc.running();
+        assert_eq!(running.len(), 1);
+
+        worker.rpc.set_unreachable(true);
+        plane
+            .reconcile_at(created_at + Duration::seconds(61), false)
+            .await;
+        assert!(worker.rpc.exists(&running[0]));
+        assert!(
+            !plane
+                .get(id)
+                .await
+                .expect("read")
+                .status
+                .phase
+                .is_terminal(),
+            "not failed while its instance is still on the worker"
+        );
+
+        worker.rpc.set_unreachable(false);
+        plane
+            .reconcile_at(created_at + Duration::seconds(62), false)
+            .await;
+        assert!(!worker.rpc.exists(&running[0]));
+        let view = plane.get(id).await.expect("read");
+        assert_eq!(view.status.phase, WorkloadPhase::Failed);
+        assert_eq!(
+            view.status
+                .condition(ConditionKind::Completed)
+                .expect("completed")
+                .reason,
+            "DeadlineExceeded"
         );
     }
 }

@@ -343,6 +343,17 @@ pub enum DriverError {
 pub trait RuntimeDriver: Send + Sync {
     fn capabilities(&self) -> &DriverCapabilities;
 
+    /// Whether a node runtime that reads the instance rows (the ADR-055
+    /// state stream) does this driver's work. Then `create`, `start`,
+    /// `stop` and `remove` only acknowledge desired state the caller has
+    /// already written: the instance is not running until the node reports
+    /// it, and deleting the instance row is how the node learns to remove
+    /// it. `false` (the default) for a driver that acts when called, whose
+    /// failed `remove` leaves the instance in place until it is retried.
+    fn reconciled_by_node(&self) -> bool {
+        false
+    }
+
     async fn prepare(&self, artifact: &Artifact) -> Result<PreparedArtifact, DriverError>;
     async fn create(
         &self,

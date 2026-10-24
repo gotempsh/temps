@@ -939,6 +939,14 @@ impl AttemptPlacement for NodeWorkloadPlacement {
             .insert(key, (Instant::now(), built.clone()));
         Ok(built)
     }
+
+    async fn node_exists(&self, node_id: i32) -> Result<bool, String> {
+        nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await
+            .map(|node| node.is_some())
+            .map_err(|e| format!("reading node {node_id}: {e}"))
+    }
 }
 
 #[cfg(test)]

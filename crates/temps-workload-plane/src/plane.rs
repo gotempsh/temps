@@ -213,6 +213,13 @@ pub struct WorkloadPlane {
     pub(crate) inventory: Option<Arc<dyn NodeInventory>>,
     pub(crate) scheduler: Arc<UnifiedScheduler>,
     pub(crate) in_flight: Arc<InFlightLedger>,
+    /// Serialises scheduling: reading the node facts (with the in-flight
+    /// ledger applied), deciding, and holding the decision's reservation
+    /// are one critical section, so two concurrent placements cannot both
+    /// admit into the same headroom. An async lock: the facts are read
+    /// across an await. Placements are control-plane work, a handful at a
+    /// time; this never sits on a request path.
+    pub(crate) scheduling: tokio::sync::Mutex<()>,
     /// Environments staged for one create, by import name (`staged:<key>`):
     /// never stored in a spec.
     pub(crate) staged_env: StagedEnvs,
@@ -409,6 +416,7 @@ impl WorkloadPlane {
                 scheduler::platforms_equal,
             ))),
             in_flight: InFlightLedger::new(),
+            scheduling: tokio::sync::Mutex::new(()),
             staged_env: Arc::new(Mutex::new(HashMap::new())),
             placement: None,
             stream_metrics: StreamMetrics::default(),
@@ -642,6 +650,9 @@ impl WorkloadPlane {
         spec: &WorkloadSpec,
         hints: &PlacementHints,
     ) -> Result<(Placement, InFlightGuard), PlaneError> {
+        // Held until the reservation is in the ledger: another placement
+        // reads the facts only after this one's hold is counted in them.
+        let _scheduling = self.scheduling.lock().await;
         let nodes = self.facts_for(name, hints).await?;
         let placement = self
             .scheduler
@@ -1453,6 +1464,95 @@ mod tests {
     use crate::testing::{
         apply_request, deployment_spec, job_spec, job_spec_with, plane_with, test_db,
     };
+
+    /// One enforcing worker with exactly 512 MB of headroom. Reading it
+    /// takes a moment, as a database read does, so two placements started
+    /// together both read the facts before either decides.
+    struct OneSlot;
+
+    #[async_trait]
+    impl NodeInventory for OneSlot {
+        async fn nodes(&self, _: Option<&str>) -> Result<Vec<scheduler::NodeFacts>, String> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let mut node = scheduler::NodeFacts::control_plane(Some("linux/amd64".into()));
+            node.id = 9;
+            node.name = "worker-9".into();
+            node.resource_policy =
+                temps_entities::node_resource_settings::NodeResourcePolicy::Enforced;
+            node.system_reserved = temps_entities::node_resource_settings::SystemReserved::NONE;
+            node.usage = Some(scheduler::NodeUsage {
+                cpu_percent: Some(0.0),
+                memory_used_bytes: Some(0.0),
+                memory_total_bytes: Some(512.0 * 1024.0 * 1024.0),
+                cpu_cores: Some(4.0),
+            });
+            Ok(vec![node])
+        }
+
+        fn socket_gate(&self, _: Option<&str>) -> Option<scheduler::SocketGate> {
+            None
+        }
+
+        async fn explain_context(
+            &self,
+            _: &PlacementHints,
+            _: Option<&str>,
+        ) -> Result<scheduler::ExplainContext, String> {
+            Ok(Default::default())
+        }
+    }
+
+    /// ADR-055 §5: two placements racing for the last 512 MB of a node:
+    /// exactly one is admitted, the other sees the first's reservation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_placements_cannot_both_take_the_last_slot() {
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                Arc::new(DatabaseConnection::Disconnected),
+                NodeDriver(None),
+                Arc::new(crate::NoEnvSource),
+                Arc::new(crate::testing::RecordingAudit::default()),
+                PlaneConfig::new("t-slot"),
+            )
+            .with_inventory(Arc::new(OneSlot)),
+        );
+        let mut spec = deployment_spec("app:1");
+        spec.resources.requests = Some(temps_workload::ResourceAmounts {
+            cpu_millis: Some(100),
+            memory_mb: Some(512),
+            ..Default::default()
+        });
+        let hints = PlacementHints {
+            exclude_control_plane: true,
+            ..Default::default()
+        };
+        let race = |name: &'static str| {
+            let plane = plane.clone();
+            let spec = spec.clone();
+            let hints = hints.clone();
+            tokio::spawn(async move { plane.schedule(name, &spec, &hints).await })
+        };
+        let (first, second) = (race("replica-a"), race("replica-b"));
+        let outcomes = [first.await.expect("joined"), second.await.expect("joined")];
+        let admitted: Vec<_> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+        assert_eq!(
+            admitted.len(),
+            1,
+            "exactly one placement fits: {outcomes:?}"
+        );
+        assert_eq!(admitted[0].0.nodes, vec![9]);
+        assert!(
+            outcomes
+                .iter()
+                .any(|o| matches!(o, Err(PlaneError::Unschedulable { .. }))),
+            "the other is refused for capacity: {outcomes:?}"
+        );
+        // The held reservation is what refused it: once released, the
+        // slot is free again.
+        drop(outcomes);
+        assert!(plane.in_flight.by_node().is_empty());
+        assert!(plane.schedule("replica-c", &spec, &hints).await.is_ok());
+    }
 
     #[tokio::test]
     async fn an_abandoned_handoff_retires_its_workload_and_a_disarmed_one_keeps_it() {
