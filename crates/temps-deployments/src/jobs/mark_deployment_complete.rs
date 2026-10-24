@@ -71,6 +71,10 @@ pub struct MarkDeploymentCompleteJob {
     queue: Arc<dyn JobQueue>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// The workload plane, when this process runs one: a replica an
+    /// `enforce` deployment started through it is retired by deleting its
+    /// workload, never by removing the container behind the plane's back.
+    workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 impl std::fmt::Debug for MarkDeploymentCompleteJob {
@@ -101,11 +105,18 @@ impl MarkDeploymentCompleteJob {
             queue,
             config_service: None,
             encryption_service,
+            workload_plane: None,
         }
     }
 
     pub fn with_config_service(mut self, config_service: Arc<temps_config::ConfigService>) -> Self {
         self.config_service = Some(config_service);
+        self
+    }
+
+    /// Retire plane-started replicas through `plane` (ADR-055 `enforce`).
+    pub fn with_workload_plane(mut self, plane: Arc<temps_workload_plane::WorkloadPlane>) -> Self {
+        self.workload_plane = Some(plane);
         self
     }
 
@@ -2135,6 +2146,13 @@ WHERE project.id = $2
     /// best-effort, but a failed remove or database update is returned so the
     /// caller does not silently consider a still-running container cleaned up.
     /// Resolves the correct (local vs remote) deployer from node_id.
+    ///
+    /// A replica an `enforce` deployment started through the workload plane
+    /// is retired by deleting its plane workload: the plane stops and
+    /// removes the instance (a container, or a microVM no deployer can
+    /// see). Removing only the container would leave the workload running
+    /// -- or restarted by the reconciler -- and a microVM's id is a 404 to
+    /// Docker, which must not count as "already removed".
     async fn teardown_container(
         &self,
         container: deployment_containers::Model,
@@ -2142,13 +2160,32 @@ WHERE project.id = $2
         environment_id: i32,
     ) -> Result<(), String> {
         let container_id = container.container_id.clone();
+        let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         // Determine which deployer to use based on node_id
-        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = if let Some(node_id) =
+        let deployer: Option<Arc<dyn temps_deployer::ContainerDeployer>> = if let Some(node_id) =
             container.node_id
         {
             match self.get_remote_deployer(node_id).await {
-                Ok(remote) => remote,
+                Ok(remote) => Some(remote),
+                // The plane retires its replica without this deployer; only
+                // the log capture below is skipped.
+                Err(e) if plane_workload.is_some() => {
+                    warn!(
+                        container_id = %container_id,
+                        node_id,
+                        error = %e,
+                        "Cannot reach worker node to capture logs; retiring the replica through \
+                         the workload plane"
+                    );
+                    None
+                }
                 Err(e) => {
                     // Never fall back to the local daemon: it does not own this
                     // container, and a matching ID there would be the wrong
@@ -2166,16 +2203,70 @@ WHERE project.id = $2
                 }
             }
         } else {
-            self.container_deployer.clone()
+            Some(self.container_deployer.clone())
         };
 
         // Capture the container's logs to durable storage BEFORE we stop and
         // remove it, so they survive teardown and can be viewed later.
-        self.capture_container_logs(&deployer, &container, project_id, environment_id)
-            .await;
+        if let Some(deployer) = deployer.as_ref() {
+            self.capture_container_logs(deployer, &container, project_id, environment_id)
+                .await;
+        }
 
+        match (plane_workload, deployer) {
+            (Some(workload), _) => {
+                if let Err(e) = crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.as_deref(),
+                    container.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                {
+                    self.log(format!("Failed to retire container {container_id}: {e}"))
+                        .await
+                        .ok();
+                    return Err(e.to_string());
+                }
+                self.log(format!(
+                    "Retired container {} through the workload plane (workload {})",
+                    container_id, workload.workload_id
+                ))
+                .await
+                .ok();
+            }
+            (None, Some(deployer)) => {
+                self.stop_and_remove_container(deployer.as_ref(), &container_id)
+                    .await?;
+            }
+            (None, None) => {
+                return Err(format!(
+                    "No deployer resolved to remove container {container_id}"
+                ));
+            }
+        }
+
+        // Mark container as deleted in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.deleted_at = Set(Some(chrono::Utc::now()));
+        active_container.status = Set(Some("removed".to_string()));
+        active_container
+            .update(self.db.as_ref())
+            .await
+            .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Stop (best effort) and remove a legacy container through its node's
+    /// deployer. An already-removed container counts as removed.
+    async fn stop_and_remove_container(
+        &self,
+        deployer: &dyn temps_deployer::ContainerDeployer,
+        container_id: &str,
+    ) -> Result<(), String> {
         // Stop container first
-        match deployer.stop_container(&container_id).await {
+        match deployer.stop_container(container_id).await {
             Ok(_) => {
                 self.log(format!("Stopped container {}", container_id))
                     .await
@@ -2192,7 +2283,7 @@ WHERE project.id = $2
         // (pruned, removed by hand, lost with its node's disk) is torn down:
         // retrying could never succeed and would keep the deployment in the
         // sweep forever.
-        match deployer.remove_container(&container_id).await {
+        match deployer.remove_container(container_id).await {
             Ok(_) => {
                 self.log(format!("Removed container {}", container_id))
                     .await
@@ -2218,15 +2309,6 @@ WHERE project.id = $2
                 ));
             }
         }
-
-        // Mark container as deleted in database
-        let mut active_container: deployment_containers::ActiveModel = container.into();
-        active_container.deleted_at = Set(Some(chrono::Utc::now()));
-        active_container.status = Set(Some("removed".to_string()));
-        active_container
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
 
         Ok(())
     }
@@ -2708,6 +2790,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     queue: Option<Arc<dyn JobQueue>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
+    workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -2722,7 +2805,18 @@ impl MarkDeploymentCompleteJobBuilder {
             queue: None,
             config_service: None,
             encryption_service: None,
+            workload_plane: None,
         }
+    }
+
+    /// The workload plane, when this process runs one (see
+    /// [`MarkDeploymentCompleteJob::with_workload_plane`]).
+    pub fn workload_plane(
+        mut self,
+        plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
+    ) -> Self {
+        self.workload_plane = plane;
+        self
     }
 
     pub fn job_id(mut self, job_id: String) -> Self {
@@ -2812,6 +2906,9 @@ impl MarkDeploymentCompleteJobBuilder {
             job = job.with_log_service(log_service);
         }
         job = job.with_config_service(config_service);
+        if let Some(plane) = self.workload_plane {
+            job = job.with_workload_plane(plane);
+        }
 
         Ok(job)
     }

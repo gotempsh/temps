@@ -572,6 +572,11 @@ pub struct DeploymentService {
     /// Planner shared with normal deployments for worker-specific environment
     /// rewrites and cross-node managed-service blockers.
     workflow_planner: std::sync::OnceLock<Arc<crate::services::WorkflowPlanner>>,
+    /// The workload plane, bound once it starts (ADR-055). Rollback and
+    /// promotion retire the superseded deployment's `enforce` replicas
+    /// through it; unset, those replicas are left for a later sweep rather
+    /// than removed behind the plane's back.
+    workload_plane: std::sync::OnceLock<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 fn deployment_url_from_settings(
@@ -1072,6 +1077,69 @@ impl DeploymentService {
                 continue;
             }
 
+            // A replica an `enforce` deployment started through the workload
+            // plane is retired by deleting its workload: the plane removes
+            // the instance on whichever node runs it. Docker on this host
+            // cannot see a microVM (or a worker's container), so its 404 must
+            // never count as "already removed".
+            let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
+                self.db.as_ref(),
+                original.deployment_id,
+                &container_id,
+            )
+            .await
+            .map_err(|error| temps_core::ContainerCleanupError::Removal {
+                project_id,
+                environment_id: container_environment_id,
+                container_id: container_id.clone(),
+                node_id,
+                reason: error.to_string(),
+            })?;
+            if let Some(workload) = plane_workload {
+                let prepared = self
+                    .mark_container_removing(&original, project_id, container_environment_id)
+                    .await?;
+                if let Err(error) = crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.get().map(Arc::as_ref),
+                    original.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                {
+                    // Keep the `removing` marker: routing stays fenced and a
+                    // retry converges once the plane can retire it.
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason: error.to_string(),
+                    });
+                }
+                let mut active: deployment_containers::ActiveModel = prepared.into();
+                active.status = Set(Some("removed".to_string()));
+                active.update(self.db.as_ref()).await.map_err(|error| {
+                    temps_core::ContainerCleanupError::Finalize {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container_id.clone(),
+                        node_id,
+                        reason: error.to_string(),
+                    }
+                })?;
+                removed += 1;
+                info!(
+                    project_id,
+                    environment_id = container_environment_id,
+                    container_id,
+                    ?node_id,
+                    workload_id = workload.workload_id,
+                    "Retired workload-plane replica before owner deletion"
+                );
+                continue;
+            }
+
             // Resolve where the container lives before touching its row.
             let deployer = match self.deployer_for_node(node_id).await {
                 Ok(deployer) => deployer,
@@ -1100,22 +1168,9 @@ impl DeploymentService {
             // process crash retryable instead of turning the row into a false
             // completed cleanup.
             let already_prepared = original.status.as_deref() == Some("removing");
-            let prepared = if already_prepared {
-                original.clone()
-            } else {
-                let mut active: deployment_containers::ActiveModel = original.clone().into();
-                active.deleted_at = Set(Some(chrono::Utc::now()));
-                active.status = Set(Some("removing".to_string()));
-                active.update(self.db.as_ref()).await.map_err(|error| {
-                    temps_core::ContainerCleanupError::Prepare {
-                        project_id,
-                        environment_id: container_environment_id,
-                        container_id: container_id.clone(),
-                        node_id,
-                        reason: error.to_string(),
-                    }
-                })?
-            };
+            let prepared = self
+                .mark_container_removing(&original, project_id, container_environment_id)
+                .await?;
 
             let runtime_container_absent = match deployer.get_container_info(&container_id).await {
                 Ok(info) => {
@@ -1228,6 +1283,33 @@ impl DeploymentService {
         Ok(removed)
     }
 
+    /// Hide a container being torn down from routing and health monitoring:
+    /// tombstoned with the distinct `removing` state, so a crash mid-removal
+    /// is retried rather than read as a completed cleanup. A row already in
+    /// that state is returned as is.
+    async fn mark_container_removing(
+        &self,
+        original: &deployment_containers::Model,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<deployment_containers::Model, temps_core::ContainerCleanupError> {
+        if original.status.as_deref() == Some("removing") {
+            return Ok(original.clone());
+        }
+        let mut active: deployment_containers::ActiveModel = original.clone().into();
+        active.deleted_at = Set(Some(chrono::Utc::now()));
+        active.status = Set(Some("removing".to_string()));
+        active.update(self.db.as_ref()).await.map_err(|error| {
+            temps_core::ContainerCleanupError::Prepare {
+                project_id,
+                environment_id,
+                container_id: original.container_id.clone(),
+                node_id: original.node_id,
+                reason: error.to_string(),
+            }
+        })
+    }
+
     async fn restore_cleanup_marker(
         &self,
         original: &deployment_containers::Model,
@@ -1335,6 +1417,7 @@ impl DeploymentService {
             audit_logger: std::sync::OnceLock::new(),
             node_scheduler: std::sync::OnceLock::new(),
             workflow_planner: std::sync::OnceLock::new(),
+            workload_plane: std::sync::OnceLock::new(),
         }
     }
 
@@ -1373,6 +1456,12 @@ impl DeploymentService {
 
     pub fn set_workflow_planner(&self, planner: Arc<crate::services::WorkflowPlanner>) {
         let _ = self.workflow_planner.set(planner);
+    }
+
+    /// Bind the started workload plane (see the field docs). Later calls are
+    /// ignored: a process runs one plane.
+    pub fn set_workload_plane(&self, plane: Arc<temps_workload_plane::WorkloadPlane>) {
+        let _ = self.workload_plane.set(plane);
     }
 
     /// The telemetry reporter, or a no-op when none has been wired.
@@ -3123,6 +3212,7 @@ impl DeploymentService {
             .queue(self.queue_service.clone())
             .config_service(self.config_service.clone())
             .encryption_service(self.encryption_service.clone())
+            .workload_plane(self.workload_plane.get().cloned())
             .build()
             .map_err(|error| {
                 DeploymentError::Other(format!("Failed to create static completion job: {error}"))
@@ -3975,6 +4065,7 @@ impl DeploymentService {
                 .queue(self.queue_service.clone())
                 .config_service(self.config_service.clone())
                 .encryption_service(self.encryption_service.clone())
+                .workload_plane(self.workload_plane.get().cloned())
                 .build()
                 .map_err(|e| {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
@@ -4596,6 +4687,7 @@ impl DeploymentService {
                 .queue(self.queue_service.clone())
                 .config_service(self.config_service.clone())
                 .encryption_service(self.encryption_service.clone())
+                .workload_plane(self.workload_plane.get().cloned())
                 .build()
                 .map_err(|e| {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
@@ -7642,6 +7734,7 @@ mod tests {
             audit_logger: std::sync::OnceLock::new(),
             node_scheduler: std::sync::OnceLock::new(),
             workflow_planner: std::sync::OnceLock::new(),
+            workload_plane: std::sync::OnceLock::new(),
         }
     }
 
@@ -7727,6 +7820,7 @@ mod tests {
             audit_logger: std::sync::OnceLock::new(),
             node_scheduler: std::sync::OnceLock::new(),
             workflow_planner: std::sync::OnceLock::new(),
+            workload_plane: std::sync::OnceLock::new(),
         }
     }
 
@@ -7782,6 +7876,89 @@ mod tests {
             .one(db.as_ref())
             .await?
             .is_some());
+        Ok(())
+    }
+
+    /// A replica started through the workload plane is retired by the
+    /// plane, never by the node's Docker: without a plane to retire it, the
+    /// cleanup fails and the row stays fenced (`removing`) rather than being
+    /// recorded as removed off a Docker 404.
+    #[tokio::test]
+    async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping plane replica cleanup integration test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+        let now = chrono::Utc::now();
+        let workload = temps_entities::workloads::ActiveModel {
+            owner_kind: Set(crate::services::plane_deployer::DEPLOYMENT_OWNER_KIND.to_string()),
+            owner_id: Set(i64::from(deployment.id)),
+            name: Set(container.container_name.clone()),
+            spec: Set(serde_json::json!({})),
+            generation: Set(1),
+            observed_generation: Set(1),
+            change_seq: Set(0),
+            status: Set(serde_json::json!({})),
+            phase: Set("running".to_string()),
+            owner_workload_id: Set(None),
+            finalizers: Set(Vec::new()),
+            expires_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            deleted_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        temps_entities::workload_instances::ActiveModel {
+            workload_id: Set(workload.id),
+            revision: Set(1),
+            attempt: Set(1),
+            node_id: Set(None),
+            driver: Set("firecracker".to_string()),
+            handle: Set(serde_json::json!({ "id": container.container_id })),
+            address: Set(None),
+            phase: Set("running".to_string()),
+            ready: Set(true),
+            conditions: Set(serde_json::json!([])),
+            exit_code: Set(None),
+            published_ports: Set(serde_json::json!([])),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            change_seq: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Docker would answer 404 for a microVM: it is never asked.
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_list_containers()
+            .returning(|| Ok(Vec::new()));
+        deployer.expect_get_container_info().never();
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        let error = result.expect_err("no plane runs to retire the replica");
+        assert!(
+            error.to_string().contains(&container.container_id),
+            "{error}"
+        );
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("container row")?;
+        assert_eq!(row.status.as_deref(), Some("removing"));
         Ok(())
     }
 
@@ -9653,6 +9830,7 @@ mod tests {
             audit_logger: std::sync::OnceLock::new(),
             node_scheduler: std::sync::OnceLock::new(),
             workflow_planner: std::sync::OnceLock::new(),
+            workload_plane: std::sync::OnceLock::new(),
         }
     }
 

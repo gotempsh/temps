@@ -309,6 +309,13 @@ pub struct ContainerInventoryItem {
 pub struct HeartbeatResponse {
     pub status: String,
     pub message: String,
+    /// Whether the instance reports in this heartbeat (ADR-055 §7) were
+    /// recorded. `false` when it carried none, when recording them failed,
+    /// or when this process runs no node state stream: the node must keep
+    /// resending them until a heartbeat answers `true`. The heartbeat itself
+    /// still succeeds, so a failed ingest never costs the node its liveness.
+    /// Absent from older servers, which agents read as `false`.
+    pub instances_accepted: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -1819,24 +1826,17 @@ async fn node_heartbeat(
     }
 
     // Instance reports of the node runtime: written only when they changed.
-    // A failure is the plane's to report; the node resends what was not
-    // accepted on its next beat, so the heartbeat itself still succeeds.
-    if let Some(reports) = request.instances.as_deref() {
-        match node_state {
-            Some(axum::Extension(node_state)) => match node_state.ingest(node_id, reports).await {
-                Ok(changed) if changed > 0 => {
-                    tracing::debug!(node_id, changed, "recorded instance reports")
-                }
-                Ok(_) => {}
-                Err(e) => warn!(node_id, "instance reports were not recorded: {}", e),
-            },
-            None => tracing::debug!(
-                node_id,
-                count = reports.len(),
-                "instance reports ignored: no node state stream in this process"
-            ),
-        }
-    }
+    // A failure is the plane's to report; the response tells the node
+    // whether they were recorded, so it resends what was not on its next
+    // beat, and the heartbeat itself still succeeds.
+    let instances_accepted = ingest_instance_reports(
+        node_state
+            .as_ref()
+            .map(|axum::Extension(service)| service.as_ref()),
+        node_id,
+        request.instances.as_deref(),
+    )
+    .await;
 
     // Reconcile container state when the agent sends its inventory.
     // This happens on the first heartbeat after agent startup/reconnect.
@@ -1875,7 +1875,47 @@ async fn node_heartbeat(
     Ok(Json(HeartbeatResponse {
         status: "ok".to_string(),
         message: "Heartbeat received".to_string(),
+        instances_accepted,
     }))
+}
+
+/// Record a heartbeat's instance reports. `true` only when there were
+/// reports and every one was ingested; otherwise the node must not consider
+/// them delivered (it suppresses a report it believes delivered until it
+/// changes, so an unacknowledged loss would never be resent).
+async fn ingest_instance_reports(
+    node_state: Option<&crate::services::NodeStateService>,
+    node_id: i32,
+    reports: Option<&[temps_workload::stream::InstanceReport]>,
+) -> bool {
+    let Some(reports) = reports.filter(|reports| !reports.is_empty()) else {
+        return false;
+    };
+    let Some(node_state) = node_state else {
+        tracing::debug!(
+            node_id,
+            count = reports.len(),
+            "instance reports not recorded: no node state stream in this process"
+        );
+        return false;
+    };
+    match node_state.ingest(node_id, reports).await {
+        Ok(changed) => {
+            if changed > 0 {
+                tracing::debug!(node_id, changed, "recorded instance reports");
+            }
+            true
+        }
+        Err(e) => {
+            warn!(
+                node_id,
+                count = reports.len(),
+                "instance reports were not recorded; the node will resend them: {}",
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Get decrypted S3 credentials for a backup/restore operation.
@@ -5889,6 +5929,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn running_report(instance_id: i64) -> temps_workload::stream::InstanceReport {
+        temps_workload::stream::InstanceReport {
+            instance_id,
+            phase: "running".to_string(),
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            conditions: Vec::new(),
+            published_ports: Vec::new(),
+        }
+    }
+
+    struct AcceptingAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for AcceptingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A node state service whose plane runs over `db`.
+    fn node_state_over(db: sea_orm::DatabaseConnection) -> crate::services::NodeStateService {
+        let service = crate::services::NodeStateService::new();
+        service.set_plane(Arc::new(temps_workload_plane::WorkloadPlane::new(
+            Arc::new(db),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("heartbeat-ack-test"),
+        )));
+        service
+    }
+
+    #[tokio::test]
+    async fn instance_reports_are_acknowledged_only_when_recorded() {
+        let reports = [running_report(4)];
+
+        // Nothing to acknowledge.
+        assert!(!ingest_instance_reports(None, 1, None).await);
+        assert!(!ingest_instance_reports(None, 1, Some(&[])).await);
+        // No node state stream in this process: not recorded.
+        assert!(!ingest_instance_reports(None, 1, Some(&reports)).await);
+        // A stream without a running plane: not recorded.
+        let without_plane = crate::services::NodeStateService::new();
+        assert!(!ingest_instance_reports(Some(&without_plane), 1, Some(&reports)).await);
+
+        // The plane fails to read the reported instances: not recorded.
+        let failing = node_state_over(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        assert!(!ingest_instance_reports(Some(&failing), 1, Some(&reports)).await);
+
+        // The plane reads them (none changed): recorded.
+        let recording = node_state_over(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::workload_instances::Model>::new()])
+                .into_connection(),
+        );
+        assert!(ingest_instance_reports(Some(&recording), 1, Some(&reports)).await);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_reports_unrecorded_instances_as_not_accepted() {
+        // This app has no node state stream, so the reports cannot be
+        // recorded: the heartbeat succeeds, the reports are not acknowledged.
+        let mut node = sample_node();
+        node.token_hash = sha256_hash("test-token");
+        let updated_node = node.clone();
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node.clone()]])
+            .append_query_results(vec![vec![node]])
+            .append_query_results(vec![vec![updated_node]])
+            .into_connection();
+
+        let app = make_app(db);
+        let body = serde_json::json!({
+            "capacity": { "cpu_percent": 50.0 },
+            "instances": [{ "instance_id": 4, "phase": "running", "conditions": [] }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["status"], "ok");
+        assert_eq!(ack["instances_accepted"], serde_json::json!(false));
     }
 
     #[tokio::test]

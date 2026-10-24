@@ -131,6 +131,9 @@ pub struct DatabaseCronConfigService {
 struct JobTarget {
     image: String,
     container_id: String,
+    /// The node `container_id` runs on (`None`: the control plane). The run
+    /// is pinned there: its variables are resolved for that node.
+    container_node_id: Option<i32>,
     project_slug: String,
 }
 
@@ -867,7 +870,7 @@ impl DatabaseCronConfigService {
         };
         let import =
             deployment_container_import(cron.project_id, cron.environment_id, &target.container_id);
-        let spec = match job_spec(cron, &target.image, import) {
+        let spec = match job_spec(cron, &target.image, import, target.container_node_id) {
             Ok(spec) => spec,
             Err(e) => {
                 warn!(cron_id = cron.id, "job cron run could not start: {e}");
@@ -954,6 +957,7 @@ impl DatabaseCronConfigService {
         Ok(JobTarget {
             image,
             container_id: container.container_id,
+            container_node_id: container.node_id,
             project_slug: project.slug,
         })
     }
@@ -2546,6 +2550,11 @@ mod tests {
             )]
         );
         assert_eq!(run.finalizers, vec![RECORD_RUN_FINALIZER.to_string()]);
+        assert_eq!(
+            run.spec.placement.pinned_nodes(),
+            Some(&[temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID][..]),
+            "the source container runs on the control plane, so the run does too"
+        );
         let executions = executions_of(db.as_ref(), cron.id).await;
         assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].workload_id, Some(run.id));
@@ -2612,6 +2621,62 @@ mod tests {
         assert_eq!(
             executions[0].output_tail.as_deref(),
             Some("report written\n")
+        );
+    }
+
+    /// The variables of a run beside a worker's container are recomputed
+    /// with the worker's `*.temps.local` rewrites, and those beside a
+    /// control-plane container carry control-plane Docker hostnames: either
+    /// way they are only right on the source's node, so the run is pinned
+    /// there instead of being placed wherever the scheduler likes.
+    #[tokio::test]
+    async fn a_run_beside_a_worker_container_is_pinned_to_that_worker() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let cron = job_cron_fixture(&db, CronConcurrencyPolicy::Allow).await;
+        let worker = temps_entities::nodes::ActiveModel {
+            name: Set("cron-source-worker".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:39998".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("active".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("worker insert");
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::NodeId,
+                Expr::value(Some(worker.id)),
+            )
+            .filter(deployment_containers::Column::ContainerId.eq("job-cron-container-id"))
+            .exec(db.as_ref())
+            .await
+            .expect("source container moved to the worker");
+
+        let service = cron_service(&db);
+        let plane = nodeless_plane(&db);
+        service.set_workload_plane(plane.clone());
+        service
+            .dispatch_job(&cron, Utc::now() - chrono::Duration::seconds(5), Utc::now())
+            .await
+            .expect("dispatched");
+        let owner = Owner::new(CRON_OWNER_KIND, i64::from(cron.id));
+        let active = plane.list_active(&owner).await.expect("active runs");
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].spec.placement.pinned_nodes(),
+            Some(&[worker.id][..]),
+            "the run lands on the worker its variables are resolved for"
         );
     }
 

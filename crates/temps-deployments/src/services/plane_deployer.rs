@@ -28,7 +28,18 @@
 //! node whose driver provides it (refused with the scheduler's reason
 //! otherwise), and a microVM is not a container the local Docker can act
 //! on, so every operation on such a replica goes through the plane
-//! (inspect, logs, exec, retire) instead of the local deployer.
+//! (inspect, logs, exec, retire) instead of the local deployer. Only a
+//! replica whose workload asks for `micro_vm` takes that path: a worker's
+//! Docker replica runs behind a plane driver too (`node-stream`,
+//! `agent-api`), but it is an ordinary container its node's deployer
+//! inspects, execs into and follows the logs of.
+//!
+//! Retiring a deployment's replicas after promotion happens outside the
+//! deploy job, so [`deployment_replica_workload`] and
+//! [`retire_replica_workload`] let that cleanup find and delete the plane
+//! workload behind a container: removing only the container would leave
+//! the workload (and a microVM) running, or let the reconciler start it
+//! again.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -48,6 +59,142 @@ use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 
 /// Owner kind of a deployment's workloads.
 pub const DEPLOYMENT_OWNER_KIND: &str = "deployment";
+
+/// The owner every replica of deployment `deployment_id` is applied under.
+pub fn deployment_owner(deployment_id: i32) -> Owner {
+    Owner::new(DEPLOYMENT_OWNER_KIND, i64::from(deployment_id))
+}
+
+/// Whether a replica whose workload asks for `isolation` runs somewhere
+/// its node's container deployer cannot reach (a microVM), so inspect,
+/// exec and logs must go through the plane. Decided by what the workload
+/// asked for, never by the driver's name: every worker replica runs behind
+/// a non-`docker` driver and is still an ordinary container.
+pub fn served_by_plane_only(isolation: Isolation) -> bool {
+    isolation == Isolation::MicroVm
+}
+
+/// The plane workload behind one of a deployment's containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicaWorkload {
+    pub workload_id: i64,
+    /// The workload is already deleted: the plane is removing (or has
+    /// removed) its instance.
+    pub retired: bool,
+}
+
+/// Why a plane-started replica could not be retired.
+#[derive(Debug, thiserror::Error)]
+pub enum ReplicaRetireError {
+    #[error(
+        "Failed to look up the workload-plane workload of container {container_id} (deployment \
+         {deployment_id}): {source}"
+    )]
+    Lookup {
+        deployment_id: i32,
+        container_id: String,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "Container {container_id} of deployment {deployment_id} was started through the \
+         workload plane as workload {workload_id}, but no workload plane runs in this process \
+         to retire it; it is left in place for a later cleanup"
+    )]
+    PlaneUnavailable {
+        deployment_id: i32,
+        container_id: String,
+        workload_id: i64,
+    },
+
+    #[error(
+        "Workload plane could not retire workload {workload_id} (container {container_id}, \
+         deployment {deployment_id}): {reason}"
+    )]
+    Delete {
+        deployment_id: i32,
+        container_id: String,
+        workload_id: i64,
+        reason: String,
+    },
+}
+
+/// The workload deployment `deployment_id` applied for runtime container
+/// `container_id`, when that replica was started through the plane
+/// (`workload_mode = enforce`, on the control plane or a worker). `None`
+/// for a legacy replica, which its node's deployer removes as before. One
+/// query.
+pub async fn deployment_replica_workload(
+    db: &sea_orm::DatabaseConnection,
+    deployment_id: i32,
+    container_id: &str,
+) -> Result<Option<ReplicaWorkload>, ReplicaRetireError> {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+    use temps_entities::{workload_instances, workloads};
+
+    let row: Option<(i64, Option<chrono::DateTime<chrono::Utc>>)> =
+        workload_instances::Entity::find()
+            .inner_join(workloads::Entity)
+            .filter(Expr::cust_with_values(
+                "\"workload_instances\".\"handle\"->>'id' = $1",
+                [container_id],
+            ))
+            .filter(workloads::Column::OwnerKind.eq(DEPLOYMENT_OWNER_KIND))
+            .filter(workloads::Column::OwnerId.eq(i64::from(deployment_id)))
+            .order_by_desc(workload_instances::Column::Id)
+            .select_only()
+            .column(workloads::Column::Id)
+            .column(workloads::Column::DeletedAt)
+            .into_tuple()
+            .one(db)
+            .await
+            .map_err(|source| ReplicaRetireError::Lookup {
+                deployment_id,
+                container_id: container_id.to_string(),
+                source,
+            })?;
+    Ok(row.map(|(workload_id, deleted_at)| ReplicaWorkload {
+        workload_id,
+        retired: deleted_at.is_some(),
+    }))
+}
+
+/// Retire `workload`, found by [`deployment_replica_workload`]: the plane
+/// stops and removes its instance (container or microVM) and never starts
+/// it again. A workload already retired needs no plane.
+pub async fn retire_replica_workload(
+    plane: Option<&WorkloadPlane>,
+    deployment_id: i32,
+    container_id: &str,
+    workload: ReplicaWorkload,
+) -> Result<(), ReplicaRetireError> {
+    if workload.retired {
+        return Ok(());
+    }
+    let plane = plane.ok_or_else(|| ReplicaRetireError::PlaneUnavailable {
+        deployment_id,
+        container_id: container_id.to_string(),
+        workload_id: workload.workload_id,
+    })?;
+    plane
+        .delete(
+            workload.workload_id,
+            "Retired",
+            &format!(
+                "deployment {deployment_id} was superseded or rejected; container \
+                 {container_id} retired"
+            ),
+        )
+        .await
+        .map_err(|e| ReplicaRetireError::Delete {
+            deployment_id,
+            container_id: container_id.to_string(),
+            workload_id: workload.workload_id,
+            reason: e.to_string(),
+        })
+}
 
 /// The control plane's microVM runtime (ADR-055 Phase 10), registered by
 /// the agents plugin when this host has a working Firecracker. The
@@ -191,6 +338,10 @@ pub struct PlaneContainerDeployer {
     /// Container id -> workload id, for retiring a replica through the
     /// plane. One deploy job's replicas: a handful of entries.
     workloads: Mutex<HashMap<String, i64>>,
+    /// Container id -> its workload when only the plane can serve it (a
+    /// microVM), `None` when its node's deployer does. A replica's
+    /// isolation never changes, so the health check's polling asks once.
+    plane_only: Mutex<HashMap<String, Option<i64>>>,
     /// The environment's attached volumes and their owner (ADR-055 Phase
     /// 9). Empty: the replica mounts nothing, exactly as before.
     volumes: Vec<temps_workload::VolumeMount>,
@@ -212,6 +363,7 @@ impl PlaneContainerDeployer {
             ready_timeout,
             isolation: Isolation::Process,
             workloads: Mutex::new(HashMap::new()),
+            plane_only: Mutex::new(HashMap::new()),
             volumes: Vec::new(),
             volume_owner: None,
         }
@@ -239,21 +391,54 @@ impl PlaneContainerDeployer {
         self
     }
 
-    /// The plane workload behind `container_id` when its runtime is not the
-    /// local Docker (a microVM), so the caller must go through the plane.
-    /// `None` for a container: the local deployer serves it as before.
+    /// The plane workload behind `container_id` when it runs in a microVM,
+    /// which no container deployer can reach, so the caller must go through
+    /// the plane. `None` for a container -- on the control plane or a
+    /// worker, whatever driver the plane started it with: the node's
+    /// deployer serves it as before.
     async fn plane_only_workload(&self, container_id: &str) -> Result<Option<i64>, DeployerError> {
+        if let Some(known) = self
+            .plane_only
+            .lock()
+            .ok()
+            .and_then(|known| known.get(container_id).copied())
+        {
+            return Ok(known);
+        }
         let found = self
             .plane
             .workload_for_instance(container_id)
             .await
             .map_err(|e| self.plane_error(&format!("look up instance {container_id}"), e))?;
-        Ok(match found {
-            Some((workload_id, driver)) if driver != temps_workload_docker::DRIVER => {
-                Some(workload_id)
+        let Some((workload_id, driver)) = found else {
+            // Not (or no longer) a plane instance. Not remembered, so a
+            // later call looks again.
+            return Ok(None);
+        };
+        let isolation = match self.plane.get(workload_id).await {
+            Ok(view) => view.spec.isolation,
+            // Gone with its instances: nothing the plane could serve.
+            Err(temps_workload_plane::PlaneError::NotFound { .. }) => return Ok(None),
+            Err(e) => {
+                return Err(self.plane_error(
+                    &format!("read workload {workload_id} of instance {container_id}"),
+                    e,
+                ))
             }
-            _ => None,
-        })
+        };
+        let plane_only = served_by_plane_only(isolation).then_some(workload_id);
+        tracing::debug!(
+            deployment_id = self.deployment_id,
+            container_id,
+            workload_id,
+            driver = %driver,
+            plane_only = plane_only.is_some(),
+            "classified a plane replica"
+        );
+        if let Ok(mut known) = self.plane_only.lock() {
+            known.insert(container_id.to_string(), plane_only);
+        }
+        Ok(plane_only)
     }
 
     async fn plane_logs(
@@ -340,7 +525,7 @@ impl ContainerDeployer for PlaneContainerDeployer {
             .map(|mapping| mapping.container_port)
             .unwrap_or(0);
         let apply = ApplyRequest {
-            owner: Owner::new(DEPLOYMENT_OWNER_KIND, i64::from(self.deployment_id)),
+            owner: deployment_owner(self.deployment_id),
             name: request.container_name.clone(),
             spec,
             project_slug: request.project_slug.clone(),
@@ -1239,5 +1424,297 @@ mod tests {
             plane.instance_env(7, instance.id).await.is_err(),
             "the staged environment is dropped after the handoff"
         );
+    }
+
+    /// The node's deployer: answers exec and inspect itself, so a test sees
+    /// which path served a replica.
+    struct LocalDeployer;
+
+    #[async_trait]
+    impl ContainerDeployer for LocalDeployer {
+        async fn deploy_container(&self, r: DeployRequest) -> Result<DeployResult, DeployerError> {
+            UnusedDeployer.deploy_container(r).await
+        }
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _: Vec<String>,
+            _: Duration,
+        ) -> Result<temps_deployer::ExecResult, DeployerError> {
+            Ok(temps_deployer::ExecResult {
+                exit_code: 0,
+                output: format!("local exec in {container_id}"),
+                truncated: false,
+            })
+        }
+        async fn start_container(&self, id: &str) -> Result<(), DeployerError> {
+            UnusedDeployer.start_container(id).await
+        }
+        async fn stop_container(&self, id: &str) -> Result<(), DeployerError> {
+            UnusedDeployer.stop_container(id).await
+        }
+        async fn pause_container(&self, id: &str) -> Result<(), DeployerError> {
+            UnusedDeployer.pause_container(id).await
+        }
+        async fn resume_container(&self, id: &str) -> Result<(), DeployerError> {
+            UnusedDeployer.resume_container(id).await
+        }
+        async fn remove_container(&self, id: &str) -> Result<(), DeployerError> {
+            UnusedDeployer.remove_container(id).await
+        }
+        async fn get_container_info(&self, id: &str) -> Result<ContainerInfo, DeployerError> {
+            Err(DeployerError::DeploymentFailed(format!(
+                "local inspect of {id}"
+            )))
+        }
+        async fn get_container_stats(
+            &self,
+            id: &str,
+        ) -> Result<temps_deployer::ContainerStats, DeployerError> {
+            UnusedDeployer.get_container_stats(id).await
+        }
+        async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
+            Ok(Vec::new())
+        }
+        async fn get_container_logs(&self, id: &str) -> Result<String, DeployerError> {
+            UnusedDeployer.get_container_logs(id).await
+        }
+        async fn stream_container_logs(
+            &self,
+            id: &str,
+        ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
+            UnusedDeployer.stream_container_logs(id).await
+        }
+    }
+
+    /// Apply deployment 42's replica `name` with `isolation`, and record the
+    /// instance `driver` started for it as runtime id `container_id`.
+    async fn plane_replica(
+        plane: &WorkloadPlane,
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        isolation: Isolation,
+        driver: &str,
+        container_id: &str,
+    ) -> i64 {
+        use sea_orm::{ActiveModelTrait, Set};
+        let mut plain = request();
+        plain.extra_networks.clear();
+        plain.container_name = name.to_string();
+        let spec = deployment_workload_spec(
+            &plain,
+            42,
+            CONTROL_PLANE_NODE_ID,
+            "staged:k".into(),
+            isolation,
+        )
+        .expect("spec");
+        let workload_id = plane
+            .apply(ApplyRequest {
+                owner: deployment_owner(42),
+                name: name.to_string(),
+                spec,
+                project_slug: Some("shop".into()),
+                finalizers: Vec::new(),
+            })
+            .await
+            .expect("applied");
+        let now = chrono::Utc::now();
+        temps_entities::workload_instances::ActiveModel {
+            workload_id: Set(workload_id),
+            revision: Set(1),
+            attempt: Set(1),
+            node_id: Set(None),
+            driver: Set(driver.to_string()),
+            handle: Set(serde_json::json!({ "id": container_id })),
+            address: Set(None),
+            phase: Set("running".into()),
+            ready: Set(true),
+            conditions: Set(serde_json::json!([])),
+            exit_code: Set(None),
+            published_ports: Set(serde_json::json!([])),
+            started_at: Set(Some(now)),
+            finished_at: Set(None),
+            change_seq: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("instance");
+        workload_id
+    }
+
+    #[tokio::test]
+    async fn worker_docker_replicas_are_served_by_the_node_deployer() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-classify-test"),
+        ));
+        // Worker Docker replicas, started by the node-stream and agent-api
+        // drivers: ordinary containers behind the node's deployer.
+        for (name, driver, container_id) in [
+            ("app-production-42-1", "node-stream", "c-node-stream"),
+            ("app-production-42-2", "agent-api", "c-agent-api"),
+        ] {
+            plane_replica(
+                &plane,
+                db.as_ref(),
+                name,
+                Isolation::Process,
+                driver,
+                container_id,
+            )
+            .await;
+        }
+        let micro_vm = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-3",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-3",
+        )
+        .await;
+
+        let deployer = PlaneContainerDeployer::new(
+            plane.clone(),
+            Arc::new(LocalDeployer),
+            42,
+            Duration::from_secs(5),
+        );
+        for container_id in ["c-node-stream", "c-agent-api"] {
+            assert_eq!(
+                deployer
+                    .plane_only_workload(container_id)
+                    .await
+                    .expect("classified"),
+                None,
+                "{container_id} is a container"
+            );
+            let exec = deployer
+                .exec_in_container(container_id, vec!["true".into()], Duration::from_secs(5))
+                .await
+                .expect("exec");
+            assert_eq!(exec.output, format!("local exec in {container_id}"));
+            let inspect = deployer
+                .get_container_info(container_id)
+                .await
+                .expect_err("the local test deployer refuses to inspect");
+            assert!(
+                inspect
+                    .to_string()
+                    .contains(&format!("local inspect of {container_id}")),
+                "{inspect}"
+            );
+        }
+        // A microVM is the plane's alone.
+        assert_eq!(
+            deployer
+                .plane_only_workload("vm-42-3")
+                .await
+                .expect("classified"),
+            Some(micro_vm)
+        );
+        let exec = deployer
+            .exec_in_container("vm-42-3", vec!["true".into()], Duration::from_secs(5))
+            .await;
+        assert!(
+            exec.map_or(true, |result| !result.output.starts_with("local")),
+            "a microVM exec never reaches the node's deployer"
+        );
+        // A container the plane never started is the node deployer's too.
+        assert_eq!(
+            deployer
+                .plane_only_workload("legacy-1")
+                .await
+                .expect("classified"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plane_owned_replica_is_retired_through_the_plane() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-retire-test"),
+        ));
+        // An enforce-mode replica on a worker.
+        let workload_id = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::Process,
+            "node-stream",
+            "c-worker",
+        )
+        .await;
+
+        // A legacy container, or one of another deployment, is not the
+        // plane's: its node's deployer removes it as before.
+        assert_eq!(
+            deployment_replica_workload(db.as_ref(), 42, "legacy-1")
+                .await
+                .expect("lookup"),
+            None
+        );
+        assert_eq!(
+            deployment_replica_workload(db.as_ref(), 43, "c-worker")
+                .await
+                .expect("lookup"),
+            None
+        );
+
+        let found = deployment_replica_workload(db.as_ref(), 42, "c-worker")
+            .await
+            .expect("lookup")
+            .expect("plane-owned");
+        assert_eq!(
+            found,
+            ReplicaWorkload {
+                workload_id,
+                retired: false
+            }
+        );
+
+        // Without a plane it is left in place, never assumed gone.
+        let error = retire_replica_workload(None, 42, "c-worker", found)
+            .await
+            .expect_err("no plane");
+        assert!(
+            matches!(error, ReplicaRetireError::PlaneUnavailable { workload_id: id, .. } if id == workload_id),
+            "{error}"
+        );
+        assert!(error.to_string().contains("c-worker"), "{error}");
+
+        retire_replica_workload(Some(plane.as_ref()), 42, "c-worker", found)
+            .await
+            .expect("retired");
+        let after = deployment_replica_workload(db.as_ref(), 42, "c-worker")
+            .await
+            .expect("lookup")
+            .expect("still recorded");
+        assert!(after.retired, "the plane retired the workload");
+        // Already retired: nothing left to do, even without a plane.
+        retire_replica_workload(None, 42, "c-worker", after)
+            .await
+            .expect("idempotent");
     }
 }

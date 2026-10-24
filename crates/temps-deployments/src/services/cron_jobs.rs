@@ -25,8 +25,8 @@ use sea_orm::{
 use temps_core::CronConcurrencyPolicy;
 use temps_entities::{cron_executions, crons};
 use temps_workload::{
-    Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, Process, SecretRef, WorkloadKind,
-    WorkloadPhase, WorkloadRef, WorkloadSpec,
+    Artifact, ConditionKind, EnvSpec, Isolation, Lifetime, PlacementSpec, Process, SecretRef,
+    WorkloadKind, WorkloadPhase, WorkloadRef, WorkloadSpec,
 };
 use temps_workload_env::SecretResolver;
 use temps_workload_plane::{EnvSource, Finalizer, WorkloadView};
@@ -228,10 +228,19 @@ fn to_u32(value: Option<i32>) -> Option<u32> {
 
 /// The workload one run of `cron` is: `command` in `image`, with the
 /// variables of `import`, labelled for the log aggregator.
+///
+/// The run is pinned to `source_node_id`, the node of the container
+/// `import` reads (`None`: the control plane). The variables are resolved
+/// for that node -- read from the container on the control plane, with
+/// Docker hostnames only it resolves, or recomputed with the worker's
+/// `*.temps.local` rewrites on a worker -- and the import has no way to
+/// learn which node the run lands on. Placed anywhere else, the run would
+/// start with connection strings its node cannot reach.
 pub fn job_spec(
     cron: &crons::Model,
     image: &str,
     import: String,
+    source_node_id: Option<i32>,
 ) -> Result<WorkloadSpec, CronJobError> {
     let command: Vec<String> = match &cron.command {
         None => {
@@ -271,7 +280,12 @@ pub fn job_spec(
         ports: vec![],
         network: Default::default(),
         probes: Default::default(),
-        placement: Default::default(),
+        placement: PlacementSpec {
+            nodes: Some(vec![
+                source_node_id.unwrap_or(temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID)
+            ]),
+            ..Default::default()
+        },
         lifetime: Lifetime::RunToCompletion {
             // 0 and NULL take the plane's defaults.
             timeout_secs: to_u32(cron.timeout_seconds).unwrap_or(0),
@@ -613,8 +627,13 @@ mod tests {
     #[test]
     fn a_run_is_the_command_in_the_deployment_image_with_its_variables() {
         let import = deployment_container_import(3, 5, "abc123");
-        let spec =
-            job_spec(&job_cron(), "registry.example.test/shop:41", import.clone()).expect("a spec");
+        let spec = job_spec(
+            &job_cron(),
+            "registry.example.test/shop:41",
+            import.clone(),
+            None,
+        )
+        .expect("a spec");
         assert_eq!(spec.owner.kind, WorkloadKind::Job);
         assert_eq!(
             spec.process.command,
@@ -636,12 +655,35 @@ mod tests {
         assert_eq!(run_name(12, at(0)), "cron-12-1700000000");
     }
 
+    /// The import resolves variables for the node of the container it reads
+    /// (control-plane Docker hostnames for a local container, `*.temps.local`
+    /// rewrites for a worker's), so the run must land on that same node:
+    /// unpinned, the plane could start a run beside a control-plane
+    /// container on a worker that cannot resolve those hostnames.
+    #[test]
+    fn a_run_is_pinned_to_the_node_its_variables_are_resolved_for() {
+        let import = deployment_container_import(3, 5, "abc123");
+        let beside_local = job_spec(&job_cron(), "img", import.clone(), None).expect("a spec");
+        assert_eq!(
+            beside_local.placement.pinned_nodes(),
+            Some(&[temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID][..]),
+            "a control-plane source keeps the run on the control plane, never on a worker"
+        );
+        let beside_worker = job_spec(&job_cron(), "img", import, Some(7)).expect("a spec");
+        assert_eq!(
+            beside_worker.placement.pinned_nodes(),
+            Some(&[7][..]),
+            "a worker source keeps the run on that worker"
+        );
+        assert_eq!(beside_worker.placement.replicas, 1);
+    }
+
     #[test]
     fn a_cron_without_a_command_is_not_a_run() {
         let mut cron = job_cron();
         cron.command = None;
         assert_eq!(
-            job_spec(&cron, "img", "x".into()),
+            job_spec(&cron, "img", "x".into(), None),
             Err(CronJobError::MissingCommand {
                 cron_id: 12,
                 path: "job:nightly-report".into()
@@ -649,7 +691,7 @@ mod tests {
         );
         cron.command = Some(serde_json::json!({"not": "a list"}));
         assert!(matches!(
-            job_spec(&cron, "img", "x".into()),
+            job_spec(&cron, "img", "x".into(), None),
             Err(CronJobError::InvalidCommand { cron_id: 12, .. })
         ));
     }
@@ -716,7 +758,7 @@ mod tests {
             id: 77,
             owner: Owner::new(CRON_OWNER_KIND, 12),
             name: run_name(12, at(0)),
-            spec: job_spec(&job_cron(), "img", "x".into()).expect("a spec"),
+            spec: job_spec(&job_cron(), "img", "x".into(), None).expect("a spec"),
             status,
             generation: 1,
             observed_generation: 1,

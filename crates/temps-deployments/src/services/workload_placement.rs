@@ -623,6 +623,46 @@ struct LoadRow {
     node_id: i32,
     instances: i64,
     cpu_millis: Option<i64>,
+    memory_mb: Option<i64>,
+}
+
+/// A positive number stored under `key` of the deployment's configuration
+/// snapshot (`deployments.deployment_config`, camelCase), else NULL: unset,
+/// `0` ("explicitly uncapped") and anything that is not a number all fall
+/// through to the next source. `key` is a fixed literal, never input. The
+/// column is `json`, hence the `jsonb` cast for `jsonb_typeof`.
+fn snapshot_amount_sql(key: &str) -> String {
+    format!(
+        "(CASE WHEN jsonb_typeof(d.deployment_config::jsonb -> '{key}') = 'number' \
+              THEN NULLIF(GREATEST((d.deployment_config::jsonb ->> '{key}')::numeric, 0), 0) END)"
+    )
+}
+
+/// What the deployment containers on each node reserve, per node: the
+/// same request-then-limit-then-default reading the scheduler applies to a
+/// deployment in flight (`reservation_of`), from each container's
+/// deployment configuration. `$1`/`$2`: the deployment default CPU
+/// (millicores) and memory (MB).
+fn container_load_sql() -> String {
+    // The snapshot stores CPU in microcores (1_000_000 = 1 core) and memory
+    // in MB, as the deploy job reads them.
+    format!(
+        "SELECT COALESCE(dc.node_id, 0) AS node_id, COUNT(*) AS instances, \
+                CAST(SUM(COALESCE(CEIL({cpu_request} / 1000), \
+                                  CEIL(dc.cpu_limit_cores * 1000), \
+                                  CEIL({cpu_limit} / 1000), \
+                                  $1)) AS BIGINT) AS cpu_millis, \
+                CAST(SUM(COALESCE({memory_request}, {memory_limit}, $2)) AS BIGINT) AS memory_mb \
+           FROM deployment_containers dc \
+           LEFT JOIN deployments d ON d.id = dc.deployment_id \
+          WHERE dc.deleted_at IS NULL \
+            AND (dc.status IS NULL OR dc.status NOT IN ('exited', 'stopped', 'failed', 'cancelled')) \
+          GROUP BY 1",
+        cpu_request = snapshot_amount_sql("cpuRequest"),
+        cpu_limit = snapshot_amount_sql("cpuLimit"),
+        memory_request = snapshot_amount_sql("memoryRequest"),
+        memory_limit = snapshot_amount_sql("memoryLimit"),
+    )
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -718,21 +758,23 @@ impl WorkloadPlacementService {
         }
     }
 
-    /// What the deployment containers on each node hold: their CPU limit
-    /// (or the deployment default when unset) and the deployment default
-    /// memory, which is not recorded per container. One grouped query.
+    /// What the deployment containers on each node hold: each container's
+    /// configured CPU and memory -- its deployment's request, else its
+    /// limit, else the deployment default -- exactly as the scheduler
+    /// reserved them while the deployment was in flight. Without this a
+    /// 2 GiB deployment would shrink to the 512 MiB default the moment it
+    /// completed and free room that is not there. One grouped query joined
+    /// to the deployments, never one per container.
     async fn container_load(&self) -> Result<BTreeMap<i32, ContainerLoad>, WorkloadPlacementError> {
         let default =
             temps_workload_plane::scheduler::kind_default_reservation(WorkloadKind::Deployment);
         let rows = LoadRow::find_by_statement(Statement::from_sql_and_values(
             DbBackend::Postgres,
-            "SELECT COALESCE(node_id, 0) AS node_id, COUNT(*) AS instances, \
-                    CAST(SUM(COALESCE(CEIL(cpu_limit_cores * 1000), $1)) AS BIGINT) AS cpu_millis \
-               FROM deployment_containers \
-              WHERE deleted_at IS NULL \
-                AND (status IS NULL OR status NOT IN ('exited', 'stopped', 'failed', 'cancelled')) \
-              GROUP BY 1",
-            vec![(default.cpu_millis as i64).into()],
+            container_load_sql(),
+            vec![
+                (default.cpu_millis as i64).into(),
+                (default.memory_mb as i64).into(),
+            ],
         ))
         .all(self.db.as_ref())
         .await
@@ -746,7 +788,7 @@ impl WorkloadPlacementService {
                     ContainerLoad {
                         reservation: Reservation {
                             cpu_millis: row.cpu_millis.unwrap_or(0).max(0) as u64,
-                            memory_mb: default.memory_mb.saturating_mul(u64::from(instances)),
+                            memory_mb: row.memory_mb.unwrap_or(0).max(0) as u64,
                         },
                         instances,
                     },
@@ -1667,6 +1709,177 @@ mod tests {
         )
         .expect("an ordinary deployment fits an enforced node 0 with room");
         assert_eq!(placement.nodes, vec![CONTROL_PLANE_NODE_ID]);
+    }
+
+    /// A completed deployment keeps the memory (and CPU) it was admitted
+    /// with: on a 4 GiB node 0 with a 512 MiB reserve, one running 2 GiB
+    /// deployment leaves 1.5 GiB, so a second 2 GiB one is refused. Counting
+    /// the finished replica at the 512 MiB default would admit it.
+    #[tokio::test]
+    async fn committed_load_keeps_each_deployments_configured_reservation() {
+        use temps_entities::deployment_config::DeploymentConfigSnapshot;
+        use temps_entities::upstream_config::UpstreamList;
+        use temps_entities::{deployment_containers, deployments};
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Postgres unavailable, skipping the committed load test: {e}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = projects::ActiveModel {
+            name: Set("big-app".to_string()),
+            slug: Set("big-app".to_string()),
+            repo_name: Set("app".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("big-app".to_string()),
+            host: Set("big-app.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert environment");
+        let (project_id, environment_id) = (project.id, environment.id);
+        let running_replica = |slug: &'static str, snapshot: DeploymentConfigSnapshot| {
+            let db = db.clone();
+            async move {
+                let deployment = deployments::ActiveModel {
+                    project_id: Set(project_id),
+                    environment_id: Set(environment_id),
+                    slug: Set(slug.to_string()),
+                    state: Set("completed".to_string()),
+                    metadata: Set(Some(deployments::DeploymentMetadata::default())),
+                    deployment_config: Set(Some(snapshot)),
+                    created_at: Set(Utc::now()),
+                    updated_at: Set(Utc::now()),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("insert deployment");
+                deployment_containers::ActiveModel {
+                    deployment_id: Set(deployment.id),
+                    container_id: Set(format!("{slug}-container")),
+                    container_name: Set(format!("{slug}-1")),
+                    container_port: Set(Some(3000)),
+                    status: Set(Some("running".to_string())),
+                    node_id: Set(None),
+                    deployed_at: Set(Utc::now()),
+                    created_at: Set(Utc::now()),
+                    ..Default::default()
+                }
+                .insert(db.as_ref())
+                .await
+                .expect("insert container");
+            }
+        };
+        // Request wins over limit, as the scheduler reserved it in flight.
+        running_replica(
+            "two-gib",
+            DeploymentConfigSnapshot {
+                cpu_request: Some(500_000),
+                memory_request: Some(2048),
+                memory_limit: Some(4096),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        let node_service = Arc::new(NodeService::new(db.clone()));
+        let legacy = NodeScheduler::new(node_service.clone());
+        let service = WorkloadPlacementService::new(
+            db.clone(),
+            node_service,
+            proof_config_service(db.clone()),
+            &legacy,
+        )
+        .with_control_plane_usage(Arc::new(|| {
+            Some(NodeUsage {
+                cpu_percent: None,
+                memory_used_bytes: None,
+                memory_total_bytes: Some(4.0 * 1024.0 * 1024.0 * 1024.0),
+                cpu_cores: Some(4.0),
+            })
+        }));
+        service
+            .set_node_resources(
+                CONTROL_PLANE_NODE_ID,
+                NodeResourceUpdate {
+                    resource_policy: Some(NodeResourcePolicy::Enforced),
+                    system_reserved: Some(SystemReserved {
+                        cpu_millis: 250,
+                        memory_mb: 512,
+                    }),
+                },
+            )
+            .await
+            .expect("enforced with a 512 MiB reserve");
+
+        let nodes = service.node_facts(None).await.expect("facts");
+        assert_eq!(nodes[0].id, CONTROL_PLANE_NODE_ID);
+        assert_eq!(nodes[0].committed.memory_mb, 2048, "the configured request");
+        assert_eq!(nodes[0].committed.cpu_millis, 500, "500_000 microcores");
+
+        let placement_spec = temps_workload::PlacementSpec::default();
+        let second_app = temps_workload::Resources {
+            requests: Some(ResourceAmounts {
+                cpu_millis: None,
+                memory_mb: Some(2048),
+                disk_mb: None,
+                pids: None,
+            }),
+            limits: None,
+        };
+        let scheduler = temps_workload_plane::scheduler::UnifiedScheduler::new(
+            service.scheduler_config().clone(),
+        );
+        let request = temps_workload_plane::scheduler::ScheduleRequest {
+            kind: temps_workload::WorkloadKind::Deployment,
+            placement: &placement_spec,
+            resources: &second_app,
+            isolation: Isolation::Process,
+            image_platforms: &[],
+            socket_gate: None,
+            exclude_node_ids: &[],
+            exclude_control_plane: false,
+            affinity_nodes: &[],
+        };
+        assert!(
+            scheduler.schedule(&nodes, &request).is_err(),
+            "4096 - 512 reserved - 2048 committed leaves 1536 MiB: a second 2 GiB app must not fit"
+        );
+
+        // A limit-only deployment reserves its limit; one with nothing
+        // configured reserves the deployment default.
+        running_replica(
+            "limit-only",
+            DeploymentConfigSnapshot {
+                memory_limit: Some(256),
+                ..Default::default()
+            },
+        )
+        .await;
+        running_replica("unconfigured", DeploymentConfigSnapshot::default()).await;
+        let default =
+            temps_workload_plane::scheduler::kind_default_reservation(WorkloadKind::Deployment);
+        let nodes = service.node_facts(None).await.expect("facts");
+        assert_eq!(nodes[0].committed.memory_mb, 2048 + 256 + default.memory_mb);
+        assert_eq!(nodes[0].committed.cpu_millis, 500 + 2 * default.cpu_millis);
+        assert_eq!(nodes[0].live_instances, 3);
     }
 
     fn facts(id: i32, name: &str, cpu: f64, mem_used_gb: f64) -> NodeFacts {

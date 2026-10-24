@@ -166,7 +166,7 @@ impl DeploymentsPlugin {
             db.clone(),
             temps_workload_plane::NodeDriver(driver),
             Arc::new(crate::services::cron_jobs::DeploymentEnvSource::new(
-                deployment_service,
+                deployment_service.clone(),
             )),
             audit,
             config,
@@ -221,6 +221,9 @@ impl DeploymentsPlugin {
                 if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
                     workflow.set_workload_plane(plane.clone());
                 }
+                // Rollback and promotion retire superseded `enforce`
+                // replicas through it.
+                deployment_service.set_workload_plane(plane.clone());
                 // Products registered beside deployments (functions) find
                 // the started plane here.
                 if let Some(shared) = context.get_service::<temps_workload_plane::SharedPlane>() {
