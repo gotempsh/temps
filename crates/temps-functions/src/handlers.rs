@@ -287,6 +287,11 @@ impl From<FunctionError> for Problem {
                     .with_title("Function Activation Failed")
                     .with_detail(error.to_string())
             }
+            FunctionError::ProjectFunctionsNotRetired { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Function Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
             FunctionError::Storage { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Function Storage Error")
                 .with_detail(error.to_string()),

@@ -135,7 +135,9 @@ pub use on_demand::*;
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
-pub use project_deletion::ProjectDeletionHook;
+pub use project_deletion::{
+    ProjectDeletionHook, ProjectDeletionHookError, ProjectDeletionHooks, ProjectDeletionHooksFailed,
+};
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{

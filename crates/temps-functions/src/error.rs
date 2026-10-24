@@ -59,6 +59,17 @@ pub enum FunctionError {
         source: ActivationError,
     },
 
+    /// Project deletion could not retire every function of the project.
+    #[error(
+        "Retiring the functions of project {project_id} failed for {failed} of {total}: {reasons}"
+    )]
+    ProjectFunctionsNotRetired {
+        project_id: i32,
+        failed: usize,
+        total: usize,
+        reasons: String,
+    },
+
     #[error("Function artifact storage failed at {path}: {reason}")]
     Storage { path: String, reason: String },
 
