@@ -32,14 +32,14 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
+use temps_vm_agent::restart::RestartBackoff;
+use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
+use temps_vm_agent::workload_log::{read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
-    read_frame, relay, write_frame, Request, Response, AGENT_PORT, DEFAULT_SPAWN_LOG,
-    MAX_PTY_RELAYS, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN, PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
+    read_frame, relay, write_frame, Request, Response, SpawnRestartPolicy, AGENT_PORT,
+    DEFAULT_SPAWN_LOG, MAX_PTY_RELAYS, MAX_READ_LOG_LINES, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN,
+    PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
 };
-
-/// `PATH` for processes this agent starts: PID 1's own environment is empty
-/// and guest images vary, so every child gets the same sane default.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Pause between PTY agent restarts, so a binary that dies at once cannot
 /// turn PID 1 into a hot loop.
@@ -547,6 +547,10 @@ fn handle_connection(mut stream: UnixStream) {
     };
 
     let shutdown = matches!(request, Request::Shutdown);
+    if shutdown {
+        // A deliberate stop: nothing is restarted on its way down.
+        stop_all_supervised();
+    }
     let response = handle_request(request);
     respond(&mut stream, &response);
 
@@ -609,130 +613,159 @@ fn handle_request(request: Request) -> Response {
             uid,
             gid,
             log_path,
-        } => spawn(cmd, env, cwd, uid, gid, log_path),
+            restart,
+            log_max_bytes,
+            log_max_files,
+        } => spawn(SpawnArgs {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+            restart,
+            log_limits: LogLimits::from_request(log_max_bytes, log_max_files),
+        }),
         Request::ProcessStatus { pid } => process_status(pid),
+        Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
     }
 }
 
 // ── Spawn (a workload's main process) ───────────────────────────────────
 
-/// Processes started by [`spawn`], kept so their exit status can be read
-/// (this PID 1 does not reap every child). Bounded by
+/// Processes started by [`spawn`], each under a [`Supervision`] that reaps
+/// it, restarts it per its policy and bounds its log. Bounded by
 /// [`MAX_SPAWNED_PROCESSES`].
-static SPAWNED: std::sync::Mutex<Vec<std::process::Child>> = std::sync::Mutex::new(Vec::new());
+static SPAWNED: std::sync::Mutex<Vec<Supervision>> = std::sync::Mutex::new(Vec::new());
 
-fn spawn(
+/// The process table; plain data, usable whatever a panicking holder did.
+fn spawned_table() -> std::sync::MutexGuard<'static, Vec<Supervision>> {
+    SPAWNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A deliberate shutdown: no supervised process may be restarted between
+/// the acknowledgement and the reboot.
+fn stop_all_supervised() {
+    for supervision in spawned_table().iter() {
+        supervision.mark_stopped();
+    }
+}
+
+struct SpawnArgs {
     cmd: Vec<String>,
     env: HashMap<String, String>,
     cwd: Option<String>,
     uid: Option<u32>,
     gid: Option<u32>,
     log_path: Option<String>,
-) -> Response {
-    if cmd.is_empty() {
+    restart: SpawnRestartPolicy,
+    log_limits: LogLimits,
+}
+
+fn spawn(args: SpawnArgs) -> Response {
+    let Some(program) = args.cmd.first().cloned() else {
         return Response::Err {
             message: "spawn: empty command".to_string(),
         };
-    }
-    let Ok(mut spawned) = SPAWNED.lock() else {
-        return Response::Err {
-            message: "spawn: process table is poisoned".to_string(),
-        };
     };
-    // Forget processes that already exited and were read.
-    spawned.retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
+    let mut spawned = spawned_table();
+    // Forget supervisions that ended: nothing of theirs runs any more.
+    spawned.retain(|supervision| !supervision.is_finished());
     if spawned.len() >= MAX_SPAWNED_PROCESSES {
         return Response::Err {
             message: format!(
-                "spawn {}: {} processes already run (limit {})",
-                cmd[0],
+                "spawn {program}: {} processes already run (limit {MAX_SPAWNED_PROCESSES})",
                 spawned.len(),
-                MAX_SPAWNED_PROCESSES
             ),
         };
     }
-    let log_path = log_path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
-    if let Some(parent) = Path::new(&log_path).parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let log = match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        Ok(file) => file,
+    let log_path = args
+        .log_path
+        .unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let log = match RotatingLog::open(&log_path, args.log_limits) {
+        Ok(log) => log,
         Err(e) => {
             return Response::Err {
-                message: format!("spawn {}: open log {}: {}", cmd[0], log_path, e),
+                message: format!("spawn {program}: open log {log_path}: {e}"),
             }
         }
     };
-    let stderr = match log.try_clone() {
-        Ok(file) => file,
+    let error_path = log_path.clone();
+    let pipeline = match LogPipeline::start(log, move |e: &std::io::Error| {
+        warn(
+            "workload_log_write_failed",
+            &[("path", json!(error_path)), ("error", json!(e.to_string()))],
+        );
+    }) {
+        Ok(pipeline) => pipeline,
         Err(e) => {
             return Response::Err {
-                message: format!("spawn {}: duplicate log handle: {}", cmd[0], e),
+                message: format!("spawn {program}: start the log writer for {log_path}: {e}"),
             }
         }
     };
-    let cwd = cwd.unwrap_or_else(|| "/".to_string());
-    let mut command = std::process::Command::new(&cmd[0]);
-    command
-        .args(&cmd[1..])
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(stderr));
-    if !env.contains_key("PATH") {
-        command.env("PATH", DEFAULT_PATH);
-    }
-    for (k, v) in &env {
-        command.env(k, v);
-    }
-    {
-        use std::os::unix::process::CommandExt;
-        if let Some(gid) = gid.or(uid) {
-            command.gid(gid);
-        }
-        if let Some(uid) = uid {
-            command.uid(uid);
-        }
-    }
-    match command.spawn() {
-        Ok(child) => {
-            let pid = child.id();
-            spawned.push(child);
-            info("spawned", &[("pid", json!(pid)), ("cmd", json!(cmd[0]))]);
+    let spec = ProcessSpec {
+        cmd: args.cmd,
+        env: args.env,
+        cwd: args.cwd.unwrap_or_else(|| "/".to_string()),
+        uid: args.uid,
+        gid: args.gid,
+    };
+    match Supervision::start(spec, args.restart, RestartBackoff::default(), pipeline) {
+        Ok(supervision) => {
+            let pid = supervision.id();
+            spawned.push(supervision);
+            info(
+                "spawned",
+                &[
+                    ("pid", json!(pid)),
+                    ("cmd", json!(program)),
+                    ("restart", json!(args.restart)),
+                    ("log_path", json!(log_path)),
+                    ("log_max_bytes", json!(args.log_limits.max_bytes)),
+                    ("log_max_files", json!(args.log_limits.max_files)),
+                ],
+            );
             Response::Spawned { pid }
         }
         Err(e) => Response::Err {
-            message: format!("spawn {}: {}", cmd[0], e),
+            message: e.to_string(),
         },
     }
 }
 
 fn process_status(pid: u32) -> Response {
-    let Ok(mut spawned) = SPAWNED.lock() else {
-        return Response::Err {
-            message: "process status: process table is poisoned".to_string(),
-        };
-    };
-    let Some(child) = spawned.iter_mut().find(|child| child.id() == pid) else {
+    let spawned = spawned_table();
+    // Newest first: a pid number can be reused by a later spawn.
+    let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
         return Response::Err {
             message: format!("process status: pid {pid} was not started by spawn"),
         };
     };
-    match child.try_wait() {
-        Ok(None) => Response::ProcessStatus {
-            running: true,
-            exit_code: None,
+    let status = supervision.status();
+    Response::ProcessStatus {
+        running: status.running(),
+        exit_code: if status.running() {
+            None
+        } else {
+            status.last_exit
         },
-        Ok(Some(status)) => Response::ProcessStatus {
-            running: false,
-            exit_code: Some(status.code().unwrap_or(-1)),
+        restart_count: status.restart_count,
+        restarting: status.restarting,
+    }
+}
+
+fn read_log(path: Option<String>, tail_lines: u32) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let lines = tail_lines.min(MAX_READ_LOG_LINES) as usize;
+    match read_tail(Path::new(&path), lines) {
+        Ok(bytes) => Response::Log {
+            data: String::from_utf8_lossy(&bytes).into_owned(),
         },
         Err(e) => Response::Err {
-            message: format!("process status {pid}: {e}"),
+            message: format!("read log {path}: {e}"),
         },
     }
 }
@@ -932,22 +965,44 @@ mod tests {
         assert!(matches!(err, MountError::InvalidArgument { .. }), "{err}");
     }
 
+    fn spawn_args(cmd: &[&str], log: &Path, restart: SpawnRestartPolicy) -> SpawnArgs {
+        SpawnArgs {
+            cmd: cmd.iter().map(|part| part.to_string()).collect(),
+            env: HashMap::new(),
+            cwd: None,
+            uid: None,
+            gid: None,
+            log_path: Some(log.display().to_string()),
+            restart,
+            log_limits: LogLimits::default(),
+        }
+    }
+
+    fn wait_for_exit(pid: u32) -> (Option<i32>, u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_status(pid) {
+                Response::ProcessStatus {
+                    running: false,
+                    restarting: false,
+                    exit_code,
+                    restart_count,
+                } => return (exit_code, restart_count),
+                _ if Instant::now() > deadline => panic!("process {pid} did not exit"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
     #[test]
     fn spawned_process_status_reports_running_then_its_exit_code() {
         let dir = std::env::temp_dir().join(format!("temps-vm-agent-spawn-{}", std::process::id()));
         let log = dir.join("out.log");
-        let response = spawn(
-            vec![
-                "/bin/sh".into(),
-                "-c".into(),
-                "echo started; sleep 0.3; exit 7".into(),
-            ],
-            HashMap::new(),
-            None,
-            None,
-            None,
-            Some(log.display().to_string()),
-        );
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", "echo started; sleep 0.3; exit 7"],
+            &log,
+            SpawnRestartPolicy::Never,
+        ));
         let Response::Spawned { pid } = response else {
             panic!("unexpected {response:?}");
         };
@@ -955,29 +1010,48 @@ mod tests {
             process_status(pid),
             Response::ProcessStatus {
                 running: true,
-                exit_code: None
+                exit_code: None,
+                ..
             }
         ));
+        assert_eq!(wait_for_exit(pid), (Some(7), 0));
         let deadline = Instant::now() + Duration::from_secs(5);
-        let exit = loop {
-            match process_status(pid) {
-                Response::ProcessStatus {
-                    running: false,
-                    exit_code,
-                } => break exit_code,
-                _ if Instant::now() > deadline => panic!("process {pid} did not exit"),
+        loop {
+            match read_log(Some(log.display().to_string()), 10) {
+                Response::Log { data } if data.contains("started") => break,
+                _ if Instant::now() > deadline => panic!("the log never showed the output"),
                 _ => std::thread::sleep(Duration::from_millis(20)),
             }
-        };
-        assert_eq!(exit, Some(7));
-        let output = std::fs::read_to_string(&log).expect("log written");
-        assert!(output.contains("started"), "{output}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(process_status(999_999), Response::Err { .. }));
         assert!(matches!(
-            spawn(Vec::new(), HashMap::new(), None, None, None, None),
+            spawn(spawn_args(&[], &log, SpawnRestartPolicy::Never)),
             Response::Err { .. }
         ));
+    }
+
+    #[test]
+    fn a_spawned_process_is_restarted_per_its_policy_under_the_same_pid_handle() {
+        let dir =
+            std::env::temp_dir().join(format!("temps-vm-agent-restart-{}", std::process::id()));
+        let marker = dir.join("ran-once");
+        let _ = std::fs::create_dir_all(&dir);
+        let script = format!(
+            "if [ -e {m} ]; then exit 0; else touch {m}; exit 1; fi",
+            m = marker.display()
+        );
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", &script],
+            &dir.join("out.log"),
+            SpawnRestartPolicy::OnFailure { max_retries: None },
+        ));
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        // The first run fails, the restart (after the 1s backoff) succeeds.
+        assert_eq!(wait_for_exit(pid), (Some(0), 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

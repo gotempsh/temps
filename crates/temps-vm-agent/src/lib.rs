@@ -18,6 +18,11 @@
 
 pub mod logging;
 pub mod mounts;
+pub mod restart;
+pub mod supervisor;
+pub mod workload_log;
+
+pub use restart::SpawnRestartPolicy;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -124,8 +129,12 @@ pub enum Request {
         signal: i32,
     },
     /// Start a long-running process and return at once (ADR-055 Phase 10:
-    /// a deployment's main process in a microVM). Its output goes to
-    /// `log_path`; [`Request::ProcessStatus`] reports whether it still runs.
+    /// a deployment's main process in a microVM). The agent pipes its
+    /// stdout/stderr into a size-bounded, rotating log at `log_path` (at
+    /// most `log_max_files` files of `log_max_bytes` each; defaults in
+    /// [`workload_log`]), restarts it per `restart`, and
+    /// [`Request::ProcessStatus`] reports on it. Every field after `cmd` is
+    /// optional so an older host keeps its old meaning (no restarts).
     Spawn {
         cmd: Vec<String>,
         #[serde(default)]
@@ -138,16 +147,33 @@ pub enum Request {
         gid: Option<u32>,
         #[serde(default)]
         log_path: Option<String>,
+        #[serde(default)]
+        restart: SpawnRestartPolicy,
+        #[serde(default)]
+        log_max_bytes: Option<u64>,
+        #[serde(default)]
+        log_max_files: Option<u32>,
     },
-    /// Whether a process [`Request::Spawn`] started still runs.
+    /// Whether a process [`Request::Spawn`] started still runs. `pid` is the
+    /// pid `Spawned` returned; it keeps naming the process across restarts.
     ProcessStatus {
         pid: u32,
+    },
+    /// The last `tail_lines` lines of a spawned process's log, read across
+    /// its rotated files. Needs no `tail` binary in the guest image.
+    ReadLog {
+        #[serde(default)]
+        path: Option<String>,
+        tail_lines: u32,
     },
     Shutdown,
 }
 
 /// Where a spawned process writes its output when the request names no path.
 pub const DEFAULT_SPAWN_LOG: &str = "/var/log/temps-workload.log";
+
+/// Most lines one [`Request::ReadLog`] returns.
+pub const MAX_READ_LOG_LINES: u32 = 10_000;
 
 /// Most processes [`Request::Spawn`] tracks at once: a workload VM runs one
 /// main process, so this only bounds a misbehaving host.
@@ -171,9 +197,21 @@ pub enum Response {
     },
     ProcessStatus {
         running: bool,
-        /// Set once the process exited (`-1` when killed by a signal).
+        /// Set once the process exited (`-1` when killed by a signal); the
+        /// last run's code while a restart is pending.
         #[serde(default)]
         exit_code: Option<i32>,
+        /// Times the agent restarted the process under its restart policy.
+        #[serde(default)]
+        restart_count: u32,
+        /// The process exited and the agent will start it again once the
+        /// backoff has passed.
+        #[serde(default)]
+        restarting: bool,
+    },
+    /// The tail [`Request::ReadLog`] asked for (lossy UTF-8).
+    Log {
+        data: String,
     },
     Err {
         message: String,
@@ -441,6 +479,9 @@ mod tests {
                 uid,
                 gid,
                 log_path,
+                restart,
+                log_max_bytes,
+                log_max_files,
                 ..
             } => {
                 assert_eq!(cmd, ["/app/server", "--port", "8080"]);
@@ -448,6 +489,9 @@ mod tests {
                 assert_eq!(uid, Some(1000));
                 assert_eq!(gid, None);
                 assert_eq!(log_path, None);
+                // An older host's request: no restarts, default log bounds.
+                assert_eq!(restart, SpawnRestartPolicy::Never);
+                assert_eq!((log_max_bytes, log_max_files), (None, None));
             }
             other => panic!("unexpected {other:?}"),
         }
@@ -457,12 +501,65 @@ mod tests {
         let response = serde_json::to_string(&Response::ProcessStatus {
             running: false,
             exit_code: Some(3),
+            restart_count: 2,
+            restarting: true,
         })
         .expect("serialises");
         assert_eq!(
             response,
-            r#"{"result":"process_status","running":false,"exit_code":3}"#
+            r#"{"result":"process_status","running":false,"exit_code":3,"restart_count":2,"restarting":true}"#
         );
+        // An older agent's status still parses on a newer host.
+        let old: Response = serde_json::from_str(r#"{"result":"process_status","running":true}"#)
+            .expect("old status parses");
+        assert!(matches!(
+            old,
+            Response::ProcessStatus {
+                running: true,
+                exit_code: None,
+                restart_count: 0,
+                restarting: false
+            }
+        ));
+    }
+
+    #[test]
+    fn a_spawn_with_a_restart_policy_and_log_bounds_round_trips() {
+        let request = Request::Spawn {
+            cmd: vec!["/app/server".into()],
+            env: HashMap::new(),
+            cwd: None,
+            uid: None,
+            gid: None,
+            log_path: None,
+            restart: SpawnRestartPolicy::UnlessStopped,
+            log_max_bytes: Some(10 * 1024 * 1024),
+            log_max_files: Some(3),
+        };
+        let json = serde_json::to_string(&request).expect("serialises");
+        assert!(
+            json.contains(r#""restart":{"policy":"unless_stopped"}"#),
+            "{json}"
+        );
+        let back: Request = serde_json::from_str(&json).expect("parses");
+        assert!(matches!(
+            back,
+            Request::Spawn {
+                restart: SpawnRestartPolicy::UnlessStopped,
+                log_max_bytes: Some(10485760),
+                log_max_files: Some(3),
+                ..
+            }
+        ));
+        let read_log: Request =
+            serde_json::from_str(r#"{"op":"read_log","tail_lines":50}"#).expect("parses");
+        assert!(matches!(
+            read_log,
+            Request::ReadLog {
+                path: None,
+                tail_lines: 50
+            }
+        ));
     }
 
     #[test]

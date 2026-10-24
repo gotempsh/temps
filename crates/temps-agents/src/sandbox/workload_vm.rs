@@ -21,6 +21,15 @@
 //! - **inspect** asks the guest whether the process still runs; it also
 //!   re-opens forwarders a control-plane restart dropped.
 //!
+//! The guest agent is the replica's runtime: it restarts the process per
+//! the spec's restart policy with an exponential backoff (the plane leaves
+//! an exited long-running replica to its runtime, as with Docker), and it
+//! pipes the process's output into a size-bounded rotating log honouring
+//! the spec's `log_rotation`, so a chatty app cannot fill the fixed-size
+//! rootfs. A pending restart reports as running, like a restarting
+//! container; the restart count is logged when it changes and exposed by
+//! [`FirecrackerWorkloadDriver::restart_count`].
+//!
 //! What a microVM cannot express here is refused at create with the field
 //! named, never dropped: secret files, volume binds, required Docker
 //! networks, UDP ports and non-numeric users.
@@ -40,14 +49,16 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use temps_vm_agent::SpawnRestartPolicy;
 use temps_workload::{
     Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,
     ExecSpec, ExecStream, InstanceHandle, InstanceSpec, InstanceState, InstanceStats,
-    InstanceStatus, Isolation, LimitSupport, ListedInstance, LogLine, LogQuery, LogStream,
-    PortBinding, PortProtocol, PreparedArtifact, RuntimeDriver, VolumeKinds,
+    InstanceStatus, Isolation, LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation,
+    LogStream, PortBinding, PortProtocol, PreparedArtifact, RestartPolicy, RuntimeDriver,
+    VolumeKinds,
 };
 
-use super::firecracker::FirecrackerSandboxProvider;
+use super::firecracker::{FirecrackerSandboxProvider, GuestProcessStatus, GuestSpawn};
 use super::{SandboxBackend, SandboxCreateConfig, SandboxHandle, SandboxProvider};
 use crate::error::AgentError;
 
@@ -86,11 +97,123 @@ struct WorkloadVmState {
     cwd: Option<String>,
     uid: Option<u32>,
     gid: Option<u32>,
-    /// The guest pid of the running process, once started.
+    /// The guest pid of the running process, once started. It keeps naming
+    /// the process across the guest agent's restarts of it.
     pid: Option<u32>,
     started_at: Option<DateTime<Utc>>,
     ports: Vec<ForwardedPort>,
     labels: BTreeMap<String, String>,
+    /// The spec's restart policy, carried out by the guest agent. Absent in
+    /// a state file written before restarts existed: that VM keeps running
+    /// its process once, as it was created to.
+    #[serde(default)]
+    restart: Option<RestartPolicy>,
+    /// The log bounds the guest applies; absent takes its default.
+    #[serde(default)]
+    log_rotation: Option<GuestLogRotation>,
+    /// The guest's restart count when inspect last saw it, so a new crash
+    /// is logged once rather than on every inspect.
+    #[serde(default)]
+    restart_count: u32,
+}
+
+/// The rotation of the workload's log inside the guest, in the units the
+/// agent takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestLogRotation {
+    pub max_bytes: u64,
+    pub max_files: u32,
+}
+
+/// The guest agent's restart policy for the spec's. A process the guest
+/// does not restart stays down (the plane leaves an exited long-running
+/// replica to its runtime), so every policy is carried out, never dropped.
+pub fn guest_restart_policy(policy: Option<RestartPolicy>) -> SpawnRestartPolicy {
+    match policy {
+        None | Some(RestartPolicy::Never) => SpawnRestartPolicy::Never,
+        Some(RestartPolicy::Always) => SpawnRestartPolicy::Always,
+        Some(RestartPolicy::UnlessStopped) => SpawnRestartPolicy::UnlessStopped,
+        // Docker's `on-failure` without a count: unlimited, with backoff.
+        Some(RestartPolicy::OnFailure) => SpawnRestartPolicy::OnFailure { max_retries: None },
+    }
+}
+
+/// A Docker-style size (`10m`, `512k`, `1g`, `1.5MB`, `4096`) in bytes;
+/// units are binary, as Docker's `max-size` reads them.
+fn parse_log_size(size: &str) -> Option<u64> {
+    let size = size.trim();
+    let split = size
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(size.len());
+    let (number, unit) = size.split_at(split);
+    let number: f64 = number.parse().ok()?;
+    let multiplier: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => return None,
+    };
+    let bytes = number * multiplier as f64;
+    (bytes.is_finite() && bytes >= 1.0 && bytes <= u64::MAX as f64).then_some(bytes as u64)
+}
+
+/// The guest log bounds for the spec's rotation. An unreadable size or a
+/// zero file count is refused naming the field; values beyond what the
+/// guest keeps on its small rootfs are clamped to its limits (and logged).
+/// `None` (no rotation requested) takes the guest's bounded default.
+pub fn resolve_log_rotation(
+    instance: &str,
+    rotation: Option<&LogRotation>,
+) -> Result<Option<GuestLogRotation>, DriverError> {
+    use temps_vm_agent::workload_log::{MAX_LOG_MAX_BYTES, MAX_LOG_MAX_FILES, MIN_LOG_MAX_BYTES};
+    let Some(rotation) = rotation else {
+        return Ok(None);
+    };
+    let max_bytes = parse_log_size(&rotation.max_size).ok_or_else(|| {
+        runtime_error(
+            "rotate the logs of",
+            instance,
+            format!(
+                "log_rotation.max_size '{}' is not a size (use e.g. 10m, 512k, 1g)",
+                rotation.max_size
+            ),
+        )
+    })?;
+    if rotation.max_file == 0 {
+        return Err(runtime_error(
+            "rotate the logs of",
+            instance,
+            "log_rotation.max_file is 0; at least one log file must be kept",
+        ));
+    }
+    let resolved = GuestLogRotation {
+        max_bytes: max_bytes.clamp(MIN_LOG_MAX_BYTES, MAX_LOG_MAX_BYTES),
+        max_files: rotation.max_file.min(MAX_LOG_MAX_FILES),
+    };
+    if resolved.max_bytes != max_bytes || resolved.max_files != rotation.max_file {
+        tracing::warn!(
+            instance = %instance,
+            requested_max_size = %rotation.max_size,
+            requested_max_file = rotation.max_file,
+            max_bytes = resolved.max_bytes,
+            max_files = resolved.max_files,
+            "microVM log rotation clamped to the guest's limits"
+        );
+    }
+    Ok(Some(resolved))
+}
+
+/// What inspect reports for a guest process: a pending restart is still a
+/// running replica (Docker reports a restarting container as running too —
+/// the runtime owns its recovery), a process that will not run again is
+/// exited with its code.
+fn observed_state(status: &GuestProcessStatus) -> (InstanceState, Option<i64>) {
+    if status.running || status.restarting {
+        (InstanceState::Running, None)
+    } else {
+        (InstanceState::Exited, status.exit_code.map(i64::from))
+    }
 }
 
 /// The image's own runtime configuration, as `docker inspect` reports it.
@@ -402,15 +525,50 @@ impl FirecrackerWorkloadDriver {
         Ok(())
     }
 
-    async fn process_running(
+    async fn process_status(
         &self,
         vm_id: &str,
         pid: u32,
-    ) -> Result<(bool, Option<i32>), DriverError> {
+    ) -> Result<GuestProcessStatus, DriverError> {
         self.provider
             .process_status(vm_id, pid)
             .await
             .map_err(|e| backend_error("inspect", vm_id, e))
+    }
+
+    /// Record a restart count the guest reports for the first time, and log
+    /// it once: a crash-looping replica shows up in the control plane's log
+    /// with its exit code, not only on the guest's serial console.
+    fn note_restarts(&self, vm_id: &str, state: &mut WorkloadVmState, status: &GuestProcessStatus) {
+        if status.restart_count == state.restart_count {
+            return;
+        }
+        tracing::warn!(
+            vm_id = %vm_id,
+            instance = %state.name,
+            restart_count = status.restart_count,
+            last_exit_code = ?status.exit_code,
+            restarting = status.restarting,
+            "microVM replica process was restarted by its restart policy"
+        );
+        state.restart_count = status.restart_count;
+        if let Err(error) = self.write_state(vm_id, state) {
+            tracing::warn!(vm_id = %vm_id, %error, "could not record the microVM replica's restart count");
+        }
+    }
+
+    /// The guest's restart count of the replica's process: how often its
+    /// restart policy brought it back. `None` when no process was started
+    /// or the VM is down.
+    pub async fn restart_count(&self, handle: &InstanceHandle) -> Result<Option<u32>, DriverError> {
+        let vm_id = handle.id.as_str();
+        let Some(pid) = self.read_state(vm_id).and_then(|state| state.pid) else {
+            return Ok(None);
+        };
+        if !self.provider.vm_running(vm_id) {
+            return Ok(None);
+        }
+        Ok(Some(self.process_status(vm_id, pid).await?.restart_count))
     }
 }
 
@@ -527,6 +685,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         attach: &Attachments,
     ) -> Result<InstanceHandle, DriverError> {
         check_expressible(spec, attach)?;
+        let log_rotation = resolve_log_rotation(&spec.name, spec.log_rotation.as_ref())?;
         let image = self.image_config(&spec.name, &spec.image).await?;
         let (cmd, cwd) = resolve_process(spec, &image)?;
         let (uid, gid) = resolve_user(&spec.name, spec.user.as_deref().or(image.user.as_deref()))?;
@@ -592,6 +751,9 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             started_at: None,
             ports,
             labels: spec.labels.clone(),
+            restart: Some(spec.restart),
+            log_rotation,
+            restart_count: 0,
         };
         if let Err(error) = self.write_state(&vm_id, &state) {
             let _ = self
@@ -624,28 +786,37 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 .await
                 .map_err(|e| backend_error("boot", vm_id, e))?;
         }
-        let running = match state.pid {
-            Some(pid) => self.process_running(vm_id, pid).await?.0,
+        // A process waiting out a restart backoff is the guest's to bring
+        // back; spawning another would run the replica twice.
+        let alive = match state.pid {
+            Some(pid) => {
+                let status = self.process_status(vm_id, pid).await?;
+                status.running || status.restarting
+            }
             None => false,
         };
-        if !running {
-            let env = self.provider.workload_env(vm_id);
+        if !alive {
+            let restart = guest_restart_policy(state.restart);
+            let spawn = GuestSpawn {
+                cmd: state.cmd.clone(),
+                env: self.provider.workload_env(vm_id),
+                cwd: state.cwd.clone(),
+                uid: state.uid,
+                gid: state.gid,
+                restart,
+                log_max_bytes: state.log_rotation.map(|r| r.max_bytes),
+                log_max_files: state.log_rotation.map(|r| r.max_files),
+            };
             let pid = self
                 .provider
-                .spawn_process(
-                    vm_id,
-                    state.cmd.clone(),
-                    env,
-                    state.cwd.clone(),
-                    state.uid,
-                    state.gid,
-                )
+                .spawn_process(vm_id, spawn)
                 .await
                 .map_err(|e| backend_error("start", vm_id, e))?;
             state.pid = Some(pid);
             state.started_at = Some(Utc::now());
+            state.restart_count = 0;
             self.write_state(vm_id, &state)?;
-            tracing::info!(vm_id = %vm_id, pid, "microVM replica process started");
+            tracing::info!(vm_id = %vm_id, pid, restart = ?restart, "microVM replica process started");
         }
         self.ensure_forwarders(vm_id, &state).await
     }
@@ -678,7 +849,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
 
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let vm_id = handle.id.as_str();
-        let Some(state) = self.read_state(vm_id) else {
+        let Some(mut state) = self.read_state(vm_id) else {
             return Ok(missing_status());
         };
         let published_ports = state
@@ -695,15 +866,17 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
         let (state_now, exit_code) = match (self.provider.vm_running(vm_id), state.pid) {
             (false, _) => (InstanceState::Exited, None),
             (true, None) => (InstanceState::Created, None),
-            (true, Some(pid)) => match self.process_running(vm_id, pid).await? {
-                (true, _) => {
+            (true, Some(pid)) => {
+                let status = self.process_status(vm_id, pid).await?;
+                self.note_restarts(vm_id, &mut state, &status);
+                let observed = observed_state(&status);
+                if observed.0 == InstanceState::Running {
                     if let Err(error) = self.ensure_forwarders(vm_id, &state).await {
                         tracing::warn!(vm_id = %vm_id, %error, "could not re-open the microVM's forwarders");
                     }
-                    (InstanceState::Running, None)
                 }
-                (false, code) => (InstanceState::Exited, code.map(i64::from)),
-            },
+                observed
+            }
         };
         Ok(InstanceStatus {
             state: state_now,
@@ -725,6 +898,17 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             return Err(unsupported(vm_id, "following logs of a microVM replica"));
         }
         let tail = query.tail.unwrap_or(DEFAULT_LOG_TAIL).max(1);
+        // The guest agent reads the tail across the log's rotated files and
+        // needs nothing from the image; `tail` is only the fallback for a
+        // VM whose agent predates that request.
+        if let Some(text) = self
+            .provider
+            .read_workload_log(vm_id, tail)
+            .await
+            .map_err(|e| backend_error("read the logs of", vm_id, e))?
+        {
+            return Ok(futures::stream::iter(log_lines(&text)).boxed());
+        }
         let result = self
             .provider
             .exec(
@@ -751,17 +935,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 ),
             ));
         }
-        let lines: Vec<Result<LogLine, DriverError>> = result
-            .stdout
-            .lines()
-            .map(|line| {
-                Ok(LogLine {
-                    stderr: false,
-                    line: Bytes::from(format!("{line}\n")),
-                })
-            })
-            .collect();
-        Ok(futures::stream::iter(lines).boxed())
+        Ok(futures::stream::iter(log_lines(&result.stdout)).boxed())
     }
 
     async fn stats(&self, _handle: &InstanceHandle) -> Result<InstanceStats, DriverError> {
@@ -835,6 +1009,19 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
             })
             .collect())
     }
+}
+
+/// The workload log's text as log lines. stdout and stderr share one log in
+/// the guest, so every line is reported as stdout.
+fn log_lines(text: &str) -> Vec<Result<LogLine, DriverError>> {
+    text.lines()
+        .map(|line| {
+            Ok(LogLine {
+                stderr: false,
+                line: Bytes::from(format!("{line}\n")),
+            })
+        })
+        .collect()
 }
 
 fn missing_status() -> InstanceStatus {
@@ -1081,6 +1268,12 @@ mod tests {
                 host_port: 40000,
             }],
             labels: BTreeMap::from([("sh.temps.deploy_id".into(), "42".into())]),
+            restart: Some(RestartPolicy::UnlessStopped),
+            log_rotation: Some(GuestLogRotation {
+                max_bytes: 10 * 1024 * 1024,
+                max_files: 3,
+            }),
+            restart_count: 2,
         };
         let json = serde_json::to_string(&state).unwrap();
         assert!(!json.contains("PORT"), "variables live in env.json only");
@@ -1088,38 +1281,206 @@ mod tests {
         assert_eq!(back, state);
     }
 
-    /// Boots a real microVM. Skips (passes) unless this host has `/dev/kvm`,
-    /// a provisioned Firecracker install under the data directory (the one
-    /// `temps serve` uses) and Docker for the image.
-    #[tokio::test]
-    async fn a_workload_boots_runs_and_is_removed_in_a_real_micro_vm() {
+    #[test]
+    fn a_state_file_from_before_restarts_still_reads_and_runs_its_process_once() {
+        let json = r#"{"name":"app-1","cmd":["/app"],"cwd":null,"uid":null,"gid":null,
+            "pid":7,"started_at":null,"ports":[],"labels":{}}"#;
+        let state: WorkloadVmState = serde_json::from_str(json).expect("old state parses");
+        assert_eq!(state.restart, None);
+        assert_eq!(state.log_rotation, None);
+        assert_eq!(state.restart_count, 0);
+        assert_eq!(
+            guest_restart_policy(state.restart),
+            SpawnRestartPolicy::Never
+        );
+    }
+
+    #[test]
+    fn every_restart_policy_is_carried_out_by_the_guest() {
+        assert_eq!(
+            guest_restart_policy(Some(RestartPolicy::Never)),
+            SpawnRestartPolicy::Never
+        );
+        assert_eq!(
+            guest_restart_policy(Some(RestartPolicy::Always)),
+            SpawnRestartPolicy::Always
+        );
+        assert_eq!(
+            guest_restart_policy(Some(RestartPolicy::UnlessStopped)),
+            SpawnRestartPolicy::UnlessStopped
+        );
+        assert_eq!(
+            guest_restart_policy(Some(RestartPolicy::OnFailure)),
+            SpawnRestartPolicy::OnFailure { max_retries: None }
+        );
+    }
+
+    #[test]
+    fn a_pending_restart_is_running_and_a_finished_process_is_exited() {
+        let status = |running, restarting, exit_code| GuestProcessStatus {
+            running,
+            exit_code,
+            restart_count: 3,
+            restarting,
+        };
+        assert_eq!(
+            observed_state(&status(true, false, None)),
+            (InstanceState::Running, None)
+        );
+        assert_eq!(
+            observed_state(&status(false, true, Some(1))),
+            (InstanceState::Running, None),
+            "the guest brings it back; the plane must not"
+        );
+        assert_eq!(
+            observed_state(&status(false, false, Some(137))),
+            (InstanceState::Exited, Some(137))
+        );
+    }
+
+    #[test]
+    fn log_sizes_read_like_dockers_max_size() {
+        assert_eq!(parse_log_size("10m"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_log_size("10MB"), Some(10 * 1024 * 1024));
+        assert_eq!(parse_log_size("512k"), Some(512 * 1024));
+        assert_eq!(parse_log_size("1g"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_log_size("1.5m"), Some(3 * 512 * 1024));
+        assert_eq!(parse_log_size(" 4096 "), Some(4096));
+        for bad in ["", "m", "10x", "-1m", "0", "ten"] {
+            assert_eq!(parse_log_size(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_requested_log_rotation_is_honoured_bounded_or_refused_naming_the_field() {
+        let rotation = |max_size: &str, max_file| LogRotation {
+            max_size: max_size.to_string(),
+            max_file,
+        };
+        assert_eq!(resolve_log_rotation("app-1", None).unwrap(), None);
+        // The plane's default for deployments.
+        assert_eq!(
+            resolve_log_rotation("app-1", Some(&rotation("10m", 3))).unwrap(),
+            Some(GuestLogRotation {
+                max_bytes: 10 * 1024 * 1024,
+                max_files: 3
+            })
+        );
+        // Beyond what a small rootfs should hold: clamped, never unbounded.
+        let clamped = resolve_log_rotation("app-1", Some(&rotation("50g", 500)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            clamped.max_bytes,
+            temps_vm_agent::workload_log::MAX_LOG_MAX_BYTES
+        );
+        assert_eq!(
+            clamped.max_files,
+            temps_vm_agent::workload_log::MAX_LOG_MAX_FILES
+        );
+        let error = resolve_log_rotation("app-1", Some(&rotation("lots", 3)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("app-1") && error.contains("max_size 'lots'"),
+            "{error}"
+        );
+        let error = resolve_log_rotation("app-1", Some(&rotation("10m", 0)))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("max_file is 0"), "{error}");
+    }
+
+    /// A driver over a real Firecracker install, or `None` (the caller
+    /// skips) unless this host has `/dev/kvm`, a provisioned Firecracker
+    /// install under the data directory `temps serve` uses, and Docker.
+    async fn real_driver() -> Option<FirecrackerWorkloadDriver> {
         if !std::path::Path::new("/dev/kvm").exists() {
             println!("/dev/kvm not present, skipping the Firecracker runtime test");
-            return;
+            return None;
         }
         let Some(home) = std::env::var_os("HOME") else {
             println!("HOME not set, skipping the Firecracker runtime test");
-            return;
+            return None;
         };
         let data_dir = std::path::PathBuf::from(home).join(".temps");
         if !crate::sandbox::firecracker::is_firecracker_available(&data_dir).await {
             println!("Firecracker is not provisioned under {data_dir:?}, skipping");
-            return;
+            return None;
         }
         let Ok(docker) = bollard::Docker::connect_with_defaults() else {
             println!("Docker not available, skipping the Firecracker runtime test");
-            return;
+            return None;
         };
         if docker.ping().await.is_err() {
             println!("Docker not available, skipping the Firecracker runtime test");
-            return;
+            return None;
         }
         let docker = Arc::new(docker);
         let provider = Arc::new(FirecrackerSandboxProvider::new(
             crate::sandbox::firecracker::FirecrackerSandboxConfig::from_data_dir(data_dir),
             docker.clone(),
         ));
-        let driver = FirecrackerWorkloadDriver::new(provider, docker);
+        Some(FirecrackerWorkloadDriver::new(provider, docker))
+    }
+
+    /// A crashing process in a real microVM is restarted by the guest, and
+    /// the replica keeps reporting as running. Skips like the test below.
+    #[tokio::test]
+    async fn a_crashing_workload_is_restarted_inside_a_real_micro_vm() {
+        let Some(driver) = real_driver().await else {
+            return;
+        };
+        let artifact = Artifact::OciImage {
+            reference: "busybox:1.36".to_string(),
+            digest: None,
+        };
+        driver.prepare(&artifact).await.expect("pull busybox");
+        let mut spec = spec();
+        spec.name = format!("fc-restart-test-{}", std::process::id());
+        spec.image = "busybox:1.36".to_string();
+        spec.ports = Vec::new();
+        spec.restart = RestartPolicy::UnlessStopped;
+        spec.command = Some(vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "echo crash-once; exit 3".to_string(),
+        ]);
+        let handle = driver
+            .create(&spec, &Attachments::default())
+            .await
+            .expect("create the microVM workload");
+        let outcome = async {
+            driver.start(&handle).await?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if driver.restart_count(&handle).await?.unwrap_or(0) >= 2 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the guest never restarted the crashing process"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let status = driver.inspect(&handle).await?;
+            assert_eq!(status.state, InstanceState::Running, "{status:?}");
+            Ok::<(), DriverError>(())
+        }
+        .await;
+        let removed = driver.remove(&handle, true).await;
+        outcome.expect("the guest restarted the workload");
+        removed.expect("remove the microVM workload");
+    }
+
+    /// Boots a real microVM. Skips (passes) unless this host has `/dev/kvm`,
+    /// a provisioned Firecracker install under the data directory (the one
+    /// `temps serve` uses) and Docker for the image.
+    #[tokio::test]
+    async fn a_workload_boots_runs_and_is_removed_in_a_real_micro_vm() {
+        let Some(driver) = real_driver().await else {
+            return;
+        };
 
         let artifact = Artifact::OciImage {
             reference: "busybox:1.36".to_string(),
