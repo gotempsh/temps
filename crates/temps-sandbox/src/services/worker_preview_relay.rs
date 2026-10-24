@@ -217,7 +217,7 @@ impl WorkerPreviewRelayServer {
         );
         splice(client, attachment, request.forwarded)
             .await
-            .map_err(unreachable)
+            .map_err(|reason| unreachable(explain_channel_failure(request.port, reason)))
     }
 }
 
@@ -296,6 +296,21 @@ fn parse_preview_host(host: &str) -> Option<(String, u16)> {
     let port: u16 = port.parse().ok().filter(|port| *port != 0)?;
     (hex.len() == 16 && hex.chars().all(|c| c.is_ascii_hexdigit()))
         .then(|| (hex.to_ascii_lowercase(), port))
+}
+
+/// The channel's failure as the person opening the preview needs it. A
+/// refused connection is by far the common case (the dev server is not
+/// running, or listens on another port), and socat's raw message buries it
+/// under the exec and container layers.
+fn explain_channel_failure(port: u16, reason: String) -> String {
+    if reason.contains("Connection refused") {
+        format!(
+            "nothing is listening on port {port} inside the sandbox; start the server \
+             there, bound to 0.0.0.0 or 127.0.0.1"
+        )
+    } else {
+        reason
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -526,6 +541,23 @@ mod tests {
             .await
             .expect_err("nothing was relayed");
         assert!(error.contains("Connection refused"), "{error}");
+    }
+
+    #[test]
+    fn a_refused_connection_is_explained_as_nothing_listening() {
+        let refused = explain_channel_failure(
+            3000,
+            "port relay error: socat[104] E connect(5, AF=2 127.0.0.1:3000, 16): Connection refused"
+                .to_string(),
+        );
+        assert!(
+            refused.contains("nothing is listening on port 3000"),
+            "{refused}"
+        );
+        assert_eq!(
+            explain_channel_failure(3000, "the worker is offline".to_string()),
+            "the worker is offline"
+        );
     }
 
     #[tokio::test]

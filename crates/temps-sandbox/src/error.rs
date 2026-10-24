@@ -841,7 +841,7 @@ mod tests {
             SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
                 assert_eq!(sandbox_id, "sbx_abc");
                 assert!(reason.contains("default-address-pools"), "{reason}");
-                assert!(reason.contains("Delete sandboxes"), "{reason}");
+                assert!(reason.contains("Stop sandboxes"), "{reason}");
             }
             other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
         }
