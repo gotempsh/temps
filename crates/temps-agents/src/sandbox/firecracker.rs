@@ -39,7 +39,42 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use temps_vm_agent::{Request, Response, AGENT_PORT, MAX_FRAME_BYTES, PTY_PORT, WORK_DIR};
+use temps_vm_agent::{
+    Request, Response, SpawnRestartPolicy, AGENT_PORT, MAX_FRAME_BYTES, PTY_PORT, WORK_DIR,
+};
+
+/// What [`FirecrackerSandboxProvider::spawn_process`] starts in a guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GuestSpawn {
+    pub cmd: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub cwd: Option<String>,
+    pub uid: Option<u32>,
+    pub gid: Option<u32>,
+    /// What the guest agent does when the process exits.
+    pub restart: SpawnRestartPolicy,
+    /// Size of one log file; `None` takes the guest's bounded default.
+    pub log_max_bytes: Option<u64>,
+    /// Log files kept (current + rotated); `None` takes the guest's default.
+    pub log_max_files: Option<u32>,
+}
+
+/// What the guest agent reports about a spawned process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GuestProcessStatus {
+    pub running: bool,
+    pub exit_code: Option<i32>,
+    /// Restarts the guest made under the process's restart policy.
+    pub restart_count: u32,
+    /// Exited, with a restart pending once the backoff has passed.
+    pub restarting: bool,
+}
+
+/// Whether an agent `Err` says it does not know the request (an agent built
+/// before that request existed), as opposed to the request failing.
+fn is_unknown_request(message: &str) -> bool {
+    message.starts_with("bad request:") && message.contains("unknown variant")
+}
 
 use super::{
     KillSignal, PtyAttachment, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
@@ -932,26 +967,28 @@ impl FirecrackerSandboxProvider {
         Some(net.guest_ip(idx))
     }
 
-    /// Start `cmd` in the guest without waiting for it; returns its pid.
+    /// Start a process in the guest without waiting for it; returns the pid
+    /// that names it from then on (across the guest's restarts of it). The
+    /// guest agent bounds and rotates its output and restarts it per
+    /// `spawn.restart`.
     pub(crate) async fn spawn_process(
         &self,
         name: &str,
-        cmd: Vec<String>,
-        env: HashMap<String, String>,
-        cwd: Option<String>,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        spawn: GuestSpawn,
     ) -> Result<u32, AgentError> {
         let response = self
             .rpc(
                 name,
                 &Request::Spawn {
-                    cmd,
-                    env,
-                    cwd,
-                    uid,
-                    gid,
+                    cmd: spawn.cmd,
+                    env: spawn.env,
+                    cwd: spawn.cwd,
+                    uid: spawn.uid,
+                    gid: spawn.gid,
                     log_path: None,
+                    restart: spawn.restart,
+                    log_max_bytes: spawn.log_max_bytes,
+                    log_max_files: spawn.log_max_files,
                 },
                 Duration::from_secs(30),
             )
@@ -963,13 +1000,12 @@ impl FirecrackerSandboxProvider {
         }
     }
 
-    /// Whether the guest process `pid` runs, and its exit code once it
-    /// exited.
+    /// What the guest knows of the process `pid` started.
     pub(crate) async fn process_status(
         &self,
         name: &str,
         pid: u32,
-    ) -> Result<(bool, Option<i32>), AgentError> {
+    ) -> Result<GuestProcessStatus, AgentError> {
         match self
             .rpc(
                 name,
@@ -978,7 +1014,43 @@ impl FirecrackerSandboxProvider {
             )
             .await?
         {
-            Response::ProcessStatus { running, exit_code } => Ok((running, exit_code)),
+            Response::ProcessStatus {
+                running,
+                exit_code,
+                restart_count,
+                restarting,
+            } => Ok(GuestProcessStatus {
+                running,
+                exit_code,
+                restart_count,
+                restarting,
+            }),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
+    /// The last `lines` lines of the workload log, read by the guest agent
+    /// across its rotated files. `None` when the guest's agent predates the
+    /// `read_log` request (the caller falls back to `tail`).
+    pub(crate) async fn read_workload_log(
+        &self,
+        name: &str,
+        lines: u32,
+    ) -> Result<Option<String>, AgentError> {
+        match self
+            .rpc(
+                name,
+                &Request::ReadLog {
+                    path: None,
+                    tail_lines: lines,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        {
+            Response::Log { data } => Ok(Some(data)),
+            Response::Err { message } if is_unknown_request(&message) => Ok(None),
             Response::Err { message } => Err(self.err(name, message)),
             other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
         }
@@ -2911,6 +2983,17 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn an_agent_that_predates_a_request_is_told_apart_from_a_failing_one() {
+        // Exactly what an older guest agent answers for a request it lacks.
+        let parse_error =
+            serde_json::from_str::<Request>(r#"{"op":"from_the_future"}"#).expect_err("unknown op");
+        assert!(is_unknown_request(&format!("bad request: {parse_error}")));
+        assert!(!is_unknown_request(
+            "read log /var/log/temps-workload.log: Permission denied"
+        ));
+    }
 
     fn provider_at(data_dir: PathBuf) -> FirecrackerSandboxProvider {
         // Firecracker unit tests do not call Docker. An HTTP client avoids
