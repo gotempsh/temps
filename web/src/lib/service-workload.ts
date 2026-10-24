@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
 import {
+  getWorkloadMode,
   getWorkloadPendingChanges,
   recreateFromWorkloadSpec,
+  updateWorkloadMode,
 } from '@/api/client'
 import type {
   PendingChanges,
@@ -12,7 +13,9 @@ import type {
   RecreateFromWorkloadSpecResponse,
   RecreateStatus,
   ServiceWorkloadMode,
+  ServiceWorkloadModeResponse,
   WorkloadChange,
+  WorkloadModeChangeResponse,
   WorkloadSupport,
 } from '@/api/client'
 
@@ -22,23 +25,8 @@ export type { ServiceWorkloadMode }
 /** Whether a database can leave `legacy`, and why not. */
 export type ServiceWorkloadSupport = WorkloadSupport
 
-/**
- * Mirrors `ServiceWorkloadModeResponse` in `workload_handlers.rs`.
- *
- * Hand-written until the client is regenerated from a server that has the
- * schema under that name: it used to share the name `WorkloadModeResponse`
- * with the environment workload mode, which replaced it in the OpenAPI
- * document, so the generated type for this operation has the wrong shape.
- */
-export interface ServiceWorkloadModeStatus {
-  service_id: number
-  service_name: string
-  service_type: string
-  mode: ServiceWorkloadMode
-  /** Omitted when the database runs on the control plane. */
-  node_id?: number | null
-  support: ServiceWorkloadSupport
-}
+/** A database's workload mode, where it runs and whether it can move. */
+export type ServiceWorkloadModeStatus = ServiceWorkloadModeResponse
 
 /** One field a recreate from the spec would change. Secrets are `***`. */
 export type ServiceWorkloadChange = WorkloadChange
@@ -46,29 +34,14 @@ export type ServiceWorkloadChange = WorkloadChange
 /** The changes a recreate would apply; `fingerprint` confirms them. */
 export type ServiceWorkloadPendingChanges = PendingChanges
 
-/**
- * Mirrors `WorkloadModeChangeResponse`. Hand-written for the same reason
- * as [`ServiceWorkloadModeStatus`], which it embeds.
- */
-export interface ServiceWorkloadModeChange {
-  previous_mode: ServiceWorkloadMode
-  workload: ServiceWorkloadModeStatus
-  /** Omitted in `legacy`, or when the container could not be read. */
-  pending_changes?: ServiceWorkloadPendingChanges | null
-}
+/** The previous mode, the new status and what a recreate would change. */
+export type ServiceWorkloadModeChange = WorkloadModeChangeResponse
 
 /** Whether a recreate needs confirmation or happened. */
 export type ServiceRecreateStatus = RecreateStatus
 
 /** The changes to confirm, or those applied and what still differs. */
 export type ServiceRecreateResult = RecreateFromWorkloadSpecResponse
-
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
-const JSON_HEADERS = { 'Content-Type': 'application/json' }
-
-export function serviceWorkloadUrl(serviceId: number): string {
-  return `/external-services/${serviceId}/workload-mode`
-}
 
 export function serviceWorkloadModeQueryKey(serviceId: number) {
   return ['external-service-workload-mode', serviceId] as const
@@ -81,9 +54,8 @@ export function serviceWorkloadPendingQueryKey(serviceId: number) {
 export async function getServiceWorkloadMode(
   serviceId: number
 ): Promise<ServiceWorkloadModeStatus> {
-  const { data } = await client.get<ServiceWorkloadModeStatus, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: serviceWorkloadUrl(serviceId),
+  const { data } = await getWorkloadMode({
+    path: { id: serviceId },
     throwOnError: true,
   })
   return data
@@ -93,11 +65,9 @@ export async function setServiceWorkloadMode(
   serviceId: number,
   mode: ServiceWorkloadMode
 ): Promise<ServiceWorkloadModeChange> {
-  const { data } = await client.put<ServiceWorkloadModeChange, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: serviceWorkloadUrl(serviceId),
+  const { data } = await updateWorkloadMode({
+    path: { id: serviceId },
     body: { mode },
-    headers: JSON_HEADERS,
     throwOnError: true,
   })
   return data

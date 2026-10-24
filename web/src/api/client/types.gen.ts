@@ -7414,8 +7414,9 @@ export type CreateNetworkPolicyRuleRequest = {
      */
     direction: string;
     /**
-     * `service` (by id), `workload` (`<kind>/<id>`), `cidr`, or `host`
-     * (egress only, enforced by the egress proxy).
+     * `service` (by id), `workload` (`<kind>/<id>`) or `cidr`. `host`
+     * parses but is refused with 409 until a node runs the shared egress
+     * proxy that enforces hostname rules.
      */
     peer_kind: string;
     peer_ref: string;
@@ -18503,6 +18504,12 @@ export type NetworkPolicyRuleResponse = {
     created_by?: number | null;
     description?: string | null;
     direction: string;
+    /**
+     * False for a `host` rule: hostname rules are enforced only by the
+     * shared egress proxy, which no node runs yet, so such a rule (stored
+     * before new ones were refused) is shown but never enforced.
+     */
+    enforceable: boolean;
     id: number;
     link_id?: number | null;
     link_table?: string | null;
@@ -18808,6 +18815,11 @@ export type NodeNetworkPolicyModeListResponse = {
 
 export type NodeNetworkPolicyModeResponse = {
     /**
+     * Why `shadow`/`enforce` is unavailable, when `supports_enforcement`
+     * is false.
+     */
+    enforcement_unavailable_reason?: string | null;
+    /**
      * `legacy` (today's behaviour), `shadow` (computed and logged, not
      * applied) or `enforce`.
      */
@@ -18819,6 +18831,12 @@ export type NodeNetworkPolicyModeResponse = {
     node_id: number;
     role: string;
     status: string;
+    /**
+     * Whether this node can run `shadow` or `enforce`. False on workers:
+     * no enforcer runs there yet, and a stored non-legacy mode on a worker
+     * is never counted as enforcing.
+     */
+    supports_enforcement: boolean;
 };
 
 export type NodePairingListResponse = {
@@ -27112,6 +27130,31 @@ export type ServiceUpdateAlertRuleRequest = {
 
 export type ServiceWorkloadMode = 'legacy' | 'shadow' | 'enforce';
 
+/**
+ * A database's workload mode.
+ */
+export type ServiceWorkloadModeResponse = {
+    /**
+     * `legacy`: the engine (or the worker's agent) builds its own
+     * container request. `shadow`: the same, and a background pass logs
+     * where the running container differs from its workload spec.
+     * `enforce`: the container is created from its admitted spec through
+     * the Docker driver, the next time it is created or recreated.
+     */
+    mode: ServiceWorkloadMode;
+    /**
+     * `None`: the database runs on the control plane.
+     */
+    node_id?: number | null;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+    /**
+     * Whether the database can leave `legacy`, and why not.
+     */
+    support: WorkloadSupport;
+};
+
 export type SesCredentialsRequest = {
     access_key_id: string;
     secret_access_key: SecretString;
@@ -33412,7 +33455,7 @@ export type WorkloadIsolationResponse = {
 export type WorkloadModeChangeResponse = {
     pending_changes?: PendingChanges | null;
     previous_mode: ServiceWorkloadMode;
-    workload: WorkloadModeResponse;
+    workload: ServiceWorkloadModeResponse;
 };
 
 export type WorkloadModeResponse = {
@@ -49636,7 +49679,7 @@ export type GetWorkloadModeResponses = {
     /**
      * The database's workload mode
      */
-    200: WorkloadModeResponse;
+    200: ServiceWorkloadModeResponse;
 };
 
 export type GetWorkloadModeResponse = GetWorkloadModeResponses[keyof GetWorkloadModeResponses];
