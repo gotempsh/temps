@@ -42,6 +42,41 @@ function render(nodeId: number | undefined, rules: ServiceAlertRuleResponse[]) {
   return html
 }
 
+function renderFailedRead(nodeId: number) {
+  // `retryOnMount: false` keeps the seeded error state: by default an errored
+  // query refetches on mount, so it would render as pending, not as failed.
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, retryOnMount: false, staleTime: Infinity },
+    },
+  })
+  const { queryKey } = nodeMetricsGetAlertRulesOptions({ path: { id: nodeId } })
+  queryClient
+    .getQueryCache()
+    .build(queryClient, { queryKey })
+    .setState({
+      status: 'error',
+      error: new Error('forbidden'),
+      fetchStatus: 'idle',
+    })
+  const html = renderToStaticMarkup(
+    <QueryClientProvider client={queryClient}>
+      <NodeAlertRules nodeId={nodeId} />
+    </QueryClientProvider>
+  )
+  queryClient.clear()
+  return html
+}
+
+/** Whether the button wrapping the given label carries the `disabled` attribute. */
+function isButtonDisabled(html: string, label: string): boolean {
+  const at = html.indexOf(label)
+  expect(at).toBeGreaterThan(-1)
+  const tag = html.slice(html.lastIndexOf('<button', at), at)
+  // The class list holds Tailwind `disabled:` variants, so match the attribute.
+  return /\sdisabled(=|\s|>)/.test(tag)
+}
+
 describe('NodeAlertRules', () => {
   test('a worker can delete its rules', () => {
     const html = render(5, [rule(1, 'node.cpu_percent', 'High CPU usage')])
@@ -79,5 +114,19 @@ describe('NodeAlertRules', () => {
     expect(html).toContain('Add recommended alerts')
     expect(html).toContain('Memory usage &gt; 90%')
     expect(html).not.toContain('CPU usage &gt; 90%')
+  })
+
+  test('adding is possible once the current rules have loaded', () => {
+    const html = render(5, [rule(1, 'node.cpu_percent', 'High CPU usage')])
+    expect(isButtonDisabled(html, 'Add recommended alerts')).toBe(false)
+    expect(isButtonDisabled(html, 'Add alert rule')).toBe(false)
+  })
+
+  test('adding is disabled while the current rules could not be read', () => {
+    // A failed read looks like "no rules", so the add buttons would offer
+    // metrics that may already have a rule and the writes would conflict.
+    const html = renderFailedRead(5)
+    expect(isButtonDisabled(html, 'Add recommended alerts')).toBe(true)
+    expect(isButtonDisabled(html, 'Add alert rule')).toBe(true)
   })
 })

@@ -40,7 +40,7 @@ import {
 } from '@/lib/node-alert-rules'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { Loader2 } from 'lucide-react'
-import { useEffect } from 'react'
+import { useEffect, useEffectEvent } from 'react'
 import { useForm } from 'react-hook-form'
 
 type Props = {
@@ -79,10 +79,15 @@ export function AddNodeAlertRuleDialog({
     defaultValues: formDefaults(firstMetric),
   })
 
-  // Start each opening from a fresh rule for a metric that is still free.
+  // Start each opening from a fresh rule for a metric that is still free. A
+  // refetch of the rules while the dialog is open changes `firstMetric`; that
+  // must not wipe what the user is typing, so only `open` triggers the reset.
+  const resetForm = useEffectEvent(() => {
+    form.reset(formDefaults(firstMetric))
+  })
   useEffect(() => {
-    if (open) form.reset(formDefaults(firstMetric))
-  }, [open, firstMetric, form])
+    if (open) resetForm()
+  }, [open])
 
   const noMetricLeft = availableMetrics.length === 0
 

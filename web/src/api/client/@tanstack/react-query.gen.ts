@@ -12041,8 +12041,8 @@ export const nodeMetricsDeleteAlertRuleMutation = (options?: Partial<Options<Nod
 /**
  * Update a node-scoped monitoring alert rule.
  *
- * Deliberately update-only: there is no delete. The control-plane defaults
- * are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted
+ * Worker rules can be deleted. Control-plane defaults are update-only because
+ * they are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted
  * rule would silently reappear on the next restart, whereas `enabled: false`
  * survives re-seeding — disabling is the operation that actually means
  * "stop alerting on this".

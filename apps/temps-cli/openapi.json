@@ -108963,7 +108963,7 @@
         "x-maturity": "beta"
       },
       "patch": {
-        "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
+        "description": "Worker rules can be deleted. Control-plane defaults are update-only because\nthey are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
         "operationId": "NodeMetricsUpdateAlertRule",
         "parameters": [
           {

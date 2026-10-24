@@ -393,7 +393,7 @@ export function NodeAlertRules({
                 size="sm"
                 variant="outline"
                 onClick={() => void handleAddRecommended()}
-                disabled={recommendedPending || rulesQuery.isPending}
+                disabled={recommendedPending || !rulesQuery.isSuccess}
                 title={recommendedLabel}
               >
                 <Sparkles className="mr-2 size-4" />
@@ -403,7 +403,7 @@ export function NodeAlertRules({
             <Button
               size="sm"
               onClick={() => setAddOpen(true)}
-              disabled={rulesQuery.isPending}
+              disabled={!rulesQuery.isSuccess}
             >
               <Plus className="mr-2 size-4" />
               <span className="hidden sm:inline">Add alert rule</span>
