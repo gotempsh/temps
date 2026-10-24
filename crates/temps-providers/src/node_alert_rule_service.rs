@@ -52,6 +52,30 @@ pub(crate) struct NewNodeAlertRule {
     pub enabled: bool,
 }
 
+/// A partial update to a node alert rule: only the fields that are `Some` change.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NodeAlertRuleChanges {
+    pub name: Option<String>,
+    pub metric_name: Option<String>,
+    pub threshold: Option<f64>,
+    pub comparator: Option<String>,
+    pub severity: Option<String>,
+    pub for_duration_secs: Option<i32>,
+    pub enabled: Option<bool>,
+}
+
+impl NodeAlertRuleChanges {
+    fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.metric_name.is_none()
+            && self.threshold.is_none()
+            && self.comparator.is_none()
+            && self.severity.is_none()
+            && self.for_duration_secs.is_none()
+            && self.enabled.is_none()
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum NodeAlertRuleError {
     #[error("Node {node_id} not found while managing an alert rule")]
@@ -163,6 +187,131 @@ impl NodeAlertRuleService {
         })
     }
 
+    /// Apply a partial update to a rule on `node_id`, validating the rule as
+    /// it will be stored (the merge of the existing rule and `changes`).
+    ///
+    /// A worker's rule keeps to what `create` allows: one of the usage
+    /// percentages and a threshold between 0 and 100, so an edit cannot leave
+    /// a rule that can never fire or that has no series to evaluate. The
+    /// control plane's seeded rules cover metrics that are not percentages
+    /// (file descriptors, ingest rates), so for node `0` only the shape of the
+    /// rule is checked, not the metric or the threshold range.
+    ///
+    /// Renaming the metric onto one the node already has a rule for is refused
+    /// with `AlreadyExists`, the same answer `create` gives.
+    pub(crate) async fn update(
+        &self,
+        node_id: i32,
+        rule_id: i32,
+        changes: NodeAlertRuleChanges,
+    ) -> Result<monitoring_alert_rules::Model, NodeAlertRuleError> {
+        let db_err = |source| NodeAlertRuleError::Database { node_id, source };
+
+        let existing = monitoring_alert_rules::Entity::find_by_id(rule_id)
+            .filter(monitoring_alert_rules::Column::NodeId.eq(node_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(db_err)?
+            .ok_or(NodeAlertRuleError::RuleNotFound { node_id, rule_id })?;
+
+        if changes.is_empty() {
+            return Ok(existing);
+        }
+
+        let merged = NewNodeAlertRule {
+            name: changes
+                .name
+                .clone()
+                .unwrap_or_else(|| existing.name.clone()),
+            metric_name: changes
+                .metric_name
+                .clone()
+                .unwrap_or_else(|| existing.metric_name.clone()),
+            threshold: changes.threshold.unwrap_or(existing.threshold),
+            comparator: changes
+                .comparator
+                .clone()
+                .unwrap_or_else(|| existing.comparator.clone()),
+            severity: changes
+                .severity
+                .clone()
+                .unwrap_or_else(|| existing.severity.clone()),
+            for_duration_secs: changes
+                .for_duration_secs
+                .unwrap_or(existing.for_duration_secs),
+            enabled: changes.enabled.unwrap_or(existing.enabled),
+        };
+        if node_id == CONTROL_PLANE_NODE_ID {
+            validate_shape(node_id, &merged)?;
+            if !merged.threshold.is_finite() {
+                return Err(NodeAlertRuleError::Validation {
+                    node_id,
+                    message: format!("threshold {} is not a finite number", merged.threshold),
+                });
+            }
+        } else {
+            validate(node_id, &merged)?;
+        }
+
+        if merged.metric_name != existing.metric_name {
+            if let Some(other) = monitoring_alert_rules::Entity::find()
+                .filter(monitoring_alert_rules::Column::NodeId.eq(node_id))
+                .filter(monitoring_alert_rules::Column::MetricName.eq(merged.metric_name.as_str()))
+                .filter(monitoring_alert_rules::Column::Id.ne(rule_id))
+                .one(self.db.as_ref())
+                .await
+                .map_err(db_err)?
+            {
+                return Err(NodeAlertRuleError::AlreadyExists {
+                    node_id,
+                    metric_name: merged.metric_name,
+                    existing_rule_id: other.id,
+                });
+            }
+        }
+
+        let metric_name = merged.metric_name.clone();
+        let mut active: monitoring_alert_rules::ActiveModel = existing.into();
+        if changes.name.is_some() {
+            active.name = Set(merged.name.trim().to_string());
+        }
+        if changes.metric_name.is_some() {
+            active.metric_name = Set(merged.metric_name);
+        }
+        if changes.threshold.is_some() {
+            active.threshold = Set(merged.threshold);
+        }
+        if changes.comparator.is_some() {
+            active.comparator = Set(merged.comparator);
+        }
+        if changes.severity.is_some() {
+            active.severity = Set(merged.severity);
+        }
+        if changes.for_duration_secs.is_some() {
+            active.for_duration_secs = Set(merged.for_duration_secs);
+        }
+        if changes.enabled.is_some() {
+            active.enabled = Set(merged.enabled);
+        }
+
+        active.update(self.db.as_ref()).await.map_err(|source| {
+            // Lost a race with a concurrent create or rename onto the same
+            // metric: the unique index on (node_id, metric_name) arbitrates.
+            if matches!(
+                source.sql_err(),
+                Some(sea_orm::SqlErr::UniqueConstraintViolation(_))
+            ) {
+                NodeAlertRuleError::AlreadyExists {
+                    node_id,
+                    metric_name,
+                    existing_rule_id: 0,
+                }
+            } else {
+                NodeAlertRuleError::Database { node_id, source }
+            }
+        })
+    }
+
     /// Delete a worker's rule. Returns the deleted row for auditing.
     ///
     /// The control plane's rules are refused: its defaults are re-seeded on
@@ -194,19 +343,12 @@ impl NodeAlertRuleService {
     }
 }
 
+/// Full validation for a worker rule: its shape, a supported metric and a
+/// percentage threshold.
 fn validate(node_id: i32, rule: &NewNodeAlertRule) -> Result<(), NodeAlertRuleError> {
     let invalid = |message: String| NodeAlertRuleError::Validation { node_id, message };
 
-    let name = rule.name.trim();
-    if name.is_empty() {
-        return Err(invalid("name cannot be empty".to_string()));
-    }
-    if name.chars().count() > MAX_RULE_NAME_CHARS {
-        return Err(invalid(format!(
-            "name is {} characters; the limit is {MAX_RULE_NAME_CHARS}",
-            name.chars().count()
-        )));
-    }
+    validate_shape(node_id, rule)?;
     if !ALERTABLE_NODE_METRICS.contains(&rule.metric_name.as_str()) {
         return Err(invalid(format!(
             "metric_name '{}' cannot be alerted on; choose one of: {}",
@@ -218,6 +360,24 @@ fn validate(node_id: i32, rule: &NewNodeAlertRule) -> Result<(), NodeAlertRuleEr
         return Err(invalid(format!(
             "threshold {} is not a percentage between 0 and 100",
             rule.threshold
+        )));
+    }
+    Ok(())
+}
+
+/// The checks that hold for every node's rules, whatever the metric: name,
+/// comparator, severity and duration.
+fn validate_shape(node_id: i32, rule: &NewNodeAlertRule) -> Result<(), NodeAlertRuleError> {
+    let invalid = |message: String| NodeAlertRuleError::Validation { node_id, message };
+
+    let name = rule.name.trim();
+    if name.is_empty() {
+        return Err(invalid("name cannot be empty".to_string()));
+    }
+    if name.chars().count() > MAX_RULE_NAME_CHARS {
+        return Err(invalid(format!(
+            "name is {} characters; the limit is {MAX_RULE_NAME_CHARS}",
+            name.chars().count()
         )));
     }
     if !matches!(rule.comparator.as_str(), ">" | "<" | ">=" | "<=") {
@@ -469,5 +629,235 @@ mod tests {
             NodeAlertRuleError::Database { node_id: 7, .. }
         ));
         assert!(err.to_string().contains("node 7"));
+    }
+
+    fn changes() -> NodeAlertRuleChanges {
+        NodeAlertRuleChanges::default()
+    }
+
+    #[tokio::test]
+    async fn updates_a_worker_rule_threshold() {
+        let mut after = stored(5, 7, "node.disk_percent");
+        after.threshold = 80.0;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(5, 7, "node.disk_percent")]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                7,
+                5,
+                NodeAlertRuleChanges {
+                    threshold: Some(80.0),
+                    ..changes()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.threshold, 80.0);
+        assert_eq!(updated.metric_name, "node.disk_percent");
+    }
+
+    #[tokio::test]
+    async fn a_worker_threshold_above_100_is_rejected_before_any_write() {
+        // Only the lookup is queued: a write would fail the mock.
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                5,
+                7,
+                "node.cpu_percent",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                5,
+                NodeAlertRuleChanges {
+                    threshold: Some(150.0),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "between 0 and 100");
+    }
+
+    #[tokio::test]
+    async fn a_worker_rule_cannot_be_renamed_to_an_unsupported_metric() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                5,
+                7,
+                "node.cpu_percent",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                5,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.fd_percent".to_string()),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "cannot be alerted on");
+    }
+
+    #[tokio::test]
+    async fn a_bad_comparator_or_empty_name_is_rejected_on_update() {
+        for (change, needle) in [
+            (
+                NodeAlertRuleChanges {
+                    comparator: Some("!=".to_string()),
+                    ..changes()
+                },
+                "comparator",
+            ),
+            (
+                NodeAlertRuleChanges {
+                    name: Some("   ".to_string()),
+                    ..changes()
+                },
+                "name cannot be empty",
+            ),
+        ] {
+            let svc =
+                service(
+                    MockDatabase::new(DatabaseBackend::Postgres)
+                        .append_query_results([vec![stored(5, 7, "node.cpu_percent")]]),
+                );
+            assert_invalid(svc.update(7, 5, change).await, needle);
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_onto_a_metric_that_already_has_a_rule_names_that_rule() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(5, 7, "node.cpu_percent")]])
+                .append_query_results([vec![stored(9, 7, "node.disk_percent")]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                5,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.disk_percent".to_string()),
+                    ..changes()
+                },
+            )
+            .await;
+
+        match result {
+            Err(NodeAlertRuleError::AlreadyExists {
+                node_id: 7,
+                existing_rule_id: 9,
+                metric_name,
+            }) => assert_eq!(metric_name, "node.disk_percent"),
+            other => panic!("expected AlreadyExists for rule 9 on node 7, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn updating_a_rule_that_belongs_to_another_node_is_not_found() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<monitoring_alert_rules::Model>::new()]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                5,
+                NodeAlertRuleChanges {
+                    enabled: Some(false),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(NodeAlertRuleError::RuleNotFound {
+                node_id: 7,
+                rule_id: 5
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_empty_update_returns_the_rule_without_writing() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                5,
+                7,
+                "node.cpu_percent",
+            )]]),
+        );
+
+        let unchanged = svc.update(7, 5, changes()).await.unwrap();
+
+        assert_eq!(unchanged.id, 5);
+    }
+
+    #[tokio::test]
+    async fn control_plane_rules_keep_non_percentage_metrics_and_large_thresholds() {
+        // The seeded defaults include rates and counts, so a threshold above
+        // 100 on a non-percentage metric is legitimate for node 0.
+        let mut before = stored(3, 0, "otel.rate_limited_requests");
+        before.threshold = 10.0;
+        let mut after = before.clone();
+        after.threshold = 500.0;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![before]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                0,
+                3,
+                NodeAlertRuleChanges {
+                    threshold: Some(500.0),
+                    ..changes()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(updated.threshold, 500.0);
+    }
+
+    #[tokio::test]
+    async fn control_plane_rules_still_reject_a_non_finite_threshold() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                3,
+                0,
+                "otel.rate_limited_requests",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                0,
+                3,
+                NodeAlertRuleChanges {
+                    threshold: Some(f64::NAN),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "not a finite number");
     }
 }

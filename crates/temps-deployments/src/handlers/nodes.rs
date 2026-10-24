@@ -2258,19 +2258,13 @@ async fn node_heartbeat(
         .map_err(Problem::from)?;
 
     // Only an accepted heartbeat (valid token, known node) reaches the store.
-    // Spawned so a slow metrics store can never delay the acknowledgement the
-    // agent is waiting on; at one task per node per beat it is bounded by the
-    // fleet size.
+    // Written in a background task so a slow metrics store can never delay the
+    // acknowledgement the agent is waiting on. The number of concurrent writes
+    // is capped: when the store falls behind the heartbeat rate the sample is
+    // skipped (counted and logged), since the node's next heartbeat supersedes
+    // it.
     if let (Some(store), Some(capacity)) = (app_state.metrics_store.clone(), metrics_capacity) {
-        tokio::spawn(async move {
-            temps_metrics::node_capacity::record_capacity(
-                store.as_ref(),
-                node_id,
-                &capacity,
-                chrono::Utc::now(),
-            )
-            .await;
-        });
+        temps_metrics::node_capacity::spawn_record_capacity(store, node_id, capacity);
     }
 
     // The architecture decides where images are placed and is supplied by the

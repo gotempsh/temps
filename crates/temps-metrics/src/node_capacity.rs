@@ -13,8 +13,11 @@
 //! with agents that were deployed before this existed.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
@@ -110,6 +113,70 @@ pub async fn record_capacity(
             0
         }
     }
+}
+
+/// Most heartbeat metric writes that may be in flight at once.
+///
+/// A heartbeat arrives every 30 s per node, so writes only overlap when one
+/// takes longer than that, and then in proportion to `nodes x latency / 30 s`.
+/// The cap keeps a slow or stalled metrics store from turning that into an
+/// unbounded pile of tasks and open store requests. 32 is far above what a
+/// healthy store needs (a fleet of 32 nodes writing at the same instant) and
+/// small enough to be a rounding error on a 4 GB host.
+pub const MAX_IN_FLIGHT_CAPACITY_WRITES: usize = 32;
+
+/// Samples skipped because the cap was reached, since the process started.
+static SKIPPED_CAPACITY_WRITES: AtomicU64 = AtomicU64::new(0);
+
+fn write_limit() -> &'static Arc<Semaphore> {
+    static LIMIT: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    LIMIT.get_or_init(|| Arc::new(Semaphore::new(MAX_IN_FLIGHT_CAPACITY_WRITES)))
+}
+
+/// Record one heartbeat's capacity in a background task, never waiting.
+///
+/// Returns `false` when the sample was skipped because
+/// [`MAX_IN_FLIGHT_CAPACITY_WRITES`] writes are already running. Skipping is
+/// the saturation policy: the node's next heartbeat, 30 s later, supersedes
+/// the lost sample, so the cost is at worst a one-point gap in a chart, and
+/// the alternative (queueing) would grow memory without bound. Skips are
+/// counted and logged on a doubling schedule (1st, 2nd, 4th, 8th, ...) so a
+/// stalled store does not also flood the log.
+///
+/// Must be called from within a Tokio runtime.
+pub fn spawn_record_capacity(
+    store: Arc<dyn MetricsStore>,
+    node_id: i32,
+    capacity: serde_json::Value,
+) -> bool {
+    spawn_record_capacity_with(write_limit().clone(), store, node_id, capacity)
+}
+
+fn spawn_record_capacity_with(
+    limit: Arc<Semaphore>,
+    store: Arc<dyn MetricsStore>,
+    node_id: i32,
+    capacity: serde_json::Value,
+) -> bool {
+    let Ok(permit) = limit.try_acquire_owned() else {
+        let skipped = SKIPPED_CAPACITY_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+        if skipped.is_power_of_two() {
+            warn!(
+                node_id,
+                skipped_total = skipped,
+                max_in_flight = MAX_IN_FLIGHT_CAPACITY_WRITES,
+                "Skipped a heartbeat metrics write for node {node_id}: {MAX_IN_FLIGHT_CAPACITY_WRITES} \
+                 writes are already in flight, so the metrics store is slower than the heartbeat rate"
+            );
+        }
+        return false;
+    };
+    tokio::spawn(async move {
+        // Held for the whole write; released when the task ends.
+        let _permit = permit;
+        record_capacity(store.as_ref(), node_id, &capacity, Utc::now()).await;
+    });
+    true
 }
 
 fn number(capacity: &serde_json::Value, key: &str) -> Option<f64> {
@@ -252,11 +319,20 @@ mod tests {
     struct SpyStore {
         written: Mutex<Vec<MetricPoint>>,
         failing: bool,
+        /// When set, every write waits for a permit from this semaphore, so a
+        /// test can hold writes in flight and release them on demand.
+        gate: Option<Arc<Semaphore>>,
     }
 
     #[async_trait]
     impl MetricsStore for SpyStore {
         async fn write_batch(&self, points: Vec<MetricPoint>) -> Result<(), MetricsError> {
+            if let Some(gate) = &self.gate {
+                gate.acquire()
+                    .await
+                    .map_err(|_| MetricsError::NotImplemented)?
+                    .forget();
+            }
             if self.failing {
                 return Err(MetricsError::NotImplemented);
             }
@@ -302,6 +378,7 @@ mod tests {
         SpyStore {
             written: Mutex::new(Vec::new()),
             failing,
+            gate: None,
         }
     }
 
@@ -339,5 +416,110 @@ mod tests {
 
         assert_eq!(written, 0);
         assert!(store.written.lock().expect("spy store mutex").is_empty());
+    }
+
+    fn gated_store() -> (Arc<SpyStore>, Arc<Semaphore>) {
+        let gate = Arc::new(Semaphore::new(0));
+        let store = Arc::new(SpyStore {
+            written: Mutex::new(Vec::new()),
+            failing: false,
+            gate: Some(gate.clone()),
+        });
+        (store, gate)
+    }
+
+    /// Wait (bounded) until `done` holds, yielding to the spawned writers.
+    async fn eventually(mut done: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if done() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not reached within 2s");
+    }
+
+    #[tokio::test]
+    async fn writes_beyond_the_cap_are_skipped_not_queued() {
+        let (store, gate) = gated_store();
+        let dyn_store: Arc<dyn MetricsStore> = store.clone();
+        let limit = Arc::new(Semaphore::new(2));
+        let beat = json!({ "cpu_percent": 5.0 });
+
+        // Two writes fill the cap and stay in flight (the store is gated).
+        assert!(spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store.clone(),
+            1,
+            beat.clone()
+        ));
+        assert!(spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store.clone(),
+            2,
+            beat.clone()
+        ));
+        // The third is dropped immediately and never reaches the store.
+        assert!(!spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store.clone(),
+            3,
+            beat.clone()
+        ));
+
+        gate.add_permits(10);
+        eventually(|| store.written.lock().expect("spy store mutex").len() == 2).await;
+        let written = store.written.lock().expect("spy store mutex");
+        let mut nodes: Vec<i32> = written.iter().map(|p| p.source_id).collect();
+        nodes.sort_unstable();
+        assert_eq!(nodes, [1, 2], "the skipped sample must not be written");
+    }
+
+    #[tokio::test]
+    async fn capacity_is_released_when_a_write_finishes() {
+        let (store, gate) = gated_store();
+        let dyn_store: Arc<dyn MetricsStore> = store.clone();
+        let limit = Arc::new(Semaphore::new(1));
+        let beat = json!({ "cpu_percent": 5.0 });
+
+        assert!(spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store.clone(),
+            1,
+            beat.clone()
+        ));
+        assert!(!spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store.clone(),
+            1,
+            beat.clone()
+        ));
+
+        gate.add_permits(10);
+        eventually(|| limit.available_permits() == 1).await;
+
+        assert!(
+            spawn_record_capacity_with(limit.clone(), dyn_store, 1, beat),
+            "a finished write must free its slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_store_still_releases_its_slot() {
+        let store = Arc::new(SpyStore {
+            written: Mutex::new(Vec::new()),
+            failing: true,
+            gate: None,
+        });
+        let dyn_store: Arc<dyn MetricsStore> = store;
+        let limit = Arc::new(Semaphore::new(1));
+
+        assert!(spawn_record_capacity_with(
+            limit.clone(),
+            dyn_store,
+            1,
+            json!({ "cpu_percent": 5.0 })
+        ));
+        eventually(|| limit.available_permits() == 1).await;
     }
 }

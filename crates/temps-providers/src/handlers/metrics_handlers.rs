@@ -64,7 +64,9 @@ use super::types::AppState;
 use crate::alert_rule_service::{
     insert_alert_rule_within_limit, AlertRuleCreateError, MAX_ALERT_RULES_PER_SERVICE,
 };
-use crate::node_alert_rule_service::{NewNodeAlertRule, NodeAlertRuleError, NodeAlertRuleService};
+use crate::node_alert_rule_service::{
+    NewNodeAlertRule, NodeAlertRuleChanges, NodeAlertRuleError, NodeAlertRuleService,
+};
 
 // `is_monotonic_counter` / `range_to_step` live in `temps_metrics` (shared
 // with the deployment container metrics handlers) — imported below.
@@ -1526,51 +1528,25 @@ async fn update_node_alert_rule(
         })?;
     }
 
-    let rule = monitoring_alert_rules::Entity::find_by_id(rule_id)
-        .filter(monitoring_alert_rules::Column::NodeId.eq(id))
-        .one(state.db.as_ref())
+    // The service merges the change with the stored rule and validates the
+    // result: a worker's rule stays a supported usage percentage with a 0-100
+    // threshold, whatever field was edited.
+    let updated = NodeAlertRuleService::new(state.db.clone())
+        .update(
+            id,
+            rule_id,
+            NodeAlertRuleChanges {
+                name: request.name,
+                metric_name: request.metric_name,
+                threshold: request.threshold,
+                comparator: request.comparator,
+                severity: request.severity,
+                for_duration_secs: request.for_duration_secs,
+                enabled: request.enabled,
+            },
+        )
         .await
-        .map_err(|e| {
-            error!(rule_id, node_id = id, error = %e, "Failed to load node alert rule");
-            internal_server_error()
-                .detail(format!("Failed to load node alert rule: {}", e))
-                .build()
-        })?
-        .ok_or_else(|| {
-            not_found()
-                .detail(format!("Alert rule {rule_id} not found on node {id}"))
-                .build()
-        })?;
-
-    let mut active: monitoring_alert_rules::ActiveModel = rule.into();
-    if let Some(name) = request.name {
-        active.name = Set(name);
-    }
-    if let Some(metric_name) = request.metric_name {
-        active.metric_name = Set(metric_name);
-    }
-    if let Some(threshold) = request.threshold {
-        active.threshold = Set(threshold);
-    }
-    if let Some(comparator) = request.comparator {
-        active.comparator = Set(comparator);
-    }
-    if let Some(severity) = request.severity {
-        active.severity = Set(severity);
-    }
-    if let Some(for_duration_secs) = request.for_duration_secs {
-        active.for_duration_secs = Set(for_duration_secs);
-    }
-    if let Some(enabled) = request.enabled {
-        active.enabled = Set(enabled);
-    }
-
-    let updated = active.update(state.db.as_ref()).await.map_err(|e| {
-        error!(rule_id, node_id = id, error = %e, "Failed to update node alert rule");
-        internal_server_error()
-            .detail(format!("Failed to update node alert rule: {}", e))
-            .build()
-    })?;
+        .map_err(|e| log_and_convert(id, e))?;
 
     info!(
         rule_id,
