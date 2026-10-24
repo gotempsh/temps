@@ -2067,7 +2067,8 @@ mod tests {
             &fx.state.public_status_page_service,
             fx.project_a,
         )
-        .await;
+        .await
+        .expect("the status page hook never fails a deletion");
         assert_eq!(fetch(&fx.public, &path).await.0, StatusCode::NOT_FOUND);
     }
 
@@ -2572,7 +2573,8 @@ mod tests {
             &fx.state.public_status_page_service,
             fx.project_a,
         )
-        .await;
+        .await
+        .expect("the status page hook never fails a deletion");
         assert!(!domains_row_exists(&fx, "gone.example.org").await);
         assert_eq!(
             fetch_as_host(&fx.public, &page.slug, "gone.example.org", false)

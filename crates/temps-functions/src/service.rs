@@ -21,11 +21,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    DbBackend, EntityTrait, JoinType, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect,
+    RelationTrait, Set, Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
-use temps_entities::{functions, ingress_endpoints, projects};
+use temps_entities::{functions, ingress_endpoints, projects, workloads};
 use temps_workload::{
     Artifact, EgressProfile, Isolation, Lifetime, NetworkSpec, PortSpec, ResourceAmounts,
     Resources, WorkloadKind, WorkloadRef, WorkloadSpec,
@@ -271,6 +272,90 @@ pub(crate) fn hostname_for(
     Ok(format!("{label}.{}", base_domain.trim_matches('.')).to_ascii_lowercase())
 }
 
+/// Namespace (first key) of the advisory locks that serialise storing a
+/// module with inserting the row that uses it, against counting a digest's
+/// rows and removing its module. `FUNC` in ASCII.
+const MODULE_LOCK_NAMESPACE: i32 = 0x4655_4e43;
+
+/// Take the advisory lock of `digest`'s module for the rest of `txn`.
+///
+/// A Postgres lock rather than a process mutex: whoever shares the module
+/// directory (another `temps serve` on the same data directory) shares the
+/// database too, so this is the one place every writer can agree on. The
+/// second key is `hashtext(digest)`; two digests that collide only wait for
+/// each other.
+async fn lock_module(txn: &DatabaseTransaction, digest: &str) -> Result<(), FunctionError> {
+    txn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+        [MODULE_LOCK_NAMESPACE.into(), digest.into()],
+    ))
+    .await
+    .map_err(FunctionError::db("locking the function module"))?;
+    Ok(())
+}
+
+/// Delete every live workload `function_id` owns: the one its row records
+/// and any other the plane still has for it. Does not read the function's
+/// row, so it also cleans up after a function whose row is already gone.
+/// Returns how many workloads were retired.
+pub(crate) async fn retire_function_workloads(
+    db: &DatabaseConnection,
+    plane: &WorkloadPlane,
+    function_id: i64,
+    name: &str,
+    recorded: Option<i64>,
+) -> Result<usize, FunctionError> {
+    let mut ids: Vec<i64> = workloads::Entity::find()
+        .select_only()
+        .column(workloads::Column::Id)
+        .filter(workloads::Column::OwnerKind.eq(FUNCTION_OWNER_KIND))
+        .filter(workloads::Column::OwnerId.eq(function_id))
+        .filter(workloads::Column::DeletedAt.is_null())
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(FunctionError::db("listing the function's workloads"))?;
+    if let Some(recorded) = recorded {
+        if !ids.contains(&recorded) {
+            ids.push(recorded);
+        }
+    }
+    for workload_id in &ids {
+        match plane
+            .delete(*workload_id, "Deleted", "the function was deleted")
+            .await
+        {
+            Ok(()) | Err(temps_workload_plane::PlaneError::NotFound { .. }) => {}
+            Err(source) => {
+                return Err(FunctionError::Plane {
+                    function_id,
+                    name: name.to_string(),
+                    operation: "delete its workload",
+                    source: Box::new(source),
+                })
+            }
+        }
+    }
+    Ok(ids.len())
+}
+
+/// Delete the ingress endpoints `function_id` owns.
+pub(crate) async fn delete_function_endpoints<C: ConnectionTrait>(
+    db: &C,
+    function_id: i64,
+) -> Result<u64, FunctionError> {
+    let deleted = ingress_endpoints::Entity::delete_many()
+        .filter(ingress_endpoints::Column::OwnerKind.eq(FUNCTION_OWNER_KIND))
+        .filter(ingress_endpoints::Column::OwnerId.eq(function_id))
+        .exec(db)
+        .await
+        .map_err(FunctionError::db(
+            "deleting the function's ingress endpoint",
+        ))?;
+    Ok(deleted.rows_affected)
+}
+
 fn blob_path(dir: &Path, digest: &str) -> PathBuf {
     let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
     dir.join(format!("{hex}.wasm"))
@@ -483,7 +568,9 @@ impl FunctionService {
         }
     }
 
-    /// Store the module under its digest (once), atomically.
+    /// Store the module under its digest (once), atomically. Callers that
+    /// insert a row using the digest hold [`lock_module`] from before this
+    /// call until that row is committed.
     async fn store_module(&self, module: &[u8]) -> Result<(String, PathBuf), FunctionError> {
         let digest = digest_of(module);
         let path = blob_path(&self.artifacts_dir, &digest);
@@ -508,26 +595,54 @@ impl FunctionService {
     }
 
     /// Remove the module of `digest` when no function uses it any more.
+    /// Failures are logged: an unused module left behind costs disk, never
+    /// correctness.
     async fn collect_module(&self, digest: &str) {
+        if let Err(error) = self.try_collect_module(digest).await {
+            warn!(
+                digest,
+                "collecting an unused function module failed: {error}"
+            );
+        }
+    }
+
+    /// Count `digest`'s rows and remove its module when there are none,
+    /// both under the module's lock: a create storing the same digest holds
+    /// that lock until its row is committed, so it either finishes first
+    /// (and its row is counted) or starts after (and stores the module
+    /// again). Returns whether the module was removed.
+    async fn try_collect_module(&self, digest: &str) -> Result<bool, FunctionError> {
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(FunctionError::db("starting the module collection"))?;
+        lock_module(&txn, digest).await?;
         let in_use = functions::Entity::find()
             .filter(functions::Column::WasmDigest.eq(digest))
-            .count(self.db.as_ref())
-            .await;
-        match in_use {
-            Ok(0) => {
-                let path = blob_path(&self.artifacts_dir, digest);
-                if let Err(error) = tokio::fs::remove_file(&path).await {
-                    if error.kind() != std::io::ErrorKind::NotFound {
-                        warn!(path = %path.display(), "removing an unused function module failed: {error}");
-                    }
+            .count(&txn)
+            .await
+            .map_err(FunctionError::db(
+                "checking whether a function module is still used",
+            ))?;
+        let mut removed = false;
+        if in_use == 0 {
+            let path = blob_path(&self.artifacts_dir, digest);
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => removed = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(FunctionError::Storage {
+                        path: path.display().to_string(),
+                        reason: format!("removing an unused function module: {error}"),
+                    })
                 }
             }
-            Ok(_) => {}
-            Err(error) => warn!(
-                digest,
-                "checking whether a function module is still used failed: {error}"
-            ),
         }
+        txn.commit()
+            .await
+            .map_err(FunctionError::db("ending the module collection"))?;
+        Ok(removed)
     }
 
     pub async fn create(
@@ -559,6 +674,11 @@ impl FunctionService {
             .await
             .map_err(FunctionError::db("reading the function's project"))?
             .ok_or(FunctionError::ProjectNotFound { project_id })?;
+        // A project being deleted has had its functions retired; one created
+        // now would outlive it.
+        if project.is_deleted {
+            return Err(FunctionError::ProjectNotFound { project_id });
+        }
         let duplicate = functions::Entity::find()
             .filter(functions::Column::ProjectId.eq(project_id))
             .filter(functions::Column::Name.eq(normalized.name.clone()))
@@ -576,15 +696,26 @@ impl FunctionService {
         let base_domain = self.domain.base_domain().await;
         let hostname = hostname_for(&normalized.name, &project.slug, &base_domain)?;
 
+        // The module is stored and the row that uses it inserted under the
+        // module's lock, held by this transaction until the row is
+        // committed: a concurrent delete of another function with the same
+        // module cannot count zero rows and remove the file in between.
+        let txn = self
+            .db
+            .begin()
+            .await
+            .map_err(FunctionError::db("starting the function insert"))?;
         let (image_reference, wasm_digest, wasm_size_bytes) = match &request.artifact {
             FunctionArtifact::Wasm { module } => {
-                let (digest, _) = self.store_module(module).await?;
+                let digest = digest_of(module);
+                lock_module(&txn, &digest).await?;
+                self.store_module(module).await?;
                 (None, Some(digest), i64::try_from(module.len()).ok())
             }
             FunctionArtifact::Oci { image } => (Some(image.trim().to_string()), None, None),
         };
         let now = Utc::now();
-        let inserted = functions::ActiveModel {
+        let inserted = match (functions::ActiveModel {
             project_id: Set(project_id),
             name: Set(normalized.name.clone()),
             artifact_kind: Set(kind.to_string()),
@@ -600,9 +731,23 @@ impl FunctionService {
             created_at: Set(now),
             updated_at: Set(now),
             ..Default::default()
-        }
-        .insert(self.db.as_ref())
-        .await;
+        })
+        .insert(&txn)
+        .await
+        {
+            Ok(function) => txn.commit().await.map(|()| function),
+            Err(error) => {
+                // End the transaction (and release the module lock) before
+                // collecting the module below, which takes the same lock.
+                if let Err(rollback) = txn.rollback().await {
+                    warn!(
+                        project_id,
+                        "rolling back a failed function insert: {rollback}"
+                    );
+                }
+                Err(error)
+            }
+        };
         let function = match inserted {
             Ok(function) => function,
             Err(error) => {
@@ -844,37 +989,42 @@ impl FunctionService {
         function_id: i64,
     ) -> Result<functions::Model, FunctionError> {
         let function = self.find(project_id, function_id).await?;
-        let key = activation_key(function.id);
-        if let Some(workload_id) = function.workload_id {
-            let plane = self.plane()?;
-            match plane
-                .delete(workload_id, "Deleted", "the function was deleted")
-                .await
-            {
-                Ok(()) | Err(temps_workload_plane::PlaneError::NotFound { .. }) => {}
-                Err(source) => {
-                    return Err(FunctionError::Plane {
-                        function_id: function.id,
-                        name: function.name.clone(),
-                        operation: "delete its workload",
-                        source: Box::new(source),
-                    })
-                }
-            }
+        self.delete_function(&function).await?;
+        info!(function_id = function.id, project_id, "function deleted");
+        Ok(function)
+    }
+
+    /// Retire `function` and remove it: it stops being routed, its
+    /// workloads, ingress endpoint and row go, and its module when no other
+    /// function uses it. Safe to repeat after a failure part-way.
+    async fn delete_function(&self, function: &functions::Model) -> Result<(), FunctionError> {
+        // Stop routing first: whatever fails below, the hostname no longer
+        // reaches an instance (an awake one is otherwise served from the
+        // activator's cached address until it is unregistered).
+        self.activator.unregister(activation_key(function.id));
+        // Without a plane nothing of it can be running here; one with a
+        // recorded workload still needs the plane to retire it.
+        let plane = match (self.plane(), function.workload_id) {
+            (Ok(plane), _) => Some(plane),
+            (Err(_), None) => None,
+            (Err(error), Some(_)) => return Err(error),
+        };
+        if let Some(plane) = plane {
+            retire_function_workloads(
+                self.db.as_ref(),
+                &plane,
+                function.id,
+                &function.name,
+                function.workload_id,
+            )
+            .await?;
         }
         let txn = self
             .db
             .begin()
             .await
             .map_err(FunctionError::db("starting the delete transaction"))?;
-        ingress_endpoints::Entity::delete_many()
-            .filter(ingress_endpoints::Column::OwnerKind.eq(FUNCTION_OWNER_KIND))
-            .filter(ingress_endpoints::Column::OwnerId.eq(function.id))
-            .exec(&txn)
-            .await
-            .map_err(FunctionError::db(
-                "deleting the function's ingress endpoint",
-            ))?;
+        delete_function_endpoints(&txn, function.id).await?;
         functions::Entity::delete_by_id(function.id)
             .exec(&txn)
             .await
@@ -882,12 +1032,55 @@ impl FunctionService {
         txn.commit()
             .await
             .map_err(FunctionError::db("committing the function delete"))?;
-        self.activator.unregister(key);
         if let Some(digest) = &function.wasm_digest {
             self.collect_module(digest).await;
         }
-        info!(function_id = function.id, project_id, "function deleted");
-        Ok(function)
+        Ok(())
+    }
+
+    /// Retire and remove every function of `project_id`, before the
+    /// project's rows are deleted: the `functions` rows cascade with the
+    /// project, but their workloads, ingress endpoints, hostnames and
+    /// modules do not, and once the rows are gone nothing names them.
+    ///
+    /// Tries every function even when one fails, then reports each failure.
+    /// Returns how many functions were removed.
+    pub async fn retire_project_functions(&self, project_id: i32) -> Result<usize, FunctionError> {
+        // One project's functions: bounded by what an operator creates by
+        // hand, and read once per project deletion.
+        let rows = functions::Entity::find()
+            .filter(functions::Column::ProjectId.eq(project_id))
+            .order_by_asc(functions::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(FunctionError::db("listing the project's functions"))?;
+        let total = rows.len();
+        let mut failures = Vec::new();
+        for function in &rows {
+            match self.delete_function(function).await {
+                Ok(()) => info!(
+                    function_id = function.id,
+                    project_id, "function deleted with its project"
+                ),
+                Err(error) => {
+                    warn!(
+                        function_id = function.id,
+                        project_id,
+                        "retiring a function of a project being deleted failed: {error}"
+                    );
+                    failures.push(format!("function {}: {error}", function.id));
+                }
+            }
+        }
+        if failures.is_empty() {
+            return Ok(total);
+        }
+        Err(FunctionError::ProjectFunctionsNotRetired {
+            project_id,
+            failed: failures.len(),
+            total,
+            reasons: failures.join("; "),
+        })
     }
 
     /// Start the function now (the console's "wake" button), through the
@@ -953,7 +1146,11 @@ impl FunctionService {
     /// reads every function row, which is O(functions) once, never per
     /// request.
     pub async fn load_into_activator(&self) -> Result<usize, FunctionError> {
+        // Functions of a project being deleted stay unrouted: the deletion
+        // retired them, or a retried one will.
         let rows = functions::Entity::find()
+            .join(JoinType::InnerJoin, functions::Relation::Project.def())
+            .filter(projects::Column::IsDeleted.eq(false))
             .filter(functions::Column::WorkloadId.is_not_null())
             .all(self.db.as_ref())
             .await
@@ -969,6 +1166,32 @@ impl FunctionService {
                 .map(|function| (function.hostname.clone(), function.id)),
         );
         Ok(rows.len())
+    }
+}
+
+/// Project deletion retires the project's functions before its rows (and
+/// with them the `functions` rows) are deleted. A failure fails the
+/// deletion, leaving the project fenced for a retry: letting the rows
+/// cascade instead would leave the function's workload running and its
+/// hostname served, with nothing left that names them.
+#[async_trait]
+impl temps_core::ProjectDeletionHook for FunctionService {
+    fn name(&self) -> &'static str {
+        "functions"
+    }
+
+    async fn project_deletion_started(
+        &self,
+        project_id: i32,
+    ) -> Result<(), temps_core::ProjectDeletionHookError> {
+        self.retire_project_functions(project_id)
+            .await
+            .map(|_| ())
+            .map_err(|error| temps_core::ProjectDeletionHookError {
+                hook: "functions".to_string(),
+                project_id,
+                reason: error.to_string(),
+            })
     }
 }
 
@@ -1311,15 +1534,26 @@ mod wasm_end_to_end {
         (status, body)
     }
 
-    #[tokio::test]
-    async fn a_wasm_function_is_created_woken_once_served_slept_and_deleted() {
+    struct Fixture {
+        _test_db: TestDatabase,
+        db: Arc<DatabaseConnection>,
+        project: projects::Model,
+        activator: Arc<Activator>,
+        service: Arc<FunctionService>,
+        artifacts: tempfile::TempDir,
+    }
+
+    /// A migrated database with one project, the real WASM driver behind a
+    /// plane, an activator with the function backend, and the service.
+    /// `None` (the test skips) without Docker.
+    async fn fixture() -> Option<Fixture> {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 let text = format!("{error:#}");
                 if is_container_runtime_unavailable(&text) {
                     println!("Docker not available, skipping: {text}");
-                    return;
+                    return None;
                 }
                 panic!("test database could not be created: {text}");
             }
@@ -1362,16 +1596,34 @@ mod wasm_end_to_end {
             Arc::new(crate::backend::FunctionActivationBackend::new(
                 db.clone(),
                 shared.clone(),
+                &activator,
             )),
         );
         let artifacts = tempfile::tempdir().expect("tempdir");
-        let service = FunctionService::new(
+        let service = Arc::new(FunctionService::new(
             db.clone(),
             shared,
             activator.clone(),
             artifacts.path().to_path_buf(),
             Arc::new(FixedDomain),
-        );
+        ));
+        Some(Fixture {
+            _test_db: test_db,
+            db,
+            project,
+            activator,
+            service,
+            artifacts,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_wasm_function_is_created_woken_once_served_slept_and_deleted() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let (project, activator, service, artifacts) =
+            (&fx.project, &fx.activator, &fx.service, &fx.artifacts);
         assert!(service.capability().wasm.available);
 
         let created = service
@@ -1446,5 +1698,272 @@ mod wasm_end_to_end {
             service.get(project.id, function.id).await,
             Err(FunctionError::NotFound { .. })
         ));
+    }
+
+    async fn create_hello(fx: &Fixture, name: &str) -> functions::Model {
+        fx.service
+            .create(
+                fx.project.id,
+                CreateFunction {
+                    name: name.to_string(),
+                    artifact: FunctionArtifact::Wasm {
+                        module: hello_module(),
+                    },
+                    port: None,
+                    idle_timeout_seconds: Some(60),
+                    wake_timeout_seconds: None,
+                    memory_limit_mb: None,
+                },
+            )
+            .await
+            .expect("created")
+    }
+
+    async fn endpoints_of(fx: &Fixture, function_id: i64) -> u64 {
+        ingress_endpoints::Entity::find()
+            .filter(ingress_endpoints::Column::OwnerKind.eq(FUNCTION_OWNER_KIND))
+            .filter(ingress_endpoints::Column::OwnerId.eq(function_id))
+            .count(fx.db.as_ref())
+            .await
+            .expect("endpoints counted")
+    }
+
+    async fn workload_deleted(fx: &Fixture, workload_id: i64) -> bool {
+        workloads::Entity::find_by_id(workload_id)
+            .one(fx.db.as_ref())
+            .await
+            .expect("workload read")
+            .is_none_or(|row| row.deleted_at.is_some())
+    }
+
+    /// Project deletion used to cascade the `functions` rows away and leave
+    /// an awake function's workload, endpoint and hostname behind, still
+    /// served from the activator's cached address. The project deletion
+    /// hook retires them before the rows go.
+    #[tokio::test]
+    async fn deleting_a_project_retires_its_awake_function() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let function = create_hello(&fx, "hello").await;
+        let workload_id = function.workload_id.expect("a workload");
+        let key = activation_key(function.id);
+        let woken = fx.activator.activate(key).await.expect("woken");
+        assert_eq!(fx.activator.state(key), Some(ActivationState::Awake));
+        let (status, _) = get(&woken.address.expect("an address")).await;
+        assert_eq!(status, 200);
+        assert_eq!(endpoints_of(&fx, function.id).await, 1);
+        let blob = blob_path(
+            fx.artifacts.path(),
+            function.wasm_digest.as_deref().expect("a digest"),
+        );
+
+        let hooks = temps_core::ProjectDeletionHooks::new();
+        hooks.add(fx.service.clone());
+        hooks.run(fx.project.id).await.expect("functions retired");
+
+        assert!(
+            fx.activator.key_for_host(&function.hostname).is_none(),
+            "the hostname is no longer routed"
+        );
+        assert!(!fx.activator.is_registered(key));
+        assert!(
+            workload_deleted(&fx, workload_id).await,
+            "the workload is deleted"
+        );
+        assert_eq!(endpoints_of(&fx, function.id).await, 0, "endpoint removed");
+        assert!(!blob.exists(), "the unused module is removed");
+        assert!(matches!(
+            fx.service.get(fx.project.id, function.id).await,
+            Err(FunctionError::NotFound { .. })
+        ));
+
+        // Idempotent: a retried deletion runs the hook again.
+        hooks
+            .run(fx.project.id)
+            .await
+            .expect("nothing left to retire");
+    }
+
+    /// Defense in depth: a function whose row is gone while it is awake (a
+    /// cascade nobody retired it before) is retired by the idle sweep
+    /// instead of failing every sweep forever.
+    #[tokio::test]
+    async fn the_sweep_retires_an_awake_function_whose_row_is_gone() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let function = create_hello(&fx, "hello").await;
+        let workload_id = function.workload_id.expect("a workload");
+        let key = activation_key(function.id);
+        fx.activator.activate(key).await.expect("woken");
+
+        // The project's rows go without the hook: the function row cascades.
+        projects::Entity::delete_by_id(fx.project.id)
+            .exec(fx.db.as_ref())
+            .await
+            .expect("project deleted");
+
+        let swept = fx
+            .activator
+            .sweep_at(fx.activator.last_activity(key).expect("touched") + 61)
+            .await;
+        assert_eq!(swept.slept, vec![key], "{swept:?}");
+        assert!(swept.failed.is_empty());
+        assert!(fx.activator.key_for_host(&function.hostname).is_none());
+        assert!(!fx.activator.is_registered(key));
+        assert!(workload_deleted(&fx, workload_id).await);
+        assert_eq!(endpoints_of(&fx, function.id).await, 0);
+    }
+
+    /// A delete's module collection used to count zero rows for a digest
+    /// while a create of the same module had stored the file but not yet
+    /// committed its row, and remove the file under it. Collection now
+    /// waits for the lock a create holds from storing the module until its
+    /// row is committed, and then sees the row.
+    #[tokio::test]
+    async fn module_collection_waits_for_a_create_holding_the_module_lock() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let module = hello_module();
+        let digest = digest_of(&module);
+
+        // A create, part-way: lock taken, module stored, row not committed.
+        let txn = fx.db.begin().await.expect("begin");
+        lock_module(&txn, &digest).await.expect("locked");
+        let (_, path) = fx.service.store_module(&module).await.expect("stored");
+
+        // A concurrent delete of the digest's last other user collects it.
+        let collecting = {
+            let service = fx.service.clone();
+            let digest = digest.clone();
+            tokio::spawn(async move { service.try_collect_module(&digest).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !collecting.is_finished(),
+            "the collection waits for the create's lock"
+        );
+        assert!(path.exists());
+
+        let now = Utc::now();
+        functions::ActiveModel {
+            project_id: Set(fx.project.id),
+            name: Set("racer".to_string()),
+            artifact_kind: Set("wasm".to_string()),
+            image_reference: Set(None),
+            wasm_digest: Set(Some(digest.clone())),
+            wasm_size_bytes: Set(i64::try_from(module.len()).ok()),
+            port: Set(i32::from(DEFAULT_PORT)),
+            idle_timeout_seconds: Set(DEFAULT_IDLE_TIMEOUT_SECS),
+            wake_timeout_seconds: Set(DEFAULT_WAKE_TIMEOUT_SECS),
+            memory_limit_mb: Set(None),
+            hostname: Set("fn-racer-shop.fn.example.test".to_string()),
+            workload_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await
+        .expect("row inserted");
+        txn.commit().await.expect("committed");
+
+        let removed = collecting
+            .await
+            .expect("the collection task finished")
+            .expect("collected");
+        assert!(!removed, "the create's committed row keeps the module");
+        assert!(path.exists(), "the new function's module survives");
+
+        // With its last user gone, the module is collected.
+        functions::Entity::delete_many()
+            .filter(functions::Column::WasmDigest.eq(digest.clone()))
+            .exec(fx.db.as_ref())
+            .await
+            .expect("rows deleted");
+        assert!(fx.service.try_collect_module(&digest).await.expect("ok"));
+        assert!(!path.exists());
+    }
+
+    /// The real create path takes the same lock: while a collection holds
+    /// it, a create of that module waits instead of storing a file the
+    /// collection could then remove.
+    #[tokio::test]
+    async fn create_waits_for_a_collection_holding_the_module_lock() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let digest = digest_of(&hello_module());
+        let txn = fx.db.begin().await.expect("begin");
+        lock_module(&txn, &digest).await.expect("locked");
+
+        let creating = {
+            let service = fx.service.clone();
+            let project_id = fx.project.id;
+            tokio::spawn(async move {
+                service
+                    .create(
+                        project_id,
+                        CreateFunction {
+                            name: "late".to_string(),
+                            artifact: FunctionArtifact::Wasm {
+                                module: hello_module(),
+                            },
+                            port: None,
+                            idle_timeout_seconds: None,
+                            wake_timeout_seconds: None,
+                            memory_limit_mb: None,
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!creating.is_finished(), "the create waits for the lock");
+        let path = blob_path(fx.artifacts.path(), &digest);
+        assert!(!path.exists(), "nothing is stored while the lock is held");
+        txn.commit().await.expect("released");
+
+        let function = creating
+            .await
+            .expect("the create task finished")
+            .expect("created");
+        assert_eq!(function.wasm_digest.as_deref(), Some(digest.as_str()));
+        assert!(path.exists());
+    }
+
+    /// A function cannot be created in a project that is being deleted: its
+    /// functions were already retired, so a new one would outlive it.
+    #[tokio::test]
+    async fn create_in_a_project_being_deleted_is_refused() {
+        let Some(fx) = fixture().await else {
+            return;
+        };
+        let mut fenced: projects::ActiveModel = fx.project.clone().into();
+        fenced.is_deleted = Set(true);
+        fenced.update(fx.db.as_ref()).await.expect("fenced");
+        let error = fx
+            .service
+            .create(
+                fx.project.id,
+                CreateFunction {
+                    name: "late".to_string(),
+                    artifact: FunctionArtifact::Wasm {
+                        module: hello_module(),
+                    },
+                    port: None,
+                    idle_timeout_seconds: None,
+                    wake_timeout_seconds: None,
+                    memory_limit_mb: None,
+                },
+            )
+            .await
+            .expect_err("refused");
+        assert!(
+            matches!(error, FunctionError::ProjectNotFound { project_id } if project_id == fx.project.id),
+            "{error}"
+        );
     }
 }

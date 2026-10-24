@@ -742,7 +742,16 @@ impl PublicUrlBase {
 
 #[async_trait::async_trait]
 impl temps_core::ProjectDeletionHook for PublicStatusPageService {
-    async fn project_deletion_started(&self, project_id: i32) {
+    fn name(&self) -> &'static str {
+        "status-pages"
+    }
+
+    /// Never fails the deletion: what it cannot release here is deleted with
+    /// the project's rows.
+    async fn project_deletion_started(
+        &self,
+        project_id: i32,
+    ) -> Result<(), temps_core::ProjectDeletionHookError> {
         self.remove_project_pages(project_id).await;
         match super::domains::release_project_certificates(self.db.as_ref(), project_id).await {
             Ok(released) if released > 0 => info!(
@@ -760,6 +769,7 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
             project_id,
             "stopped serving status pages of a project being deleted"
         );
+        Ok(())
     }
 }
 

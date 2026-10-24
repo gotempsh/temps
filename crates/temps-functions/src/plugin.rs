@@ -18,7 +18,7 @@ use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, RequiredService, ServiceRegistrationContext,
     TempsPlugin,
 };
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectDeletionHooks};
 use temps_workload_activator::{ActivationKind, Activator};
 use temps_workload_plane::SharedPlane;
 use tracing::{debug, info, warn};
@@ -69,15 +69,23 @@ impl TempsPlugin for FunctionsPlugin {
             let artifacts_dir = config.data_dir().join("functions");
             activator.set_backend(
                 ActivationKind::Function,
-                Arc::new(FunctionActivationBackend::new(db.clone(), plane.clone())),
+                Arc::new(FunctionActivationBackend::new(
+                    db.clone(),
+                    plane.clone(),
+                    &activator,
+                )),
             );
-            context.register_service(Arc::new(FunctionService::new(
+            let service = Arc::new(FunctionService::new(
                 db,
                 plane,
                 activator,
                 artifacts_dir,
                 Arc::new(SettingsDomain::new(config)),
-            )));
+            ));
+            context.register_service(service.clone());
+            // A project's functions are retired before its rows (and the
+            // cascading `functions` rows) are deleted.
+            ProjectDeletionHooks::get_or_register(context).add(service);
             debug!("Functions plugin services registered");
             Ok(())
         })

@@ -64,6 +64,10 @@ impl TempsPlugin for ProjectsPlugin {
             ));
             context.register_service(project_service);
 
+            // The list other plugins add their project deletion hooks to;
+            // whichever plugin registers first creates it.
+            temps_core::ProjectDeletionHooks::get_or_register(context);
+
             // Create CustomDomainService
             let custom_domain_service = Arc::new(CustomDomainService::new(db.clone()));
             context.register_service(custom_domain_service);
@@ -129,7 +133,9 @@ impl TempsPlugin for ProjectsPlugin {
             telemetry,
             project_access_checker,
             sensitive_action_authorizer,
-            project_deletion_hook: context.get_service::<dyn temps_core::ProjectDeletionHook>(),
+            // Registered (possibly empty) by `register_services`, so always
+            // present; plugins add their hooks to the same list.
+            project_deletion_hooks: context.require_service::<temps_core::ProjectDeletionHooks>(),
         });
         let routes = crate::handlers::configure_routes()
             .with_state(app_state)

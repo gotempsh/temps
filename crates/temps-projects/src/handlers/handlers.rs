@@ -1748,11 +1748,29 @@ async fn run_project_teardown(
             Problem::from(error)
         })?;
 
-    // Stop serving anything public for this project now: if cleanup below
-    // fails, the project stays fenced but `ProjectDeleted` is never emitted.
-    if let Some(hook) = &state.project_deletion_hook {
-        hook.project_deletion_started(id).await;
-    }
+    // Stop serving anything public for this project now, and retire what
+    // features run for it outside the deployment pipeline (functions): if
+    // cleanup below fails, the project stays fenced but `ProjectDeleted` is
+    // never emitted. A failing hook fails the deletion rather than letting
+    // the row delete cascade away the records it still needs to finish
+    // (a function's row is what names its workload and hostname); every
+    // hook is idempotent, so a retried delete runs them all again.
+    state
+        .project_deletion_hooks
+        .run(id)
+        .await
+        .map_err(|error| {
+            error!(
+                project_id = id,
+                %error,
+                "Project deletion hooks failed; project stays fenced, retry the delete to finish it"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Deletion Cleanup Failed")
+                .with_detail(format!(
+                    "{error}. Project {id} stays marked deleted; retry the delete to finish it."
+                ))
+        })?;
 
     state
         .deployment_canceller
@@ -5173,6 +5191,43 @@ mod tests {
                 "`{step}` must run inside run_project_teardown, not in the request future"
             );
         }
+    }
+
+    /// Project hooks (functions retiring their workloads, status pages going
+    /// down) must run before the rows are deleted, because the row delete
+    /// cascades away the records that say what to retire; and a failing hook
+    /// must stop the teardown instead of being skipped.
+    #[test]
+    fn teardown_runs_deletion_hooks_before_deleting_rows_and_stops_on_failure() {
+        let source = include_str!("handlers.rs");
+        let start = source
+            .find("async fn run_project_teardown(")
+            .expect("run_project_teardown exists");
+        let tail = &source[start..];
+        let end = tail
+            .find("pub async fn delete_project(")
+            .expect("end of run_project_teardown");
+        let teardown = &tail[..end];
+
+        let fence = teardown
+            .find("begin_project_deletion")
+            .expect("the teardown fences the project");
+        let hooks = teardown
+            .find(".project_deletion_hooks")
+            .expect("the teardown runs the project deletion hooks");
+        let rows = teardown
+            .find(".delete_project(")
+            .expect("the teardown deletes the project rows");
+        assert!(fence < hooks, "hooks run after the fence commits");
+        assert!(hooks < rows, "hooks run before the rows are deleted");
+        let hook_call = &teardown[hooks..rows];
+        let propagated = hook_call
+            .find("})?;")
+            .expect("a failing hook is propagated with `?`");
+        assert!(
+            hook_call[..propagated].contains(".run(id)"),
+            "the hook result is what is propagated"
+        );
     }
 
     #[tokio::test]
