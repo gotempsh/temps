@@ -488,29 +488,37 @@ impl NodeEnforcer {
         let mut identities = IdentityMap::new();
         let mut local = BTreeSet::new();
         let mut owned: Vec<(WorkloadRef, &ObservedContainer)> = Vec::new();
+        // Every address a container on this node holds, with the workload
+        // it is an instance of (`None` when unidentified).
+        let mut local_holders: HashMap<IpAddr, Option<WorkloadRef>> = HashMap::new();
         for container in &containers {
-            let Some(workload) = identify(container, &snapshot.container_names) else {
+            let workload = identify(container, &snapshot.container_names);
+            for addr in container_addresses(container) {
+                local_holders
+                    .entry(addr)
+                    .and_modify(|holder| {
+                        if *holder != workload {
+                            // Two different holders: owned by neither.
+                            *holder = None;
+                        }
+                    })
+                    .or_insert(workload);
+            }
+            let Some(workload) = workload else {
                 continue;
             };
             local.insert(workload);
-            for endpoint in &container.endpoints {
-                if let Some(v4) = endpoint.ipv4 {
-                    identities.insert(workload, IpAddr::V4(v4));
-                }
-                if let Some(v6) = endpoint.ipv6 {
-                    identities.insert(workload, IpAddr::V6(v6));
-                }
+            for addr in container_addresses(container) {
+                identities.insert(workload, addr);
             }
             owned.push((workload, container));
         }
-        for workload in snapshot.remote.workloads() {
-            if local.contains(workload) {
-                continue;
-            }
-            for addr in snapshot.remote.addresses(workload) {
-                identities.insert(*workload, addr);
-            }
-        }
+        merge_remote(
+            &self.node,
+            &mut identities,
+            &snapshot.remote,
+            &local_holders,
+        );
 
         let mut system_peers = snapshot.system_peers.clone();
         for container in &containers {
@@ -675,6 +683,57 @@ impl NodeEnforcer {
                 Ok(outcome) => debug!(node = %self.node, ?outcome, "network policy pass"),
                 Err(e) => warn!(node = %self.node, error = %e, "network policy pass failed"),
             }
+        }
+    }
+}
+
+/// The IPv4 and IPv6 addresses of every endpoint of a container.
+fn container_addresses(container: &ObservedContainer) -> impl Iterator<Item = IpAddr> + '_ {
+    container.endpoints.iter().flat_map(|endpoint| {
+        endpoint
+            .ipv4
+            .map(IpAddr::V4)
+            .into_iter()
+            .chain(endpoint.ipv6.map(IpAddr::V6))
+    })
+}
+
+/// Adds the worker-hosted addresses the control plane recorded to the
+/// identities observed on this node.
+///
+/// A workload may run both here and elsewhere (a database cluster with a
+/// local monitor and data members on workers), so every remote address is
+/// kept whether or not the workload also has a local instance: a peer set
+/// must hold all of a workload's instances, or an allow misses the remote
+/// members and a deny lets them through.
+///
+/// What this node observes is authoritative for the addresses it holds,
+/// though. A remote record naming an address that a local container of a
+/// *different* workload (or an unidentified one) holds is stale or
+/// colliding; merging it would hand that local container the remote
+/// workload's identity, so it is skipped. A record repeating the address of
+/// a local instance of the same workload is harmless (sets deduplicate).
+fn merge_remote(
+    node: &str,
+    identities: &mut IdentityMap,
+    remote: &IdentityMap,
+    local_holders: &HashMap<IpAddr, Option<WorkloadRef>>,
+) {
+    for workload in remote.workloads() {
+        for addr in remote.addresses(workload) {
+            if let Some(holder) = local_holders.get(&addr) {
+                if holder.as_ref() != Some(workload) {
+                    debug!(
+                        node = %node,
+                        remote_workload = %workload,
+                        local_holder = ?holder,
+                        %addr,
+                        "remote address is held by another container on this node; skipped"
+                    );
+                    continue;
+                }
+            }
+            identities.insert(*workload, addr);
         }
     }
 }
@@ -1105,6 +1164,100 @@ mod tests {
             applied[0].contains("172.20.5.42"),
             "the remote service's address backs the link allow: {}",
             applied[0]
+        );
+    }
+
+    /// The elements line of an nft set in a ruleset, e.g.
+    /// `elements = { 10.0.0.1, 10.0.0.2 }`.
+    fn set_elements(ruleset: &str, set: &str) -> String {
+        let header = format!("set {set} {{");
+        let start = ruleset
+            .find(&header)
+            .unwrap_or_else(|| panic!("set {set} missing:\n{ruleset}"));
+        let rest = &ruleset[start..];
+        let end = rest.find("\t}").unwrap_or(rest.len());
+        rest[..end]
+            .lines()
+            .find(|l| l.contains("elements"))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_service_with_local_and_remote_members_is_matched_at_every_member() {
+        // service/5 has a local member (app-2, 10.237.1.3) and a data member
+        // on a worker the control plane recorded at 172.20.5.42.
+        let mut h = harness(NodeMode::Enforce);
+        let mut snapshot = h.policies.snapshot().await.unwrap();
+        snapshot.remote = IdentityMap::new().with(service(5), "172.20.5.42".parse().unwrap());
+        // A second local sandbox with an open egress profile denies service/5.
+        snapshot.policies.push(WorkloadPolicy {
+            subject: sandbox(2),
+            egress: Profile::Open,
+            ingress: Profile::Open,
+            rules: vec![Rule {
+                id: 2,
+                direction: Direction::Egress,
+                peer: Peer::Workload(service(5)),
+                ports: None,
+                protocol: L4Protocol::Any,
+                action: Action::Deny,
+                origin: Origin::Operator,
+            }],
+        });
+        if let Ok(mut containers) = h.instances.containers.lock() {
+            containers.push(container(
+                4,
+                &[(labels::KIND, "sandbox"), (labels::OWNER_ID, "2")],
+                "10.237.1.5",
+            ));
+        }
+        h.policies.set_snapshot(snapshot);
+        assert!(matches!(
+            h.enforcer.reconcile().await.unwrap(),
+            PassOutcome::Applied(_)
+        ));
+        let applied = h.executor.applied.lock().await;
+        let ruleset = &applied[0];
+        assert_eq!(
+            set_elements(ruleset, "w_service_5_v4"),
+            "elements = { 10.237.1.3, 172.20.5.42 }",
+            "both the local and the remote member are in the peer set:\n{ruleset}"
+        );
+        // The restricted client's allow and the open profile's deny both
+        // match through that set.
+        assert!(
+            ruleset.contains("ip daddr @w_service_5_v4 tcp dport 5432 return"),
+            "{ruleset}"
+        );
+        assert!(
+            ruleset.contains("ip daddr @w_service_5_v4 counter reject"),
+            "{ruleset}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_record_for_an_address_another_local_container_holds_is_ignored() {
+        let mut h = harness(NodeMode::Enforce);
+        let mut snapshot = h.policies.snapshot().await.unwrap();
+        // 10.237.1.2 is sandbox/1 on this node: a record claiming it for
+        // service/5 is stale and must not hand sandbox/1 that identity.
+        // 10.237.1.3 repeats service/5's own local member and is kept.
+        snapshot.remote = IdentityMap::new()
+            .with(service(5), "10.237.1.2".parse().unwrap())
+            .with(service(5), "10.237.1.3".parse().unwrap())
+            .with(service(5), "172.20.5.42".parse().unwrap());
+        let plan = h.enforcer.plan(&snapshot).await.unwrap();
+        let addrs: Vec<String> = plan
+            .identities
+            .addresses(&service(5))
+            .map(|a| a.to_string())
+            .collect();
+        assert_eq!(addrs, ["10.237.1.3", "172.20.5.42"]);
+        assert_eq!(
+            plan.identities.owner_of("10.237.1.2".parse().unwrap()),
+            Some(sandbox(1))
         );
     }
 

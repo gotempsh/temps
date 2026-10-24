@@ -16,6 +16,7 @@ pub mod internal_proxy;
 pub mod network_sync;
 pub mod node_runtime;
 mod output_buffer;
+mod overlay_driver;
 pub mod public_ingress;
 pub mod route_store;
 pub mod route_sync_client;
