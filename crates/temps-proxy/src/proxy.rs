@@ -1075,6 +1075,9 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The previewed sandbox runs on a worker node: `upstream_peer` sends the
+    /// request to this process's worker preview relay instead of the gateway.
+    pub preview_on_worker: bool,
     /// The admin gate denied this request, so `upstream_peer` must send it to
     /// the listener that serves only the console's public routes (ADR-051)
     /// instead of resolving a peer. A non-allowlisted client can therefore
@@ -5369,6 +5372,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             public_surface_only: false,
             status_page_host: false,
@@ -6048,6 +6052,8 @@ impl ProxyHttp for LoadBalancer {
                             port = host.port,
                             "preview-auth: allowed"
                         );
+                        ctx.preview_on_worker =
+                            self.sandbox_lookup_cache.on_worker(&host.hex).await;
                         ctx.preview_route = Some(host);
                         ctx.routing_status = "preview".to_string();
 
@@ -6056,9 +6062,19 @@ impl ProxyHttp for LoadBalancer {
                         // secrets that happen to be present.
                         let _ = session.req_header_mut().remove_header("authorization");
 
-                        // Inject the shared secret so the gateway accepts us.
-                        // Read at request time to allow live rotation.
-                        if let Ok(secret) = std::env::var("PREVIEW_GATEWAY_SHARED_SECRET") {
+                        // Inject the token of whichever peer serves the
+                        // sandbox, so it accepts us: the worker preview
+                        // relay's, or the gateway's shared secret, read at
+                        // request time to allow live rotation.
+                        if ctx.preview_on_worker {
+                            if let Some(relay) =
+                                temps_core::sandbox_preview_relay::worker_preview_relay()
+                            {
+                                session
+                                    .req_header_mut()
+                                    .insert_header("X-Temps-Preview-Token", &relay.token)?;
+                            }
+                        } else if let Ok(secret) = std::env::var("PREVIEW_GATEWAY_SHARED_SECRET") {
                             if !secret.is_empty() {
                                 session
                                     .req_header_mut()
@@ -8379,7 +8395,21 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let gateway_peer = preview_gateway_peer();
+            let gateway_peer = if ctx.preview_on_worker {
+                // A sandbox on a worker is reached through the relay the
+                // sandbox plugin runs in the console process; a proxy
+                // running on its own has none.
+                let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() else {
+                    return Err(Error::explain(
+                        pingora_core::ErrorType::ConnectNoRoute,
+                        "this sandbox runs on a worker node, and its previews are relayed by \
+                         the console process; this proxy runs without one",
+                    ));
+                };
+                relay.address.to_string()
+            } else {
+                preview_gateway_peer()
+            };
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_request_group_key(host, &ctx.request_id);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
@@ -9242,6 +9272,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             public_surface_only: false,
             status_page_host: false,
@@ -9781,6 +9812,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             public_surface_only: false,
             status_page_host: false,

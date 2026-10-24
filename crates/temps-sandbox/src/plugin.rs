@@ -344,6 +344,22 @@ impl TempsPlugin for SandboxPlugin {
                 sweeper.run().await;
             });
 
+            // Preview URLs of sandboxes on worker nodes: the proxy hands them
+            // to this relay, which reaches the sandbox through its worker.
+            let relay = Arc::new(
+                crate::services::worker_preview_relay::WorkerPreviewRelayServer::new(
+                    db.clone(),
+                    registry.clone(),
+                ),
+            );
+            if let Err(error) = relay.start().await {
+                tracing::error!(
+                    %error,
+                    "Could not start the worker sandbox preview relay; previews of sandboxes on \
+                     worker nodes will answer 502 until the server restarts"
+                );
+            }
+
             Ok(())
         })
     }

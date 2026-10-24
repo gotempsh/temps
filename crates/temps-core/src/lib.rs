@@ -56,6 +56,7 @@ pub mod docker_socket_grant;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod sandbox_preview_relay;
 pub mod sandbox_runtime;
 pub mod secret_string;
 pub mod secrets_manager;

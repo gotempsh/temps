@@ -771,23 +771,17 @@ impl SandboxResponse {
             .strip_prefix("sbx_")
             .unwrap_or(&s.public_id)
             .to_string();
-        // Preview URLs only route to control-plane sandboxes today; a worker
-        // sandbox advertising one would hand out a URL that never answers
-        // (ADR-048 phase 2). Clients read the empty template as "no preview".
-        let (template, routes) = if s.node_id.is_some() {
-            (String::new(), Vec::new())
-        } else {
-            let routes = s
-                .ports
-                .iter()
-                .map(|port| SandboxRoute {
-                    url: parts.url_for(&s.public_id, *port),
-                    subdomain: format!("ws-{}-{}", label, port),
-                    port: *port as u32,
-                })
-                .collect();
-            (template, routes)
-        };
+        // Worker sandboxes are served too: the proxy relays their previews
+        // through the worker's agent.
+        let routes = s
+            .ports
+            .iter()
+            .map(|port| SandboxRoute {
+                url: parts.url_for(&s.public_id, *port),
+                subdomain: format!("ws-{}-{}", label, port),
+                port: *port as u32,
+            })
+            .collect();
         Self {
             sandbox: SandboxInner {
                 id: s.public_id,

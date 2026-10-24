@@ -18,6 +18,7 @@ pub mod row_status;
 pub mod sandbox_service;
 pub mod service_manager;
 pub mod snapshot_service;
+pub mod worker_preview_relay;
 
 pub use exec::{ExecOptions, ExecResult};
 pub use expiration_sweeper::SandboxExpirationSweeper;

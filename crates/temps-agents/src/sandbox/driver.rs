@@ -887,6 +887,23 @@ impl SandboxExt for SandboxBackendDriver {
         ))
     }
 
+    async fn connect_port(
+        &self,
+        handle: &InstanceHandle,
+        port: u16,
+    ) -> Result<ByteChannel, DriverError> {
+        let attachment = self
+            .provider
+            .connect_port(&self.handle(handle), port)
+            .await
+            .map_err(|e| self.fail("connect_port", &handle.name, e))?;
+        Ok(pty_channel(
+            attachment,
+            self.capabilities.name.clone(),
+            handle.name.clone(),
+        ))
+    }
+
     async fn check_agent_runtime(
         &self,
         handle: &InstanceHandle,

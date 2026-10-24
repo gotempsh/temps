@@ -278,6 +278,14 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).attach_pty(handle).await
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<super::PtyAttachment, AgentError> {
+        self.owner_of(handle).connect_port(handle, port).await
+    }
+
     async fn resize_disk(
         &self,
         handle: &SandboxHandle,

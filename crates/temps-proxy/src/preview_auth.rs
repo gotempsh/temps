@@ -559,6 +559,15 @@ pub async fn lookup_sandbox(
     db: &Arc<DbConnection>,
     public_id_suffix: &str,
 ) -> PreviewSandboxLookup {
+    lookup_placed_sandbox(db, public_id_suffix).await.0
+}
+
+/// [`lookup_sandbox`], plus whether the sandbox runs on a worker node: its
+/// previews then go to the worker preview relay instead of the gateway.
+pub async fn lookup_placed_sandbox(
+    db: &Arc<DbConnection>,
+    public_id_suffix: &str,
+) -> (PreviewSandboxLookup, bool) {
     use sea_orm::{ColumnTrait, QueryFilter};
     use temps_entities::sandboxes;
 
@@ -569,26 +578,17 @@ pub async fn lookup_sandbox(
         .one(db.as_ref())
         .await
     {
-        Ok(Some(row)) if row.status == "destroyed" => PreviewSandboxLookup::NotFound,
-        // Sandboxes on worker nodes (ADR-048) have no preview routing: the
-        // gateway can only reach control-plane containers. Answer exactly
-        // like an unknown sandbox rather than asking for a password that
-        // could never lead anywhere.
-        Ok(Some(row)) if row.node_id.is_some() => {
-            debug!(
-                public_id = %full_public_id,
-                node_id = ?row.node_id,
-                "preview-auth: sandbox runs on a worker node, which has no preview routing"
-            );
-            PreviewSandboxLookup::NotFound
+        Ok(Some(row)) if row.status == "destroyed" => (PreviewSandboxLookup::NotFound, false),
+        Ok(Some(row)) => {
+            let on_worker = row.node_id.is_some();
+            (preview_lookup_for(row), on_worker)
         }
-        Ok(Some(row)) => preview_lookup_for(row),
         Ok(None) => {
             debug!(
                 public_id = %full_public_id,
                 "preview-auth: sandbox not found"
             );
-            PreviewSandboxLookup::NotFound
+            (PreviewSandboxLookup::NotFound, false)
         }
         Err(e) => {
             warn!(
@@ -596,12 +596,12 @@ pub async fn lookup_sandbox(
                 error = %e,
                 "preview-auth: failed to load sandbox"
             );
-            PreviewSandboxLookup::NotFound
+            (PreviewSandboxLookup::NotFound, false)
         }
     }
 }
 
-/// How a live, control-plane sandbox row is gated: the same decision as
+/// How a live sandbox row is gated: the same decision as
 /// its compiled endpoint ([`temps_routes::ingress::sandbox_endpoint`]). A
 /// preview password wins whatever the access setting; without one `legacy`
 /// and `public` leave the hostname as the gate and `temps_login` asks for
@@ -663,8 +663,9 @@ const SANDBOX_LOOKUP_CACHE_MAX_CAPACITY: u64 = 10_000;
 /// unaffected because the fingerprint in the cookie no longer matches.
 pub struct SandboxLookupCache {
     db: Arc<DbConnection>,
-    /// `sandbox_hex → PreviewSandboxLookup`. TTL 30 s, cap 10 k.
-    cache: Cache<String, PreviewSandboxLookup>,
+    /// `sandbox_hex → (PreviewSandboxLookup, runs on a worker)`. TTL 30 s,
+    /// cap 10 k.
+    cache: Cache<String, (PreviewSandboxLookup, bool)>,
 }
 
 impl SandboxLookupCache {
@@ -692,6 +693,16 @@ impl SandboxLookupCache {
     /// Both hit and miss results are cached so repeated requests for the same
     /// sandbox — including non-existent ones — never amplify into DB load.
     pub async fn lookup(&self, hex: &str) -> PreviewSandboxLookup {
+        self.lookup_placed(hex).await.0
+    }
+
+    /// Whether the sandbox runs on a worker node, from the same cache entry
+    /// [`Self::lookup`] filled while authenticating the request.
+    pub async fn on_worker(&self, hex: &str) -> bool {
+        self.lookup_placed(hex).await.1
+    }
+
+    async fn lookup_placed(&self, hex: &str) -> (PreviewSandboxLookup, bool) {
         let key = hex.to_string();
 
         // Fast path: previous lookup already resolved this hex.
@@ -701,10 +712,11 @@ impl SandboxLookupCache {
         }
 
         // Cache miss: query the database.
-        let result = lookup_sandbox(&self.db, hex).await;
+        let result = lookup_placed_sandbox(&self.db, hex).await;
         debug!(
             hex,
-            found = !matches!(result, PreviewSandboxLookup::NotFound),
+            found = !matches!(result.0, PreviewSandboxLookup::NotFound),
+            on_worker = result.1,
             "sandbox DB lookup; caching result"
         );
         self.cache.insert(key, result.clone()).await;
@@ -716,9 +728,9 @@ impl SandboxLookupCache {
     /// cached fingerprint check, so the normal authenticated hot path remains
     /// cache-only while freshly rotated/reconciled cookies work immediately.
     pub async fn lookup_fresh(&self, hex: &str) -> PreviewSandboxLookup {
-        let result = lookup_sandbox(&self.db, hex).await;
+        let result = lookup_placed_sandbox(&self.db, hex).await;
         self.cache.insert(hex.to_string(), result.clone()).await;
-        result
+        result.0
     }
 
     /// Validate a share-link grant and return the current password hash used
@@ -1348,10 +1360,11 @@ mod tests {
         );
     }
 
-    /// ADR-048: a sandbox on a worker node has no preview routing, so it
-    /// resolves exactly like an unknown sandbox, password or not.
+    /// A sandbox on a worker node is gated exactly like one on the control
+    /// plane, and the cache remembers where it runs so the proxy can hand
+    /// its previews to the worker relay.
     #[tokio::test]
-    async fn worker_node_sandboxes_resolve_as_not_found() {
+    async fn worker_node_sandboxes_are_gated_like_local_ones_and_marked() {
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
         let on_worker = |password: Option<&str>| sandboxes::Model {
             node_id: Some(3),
@@ -1363,23 +1376,31 @@ mod tests {
                     vec![on_worker(None)],
                     vec![on_worker(Some(hash))],
                     vec![sandbox_model("sbx_aabbccdd11223344", "running", None)],
+                    vec![on_worker(None)],
                 ])
                 .into_connection(),
         );
 
-        let open = lookup_sandbox(&db, "aabbccdd11223344").await;
+        let (open, open_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
+        assert!(matches!(open, PreviewSandboxLookup::Open), "{open:?}");
+        assert!(open_on_worker);
+        let (protected, protected_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
         assert!(
-            matches!(open, PreviewSandboxLookup::NotFound),
-            "an unprotected worker sandbox must not be Open: {open:?}"
+            matches!(protected, PreviewSandboxLookup::Protected { .. }),
+            "{protected:?}"
         );
-        let protected = lookup_sandbox(&db, "aabbccdd11223344").await;
-        assert!(
-            matches!(protected, PreviewSandboxLookup::NotFound),
-            "a protected worker sandbox must not ask for a password: {protected:?}"
-        );
-        // The same sandbox on the control plane is still served.
-        let local = lookup_sandbox(&db, "aabbccdd11223344").await;
+        assert!(protected_on_worker);
+        let (local, local_on_worker) = lookup_placed_sandbox(&db, "aabbccdd11223344").await;
         assert!(matches!(local, PreviewSandboxLookup::Open), "{local:?}");
+        assert!(!local_on_worker);
+
+        // Authentication and routing read one cache entry: one query.
+        let cache = SandboxLookupCache::new(db);
+        assert!(matches!(
+            cache.lookup("aabbccdd11223344").await,
+            PreviewSandboxLookup::Open
+        ));
+        assert!(cache.on_worker("aabbccdd11223344").await);
     }
 
     /// ADR-055 §11: `sandboxes.preview_access` decides a passwordless

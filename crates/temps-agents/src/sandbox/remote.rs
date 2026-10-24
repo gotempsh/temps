@@ -14,17 +14,12 @@
 //!
 //! Limits, each surfaced as an explicit
 //! [`AgentError::SandboxUnsupportedOnNode`] instead of a silent fallback.
-//! On a node whose sandbox driver mode is `legacy` (the default) or `shadow`:
-//! interactive terminals, the retained agent runtime, snapshots, disk resize,
-//! image identity, harness recovery, workspace volumes, the Firecracker
-//! backend and application networks are not available for sandboxes on
-//! worker nodes. In `enforce` (ADR-055 phase 6) the terminal and agent
-//! runtime travel over a byte-channel WebSocket, and disk resize, image
-//! identity, the runtime check and harness recovery are forwarded; the node's
-//! own driver then decides (a Docker node still cannot resize a disk).
-//! Snapshots and restore, workspace volumes, the Firecracker backend,
-//! application networks, the model/git/MCP relays and image rebuilds stay
-//! refused in every mode.
+//! The terminal, the agent runtime and preview ports travel over a
+//! byte-channel WebSocket; disk resize, image identity, the runtime check and
+//! harness recovery are forwarded, and the node's own driver then decides (a
+//! Docker node still cannot resize a disk). Snapshots and restore, workspace
+//! volumes, the Firecracker backend, application networks, the model/git/MCP
+//! relays and image rebuilds are refused.
 //!
 //! Exec output: an exec with a line callback (`exec_streamed`, and the other
 //! exec variants when given a callback) goes through
@@ -56,7 +51,6 @@ use super::{
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
-use temps_entities::sandbox_driver_mode::SandboxDriverMode;
 
 /// Name reported by [`RemoteSandboxProvider::name`].
 pub const REMOTE_PROVIDER_NAME: &str = "remote";
@@ -414,7 +408,7 @@ pub struct RemoteErrorBody {
     pub error: String,
 }
 
-// ── ADR-055 phase 6: operations forwarded for `enforce` nodes ───────────
+// ── ADR-055 phase 6: driver operations forwarded to the node ────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RemoteResizeDiskRequest {
@@ -475,6 +469,9 @@ pub enum RemoteByteChannel {
     Terminal,
     /// The retained agent runtime's daemon (`connect_agent_runtime`).
     AgentRuntime,
+    /// TCP `port` on the sandbox's loopback (`connect_port`): a preview URL
+    /// of a sandbox on this node, relayed by the control plane's ingress.
+    Port,
 }
 
 impl RemoteByteChannel {
@@ -482,6 +479,7 @@ impl RemoteByteChannel {
         match self {
             Self::Terminal => "terminal",
             Self::AgentRuntime => "agent_runtime",
+            Self::Port => "port",
         }
     }
 }
@@ -494,6 +492,10 @@ pub struct RemoteByteChannelQuery {
     /// Sandbox container name (`temps-sandbox-<label>`).
     pub sandbox: String,
     pub channel: RemoteByteChannel,
+    /// The sandbox port a `port` channel connects to; required for it and
+    /// ignored by the other channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 /// The one text frame a node sends on a byte channel: the guest side failed,
@@ -564,10 +566,6 @@ pub struct RemoteSandboxProvider {
     defaults: RemoteSandboxDefaults,
     /// See [`EXEC_STREAM_IDLE_TIMEOUT`]; shortened by tests.
     exec_stream_idle_timeout: Duration,
-    /// The node's sandbox driver mode (ADR-055 §6). Only `enforce` forwards
-    /// the driver operations the node serves since phase 6; `legacy` and
-    /// `shadow` keep refusing them here without calling the node.
-    driver_mode: SandboxDriverMode,
     /// TLS for byte-channel WebSockets: the same cluster CA and
     /// control-plane identity as `client`. `None` for `http://` agents
     /// (tests) — sandbox calls to a real node are always `https://`.
@@ -719,7 +717,6 @@ impl RemoteSandboxProvider {
             client,
             defaults: RemoteSandboxDefaults::default(),
             exec_stream_idle_timeout: EXEC_STREAM_IDLE_TIMEOUT,
-            driver_mode: SandboxDriverMode::Legacy,
             ws_connector: None,
         }
     }
@@ -729,41 +726,10 @@ impl RemoteSandboxProvider {
         self
     }
 
-    /// The node's sandbox driver mode; see [`Self::forwards`].
-    pub fn with_driver_mode(mut self, mode: SandboxDriverMode) -> Self {
-        self.driver_mode = mode;
-        self
-    }
-
     /// TLS for byte-channel WebSockets to an `https://` agent.
     pub fn with_ws_connector(mut self, connector: Option<tokio_tungstenite::Connector>) -> Self {
         self.ws_connector = connector;
         self
-    }
-
-    pub fn driver_mode(&self) -> SandboxDriverMode {
-        self.driver_mode
-    }
-
-    /// Whether `feature` is forwarded to the node, or refused here as it was
-    /// before ADR-055 phase 6. Only `enforce` forwards; in `shadow` the
-    /// refusal stands and what `enforce` would do is logged.
-    fn forwards(&self, sandbox: &str, feature: &str) -> Result<(), AgentError> {
-        match self.driver_mode {
-            SandboxDriverMode::Enforce => Ok(()),
-            SandboxDriverMode::Shadow => {
-                tracing::info!(
-                    node_id = self.node_id,
-                    node_name = %self.node_name,
-                    sandbox,
-                    feature,
-                    shadow_plan = "forward to the worker node",
-                    "sandbox driver shadow: enforce would forward this operation to the node"
-                );
-                Err(self.unsupported(sandbox, feature))
-            }
-            SandboxDriverMode::Legacy => Err(self.unsupported(sandbox, feature)),
-        }
     }
 
     /// Open a byte channel (terminal or agent runtime) through
@@ -774,6 +740,7 @@ impl RemoteSandboxProvider {
         &self,
         handle: &SandboxHandle,
         channel: RemoteByteChannel,
+        port: Option<u16>,
         operation: &'static str,
     ) -> Result<PtyAttachment, AgentError> {
         use futures::{SinkExt, StreamExt};
@@ -801,11 +768,14 @@ impl RemoteSandboxProvider {
                 "the node's agent address is not an http(s) URL ({operation})"
             )));
         };
-        let url = format!(
+        let mut url = format!(
             "{base}/agent/sandboxes/byte-channel?sandbox={}&channel={}",
             handle.sandbox_name,
             channel.as_str()
         );
+        if let Some(port) = port {
+            url.push_str(&format!("&port={port}"));
+        }
         let mut request = url.into_client_request().map_err(|e| {
             tracing::warn!(node_id = self.node_id, error = %e, "Invalid byte-channel URL");
             self.unavailable(format!("the node's agent address is invalid ({operation})"))
@@ -1527,10 +1497,6 @@ impl SandboxProvider for RemoteSandboxProvider {
     }
 
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
-        self.forwards(
-            &handle.sandbox_name,
-            "Runtime updates (immutable image identity)",
-        )?;
         let response: RemoteImageIdentityResponse = self
             .call(
                 "/agent/sandboxes/image-identity",
@@ -1550,7 +1516,6 @@ impl SandboxProvider for RemoteSandboxProvider {
         &self,
         handle: &SandboxHandle,
     ) -> Result<RuntimeCompatibility, AgentError> {
-        self.forwards(&handle.sandbox_name, "The retained agent runtime")?;
         let response: RemoteRuntimeCompatibility = self
             .call(
                 "/agent/sandboxes/agent-runtime-check",
@@ -1571,7 +1536,6 @@ impl SandboxProvider for RemoteSandboxProvider {
         handle: &SandboxHandle,
         epoch: u64,
     ) -> Result<(), AgentError> {
-        self.forwards(&handle.sandbox_name, "Agent harness recovery")?;
         self.call_ok(
             "/agent/sandboxes/recover-agent-harness",
             &RemoteRecoverHarnessRequest {
@@ -1862,8 +1826,7 @@ impl SandboxProvider for RemoteSandboxProvider {
     }
 
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
-        self.forwards(&handle.sandbox_name, "The interactive terminal")?;
-        self.open_byte_channel(handle, RemoteByteChannel::Terminal, "terminal attach")
+        self.open_byte_channel(handle, RemoteByteChannel::Terminal, None, "terminal attach")
             .await
     }
 
@@ -1929,13 +1892,22 @@ impl SandboxProvider for RemoteSandboxProvider {
         &self,
         handle: &SandboxHandle,
     ) -> Result<PtyAttachment, AgentError> {
-        self.forwards(&handle.sandbox_name, "The retained agent runtime")?;
         self.open_byte_channel(
             handle,
             RemoteByteChannel::AgentRuntime,
+            None,
             "agent runtime connect",
         )
         .await
+    }
+
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.open_byte_channel(handle, RemoteByteChannel::Port, Some(port), "port connect")
+            .await
     }
 
     async fn resize_disk(
@@ -1943,7 +1915,6 @@ impl SandboxProvider for RemoteSandboxProvider {
         handle: &SandboxHandle,
         new_size_mb: u64,
     ) -> Result<(), AgentError> {
-        self.forwards(&handle.sandbox_name, "Disk resize")?;
         self.call_ok(
             "/agent/sandboxes/resize-disk",
             &RemoteResizeDiskRequest {
@@ -2500,28 +2471,7 @@ mod tests {
     async fn unsupported_features_are_named_errors_without_calling_the_node() {
         let (url, seen) = fake_agent(200, Some(serde_json::json!({"ok": true}))).await;
         let provider = provider_at(&url);
-        let h = remote_handle();
 
-        assert_unsupported(
-            provider.attach_pty(&h).await.err().unwrap(),
-            "interactive terminal",
-        );
-        assert_unsupported(
-            provider.check_agent_runtime(&h).await.unwrap_err(),
-            "retained agent runtime",
-        );
-        assert_unsupported(
-            provider.recover_agent_harness(&h, 1).await.unwrap_err(),
-            "harness recovery",
-        );
-        assert_unsupported(
-            provider.image_identity(&h).await.unwrap_err(),
-            "image identity",
-        );
-        assert_unsupported(
-            provider.resize_disk(&h, 1024).await.unwrap_err(),
-            "Disk resize",
-        );
         assert_unsupported(provider.rebuild_image().await.unwrap_err(), "sandbox image");
 
         let mut with_volume = create_config();
@@ -2540,30 +2490,10 @@ mod tests {
         assert!(seen.lock().await.is_none(), "no request reached the node");
     }
 
-    // ── ADR-055 phase 6: driver modes ───────────────────────────────────
-
-    #[tokio::test]
-    async fn shadow_mode_still_refuses_without_calling_the_node() {
-        let (url, seen) = fake_agent(200, Some(serde_json::json!({"ok": true}))).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Shadow);
-        let h = remote_handle();
-        assert_unsupported(
-            provider.attach_pty(&h).await.err().unwrap(),
-            "interactive terminal",
-        );
-        assert_unsupported(
-            provider.resize_disk(&h, 1024).await.unwrap_err(),
-            "Disk resize",
-        );
-        assert_unsupported(
-            provider.image_identity(&h).await.unwrap_err(),
-            "image identity",
-        );
-        assert!(seen.lock().await.is_none(), "no request reached the node");
-    }
+    // ── Driver operations forwarded to the node ─────────────────────────
 
     /// A fake worker serving the phase-6 routes, recording `(path, body)`.
-    async fn fake_enforce_agent() -> (
+    async fn fake_driver_agent() -> (
         String,
         std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>,
     ) {
@@ -2592,9 +2522,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_forwards_resize_identity_runtime_check_and_harness_recovery() {
-        let (url, calls) = fake_enforce_agent().await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+    async fn resize_identity_runtime_check_and_harness_recovery_are_forwarded() {
+        let (url, calls) = fake_driver_agent().await;
+        let provider = provider_at(&url);
         let h = remote_handle();
 
         provider
@@ -2651,7 +2581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_maps_a_node_driver_refusal_like_any_worker_failure() {
+    async fn a_node_driver_refusal_maps_like_any_worker_failure() {
         // A Docker node cannot resize a disk: its driver's refusal comes back
         // as the worker's error, naming the node, not as a silent success.
         let (url, _seen) = fake_agent(
@@ -2661,7 +2591,7 @@ mod tests {
             })),
         )
         .await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         let err = provider
             .resize_disk(&remote_handle(), 2048)
             .await
@@ -2675,9 +2605,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_still_refuses_what_no_node_serves_without_calling_it() {
+    async fn what_no_node_serves_is_refused_without_calling_it() {
         let (url, seen) = fake_agent(200, Some(serde_json::json!({"ok": true}))).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         let h = remote_handle();
         assert_unsupported(
             provider.take_snapshot(&h, None, 1024).await.unwrap_err(),
@@ -2745,10 +2675,12 @@ mod tests {
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or_default()
                             .to_string();
+                        let port = query.port.map(|p| format!(" port={p}")).unwrap_or_default();
                         queries.lock().await.push(format!(
-                            "{} {} {}",
+                            "{} {}{} {}",
                             query.sandbox,
                             query.channel.as_str(),
+                            port,
                             auth
                         ));
                         if missing {
@@ -2793,11 +2725,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_tunnels_the_terminal_over_a_byte_channel() {
+    async fn the_terminal_is_tunnelled_over_a_byte_channel() {
         use futures::StreamExt;
         use tokio::io::AsyncWriteExt;
         let (url, queries) = fake_byte_channel_agent(false).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         let mut pty = provider
             .attach_pty(&remote_handle())
             .await
@@ -2830,9 +2762,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enforce_opens_the_agent_runtime_over_the_same_channel() {
+    async fn the_agent_runtime_opens_over_the_same_channel() {
         let (url, queries) = fake_byte_channel_agent(false).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         provider
             .connect_agent_runtime(&remote_handle())
             .await
@@ -2844,9 +2776,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_preview_port_is_relayed_over_the_same_channel() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let (url, queries) = fake_byte_channel_agent(false).await;
+        let provider = provider_at(&url);
+        let mut channel = provider
+            .connect_port(&remote_handle(), 3000)
+            .await
+            .expect("port connected");
+        channel
+            .input
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write");
+        channel.input.flush().await.expect("flush");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), channel.output.next())
+            .await
+            .expect("an answer in time")
+            .expect("a frame")
+            .expect("bytes");
+        assert_eq!(echoed.as_ref(), b"echo:GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            *queries.lock().await,
+            vec!["temps-sandbox-abc port port=3000 Bearer tok".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn a_byte_channel_to_a_missing_sandbox_is_not_found() {
         let (url, _queries) = fake_byte_channel_agent(true).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         match provider.attach_pty(&remote_handle()).await {
             Err(AgentError::SandboxNotFound { sandbox, .. }) => {
                 assert!(sandbox.contains("worker-2"), "{sandbox}");
@@ -2859,7 +2819,7 @@ mod tests {
     #[tokio::test]
     async fn a_byte_channel_is_never_opened_for_a_non_sandbox_name() {
         let (url, queries) = fake_byte_channel_agent(false).await;
-        let provider = provider_at(&url).with_driver_mode(SandboxDriverMode::Enforce);
+        let provider = provider_at(&url);
         let mut h = remote_handle();
         h.sandbox_name = "temps-sandbox-abc&channel=agent_runtime".into();
         assert!(matches!(

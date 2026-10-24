@@ -1817,11 +1817,24 @@ pub async fn open_sandbox_byte_channel(
     let attachment = match query.channel {
         RemoteByteChannel::Terminal => host.provider.attach_pty(&handle).await,
         RemoteByteChannel::AgentRuntime => host.provider.connect_agent_runtime(&handle).await,
+        RemoteByteChannel::Port => match query.port.filter(|port| *port != 0) {
+            Some(port) => host.provider.connect_port(&handle, port).await,
+            None => {
+                return Err(err(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "a port channel to sandbox '{}' needs a non-zero `port`",
+                        handle.sandbox_name
+                    ),
+                ))
+            }
+        },
     }
     .map_err(provider_err)?;
     tracing::info!(
         sandbox = %handle.sandbox_name,
         channel = ?query.channel,
+        port = ?query.port,
         "Opened a sandbox byte channel for the control plane"
     );
     let work_root = state.work_root.clone();

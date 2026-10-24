@@ -503,13 +503,15 @@ Changing the list only affects new sandboxes; existing ones keep running where t
 - **An `https://` agent address.** The control plane talks to the worker over the mutual-TLS connection set up when the node joined. A node registered with a plain `http://` address is listed as not eligible, with the reason.
 - **An active node.** Offline nodes, and nodes whose sandboxes are being destroyed, don't take new sandboxes. `sandbox nodes` and the console show why.
 
+### Terminal, agent runtime and preview URLs
+
+A sandbox on a worker works like one on the control plane for the interactive terminal, the agent runtime (Temps Fleet) and preview URLs. The control plane carries each one over the mutual-TLS connection to the worker's agent. Preview URLs keep the `ws-<id>-<port>.<preview domain>` form and the same password protection. Each preview connection is relayed into the sandbox's own port, so nothing is published on the worker's network.
+
 ### Not available on worker nodes yet
 
 These features only work for sandboxes on the control plane for now. On a worker sandbox they fail with a message naming the node (`422`) instead of doing something different:
 
-- the interactive terminal and the agent runtime (Temps Fleet)
 - snapshots, both taking and restoring them
-- preview URLs (the sandbox page explains why there is none)
 - disk resize and workspace volumes
 - the Firecracker and microsandbox backends, and the git, model and harness relays
 
@@ -819,7 +821,7 @@ node's native architecture automatically.
 Multi-node is functional but still evolving. Known limitations:
 
 - **No bin-packing** — placement is least-loaded plus anti-affinity, not full bin-packing across resource dimensions.
-- **Worker sandboxes are a subset** — sandboxes on worker nodes have no terminal, agent runtime (Fleet), snapshots, preview URLs, disk resize, workspace volumes or Firecracker/microsandbox backends yet. See [Sandboxes on worker nodes](#sandboxes).
+- **Worker sandboxes are a subset** — sandboxes on worker nodes have no snapshots, disk resize, workspace volumes or Firecracker/microsandbox backends yet; their terminal, agent runtime and preview URLs work as on the control plane. See [Sandboxes on worker nodes](#sandboxes).
 - **Sandboxes don't move** — a sandbox stays on the node it was created on. Draining a node does not move its sandboxes; [evict them](#sandboxes) before removing the node.
 - **Drain rebuilds what it moves** — a deployment whose only replicas are on the draining node is rebuilt elsewhere from its source: the Git ref it was built from, the same image for image deployments, or the retained ZIP for uploaded-source deployments. If any such deployment has nothing to rebuild from (for example its uploaded archive is gone), the drain is refused with a `409` that names it (the first 50 individually, the rest counted), and the node is left unchanged; redeploy or delete that workload first.
 - **Removing a node cleans up what Temps left on it** — before a drained node is removed, Temps removes the containers it placed there that no deployment needs but that may still exist, such as a failed deployment's container, or one a drain's redeploy replaced while the node was unreachable. With the agent running, Temps asks the node about each of those containers individually: one that is still there is removed after its labels confirm the owning project, and only Docker reporting it not found counts as already gone, so nothing it placed there is forgotten. Containers that earlier releases recorded as removed on a worker without confirming it are checked the same way after upgrading. Containers of a current or still-running deployment block removal until the drain has moved them, and so do those of the deployment a rollout in progress would fall back to if its new deployment fails its checks; retry once the rollout finishes. If the node's agent cannot confirm that a container is gone, removal is refused with a `409` listing each container (the first 50 are described individually and the rest are counted). Start `temps agent` on the node, or remove them on that host with `docker rm -f`, then retry. If the host is gone for good, remove it with `?force=true` (**Remove Anyway** in the console's remove dialog, or `temps node remove <id> --yes --force`): the containers are recorded as orphaned on that node, listed in the response, and later project deletion skips them instead of failing. Because removal deletes containers on the host, it asks an administrator with MFA enrolled to verify again in the console, as draining does; API keys and CLI tokens are not prompted.

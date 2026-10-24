@@ -1897,6 +1897,88 @@ fn write_probe_script(dir: &str) -> String {
 }
 
 impl DockerSandboxProvider {
+    /// Run `cmd` in the sandbox as `SANDBOX_USER` with its stdio attached,
+    /// as a plain binary pipe (no TTY: Docker would mangle the bytes with
+    /// ONLCR). Anything on the exec's stderr is the relay failing, and ends
+    /// the stream as an error rather than being mixed into the bytes.
+    ///
+    /// Nothing long-lived runs inside this exec: `socat` exits when its stdin
+    /// closes, and the exec dies with it.
+    async fn exec_byte_pipe(
+        &self,
+        handle: &SandboxHandle,
+        cmd: Vec<String>,
+        operation: &'static str,
+        relay: &'static str,
+    ) -> Result<PtyAttachment, AgentError> {
+        let exec_failed = |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        };
+
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            tty: Some(false),
+            cmd: Some(cmd),
+            user: Some(SANDBOX_USER.to_string()),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, exec_config)
+            .await
+            .map_err(|e| exec_failed(format!("failed to create {} exec: {}", operation, e)))?;
+
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| exec_failed(format!("failed to start {} exec: {}", operation, e)))?;
+
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                let output = output.map(move |chunk| match chunk {
+                    Ok(LogOutput::StdOut { message }) => Ok(message),
+                    Ok(LogOutput::Console { message }) => Ok(message),
+                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!(
+                            "{} error: {}",
+                            relay,
+                            String::from_utf8_lossy(&message).trim()
+                        ),
+                    }),
+                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+                    Err(e) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!("{} stream failed: {}", operation, e),
+                    }),
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(exec_failed(format!(
+                "{} exec returned detached; expected an attached stream",
+                operation
+            ))),
+        }
+    }
+
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self {
             docker,
@@ -5574,82 +5656,48 @@ impl SandboxProvider for DockerSandboxProvider {
     /// user. Executing as root would work but would break the "same trust
     /// boundary as the sandbox user" property the ADR relies on.
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
-        let exec_failed = |reason: String| AgentError::SandboxExecFailed {
-            run_id: 0,
-            sandbox_id: handle.sandbox_id.clone(),
-            reason,
-        };
-
-        let exec_config = bollard::models::ExecConfig {
-            attach_stdin: Some(true),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            // No `tty: true` here. The PTY lives *inside* the agent; this
-            // exec is a plain binary pipe carrying framed protocol bytes.
-            // Asking Docker for a TTY would mangle them with ONLCR.
-            tty: Some(false),
-            cmd: Some(vec![
+        self.exec_byte_pipe(
+            handle,
+            vec![
                 "socat".to_string(),
                 "-".to_string(),
                 format!("UNIX-CONNECT:{}", PTY_AGENT_SOCKET),
-            ]),
-            user: Some(SANDBOX_USER.to_string()),
-            ..Default::default()
-        };
+            ],
+            "PTY attach",
+            "PTY agent relay",
+        )
+        .await
+    }
 
-        let exec = self
-            .docker
-            .create_exec(&handle.sandbox_id, exec_config)
-            .await
-            .map_err(|e| exec_failed(format!("failed to create PTY attach exec: {}", e)))?;
-
-        let started = self
-            .docker
-            .start_exec(
-                &exec.id,
-                Some(bollard::exec::StartExecOptions {
-                    detach: false,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| exec_failed(format!("failed to start PTY attach exec: {}", e)))?;
-
-        match started {
-            StartExecResults::Attached { output, input } => {
-                let sandbox_id = handle.sandbox_id.clone();
-                // Docker frames the exec's stdout/stderr; the agent's bytes
-                // arrive as StdOut. StdErr here is socat complaining (e.g.
-                // the socket is missing because the image predates the
-                // agent), which must surface as an error rather than be
-                // silently mixed into the protocol stream.
-                let output = output.map(move |chunk| match chunk {
-                    Ok(LogOutput::StdOut { message }) => Ok(message),
-                    Ok(LogOutput::Console { message }) => Ok(message),
-                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: sandbox_id.clone(),
-                        reason: format!(
-                            "PTY agent relay error: {}",
-                            String::from_utf8_lossy(&message).trim()
-                        ),
-                    }),
-                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
-                    Err(e) => Err(AgentError::SandboxExecFailed {
-                        run_id: 0,
-                        sandbox_id: sandbox_id.clone(),
-                        reason: format!("PTY attach stream failed: {}", e),
-                    }),
-                });
-                Ok(PtyAttachment {
-                    output: Box::pin(output),
-                    input,
-                })
-            }
-            StartExecResults::Detached => Err(exec_failed(
-                "PTY attach exec returned detached; expected an attached stream".to_string(),
-            )),
+    /// `socat` from the exec's stdio to `127.0.0.1:<port>` inside the
+    /// sandbox, as `SANDBOX_USER`: the same pipe the terminal uses, pointed
+    /// at the dev server. Each preview connection is one exec, which ends
+    /// when either side closes. A refused connection is socat's stderr, so it
+    /// arrives as the stream's first item, before any byte was relayed.
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        if port == 0 {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "port 0 of sandbox '{}' is not a port a preview can reach",
+                    handle.sandbox_name
+                ),
+            });
         }
+        self.exec_byte_pipe(
+            handle,
+            vec![
+                "socat".to_string(),
+                "-".to_string(),
+                format!("TCP:127.0.0.1:{port}"),
+            ],
+            "port connect",
+            "port relay",
+        )
+        .await
     }
 
     async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {

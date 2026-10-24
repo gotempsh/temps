@@ -705,6 +705,22 @@ pub trait SandboxExt: RuntimeDriver {
         ))
     }
 
+    /// A byte channel to TCP `port` on the instance's loopback: what a
+    /// preview URL of the sandbox reaches when the ingress cannot dial the
+    /// instance directly (it runs on another node).
+    async fn connect_port(
+        &self,
+        handle: &InstanceHandle,
+        port: u16,
+    ) -> Result<ByteChannel, DriverError> {
+        let _ = port;
+        Err(unsupported(
+            self.capabilities(),
+            "connect_port",
+            &handle.name,
+        ))
+    }
+
     async fn check_agent_runtime(
         &self,
         handle: &InstanceHandle,

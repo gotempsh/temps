@@ -164,6 +164,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.owner_of(handle)
+            .await?
+            .connect_port(handle, port)
+            .await
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,
@@ -482,9 +493,6 @@ struct NodeClientKey {
     defaults: RemoteSandboxDefaults,
     /// The client trusts this cluster CA.
     cluster_ca_cert_pem: Option<String>,
-    /// Which operations the client forwards (ADR-055 §6); switching the
-    /// node's mode rebuilds it on the next call.
-    sandbox_driver_mode: temps_entities::sandbox_driver_mode::SandboxDriverMode,
 }
 
 impl NodeClientKey {
@@ -494,7 +502,6 @@ impl NodeClientKey {
             token_encrypted: node.token_encrypted.clone(),
             defaults: sandbox_defaults(&settings.agent_sandbox),
             cluster_ca_cert_pem: settings.multi_node.cluster_ca_cert_pem.clone(),
-            sandbox_driver_mode: node.sandbox_driver_mode,
         }
     }
 }
@@ -539,11 +546,9 @@ impl NodeProviderFactory for MtlsProviderFactory {
         )
         .await
         .map_err(|e| e.to_string())?;
-        // Byte channels (terminal, agent runtime) are only forwarded in
-        // `enforce`; their WebSocket presents the same identity as `client`.
-        let ws_connector = if node.sandbox_driver_mode.uses_drivers()
-            && temps_deployments::cluster_ca::is_https_address(&node.address)
-        {
+        // Byte channels (terminal, agent runtime, preview ports) present the
+        // same identity as `client` on their WebSocket.
+        let ws_connector = if temps_deployments::cluster_ca::is_https_address(&node.address) {
             let config = temps_deployments::cluster_ca::cp_ws_client_config(
                 self.config_service.as_ref(),
                 self.encryption_service.as_ref(),
@@ -563,7 +568,6 @@ impl NodeProviderFactory for MtlsProviderFactory {
                 client,
             )
             .with_defaults(defaults)
-            .with_driver_mode(node.sandbox_driver_mode)
             .with_ws_connector(ws_connector),
         ))
     }
@@ -1347,14 +1351,6 @@ mod tests {
         let mut ca = base.clone();
         ca.multi_node.cluster_ca_cert_pem = Some("rotated-ca".to_string());
         assert_ne!(key, NodeClientKey::new(&n, &ca), "cluster CA");
-        let mut enforcing = n.clone();
-        enforcing.sandbox_driver_mode =
-            temps_entities::sandbox_driver_mode::SandboxDriverMode::Enforce;
-        assert_ne!(
-            key,
-            NodeClientKey::new(&enforcing, &base),
-            "sandbox driver mode"
-        );
     }
 
     #[tokio::test]

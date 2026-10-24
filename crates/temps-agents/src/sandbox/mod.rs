@@ -941,6 +941,27 @@ pub trait SandboxProvider: Send + Sync {
         })
     }
 
+    /// A byte pipe to TCP `port` on the sandbox's own loopback, carrying
+    /// whatever protocol the process listening there speaks. The ingress
+    /// uses it for preview URLs of sandboxes it cannot dial directly, i.e.
+    /// those on worker nodes. The caller must authorize the request first.
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "port {} of sandbox '{}' cannot be reached through provider '{}'",
+                port,
+                handle.sandbox_name,
+                self.name()
+            ),
+        })
+    }
+
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
         &self,

@@ -406,7 +406,11 @@ impl StandaloneSandboxRegistry {
     /// provider side returns handles for stopped sandboxes too, so lifecycle
     /// ops like `start` can act on them. Callers that need the container
     /// to be running (e.g. `exec`) must check separately.
-    async fn get_or_recover(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
+    pub(crate) async fn get_or_recover(
+        &self,
+        id: i32,
+        public_id: &str,
+    ) -> Result<SandboxHandle, AgentError> {
         if let Some(h) = self.handles.read().await.get(&id).cloned() {
             return Ok(h);
         }

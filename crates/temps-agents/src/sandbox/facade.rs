@@ -384,6 +384,18 @@ impl SandboxProvider for DriverSandboxProvider {
             .map_err(agent_error)
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.driver_for(handle)?
+            .connect_port(&instance_handle(handle), port)
+            .await
+            .map(pty_attachment)
+            .map_err(agent_error)
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,

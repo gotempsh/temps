@@ -292,6 +292,14 @@ impl SandboxProvider for ModeRoutingSandboxProvider {
         self.provider().await.connect_agent_runtime(handle).await
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.provider().await.connect_port(handle, port).await
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,

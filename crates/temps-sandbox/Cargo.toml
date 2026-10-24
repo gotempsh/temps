@@ -46,6 +46,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 tempfile = { workspace = true }
