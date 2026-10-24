@@ -380,6 +380,23 @@ const HEARTBEAT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 /// Maximum backoff delay between heartbeat retries.
 const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
 
+/// The part of the control plane's heartbeat response the agent acts on.
+#[derive(serde::Deserialize)]
+struct HeartbeatAck {
+    /// Absent from servers that predate it: read as "not recorded", so a
+    /// report is resent rather than silently dropped.
+    #[serde(default)]
+    instances_accepted: bool,
+}
+
+/// Whether a successful heartbeat's response says the instance reports it
+/// carried were recorded. Anything unreadable counts as not recorded.
+fn instance_reports_acknowledged(body: &[u8]) -> bool {
+    serde_json::from_slice::<HeartbeatAck>(body)
+        .map(|ack| ack.instances_accepted)
+        .unwrap_or(false)
+}
+
 /// Heartbeats between re-checks of an already-known container platform.
 ///
 /// At the 30s heartbeat interval this is ~10 minutes. The daemon behind
@@ -639,7 +656,30 @@ fn spawn_heartbeat_loop(
                             inventory_sent = true;
                         }
                         if let (Some(runtime), Some(_)) = (&node_runtime, body.get("instances")) {
-                            runtime.mark_sent(&instance_reports);
+                            // The runtime suppresses a report it believes
+                            // delivered until it changes, so only a server
+                            // that says it recorded them makes them sent;
+                            // otherwise they ride the next beat again.
+                            let accepted = match response.bytes().await {
+                                Ok(bytes) => instance_reports_acknowledged(&bytes),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        node_id = node_id,
+                                        error = %e,
+                                        "Failed to read the heartbeat response; instance reports will be resent"
+                                    );
+                                    false
+                                }
+                            };
+                            if accepted {
+                                runtime.mark_sent(&instance_reports);
+                            } else {
+                                tracing::debug!(
+                                    node_id = node_id,
+                                    count = instance_reports.len(),
+                                    "Control plane did not acknowledge the instance reports; resending them next heartbeat"
+                                );
+                            }
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
@@ -1130,6 +1170,24 @@ async fn serve_mtls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instance_reports_count_as_sent_only_when_the_server_recorded_them() {
+        assert!(instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received","instances_accepted":true}"#
+        ));
+        // The server could not record them: resend.
+        assert!(!instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received","instances_accepted":false}"#
+        ));
+        // A server that predates the acknowledgement: resend.
+        assert!(!instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received"}"#
+        ));
+        // An unreadable body: resend.
+        assert!(!instance_reports_acknowledged(b"<html>bad gateway</html>"));
+        assert!(!instance_reports_acknowledged(b""));
+    }
 
     fn test_agent_config(require_mtls: bool) -> AgentConfig {
         AgentConfig {

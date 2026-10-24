@@ -48,6 +48,14 @@ fn retained_cleanup_retry_status() -> String {
     retained_cleanup_retry_status_at(chrono::Utc::now())
 }
 
+/// How a registered container is torn down.
+enum TeardownPath {
+    /// Started through the workload plane: retired by deleting its workload.
+    Plane(crate::services::plane_deployer::ReplicaWorkload),
+    /// A legacy container: stopped and removed by its node's deployer.
+    Deployer(Arc<dyn ContainerDeployer>),
+}
+
 fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String {
     format!(
         "{RETAINED_CLEANUP_RETRY_PREFIX}{}",
@@ -2272,7 +2280,9 @@ impl WorkflowExecutionService {
                     .log_service(self.log_service.clone())
                     .container_deployer(self.container_deployer.clone())
                     .queue(self.queue.clone())
-                    .config_service(self.config_service.clone());
+                    .config_service(self.config_service.clone())
+                    // Superseded `enforce` replicas are retired through it.
+                    .workload_plane(self.workload_plane.get().cloned());
 
                 if let Some(enc_service) = self.encryption_service.get() {
                     builder = builder.encryption_service(enc_service.clone());
@@ -4051,8 +4061,27 @@ impl WorkflowExecutionService {
             || original_status
                 .as_deref()
                 .is_some_and(|status| status.starts_with("retained:"));
-        let deployer = match self.teardown_deployer_for_node(container.node_id).await {
-            Ok(deployer) => deployer,
+        // A replica an `enforce` deployment started through the workload
+        // plane is retired by deleting its workload: the plane removes the
+        // instance (a container or a microVM Docker cannot see). Removing
+        // only the container would leave the workload running or restarted,
+        // and a microVM's 404 must never count as "already removed".
+        let resolved = match crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container_id,
+        )
+        .await
+        {
+            Ok(Some(workload)) => Ok(TeardownPath::Plane(workload)),
+            Ok(None) => self
+                .teardown_deployer_for_node(container.node_id)
+                .await
+                .map(TeardownPath::Deployer),
+            Err(error) => Err(WorkflowExecutionError::ReplicaRetire(error)),
+        };
+        let teardown = match resolved {
+            Ok(teardown) => teardown,
             Err(error) if rotate_retry => {
                 if let Err(rotation_error) = self
                     .rotate_retained_cleanup_retry(&container, &container_id, None)
@@ -4100,15 +4129,33 @@ impl WorkflowExecutionService {
             return Ok(None);
         }
 
-        if let Err(error) = deployer.stop_container(&container_id).await {
-            warn!(
-                "Failed to stop container {} on node {:?}: {}",
-                container_id, container.node_id, error
-            );
-        }
+        let removal: Result<(), String> = match teardown {
+            TeardownPath::Plane(workload) => {
+                crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.get().map(Arc::as_ref),
+                    container.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            TeardownPath::Deployer(deployer) => {
+                if let Err(error) = deployer.stop_container(&container_id).await {
+                    warn!(
+                        "Failed to stop container {} on node {:?}: {}",
+                        container_id, container.node_id, error
+                    );
+                }
+                match deployer.remove_container(&container_id).await {
+                    Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        };
 
-        match deployer.remove_container(&container_id).await {
-            Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+        match removal {
+            Ok(()) => {}
             Err(error) => {
                 // Never hide a still-live container from later cleanup attempts.
                 // Retained failures receive a timestamped, lexically-last state,
@@ -4615,6 +4662,10 @@ pub enum WorkflowExecutionError {
         platform: String,
         reason: String,
     },
+
+    /// Finding or retiring a replica the workload plane started.
+    #[error(transparent)]
+    ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
 }
 
 impl WorkflowExecutionError {
@@ -4643,7 +4694,8 @@ impl WorkflowExecutionError {
             | Self::MissingJobConfig(_)
             | Self::InvalidJobConfig(_)
             | Self::UnsupportedJobType(_)
-            | Self::JobCreationFailed(_) => false,
+            | Self::JobCreationFailed(_)
+            | Self::ReplicaRetire(_) => false,
         }
     }
 }
