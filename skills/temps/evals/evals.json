@@ -90,6 +90,23 @@
         "Uses a path route instead of CORS or a custom proxy for /api",
         "Follows up with `instantiations show <id> --wait` or `retry` instead of re-running the import"
       ]
+    },
+    {
+      "id": 8,
+      "prompt": "Create Keycloak on my production Temps instance using the curated service if it is available. There is no local application repository or workspace project link. A suitable managed PostgreSQL service already exists; reuse it.",
+      "expected_output": "Inspects the live app catalog and existing managed database, chooses the matching curated Keycloak template, creates it through native server-side template provisioning with the existing database ID, follows the instantiation and the returned service deployment, and reports HTTPS/SSO configuration separately from provisioning.",
+      "files": [],
+      "expectations": [
+        "Routes to curated-services before the repository deployment workflow and inspects the actual template requirements",
+        "Uses the matching curated app template and native database bindings instead of creating a Dockerfile, custom project or duplicate PostgreSQL service",
+        "Does not require a local checkout, Git connection or workspace project link for server-side template creation",
+        "Uses connected Temps tools when available, otherwise the pinned CLI with an explicit target context",
+        "Reuses the existing managed database by ID without revealing or manually copying credentials",
+        "Follows or retries the same instantiation after an interrupted wait rather than creating duplicates",
+        "Queries the returned service and its own environment rather than inheriting an unrelated workspace link environment filter",
+        "Verifies deployment status and the configured health endpoint instead of treating successful instantiation as proof of readiness",
+        "Reports HTTPS, SSO integration and backup prerequisites honestly without silently changing existing logins"
+      ]
     }
   ]
 }

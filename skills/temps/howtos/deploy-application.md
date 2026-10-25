@@ -3,6 +3,13 @@
 Use this journey for a repository that should become a Temps project or a new
 deployment of an existing project.
 
+If the request is to provision a named application rather than deploy the user's
+source, check the curated app catalog first and follow
+[curated services](curated-services.md) when a matching template meets the
+request. Curated image services do not need a local repository, Dockerfile, or
+workspace project link. Do not create those prerequisites just to use the
+source-deployment workflow.
+
 1. Inspect the framework, package manager, lockfile, start/build commands,
    health route, required environment-variable names, and existing
    `.temps.yaml`. Read [the runtime contract](../references/runtime-contract.md).

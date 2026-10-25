@@ -17,8 +17,11 @@ Python 3.9+ for the bundled read-only capability detector.
 
 1. Classify the task: application preparation, deployment, platform operation,
    observability, recovery, or diagnosis.
-2. Inspect before changing anything. Identify the repository framework,
-   current Temps context, target project/environment, and existing setup.
+2. Inspect before changing anything. Identify the current Temps context,
+   target project/environment, and existing setup. For a named application,
+   check the instance's curated app catalog before creating a repository,
+   Dockerfile, or custom project. Prefer a matching curated service when it
+   meets the request; inspect a repository framework only for source deployment.
 3. Read only the references named in the routing table below. Do not load the
    complete command index or unrelated observability pillars.
 4. For CLI work, use the pinned zero-install invocation and the safety contract
@@ -69,6 +72,7 @@ When the user opts in:
 | Intent | Read |
 |---|---|
 | Authenticate, select a server, or execute CLI operations | [references/cli-runtime.md](references/cli-runtime.md), then [references/commands/INDEX.md](references/commands/INDEX.md) |
+| Provision a catalog application such as Keycloak or Browserless, including a single-service template | [howtos/curated-services.md](howtos/curated-services.md) |
 | Create, link, deploy, or migrate an application | [howtos/deploy-application.md](howtos/deploy-application.md), [references/runtime-contract.md](references/runtime-contract.md) |
 | Group services into a project (the console's "Project"), import apps from a monorepo, share variables, or route `/api` to another service | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md) |
 | Create a multi-service app from a template, or follow/retry an import | [howtos/projects-and-monorepos.md](howtos/projects-and-monorepos.md), then [references/commands/templates.md](references/commands/templates.md) or [references/commands/instantiations.md](references/commands/instantiations.md) |
