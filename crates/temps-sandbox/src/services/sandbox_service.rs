@@ -204,6 +204,11 @@ pub struct CreateSandboxRequest {
     /// automatic placement. Resolved against the operator allow-list by
     /// [`crate::services::placement`].
     pub node: Option<String>,
+    /// Which outside destinations the sandbox may reach. The default,
+    /// `internet`, is any public destination on ports 80 and 443; a
+    /// `restricted` policy needs a backend that can enforce it (docker), and
+    /// create fails with a 422 rather than starting the sandbox without it.
+    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
 }
 
 /// First-class sandbox identity for a durable AI application workspace.
@@ -746,6 +751,8 @@ pub struct SandboxSummary {
     /// `"control-plane"` or a `node-<id>` placeholder; service methods that
     /// return summaries replace the placeholder with the real node name.
     pub node_name: String,
+    /// The egress policy the sandbox enforces.
+    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -783,6 +790,7 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 None => crate::services::placement::CONTROL_PLANE_NAME.to_string(),
                 Some(id) => format!("node-{id}"),
             },
+            egress_policy: m.egress_policy.0.clone(),
         }
     }
 }
@@ -2094,6 +2102,12 @@ impl SandboxService {
             None => SandboxLifecycle::default(),
             Some(value) => SandboxLifecycle::parse(value)?,
         };
+        let egress_policy =
+            req.egress_policy
+                .normalized()
+                .map_err(|error| SandboxError::Validation {
+                    message: format!("egress_policy: {error}"),
+                })?;
 
         if req.from_snapshot_artifact.is_some() && req.source.is_some() {
             return Err(SandboxError::Validation {
@@ -2275,6 +2289,10 @@ impl SandboxService {
             project_id: Set(req.project_id),
             source_repo_url: Set(source_repo_url),
             node_id: Set(node_id),
+            // Part of the create config below, so the sandbox enforces it
+            // from its first instant; the row is marked destroyed if the
+            // create fails.
+            egress_policy: Set(sandboxes::StoredEgressPolicy(egress_policy.clone())),
             ..Default::default()
         };
         let mut row = active.insert(self.db.as_ref()).await.map_err(|e| {
@@ -2330,6 +2348,7 @@ impl SandboxService {
             pids_limit: req.pids_limit,
             disk_size_mb: req.disk_size_mb,
             allow_docker: req.allow_docker,
+            egress_policy,
             network_mode: None,
             env_vars: req.env,
             idle_timeout: Duration::from_secs(timeout),
@@ -4741,6 +4760,7 @@ TEMPS_ASKPASS_EOF\n\
             .start(row.id, public_id_value)
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
+        self.enforce_stored_egress_policy(&row).await?;
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
         let sandbox_id = row.id;
@@ -4785,6 +4805,7 @@ TEMPS_ASKPASS_EOF\n\
             .restart(row.id, public_id_value)
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
+        self.enforce_stored_egress_policy(&row).await?;
         let now = Utc::now();
         let sandbox_id = row.id;
         let changes = sandboxes::ActiveModel {
@@ -4863,6 +4884,146 @@ TEMPS_ASKPASS_EOF\n\
         )
         .await;
         Ok(updated)
+    }
+
+    /// Replace the sandbox's egress policy: which outside destinations it
+    /// may reach.
+    ///
+    /// The backend applies the policy first and the row is written only
+    /// once it has, so the stored policy is never one the sandbox does not
+    /// enforce. If that write then fails (the sandbox was destroyed
+    /// meanwhile, or the database is unavailable), the previous policy is
+    /// applied again before the error is returned. A running Docker sandbox
+    /// gets a new egress proxy, which cuts its outbound connections for a
+    /// second or two; a stopped one keeps the policy for its next start.
+    pub async fn set_egress_policy(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        policy: temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| SandboxError::Validation {
+                message: format!("egress policy for sandbox {public_id_value}: {error}"),
+            })?;
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        ensure_not_agent_run(&row)?;
+        if row.status != "running" && row.status != "stopped" {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: row.status.clone(),
+                operation: "change its egress policy".into(),
+            });
+        }
+        // Serializes with every other change to this sandbox's compute
+        // (restart, resize, a resume re-applying its policy), so two updates
+        // cannot leave the row naming one policy and the sandbox enforcing
+        // the other.
+        let _serialized = self.registry.begin_planned_downtime(row.id).await;
+        let previous = row.egress_policy.0.clone();
+        self.registry
+            .set_egress_policy(row.id, public_id_value, &policy)
+            .await
+            .map_err(|e| from_agent_error(public_id_value, e))?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            egress_policy: Set(sandboxes::StoredEgressPolicy(policy.clone())),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let updated = match self
+            .update_row_if(&row, changes, Expect::Live, None, "egress policy update")
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Err(rollback) = self
+                    .registry
+                    .set_egress_policy(row.id, public_id_value, &previous)
+                    .await
+                {
+                    tracing::error!(
+                        sandbox_id = %public_id_value,
+                        internal_id = row.id,
+                        applied_mode = policy.mode.as_str(),
+                        stored_mode = previous.mode.as_str(),
+                        "egress policy was applied but not stored ({error}), and restoring \
+                         the stored policy failed too ({rollback}); the sandbox enforces a \
+                         policy its row does not show until the policy is set again"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            sandbox_id = %public_id_value,
+            internal_id = row.id,
+            from_mode = previous.mode.as_str(),
+            to_mode = policy.mode.as_str(),
+            rules = policy.rules.len(),
+            "sandbox egress policy updated"
+        );
+        self.record_event(
+            row.id,
+            "egress_policy_updated",
+            Some(serde_json::json!({
+                "from_mode": previous.mode.as_str(),
+                "to_mode": policy.mode.as_str(),
+                "rules": policy.rules.len(),
+            })),
+        )
+        .await;
+        Ok(updated)
+    }
+
+    /// Make a sandbox that has just started enforce its stored egress
+    /// policy. The backend carries the policy across a stop (Docker keeps it
+    /// on the parked egress proxy), so this is normally a no-op; it puts the
+    /// policy back on a sandbox whose proxy was lost while it was stopped.
+    /// A restricted sandbox that cannot get its policy back is stopped again
+    /// rather than left running with wider egress than its owner allowed.
+    async fn enforce_stored_egress_policy(
+        &self,
+        row: &sandboxes::Model,
+    ) -> Result<(), SandboxError> {
+        // `internet` is what a backend without a stored policy enforces, so
+        // only a restricted policy can need re-applying. A concurrent change
+        // to restricted is applied by `set_egress_policy` itself.
+        if !row.egress_policy.0.is_restricted() {
+            return Ok(());
+        }
+        let _serialized = self.registry.begin_planned_downtime(row.id).await;
+        // Re-read under the lock: a concurrent `set_egress_policy` may have
+        // replaced the policy since `row` was loaded.
+        let Some(current) = sandboxes::Entity::find_by_id(row.id)
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(());
+        };
+        let policy = current.egress_policy.0;
+        let Err(error) = self
+            .registry
+            .set_egress_policy(row.id, &row.public_id, &policy)
+            .await
+        else {
+            return Ok(());
+        };
+        tracing::error!(
+            sandbox_id = %row.public_id,
+            internal_id = row.id,
+            "could not re-apply the restricted egress policy of a started sandbox ({error}); \
+             stopping it so it does not run with wider egress"
+        );
+        if let Err(stop) = self.registry.stop(row.id, &row.public_id).await {
+            tracing::error!(
+                sandbox_id = %row.public_id,
+                internal_id = row.id,
+                "could not stop sandbox after failing to re-apply its egress policy: {stop}"
+            );
+        }
+        Err(from_agent_error(&row.public_id, error))
     }
 
     /// Seed an already-running sandbox with additional content. Mirrors
@@ -5656,6 +5817,7 @@ TEMPS_ASKPASS_EOF\n\
                 });
             }
         }
+        self.enforce_stored_egress_policy(&row).await?;
 
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
@@ -5902,6 +6064,7 @@ fn application_sandbox_create_config(
         pids_limit: Some(config.pids_limit),
         disk_size_mb: Some(config.disk_limit_mb),
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: None,
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -6619,6 +6782,7 @@ pub(crate) mod tests {
             preview_password_hint: None,
             preview_access: Default::default(),
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "workspace".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -6900,6 +7064,7 @@ pub(crate) mod tests {
             preview_password_hint: None,
             preview_access: Default::default(),
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -7264,6 +7429,7 @@ pub(crate) mod tests {
             preview_password_hint: None,
             preview_access: Default::default(),
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -7368,6 +7534,10 @@ mod storage_cleanup_tests {
         /// when it cannot stop a container whose isolation policy is stale.
         /// `start` clears it, as a successful start replaces that state.
         alive_check_fails: Arc<AtomicBool>,
+        /// Every egress policy applied, in order.
+        egress_calls: Arc<Mutex<Vec<temps_agents::sandbox::SandboxEgressPolicy>>>,
+        /// Refuse restricted policies, like a backend without allow-lists.
+        fail_egress: bool,
     }
 
     impl FakeProvider {
@@ -7386,6 +7556,8 @@ mod storage_cleanup_tests {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_check_fails: Arc::new(AtomicBool::new(false)),
+                egress_calls: Arc::new(Mutex::new(Vec::new())),
+                fail_egress: false,
             }
         }
     }
@@ -7568,6 +7740,24 @@ mod storage_cleanup_tests {
             Ok(())
         }
 
+        async fn set_egress_policy(
+            &self,
+            handle: &SandboxHandle,
+            policy: &temps_agents::sandbox::SandboxEgressPolicy,
+        ) -> Result<(), AgentError> {
+            if self.fail_egress && policy.is_restricted() {
+                return Err(AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox: handle.sandbox_name.clone(),
+                    backend: "firecracker".into(),
+                });
+            }
+            self.egress_calls
+                .lock()
+                .expect("egress call mutex")
+                .push(policy.clone());
+            Ok(())
+        }
+
         async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
             Ok(None)
         }
@@ -7726,6 +7916,7 @@ mod storage_cleanup_tests {
             preview_password_hint: None,
             preview_access: Default::default(),
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -9748,6 +9939,255 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
+    fn restricted_egress() -> temps_agents::sandbox::SandboxEgressPolicy {
+        temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+            temps_agents::sandbox::EgressRule::host("API.example.com", &[443]),
+            temps_agents::sandbox::EgressRule::cidr("1.1.1.0/24", &[]),
+        ])
+    }
+
+    fn with_egress(
+        row: sandboxes::Model,
+        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> sandboxes::Model {
+        sandboxes::Model {
+            egress_policy: sandboxes::StoredEgressPolicy(policy.normalized().expect("valid")),
+            ..row
+        }
+    }
+
+    fn egress_event() -> sandbox_events::Model {
+        sandbox_events::Model {
+            event_type: "egress_policy_updated".into(),
+            ..destroyed_event()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_egress_policy_is_applied_before_it_is_stored() {
+        let data_root = unique_data_root("egress-set");
+        let policy = restricted_egress();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .append_query_results([vec![with_egress(
+                row_with(PUBLIC_ID, "ephemeral", "running"),
+                &policy,
+            )]])
+            .append_query_results([vec![egress_event()]])
+            .into_connection();
+        let db = Arc::new(db);
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let updated = service
+            .set_egress_policy(PUBLIC_ID, 1, policy.clone())
+            .await
+            .expect("applied and stored");
+
+        let normalized = policy.normalized().expect("valid");
+        assert_eq!(updated.egress_policy.0, normalized);
+        // The backend got the normalized policy, once.
+        assert_eq!(*calls.lock().expect("calls"), vec![normalized]);
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("only handle")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("egress_policy"), "the row is written: {sql}");
+        assert!(
+            sql.contains("egress_policy_updated"),
+            "an event is recorded: {sql}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_egress_policy_never_reaches_the_backend() {
+        let data_root = unique_data_root("egress-invalid");
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(
+                PUBLIC_ID,
+                1,
+                temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+                    temps_agents::sandbox::EgressRule::cidr("10.0.0.0/8", &[]),
+                ]),
+            )
+            .await
+            .expect_err("a private range can never be allowed");
+
+        assert!(matches!(err, SandboxError::Validation { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains(PUBLIC_ID) && text.contains("10.0.0.0/8"),
+            "{text}"
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_enforce_a_restricted_policy_is_a_typed_refusal() {
+        let data_root = unique_data_root("egress-unsupported");
+        // Only the lookup: no write may follow a refusal.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .into_connection();
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("refused");
+
+        assert!(
+            matches!(&err, SandboxError::EgressPolicyUnsupported { sandbox_id, backend }
+                if sandbox_id == PUBLIC_ID && backend == "firecracker"),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_cannot_be_stored_is_rolled_back_on_the_backend() {
+        let data_root = unique_data_root("egress-rollback");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            // The conditional write matches nothing: destroyed meanwhile.
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "destroyed")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("destroyed meanwhile");
+
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![
+                restricted_egress().normalized().expect("valid"),
+                temps_agents::sandbox::SandboxEgressPolicy::internet(),
+            ],
+            "the stored policy is put back"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn the_egress_policy_of_an_agent_run_sandbox_is_not_changed_here() {
+        let data_root = unique_data_root("egress-agent-run");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, Some(42))]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("managed by the run");
+
+        assert!(
+            matches!(err, SandboxError::ManagedByAgentRun { run_id: 42, .. }),
+            "{err:?}"
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_reapplies_a_stored_restricted_policy() {
+        let data_root = unique_data_root("egress-resume");
+        let policy = restricted_egress();
+        let stopped = with_egress(row_with(PUBLIC_ID, "ephemeral", "stopped"), &policy);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stopped.clone()]])
+            // enforce_stored_egress_policy re-reads the row.
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([vec![with_egress(
+                row_with(PUBLIC_ID, "ephemeral", "running"),
+                &policy,
+            )]])
+            .append_query_results([vec![destroyed_event()]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let row = service.resume_sandbox(PUBLIC_ID, 1).await.expect("resumed");
+
+        assert_eq!(row.status, "running");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![policy.normalized().expect("valid")]
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_stops_a_sandbox_whose_restricted_policy_cannot_be_reapplied() {
+        let data_root = unique_data_root("egress-resume-fail");
+        let stopped = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "stopped"),
+            &restricted_egress(),
+        );
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([vec![stopped]])
+            .into_connection();
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let lifecycle = provider.lifecycle_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .resume_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("never runs with wider egress");
+
+        assert!(
+            matches!(err, SandboxError::EgressPolicyUnsupported { .. }),
+            "{err:?}"
+        );
+        assert_eq!(*lifecycle.lock().expect("calls"), vec!["start", "stop"]);
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_of_an_internet_sandbox_does_not_touch_its_policy() {
+        let data_root = unique_data_root("egress-resume-internet");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .append_query_results([vec![destroyed_event()]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        service.resume_sandbox(PUBLIC_ID, 1).await.expect("resumed");
+
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     #[test]
     fn eviction_guard_serializes_evictions_of_one_node() {
         let nodes = Arc::new(EvictingNodes::default());
@@ -10214,6 +10654,7 @@ mod storage_cleanup_tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(3600),

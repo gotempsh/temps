@@ -91,6 +91,7 @@ fn create_config(
         // Asked of every driver: the ones that cannot apply it must say so.
         disk_size_mb: Some(2048),
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: Some("none".to_string()),
         env_vars: HashMap::from([("EVAL_GREETING".to_string(), "from-env".to_string())]),
         idle_timeout: Duration::from_secs(600),

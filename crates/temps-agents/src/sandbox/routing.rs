@@ -294,6 +294,16 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).resize_disk(handle, new_size_mb).await
     }
 
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .set_egress_policy(handle, policy)
+            .await
+    }
+
     async fn take_snapshot(
         &self,
         handle: &SandboxHandle,
@@ -612,6 +622,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

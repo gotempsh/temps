@@ -13923,6 +13923,7 @@ mod tests {
             preview_password_hint: None,
             preview_access: Default::default(),
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

@@ -126,6 +126,11 @@ impl From<AgentError> for Problem {
                 .with_type("https://temps.sh/probs/sandbox-node-conflict")
                 .with_title("Sandbox Conflict On Worker Node")
                 .with_detail(error.to_string()),
+            AgentError::SandboxEgressPolicyUnsupported { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Egress Policy Not Supported By This Backend")
+                    .with_detail(error.to_string())
+            }
             AgentError::SecretNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Secret Not Found")
                 .with_detail(error.to_string()),

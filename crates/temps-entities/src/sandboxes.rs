@@ -2,8 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::entity::prelude::*;
+use sea_orm::FromJsonQueryResult;
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
+use temps_workload::SandboxEgressPolicy;
+
+/// JSON column wrapper for a sandbox's egress policy. The default is
+/// `internet`, the column default too.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, FromJsonQueryResult)]
+pub struct StoredEgressPolicy(pub SandboxEgressPolicy);
 
 /// Standalone sandboxes created via the `/v1/sandbox` API — the temps
 /// counterpart to `@vercel/sandbox`. Separate from workspace sessions
@@ -92,6 +99,14 @@ pub struct Model {
     /// its node for its whole lifetime.
     pub node_id: Option<i32>,
 
+    /// Which outside destinations the sandbox may reach, set by its owner
+    /// (`internet`, the default, or `restricted` to an allow-list of hosts
+    /// and CIDR blocks). Written only after the sandbox's backend applied
+    /// it, so the row is what the sandbox enforces.
+    #[serde(default)]
+    #[sea_orm(column_type = "JsonBinary")]
+    pub egress_policy: StoredEgressPolicy,
+
     pub created_at: DBDateTime,
     pub last_activity_at: DBDateTime,
     pub expires_at: DBDateTime,
@@ -140,3 +155,34 @@ impl Related<super::users::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_default_policy_is_the_column_default() {
+        // Must equal the DEFAULT of `sandboxes.egress_policy` in
+        // m20261024_000011_sandbox_egress_policy.
+        assert_eq!(
+            serde_json::to_string(&StoredEgressPolicy::default()).expect("serializes"),
+            r#"{"mode":"internet","rules":[]}"#
+        );
+    }
+
+    #[test]
+    fn a_row_serialized_before_the_column_reads_as_internet() {
+        let stored: StoredEgressPolicy = serde_json::from_str(
+            r#"{"mode":"restricted","rules":[{"host":"api.example.com","ports":[443]}]}"#,
+        )
+        .expect("parses");
+        assert!(stored.0.is_restricted());
+        #[derive(Deserialize)]
+        struct Partial {
+            #[serde(default)]
+            egress_policy: StoredEgressPolicy,
+        }
+        let old: Partial = serde_json::from_str("{}").expect("parses");
+        assert_eq!(old.egress_policy, StoredEgressPolicy::default());
+    }
+}

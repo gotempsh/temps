@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     Condition, ConditionKind, ConditionStatus, DriverCapabilities, DriverError, EgressProfile,
-    InstanceHandle, Isolation, RuntimeDriver, WorkloadRef,
+    InstanceHandle, Isolation, RuntimeDriver, SandboxEgressPolicy, WorkloadRef,
 };
 
 /// Which egress profiles a driver can enforce for a sandbox.
@@ -80,6 +80,9 @@ pub struct SandboxCapabilities {
     /// Run Docker inside the guest (never the host's socket).
     pub guest_docker: bool,
     pub egress: EgressSupport,
+    /// Enforce a `restricted` [`SandboxEgressPolicy`]: outbound traffic
+    /// limited to named hosts and CIDR blocks.
+    pub egress_rules: bool,
 }
 
 /// One thing a sandbox can need from a driver.
@@ -100,6 +103,8 @@ pub enum SandboxFeature {
     WorkspaceVolume,
     GuestDocker,
     Egress(EgressProfile),
+    /// A `restricted` egress policy: an allow-list of hosts and CIDR blocks.
+    EgressRules,
     /// The `Untrusted` safety caps (§4) a process-isolated driver must be
     /// able to apply: a memory ceiling and a pids cap. A microVM bounds both
     /// by its own size and kernel.
@@ -125,6 +130,7 @@ impl fmt::Display for SandboxFeature {
             SandboxFeature::Egress(EgressProfile::Open) => "open egress",
             SandboxFeature::Egress(EgressProfile::Restricted) => "restricted egress",
             SandboxFeature::Egress(EgressProfile::None) => "no-network egress",
+            SandboxFeature::EgressRules => "egress allow-lists (a restricted egress policy)",
             SandboxFeature::SafetyCaps => "the sandbox safety caps (memory and pids)",
         })
     }
@@ -151,6 +157,7 @@ pub fn supports(
         SandboxFeature::WorkspaceVolume => sandbox.workspace_volume,
         SandboxFeature::GuestDocker => sandbox.guest_docker,
         SandboxFeature::Egress(profile) => sandbox.egress.supports(profile),
+        SandboxFeature::EgressRules => sandbox.egress_rules,
         SandboxFeature::SafetyCaps => match driver.isolation {
             Isolation::MicroVm => true,
             Isolation::Process | Isolation::InHost => driver.limits.memory && driver.limits.pids,
@@ -433,6 +440,8 @@ pub struct SandboxCreate {
     pub limits: SandboxLimits,
     /// `None`: the driver's configured default.
     pub egress: Option<EgressProfile>,
+    /// Which destinations the sandbox may reach (normalized).
+    pub egress_policy: SandboxEgressPolicy,
     /// Host checkout seeding the work dir.
     pub host_work_dir: PathBuf,
     /// Named volume mounted at the work dir instead.
@@ -452,6 +461,7 @@ impl fmt::Debug for SandboxCreate {
             .field("env_keys", &env_keys)
             .field("limits", &self.limits)
             .field("egress", &self.egress)
+            .field("egress_policy", &self.egress_policy)
             .field("host_work_dir", &self.host_work_dir)
             .field("workspace_volume", &self.workspace_volume)
             .field("idle_timeout", &self.idle_timeout)
@@ -467,6 +477,9 @@ impl SandboxCreate {
         requirements.limits = self.limits.requested();
         if let Some(egress) = self.egress {
             requirements = requirements.require(SandboxFeature::Egress(egress));
+        }
+        if self.egress_policy.is_restricted() {
+            requirements = requirements.require(SandboxFeature::EgressRules);
         }
         if self.workspace_volume.is_some() {
             requirements = requirements.require(SandboxFeature::WorkspaceVolume);
@@ -850,6 +863,24 @@ pub trait SandboxExt: RuntimeDriver {
             &handle.name,
         ))
     }
+
+    /// Replace the egress policy of an existing sandbox. `policy` is
+    /// normalized. A driver without `egress_rules` already enforces the
+    /// default (`internet`) policy, so only a `restricted` one is refused.
+    async fn set_egress_policy(
+        &self,
+        handle: &InstanceHandle,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), DriverError> {
+        if policy.is_restricted() {
+            return Err(unsupported(
+                self.capabilities(),
+                "set_egress_policy",
+                &handle.name,
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -881,6 +912,11 @@ mod tests {
             pids: true,
             disk: true,
         }
+    }
+
+    fn sandbox_supports_rules(caps: &SandboxCapabilities) -> bool {
+        let driver = driver("docker", Isolation::Process, all_limits());
+        supports(&driver, caps, SandboxFeature::EgressRules)
     }
 
     fn sandbox(restricted: bool, workspace_volume: bool) -> SandboxCapabilities {
@@ -1079,6 +1115,7 @@ mod tests {
                 ..SandboxLimits::default()
             },
             egress: Some(EgressProfile::Restricted),
+            egress_policy: SandboxEgressPolicy::restricted(Vec::new()),
             host_work_dir: PathBuf::from("/tmp/x"),
             workspace_volume: Some("vol".into()),
             idle_timeout: Duration::from_secs(1),
@@ -1091,10 +1128,26 @@ mod tests {
                 SandboxFeature::Exec,
                 SandboxFeature::SafetyCaps,
                 SandboxFeature::Egress(EgressProfile::Restricted),
+                SandboxFeature::EgressRules,
                 SandboxFeature::WorkspaceVolume,
                 SandboxFeature::GuestDocker,
             ]
         );
+        // The default (internet) policy asks nothing extra of a driver.
+        let open = SandboxCreate {
+            egress_policy: SandboxEgressPolicy::default(),
+            ..create.clone()
+        };
+        assert!(!open
+            .requirements()
+            .features
+            .contains(&SandboxFeature::EgressRules));
+        let caps = SandboxCapabilities::default();
+        assert!(!sandbox_supports_rules(&caps));
+        assert!(sandbox_supports_rules(&SandboxCapabilities {
+            egress_rules: true,
+            ..caps
+        }));
         assert!(requirements.limits.disk);
         // Environment values never reach logs.
         let debug = format!("{create:?}");

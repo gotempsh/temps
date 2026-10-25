@@ -686,6 +686,19 @@ impl StandaloneSandboxRegistry {
         }
     }
 
+    /// Apply an egress policy to the sandbox's compute. Same recovery as
+    /// [`Self::start`]. Callers serialize it with other compute changes
+    /// through [`Self::begin_planned_downtime`].
+    pub async fn set_egress_policy(
+        &self,
+        id: i32,
+        public_id: &str,
+        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider.set_egress_policy(&handle, policy).await
+    }
+
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
     pub async fn resize_disk(
         &self,
@@ -1826,6 +1839,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1859,6 +1873,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

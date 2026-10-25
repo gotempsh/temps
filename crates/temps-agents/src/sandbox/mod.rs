@@ -34,6 +34,11 @@ pub fn home_volume_name_for_label(label: &str) -> String {
     )
 }
 
+/// A sandbox's outbound policy (which hosts and CIDR blocks it may reach).
+pub use temps_workload::{
+    EgressMode, EgressPolicyError, EgressRule, SandboxEgressPolicy, MAX_EGRESS_RULES,
+};
+
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
     SANDBOX_WORK_DIR,
@@ -221,6 +226,12 @@ pub struct SandboxCreateConfig {
     pub disk_size_mb: Option<u64>,
     /// Network access: "full", "restricted", "none"
     pub network_mode: Option<String>,
+    /// Which destinations the sandbox may reach once it has a network. The
+    /// default (`internet`) is any public destination on ports 80/443; a
+    /// `restricted` policy needs a backend with egress allow-lists (Docker)
+    /// and is refused with [`AgentError::SandboxEgressPolicyUnsupported`]
+    /// elsewhere.
+    pub egress_policy: SandboxEgressPolicy,
     /// Environment variables to inject (ANTHROPIC_API_KEY, etc.)
     pub env_vars: HashMap<String, String>,
     /// Maximum time the sandbox should stay alive without activity
@@ -249,6 +260,29 @@ impl SandboxCreateConfig {
                     "sandbox run {}: allow_docker requires the microsandbox backend; {} does not support guest Docker",
                     self.run_id, backend
                 ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The name a create request goes by in errors: the explicit label, or
+    /// the run id.
+    pub(crate) fn sandbox_label(&self) -> String {
+        self.container_name_override
+            .clone()
+            .unwrap_or_else(|| self.run_id.to_string())
+    }
+
+    /// Fail closed on a backend that cannot enforce a restricted egress
+    /// policy, rather than starting a sandbox with more access than asked.
+    pub(crate) fn refuse_restricted_egress(
+        &self,
+        backend: SandboxBackend,
+    ) -> Result<(), AgentError> {
+        if self.egress_policy.is_restricted() {
+            return Err(AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: self.sandbox_label(),
+                backend: backend.to_string(),
             });
         }
         Ok(())
@@ -1345,6 +1379,26 @@ done
                 self.name()
             ),
         })
+    }
+
+    /// Replace the egress policy of an existing sandbox, running or stopped.
+    /// `policy` is normalized. The new policy holds for every connection
+    /// opened after this returns; connections already open may be cut.
+    /// Default: the provider cannot enforce allow-lists, so `internet` (what
+    /// it already does) is accepted and `restricted` is refused with a typed
+    /// error.
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        if policy.is_restricted() {
+            return Err(AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: handle.sandbox_name.clone(),
+                backend: handle.backend.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Attempt to recover a sandbox after server restart (by naming convention).

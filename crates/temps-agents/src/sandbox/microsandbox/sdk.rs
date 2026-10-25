@@ -1188,6 +1188,9 @@ impl MicrosandboxSandboxProvider {
 impl SandboxProvider for MicrosandboxSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         let run_id = config.run_id;
+        // The SDK's network policy is all or host-only: it cannot hold a
+        // per-destination allow-list, so a restricted policy fails closed.
+        config.refuse_restricted_egress(SandboxBackend::Microsandbox)?;
         // An explicit create on an unready host fails with the precise
         // reason — never a silent fallback to another backend.
         self.probe()
@@ -2209,6 +2212,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

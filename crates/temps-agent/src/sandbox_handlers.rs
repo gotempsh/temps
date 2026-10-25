@@ -47,13 +47,13 @@ use temps_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
 use temps_agents::sandbox::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteByteChannel,
     RemoteByteChannelError, RemoteByteChannelQuery, RemoteCreateRequest, RemoteDestroyRequest,
-    RemoteErrorBody, RemoteExecFrame, RemoteExecRequest, RemoteExecResponse, RemoteFileContents,
-    RemoteHandleRequest, RemoteImageIdentityResponse, RemoteKillRequest, RemoteOkResponse,
-    RemoteReadFileRequest, RemoteRecoverHarnessRequest, RemoteRecoverRequest,
-    RemoteReleaseOrphanedRequest, RemoteResizeDiskRequest, RemoteRuntimeCompatibility,
-    RemoteStatusResponse, RemoteWriteDirectoryRequest, RemoteWriteFileRequest,
-    EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX, WORKER_EXEC_OUTPUT_LIMIT,
-    WORKER_READ_FILE_MAX_BYTES,
+    RemoteEgressPolicyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest,
+    RemoteExecResponse, RemoteFileContents, RemoteHandleRequest, RemoteImageIdentityResponse,
+    RemoteKillRequest, RemoteOkResponse, RemoteReadFileRequest, RemoteRecoverHarnessRequest,
+    RemoteRecoverRequest, RemoteReleaseOrphanedRequest, RemoteResizeDiskRequest,
+    RemoteRuntimeCompatibility, RemoteStatusResponse, RemoteWriteDirectoryRequest,
+    RemoteWriteFileRequest, EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX,
+    WORKER_EXEC_OUTPUT_LIMIT, WORKER_READ_FILE_MAX_BYTES,
 };
 use temps_agents::sandbox::user::SANDBOX_WORK_DIR;
 use temps_agents::sandbox::{
@@ -259,7 +259,8 @@ async fn require_handle(
 
 /// Map a provider error to the status the control plane's client reads:
 /// 404 = the container is gone, 400 = bad request, 422 = not available on a
-/// worker node, 503 = this node can't serve sandboxes right now, 504 = the
+/// worker node, 501 = the backend cannot enforce a restricted egress policy,
+/// 503 = this node can't serve sandboxes right now, 504 = the
 /// guest did not answer a terminal attach in time, 500 = the operation itself
 /// failed.
 fn provider_err(e: AgentError) -> ApiError {
@@ -275,6 +276,9 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
         AgentError::SandboxConflictOnNode { .. } => StatusCode::CONFLICT,
+        // Kept apart from 422 (not available on worker nodes): this backend
+        // can never enforce the policy, wherever it runs.
+        AgentError::SandboxEgressPolicyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
         AgentError::SandboxTerminalTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -545,6 +549,12 @@ pub async fn create_sandbox(
             format!("invalid sandbox label '{}'", req.label),
         ));
     }
+    let egress_policy = req.egress_policy.normalized().map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("sandbox '{}': {}", req.label, e),
+        )
+    })?;
     let claim = CreateClaim::acquire(&state, &req.label)?;
     let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.label);
     let replacing = match host.containers.find(&container_name).await {
@@ -630,6 +640,7 @@ pub async fn create_sandbox(
         pids_limit: req.pids_limit,
         disk_size_mb: req.disk_size_mb,
         allow_docker: false,
+        egress_policy,
         network_mode: req.network_mode,
         env_vars: req.env_vars,
         idle_timeout: Duration::from_secs(req.idle_timeout_secs),
@@ -1679,6 +1690,50 @@ pub async fn resize_sandbox_disk(
     Ok(ok())
 }
 
+/// `POST /agent/sandboxes/egress-policy`
+///
+/// Replace the egress policy of a sandbox on this node, running or stopped.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/egress-policy",
+    request_body = RemoteEgressPolicyRequest,
+    responses(
+        (status = 200, description = "Policy applied", body = RemoteOkResponse),
+        (status = 400, description = "Not a sandbox handle, or an invalid policy", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Sandbox container does not exist", body = RemoteErrorBody),
+        (status = 500, description = "Applying the policy failed", body = RemoteErrorBody),
+        (status = 501, description = "The sandbox's backend cannot enforce a restricted policy", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_sandbox_egress_policy(
+    State(state): HostState,
+    Json(req): Json<RemoteEgressPolicyRequest>,
+) -> ApiResult<RemoteOkResponse> {
+    let policy = req.policy.normalized().map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            format!("sandbox '{}': {}", req.handle.sandbox_name, e),
+        )
+    })?;
+    let host = host(&state)?;
+    let handle = require_handle(host, req.handle).await?;
+    host.provider
+        .set_egress_policy(&handle, &policy)
+        .await
+        .map_err(provider_err)?;
+    tracing::info!(
+        sandbox = %handle.sandbox_name,
+        mode = %policy.mode,
+        rules = policy.rules.len(),
+        "Applied sandbox egress policy for control plane"
+    );
+    Ok(ok())
+}
+
 /// `POST /agent/sandboxes/image-identity`
 #[utoipa::path(
     tag = "Sandboxes",
@@ -1919,7 +1974,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use temps_agents::sandbox::{KillSignal, SandboxBackend, SandboxExecResult};
+    use temps_agents::sandbox::{
+        EgressRule, KillSignal, SandboxBackend, SandboxEgressPolicy, SandboxExecResult,
+    };
     use tokio::sync::Notify;
 
     #[test]
@@ -2040,6 +2097,12 @@ mod tests {
         /// Command and environment of every `exec` / `exec_streamed` call
         /// (`exec_as_root` reaches `exec` through the trait default).
         exec_calls: Mutex<Vec<ExecCall>>,
+        /// The egress policy of every create.
+        created_policies: Mutex<Vec<SandboxEgressPolicy>>,
+        /// (resolved container id, policy) of every `set_egress_policy`.
+        egress_calls: Mutex<Vec<(String, SandboxEgressPolicy)>>,
+        /// Refuse restricted policies like a backend without allow-lists.
+        egress_unsupported: bool,
     }
 
     impl FakeProvider {
@@ -2058,6 +2121,10 @@ mod tests {
             if let Some(gate) = &self.create_gate {
                 gate.notified().await;
             }
+            self.created_policies
+                .lock()
+                .unwrap()
+                .push(config.egress_policy.clone());
             if self.create_fails {
                 return Err(AgentError::SandboxCreationFailed {
                     run_id: config.run_id,
@@ -2191,6 +2258,23 @@ mod tests {
         }
         async fn release_orphaned_resources(&self, label: &str) -> Result<(), AgentError> {
             self.released.lock().unwrap().push(label.to_string());
+            Ok(())
+        }
+        async fn set_egress_policy(
+            &self,
+            handle: &SandboxHandle,
+            policy: &SandboxEgressPolicy,
+        ) -> Result<(), AgentError> {
+            if self.egress_unsupported && policy.is_restricted() {
+                return Err(AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox: handle.sandbox_name.clone(),
+                    backend: "microsandbox".into(),
+                });
+            }
+            self.egress_calls
+                .lock()
+                .unwrap()
+                .push((handle.sandbox_id.clone(), policy.clone()));
             Ok(())
         }
         async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
@@ -2335,10 +2419,170 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             network_mode: None,
+            egress_policy: SandboxEgressPolicy::default(),
             env_vars: HashMap::new(),
             idle_timeout_secs: 60,
             backend: None,
         })
+    }
+
+    /// Serve `node`'s real sandbox routes (auth included) and return a
+    /// control-plane provider pointed at them.
+    async fn control_plane_for(
+        node: &Node,
+    ) -> temps_agents::sandbox::remote::RemoteSandboxProvider {
+        let app = crate::server::sandbox_router(
+            node.state.clone(),
+            Arc::new(crate::auth::AgentAuth::new("round-trip-token")),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        temps_agents::sandbox::remote::RemoteSandboxProvider::new(
+            2,
+            "worker-2".into(),
+            format!("http://{addr}"),
+            "round-trip-token".into(),
+            reqwest::Client::new(),
+        )
+    }
+
+    fn restricted() -> SandboxEgressPolicy {
+        SandboxEgressPolicy::restricted(vec![
+            EgressRule::host("api.example.com", &[443]),
+            EgressRule::cidr("1.1.1.0/24", &[]),
+        ])
+    }
+
+    fn stamped(handle: SandboxHandle) -> SandboxHandle {
+        SandboxHandle {
+            node_id: Some(2),
+            ..handle
+        }
+    }
+
+    #[tokio::test]
+    async fn an_egress_policy_round_trips_from_the_control_plane_to_the_provider() {
+        let n = node();
+        let control_plane = control_plane_for(&n).await;
+        let policy = restricted().normalized().unwrap();
+        control_plane
+            .set_egress_policy(
+                &stamped(sandbox_handle("temps-sandbox-abc", "forged-id")),
+                &policy,
+            )
+            .await
+            .unwrap();
+        let calls = n.provider.egress_calls.lock().unwrap().clone();
+        // Applied to the container the node resolved, with the policy intact.
+        assert_eq!(calls, vec![("real-id".to_string(), policy)]);
+    }
+
+    #[tokio::test]
+    async fn a_restricted_create_round_trips_and_is_confirmed_on_the_node() {
+        // A stopped sandbox the create replaces, so the confirmation that
+        // follows the create resolves it.
+        let n = node_with(
+            FakeProvider::default(),
+            vec![(
+                "temps-sandbox-new1",
+                NamedContainer::Sandbox {
+                    id: "new1-id".into(),
+                    running: false,
+                },
+            )],
+        );
+        let control_plane = control_plane_for(&n).await;
+        let config = SandboxCreateConfig {
+            node_id: Some(2),
+            run_id: 1,
+            container_name_override: Some("new1".into()),
+            host_work_dir: PathBuf::from("/unused"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            allow_docker: false,
+            egress_policy: restricted(),
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+            owner_user_id: None,
+        };
+        let handle = control_plane.create(config).await.unwrap();
+        assert_eq!(handle.sandbox_name, "temps-sandbox-new1");
+        let normalized = restricted().normalized().unwrap();
+        assert_eq!(
+            *n.provider.created_policies.lock().unwrap(),
+            vec![normalized.clone()]
+        );
+        assert_eq!(
+            *n.provider.egress_calls.lock().unwrap(),
+            vec![("new1-id".to_string(), normalized)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_backend_without_allow_lists_answers_with_the_typed_refusal() {
+        let n = node_with(
+            FakeProvider {
+                egress_unsupported: true,
+                ..FakeProvider::default()
+            },
+            Vec::new(),
+        );
+        let control_plane = control_plane_for(&n).await;
+        let err = control_plane
+            .set_egress_policy(
+                &stamped(sandbox_handle("temps-sandbox-abc", "x")),
+                &restricted().normalized().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxEgressPolicyUnsupported { .. }),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("worker-2"), "{err}");
+        // `internet` is still accepted.
+        control_plane
+            .set_egress_policy(
+                &stamped(sandbox_handle("temps-sandbox-abc", "x")),
+                &SandboxEgressPolicy::internet(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_node_validates_the_policy_itself() {
+        let n = node();
+        let control_plane = control_plane_for(&n).await;
+        let invalid =
+            SandboxEgressPolicy::restricted(vec![EgressRule::host("api.example.com", &[0])]);
+        let err = control_plane
+            .set_egress_policy(&stamped(sandbox_handle("temps-sandbox-abc", "x")), &invalid)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AgentError::Validation { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("port 0"), "{text}");
+        assert!(text.contains("temps-sandbox-abc"), "{text}");
+        assert!(n.provider.egress_calls.lock().unwrap().is_empty());
+
+        // And on create, before anything is created.
+        let mut req = create_req("bad1");
+        req.0.egress_policy = invalid;
+        let Err(err) = create_sandbox(State(n.state.clone()), req).await else {
+            panic!("an invalid egress policy must refuse the create");
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(n.provider.created_policies.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

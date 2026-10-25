@@ -2024,6 +2024,7 @@ impl FirecrackerSandboxProvider {
 impl SandboxProvider for FirecrackerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
+        config.refuse_restricted_egress(super::SandboxBackend::Firecracker)?;
         let name = self.resolve_name(&config);
         let vm_dir = self.config.vm_dir(&name);
         let image = config
@@ -2497,6 +2498,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Firecracker)?;
+        config.refuse_restricted_egress(super::SandboxBackend::Firecracker)?;
         if artifact.backend != super::SandboxBackend::Firecracker {
             return Err(AgentError::SandboxCreationFailed {
                 run_id: config.run_id,
@@ -3022,6 +3024,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -3749,6 +3752,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: Some(0),
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

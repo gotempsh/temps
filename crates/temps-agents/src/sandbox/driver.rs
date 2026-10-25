@@ -90,6 +90,9 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     restricted: true,
                     none: true,
                 },
+                // The per-sandbox egress proxy enforces host and CIDR
+                // allow-lists.
+                egress_rules: true,
             },
         ),
         SandboxBackend::Firecracker => (
@@ -137,6 +140,9 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     restricted: false,
                     none: true,
                 },
+                // A TAP device routes straight out; there is no proxy to
+                // hold an allow-list.
+                egress_rules: false,
             },
         ),
         SandboxBackend::Microsandbox => (
@@ -177,6 +183,9 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     restricted: true,
                     none: true,
                 },
+                // The SDK's network policy is all-or-host-only; it has no
+                // per-destination allow-list.
+                egress_rules: false,
             },
         ),
         // The dev-only fork-exec fallback is not a driver: it has no
@@ -255,6 +264,12 @@ pub fn sandbox_create_from(
         .clone()
         .unwrap_or_else(|| config.run_id.to_string());
     let egress = egress_from_network_mode(config.network_mode.as_deref(), &label)?;
+    let egress_policy = config
+        .egress_policy
+        .normalized()
+        .map_err(|e| AgentError::Validation {
+            message: format!("sandbox '{}': {}", label, e),
+        })?;
     let mut env: Vec<(String, String)> = config.env_vars.into_iter().collect();
     env.sort();
     Ok(SandboxCreate {
@@ -270,6 +285,7 @@ pub fn sandbox_create_from(
             disk_mb: config.disk_size_mb,
         },
         egress,
+        egress_policy,
         host_work_dir: config.host_work_dir,
         workspace_volume: config.workspace_volume,
         idle_timeout: config.idle_timeout,
@@ -289,6 +305,7 @@ fn create_config_for(backend: SandboxBackend, create: SandboxCreate) -> SandboxC
         memory_limit_mb: create.limits.memory_mb,
         pids_limit: create.limits.pids,
         disk_size_mb: create.limits.disk_mb,
+        egress_policy: create.egress_policy,
         network_mode: create.egress.map(|e| network_mode_for(e).to_string()),
         env_vars: create.env.into_iter().collect::<HashMap<_, _>>(),
         idle_timeout: create.idle_timeout,
@@ -1028,6 +1045,17 @@ impl SandboxExt for SandboxBackendDriver {
             .await
             .map_err(|e| self.fail("resize_disk", &handle.name, e))
     }
+
+    async fn set_egress_policy(
+        &self,
+        handle: &InstanceHandle,
+        policy: &temps_workload::SandboxEgressPolicy,
+    ) -> Result<(), DriverError> {
+        self.provider
+            .set_egress_policy(&self.handle(handle), policy)
+            .await
+            .map_err(|e| self.fail("set_egress_policy", &handle.name, e))
+    }
 }
 
 #[cfg(test)]
@@ -1091,6 +1119,9 @@ mod tests {
             memory_limit_mb: Some(256),
             pids_limit: Some(64),
             disk_size_mb: Some(2048),
+            egress_policy: temps_workload::SandboxEgressPolicy::restricted(vec![
+                temps_workload::EgressRule::host("API.example.com", &[]),
+            ]),
             network_mode: Some("restricted".into()),
             env_vars: HashMap::from([("A".into(), "1".into())]),
             idle_timeout: std::time::Duration::from_secs(9),
@@ -1110,6 +1141,68 @@ mod tests {
         assert_eq!(back.network_mode.as_deref(), Some("restricted"));
         assert_eq!(back.env_vars.get("A").map(String::as_str), Some("1"));
         assert_eq!(back.backend, Some(SandboxBackend::Docker));
+        // The policy travels normalized.
+        assert_eq!(
+            back.egress_policy.rules,
+            vec![temps_workload::EgressRule::host(
+                "api.example.com",
+                &[80, 443]
+            )]
+        );
+        assert!(back.egress_policy.is_restricted());
+    }
+
+    #[test]
+    fn an_invalid_egress_policy_is_refused_naming_the_sandbox() {
+        let mut config = test_config();
+        config.egress_policy = temps_workload::SandboxEgressPolicy::restricted(vec![
+            temps_workload::EgressRule::cidr("10.0.0.0/8", &[]),
+        ]);
+        let owner = temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Sandbox, 7);
+        let error = sandbox_create_from(config, owner).unwrap_err();
+        assert!(matches!(error, AgentError::Validation { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(message.contains("sandbox 'abc'"), "{message}");
+        assert!(message.contains("10.0.0.0/8"), "{message}");
+    }
+
+    #[test]
+    fn only_docker_enforces_egress_allow_lists() {
+        for (backend, expected) in [
+            (SandboxBackend::Docker, true),
+            (SandboxBackend::Firecracker, false),
+            (SandboxBackend::Microsandbox, false),
+            (SandboxBackend::Local, false),
+        ] {
+            let (driver, sandbox) = capabilities_for(backend);
+            assert_eq!(
+                supports(&driver, &sandbox, SandboxFeature::EgressRules),
+                expected,
+                "{backend}"
+            );
+        }
+    }
+
+    fn test_config() -> SandboxCreateConfig {
+        SandboxCreateConfig {
+            allow_docker: false,
+            run_id: 7,
+            container_name_override: Some("abc".into()),
+            host_work_dir: PathBuf::from("/tmp/w"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            egress_policy: Default::default(),
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(9),
+            backend: None,
+            owner_user_id: None,
+            node_id: None,
+        }
     }
 
     #[test]

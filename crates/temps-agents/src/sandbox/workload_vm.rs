@@ -728,6 +728,7 @@ impl RuntimeDriver for FirecrackerWorkloadDriver {
                 .map(|bytes| (bytes as u64).div_ceil(1024 * 1024)),
             pids_limit: None,
             disk_size_mb: spec.limits.disk_mb.map(u64::from),
+            egress_policy: Default::default(),
             network_mode: Some("full".to_string()),
             // Persisted by the backend in the 0700 VM dir as a 0600 file,
             // exactly as a sandbox's variables, so a restart can respawn.

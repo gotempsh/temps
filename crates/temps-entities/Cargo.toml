@@ -13,6 +13,7 @@ homepage.workspace = true
 [dependencies]
 temps-core = { path = "../temps-core" }
 temps-workload-ingress = { path = "../temps-workload-ingress" }
+temps-workload = { path = "../temps-workload" }
 sea-orm = { workspace = true }
 serde = { workspace = true }
 chrono = { workspace = true }

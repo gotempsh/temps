@@ -159,6 +159,16 @@ pub enum AgentError {
         reason: String,
     },
 
+    /// A sandbox asked for a `restricted` egress policy (an allow-list of
+    /// hosts and CIDR blocks) on a backend that cannot enforce one. The
+    /// default `internet` policy works on every backend.
+    #[error(
+        "Sandbox '{sandbox}' runs on the {backend} backend, which cannot enforce a restricted \
+         egress policy (an allow-list of hosts and CIDR blocks); use the docker backend, or \
+         egress mode 'internet'"
+    )]
+    SandboxEgressPolicyUnsupported { sandbox: String, backend: String },
+
     #[error("Secret '{name}' not found")]
     SecretNotFound { name: String },
 

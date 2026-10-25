@@ -240,7 +240,7 @@ pub fn build_router(
 /// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
 /// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
 /// other route keeps axum's 2 MiB default.
-fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
     let upload_slot =
         || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
     Router::new()
@@ -309,6 +309,10 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
         .route(
             "/agent/sandboxes/resize-disk",
             post(sandbox_handlers::resize_sandbox_disk),
+        )
+        .route(
+            "/agent/sandboxes/egress-policy",
+            post(sandbox_handlers::set_sandbox_egress_policy),
         )
         .route(
             "/agent/sandboxes/image-identity",
@@ -1367,7 +1371,7 @@ mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 18] = [
+    const SANDBOX_ROUTES: [&str; 19] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1383,6 +1387,7 @@ mod tests {
         "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
         "/agent/sandboxes/resize-disk",
+        "/agent/sandboxes/egress-policy",
         "/agent/sandboxes/image-identity",
         "/agent/sandboxes/agent-runtime-check",
         "/agent/sandboxes/recover-agent-harness",

@@ -18,6 +18,7 @@
 
 pub mod condition;
 pub mod driver;
+pub mod egress;
 pub mod labels;
 pub mod reference;
 pub mod resources;
@@ -34,6 +35,10 @@ pub use driver::{
     InstanceStatus, LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream,
     NetworkAttachment, PortBinding, PreparedArtifact, ResolverSource, RuntimeDriver, SecretFile,
     SnapshotRef, VolumeKinds,
+};
+pub use egress::{
+    never_reachable, EgressDenial, EgressMode, EgressPolicyError, EgressRule, SandboxEgressPolicy,
+    DEFAULT_EGRESS_PORTS, MAX_EGRESS_PORTS_PER_RULE, MAX_EGRESS_RULES,
 };
 pub use reference::{InvalidWorkloadRef, UnknownWorkloadKind, WorkloadKind, WorkloadRef};
 pub use resources::{ResourceAmounts, Resources};

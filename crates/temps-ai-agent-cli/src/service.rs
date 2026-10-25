@@ -1813,6 +1813,7 @@ impl AgentCliAiService {
                     pids_limit: None,
                     disk_size_mb: None,
                     allow_docker: false,
+                    egress_policy: Default::default(),
                     network_mode: None,
                     // No host credential, API key, or browser value crosses
                     // this boundary. A harness authenticates inside its own
@@ -5056,6 +5057,7 @@ fn candidate_probe_create_config(
         pids_limit: Some(128),
         disk_size_mb: None,
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: Some("restricted".into()),
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(120),

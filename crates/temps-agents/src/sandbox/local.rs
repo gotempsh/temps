@@ -26,6 +26,7 @@ impl LocalSandboxProvider {
 impl SandboxProvider for LocalSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Local)?;
+        config.refuse_restricted_egress(super::SandboxBackend::Local)?;
         let sandbox_name = format!("local-sandbox-{}", config.run_id);
         tracing::debug!(
             "LocalSandboxProvider: creating sandbox {} at {:?}",
@@ -319,6 +320,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(3600),

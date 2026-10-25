@@ -171,6 +171,9 @@ pub struct RemoteCreateRequest {
     pub pids_limit: Option<i64>,
     pub disk_size_mb: Option<u64>,
     pub network_mode: Option<String>,
+    /// Which destinations the sandbox may reach. Absent = `internet`.
+    #[serde(default)]
+    pub egress_policy: super::SandboxEgressPolicy,
     pub env_vars: HashMap<String, String>,
     pub idle_timeout_secs: u64,
     pub backend: Option<SandboxBackend>,
@@ -414,6 +417,14 @@ pub struct RemoteErrorBody {
 pub struct RemoteResizeDiskRequest {
     pub handle: SandboxHandle,
     pub new_size_mb: u64,
+}
+
+/// `POST /agent/sandboxes/egress-policy` — replace a sandbox's egress
+/// policy on the node.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteEgressPolicyRequest {
+    pub handle: SandboxHandle,
+    pub policy: super::SandboxEgressPolicy,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -1142,6 +1153,27 @@ impl RemoteSandboxProvider {
                     operation,
                 )
             }
+            // The sandbox's backend on the worker cannot enforce a restricted
+            // egress policy.
+            (reqwest::StatusCode::NOT_IMPLEMENTED, message) => {
+                tracing::debug!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    operation,
+                    message = message.as_deref().unwrap_or_default(),
+                    "Worker node cannot enforce a restricted egress policy"
+                );
+                AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox: format!(
+                        "{} on worker node '{}'",
+                        handle.map(|h| h.sandbox_name.as_str()).unwrap_or("sandbox"),
+                        self.node_name
+                    ),
+                    backend: handle
+                        .map(|h| h.backend.to_string())
+                        .unwrap_or_else(|| "worker's".to_string()),
+                }
+            }
             (_, Some(message)) => self.failed(handle, operation, message),
             // A worker agent older than ADR-048 has no sandbox routes, so
             // axum answers a bare 404 with no error body.
@@ -1454,6 +1486,13 @@ impl SandboxProvider for RemoteSandboxProvider {
         if config.backend == Some(SandboxBackend::Firecracker) {
             return Err(self.unsupported(&label, "The firecracker backend"));
         }
+        let egress_policy =
+            config
+                .egress_policy
+                .normalized()
+                .map_err(|e| AgentError::Validation {
+                    message: format!("sandbox '{}': {}", label, e),
+                })?;
         let body = RemoteCreateRequest {
             run_id: config.run_id,
             label,
@@ -1471,6 +1510,7 @@ impl SandboxProvider for RemoteSandboxProvider {
             network_mode: config
                 .network_mode
                 .or_else(|| self.defaults.network_mode.clone()),
+            egress_policy: egress_policy.clone(),
             env_vars: config.env_vars,
             idle_timeout_secs: config.idle_timeout.as_secs(),
             backend: config.backend,
@@ -1493,7 +1533,34 @@ impl SandboxProvider for RemoteSandboxProvider {
                 },
                 other => other,
             })?;
-        Ok(self.stamp(handle))
+        let handle = self.stamp(handle);
+        if egress_policy.is_restricted() {
+            // A node running an older temps drops the field it does not know
+            // and would start the sandbox with open egress. Re-applying the
+            // policy through the operation that must exist on a node that
+            // understands it fails closed instead.
+            if let Err(e) = self.set_egress_policy(&handle, &egress_policy).await {
+                if let Err(cleanup) = self.destroy(&handle, true).await {
+                    tracing::warn!(
+                        node_id = self.node_id,
+                        node_name = %self.node_name,
+                        sandbox = %handle.sandbox_name,
+                        error = %cleanup,
+                        "Failed to remove a sandbox whose egress policy the node did not confirm"
+                    );
+                }
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: format!("{} (node '{}')", REMOTE_PROVIDER_NAME, self.node_name),
+                    reason: format!(
+                        "the node did not confirm the sandbox's restricted egress policy, \
+                         so the sandbox was removed: {}",
+                        e
+                    ),
+                });
+            }
+        }
+        Ok(handle)
     }
 
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
@@ -1928,6 +1995,24 @@ impl SandboxProvider for RemoteSandboxProvider {
         .await
     }
 
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.call_ok(
+            "/agent/sandboxes/egress-policy",
+            &RemoteEgressPolicyRequest {
+                handle: Self::local_handle(handle),
+                policy: policy.clone(),
+            },
+            LIFECYCLE_TIMEOUT,
+            handle,
+            "egress policy update",
+        )
+        .await
+    }
+
     fn name(&self) -> &str {
         REMOTE_PROVIDER_NAME
     }
@@ -2215,6 +2300,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: Default::default(),
             idle_timeout: Duration::from_secs(60),
@@ -2577,6 +2663,169 @@ mod tests {
                 body["handle"]["sandbox_name"], "temps-sandbox-abc",
                 "{path}"
             );
+        }
+    }
+
+    fn restricted_policy() -> crate::sandbox::SandboxEgressPolicy {
+        crate::sandbox::SandboxEgressPolicy::restricted(vec![crate::sandbox::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+    }
+
+    type EgressReply = std::sync::Arc<(u16, Option<serde_json::Value>)>;
+
+    /// A fake worker that creates `temps-sandbox-<label>` and answers the
+    /// egress-policy route with `egress_status` (a bare status when the body
+    /// is `None`, like a node whose agent predates the route).
+    async fn fake_create_agent(
+        egress_status: u16,
+        egress_body: Option<serde_json::Value>,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use axum::{extract::State, http::StatusCode, http::Uri, response::IntoResponse, Json};
+        type Calls = std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+        let calls: Calls = Default::default();
+        let egress: EgressReply = std::sync::Arc::new((egress_status, egress_body));
+        let app = axum::Router::new()
+            .fallback(
+                |State((calls, egress)): State<(Calls, EgressReply)>,
+                 uri: Uri,
+                 Json(req): Json<serde_json::Value>| async move {
+                    let path = uri.path().to_string();
+                    calls.lock().await.push((path.clone(), req.clone()));
+                    match path.as_str() {
+                        "/agent/sandboxes" => {
+                            let label = req["label"].as_str().unwrap_or_default();
+                            let created = handle(&format!("temps-sandbox-{label}"));
+                            Json(serde_json::to_value(created).unwrap()).into_response()
+                        }
+                        "/agent/sandboxes/egress-policy" => {
+                            let status = StatusCode::from_u16(egress.0).unwrap();
+                            match &egress.1 {
+                                Some(body) => (status, Json(body.clone())).into_response(),
+                                None => status.into_response(),
+                            }
+                        }
+                        _ => Json(serde_json::json!({"ok": true})).into_response(),
+                    }
+                },
+            )
+            .with_state((calls.clone(), egress));
+        (serve(app).await, calls)
+    }
+
+    #[tokio::test]
+    async fn a_restricted_create_sends_the_policy_and_has_the_node_confirm_it() {
+        let (url, calls) = fake_create_agent(200, Some(serde_json::json!({"ok": true}))).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = crate::sandbox::SandboxEgressPolicy::restricted(vec![
+            crate::sandbox::EgressRule::host("API.example.com.", &[443]),
+        ]);
+        let handle = provider.create(config).await.unwrap();
+        assert_eq!(handle.node_id, Some(2));
+        let calls = calls.lock().await;
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/agent/sandboxes", "/agent/sandboxes/egress-policy"]
+        );
+        // Normalized before it leaves the control plane.
+        let sent = &calls[0].1["egress_policy"];
+        assert_eq!(sent["mode"], "restricted");
+        assert_eq!(sent["rules"][0]["host"], "api.example.com");
+        assert_eq!(calls[1].1["policy"], *sent);
+        assert!(calls[1].1["handle"]["node_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn an_internet_create_needs_no_confirmation() {
+        let (url, calls) = fake_create_agent(500, None).await;
+        let provider = provider_at(&url);
+        provider.create(create_config()).await.unwrap();
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["egress_policy"]["mode"], "internet");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_cannot_confirm_a_restricted_policy_gets_its_sandbox_removed() {
+        // An agent without the route: axum's bare 404.
+        let (url, calls) = fake_create_agent(404, None).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = restricted_policy();
+        let err = provider.create(config).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxCreationFailed { .. }),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("did not confirm"), "{text}");
+        assert!(text.contains("worker-2"), "{text}");
+        let calls = calls.lock().await;
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/agent/sandboxes",
+                "/agent/sandboxes/egress-policy",
+                "/agent/sandboxes/destroy"
+            ]
+        );
+        assert_eq!(calls[2].1["handle"]["sandbox_name"], "temps-sandbox-abc");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_policy_never_reaches_the_node() {
+        let (url, calls) = fake_create_agent(200, None).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = crate::sandbox::SandboxEgressPolicy::restricted(vec![
+            crate::sandbox::EgressRule::host("a.*.example.com", &[]),
+        ]);
+        let err = provider.create(config).await.unwrap_err();
+        assert!(matches!(err, AgentError::Validation { .. }), "{err:?}");
+        assert!(err.to_string().contains("a.*.example.com"), "{err}");
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_egress_policy_is_forwarded_and_a_501_is_the_typed_refusal() {
+        let (url, calls) = fake_driver_agent().await;
+        let provider = provider_at(&url);
+        let policy = restricted_policy().normalized().unwrap();
+        provider
+            .set_egress_policy(&remote_handle(), &policy)
+            .await
+            .unwrap();
+        let calls = calls.lock().await;
+        assert_eq!(calls[0].0, "/agent/sandboxes/egress-policy");
+        assert_eq!(
+            calls[0].1["policy"]["rules"][0]["ports"],
+            serde_json::json!([443])
+        );
+        assert!(calls[0].1["handle"]["node_id"].is_null());
+
+        let (url, _) = fake_agent(
+            501,
+            Some(serde_json::json!({"error": "cannot enforce a restricted egress policy"})),
+        )
+        .await;
+        let err = provider_at(&url)
+            .set_egress_policy(&remote_handle(), &policy)
+            .await
+            .unwrap_err();
+        match &err {
+            AgentError::SandboxEgressPolicyUnsupported { sandbox, backend } => {
+                assert!(sandbox.contains("temps-sandbox-abc"), "{sandbox}");
+                assert!(sandbox.contains("worker-2"), "{sandbox}");
+                assert_eq!(backend, "docker");
+            }
+            other => panic!("expected the typed refusal, got {other:?}"),
         }
     }
 

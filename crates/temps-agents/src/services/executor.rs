@@ -834,6 +834,7 @@ impl AgentExecutor {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some(global_sandbox.network_mode.clone()),
             env_vars: sandbox_env,
             idle_timeout: Duration::from_secs(timeout_seconds as u64 + 60),

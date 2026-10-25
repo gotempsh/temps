@@ -285,6 +285,14 @@ pub enum SandboxError {
         feature: String,
     },
 
+    /// The sandbox's backend cannot enforce a `restricted` egress policy
+    /// (only Docker sandboxes can). The request is well-formed; it just
+    /// cannot be honoured where the sandbox runs. Mapped to HTTP 422.
+    #[error(
+        "Sandbox {sandbox_id} runs on the {backend} backend, which cannot restrict egress to an allow-list of hosts and CIDR blocks. Use egress mode 'internet' for it, or create the sandbox on the docker backend."
+    )]
+    EgressPolicyUnsupported { sandbox_id: String, backend: String },
+
     /// The sandbox's worker node refused the operation because it would
     /// replace a live sandbox there (ADR-048). Mapped to HTTP 409.
     #[error("Sandbox {sandbox_id} conflicts with existing state on its worker node: {reason}")]
@@ -494,6 +502,14 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             node_name,
             feature,
         },
+        // A restricted egress policy on a backend that cannot enforce one: a
+        // 422 naming the backend, never a silently wider policy.
+        AgentError::SandboxEgressPolicyUnsupported { backend, .. } => {
+            SandboxError::EgressPolicyUnsupported {
+                sandbox_id: sandbox_id.to_string(),
+                backend,
+            }
+        }
         // ADR-048: the worker refused to replace a live sandbox — a 409, and
         // nothing is torn down for it.
         conflict @ AgentError::SandboxConflictOnNode { .. } => SandboxError::NodeConflict {
@@ -516,6 +532,32 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unenforceable_egress_policy_is_a_422_naming_the_backend() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: "temps-sandbox-abc".into(),
+                backend: "firecracker".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::EgressPolicyUnsupported { sandbox_id, backend }
+                if sandbox_id == "sbx_abc" && backend == "firecracker"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("sbx_abc") && text.contains("firecracker"),
+            "{text}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
 
     #[test]
     fn worker_conflicts_are_409s_not_failures() {

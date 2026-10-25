@@ -864,6 +864,7 @@ pub async fn smoke_test_agent(
             // and cloud-metadata endpoints.  Control-plane connectivity checks
             // must be done from outside the container by polling agent_run
             // status from the test harness, not from inside via localhost.
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: test_env,
             idle_timeout: std::time::Duration::from_secs(60),

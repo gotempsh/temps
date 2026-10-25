@@ -21,6 +21,11 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 # `AsyncWrite`, for the sandbox byte channels.
 tokio = { workspace = true }
+# Only for API schemas of the types products expose (the egress policy).
+utoipa = { workspace = true, optional = true }
+
+[features]
+openapi = ["dep:utoipa"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

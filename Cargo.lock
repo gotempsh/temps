@@ -14118,6 +14118,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
+ "temps-workload",
  "temps-workload-ingress",
  "thiserror 2.0.21",
  "utoipa",
@@ -15955,6 +15956,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "utoipa",
 ]
 
 [[package]]

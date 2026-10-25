@@ -1492,6 +1492,7 @@ mod tests {
                 SandboxPreviewAccess::Public
             },
             preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

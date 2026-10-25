@@ -17,7 +17,7 @@ use super::user::{
 };
 use super::{
     ExecStream, OnStreamEventCallback, PtyAttachment, RuntimeCompatibility, SandboxCreateConfig,
-    SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
+    SandboxEgressPolicy, SandboxExecResult, SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::docker_network_isolation::{
@@ -284,6 +284,92 @@ fn container_has_environment_value(
                     .split_once('=')
                     .is_some_and(|(key, value)| key == expected_key && value == expected_value)
             })
+        })
+}
+
+/// The value of `key` in the container's environment, when it is set.
+fn container_environment_value<'a>(
+    container: &'a bollard::models::ContainerInspectResponse,
+    key: &str,
+) -> Option<&'a str> {
+    container
+        .config
+        .as_ref()
+        .and_then(|config| config.env.as_ref())
+        .and_then(|environment| {
+            environment.iter().find_map(|entry| {
+                entry
+                    .split_once('=')
+                    .and_then(|(name, value)| (name == key).then_some(value))
+            })
+        })
+}
+
+/// A sandbox's egress policy in the form the proxy sidecar receives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SidecarEgressPolicy {
+    /// Canonical JSON of the normalized policy.
+    json: String,
+    /// SHA-256 of `json`, hex encoded.
+    digest: String,
+}
+
+impl SidecarEgressPolicy {
+    fn new(sandbox: &str, policy: &SandboxEgressPolicy) -> Result<Self, AgentError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| AgentError::Validation {
+                message: format!("sandbox '{sandbox}': {error}"),
+            })?;
+        let json = serde_json::to_string(&policy).map_err(|error| {
+            AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("serialize the egress policy of sandbox '{sandbox}': {error}"),
+            }
+        })?;
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(json.as_bytes()));
+        Ok(Self { json, digest })
+    }
+
+    /// Whether `container` is a sidecar created for exactly this policy and
+    /// sandbox.
+    fn is_carried_by(
+        &self,
+        container: &bollard::models::ContainerInspectResponse,
+        sandbox: &str,
+    ) -> bool {
+        container
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .and_then(|labels| labels.get(SANDBOX_EGRESS_RULES_LABEL))
+            .is_some_and(|digest| *digest == self.digest)
+            && container_has_environment_value(container, SANDBOX_EGRESS_RULES_ENV, &self.json)
+            && container_has_environment_value(container, SANDBOX_NAME_ENV, sandbox)
+    }
+}
+
+/// The policy an existing egress sidecar enforces: `internet` when it
+/// carries none (it predates egress policies). A policy that no longer
+/// parses is an error rather than `internet`, so a sandbox whose rules
+/// cannot be read never silently gets the whole internet back.
+fn egress_policy_of_sidecar(
+    proxy_name: &str,
+    container: &bollard::models::ContainerInspectResponse,
+) -> Result<SandboxEgressPolicy, AgentError> {
+    let Some(raw) = container_environment_value(container, SANDBOX_EGRESS_RULES_ENV) else {
+        return Ok(SandboxEgressPolicy::internet());
+    };
+    serde_json::from_str::<SandboxEgressPolicy>(raw)
+        .map_err(|error| error.to_string())
+        .and_then(|policy| policy.normalized().map_err(|error| error.to_string()))
+        .map_err(|reason| AgentError::SandboxProviderUnavailable {
+            provider: "docker".to_string(),
+            reason: format!(
+                "the egress policy on sandbox egress proxy '{proxy_name}' cannot be read \
+                 ({reason}); re-apply the sandbox's egress policy to replace it"
+            ),
         })
 }
 
@@ -686,6 +772,15 @@ pub const SANDBOX_MODEL_RELAY_BASE_URL: &str =
     "http://temps-sandbox-egress-proxy:3128/.temps/model-relay";
 const SANDBOX_EGRESS_POLICY_LABEL: &str = "sh.temps.sandbox-egress-policy";
 const SANDBOX_EGRESS_POLICY_VERSION: &str = "1";
+/// The sandbox's normalized [`SandboxEgressPolicy`], as JSON, in the egress
+/// proxy's environment. A sidecar without it enforces `internet`, which is
+/// what every sidecar created before egress policies existed did.
+const SANDBOX_EGRESS_RULES_ENV: &str = "TEMPS_SANDBOX_EGRESS_POLICY";
+/// SHA-256 (hex) of that JSON on the sidecar, so a policy change shows up as
+/// drift and `ensure_egress_proxy` replaces the sidecar.
+const SANDBOX_EGRESS_RULES_LABEL: &str = "sh.temps.sandbox-egress-rules";
+/// The sandbox a sidecar serves, so its refusals name it.
+const SANDBOX_NAME_ENV: &str = "TEMPS_SANDBOX_NAME";
 
 /// The sandbox a network belongs to, when the network is a candidate for
 /// being reaped as orphaned: it carries the ownership label, its name is the
@@ -752,6 +847,17 @@ enum NetworkDetach<'a> {
     /// Only the preview gateway with this container name; anything else is
     /// left attached so Docker refuses to remove a network a workload uses.
     OnlyGateway(&'a str),
+}
+
+/// What [`DockerSandboxProvider::remove_isolated_sandbox_network_with`] does
+/// with the sandbox's egress proxy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EgressProxyDisposal {
+    /// Remove it: the sandbox is gone.
+    Remove,
+    /// Stop it and keep it: the sandbox is only parked, and the proxy holds
+    /// its egress policy until the sandbox starts again.
+    Park,
 }
 
 /// Containers attached to `network` other than the sandbox's own egress proxy
@@ -844,10 +950,17 @@ fn network_labelled_for_another_gateway<'a>(
 const SANDBOX_MCP_RELAY_BASE_URL: &str = "http://temps-sandbox-egress-proxy:3128/.temps/mcp";
 
 /// Small CONNECT/HTTP forward proxy used as the sandbox's only internet
-/// route. It resolves the destination itself, rejects the request when *any*
-/// answer is private/non-routable (which closes DNS-rebinding fallbacks),
+/// route. It applies the sandbox's egress policy (`TEMPS_SANDBOX_EGRESS_POLICY`,
+/// the normalized [`SandboxEgressPolicy`] as JSON): in `internet` mode any
+/// public destination on ports 80/443, in `restricted` mode only the hosts and
+/// CIDR blocks a rule names, on that rule's ports, and a name no rule could
+/// allow is refused before it is even resolved. It resolves the destination
+/// itself, rejects the request when *any* answer is private/non-routable
+/// (which closes DNS-rebinding fallbacks, and holds in every mode), and
 /// connects to the already-validated IP rather than resolving the hostname a
-/// second time, and permits only normal web ports.
+/// second time. A refusal is a 403 naming the sandbox and destination, and
+/// one rate-limited JSON line on stdout. The Temps relays (model, MCP, git)
+/// are served by the proxy itself and work whatever the policy.
 ///
 /// The process runs non-root in a read-only, capability-free container. It
 /// carries no credentials and does not terminate TLS.
@@ -863,6 +976,7 @@ if (!['http:', 'https:'].includes(controlPlane.protocol) ||
     controlPlane.username || controlPlane.password) {
   throw new Error("TEMPS_CONTROL_PLANE_URL must be an HTTP(S) origin without credentials");
 }
+const sandboxName = process.env.TEMPS_SANDBOX_NAME || "unknown";
 
 function isPrivateAddress(address) {
   if (address.startsWith("::ffff:")) address = address.slice(7);
@@ -889,21 +1003,203 @@ function isPrivateAddress(address) {
     normalized.startsWith("2001:2:") || normalized.startsWith("2001:db8:");
 }
 
-async function resolvePublic(hostname) {
-  const answers = await dns.lookup(hostname, { all: true, verbatim: true });
-  if (answers.length === 0 || answers.some(({ address }) => isPrivateAddress(address))) {
-    throw new Error("destination is private or non-routable");
+// ---- egress policy (begin) ----
+// The sandbox's egress policy, set by its owner and validated by Temps:
+// `internet` allows any public destination on ports 80 and 443;
+// `restricted` allows only destinations a rule names. Private destinations
+// are refused in both modes, before any rule is consulted.
+
+function normalizeHost(value) {
+  let host = String(value).trim().toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1);
+  if (host.endsWith(".")) host = host.slice(0, -1);
+  return host;
+}
+
+function canonicalAddress(address) {
+  const lowered = String(address).toLowerCase();
+  return lowered.startsWith("::ffff:") && net.isIPv4(lowered.slice(7)) ? lowered.slice(7) : lowered;
+}
+
+function loadEgressPolicy(raw) {
+  if (raw === undefined || raw === "") return { mode: "internet", rules: [] };
+  const parsed = JSON.parse(raw);
+  if (parsed.mode !== "internet" && parsed.mode !== "restricted") {
+    throw new Error(`unknown egress policy mode ${JSON.stringify(parsed.mode)}`);
   }
-  return answers.find(({ family }) => family === 4) || answers[0];
+  const rules = (parsed.rules || []).map((rule) => {
+    const listed = Array.isArray(rule.ports) && rule.ports.length > 0 ? rule.ports : [80, 443];
+    const ports = new Set(listed.map(Number));
+    if (typeof rule.host === "string") return { host: normalizeHost(rule.host), ports };
+    if (typeof rule.cidr === "string") {
+      const slash = rule.cidr.lastIndexOf("/");
+      const address = canonicalAddress(slash === -1 ? rule.cidr : rule.cidr.slice(0, slash));
+      const family = net.isIPv4(address) ? "ipv4" : "ipv6";
+      const prefix = slash === -1 ? (family === "ipv4" ? 32 : 128) : Number(rule.cidr.slice(slash + 1));
+      const blocks = new net.BlockList();
+      blocks.addSubnet(address, prefix, family);
+      return { cidr: rule.cidr, family, blocks, ports };
+    }
+    throw new Error("egress rule names neither a host nor a cidr");
+  });
+  if (parsed.mode === "internet" && rules.length > 0) {
+    throw new Error("egress mode internet takes no rules");
+  }
+  return { mode: parsed.mode, rules };
+}
+
+function hostMatches(pattern, host) {
+  if (pattern.startsWith("*.")) {
+    const suffix = pattern.slice(1);
+    return host.length > suffix.length && host.endsWith(suffix);
+  }
+  return pattern === host;
+}
+
+function addressInRule(rule, address) {
+  if (rule.blocks === undefined) return false;
+  const candidate = canonicalAddress(address);
+  const family = net.isIPv4(candidate) ? "ipv4" : "ipv6";
+  return rule.family === family && rule.blocks.check(candidate, family);
+}
+
+// Whether a destination could be allowed at all, decided before any DNS
+// lookup: a restricted sandbox cannot use name resolution to reach (or leak
+// data to) a name no rule allows.
+function mayResolve(policy, hostname, port) {
+  if (policy.mode === "internet") return [80, 443].includes(port);
+  const host = normalizeHost(hostname);
+  const literal = net.isIP(host) !== 0;
+  return policy.rules.some((rule) => rule.ports.has(port) &&
+    (rule.cidr !== undefined || (!literal && hostMatches(rule.host, host))));
+}
+
+// The decision for a destination the sandbox named as `hostname`, resolved
+// to `answers` ([{ address, family }]). Returns { address } to connect to,
+// or { denied: "private" | "policy" }.
+function egressDecision(policy, hostname, port, answers) {
+  if (answers.length === 0 || answers.some(({ address }) => isPrivateAddress(address))) {
+    return { denied: "private" };
+  }
+  const ordered = [
+    ...answers.filter(({ family }) => family === 4),
+    ...answers.filter(({ family }) => family !== 4),
+  ];
+  if (policy.mode === "internet") {
+    return [80, 443].includes(port) ? { address: ordered[0].address } : { denied: "policy" };
+  }
+  const host = normalizeHost(hostname);
+  const literal = net.isIP(host) !== 0;
+  const rules = policy.rules.filter((rule) => rule.ports.has(port));
+  if (!literal && rules.some((rule) => rule.host !== undefined && hostMatches(rule.host, host))) {
+    return { address: ordered[0].address };
+  }
+  const match = ordered.find(({ address }) => rules.some((rule) => addressInRule(rule, address)));
+  return match ? { address: match.address } : { denied: "policy" };
+}
+// ---- egress policy (end) ----
+
+// A malformed policy stops the proxy: the sandbox then has no route out at
+// all, never a wider one.
+const egressPolicy = loadEgressPolicy(process.env.TEMPS_SANDBOX_EGRESS_POLICY);
+
+class Denied extends Error {
+  constructor(reason, destination) {
+    super(`egress to ${destination} denied (${reason})`);
+    this.reason = reason;
+    this.destination = destination;
+  }
+}
+
+function formatDestination(hostname, port) {
+  const host = normalizeHost(hostname);
+  return net.isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`;
+}
+
+function denialExplanation(reason) {
+  switch (reason) {
+    case "policy":
+      return egressPolicy.mode === "restricted"
+        ? "the sandbox's egress policy does not allow it (mode restricted: only the listed hosts and CIDR blocks, on their ports)"
+        : "the sandbox's egress policy does not allow it (mode internet: ports 80 and 443 only)";
+    case "private":
+      return "private, loopback, link-local and metadata addresses are never reachable from a sandbox";
+    case "unresolvable":
+      return "the name did not resolve";
+    default:
+      return "only plain http:// requests and CONNECT tunnels can leave the sandbox";
+  }
+}
+
+const denialLog = { windowStart: 0, logged: 0, suppressed: 0 };
+function logDenial(method, reason, destination) {
+  const now = Date.now();
+  if (now - denialLog.windowStart >= 10_000) {
+    if (denialLog.suppressed > 0) {
+      process.stdout.write(JSON.stringify({
+        level: "warn", event: "sandbox_egress_denied_suppressed", sandbox: sandboxName,
+        suppressed: denialLog.suppressed, time: new Date(now).toISOString(),
+      }) + "\n");
+    }
+    denialLog.windowStart = now;
+    denialLog.logged = 0;
+    denialLog.suppressed = 0;
+  }
+  if (denialLog.logged >= 20) {
+    denialLog.suppressed += 1;
+    return;
+  }
+  denialLog.logged += 1;
+  process.stdout.write(JSON.stringify({
+    level: "warn", event: "sandbox_egress_denied", sandbox: sandboxName, destination,
+    method, reason, policy_mode: egressPolicy.mode, time: new Date(now).toISOString(),
+  }) + "\n");
+}
+
+function denial(error, fallbackDestination, method) {
+  const reason = error instanceof Denied ? error.reason : "invalid";
+  const destination = error instanceof Denied ? error.destination : fallbackDestination;
+  logDenial(method, reason, destination);
+  return `sandbox ${sandboxName}: egress to ${destination} denied: ${denialExplanation(reason)}\n`;
+}
+
+function refuseRequest(request, response, error) {
+  const body = denial(error, String(request.url).slice(0, 256), request.method);
+  if (!response.headersSent) {
+    response.writeHead(403, {
+      "content-type": "text/plain; charset=utf-8",
+      "content-length": Buffer.byteLength(body),
+    });
+  }
+  response.end(body);
+}
+
+// Admit an outbound destination: the policy, then DNS, then the policy and
+// the private-address check against what the name resolved to. Returns the
+// address to connect to, so the name is never resolved a second time.
+async function admit(hostname, port) {
+  const host = normalizeHost(hostname);
+  const destination = formatDestination(host, port);
+  if (!mayResolve(egressPolicy, host, port)) throw new Denied("policy", destination);
+  let answers;
+  try {
+    answers = await dns.lookup(host, { all: true, verbatim: true });
+  } catch (_) {
+    throw new Denied("unresolvable", destination);
+  }
+  const decision = egressDecision(egressPolicy, host, port, answers);
+  if (decision.denied) throw new Denied(decision.denied, destination);
+  return decision.address;
 }
 
 function parseAuthority(value, defaultPort) {
-  const parsed = new URL(`http://${value}`);
-  const port = Number(parsed.port || defaultPort);
-  if (parsed.username || parsed.password || ![80, 443].includes(port)) {
-    throw new Error("destination port is not allowed");
-  }
-  return { hostname: parsed.hostname, port };
+  const authority = String(value);
+  const match = /^(\[[0-9A-Fa-f:.]+\]|[^\s:\/?#@\[\]]+)(?::([0-9]{1,5}))?$/.exec(authority);
+  if (!match) throw new Denied("invalid", authority.slice(0, 256));
+  const port = match[2] === undefined ? defaultPort : Number(match[2]);
+  if (port < 1 || port > 65535) throw new Denied("invalid", authority.slice(0, 256));
+  const parsed = new URL(`http://${match[1]}`);
+  return { hostname: normalizeHost(parsed.hostname), port };
 }
 
 function modelRelayTarget(request) {
@@ -994,19 +1290,24 @@ async function forwardGitRelay(request, response) {
 }
 
 async function forward(request, response, target, allowPrivate) {
-  const answer = allowPrivate
-    ? (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0]
-    : await resolvePublic(target.hostname);
-  if (!answer) throw new Error("destination did not resolve");
   const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
+  let address;
+  if (allowPrivate) {
+    // A Temps relay: the control plane, whatever the sandbox's policy.
+    const answer = (await dns.lookup(target.hostname, { all: true, verbatim: true }))[0];
+    if (!answer) throw new Error("destination did not resolve");
+    address = answer.address;
+  } else {
+    address = await admit(target.hostname, port);
+  }
   const headers = { ...request.headers, host: target.host };
   delete headers["proxy-authorization"];
   delete headers["proxy-connection"];
   const transport = target.protocol === "https:" ? https : http;
   const upstream = transport.request({
-    host: answer.address,
+    host: address,
     port,
-    servername: target.hostname,
+    servername: normalizeHost(target.hostname),
     method: request.method,
     path: `${target.pathname}${target.search}`,
     headers,
@@ -1042,24 +1343,23 @@ async function handleRequest(request, response) {
       return;
     }
     const target = new URL(request.url);
-    const port = Number(target.port || (target.protocol === "http:" ? 80 : 443));
-    if (target.protocol !== "http:" || target.username || target.password ||
-        ![80, 443].includes(port)) {
+    if (target.protocol !== "http:" || target.username || target.password) {
       throw new Error("request target is not allowed");
     }
     await forward(request, response, target, false);
-  } catch (_) {
-    response.writeHead(403, { "content-type": "text/plain" });
-    response.end("destination denied\n");
+  } catch (error) {
+    refuseRequest(request, response, error);
   }
 }
 
 const server = http.createServer(handleRequest);
 
 server.on("connect", async (request, client, head) => {
+  let destination = String(request.url).slice(0, 256);
   try {
     const { hostname, port } = parseAuthority(request.url, 443);
-    const { address } = await resolvePublic(hostname);
+    destination = formatDestination(hostname, port);
+    const address = await admit(hostname, port);
     const upstream = net.connect({ host: address, port }, () => {
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length) upstream.write(head);
@@ -1070,8 +1370,14 @@ server.on("connect", async (request, client, head) => {
     upstream.setTimeout(60_000, () => upstream.destroy());
     client.on("error", () => upstream.destroy());
     upstream.on("error", () => client.destroy());
-  } catch (_) {
-    client.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+  } catch (error) {
+    const body = denial(error, destination, "CONNECT");
+    client.end(
+      "HTTP/1.1 403 Forbidden\r\n" +
+      "Content-Type: text/plain; charset=utf-8\r\n" +
+      `Content-Length: ${Buffer.byteLength(body)}\r\n` +
+      "Connection: close\r\n\r\n" + body
+    );
   }
 });
 
@@ -2644,29 +2950,41 @@ impl DockerSandboxProvider {
     /// boundary on native Linux, Docker Desktop, Colima, and remote daemons
     /// without asking an operator to install host firewall rules or enable an
     /// insecure environment-variable escape hatch.
+    ///
+    /// `egress_policy` is the policy the proxy must enforce; `None` keeps
+    /// the one the sandbox's existing proxy carries (see
+    /// [`Self::ensure_egress_proxy`]).
     async fn ensure_network(
         &self,
         container_name: &str,
         sandbox_network: &str,
         control_plane_url: &str,
+        egress_policy: Option<&SandboxEgressPolicy>,
     ) -> Result<(), AgentError> {
         if sandbox_network == "none" {
             return Ok(());
         }
 
         let _guard = self.network_lock.lock().await;
-        self.ensure_network_locked(container_name, sandbox_network, control_plane_url)
-            .await
+        self.ensure_network_locked(
+            container_name,
+            sandbox_network,
+            control_plane_url,
+            egress_policy,
+        )
+        .await
+        .map(|_| ())
     }
 
     /// [`Self::ensure_network`] for a caller that already holds
-    /// `network_lock`.
+    /// `network_lock`. Returns whether the egress proxy was (re)created.
     async fn ensure_network_locked(
         &self,
         container_name: &str,
         sandbox_network: &str,
         control_plane_url: &str,
-    ) -> Result<(), AgentError> {
+        egress_policy: Option<&SandboxEgressPolicy>,
+    ) -> Result<bool, AgentError> {
         // Held until the gateway is attached, so a rename cannot land between
         // labelling this network with the gateway's name and attaching it.
         let gateway = self.config.preview_gateway_container_name.read().await;
@@ -2674,10 +2992,17 @@ impl DockerSandboxProvider {
             .await?;
         self.ensure_isolated_sandbox_bridge(sandbox_network, container_name, &gateway)
             .await?;
-        self.ensure_egress_proxy(container_name, sandbox_network, control_plane_url)
+        let replaced = self
+            .ensure_egress_proxy(
+                container_name,
+                sandbox_network,
+                control_plane_url,
+                egress_policy,
+            )
             .await?;
         self.connect_preview_gateways(sandbox_network, &gateway)
-            .await
+            .await?;
+        Ok(replaced)
     }
 
     /// Give a stopped sandbox's isolated network back to Docker.
@@ -2688,7 +3013,9 @@ impl DockerSandboxProvider {
     /// stopped container keeps its configuration, which still names the
     /// network, so the isolation policy check passes while it is parked;
     /// [`Self::prepare_network_for_start`] recreates the network and replaces
-    /// the stale endpoint before it runs again. Best effort: a failure only
+    /// the stale endpoint before it runs again. The egress proxy is stopped
+    /// rather than removed: it carries the sandbox's egress policy, which
+    /// the proxy recreated on start inherits. Best effort: a failure only
     /// leaves the network in place for the reaper.
     async fn release_parked_sandbox_network(&self, container_name: &str) {
         let _guard = self.network_lock.lock().await;
@@ -2702,6 +3029,7 @@ impl DockerSandboxProvider {
             .remove_isolated_sandbox_network_with(
                 container_name,
                 NetworkDetach::OnlyGateway(&gateway),
+                EgressProxyDisposal::Park,
             )
             .await;
         if errors.is_empty() {
@@ -2743,6 +3071,7 @@ impl DockerSandboxProvider {
             &handle.sandbox_name,
             &network_name,
             &self.config.control_plane_url,
+            None,
         )
         .await?;
         self.reattach_sandbox_network(handle, info, &network_name)
@@ -3158,7 +3487,7 @@ impl DockerSandboxProvider {
             let Some(_claim) = ReapClaim::try_new(&self.creates_in_flight, owner) else {
                 continue;
             };
-            match self
+            let proxy = match self
                 .docker
                 .inspect_container(
                     owner,
@@ -3166,12 +3495,13 @@ impl DockerSandboxProvider {
                 )
                 .await
             {
-                Err(error) if docker_error_is_not_found(&error) => {}
+                Err(error) if docker_error_is_not_found(&error) => EgressProxyDisposal::Remove,
                 // A stopped sandbox gets its network back from `start`, so
                 // holding the subnet while it is parked buys nothing. This
                 // also frees sandboxes stopped before `stop` released their
                 // network, or stopped behind Temps' back (a daemon restart).
-                Ok(info) if container_is_parked(&info) => {}
+                // Its proxy is kept, stopped, for the egress policy it holds.
+                Ok(info) if container_is_parked(&info) => EgressProxyDisposal::Park,
                 Ok(_) => continue,
                 Err(error) => {
                     tracing::warn!(
@@ -3180,7 +3510,7 @@ impl DockerSandboxProvider {
                     );
                     continue;
                 }
-            }
+            };
             // The owner's container is absent, but a sandbox another Temps
             // process is creating right now would be attached by the time
             // this looks again. Never force-disconnect a workload: a network
@@ -3213,7 +3543,11 @@ impl DockerSandboxProvider {
                 }
             }
             if self
-                .remove_isolated_sandbox_network_with(owner, NetworkDetach::OnlyGateway(gateway))
+                .remove_isolated_sandbox_network_with(
+                    owner,
+                    NetworkDetach::OnlyGateway(gateway),
+                    proxy,
+                )
                 .await
                 .is_empty()
             {
@@ -3229,8 +3563,12 @@ impl DockerSandboxProvider {
     }
 
     async fn remove_isolated_sandbox_network(&self, container_name: &str) -> Vec<String> {
-        self.remove_isolated_sandbox_network_with(container_name, NetworkDetach::Everything)
-            .await
+        self.remove_isolated_sandbox_network_with(
+            container_name,
+            NetworkDetach::Everything,
+            EgressProxyDisposal::Remove,
+        )
+        .await
     }
 
     /// Remove a sandbox's egress proxy and isolated network.
@@ -3247,29 +3585,64 @@ impl DockerSandboxProvider {
         &self,
         container_name: &str,
         detach: NetworkDetach<'_>,
+        proxy: EgressProxyDisposal,
     ) -> Vec<String> {
         let mut cleanup_errors = Vec::new();
         let proxy_name = sandbox_egress_proxy_name(container_name);
-        if let Err(error) = self
-            .docker
-            .remove_container(
-                &proxy_name,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            if !docker_error_is_not_found(&error) {
-                cleanup_errors.push(format!(
-                    "remove per-sandbox egress proxy '{proxy_name}': {error}"
-                ));
-                tracing::warn!(
-                    container = proxy_name,
-                    "Failed to remove per-sandbox egress proxy: {error}"
-                );
+        match proxy {
+            EgressProxyDisposal::Remove => {
+                if let Err(error) = self
+                    .docker
+                    .remove_container(
+                        &proxy_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                {
+                    if !docker_error_is_not_found(&error) {
+                        cleanup_errors.push(format!(
+                            "remove per-sandbox egress proxy '{proxy_name}': {error}"
+                        ));
+                        tracing::warn!(
+                            container = proxy_name,
+                            "Failed to remove per-sandbox egress proxy: {error}"
+                        );
+                    }
+                }
             }
+            // A stopped container holds no endpoint, so the network can go
+            // while the proxy keeps the sandbox's egress policy for the one
+            // `ensure_egress_proxy` recreates when the sandbox starts.
+            EgressProxyDisposal::Park => match self
+                .docker
+                .stop_container(
+                    &proxy_name,
+                    Some(bollard::query_parameters::StopContainerOptions {
+                        t: Some(0),
+                        signal: None,
+                    }),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(error) if docker_error_is_not_found(&error) => {}
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 304, ..
+                }) => {}
+                Err(error) => {
+                    cleanup_errors.push(format!(
+                        "stop per-sandbox egress proxy '{proxy_name}' of a stopped sandbox: {error}"
+                    ));
+                    tracing::warn!(
+                        container = proxy_name,
+                        "Failed to stop the egress proxy of a stopped sandbox: {error}"
+                    );
+                    return cleanup_errors;
+                }
+            },
         }
         let network_name = sandbox_network_name(container_name);
         let network = match self
@@ -3485,24 +3858,52 @@ impl DockerSandboxProvider {
         Ok(())
     }
 
+    /// Make sure `sandbox_container_name`'s egress proxy runs on both of its
+    /// networks with the current script, image and egress policy, replacing
+    /// it otherwise. Returns whether it was (re)created, which interrupts the
+    /// sandbox's outbound connections.
+    ///
+    /// `desired` is the policy to enforce. `None` keeps the policy the
+    /// existing proxy carries (a stopped one included: parking stops the
+    /// proxy instead of removing it for this), and is `internet` only when
+    /// the sandbox has no proxy at all. A proxy whose policy cannot be read
+    /// is an error, never `internet`.
     async fn ensure_egress_proxy(
         &self,
         sandbox_container_name: &str,
         sandbox_network: &str,
         control_plane_url: &str,
-    ) -> Result<(), AgentError> {
+        desired: Option<&SandboxEgressPolicy>,
+    ) -> Result<bool, AgentError> {
         let image = image_name_for_runtime("node");
         self.ensure_image_for_runtime("node").await?;
         let proxy_name = sandbox_egress_proxy_name(sandbox_container_name);
 
-        let inspected = self
+        let existing = match self
             .docker
             .inspect_container(
                 &proxy_name,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
-            .await;
-        if let Ok(info) = &inspected {
+            .await
+        {
+            Ok(info) => Some(info),
+            Err(error) if docker_error_is_not_found(&error) => None,
+            Err(error) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!("inspect managed sandbox egress proxy: {error}"),
+                })
+            }
+        };
+        let policy = match (desired, &existing) {
+            (Some(policy), _) => policy.clone(),
+            (None, Some(info)) => egress_policy_of_sidecar(&proxy_name, info)?,
+            (None, None) => SandboxEgressPolicy::internet(),
+        };
+        let egress = SidecarEgressPolicy::new(sandbox_container_name, &policy)?;
+
+        if let Some(info) = &existing {
             let image_matches = info
                 .config
                 .as_ref()
@@ -3536,26 +3937,21 @@ impl DockerSandboxProvider {
                 control_plane_url,
             );
             let host_gateway_matches = container_has_extra_host(info, SANDBOX_HOST_GATEWAY);
+            let rules_match = egress.is_carried_by(info, sandbox_container_name);
+            // A stopped proxy is always recreated rather than started: it
+            // was parked with its sandbox, and its endpoint still names the
+            // network released then.
+            let running = info.state.as_ref().and_then(|state| state.running) == Some(true);
             if image_matches
                 && policy_matches
                 && networks_match
                 && command_matches
                 && control_plane_matches
                 && host_gateway_matches
+                && rules_match
+                && running
             {
-                if info.state.as_ref().and_then(|state| state.running) != Some(true) {
-                    self.docker
-                        .start_container(
-                            &proxy_name,
-                            None::<bollard::query_parameters::StartContainerOptions>,
-                        )
-                        .await
-                        .map_err(|source| AgentError::SandboxProviderUnavailable {
-                            provider: "docker".to_string(),
-                            reason: format!("start managed sandbox egress proxy: {source}"),
-                        })?;
-                }
-                return Ok(());
+                return Ok(false);
             }
 
             self.docker
@@ -3571,29 +3967,70 @@ impl DockerSandboxProvider {
                     provider: "docker".to_string(),
                     reason: format!("replace drifted sandbox egress proxy: {source}"),
                 })?;
-        } else if let Err(error) = inspected {
-            if !docker_error_is_not_found(&error) {
-                return Err(AgentError::SandboxProviderUnavailable {
-                    provider: "docker".to_string(),
-                    reason: format!("inspect managed sandbox egress proxy: {error}"),
-                });
-            }
         }
 
+        self.create_egress_proxy_container(
+            &proxy_name,
+            sandbox_container_name,
+            control_plane_url,
+            &egress,
+        )
+        .await?;
+
+        // A proxy that cannot be connected or started is left created: it
+        // reaches nothing, and it keeps the sandbox's egress policy for the
+        // next attempt instead of letting that one fall back to `internet`.
+        self.connect_container_to_network(
+            &proxy_name,
+            sandbox_network,
+            Some(SANDBOX_EGRESS_PROXY_ALIAS),
+        )
+        .await?;
+
+        self.docker
+            .start_container(
+                &proxy_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|source| AgentError::SandboxProviderUnavailable {
+                provider: "docker".to_string(),
+                reason: format!("start managed sandbox egress proxy: {source}"),
+            })?;
+        tracing::info!(
+            container = proxy_name,
+            sandbox = sandbox_container_name,
+            egress_mode = policy.mode.as_str(),
+            egress_rules = policy.rules.len(),
+            "Managed sandbox egress proxy is ready"
+        );
+        Ok(true)
+    }
+
+    /// Create (without starting) the egress proxy container `proxy_name` for
+    /// `sandbox_container_name`, attached only to the outbound bridge.
+    async fn create_egress_proxy_container(
+        &self,
+        proxy_name: &str,
+        sandbox_container_name: &str,
+        control_plane_url: &str,
+        egress: &SidecarEgressPolicy,
+    ) -> Result<(), AgentError> {
         let mut tmpfs = HashMap::new();
         tmpfs.insert("/tmp".to_string(), "size=16m,mode=1777".to_string());
         let body = bollard::models::ContainerCreateBody {
-            image: Some(image),
+            image: Some(image_name_for_runtime("node")),
             user: Some(format!("{SANDBOX_UID}:{SANDBOX_GID}")),
             entrypoint: Some(vec!["node".to_string()]),
             cmd: Some(vec![
                 "-e".to_string(),
                 SANDBOX_EGRESS_PROXY_SCRIPT.to_string(),
             ]),
-            env: Some(vec![format!(
-                "{SANDBOX_CONTROL_PLANE_URL_ENV}={}",
-                control_plane_url
-            )]),
+            env: Some(vec![
+                format!("{SANDBOX_CONTROL_PLANE_URL_ENV}={control_plane_url}"),
+                format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
+                format!("{SANDBOX_NAME_ENV}={sandbox_container_name}"),
+            ]),
             labels: Some(HashMap::from([
                 (
                     SANDBOX_EGRESS_POLICY_LABEL.to_string(),
@@ -3602,6 +4039,10 @@ impl DockerSandboxProvider {
                 (
                     SANDBOX_NETWORK_OWNER_LABEL.to_string(),
                     sandbox_container_name.to_string(),
+                ),
+                (
+                    SANDBOX_EGRESS_RULES_LABEL.to_string(),
+                    egress.digest.clone(),
                 ),
             ])),
             host_config: Some(bollard::models::HostConfig {
@@ -3633,7 +4074,7 @@ impl DockerSandboxProvider {
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&proxy_name)
+                        .name(proxy_name)
                         .build(),
                 ),
                 body,
@@ -3643,43 +4084,51 @@ impl DockerSandboxProvider {
                 provider: "docker".to_string(),
                 reason: format!("create managed sandbox egress proxy: {source}"),
             })?;
+        Ok(())
+    }
 
-        if let Err(source) = self
-            .connect_container_to_network(
+    /// Apply `policy` to a sandbox that is not running: replace its parked
+    /// proxy with a created, never-started one carrying the new policy,
+    /// which the proxy recreated when the sandbox starts inherits.
+    async fn park_egress_policy(
+        &self,
+        sandbox_container_name: &str,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let egress = SidecarEgressPolicy::new(sandbox_container_name, policy)?;
+        self.ensure_image_for_runtime("node").await?;
+        self.ensure_managed_bridge(SANDBOX_EGRESS_NETWORK, false)
+            .await?;
+        let proxy_name = sandbox_egress_proxy_name(sandbox_container_name);
+        match self
+            .docker
+            .remove_container(
                 &proxy_name,
-                sandbox_network,
-                Some(SANDBOX_EGRESS_PROXY_ALIAS),
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
             )
             .await
         {
-            let _ = self
-                .docker
-                .remove_container(
-                    &proxy_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                )
-                .await;
-            return Err(source);
+            Ok(()) => {}
+            Err(error) if docker_error_is_not_found(&error) => {}
+            Err(source) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "replace the parked egress proxy of sandbox '{sandbox_container_name}': {source}"
+                    ),
+                })
+            }
         }
-
-        self.docker
-            .start_container(
-                &proxy_name,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|source| AgentError::SandboxProviderUnavailable {
-                provider: "docker".to_string(),
-                reason: format!("start managed sandbox egress proxy: {source}"),
-            })?;
-        tracing::info!(
-            container = proxy_name,
-            "Managed sandbox egress proxy is ready"
-        );
-        Ok(())
+        self.create_egress_proxy_container(
+            &proxy_name,
+            sandbox_container_name,
+            &self.config.control_plane_url,
+            &egress,
+        )
+        .await
     }
 
     fn container_name(run_id: i32) -> String {
@@ -3887,6 +4336,7 @@ impl DockerSandboxProvider {
                         container_name,
                         &sandbox_network_name(container_name),
                         &self.config.control_plane_url,
+                        None,
                     )
                     .await?;
                 }
@@ -4377,6 +4827,13 @@ impl SandboxProvider for DockerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
+        let egress_policy =
+            config
+                .egress_policy
+                .normalized()
+                .map_err(|error| AgentError::Validation {
+                    message: format!("sandbox '{container_name}': {error}"),
+                })?;
         // Held until the container exists: from here on this sandbox's
         // network may be in use although no container carries its name.
         // A create never overlaps a reap of the same name: wait it out.
@@ -4471,6 +4928,7 @@ impl SandboxProvider for DockerSandboxProvider {
                 &container_name,
                 &docker_network,
                 &self.config.control_plane_url,
+                Some(&egress_policy),
             )
             .await
         {
@@ -4811,6 +5269,7 @@ impl SandboxProvider for DockerSandboxProvider {
             &handle.sandbox_name,
             &sandbox_network_name(&handle.sandbox_name),
             control_plane_url,
+            None,
         )
         .await?;
         Ok(SANDBOX_MODEL_RELAY_BASE_URL.to_string())
@@ -4839,6 +5298,7 @@ impl SandboxProvider for DockerSandboxProvider {
             &handle.sandbox_name,
             &sandbox_network_name(&handle.sandbox_name),
             control_plane_url,
+            None,
         )
         .await?;
         sandbox_mcp_relay_url(control_plane_url, registered_url).ok_or_else(|| {
@@ -5667,6 +6127,98 @@ impl SandboxProvider for DockerSandboxProvider {
             "PTY agent relay",
         )
         .await
+    }
+
+    /// Replace the sandbox's egress proxy with one enforcing `policy`.
+    ///
+    /// A running sandbox gets a new proxy at once: its outbound connections
+    /// are cut while the old proxy is removed and the new one starts (the
+    /// elapsed time is logged as `interruption_ms`, typically one to three
+    /// seconds), and tunnels open through the old proxy are closed, so a
+    /// tightened policy also ends connections it no longer allows. A stopped
+    /// sandbox gets a parked proxy holding the policy for its next start.
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| AgentError::Validation {
+                message: format!("sandbox '{}': {error}", handle.sandbox_name),
+            })?;
+        let info = match self
+            .docker
+            .inspect_container(
+                &handle.sandbox_id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => info,
+            Err(error) if docker_error_is_not_found(&error) => {
+                return Err(AgentError::SandboxNotFound {
+                    run_id: 0,
+                    sandbox: format!("container {}", handle.sandbox_name),
+                })
+            }
+            Err(error) => {
+                return Err(AgentError::SandboxProviderUnavailable {
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "inspect sandbox '{}' before applying its egress policy: {error}",
+                        handle.sandbox_name
+                    ),
+                })
+            }
+        };
+        let network_mode = info
+            .host_config
+            .as_ref()
+            .and_then(|config| config.network_mode.as_deref());
+        if network_mode == Some("none") {
+            // No network, so no egress to restrict in any mode.
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                egress_mode = policy.mode.as_str(),
+                "Sandbox has no network; its egress policy has nothing to enforce"
+            );
+            return Ok(());
+        }
+        let _guard = self.network_lock.lock().await;
+        if container_is_parked(&info) {
+            self.park_egress_policy(&handle.sandbox_name, &policy)
+                .await?;
+            tracing::info!(
+                sandbox = %handle.sandbox_name,
+                egress_mode = policy.mode.as_str(),
+                egress_rules = policy.rules.len(),
+                "Egress policy of a stopped sandbox stored for its next start"
+            );
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        let replaced = self
+            .ensure_network_locked(
+                &handle.sandbox_name,
+                &sandbox_network_name(&handle.sandbox_name),
+                &self.config.control_plane_url,
+                Some(&policy),
+            )
+            .await?;
+        tracing::info!(
+            sandbox = %handle.sandbox_name,
+            egress_mode = policy.mode.as_str(),
+            egress_rules = policy.rules.len(),
+            replaced_proxy = replaced,
+            interruption_ms = if replaced {
+                u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+            } else {
+                0
+            },
+            "Egress policy applied to a running sandbox"
+        );
+        Ok(())
     }
 
     /// `socat` from the exec's stdio to `127.0.0.1:<port>` inside the
@@ -7769,6 +8321,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7822,6 +8375,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(60),
@@ -7990,6 +8544,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -8354,6 +8909,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
             idle_timeout: Duration::from_secs(120),
@@ -8518,6 +9074,7 @@ mod tests {
                     pids_limit: None,
                     disk_size_mb: None,
                     allow_docker: false,
+                    egress_policy: Default::default(),
                     network_mode: Some("none".to_string()),
                     env_vars: HashMap::new(),
                     idle_timeout: Duration::from_secs(120),
@@ -8771,6 +9328,7 @@ mod tests {
                 pids_limit: None,
                 disk_size_mb: None,
                 allow_docker: false,
+                egress_policy: Default::default(),
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(120),
@@ -9140,6 +9698,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -9364,6 +9923,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -9517,6 +10077,7 @@ mod tests {
                 pids_limit: None,
                 disk_size_mb: None,
                 allow_docker: false,
+                egress_policy: Default::default(),
                 network_mode: Some("none".to_string()),
                 env_vars: HashMap::new(),
                 idle_timeout: Duration::from_secs(60),
@@ -9741,7 +10302,11 @@ mod tests {
             "octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31",
             "octets[0] === 192 && octets[1] === 168",
             "answers.some(({ address }) => isPrivateAddress(address))",
-            "![80, 443].includes(port)",
+            "if (policy.mode === \"internet\") return [80, 443].includes(port);",
+            "if (!mayResolve(egressPolicy, host, port)) throw new Denied(\"policy\", destination);",
+            "const egressPolicy = loadEgressPolicy(process.env.TEMPS_SANDBOX_EGRESS_POLICY);",
+            "address = await admit(target.hostname, port);",
+            "const address = await admit(hostname, port);",
             "HTTP/1.1 403 Forbidden",
         ] {
             assert!(
@@ -9988,6 +10553,10 @@ async function forward(_request, response, _target, allowPrivate) {{
   if (allowPrivate) privateForwardCalls += 1;
   response.end();
 }}
+function refuseRequest(_request, response) {{
+  response.writeHead(403);
+  response.end();
+}}
 {functions}
 {handler}
 function response() {{
@@ -10076,6 +10645,519 @@ function response() {{
                 "unexpectedly relayed {rejected}"
             );
         }
+    }
+
+    /// The proxy script between two markers, `start` included.
+    fn proxy_script_between(start: &str, end: &str) -> &'static str {
+        let from = SANDBOX_EGRESS_PROXY_SCRIPT
+            .find(start)
+            .unwrap_or_else(|| panic!("proxy script has no {start:?}"));
+        let to = SANDBOX_EGRESS_PROXY_SCRIPT[from..]
+            .find(end)
+            .map(|offset| from + offset)
+            .unwrap_or_else(|| panic!("proxy script has no {end:?} after {start:?}"));
+        &SANDBOX_EGRESS_PROXY_SCRIPT[from..to]
+    }
+
+    /// Run `script` with Node.js and return its stdout, or `None` when Node
+    /// is not installed.
+    fn run_node(script: &str) -> Option<String> {
+        let output = match std::process::Command::new("node")
+            .args(["-e", script])
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping executable proxy egress test: Node.js is unavailable");
+                return None;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "node failed (status {:?}): {}\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn parity_policy() -> SandboxEgressPolicy {
+        SandboxEgressPolicy::restricted(vec![
+            temps_workload::EgressRule::host("API.example.com.", &[443]),
+            temps_workload::EgressRule::host("*.pkg.example.org", &[]),
+            temps_workload::EgressRule::cidr("1.1.1.7/24", &[443, 8443]),
+            temps_workload::EgressRule::cidr("2606:4700::/32", &[443]),
+            temps_workload::EgressRule::host("internal.example.com", &[443]),
+        ])
+        .normalized()
+        .expect("valid parity policy")
+    }
+
+    /// (requested host, resolved address, port)
+    const EGRESS_PARITY_CASES: &[(&str, &str, u16)] = &[
+        ("api.example.com", "93.184.216.34", 443),
+        ("API.Example.com.", "93.184.216.34", 443),
+        ("api.example.com", "93.184.216.34", 80),
+        ("other.example.com", "93.184.216.34", 443),
+        ("registry.pkg.example.org", "93.184.216.35", 443),
+        ("a.b.pkg.example.org", "93.184.216.35", 80),
+        ("pkg.example.org", "93.184.216.35", 443),
+        ("evilpkg.example.org", "93.184.216.35", 443),
+        ("registry.pkg.example.org", "93.184.216.35", 22),
+        ("1.1.1.1", "1.1.1.1", 443),
+        ("1.1.1.1", "1.1.1.1", 8443),
+        ("1.1.1.1", "1.1.1.1", 80),
+        ("1.1.2.1", "1.1.2.1", 443),
+        ("dns.example.net", "1.1.1.9", 443),
+        ("2606:4700:4700::1111", "2606:4700:4700::1111", 443),
+        ("[2606:4700:4700::1111]", "2606:4700:4700::1111", 443),
+        ("2a00:1450::1", "2a00:1450::1", 443),
+        ("93.184.216.34", "93.184.216.34", 443),
+        ("internal.example.com", "10.0.0.5", 443),
+        ("api.example.com", "169.254.169.254", 443),
+        ("api.example.com", "::ffff:127.0.0.1", 443),
+        ("api.example.com", "fd00::1", 443),
+        ("api.example.com", "100.64.0.1", 443),
+        ("api.example.com", "203.0.113.9", 443),
+        ("api.example.com", "2001:db8::1", 443),
+        ("example.net", "93.184.216.34", 443),
+        ("example.net", "93.184.216.34", 22),
+        ("example.net", "192.168.1.1", 80),
+    ];
+
+    /// The JavaScript matcher the proxy runs and the Rust one the API
+    /// validates against must agree, for both modes: the expected answers
+    /// come from `SandboxEgressPolicy::decide`, the actual ones from the
+    /// proxy's own `egressDecision` and `mayResolve`.
+    #[test]
+    fn sandbox_proxy_egress_matcher_agrees_with_the_rust_policy() {
+        let block = proxy_script_between(
+            "function isPrivateAddress(address) {",
+            "// ---- egress policy (end) ----",
+        );
+        let mut checks = Vec::new();
+        for (policy, label) in [
+            (parity_policy(), "restricted"),
+            (SandboxEgressPolicy::internet(), "internet"),
+        ] {
+            let policy_json = serde_json::to_string(&policy).expect("policy json");
+            let cases: Vec<serde_json::Value> = EGRESS_PARITY_CASES
+                .iter()
+                .map(|(host, address, port)| {
+                    let parsed: std::net::IpAddr = address.parse().expect("test address");
+                    let expected = policy
+                        .decide(host, parsed, *port)
+                        .err()
+                        .map(|denial| denial.as_str());
+                    serde_json::json!({
+                        "host": host,
+                        "address": address,
+                        "family": if parsed.is_ipv4() { 4 } else { 6 },
+                        "port": port,
+                        "expected": expected,
+                    })
+                })
+                .collect();
+            checks.push(serde_json::json!({
+                "label": label,
+                "policy": policy_json,
+                "cases": cases,
+            }));
+        }
+        let checks = serde_json::to_string(&checks).expect("checks json");
+        let script = format!(
+            r#"
+const net = require("net");
+{block}
+const failures = [];
+for (const check of {checks}) {{
+  const policy = loadEgressPolicy(check.policy);
+  for (const c of check.cases) {{
+    const decision = egressDecision(policy, c.host, c.port, [{{ address: c.address, family: c.family }}]);
+    const got = decision.denied === undefined ? null : decision.denied;
+    if (got !== c.expected) failures.push(`${{check.label}} ${{c.host}} -> ${{c.address}}:${{c.port}}: proxy ${{got}}, rust ${{c.expected}}`);
+    if (c.expected === null && decision.address !== c.address) failures.push(`${{check.label}} ${{c.host}}: connects to ${{decision.address}}`);
+    // The pre-DNS check may only refuse what the full decision refuses.
+    if (c.expected === null && !mayResolve(policy, c.host, c.port)) failures.push(`${{check.label}} ${{c.host}}:${{c.port}} refused before resolution`);
+  }}
+}}
+// Names no rule could allow are refused before any lookup. A CIDR rule on
+// the port means any name might resolve into it, so only host rules here.
+const hostsOnly = loadEgressPolicy({hosts_only_policy});
+for (const [host, port] of [["other.example.com", 443], ["api.example.com", 80], ["pkg.example.org", 443]]) {{
+  if (mayResolve(hostsOnly, host, port)) failures.push(`resolves ${{host}}:${{port}}`);
+}}
+// With a CIDR rule, only ports no rule lists are refused unresolved.
+const restricted = loadEgressPolicy({checks_policy});
+if (!mayResolve(restricted, "other.example.com", 8443)) failures.push("a name that may resolve into a CIDR rule was refused");
+if (mayResolve(restricted, "other.example.com", 22)) failures.push("resolves other.example.com:22");
+// Any answer being private refuses the whole destination.
+if (!egressDecision(restricted, "api.example.com", 443, [
+  {{ address: "93.184.216.34", family: 4 }}, {{ address: "10.0.0.1", family: 4 }},
+]).denied) failures.push("mixed public/private answers were admitted");
+// A malformed policy stops the proxy instead of widening it.
+for (const raw of ["{{", JSON.stringify({{ mode: "open" }}), JSON.stringify({{ mode: "internet", rules: [{{ host: "a.example.com" }}] }})]) {{
+  let threw = false;
+  try {{ loadEgressPolicy(raw); }} catch (_) {{ threw = true; }}
+  if (!threw) failures.push(`accepted policy ${{raw}}`);
+}}
+if (loadEgressPolicy(undefined).mode !== "internet") failures.push("absent policy is not internet");
+process.stdout.write(failures.join("\n"));
+"#,
+            checks_policy = serde_json::to_string(
+                &serde_json::to_string(&parity_policy()).expect("policy json")
+            )
+            .expect("quoted policy"),
+            hosts_only_policy = serde_json::to_string(
+                &serde_json::to_string(
+                    &SandboxEgressPolicy::restricted(vec![
+                        temps_workload::EgressRule::host("api.example.com", &[443]),
+                        temps_workload::EgressRule::host("*.pkg.example.org", &[]),
+                    ])
+                    .normalized()
+                    .expect("valid policy")
+                )
+                .expect("policy json")
+            )
+            .expect("quoted policy"),
+        );
+        let Some(stdout) = run_node(&script) else {
+            return;
+        };
+        assert!(stdout.trim().is_empty(), "matcher disagreement:\n{stdout}");
+    }
+
+    /// The refusal a sandbox sees names the sandbox, the destination and
+    /// the policy, and the proxy logs one JSON line for it; CONNECT and
+    /// absolute-URI authorities accept any port and normalize hosts.
+    #[test]
+    fn sandbox_proxy_refusals_explain_themselves() {
+        let policy_block = proxy_script_between(
+            "function isPrivateAddress(address) {",
+            "// ---- egress policy (end) ----",
+        );
+        let refusal = proxy_script_between(
+            "class Denied extends Error {",
+            "\n\nfunction modelRelayTarget(request) {",
+        );
+        let policy =
+            serde_json::to_string(&serde_json::to_string(&parity_policy()).expect("policy json"))
+                .expect("quoted policy");
+        let script = format!(
+            r#"
+const net = require("net");
+const answers = {{
+  "api.example.com": [{{ address: "93.184.216.34", family: 4 }}],
+  "internal.example.com": [{{ address: "10.0.0.5", family: 4 }}],
+}};
+let lookups = 0;
+const dns = {{ lookup: async (host) => {{
+  lookups += 1;
+  if (net.isIP(host)) return [{{ address: host, family: net.isIP(host) }}];
+  if (!answers[host]) throw new Error("ENOTFOUND");
+  return answers[host];
+}} }};
+const sandboxName = "temps-sandbox-t1";
+{policy_block}
+const egressPolicy = loadEgressPolicy({policy});
+const logged = [];
+process.stdout.write = (line) => {{ logged.push(String(line)); return true; }};
+{refusal}
+const failures = [];
+const expectDenied = async (host, port, reason) => {{
+  try {{
+    await admit(host, port);
+    failures.push(`admitted ${{host}}:${{port}}`);
+  }} catch (error) {{
+    if (!(error instanceof Denied) || error.reason !== reason) failures.push(`${{host}}:${{port}}: ${{error.reason || error}} instead of ${{reason}}`);
+  }}
+}};
+(async () => {{
+  if (await admit("API.example.com.", 443) !== "93.184.216.34") failures.push("allowed host not admitted");
+  const before = lookups;
+  await expectDenied("blocked.example.com", 22, "policy");
+  if (lookups !== before) failures.push("a name no rule allows was resolved");
+  await expectDenied("internal.example.com", 443, "private");
+  await expectDenied("missing.pkg.example.org", 443, "unresolvable");
+  if ((await admit("1.1.1.200", 8443)) !== "1.1.1.200") failures.push("cidr literal not admitted");
+
+  const reply = {{ status: 0, headers: {{}}, body: "", headersSent: false,
+    writeHead(code, headers) {{ this.status = code; this.headers = headers; }},
+    end(body) {{ this.body = body; }} }};
+  let error;
+  try {{ await admit("blocked.example.com", 9000); }} catch (caught) {{ error = caught; }}
+  refuseRequest({{ method: "GET", url: "http://blocked.example.com:9000/x" }}, reply, error);
+  if (reply.status !== 403) failures.push(`status ${{reply.status}}`);
+  for (const part of ["sandbox temps-sandbox-t1", "blocked.example.com:9000", "mode restricted"]) {{
+    if (!reply.body.includes(part)) failures.push(`403 body lacks ${{part}}: ${{reply.body}}`);
+  }}
+  if (reply.headers["content-length"] !== Buffer.byteLength(reply.body)) failures.push("content-length");
+  const entry = JSON.parse(logged[logged.length - 1]);
+  if (entry.event !== "sandbox_egress_denied" || entry.sandbox !== "temps-sandbox-t1" ||
+      entry.destination !== "blocked.example.com:9000" || entry.reason !== "policy" ||
+      entry.policy_mode !== "restricted") failures.push(`log line ${{logged[logged.length - 1]}}`);
+
+  // Rate limited: a flood logs a bounded number of lines.
+  const linesBefore = logged.length;
+  for (let i = 0; i < 100; i += 1) denial(new Denied("policy", "flood.example.com:443"), "", "CONNECT");
+  if (logged.length - linesBefore > 20) failures.push(`logged ${{logged.length - linesBefore}} lines for a flood`);
+
+  const authority = (value, port) => {{ try {{ return parseAuthority(value, port); }} catch (_) {{ return null; }} }};
+  const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!same(authority("API.Example.com:8443", 443), {{ hostname: "api.example.com", port: 8443 }})) failures.push("authority with port");
+  if (!same(authority("api.example.com", 443), {{ hostname: "api.example.com", port: 443 }})) failures.push("authority default port");
+  if (!same(authority("api.example.com:80", 443), {{ hostname: "api.example.com", port: 80 }})) failures.push("authority :80");
+  if (!same(authority("[2606:4700::1]:443", 443), {{ hostname: "2606:4700::1", port: 443 }})) failures.push("authority ipv6");
+  for (const bad of ["a.example.com:0", "a.example.com:65536", "user@a.example.com:443", "a.example.com:443/x", "a b:443", ""]) {{
+    if (authority(bad, 443) !== null) failures.push(`accepted authority ${{bad}}`);
+  }}
+  process.stderr.write(failures.join("\n"));
+  process.exit(failures.length === 0 ? 0 : 1);
+}})();
+"#
+        );
+        run_node(&script);
+    }
+
+    /// Run the whole proxy script as the sidecar would, on a loopback port,
+    /// and send it the raw requests in `requests`. Returns each response and
+    /// everything the proxy logged, or `None` when Node is not installed.
+    /// Every destination used here is refused before any DNS or network
+    /// access, so the test runs offline.
+    fn run_proxy_process(
+        policy: &SandboxEgressPolicy,
+        requests: &[&str],
+    ) -> Option<(Vec<String>, String)> {
+        let listen = "server.listen(3128, \"0.0.0.0\");";
+        assert_eq!(SANDBOX_EGRESS_PROXY_SCRIPT.matches(listen).count(), 1);
+        let requests_json = serde_json::to_string(requests).expect("requests json");
+        let client = format!(
+            r#"server.listen(0, "127.0.0.1", async () => {{
+  const {{ port }} = server.address();
+  for (const raw of {requests_json}) {{
+    const answer = await new Promise((resolve, reject) => {{
+      const socket = net.connect(port, "127.0.0.1", () => socket.write(raw));
+      const chunks = [];
+      socket.on("data", (chunk) => chunks.push(chunk));
+      socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+      socket.on("error", reject);
+      socket.setTimeout(5000, () => reject(new Error("proxy did not answer " + raw)));
+    }});
+    process.stdout.write("RESPONSE " + JSON.stringify(answer) + "\n");
+  }}
+  process.exit(0);
+}});"#
+        );
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, &client);
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
+            .env("TEMPS_SANDBOX_NAME", "sbx-egress-test")
+            .env(
+                "TEMPS_SANDBOX_EGRESS_POLICY",
+                serde_json::to_string(policy).expect("policy json"),
+            )
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping proxy process test: Node.js is unavailable");
+                return None;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(
+            output.status.success(),
+            "proxy process failed (status {:?}): {}\n{stdout}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let mut responses = Vec::new();
+        let mut log = String::new();
+        for line in stdout.lines() {
+            match line.strip_prefix("RESPONSE ") {
+                Some(json) => responses.push(serde_json::from_str(json).expect("response json")),
+                None => {
+                    log.push_str(line);
+                    log.push('\n');
+                }
+            }
+        }
+        assert_eq!(responses.len(), requests.len(), "{stdout}");
+        Some((responses, log))
+    }
+
+    /// The sidecar process itself, not a fragment of it: a restricted
+    /// policy refuses what it does not list, over CONNECT and plain HTTP,
+    /// with a 403 a sandbox user can act on and a JSON log line per refusal.
+    #[test]
+    fn the_proxy_process_enforces_a_restricted_policy() {
+        let policy = SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+        .normalized()
+        .expect("valid policy");
+        let Some((responses, log)) = run_proxy_process(
+            &policy,
+            &[
+                "CONNECT other.example.net:443 HTTP/1.1\r\nHost: other.example.net:443\r\n\r\n",
+                "CONNECT api.example.com:22 HTTP/1.1\r\nHost: api.example.com:22\r\n\r\n",
+                "CONNECT 1.1.1.1:443 HTTP/1.1\r\nHost: 1.1.1.1:443\r\n\r\n",
+                "GET http://other.example.net/ HTTP/1.1\r\nHost: other.example.net\r\nConnection: close\r\n\r\n",
+            ],
+        ) else {
+            return;
+        };
+
+        for (response, destination) in responses.iter().zip([
+            "other.example.net:443",
+            "api.example.com:22",
+            "1.1.1.1:443",
+            "other.example.net:80",
+        ]) {
+            assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+            assert!(
+                response.contains(&format!(
+                    "sandbox sbx-egress-test: egress to {destination} denied"
+                )),
+                "{response}"
+            );
+            assert!(response.contains("mode restricted"), "{response}");
+        }
+        let refusals: Vec<serde_json::Value> = log
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each log line is JSON"))
+            .collect();
+        assert_eq!(refusals.len(), 4, "{log}");
+        assert!(refusals
+            .iter()
+            .all(|line| line["sandbox"] == "sbx-egress-test" && line["reason"] == "policy"));
+    }
+
+    /// The default policy: public destinations on 80 and 443 only, and the
+    /// private-address refusal holds whatever the port.
+    #[test]
+    fn the_proxy_process_enforces_the_internet_policy() {
+        let Some((responses, log)) = run_proxy_process(
+            &SandboxEgressPolicy::internet(),
+            &[
+                "CONNECT 10.0.0.1:443 HTTP/1.1\r\nHost: 10.0.0.1:443\r\n\r\n",
+                "CONNECT 169.254.169.254:80 HTTP/1.1\r\nHost: 169.254.169.254:80\r\n\r\n",
+                "CONNECT 1.1.1.1:22 HTTP/1.1\r\nHost: 1.1.1.1:22\r\n\r\n",
+            ],
+        ) else {
+            return;
+        };
+
+        assert!(responses[0].contains("egress to 10.0.0.1:443 denied: private"));
+        assert!(responses[1].contains("egress to 169.254.169.254:80 denied: private"));
+        assert!(
+            responses[2].contains("egress to 1.1.1.1:22 denied")
+                && responses[2].contains("mode internet: ports 80 and 443 only"),
+            "{}",
+            responses[2]
+        );
+        assert!(responses.iter().all(|r| r.starts_with("HTTP/1.1 403")));
+        assert_eq!(log.lines().count(), 3, "{log}");
+    }
+
+    #[test]
+    fn a_sidecar_carries_its_egress_policy_and_fails_closed_on_garbage() {
+        let restricted = parity_policy();
+        let egress = SidecarEgressPolicy::new("temps-sandbox-t1", &restricted).expect("valid");
+        let internet =
+            SidecarEgressPolicy::new("temps-sandbox-t1", &SandboxEgressPolicy::internet())
+                .expect("valid");
+        assert_ne!(
+            egress.digest, internet.digest,
+            "a policy change must be drift"
+        );
+        assert_eq!(egress.digest.len(), 64);
+        // Normalization first: the same policy spelled differently is the
+        // same sidecar.
+        let respelled = SidecarEgressPolicy::new(
+            "temps-sandbox-t1",
+            &SandboxEgressPolicy::restricted(vec![
+                temps_workload::EgressRule::host("api.example.com", &[443]),
+                temps_workload::EgressRule::host("*.PKG.example.org", &[443, 80]),
+                temps_workload::EgressRule::cidr("1.1.1.0/24", &[8443, 443]),
+                temps_workload::EgressRule::cidr("2606:4700::1/32", &[443]),
+                temps_workload::EgressRule::host("internal.example.com.", &[443]),
+            ]),
+        )
+        .expect("valid");
+        assert_eq!(respelled, egress);
+
+        let sidecar = |env: Vec<String>, digest: &str| bollard::models::ContainerInspectResponse {
+            config: Some(bollard::models::ContainerConfig {
+                env: Some(env),
+                labels: Some(HashMap::from([(
+                    SANDBOX_EGRESS_RULES_LABEL.to_string(),
+                    digest.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let current = sidecar(
+            vec![
+                format!("{SANDBOX_EGRESS_RULES_ENV}={}", egress.json),
+                format!("{SANDBOX_NAME_ENV}=temps-sandbox-t1"),
+            ],
+            &egress.digest,
+        );
+        assert!(egress.is_carried_by(&current, "temps-sandbox-t1"));
+        assert!(!internet.is_carried_by(&current, "temps-sandbox-t1"));
+        assert!(!egress.is_carried_by(&current, "temps-sandbox-other"));
+        assert_eq!(
+            egress_policy_of_sidecar("proxy", &current).expect("readable"),
+            restricted
+        );
+
+        // A sidecar from before egress policies enforces `internet`.
+        let legacy = sidecar(vec!["TEMPS_CONTROL_PLANE_URL=http://cp".into()], "");
+        assert_eq!(
+            egress_policy_of_sidecar("proxy", &legacy).expect("readable"),
+            SandboxEgressPolicy::internet()
+        );
+        assert!(!internet.is_carried_by(&legacy, "temps-sandbox-t1"));
+
+        // Unreadable is an error, never `internet`.
+        for garbage in [
+            "{",
+            r#"{"mode":"open"}"#,
+            r#"{"mode":"restricted","rules":[{"cidr":"10.0.0.0/8"}]}"#,
+        ] {
+            let broken = sidecar(
+                vec![format!("{SANDBOX_EGRESS_RULES_ENV}={garbage}")],
+                &egress.digest,
+            );
+            let error = egress_policy_of_sidecar("temps-sandbox-egress-proxy-v2-x", &broken)
+                .expect_err("garbage policy");
+            assert!(
+                matches!(error, AgentError::SandboxProviderUnavailable { .. }),
+                "{error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("temps-sandbox-egress-proxy-v2-x"),
+                "{error}"
+            );
+        }
+
+        // An invalid policy is refused naming the sandbox.
+        let error = SidecarEgressPolicy::new(
+            "temps-sandbox-t1",
+            &SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host("*", &[])]),
+        )
+        .expect_err("invalid");
+        assert!(matches!(error, AgentError::Validation { .. }), "{error:?}");
+        assert!(error.to_string().contains("temps-sandbox-t1"), "{error}");
     }
 
     // ---- legacy Linux iptables helper tests ---------------------------------

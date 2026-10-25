@@ -247,6 +247,7 @@ async fn smoke_test(provider: &MicrosandboxSandboxProvider) -> anyhow::Result<()
         pids_limit: None,
         disk_size_mb: None,
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: Some("none".to_string()),
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(60),

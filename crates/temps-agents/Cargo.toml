@@ -16,7 +16,7 @@ temps-ai = { path = "../temps-ai" }
 temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
 # ADR-055 §6: sandbox backends are runtime drivers (`SandboxExt`).
-temps-workload = { path = "../temps-workload" }
+temps-workload = { path = "../temps-workload", features = ["openapi"] }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
 temps-config = { path = "../temps-config" }

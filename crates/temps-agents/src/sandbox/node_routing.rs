@@ -337,6 +337,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .await?
+            .set_egress_policy(handle, policy)
+            .await
+    }
+
     async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
         self.local.recover(run_id).await
     }
@@ -918,6 +929,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

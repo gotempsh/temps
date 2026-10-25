@@ -68,6 +68,9 @@ pub fn requirements_for(config: &SandboxCreateConfig) -> Result<SandboxRequireme
     if let Some(egress) = egress_from_network_mode(config.network_mode.as_deref(), &label)? {
         requirements = requirements.require(SandboxFeature::Egress(egress));
     }
+    if config.egress_policy.is_restricted() {
+        requirements = requirements.require(SandboxFeature::EgressRules);
+    }
     if config.workspace_volume.is_some() {
         requirements = requirements.require(SandboxFeature::WorkspaceVolume);
     }
@@ -153,6 +156,25 @@ impl DriverSandboxProvider {
             .clone()
             .unwrap_or_else(|| config.run_id.to_string());
         let requirements = requirements_for(config)?;
+        // A restricted egress policy on a backend that cannot enforce one is
+        // its own typed refusal, so the caller learns which setting to
+        // change rather than reading a list of what every driver lacks.
+        if config.egress_policy.is_restricted() {
+            let enforceable = |d: &Arc<dyn SandboxExt>| d.sandbox_capabilities().egress_rules;
+            let refused_backend = match config.backend {
+                Some(requested) => self
+                    .drivers
+                    .iter()
+                    .find(|d| d.capabilities().name == requested.to_string())
+                    .filter(|d| !enforceable(d))
+                    .map(|_| requested.to_string()),
+                None if !self.drivers.iter().any(enforceable) => Some(self.default.to_string()),
+                None => None,
+            };
+            if let Some(backend) = refused_backend {
+                return Err(AgentError::SandboxEgressPolicyUnsupported { sandbox, backend });
+            }
+        }
         let candidates: Vec<DriverCandidate<'_>> = self
             .drivers
             .iter()
@@ -392,6 +414,24 @@ impl SandboxProvider for DriverSandboxProvider {
             .connect_port(&instance_handle(handle), port)
             .await
             .map(pty_attachment)
+            .map_err(agent_error)
+    }
+
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let driver = self.driver_for(handle)?;
+        if policy.is_restricted() && !driver.sandbox_capabilities().egress_rules {
+            return Err(AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: handle.sandbox_name.clone(),
+                backend: handle.backend.to_string(),
+            });
+        }
+        driver
+            .set_egress_policy(&instance_handle(handle), policy)
+            .await
             .map_err(agent_error)
     }
 
@@ -903,6 +943,19 @@ pub(crate) mod tests {
                     .then(|| self.handle(container_name)),
             )
         }
+        async fn set_egress_policy(
+            &self,
+            handle: &SandboxHandle,
+            policy: &crate::sandbox::SandboxEgressPolicy,
+        ) -> Result<(), AgentError> {
+            self.record(format!(
+                "egress {} {} rules={}",
+                handle.sandbox_name,
+                policy.mode,
+                policy.rules.len()
+            ));
+            Ok(())
+        }
         fn name(&self) -> &str {
             "fake"
         }
@@ -929,6 +982,7 @@ pub(crate) mod tests {
             memory_limit_mb: Some(256),
             pids_limit: None,
             disk_size_mb: None,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1030,6 +1084,96 @@ pub(crate) mod tests {
             error.to_string().contains("docker lacks guest Docker"),
             "{error}"
         );
+    }
+
+    fn restricted_policy() -> crate::sandbox::SandboxEgressPolicy {
+        crate::sandbox::SandboxEgressPolicy::restricted(vec![crate::sandbox::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+    }
+
+    #[tokio::test]
+    async fn a_restricted_egress_policy_is_placed_on_a_driver_that_enforces_it() {
+        let (facade, docker, fc, _) = facade(SandboxBackend::Firecracker);
+        let mut cfg = config("abc");
+        cfg.egress_policy = restricted_policy();
+        let handle = facade.create(cfg).await.unwrap();
+        assert_eq!(handle.backend, SandboxBackend::Docker);
+        assert!(fc.calls().is_empty(), "firecracker never sees it");
+        assert_eq!(docker.calls().len(), 1);
+        assert!(
+            handle.conditions[0].message.contains("egress allow-lists"),
+            "{:?}",
+            handle.conditions
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restricted_egress_policy_on_a_named_backend_without_allow_lists_is_a_typed_refusal()
+    {
+        for backend in [SandboxBackend::Firecracker, SandboxBackend::Microsandbox] {
+            let (facade, docker, fc, msb) = facade(SandboxBackend::Docker);
+            let mut cfg = config("abc");
+            cfg.backend = Some(backend);
+            cfg.egress_policy = restricted_policy();
+            let error = facade.create(cfg).await.unwrap_err();
+            match &error {
+                AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox,
+                    backend: refused,
+                } => {
+                    assert_eq!(sandbox, "abc");
+                    assert_eq!(refused, &backend.to_string());
+                }
+                other => panic!("{backend}: expected a typed refusal, got {other:?}"),
+            }
+            assert!(
+                error.to_string().contains("use the docker backend"),
+                "{error}"
+            );
+            assert!(docker.calls().is_empty() && fc.calls().is_empty() && msb.calls().is_empty());
+
+            // The default policy is fine everywhere.
+            let mut cfg = config("open");
+            cfg.backend = Some(backend);
+            assert!(facade.create(cfg).await.is_ok(), "{backend}");
+        }
+    }
+
+    #[tokio::test]
+    async fn set_egress_policy_goes_to_the_owning_driver_or_is_refused_by_capability() {
+        let (facade, docker, fc, _) = facade(SandboxBackend::Docker);
+        let docker_handle = docker.handle("temps-sandbox-d");
+        facade
+            .set_egress_policy(&docker_handle, &restricted_policy())
+            .await
+            .unwrap();
+        assert_eq!(
+            docker.calls(),
+            vec!["egress temps-sandbox-d restricted rules=1"]
+        );
+
+        let fc_handle = fc.handle("temps-sandbox-f");
+        let error = facade
+            .set_egress_policy(&fc_handle, &restricted_policy())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                AgentError::SandboxEgressPolicyUnsupported { sandbox, backend }
+                    if sandbox == "temps-sandbox-f" && backend == "firecracker"
+            ),
+            "{error:?}"
+        );
+        assert!(fc.calls().is_empty(), "never reaches the backend");
+        // `internet` is what every backend already does.
+        facade
+            .set_egress_policy(&fc_handle, &crate::sandbox::SandboxEgressPolicy::internet())
+            .await
+            .unwrap();
+        assert_eq!(fc.calls(), vec!["egress temps-sandbox-f internet rules=0"]);
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ fn config(run_id: i32, network_mode: Option<&str>) -> SandboxCreateConfig {
         pids_limit: None,
         disk_size_mb: None,
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: network_mode.map(str::to_string),
         env_vars: HashMap::from([("TASK".to_string(), "golden".to_string())]),
         idle_timeout: Duration::from_secs(600),
