@@ -307,78 +307,97 @@ anywhere.
 reported (tailscaled version, `BackendState`, tags, MagicDNS and HTTPS on,
 `Self.DNSName`, who holds `<machine>:443` in its Serve config, the
 `--tailscale-serve` consent, root or not), the credential, the Service as
-read from the API when planning (absent, or its `comment`, `ports` and
-`addrs`), and the address's allowed principals.
+read from the API when planning (absent, or its `comment`, `ports`,
+`tags` and `addrs`), and the address's allowed principals.
 
 | Intent | Found by | Lookup authority |
 |---|---|---|
 | `TailscaleCredential {name}` | its Temps row | immediate |
 | `TailscaleService {name, marker}` | `GET …/services/{name}` and its `comment` | settled (two misses), as Cloudflare DNS |
+| `TailscaleServiceHost {name, node_id}` | its `tailnet_service_hosts` row | immediate |
 | `TailscaleServe {node_id, address_id}` | the desired-entry row, then the agent's report | immediate for the row; the step is done only on the report |
 | `ServiceApproval {name, node_id}` | none: a wait, no side effect | n/a |
 
-- **Who owns a Service: the install; which run wrote it: the run id.**
-  Temps writes `comment: "temps:<install>:<run_id>"`, the ADR 031 marker
-  idea in the one free field a Service has. The two parts answer different
-  questions, as the marker's scope and `run_id` do for DNS in ADR 064:
+- **Temps' Service definition is fixed, and Temps never updates a
+  Service.** Every Service Temps makes has the same definition: `ports`
+  `["tcp:443"]`, `tags` the worker tag the plan chose (`tag:temps` by
+  default), and `comment: "temps:<install>:<creator_run_id>"`, the ADR 031
+  marker idea in the one free field a Service has. Since nothing about it
+  ever needs to change, Temps calls `PUT` only to create, never to update.
+  That removes the cases where an update could lose someone else's change
+  or rewrite the marker.
+- **Who owns it, and who created it.**
   - **Ownership is `<install>`** (ADR 031's `install_id`). Planning,
     reconciliation and the outside check treat a Service whose marker
-    carries this install as Temps', whatever its run id. A later run, or a
-    retry under a new run id, therefore never sees this install's own
-    Service as foreign;
-  - **the run id says which run created it.** A resumed run keeps its run
-    id, so its own write reads as done. A new run that finds this
-    install's Service for the address (D1, option 1) journals it as found
-    already, not created. It may update the fields Temps sets, under the
-    same checks below, but its undo never deletes it; only the run whose id
-    is in the marker may delete it;
-  - a marker with another install's id, or no marker, is not Temps'. It is
+    carries this install as Temps', whatever run created it, so a later
+    run never sees this install's own Service as foreign.
+  - **The creator run id is written once, at creation, and never
+    rewritten.** The journal entry of the run that created it records the
+    state `created`. Any other run that finds it (a re-run for the address,
+    D1 option 1) records `found`, and it never writes to the Service at
+    all.
+  - A marker with another install's id, or no marker, is not Temps'. It is
     never written to or deleted.
-- **A Service is never adopted.** The API's `PUT` creates *or updates*, so
-  a `PUT` on someone else's Service would rewrite it. The plan reads the
-  name first; one that exists without this install's marker blocks the
+- **Which hosts are valid: the recorded ones.** Each worker a run configures
+  for a Service gets a `tailnet_service_hosts` row (Service name, node,
+  address, the run that added it). The row is written in the same
+  transaction as that worker's Serve desired-entry row and is journaled, so
+  undo removes it. The valid hosts of a Service are its rows, whichever run
+  of this install added them; a host advertising the name without a row is
+  foreign.
+- **Create only when absent.** The plan reads the name first and records
+  what it found in the fingerprint: absent, or the `comment`, `ports`,
+  `tags` and `addrs`. A name held without this install's marker blocks the
   option ("`svc:myapp` already exists in your tailnet and Temps did not
-  create it; pick another name"). Temps re-reads the name immediately
-  before the `PUT`; a Service found there without this install's marker
-  stops the step as `conflict` and nothing is written.
+  create it; pick another name"). Immediately before the `PUT` the step
+  reads the name again:
+  - absent: create it;
+  - this run's own marker (a resumed run whose earlier `PUT` landed): no
+    `PUT`, go to the check below;
+  - anything else, including this install's Service with any field
+    different from the plan's read: `conflict`, nothing written, and the
+    message names the field that changed.
 - **The create can still overwrite, and the ADR accepts that window.** The
-  Services API has no conditional create (no `If-Match`, no
-  create-only verb), so a Service someone else creates between that
-  re-read and the `PUT` is replaced by this run's definition and then
-  carries this run's marker. The marker alone cannot reveal it, and the
-  pre-`PUT` read, which saw nothing, cannot either. Generated names would
-  close the window, but the name is the address the user picked (D1), so
-  Temps keeps user-chosen names and bounds the damage instead:
+  Services API has no conditional create (no `If-Match`, no create-only
+  verb), so a Service someone else creates between that re-read and the
+  `PUT` is replaced by this run's definition and then carries this run's
+  marker. The marker alone cannot reveal it, and the pre-`PUT` read, which
+  saw nothing, cannot either. Generated names would close the window, but
+  the name is the address the user picked (D1), so Temps keeps user-chosen
+  names and bounds the damage instead:
   - the window is one request long, the same as for Cloudflare DNS in
     ADR 064 D4, and only an actor who already has a `services`-scoped
     credential for the tailnet can use it;
   - what the overwrite replaces is the other Service's definition (its
-    ports and comment). It moves no traffic by itself: a Service routes
-    only to hosts that advertise it and that the tailnet admin approved;
-  - **after the `PUT` the step reads the Service back, the whole
-    definition and its hosts.** It is `done` only if every field matches:
-    - the marker is this run's;
-    - `ports` and `tags` are exactly what the run wrote;
-    - `addrs` is non-empty and inside the Tailscale ranges.
-      Tailscale assigns the TailVIP, so the run records it in the journal
-      here rather than choosing it;
-    - every host advertising the name is a worker this run configured.
+    ports, tags and comment). It moves no traffic by itself: a Service
+    routes only to hosts that advertise it and that the tailnet admin
+    approved;
+  - the host check below catches the other actor's devices, and the run
+    never approves hosts, so an overwritten name cannot be turned into
+    traffic to Temps' worker without the tailnet admin approving it.
+- **When the Service step is `done`.** The step reads the whole definition
+  and its hosts back:
+  - **after creating it:** the marker is this run's, `ports` and `tags` are
+    the fixed definition, and `addrs` is non-empty and inside the Tailscale
+    ranges. Tailscale assigns the TailVIP, so the run records `addrs` in
+    the journal here rather than choosing them;
+  - **when it was found:** the marker carries this install (any creator),
+    `ports` and `tags` are the fixed definition, and `addrs` equals the
+    `addrs` journaled by the run that created it;
+  - **in both cases:** every host advertising the name has a
+    `tailnet_service_hosts` row.
 
-    Any mismatch makes the step `conflict`, even with this run's marker,
-    and names the field: "`svc:myapp` now listens on `tcp:8443` as well,
-    which Temps did not set", or "`svc:myapp` is also advertised by `nas`,
-    which this setup did not configure. Someone may have created the same
-    name while Temps did; check it before approving." The reconciler and
-    the outside check (D5) keep comparing the same fields against the
-    journaled definition after the run. So a later change to the ports,
-    the tags or the recorded `addrs`, or a new advertising host, is
-    reported too; it is never accepted as the new truth. This check is why reading a
-    Service's hosts is required: if implementation finds that the D2 scopes
-    cannot read them, the Service way in is not offered until a way to read
-    them without `devices:core` is found;
-  - the run never approves hosts (below), so an overwritten name cannot be
-    turned into traffic to Temps' worker without the tailnet admin
-    approving it.
+  Any mismatch makes the step `conflict`, even with this install's marker,
+  and names the field: "`svc:myapp` now listens on `tcp:8443` as well,
+  which Temps did not set", or "`svc:myapp` is also advertised by `nas`,
+  which no Temps setup configured. Someone may have created the same name
+  while Temps did; check it before approving." The reconciler and the
+  outside check (D5) keep applying the same rule after the run, so a later
+  change to the definition or a new unrecorded host is reported too. It is
+  never accepted as the new truth. This check is why reading a Service's
+  hosts is required: if implementation finds that the D2 scopes cannot read
+  them, the Service way in is not offered until a way to read them without
+  `devices:core` is found.
 - **The Serve entry is declared, and applied by the agent.** The run writes
   a desired-entry row (`tailnet_serve_entries`: node, address, way in,
   Service name) and the route snapshot carries it to that worker only. The
@@ -395,17 +414,32 @@ read from the API when planning (absent, or its `comment`, `ports` and
   documented; until it is, the snippet names each Service. The run waits
   in `waiting` and resumes when the host reads as approved; it is not a
   failure.
-- **Undo, newest first:** the agent removes its Serve entry and its
-  `AdvertiseServices` name (the desired row is deleted; done on the
-  agent's report, or at once if the worker is gone from the cluster);
-  then a Service this run created is deleted only while its `comment`
-  still holds this run's marker, its definition still matches the
-  journal, and its hosts are only workers whose entries this run removed. Anything else pauses undo as a conflict ("`svc:myapp`
-  is now also hosted by `nas`, which this setup did not configure. Keep
-  it, or delete it anyway?"). A Service the run found already there is
-  never deleted. The credential row is removed only if the run created it
-  and nothing else uses it. The address's audience goes back last, as in
-  phase 2.
+- **Undo, newest first.**
+  - **Hosts first.** The agent removes the run's Serve entries and its
+    `AdvertiseServices` names. The desired rows and the run's
+    `tailnet_service_hosts` rows are deleted; the step is done on the
+    agent's report, or at once if the worker is gone from the cluster.
+  - **Then the Service, only once it has no hosts left.** It is deleted by
+    the undo that removes its last recorded host, whichever run of this
+    install that is. Deleting it also needs three things:
+    - a journal entry of this install recording `created` for it, with the
+      run id in its marker;
+    - its definition still matches that entry;
+    - no unrecorded host advertises it.
+
+    This way neither the creator's undo nor a later run's undo leaves an
+    orphan.
+  - **A Service still in use is kept.** If other runs' hosts remain, undo
+    reports "kept: `svc:myapp` still serves `myapp` on `nas` (set up on
+    3 May)" and is done. That is expected, not a conflict.
+  - **Anything else pauses undo as a conflict:** a changed definition, or an
+    unrecorded host ("`svc:myapp` is now also hosted by `nas`, which no Temps
+    setup configured. Keep it, or delete it anyway?").
+  - **Never deleted:** a Service no journal of this install records as
+    `created`.
+  - **The rest.** The credential row is removed only if the run created it
+    and nothing else uses it. The address's audience goes back last, as in
+    phase 2.
 - **Reconcile** treats a missing agent report like any pending step: the
   desired row is authoritative for what was asked; the agent's next
   heartbeat says what is true. A worker that does not report for 20
@@ -444,7 +478,7 @@ device can give.
 **Outside (the control plane):** no tunnel publishes or is publishing the
 name; public DNS returns nothing for it or only Tailscale addresses; and
 the agent reports Funnel off for it; and, for a Service, every host
-advertising it is a worker Temps configured for this address (D4), read
+advertising it has a `tailnet_service_hosts` row (D4), read
 from the API with the D2 credential. A foreign host is shown with its name
 and is a failure. A Funnel entry for the name, or a
 `Tailscale-Funnel-Request` seen at the socket, is shown in red ("This
@@ -763,9 +797,11 @@ window in which a phase 2 address is unserved.
   and the outside check shows it in red (D3, D5).
 - The agent edits only Serve entries it wrote, with conditional writes,
   and only with the worker owner's consent. A Service is never adopted by
-  name. Ownership is the install in its marker, and only the run that
-  created a Service may delete it (D4). The
-  Services API cannot create conditionally, so a same-name Service created
+  name, and Temps never updates one: `PUT` only creates, so neither the
+  marker nor anyone else's change is ever rewritten. Ownership is the
+  install in its marker. A Service is deleted only when its last recorded
+  host is removed and a journal of this install shows Temps created it
+  (D4). The Services API cannot create conditionally, so a same-name Service created
   within one request of Temps' `PUT` can be overwritten. Temps detects it
   by the Service's hosts rather than its marker, and never approves hosts
   itself (D4).
