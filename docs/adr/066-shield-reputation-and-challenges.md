@@ -344,11 +344,12 @@ Cloudflare without Bot Management".
   HMAC-SHA256 under the current Shield key. Tokens are valid for 5 minutes.
   The token string is the `challenge` input of the existing WASM solver, so
   the solver does not change.
-- **Verification.** `POST /api/_temps/captcha/verify` takes only the token
-  and the nonce. The ingress recomputes the identity from the connection and
-  checks, in order: MAC, expiry, environment and identity match, then the
-  proof-of-work bits. That is one HMAC and one SHA-256 per attempt, with no
-  database.
+- **Verification.** `POST /api/_temps/captcha/verify` takes only the token,
+  the nonce and the reported solve time (`solve_ms`, optional, used only for
+  the D6 measurements). The ingress recomputes the identity from the
+  connection and checks, in order: MAC, expiry, environment and identity
+  match, then the proof-of-work bits. That is one HMAC and one SHA-256 per
+  attempt, with no database.
 - **Clearance.** Success sets `__Host-temps_clr`: environment, identity,
   issue and expiry times and a random budget id, signed. `Secure`,
   `HttpOnly`, `SameSite=Lax`, `Path=/`, valid 24 hours. The `__Host-` prefix
@@ -816,8 +817,11 @@ the work:
 - Trust chain: `cf-ja4` from a non-Cloudflare peer is ignored and stripped;
   a Cloudflare peer without it gives `None`, never Cloudflare's own JA4; an
   edge header with a bad signature or an old `ts` is ignored.
-- Regression for problem 1: a precomputed `(challenge, nonce)` posted with a
-  chosen identifier must not clear anyone.
+- Regression for problem 1: the old body, with a challenge, environment and
+  identifier chosen by the client, is rejected; and a token solved for one
+  visitor and submitted from another connection (different address prefix,
+  User-Agent or fingerprint) sets no clearance. Phase 1 covers both in
+  `attack_mode_challenge_tests` and in `temps-shield`'s unit tests.
 - Proxy harness tests (`proxy.rs`) for each mode and verdict, and for the
   429 path on non-navigation requests.
 - Agent tests: snapshot fetch and swap, sealed keys, challenge served and
@@ -840,8 +844,11 @@ the work:
 - **Verify endpoint.** Stateless, one HMAC and one hash per attempt, covered
   by the rate limiter.
 - **Cookie theft.** A stolen clearance works only from the same address
-  prefix, User-Agent and JA4, for one environment, within its budget and
-  expiry.
+  prefix, User-Agent and fingerprint, for one environment, within its budget
+  and expiry. Until phase 3 the fingerprint is the proxy's coarse TLS
+  fingerprint (version and negotiated cipher), which many clients share, so
+  in phase 1 the binding rests mostly on the address prefix and User-Agent;
+  JA4 makes it specific to the client stack.
 - **Pre-TLS read.** Bounded at 16 KB and 2 s, and adds no new way to hold a
   connection open: the TLS handshake would wait for the same bytes.
 - **Forwarded fingerprints.** JA4 headers are trusted exactly where

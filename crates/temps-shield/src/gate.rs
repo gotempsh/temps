@@ -118,7 +118,15 @@ impl ChallengeGate {
             return Err(ChallengeError::WrongVisitor);
         }
         check_work(token, nonce, claims.difficulty)?;
-        if !self.redeemed.entry(claims.salt).or_insert(()).is_fresh() {
+        // `or_insert_with` coalesces concurrent callers on one key, so exactly
+        // one sees a fresh entry. `or_insert` does not: racing submissions of
+        // one solution would each mint a clearance.
+        if !self
+            .redeemed
+            .entry(claims.salt)
+            .or_insert_with(|| ())
+            .is_fresh()
+        {
             return Err(ChallengeError::Replayed);
         }
         seal_clearance(
@@ -287,6 +295,33 @@ mod tests {
             gate.redeem(&token, &nonce, 1, &visitor(1), NOW),
             Err(ChallengeError::Replayed)
         );
+    }
+
+    /// Redemption is one atomic insert into the redeemed set, so racing
+    /// submissions of one solution mint exactly one clearance.
+    #[test]
+    fn concurrent_redemptions_of_one_token_succeed_once() {
+        const THREADS: usize = 8;
+        let gate = gate();
+        let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
+        let nonce = solve(&token, DIFFICULTY);
+        let barrier = std::sync::Barrier::new(THREADS);
+        let successes = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..THREADS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        gate.redeem(&token, &nonce, 1, &visitor(1), NOW).is_ok()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|handle| handle.join().ok())
+                .filter(|ok| *ok)
+                .count()
+        });
+        assert_eq!(successes, 1);
     }
 
     #[test]

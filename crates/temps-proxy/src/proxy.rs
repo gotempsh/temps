@@ -1707,35 +1707,24 @@ impl LoadBalancer {
         Ok(self.request_authority(session)?.host)
     }
 
-    /// Extract TLS fingerprint with client characteristics
+    /// Extract the TLS fingerprint, version and cipher of the connection.
     ///
-    /// Returns a fingerprint including:
-    /// - TLS version and cipher (from TLS handshake)
-    /// - Client IP address
-    /// - User-Agent header
-    ///
-    /// This creates a unique identifier per person/device, ensuring
-    /// each different visitor gets a different fingerprint.
+    /// The fingerprint describes only the TLS session. Attack mode binds a
+    /// clearance to it together with the client's /24 or /64 and the
+    /// User-Agent (ADR 066, D3), so it must not contain the full address.
     fn extract_tls_info(&self, session: &PingoraSession, ctx: &mut ProxyContext) {
         // Access SSL digest from the downstream session's digest
         // digest() returns Option<&Digest>, and Digest contains ssl_digest: Option<Arc<SslDigest>>
         if let Some(digest) = session.downstream_session.digest() {
             if let Some(ssl_digest) = &digest.ssl_digest {
-                // Compute fingerprint with IP and user agent
-                if let Some(fingerprint) = tls_fingerprint::compute_fingerprint_from_arc(
-                    ssl_digest,
-                    ctx.ip_address.as_deref(),
-                    &ctx.user_agent,
-                ) {
-                    ctx.tls_fingerprint = Some(fingerprint.clone());
-
+                if let Some(fingerprint) =
+                    tls_fingerprint::compute_tls_fingerprint_from_arc(ssl_digest)
+                {
                     debug!(
-                        "Extracted fingerprint: {} (IP: {}, UA: {}) for request_id={}",
-                        fingerprint,
-                        ctx.ip_address.as_ref().unwrap_or(&"unknown".to_string()),
-                        ctx.user_agent,
-                        ctx.request_id
+                        "Extracted fingerprint: {} for request_id={}",
+                        fingerprint, ctx.request_id
                     );
+                    ctx.tls_fingerprint = Some(fingerprint);
                 }
 
                 // Extract TLS version and cipher for logging
@@ -11779,10 +11768,24 @@ mod attack_mode_challenge_tests {
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         assert!(body.contains("unsolved"), "{body}");
 
-        // 4. A solved token for this visitor sets the clearance. It is issued
-        //    at a low difficulty with the same keys, to keep the test fast.
-        let identity = crate::shield::visitor_identity(None, UA, Some(FINGERPRINT));
+        // 4. A token solved for another visitor (here another User-Agent)
+        //    clears no one: the proxy derives the visitor from the
+        //    connection, not from anything in the body. Tokens are issued at
+        //    a low difficulty with the same keys, to keep the test fast.
         let gate = crate::shield::test_gate();
+        let other = crate::shield::visitor_identity(None, "curl/8.5.0", Some(FINGERPRINT));
+        let foreign = gate.issue(env_id, &other, 4, temps_shield::unix_now())?;
+        let foreign = format!(
+            r#"{{"token":"{foreign}","nonce":"{}"}}"#,
+            solve(&foreign, 4)
+        );
+        let (head, body) = answered(send(&h, post_verify(&foreign)).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert!(body.contains("invalid"), "{body}");
+        assert!(!head.contains("temps_clr"), "{head}");
+
+        // 5. A solved token for this visitor sets the clearance.
+        let identity = crate::shield::visitor_identity(None, UA, Some(FINGERPRINT));
         let easy = gate.issue(env_id, &identity, 4, temps_shield::unix_now())?;
         let solved = format!(
             r#"{{"token":"{easy}","nonce":"{}","solve_ms":5}}"#,
@@ -11805,11 +11808,11 @@ mod attack_mode_challenge_tests {
         );
         let pair = cookie.split(';').next().unwrap_or_default().to_string();
 
-        // 5. The same token cannot be redeemed twice.
+        // 6. The same token cannot be redeemed twice.
         let (head, _) = answered(send(&h, post_verify(&solved)).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
 
-        // 6. The clearance admits this visitor, and only this visitor.
+        // 7. The clearance admits this visitor, and only this visitor.
         assert!(matches!(
             send(&h, get(UA, Some(&pair))).await?,
             Outcome::Forwarded
