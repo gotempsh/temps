@@ -440,8 +440,10 @@ read from the API when planning (absent, or its `comment`, `ports`,
   on `conflict`; it never overwrites. Since tailscaled's write is
   conditional, there is no lost-update window on the worker. On `applied`
   the row records `applied_etag` and that the agent wrote the entry; on
-  `conflict` or `error` it records that the agent wrote nothing. The same
-  rule covers the machine-name way in, which has entries but no Service.
+  `conflict` it records that the agent wrote nothing; on `error` it records
+  that the outcome is unknown, since the write may have landed before the
+  error. The same rule covers the machine-name way in, which has entries
+  but no Service.
 - **Approval is waited for, never done.** The step shows the admin-console
   link and the policy entry to paste:
   `"autoApprovers": {"services": {"svc:myapp": ["tag:temps"]}}`. Whether
@@ -958,7 +960,8 @@ window in which a phase 2 address is unserved.
 
 | Phase | Scope |
 |---|---|
-| 3a | D1 machine-name way in (`tailscale_serve`); D2 agent LocalAPI client, consent flag, owned entries; D3 per-address socket and header stripping; D4 Serve entry steps and undo; D5 checks and messages; `Audience::parse` fails closed |
+| 2 (prerequisite) | `Audience::parse` fails closed: an unknown stored audience, and `signed_in` before phase 4, is served to nobody, never to a private range (D6). Ships with ADR 064 phase 2, before any later audience can be stored |
+| 3a | D1 machine-name way in (`tailscale_serve`); D2 agent LocalAPI client, consent flag, owned entries; D3 per-address socket and header stripping; D4 Serve entry steps and undo; D5 checks and messages |
 | 3b | D1 Service way in (`tailscale_service`); D2 Tailscale provider and OAuth client with scope checks; D4 Service, approval wait and undo |
 | 3c | D6 `tailnet_users`: principals table, Serve socket identity, whois for tags and for the phase 2 Tailscale listener; capability gating |
 | 4a | D7/D8 Temps gate on every listener: sign-in, cookie, logout, revocation, `gate.v1` capability; D10 checks and monitors |
