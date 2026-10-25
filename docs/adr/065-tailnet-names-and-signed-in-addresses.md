@@ -961,7 +961,8 @@ window in which a phase 2 address is unserved.
    (`Tailscale-App-Capabilities`), granted in the tailnet policy, or not at
    all?
 4. Should a user be able to bring a Service defined by hand in the admin
-   console, with no OAuth client, if approval can be seen locally (2)?
+   console, with no OAuth client? Seeing approval locally (2) is not
+   enough: the Service's hosts still have to be readable (D4).
 5. Does the Temps gate also admit people who are not console users (an
    invite link, a one-time email code), or is that what Access is for?
 6. ADR 064's open question 2 applies here too: do preview environments
