@@ -335,6 +335,11 @@ pub struct ApplicationWorkspaceUsage {
     pub open_ports: Vec<u16>,
 }
 
+/// `reason` of the `stopped` event recorded when a started sandbox is
+/// stopped again because its restricted egress policy could not be
+/// re-applied.
+pub const EGRESS_POLICY_REAPPLY_FAILED: &str = "egress_policy_reapply_failed";
+
 const APPLICATION_WORKSPACE_NAME_PREFIX: &str = "ai-application:";
 const SOURCE_IMPORT_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_IMPORT_PROVIDER_TIMEOUT: Duration = Duration::from_secs(130);
@@ -5016,14 +5021,65 @@ TEMPS_ASKPASS_EOF\n\
             "could not re-apply the restricted egress policy of a started sandbox ({error}); \
              stopping it so it does not run with wider egress"
         );
-        if let Err(stop) = self.registry.stop(row.id, &row.public_id).await {
-            tracing::error!(
-                sandbox_id = %row.public_id,
-                internal_id = row.id,
-                "could not stop sandbox after failing to re-apply its egress policy: {stop}"
-            );
+        self.jobs.abort_all(row.id).await;
+        match self.registry.stop(row.id, &row.public_id).await {
+            Ok(()) | Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {
+                self.mark_stopped_for_egress_failure(row, &error).await;
+            }
+            Err(stop) => {
+                // The compute may still be running; a `stopped` row would hide
+                // it, so the row keeps its status and the error says why.
+                tracing::error!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    "could not stop sandbox after failing to re-apply its egress policy: {stop}"
+                );
+            }
         }
         Err(from_agent_error(&row.public_id, error))
+    }
+
+    /// Record that the service stopped a sandbox because its stored egress
+    /// policy could not be re-applied: the row moves to `stopped` (unless it
+    /// was destroyed meanwhile) and a `stopped` event carries the reason, so
+    /// the console can say why the sandbox is not running.
+    async fn mark_stopped_for_egress_failure(
+        &self,
+        row: &sandboxes::Model,
+        cause: &temps_agents::error::AgentError,
+    ) {
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("stopped".to_string()),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        match row_status::update_when(self.db.as_ref(), changes, Expect::Live).await {
+            Ok(Some(_)) => {
+                self.record_event(
+                    row.id,
+                    "stopped",
+                    Some(serde_json::json!({
+                        "reason": EGRESS_POLICY_REAPPLY_FAILED,
+                        "detail": format!(
+                            "the sandbox's restricted egress policy could not be re-applied \
+                             after it started, so it was stopped rather than run with wider \
+                             egress: {cause}"
+                        ),
+                    })),
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(db_error) => {
+                tracing::error!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    error = %db_error,
+                    "could not mark sandbox stopped after failing to re-apply its egress policy"
+                );
+            }
+        }
     }
 
     /// Seed an already-running sandbox with additional content. Mirrors
@@ -10146,16 +10202,21 @@ mod storage_cleanup_tests {
             row_with(PUBLIC_ID, "ephemeral", "stopped"),
             &restricted_egress(),
         );
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_query_results([vec![stopped.clone()]])
-            .append_query_results([vec![stopped]])
-            .into_connection();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stopped.clone()]])
+                .append_query_results([vec![stopped.clone()]])
+                // mark_stopped_for_egress_failure: the row and its event.
+                .append_query_results([vec![stopped]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
         let provider = FakeProvider {
             fail_egress: true,
             ..FakeProvider::new()
         };
         let lifecycle = provider.lifecycle_calls.clone();
-        let (service, _) = build_service(db, provider, data_root.clone());
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
 
         let err = service
             .resume_sandbox(PUBLIC_ID, 1)
@@ -10167,6 +10228,76 @@ mod storage_cleanup_tests {
             "{err:?}"
         );
         assert_eq!(*lifecycle.lock().expect("calls"), vec!["start", "stop"]);
+        drop(service);
+        let sql = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("only handle")
+                .into_transaction_log()
+        );
+        assert!(!sql.contains("\"running\""), "never marked running: {sql}");
+        assert!(sql.contains(EGRESS_POLICY_REAPPLY_FAILED), "{sql}");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The row must not keep saying `running` for a sandbox the service
+    /// stopped because its egress policy could not be re-applied after a
+    /// restart; the `stopped` event names why.
+    #[tokio::test]
+    async fn restart_marks_stopped_a_sandbox_whose_restricted_policy_cannot_be_reapplied() {
+        let data_root = unique_data_root("egress-restart-fail");
+        let running = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "running"),
+            &restricted_egress(),
+        );
+        let stopped = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "stopped"),
+            &restricted_egress(),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![running.clone()]])
+                // enforce_stored_egress_policy re-reads the row.
+                .append_query_results([vec![running]])
+                // mark_stopped_for_egress_failure: running -> stopped.
+                .append_query_results([vec![stopped]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let lifecycle = provider.lifecycle_calls.clone();
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let err = service
+            .restart_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("never runs with wider egress");
+
+        assert!(
+            matches!(err, SandboxError::EgressPolicyUnsupported { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            lifecycle.lock().expect("calls").last().copied(),
+            Some("stop"),
+            "the container is stopped"
+        );
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("only handle")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("UPDATE") && sql.contains("\"stopped\""),
+            "the row is marked stopped: {sql}"
+        );
+        assert!(
+            sql.contains(EGRESS_POLICY_REAPPLY_FAILED) && sql.contains("egress policy"),
+            "the stopped event names the egress policy failure: {sql}"
+        );
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
