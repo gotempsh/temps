@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[allow(clippy::module_inception)]
-pub mod captcha;
-#[allow(clippy::module_inception)]
 pub mod handler;
 pub mod ip_access_control;
 pub mod password_wall;

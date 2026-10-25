@@ -548,9 +548,7 @@ pub fn setup_proxy_server(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
-    ));
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(&encryption_service));
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
@@ -617,7 +615,7 @@ pub fn setup_proxy_server(
         config_service.clone(),
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
         disable_https_redirect,
     )
@@ -965,8 +963,8 @@ pub fn create_proxy_service(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(
+        &temps_core::EncryptionService::new(&config.encryption_key)?,
     ));
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
@@ -987,7 +985,7 @@ pub fn create_proxy_service(
         config_service,
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
         disable_https_redirect,
     )
