@@ -36,7 +36,8 @@ use super::audit::{
 };
 use crate::services::environment_service::EnvironmentService;
 use crate::services::ingress_service::{
-    IngressError, IngressService, IngressSettings, IngressSettingsUpdate, SandboxLoginTarget,
+    IngressError, IngressService, IngressSettings, IngressSettingsUpdate, IssuedLoginGrant,
+    SandboxLoginTarget,
 };
 
 pub struct IngressAppState {
@@ -65,15 +66,17 @@ impl From<IngressError> for Problem {
                     .detail(error.to_string())
                     .build()
             }
-            IngressError::SandboxNotFound { .. } => temps_core::error_builder::not_found()
-                .title("Sandbox Not Found")
-                .detail(error.to_string())
-                .build(),
+            IngressError::SandboxNotFound { .. } | IngressError::SandboxPublicIdNotFound { .. } => {
+                temps_core::error_builder::not_found()
+                    .title("Sandbox Not Found")
+                    .detail(error.to_string())
+                    .build()
+            }
             IngressError::SandboxNotLoginProtected { .. } => temps_core::error_builder::conflict()
                 .title("Temps Login Not Required")
                 .detail(error.to_string())
                 .build(),
-            IngressError::SandboxDatabase { .. } => {
+            IngressError::SandboxDatabase { .. } | IngressError::SandboxPublicIdDatabase { .. } => {
                 temps_core::error_builder::internal_server_error()
                     .title("Sandbox Preview Sign-In Unavailable")
                     .detail(error.to_string())
@@ -130,7 +133,13 @@ pub struct CreateIngressLoginGrantRequest {
     pub owner_id: i64,
     /// `http` or `https`: how the visitor reached the host.
     pub scheme: String,
+    /// The hostname, without a port.
     pub host: String,
+    /// The port the visitor reached the host on, when the proxy's request
+    /// carries one (it leaves out the scheme's default). Pass it through
+    /// unchanged: it is part of the signature.
+    #[serde(default)]
+    pub port: Option<i64>,
     /// Path on the host to return to.
     pub next: Option<String>,
     /// Unix seconds the proxy signed the request at.
@@ -186,7 +195,11 @@ struct VerifiedLoginRequest {
     /// The environment or sandbox id (internal, not the public id).
     owner_id: i32,
     scheme: LoginScheme,
+    /// The hostname the grant is bound to: lowercase, no port.
     host: String,
+    /// The port to send the browser back to; `None` for the scheme's
+    /// default.
+    port: Option<u16>,
 }
 
 impl VerifiedLoginRequest {
@@ -195,6 +208,27 @@ impl VerifiedLoginRequest {
             kind: self.kind,
             id: i64::from(self.owner_id),
         }
+    }
+
+    /// `host[:port]`: what the proxy signed, and where the grant goes.
+    fn authority(&self) -> String {
+        grant::login_authority(self.scheme, &self.host, self.port)
+    }
+}
+
+/// A login request's `port`, when it has one: 1-65535.
+fn login_port(port: Option<i64>, what: &str, owner_id: i32) -> Result<Option<u16>, Problem> {
+    let Some(port) = port else {
+        return Ok(None);
+    };
+    match u16::try_from(port) {
+        Ok(valid) if valid != 0 => Ok(Some(valid)),
+        Ok(_) | Err(_) => Err(temps_core::error_builder::bad_request()
+            .title("Invalid Login Request")
+            .detail(format!(
+                "Port {port} for {what} {owner_id} is not a TCP port (1-65535)"
+            ))
+            .build()),
     }
 }
 
@@ -242,16 +276,19 @@ fn verify_login_request(
             ))
             .build()
     })?;
+    let port = scheme.explicit_port(login_port(request.port, what, owner_id)?);
     let verified = VerifiedLoginRequest {
         kind,
         owner_id,
         scheme,
         host,
+        port,
     };
+    let authority = verified.authority();
     if !grant::login_request_valid(
         &GrantKey::derive(master, verified.owner()),
         scheme,
-        &verified.host,
+        &authority,
         request.ts,
         &request.sig,
         now,
@@ -259,8 +296,7 @@ fn verify_login_request(
         return Err(temps_core::error_builder::forbidden()
             .title("Sign-In Link Invalid Or Expired")
             .detail(format!(
-                "The sign-in request for {} ({what} {owner_id}) is not signed by this instance or is older than {} minutes; open the page again to get a new one",
-                verified.host,
+                "The sign-in request for {authority} ({what} {owner_id}) is not signed by this instance or is older than {} minutes; open the page again to get a new one",
                 grant::LOGIN_REQUEST_TTL_SECS / 60
             ))
             .build());
@@ -268,21 +304,25 @@ fn verify_login_request(
     Ok(verified)
 }
 
+/// The host's exchange URL, on the port the visitor came from, carrying the
+/// grant and where to go next.
 fn redirect_url(
-    scheme: LoginScheme,
-    host: &str,
+    request: &VerifiedLoginRequest,
     token: &str,
     next: &str,
 ) -> Result<String, Problem> {
+    let authority = request.authority();
     let mut url = url::Url::parse(&format!(
-        "{}://{host}{}",
-        scheme.as_str(),
+        "{}://{authority}{}",
+        request.scheme.as_str(),
         grant::EXCHANGE_PATH
     ))
     .map_err(|e| {
         temps_core::error_builder::internal_server_error()
             .title("Sign-In Redirect Failed")
-            .detail(format!("Cannot build the sign-in redirect to {host}: {e}"))
+            .detail(format!(
+                "Cannot build the sign-in redirect to {authority}: {e}"
+            ))
             .build()
     })?;
     url.query_pairs_mut()
@@ -543,6 +583,198 @@ pub async fn update_ingress_settings(
     Ok(Json(IngressSettingsResponse::from(settings)))
 }
 
+/// Records, signs and audits an exchange grant that opens `target`'s
+/// preview on `request`'s host for the caller: the checks and the record
+/// every sandbox preview login goes through, from the proxy's sign-in page
+/// or from the console framing the preview.
+async fn issue_sandbox_login_grant(
+    state: &IngressAppState,
+    auth: &temps_auth::AuthContext,
+    context: AuditContext,
+    target: &SandboxLoginTarget,
+    request: &VerifiedLoginRequest,
+    now: u64,
+) -> Result<(IssuedLoginGrant, String), Problem> {
+    // This keeps a grant for one sandbox from ever naming another
+    // sandbox's preview host.
+    if !target.owns_preview_host(&request.host) {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Login Request")
+            .detail(format!(
+                "Host '{}' is not a preview host of sandbox {} (expected {}<port>.<preview domain>)",
+                request.host,
+                target.public_id,
+                target.preview_label_prefix()
+            ))
+            .build());
+    }
+    may_open_sandbox(state, auth, target).await?;
+    let user_id = auth.user_id();
+    let (_, expires_at) = session_expiry(now);
+    let permission = SandboxPreviewAccess::LOGIN_PERMISSION;
+    let issued = state
+        .ingress_service
+        .record_sandbox_login_grant(
+            user_id,
+            target.sandbox_id,
+            &request.host,
+            permission,
+            expires_at,
+        )
+        .await?;
+    let token = mint_exchange_grant(
+        state.cookie_crypto.ingress_grant_master_key(),
+        request,
+        issued.grant_id,
+        permission,
+        user_id,
+        now,
+    )?;
+    info!(
+        sandbox_id = %target.public_id,
+        grant_id = issued.grant_id,
+        user_id,
+        "Sandbox preview Temps login grant issued"
+    );
+    let audit = SandboxPreviewLoginGrantIssuedAudit {
+        context,
+        sandbox_id: target.public_id.clone(),
+        project_id: target.project_id,
+        grant_id: issued.grant_id,
+        host: request.host.clone(),
+        permission: permission.to_string(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for login grant {} of sandbox {}: {e}",
+            issued.grant_id, target.public_id
+        );
+    }
+    Ok((issued, token))
+}
+
+/// The console asking to frame a sandbox's preview page.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateSandboxPreviewSessionRequest {
+    /// The sandbox's public id (`sbx_<hex>`).
+    pub sandbox_id: String,
+    /// The preview page to open, as the console would frame it:
+    /// `http(s)://ws-<hex>-<port>.<preview domain>[:port]/path?query`.
+    pub url: String,
+}
+
+/// The parts of a preview page URL a grant is issued for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewPage {
+    scheme: LoginScheme,
+    host: String,
+    port: Option<u16>,
+    /// Path and query on the host, already safe to redirect to.
+    next: String,
+}
+
+fn preview_page(sandbox_id: &str, raw: &str) -> Result<PreviewPage, Problem> {
+    let invalid = |reason: String| {
+        temps_core::error_builder::bad_request()
+            .title("Invalid Preview URL")
+            .detail(format!(
+                "Cannot open '{raw}' for sandbox {sandbox_id}: {reason}"
+            ))
+            .build()
+    };
+    let url = url::Url::parse(raw.trim()).map_err(|e| invalid(e.to_string()))?;
+    let scheme = LoginScheme::parse(url.scheme())
+        .ok_or_else(|| invalid("the scheme must be http or https".to_string()))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("it must not carry credentials".to_string()));
+    }
+    let host = url
+        .host_str()
+        .and_then(grant_host)
+        .ok_or_else(|| invalid("its host is not a preview hostname".to_string()))?;
+    let next = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    Ok(PreviewPage {
+        scheme,
+        host,
+        // `Url` has already checked the port is a u16 and dropped the
+        // scheme's default.
+        port: scheme.explicit_port(url.port()),
+        next: safe_next(Some(&next)).to_string(),
+    })
+}
+
+#[utoipa::path(
+    post,
+    path = "/ingress/sandbox-preview-sessions",
+    tag = "Sandboxes",
+    request_body = CreateSandboxPreviewSessionRequest,
+    responses(
+        (status = 201, description = "Grant issued; load redirect_url in the frame (or tab) that shows the preview. It signs the browser in to that preview host and lands on the requested page", body = IngressLoginGrantResponse),
+        (status = 400, description = "The URL is not one of the sandbox's preview pages", body = temps_core::problemdetails::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Not a browser session, not the sandbox's owner, or insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 404, description = "Sandbox not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "The sandbox's preview does not ask for a Temps login (it is public or password-protected): load the URL as it is, or use a preview link", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+/// Signs the console's own browser in to a `temps_login` sandbox preview
+/// without showing the sign-in page: the same grant `/ingress/login-grants`
+/// issues after that page, for a console that already has a session and
+/// wants to frame the preview.
+pub async fn create_sandbox_preview_session(
+    State(state): State<Arc<IngressAppState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateSandboxPreviewSessionRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    if !auth.is_session() {
+        return Err(temps_core::error_builder::forbidden()
+            .title("Browser Session Required")
+            .detail(format!(
+                "Preview sessions for sandbox {} are issued to signed-in console sessions only, not to API keys or tokens",
+                request.sandbox_id
+            ))
+            .build());
+    }
+    let page = preview_page(&request.sandbox_id, &request.url)?;
+    let target = state
+        .ingress_service
+        .sandbox_login_target_by_public_id(&request.sandbox_id)
+        .await?;
+    let verified = VerifiedLoginRequest {
+        kind: ProductKind::Sandbox,
+        owner_id: target.sandbox_id,
+        scheme: page.scheme,
+        host: page.host,
+        port: page.port,
+    };
+    let context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+    let now = now_secs();
+    let (issued, token) =
+        issue_sandbox_login_grant(&state, &auth, context, &target, &verified, now).await?;
+    let redirect_url = redirect_url(&verified, &token, &page.next)?;
+    Ok((
+        StatusCode::CREATED,
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(IngressLoginGrantResponse {
+            redirect_url,
+            grant_id: issued.grant_id,
+            expires_at: issued
+                .expires_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }),
+    ))
+}
+
 #[utoipa::path(
     post,
     path = "/ingress/login-grants",
@@ -587,59 +819,11 @@ pub async fn create_ingress_login_grant(
 
     let (issued, token) = match verified.kind {
         ProductKind::Sandbox => {
-            let sandbox_id = verified.owner_id;
             let target = state
                 .ingress_service
-                .sandbox_login_target(sandbox_id)
+                .sandbox_login_target(verified.owner_id)
                 .await?;
-            // The signature already binds the host; this keeps a grant for
-            // one sandbox from ever naming another sandbox's preview host.
-            if !target.owns_preview_host(&verified.host) {
-                return Err(temps_core::error_builder::bad_request()
-                    .title("Invalid Login Request")
-                    .detail(format!(
-                        "Host '{}' is not a preview host of sandbox {} (expected {}<port>.<preview domain>)",
-                        verified.host,
-                        target.public_id,
-                        target.preview_label_prefix()
-                    ))
-                    .build());
-            }
-            may_open_sandbox(&state, &auth, &target).await?;
-            let permission = SandboxPreviewAccess::LOGIN_PERMISSION;
-            let issued = state
-                .ingress_service
-                .record_sandbox_login_grant(
-                    user_id,
-                    sandbox_id,
-                    &verified.host,
-                    permission,
-                    expires_at,
-                )
-                .await?;
-            let token =
-                mint_exchange_grant(master, &verified, issued.grant_id, permission, user_id, now)?;
-            info!(
-                sandbox_id = %target.public_id,
-                grant_id = issued.grant_id,
-                user_id,
-                "Sandbox preview Temps login grant issued"
-            );
-            let audit = SandboxPreviewLoginGrantIssuedAudit {
-                context,
-                sandbox_id: target.public_id.clone(),
-                project_id: target.project_id,
-                grant_id: issued.grant_id,
-                host: verified.host.clone(),
-                permission: permission.to_string(),
-            };
-            if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-                error!(
-                    "Failed to create audit log for login grant {} of sandbox {}: {e}",
-                    issued.grant_id, target.public_id
-                );
-            }
-            (issued, token)
+            issue_sandbox_login_grant(&state, &auth, context, &target, &verified, now).await?
         }
         ProductKind::Environment | ProductKind::Database | ProductKind::Function => {
             let environment_id = verified.owner_id;
@@ -694,7 +878,7 @@ pub async fn create_ingress_login_grant(
             (issued, token)
         }
     };
-    let redirect_url = redirect_url(verified.scheme, &verified.host, &token, next)?;
+    let redirect_url = redirect_url(&verified, &token, next)?;
 
     Ok((
         StatusCode::CREATED,
@@ -716,6 +900,10 @@ pub fn configure_routes() -> Router<Arc<IngressAppState>> {
             get(get_ingress_settings).put(update_ingress_settings),
         )
         .route("/ingress/login-grants", post(create_ingress_login_grant))
+        .route(
+            "/ingress/sandbox-preview-sessions",
+            post(create_sandbox_preview_session),
+        )
 }
 
 #[derive(OpenApi)]
@@ -723,7 +911,8 @@ pub fn configure_routes() -> Router<Arc<IngressAppState>> {
     paths(
         get_ingress_settings,
         update_ingress_settings,
-        create_ingress_login_grant
+        create_ingress_login_grant,
+        create_sandbox_preview_session
     ),
     components(schemas(
         IngressMode,
@@ -731,6 +920,7 @@ pub fn configure_routes() -> Router<Arc<IngressAppState>> {
         UpdateIngressSettingsRequest,
         CreateIngressLoginGrantRequest,
         IngressLoginGrantResponse,
+        CreateSandboxPreviewSessionRequest,
     ))
 )]
 pub struct IngressApiDoc;
@@ -752,6 +942,7 @@ mod tests {
             owner_id: 7,
             scheme: scheme.as_str().into(),
             host: host.into(),
+            port: None,
             next: Some("/dashboard".into()),
             ts,
             sig: grant::sign_login_request(&GrantKey::derive(&MASTER, owner), scheme, host, ts),
@@ -776,6 +967,7 @@ mod tests {
             owner_id: sandbox_id,
             scheme: "https".into(),
             host: host.into(),
+            port: None,
             next: Some("/".into()),
             ts,
             sig: grant::sign_login_request(
@@ -798,8 +990,144 @@ mod tests {
                 owner_id: 7,
                 scheme: LoginScheme::Https,
                 host: "app.example.test".into(),
+                port: None,
             }
         );
+    }
+
+    /// A sandbox login request the proxy signed for a non-default port.
+    fn signed_sandbox_request_on_port(
+        sandbox_id: i64,
+        host: &str,
+        port: u16,
+        ts: u64,
+    ) -> CreateIngressLoginGrantRequest {
+        let owner = ProductRef {
+            kind: ProductKind::Sandbox,
+            id: sandbox_id,
+        };
+        CreateIngressLoginGrantRequest {
+            owner_kind: "sandbox".into(),
+            owner_id: sandbox_id,
+            scheme: "http".into(),
+            host: host.into(),
+            port: Some(i64::from(port)),
+            next: Some("/app".into()),
+            ts,
+            sig: grant::sign_login_request(
+                &GrantKey::derive(&MASTER, owner),
+                LoginScheme::Http,
+                &grant::login_authority(LoginScheme::Http, host, Some(port)),
+                ts,
+            ),
+        }
+    }
+
+    #[test]
+    fn a_framed_preview_url_names_its_scheme_host_port_and_page() {
+        let page = preview_page(
+            "sbx_0123456789abcdef",
+            "http://WS-0123456789abcdef-3000.localho.st:8055/pricing?plan=pro",
+        )
+        .expect("valid");
+        assert_eq!(
+            page,
+            PreviewPage {
+                scheme: LoginScheme::Http,
+                host: "ws-0123456789abcdef-3000.localho.st".into(),
+                port: Some(8055),
+                next: "/pricing?plan=pro".into(),
+            }
+        );
+        // The default port is dropped, and the redirect goes back to the
+        // same page through the exchange path.
+        let page = preview_page(
+            "sbx_0123456789abcdef",
+            "https://ws-0123456789abcdef-3000.preview.example.test:443/",
+        )
+        .expect("valid");
+        assert_eq!(page.port, None);
+        let verified = VerifiedLoginRequest {
+            kind: ProductKind::Sandbox,
+            owner_id: 11,
+            scheme: page.scheme,
+            host: page.host.clone(),
+            port: page.port,
+        };
+        assert_eq!(
+            redirect_url(&verified, "tg1.a.b", &page.next).unwrap(),
+            "https://ws-0123456789abcdef-3000.preview.example.test/.well-known/temps/ingress/grant?grant=tg1.a.b&next=%2F"
+        );
+
+        for invalid in [
+            "not a url",
+            "ftp://ws-0123456789abcdef-3000.localho.st/",
+            "http://user:pass@ws-0123456789abcdef-3000.localho.st/",
+            "http://[::1]:8055/",
+            "http://ws-0123456789abcdef-3000.localho.st:70000/",
+        ] {
+            let problem = preview_page("sbx_0123456789abcdef", invalid).unwrap_err();
+            assert_eq!(status(problem), StatusCode::BAD_REQUEST, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn the_port_survives_the_round_trip_and_the_grant_names_only_the_hostname() {
+        let host = "ws-0123456789abcdef-3000.localho.st";
+        let request = signed_sandbox_request_on_port(11, host, 8055, NOW);
+        let verified = verify_login_request(&MASTER, &request, NOW).expect("valid");
+        assert_eq!(verified.host, host);
+        assert_eq!(verified.port, Some(8055));
+        assert_eq!(
+            redirect_url(&verified, "tg1.a.b", "/app").unwrap(),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/.well-known/temps/ingress/grant?grant=tg1.a.b&next=%2Fapp"
+        );
+        // The grant is bound to the hostname alone: the proxy compares it
+        // with the port-stripped `Host`.
+        let token = mint_exchange_grant(
+            &MASTER,
+            &verified,
+            41,
+            SandboxPreviewAccess::LOGIN_PERMISSION,
+            1,
+            NOW,
+        )
+        .expect("mint");
+        let mut buffer = [0u8; grant::MAX_GRANT_PAYLOAD];
+        let claims = grant::verify(
+            &GrantKey::derive(&MASTER, verified.owner()),
+            &token,
+            &mut buffer,
+        )
+        .expect("verifies");
+        assert_eq!(claims.host, host);
+
+        // The port is signed: changing or dropping it is refused.
+        let mut moved = signed_sandbox_request_on_port(11, host, 8055, NOW);
+        moved.port = Some(8056);
+        let mut dropped = signed_sandbox_request_on_port(11, host, 8055, NOW);
+        dropped.port = None;
+        for request in [moved, dropped] {
+            assert_eq!(
+                status(verify_login_request(&MASTER, &request, NOW).unwrap_err()),
+                StatusCode::FORBIDDEN
+            );
+        }
+        // Not a TCP port at all.
+        for port in [0, 65_536, -1] {
+            let mut invalid = signed_sandbox_request_on_port(11, host, 8055, NOW);
+            invalid.port = Some(port);
+            let problem = verify_login_request(&MASTER, &invalid, NOW).unwrap_err();
+            assert_eq!(status(problem), StatusCode::BAD_REQUEST, "port {port}");
+        }
+        // The scheme's default port is the same as none.
+        let mut default_port = signed_request("app.example.test", LoginScheme::Https, NOW);
+        default_port.port = Some(443);
+        let verified = verify_login_request(&MASTER, &default_port, NOW).expect("valid");
+        assert_eq!(verified.port, None);
+        assert!(redirect_url(&verified, "t", "/")
+            .unwrap()
+            .starts_with("https://app.example.test/.well-known/"));
     }
 
     #[test]
@@ -918,6 +1246,26 @@ mod tests {
             status(
                 IngressError::SandboxDatabase {
                     sandbox_id: 3,
+                    operation: "sandbox lookup",
+                    source: sea_orm::DbErr::Custom("down".into()),
+                }
+                .into()
+            ),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(
+                IngressError::SandboxPublicIdNotFound {
+                    public_id: "sbx_0123456789abcdef".into()
+                }
+                .into()
+            ),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(
+                IngressError::SandboxPublicIdDatabase {
+                    public_id: "sbx_0123456789abcdef".into(),
                     operation: "sandbox lookup",
                     source: sea_orm::DbErr::Custom("down".into()),
                 }
@@ -1055,13 +1403,13 @@ mod tests {
 
     #[test]
     fn the_redirect_lands_on_the_hosts_exchange_path_with_a_safe_next() {
-        let url = redirect_url(
-            LoginScheme::Https,
-            "app.example.test",
-            "tg1.a.b",
-            safe_next(Some("/a?b=c")),
+        let request = verify_login_request(
+            &MASTER,
+            &signed_request("app.example.test", LoginScheme::Https, NOW),
+            NOW,
         )
-        .unwrap();
+        .expect("valid");
+        let url = redirect_url(&request, "tg1.a.b", safe_next(Some("/a?b=c"))).unwrap();
         assert_eq!(
             url,
             "https://app.example.test/.well-known/temps/ingress/grant?grant=tg1.a.b&next=%2Fa%3Fb%3Dc"
@@ -1154,9 +1502,19 @@ mod tests {
     }
 
     fn state(checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>) -> IngressAppState {
-        let db = Arc::new(
+        state_on(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
-        );
+            checker,
+            Arc::new(NoAudit),
+        )
+    }
+
+    fn state_on(
+        db: sea_orm::DatabaseConnection,
+        checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+        audit_service: Arc<dyn AuditLogger>,
+    ) -> IngressAppState {
+        let db = Arc::new(db);
         let config = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(
@@ -1173,7 +1531,7 @@ mod tests {
             ingress_service: Arc::new(IngressService::new(db.clone())),
             environment_service: Arc::new(EnvironmentService::new(db, config)),
             cookie_crypto: Arc::new(CookieCrypto::from_bytes(&MASTER)),
-            audit_service: Arc::new(NoAudit),
+            audit_service,
             project_access_checker: checker,
         }
     }
@@ -1211,12 +1569,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_api_key_cannot_get_a_login_grant() {
-        let state = Arc::new(state(None));
-        let user = user(temps_auth::Role::Admin).user.expect("user");
-        let api_key = temps_auth::AuthContext::new_cli_token(user, temps_auth::Role::Admin);
-        let metadata = RequestMetadata {
+    fn metadata() -> RequestMetadata {
+        RequestMetadata {
             ip_address: "192.0.2.1".into(),
             user_agent: "test".into(),
             headers: Default::default(),
@@ -1226,7 +1580,224 @@ mod tests {
             scheme: "https".into(),
             host: "console.example.test".into(),
             is_secure: true,
+        }
+    }
+
+    /// Records the operation type of every audit entry.
+    #[derive(Default)]
+    struct RecordingAudit(std::sync::Mutex<Vec<String>>);
+
+    #[temps_core::async_trait::async_trait]
+    impl AuditLogger for RecordingAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            if let Ok(mut seen) = self.0.lock() {
+                seen.push(operation.operation_type());
+            }
+            Ok(())
+        }
+    }
+
+    const SANDBOX_PUBLIC_ID: &str = "sbx_0123456789abcdef";
+
+    fn sandbox_row(access: SandboxPreviewAccess) -> temps_entities::sandboxes::Model {
+        let now = Utc::now();
+        temps_entities::sandboxes::Model {
+            id: 11,
+            public_id: SANDBOX_PUBLIC_ID.into(),
+            user_id: Some(1),
+            agent_run_id: None,
+            name: "sbx-11".into(),
+            status: "running".into(),
+            lifecycle: "ephemeral".into(),
+            project_id: None,
+            source_repo_url: None,
+            image: None,
+            work_dir: "/workspace".into(),
+            timeout_secs: 600,
+            metadata: None,
+            backend: None,
+            node_id: None,
+            created_at: now,
+            last_activity_at: now,
+            expires_at: now,
+            preview_password_hash: None,
+            preview_password_hint: None,
+            preview_access: access,
+            preview_allowed_cidrs: Vec::new(),
+        }
+    }
+
+    fn grant_row(host: &str) -> temps_entities::ingress_login_grants::Model {
+        temps_entities::ingress_login_grants::Model {
+            id: 77,
+            user_id: 1,
+            owner_kind: "sandbox".into(),
+            owner_id: 11,
+            host: host.into(),
+            permission: SandboxPreviewAccess::LOGIN_PERMISSION.into(),
+            expires_at: Utc::now() + chrono::Duration::hours(12),
+            revoked_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn preview_session(
+        state: IngressAppState,
+        auth: temps_auth::AuthContext,
+        url: &str,
+    ) -> Result<axum::response::Response, Problem> {
+        create_sandbox_preview_session(
+            State(Arc::new(state)),
+            RequireAuth(auth),
+            Extension(metadata()),
+            Json(CreateSandboxPreviewSessionRequest {
+                sandbox_id: SANDBOX_PUBLIC_ID.into(),
+                url: url.into(),
+            }),
+        )
+        .await
+        .map(IntoResponse::into_response)
+    }
+
+    #[tokio::test]
+    async fn the_console_frames_a_temps_login_preview_through_the_exchange_path() {
+        let host = "ws-0123456789abcdef-3000.localho.st";
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::TempsLogin)]])
+            .append_query_results([vec![grant_row(host)]])
+            .into_connection();
+        let audit = Arc::new(RecordingAudit::default());
+        let response = preview_session(
+            state_on(db, None, audit.clone()),
+            user(temps_auth::Role::User),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/pricing?plan=pro",
+        )
+        .await
+        .expect("issued");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.as_bytes()),
+            Some(&b"no-store"[..])
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["grant_id"], 77);
+        let redirect = url::Url::parse(body["redirect_url"].as_str().expect("redirect_url"))
+            .expect("absolute url");
+        // Same scheme, host and port the console frames, on the exchange
+        // path, coming back to the page it asked for.
+        assert_eq!(redirect.scheme(), "http");
+        assert_eq!(redirect.host_str(), Some(host));
+        assert_eq!(redirect.port(), Some(8055));
+        assert_eq!(redirect.path(), grant::EXCHANGE_PATH);
+        let pairs: std::collections::HashMap<String, String> =
+            redirect.query_pairs().into_owned().collect();
+        assert_eq!(pairs["next"], "/pricing?plan=pro");
+        // An exchange grant for this sandbox, bound to the hostname.
+        let owner = ProductRef {
+            kind: ProductKind::Sandbox,
+            id: 11,
         };
+        let crypto = CookieCrypto::from_bytes(&MASTER);
+        let mut buffer = [0u8; grant::MAX_GRANT_PAYLOAD];
+        let claims = grant::verify(
+            &GrantKey::derive(crypto.ingress_grant_master_key(), owner),
+            &pairs["grant"],
+            &mut buffer,
+        )
+        .expect("verifies with the sandbox's key");
+        assert_eq!(claims.usage, GrantUse::Exchange);
+        assert_eq!(claims.host, host);
+        assert_eq!(claims.grant_id, 77);
+        assert_eq!(claims.user_id, 1);
+        assert_eq!(claims.permission, SandboxPreviewAccess::LOGIN_PERMISSION);
+        // Recorded and audited like a grant from the sign-in page.
+        let seen = audit.0.lock().map(|seen| seen.clone()).unwrap_or_default();
+        assert_eq!(seen, vec!["SANDBOX_PREVIEW_LOGIN_GRANT_ISSUED".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_console_gets_no_preview_session_it_could_not_get_by_signing_in() {
+        // Another sandbox's preview host.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::TempsLogin)]])
+            .into_connection();
+        let problem = preview_session(
+            state_on(db, None, Arc::new(NoAudit)),
+            user(temps_auth::Role::User),
+            "http://ws-fedcba9876543210-3000.localho.st:8055/",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status(problem), StatusCode::BAD_REQUEST);
+
+        // A sandbox that is public or password-protected needs no grant.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::Password)]])
+            .into_connection();
+        let problem = preview_session(
+            state_on(db, None, Arc::new(NoAudit)),
+            user(temps_auth::Role::User),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status(problem), StatusCode::CONFLICT);
+
+        // Someone else's sandbox.
+        let mut row = sandbox_row(SandboxPreviewAccess::TempsLogin);
+        row.user_id = Some(2);
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        let problem = preview_session(
+            state_on(db, None, Arc::new(NoAudit)),
+            user(temps_auth::Role::Admin),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status(problem), StatusCode::FORBIDDEN);
+
+        // A missing sandbox.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::sandboxes::Model>::new()])
+            .into_connection();
+        let problem = preview_session(
+            state_on(db, None, Arc::new(NoAudit)),
+            user(temps_auth::Role::User),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status(problem), StatusCode::NOT_FOUND);
+
+        // An API key, before anything is looked up.
+        let owner = user(temps_auth::Role::Admin).user.expect("user");
+        let problem = preview_session(
+            state(None),
+            temps_auth::AuthContext::new_cli_token(owner, temps_auth::Role::Admin),
+            "http://ws-0123456789abcdef-3000.localho.st:8055/",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status(problem), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn an_api_key_cannot_get_a_login_grant() {
+        let state = Arc::new(state(None));
+        let user = user(temps_auth::Role::Admin).user.expect("user");
+        let api_key = temps_auth::AuthContext::new_cli_token(user, temps_auth::Role::Admin);
+        let metadata = metadata();
         let result = create_ingress_login_grant(
             State(state),
             RequireAuth(api_key),

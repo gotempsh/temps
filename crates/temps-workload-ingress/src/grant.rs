@@ -397,6 +397,34 @@ impl LoginScheme {
             _ => None,
         }
     }
+
+    /// The port a browser leaves out of the authority for this scheme.
+    pub fn default_port(&self) -> u16 {
+        match self {
+            LoginScheme::Http => 80,
+            LoginScheme::Https => 443,
+        }
+    }
+
+    /// `port` unless it is this scheme's default: the port a login request
+    /// carries and signs.
+    pub fn explicit_port(&self, port: Option<u16>) -> Option<u16> {
+        port.filter(|port| *port != self.default_port())
+    }
+}
+
+/// What a login request signs as its host, and where the console sends the
+/// exchange grant back to: the hostname (lowercase, no port), plus `:port`
+/// when the visitor reached it on a port other than the scheme's default.
+///
+/// Only the redirect carries the port. Grants are bound to the hostname
+/// alone, so a request that changes the port cannot retarget a grant to
+/// another host, only to another port of the same one.
+pub fn login_authority(scheme: LoginScheme, host: &str, port: Option<u16>) -> String {
+    match scheme.explicit_port(port) {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
 }
 
 fn login_request_mac(
@@ -423,6 +451,7 @@ fn login_request_mac(
 /// The console only issues an exchange grant for a host the owner's ingress
 /// asked about: without this signature, anyone could make the console
 /// redirect a signed-in user, with a grant, to a host of their choosing.
+/// `host` is the [`login_authority`], so the port is signed too.
 pub fn sign_login_request(
     key: &GrantKey,
     scheme: LoginScheme,
@@ -595,6 +624,49 @@ mod tests {
         ));
         assert_eq!(LoginScheme::parse("https"), Some(LoginScheme::Https));
         assert_eq!(LoginScheme::parse("ftp"), None);
+    }
+
+    #[test]
+    fn the_login_authority_carries_only_a_non_default_port_and_is_signed() {
+        let host = "ws-a1b2c3d4e5f60718-3000.localho.st";
+        assert_eq!(
+            login_authority(LoginScheme::Http, host, Some(8055)),
+            "ws-a1b2c3d4e5f60718-3000.localho.st:8055"
+        );
+        assert_eq!(login_authority(LoginScheme::Http, host, Some(80)), host);
+        assert_eq!(login_authority(LoginScheme::Https, host, Some(443)), host);
+        assert_eq!(
+            login_authority(LoginScheme::Https, host, Some(80)),
+            "ws-a1b2c3d4e5f60718-3000.localho.st:80"
+        );
+        assert_eq!(login_authority(LoginScheme::Https, host, None), host);
+
+        // The port is part of what is signed: a request signed for one port
+        // does not verify for another, nor for the bare hostname.
+        let key = GrantKey::derive(&MASTER, sandbox(3));
+        let signed = login_authority(LoginScheme::Http, host, Some(8055));
+        let signature = sign_login_request(&key, LoginScheme::Http, &signed, 1_000);
+        assert!(login_request_valid(
+            &key,
+            LoginScheme::Http,
+            &signed,
+            1_000,
+            &signature,
+            1_000
+        ));
+        for other in [
+            host.to_string(),
+            login_authority(LoginScheme::Http, host, Some(8056)),
+        ] {
+            assert!(!login_request_valid(
+                &key,
+                LoginScheme::Http,
+                &other,
+                1_000,
+                &signature,
+                1_000
+            ));
+        }
     }
 
     #[test]

@@ -605,9 +605,15 @@ pub fn shadow_step(
 /// [`GRANT_EXCHANGE_PATH`] on `host` with an exchange grant. `None` when the
 /// instance's external URL is not an absolute `http(s)` URL.
 ///
+/// `host` is the authority the browser used (the `Host` header). A port
+/// other than the scheme's default travels as `port`, so the console sends
+/// the visitor back to the port they came from; the hostname alone is what
+/// the grant is bound to.
+///
 /// The request is signed with the owner's grant key
-/// ([`grant::sign_login_request`]), so the console only ever sends a grant
-/// back to a host this ingress asked about.
+/// ([`grant::sign_login_request`], over [`grant::login_authority`]), so the
+/// console only ever sends a grant back to a host and port this ingress
+/// asked about.
 ///
 /// Runs only on the challenge path, never for an admitted request.
 pub fn login_redirect_url(
@@ -623,24 +629,46 @@ pub fn login_redirect_url(
     if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
         return None;
     }
+    let port = scheme.explicit_port(authority_port(host));
     let mut buffer = [0u8; 256];
     let host = grant_host(host, &mut buffer)?;
-    let signature =
-        grant::sign_login_request(&GrantKey::derive(master, owner), scheme, host, now_secs);
+    let signature = grant::sign_login_request(
+        &GrantKey::derive(master, owner),
+        scheme,
+        &grant::login_authority(scheme, host, port),
+        now_secs,
+    );
     let mut url = base;
     let path = format!("{}/ingress/login", url.path().trim_end_matches('/'));
     url.set_path(&path);
     url.set_query(None);
     url.set_fragment(None);
-    url.query_pairs_mut()
-        .append_pair("owner_kind", owner.kind.as_str())
-        .append_pair("owner_id", &owner.id.to_string())
-        .append_pair("scheme", scheme.as_str())
-        .append_pair("host", host)
-        .append_pair("next", sanitize_next(next))
-        .append_pair("ts", &now_secs.to_string())
-        .append_pair("sig", &signature);
+    {
+        let mut query = url.query_pairs_mut();
+        query
+            .append_pair("owner_kind", owner.kind.as_str())
+            .append_pair("owner_id", &owner.id.to_string())
+            .append_pair("scheme", scheme.as_str())
+            .append_pair("host", host);
+        if let Some(port) = port {
+            query.append_pair("port", &port.to_string());
+        }
+        query
+            .append_pair("next", sanitize_next(next))
+            .append_pair("ts", &now_secs.to_string())
+            .append_pair("sig", &signature);
+    }
     Some(url.into())
+}
+
+/// The port of a `Host` authority (`name:port`), when it has a valid one.
+/// IPv6 literals without brackets and out-of-range ports have none.
+fn authority_port(authority: &str) -> Option<u16> {
+    let (name, port) = authority.rsplit_once(':')?;
+    if name.contains(':') && !name.ends_with(']') {
+        return None;
+    }
+    port.parse().ok()
 }
 
 /// `next` when it is a path on this host, `/` otherwise: never an absolute
@@ -908,12 +936,29 @@ pub fn exchange_preview_grant(
         query,
     )?;
     let set_cookie = format!(
-        "{PREVIEW_LOGIN_COOKIE_NAME}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax{}",
+        "{PREVIEW_LOGIN_COOKIE_NAME}={}; Path=/; Max-Age={}; HttpOnly{}",
         traded.session,
         grant::SESSION_GRANT_TTL_SECS,
-        if secure { "; Secure" } else { "" }
+        preview_login_cookie_scope(secure)
     );
     Ok(traded.into_exchange(set_cookie))
+}
+
+/// The `SameSite`/`Secure` attributes of the [`PREVIEW_LOGIN_COOKIE_NAME`]
+/// cookie, the same as the preview password cookie's: the console frames
+/// previews, and a `SameSite=Lax` cookie is not sent inside a cross-site
+/// iframe. Over HTTPS the cookie is partitioned (CHIPS), so it only works
+/// under the site that framed it. Plain HTTP can have neither `None` nor
+/// `Partitioned` (both need `Secure`), so it stays `Lax`. Always host-only:
+/// the session is bound to this host, and one cookie name serves every
+/// sandbox, so a parent-domain cookie would let previews overwrite each
+/// other's sessions.
+pub fn preview_login_cookie_scope(secure: bool) -> &'static str {
+    if secure {
+        "; Secure; SameSite=None; Partitioned"
+    } else {
+        "; SameSite=Lax"
+    }
 }
 
 /// Whether `cookie_header` carries a [`PREVIEW_LOGIN_COOKIE_NAME`] session
@@ -1722,10 +1767,25 @@ mod tests {
         assert_eq!(exchange.location, "/app?x=1");
         assert_eq!((exchange.grant_id, exchange.user_id), (31, 4));
         assert!(exchange.set_cookie.starts_with("temps_preview_login=tg1."));
+        // Over HTTPS the cookie is the framed one, like the password
+        // preview cookie: sent inside the console's iframe.
         assert!(exchange
             .set_cookie
-            .ends_with("; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax; Secure"));
+            .ends_with("; Path=/; Max-Age=43200; HttpOnly; Secure; SameSite=None; Partitioned"));
         assert!(!exchange.set_cookie.contains("Domain="));
+        // Over plain HTTP neither `None` nor `Partitioned` is possible.
+        let plain = exchange_preview_grant(
+            5,
+            &facts,
+            &ConsumedExchanges::default(),
+            Some(&query),
+            false,
+        )
+        .expect("exchange over http");
+        assert!(plain
+            .set_cookie
+            .ends_with("; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax"));
+        assert!(!plain.set_cookie.contains("Domain="));
 
         let pair = exchange.set_cookie.split(';').next().expect("cookie pair");
         let header = format!("other=1; {pair}");
@@ -1904,6 +1964,67 @@ mod tests {
             &pairs["sig"],
             T0,
         ));
+        // The scheme's default port is left out.
+        assert!(!pairs.contains_key("port"), "{url}");
+    }
+
+    #[test]
+    fn a_login_redirect_from_a_non_default_port_carries_and_signs_it() {
+        let master = [9u8; 32];
+        let url = login_redirect_url(
+            "http://console.example.test:8081/",
+            &master,
+            sandbox_owner(5),
+            LoginScheme::Http,
+            "ws-aabbccdd11223344-3000.preview.example.test:8055",
+            "/",
+            T0,
+        )
+        .expect("redirect url");
+        let parsed = url::Url::parse(&url).expect("absolute url");
+        let pairs: std::collections::HashMap<String, String> =
+            parsed.query_pairs().into_owned().collect();
+        // The hostname stays port-less (it is what the grant is bound to);
+        // the port travels on its own and is signed with it.
+        assert_eq!(pairs["host"], PREVIEW_HOST);
+        assert_eq!(pairs["port"], "8055");
+        let key = GrantKey::derive(&master, sandbox_owner(5));
+        let signed = format!("{PREVIEW_HOST}:8055");
+        assert!(grant::login_request_valid(
+            &key,
+            LoginScheme::Http,
+            &signed,
+            T0,
+            &pairs["sig"],
+            T0,
+        ));
+        for forged in [PREVIEW_HOST.to_string(), format!("{PREVIEW_HOST}:8056")] {
+            assert!(!grant::login_request_valid(
+                &key,
+                LoginScheme::Http,
+                &forged,
+                T0,
+                &pairs["sig"],
+                T0,
+            ));
+        }
+
+        // HTTPS on a non-default port, and an out-of-range port (no port).
+        let url = login_redirect_url(
+            "https://console.example.test/",
+            &master,
+            sandbox_owner(5),
+            LoginScheme::Https,
+            "ws-aabbccdd11223344-3000.preview.example.test:8443",
+            "/",
+            T0,
+        )
+        .expect("redirect url");
+        assert!(url.contains("&port=8443&"), "{url}");
+        assert_eq!(authority_port("example.test:70000"), None);
+        assert_eq!(authority_port("example.test"), None);
+        assert_eq!(authority_port("[::1]:8055"), Some(8055));
+        assert_eq!(authority_port("::1"), None);
     }
 
     #[test]

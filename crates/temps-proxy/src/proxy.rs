@@ -4459,13 +4459,15 @@ impl LoadBalancer {
             let mut response = ResponseHeader::build(303, None)?;
             response.insert_header("Location", "/")?;
             response.append_header("Set-Cookie", &set_cookie)?;
-            // Sign out of a Temps-login session on this host as well.
+            // Sign out of a Temps-login session on this host as well, with
+            // the attributes it was set with (a partitioned cookie is only
+            // cleared by a partitioned `Set-Cookie`).
             response.append_header(
                 "Set-Cookie",
                 format!(
-                    "{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{}",
+                    "{}=; Path=/; Max-Age=0; HttpOnly{}",
                     crate::ingress::PREVIEW_LOGIN_COOKIE_NAME,
-                    if secure { "; Secure" } else { "" }
+                    crate::ingress::preview_login_cookie_scope(secure)
                 ),
             )?;
             response.insert_header("Cache-Control", "no-store")?;

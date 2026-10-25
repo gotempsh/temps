@@ -76,6 +76,17 @@ pub enum IngressError {
         #[source]
         source: DbErr,
     },
+
+    #[error("Sandbox {public_id} not found or destroyed")]
+    SandboxPublicIdNotFound { public_id: String },
+
+    #[error("Ingress {operation} for sandbox {public_id} failed: {source}")]
+    SandboxPublicIdDatabase {
+        public_id: String,
+        operation: &'static str,
+        #[source]
+        source: DbErr,
+    },
 }
 
 /// What a Temps-login grant for a sandbox preview is checked against.
@@ -365,6 +376,32 @@ impl IngressService {
                 source,
             })?
             .ok_or(IngressError::SandboxNotFound { sandbox_id })?;
+        Self::login_target_of(sandbox)
+    }
+
+    /// [`Self::sandbox_login_target`] by the sandbox's public id
+    /// (`sbx_<hex>`), for the console, which only knows that one.
+    pub async fn sandbox_login_target_by_public_id(
+        &self,
+        public_id: &str,
+    ) -> Result<SandboxLoginTarget, IngressError> {
+        let sandbox = sandboxes::Entity::find()
+            .filter(sandboxes::Column::PublicId.eq(public_id))
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| IngressError::SandboxPublicIdDatabase {
+                public_id: public_id.to_string(),
+                operation: "sandbox lookup",
+                source,
+            })?
+            .ok_or_else(|| IngressError::SandboxPublicIdNotFound {
+                public_id: public_id.to_string(),
+            })?;
+        Self::login_target_of(sandbox)
+    }
+
+    fn login_target_of(sandbox: sandboxes::Model) -> Result<SandboxLoginTarget, IngressError> {
         if sandbox.preview_access != SandboxPreviewAccess::TempsLogin {
             return Err(IngressError::SandboxNotLoginProtected {
                 public_id: sandbox.public_id,
@@ -547,6 +584,53 @@ mod tests {
         assert!(matches!(
             error,
             IngressError::SandboxNotFound { sandbox_id: 12 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_login_target_is_found_by_public_id_with_the_same_checks() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::TempsLogin)]])
+            .append_query_results([vec![sandbox_row(SandboxPreviewAccess::Public)]])
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .append_query_errors([DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let service = IngressService::new(Arc::new(db));
+        let target = service
+            .sandbox_login_target_by_public_id("sbx_0123456789abcdef")
+            .await
+            .unwrap();
+        assert_eq!(target.sandbox_id, 11);
+        assert_eq!(target.owner_user_id, Some(4));
+        assert!(matches!(
+            service
+                .sandbox_login_target_by_public_id("sbx_0123456789abcdef")
+                .await
+                .unwrap_err(),
+            IngressError::SandboxNotLoginProtected {
+                access: "public",
+                ..
+            }
+        ));
+        let missing = service
+            .sandbox_login_target_by_public_id("sbx_ffffffffffffffff")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "Sandbox sbx_ffffffffffffffff not found or destroyed"
+        );
+        let failed = service
+            .sandbox_login_target_by_public_id("sbx_ffffffffffffffff")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &failed,
+            IngressError::SandboxPublicIdDatabase {
+                public_id,
+                operation: "sandbox lookup",
+                ..
+            } if public_id == "sbx_ffffffffffffffff"
         ));
     }
 
