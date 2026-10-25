@@ -1080,6 +1080,16 @@
         ],
         "type": "object"
       },
+      "AddressScope": {
+        "description": "Who can reach an address.",
+        "enum": [
+          "public",
+          "private",
+          "cgnat",
+          "local"
+        ],
+        "type": "string"
+      },
       "AdminGateResponse": {
         "properties": {
           "allowed_hosts": {
@@ -1639,6 +1649,50 @@
             "description": "Sandbox is always enabled — the executor refuses to run any agent\noutside a sandboxed container. Field is retained so existing settings\nrows still deserialize, but it is ignored at runtime.",
             "type": "boolean"
           },
+          "max_cpu_limit": {
+            "default": null,
+            "description": "Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.\n`cpu_limit` above only sets the default for requests that omit the\nfield; this is the ceiling. `None` = the built-in ceiling (16 cores).\nA value above the built-in ceiling has no effect.",
+            "example": 4,
+            "format": "double",
+            "minimum": 0.01,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_memory_limit_mb": {
+            "default": null,
+            "description": "Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (32768 MB). On the control plane the\nhost's physical memory is an additional ceiling.",
+            "example": 8192,
+            "format": "int64",
+            "minimum": 6,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_pids_limit": {
+            "default": null,
+            "description": "Highest `pids_limit` a `POST /sandboxes` request may ask for.\n`None` = the built-in ceiling (4096).",
+            "example": 1024,
+            "format": "int64",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_sandboxes_per_user": {
+            "default": null,
+            "description": "Most sandboxes (not destroyed) one user may have created through\n`POST /sandboxes` at a time; a create over the cap is refused.\n`None` = unlimited. AI application workspaces, agent runs and the\nsandboxes the platform creates for AI chat or autofix do not count\nand are not refused. Sandboxes created before this setting existed\nare not counted either.",
+            "example": 10,
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "memory_limit_mb": {
             "default": 8192,
             "description": "Memory limit in MB for sandbox containers",
@@ -1703,6 +1757,42 @@
           },
           "enabled": {
             "type": "boolean"
+          },
+          "max_cpu_limit": {
+            "description": "Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.",
+            "format": "double",
+            "minimum": 0.01,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_memory_limit_mb": {
+            "description": "Operator ceiling for `memory_limit_mb`; `null` = built-in.",
+            "format": "int64",
+            "minimum": 6,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_pids_limit": {
+            "description": "Operator ceiling for `pids_limit`; `null` = built-in.",
+            "format": "int64",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "max_sandboxes_per_user": {
+            "description": "Most live sandboxes per user; `null` = unlimited.",
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "memory_limit_mb": {
             "format": "int64",
@@ -3582,6 +3672,10 @@
               "custom_image": "",
               "default_provider": "claude_cli",
               "enabled": true,
+              "max_cpu_limit": null,
+              "max_memory_limit_mb": null,
+              "max_pids_limit": null,
+              "max_sandboxes_per_user": null,
               "memory_limit_mb": 8192,
               "network_mode": "full",
               "providers": {},
@@ -3717,6 +3811,8 @@
             "default": {
               "cache_mb": 2048,
               "head_buffer_mb": 8,
+              "ingest_kib_per_sec": 256,
+              "ingest_lines_per_sec": 250,
               "max_file": 3,
               "max_size": "50m",
               "service_max_file": 3,
@@ -3762,6 +3858,14 @@
           "edge_target": {
             "default": null,
             "description": "Public edge target that generated DNS records point at when a managed\ndomain opts into automatic record sync. An IPv4/IPv6 address produces an\n`A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`\ndisables DNS record sync regardless of per-domain opt-in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_hostname_template": {
+            "default": null,
+            "description": "Label of a new environment's generated hostname under `preview_domain`,\nfrom `{project}` and `{env}` (ADR 058 D9). `None` means\n[`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to\nenvironments created after it is set; existing ones keep their names.",
             "type": [
               "string",
               "null"
@@ -3856,7 +3960,8 @@
               "node_failover_after_secs": 300,
               "node_memory_alert_percent": 90,
               "private_address": null,
-              "require_mtls": true
+              "require_mtls": true,
+              "wg_endpoint": null
             }
           },
           "observability_compression": {
@@ -3907,6 +4012,14 @@
               "image": ""
             },
             "description": "Workspace preview gateway settings (single shared container per node).\nOwned by `PATCH /preview-gateway/settings` and\n`POST /preview-gateway/upgrade`, which change the gateway's containers\nto match; the generic settings update preserves the stored value."
+          },
+          "production_hostname_template": {
+            "default": null,
+            "description": "Label for an environment named `production`, when it should differ\n(e.g. `{project}` for `app.example.com`). `None` uses\n`environment_hostname_template`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "public_ingress_url": {
             "default": null,
@@ -10359,8 +10472,141 @@
         ],
         "type": "object"
       },
+      "ClusterNetworkChangeResponse": {
+        "description": "`PUT /settings/cluster-network` answer.",
+        "properties": {
+          "reassigned": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterNetworkReassignment"
+            },
+            "type": "array"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ClusterNetworkStatus"
+          }
+        },
+        "required": [
+          "reassigned",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ClusterNetworkControlPlane": {
+        "description": "The control plane's overlay.",
+        "properties": {
+          "compute_cidr": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlay_ready": {
+            "type": "boolean"
+          },
+          "setup_failure": {
+            "description": "Why its last overlay setup failed, with the fix, when it did.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "overlay_ready"
+        ],
+        "type": "object"
+      },
+      "ClusterNetworkNode": {
+        "description": "One worker's view of the overlay.",
+        "properties": {
+          "compute_cidr": {
+            "description": "Its subnet of the pool, if allocated.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "in_use": {
+            "description": "Whether its allocation locks the pool, and why when it does.",
+            "type": "boolean"
+          },
+          "in_use_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "occupied_ranges": {
+            "description": "What the node reported it already uses outside Temps.",
+            "items": {
+              "$ref": "#/components/schemas/OccupiedRangeReport"
+            },
+            "type": "array"
+          },
+          "overlay_last_error": {
+            "description": "Why the overlay is unavailable: the colliding range, its owner and\nthe fixes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlay_remediation": {
+            "description": "The last automatic move of its allocation, and why.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlay_status": {
+            "description": "`ready`, `unavailable`, or `None` when its agent never reported it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "in_use",
+          "occupied_ranges"
+        ],
+        "type": "object"
+      },
+      "ClusterNetworkReassignment": {
+        "description": "A node whose allocation a change moved.",
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
       "ClusterNetworkSettings": {
-        "description": "Read-only cluster network state. Pool changes are performed on the control\nplane through `temps network setup-multi-node`, which enforces that no\nexisting node allocation can be stranded by an in-place edit.",
+        "description": "Read-only cluster network state. The pool is changed through\n`PUT /settings/cluster-network` or `temps network setup-multi-node`, which\nrefuse while any allocation is in use (ADR 056). `locked` means only that\nallocations exist: allocations never applied are re-assigned by a change,\nso whether it is allowed now is `GET /settings/cluster-network`'s\n`can_change`.",
         "properties": {
           "allocation_count": {
             "format": "int64",
@@ -10384,6 +10630,67 @@
           "subnet_prefix_len",
           "allocation_count",
           "locked"
+        ],
+        "type": "object"
+      },
+      "ClusterNetworkStatus": {
+        "description": "`GET /settings/cluster-network`.",
+        "properties": {
+          "can_change": {
+            "description": "Whether `PUT` can change the pool now.",
+            "type": "boolean"
+          },
+          "change_blocked_by": {
+            "description": "Why it cannot: the members using the pool, or a control-plane setup\nin progress.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "compute_pool_cidr": {
+            "type": "string"
+          },
+          "control_plane": {
+            "$ref": "#/components/schemas/ClusterNetworkControlPlane"
+          },
+          "default_compute_pool_cidr": {
+            "description": "What a new cluster starts with.",
+            "type": "string"
+          },
+          "mesh_enabled": {
+            "type": "boolean"
+          },
+          "mesh_pool_cidr": {
+            "description": "The WireGuard mesh pool; a compute pool may not overlap it.",
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/ClusterNetworkNode"
+            },
+            "type": "array"
+          },
+          "pool_confirmed": {
+            "description": "Whether an operator has confirmed the pool, or a member already uses\nit. The console asks for it once before adding the first node.",
+            "type": "boolean"
+          },
+          "subnet_prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compute_pool_cidr",
+          "subnet_prefix_len",
+          "default_compute_pool_cidr",
+          "mesh_pool_cidr",
+          "mesh_enabled",
+          "pool_confirmed",
+          "can_change",
+          "change_blocked_by",
+          "control_plane",
+          "nodes"
         ],
         "type": "object"
       },
@@ -11060,6 +11367,10 @@
       "ComposeHostStatusResponse": {
         "description": "The host's Docker Compose CLI as probed at startup.",
         "properties": {
+          "applicable": {
+            "description": "False when this process never runs Compose workloads (a hosted control\nplane): the CLI is neither probed nor expected, so a missing or old\nCompose is not a problem to report there.",
+            "type": "boolean"
+          },
           "available": {
             "description": "Whether the Compose CLI ran.",
             "type": "boolean"
@@ -11103,6 +11414,7 @@
           }
         },
         "required": [
+          "applicable",
           "probed",
           "available",
           "supported",
@@ -11871,6 +12183,187 @@
         ],
         "type": "object"
       },
+      "ConnectorLinksView": {
+        "description": "A tunnel's live connections, read from the provider on request.",
+        "properties": {
+          "links": {
+            "items": {
+              "$ref": "#/components/schemas/LinkView"
+            },
+            "type": "array"
+          },
+          "status": {
+            "description": "The provider's own word for the tunnel (Cloudflare: `healthy`,\n`degraded`, `down`, `inactive`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "links"
+        ],
+        "type": "object"
+      },
+      "ConnectorList": {
+        "description": "One page of tunnels, newest first.",
+        "properties": {
+          "connectors": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorView"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "connectors",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "ConnectorNodeView": {
+        "properties": {
+          "driver": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "ready_connections": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reported_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "state"
+        ],
+        "type": "object"
+      },
+      "ConnectorView": {
+        "properties": {
+          "auto_publish": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "dns_provider_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dns_target": {
+            "description": "Where published hostnames point.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "domain": {
+            "type": "string"
+          },
+          "edge_port": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "external_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectorNodeView"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "publications": {
+            "items": {
+              "$ref": "#/components/schemas/PublicationView"
+            },
+            "type": "array"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "domain",
+          "status",
+          "edge_port",
+          "auto_publish",
+          "nodes",
+          "publications",
+          "created_at"
+        ],
+        "type": "object"
+      },
       "ConsoleEventPayload": {
         "description": "Payload for server-side event ingestion via the console API.\n\nThe app backend reads the encrypted `_temps_visitor_id` and `_temps_sid`\ncookie values from the user's request and forwards them here.\nTemps decrypts them server-side to resolve visitor/session identity.",
         "properties": {
@@ -12418,6 +12911,24 @@
             "minimum": 1,
             "type": "integer"
           },
+          "ingest_kib_per_sec": {
+            "default": 256,
+            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit.",
+            "example": 256,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ingest_lines_per_sec": {
+            "default": 250,
+            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving.",
+            "example": 250,
+            "format": "int32",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": "integer"
+          },
           "max_file": {
             "default": 3,
             "description": "Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)",
@@ -12498,14 +13009,16 @@
             "type": "string"
           },
           "value": {
-            "description": "Averaged metric value for the bucket.",
+            "description": "Averaged metric value for the bucket; `null` when the container\nreported no sample in it (it was stopped, or the server was down), so\ncharts show a gap instead of interpolating across it.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
-          "time",
-          "value"
+          "time"
         ],
         "type": "object"
       },
@@ -14283,6 +14796,36 @@
         "required": [
           "name",
           "config"
+        ],
+        "type": "object"
+      },
+      "CreateConnectorRequest": {
+        "properties": {
+          "name": {
+            "description": "Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.",
+            "type": "string"
+          },
+          "node_ids": {
+            "description": "Nodes that run a connector replica.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "provider": {
+            "description": "The provider's `kind`, from `GET /ingress/providers`.",
+            "type": "string"
+          },
+          "values": {
+            "description": "Answers to the provider's setup fields, by field key. DNS provider\nfields take the provider's id; every other field takes a string.",
+            "type": "object"
+          }
+        },
+        "required": [
+          "name",
+          "provider",
+          "node_ids"
         ],
         "type": "object"
       },
@@ -16460,16 +17003,20 @@
             ]
           },
           "cpu_limit": {
+            "description": "CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).\nOmit for the operator's default.",
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
             ]
           },
           "disk_size_mb": {
-            "description": "Root disk size in MB (Firecracker only; Docker ignores it). Omit for\nthe platform default (1 GiB).",
+            "description": "Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores\nit). Omit for the platform default (1 GiB).",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 65536,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -16511,8 +17058,10 @@
             ]
           },
           "memory_limit_mb": {
+            "description": "Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,\nand never more than the host has). Omit for the operator's default.",
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -16534,7 +17083,10 @@
             ]
           },
           "pids_limit": {
+            "description": "Max processes, `[1, 4096]` (lower if an administrator set a maximum);\n`0`/negative (unlimited) is rejected. Omit for the platform default\n(512).",
             "format": "int64",
+            "maximum": 4096,
+            "minimum": 1,
             "type": [
               "integer",
               "null"
@@ -17420,6 +17972,11 @@
           "current_status": {
             "type": "string"
           },
+          "downtime_seconds": {
+            "description": "Seconds of the window covered by a non-operational check result.",
+            "format": "int64",
+            "type": "integer"
+          },
           "last_check_at": {
             "format": "date-time",
             "type": [
@@ -17431,15 +17988,31 @@
             "format": "int32",
             "type": "integer"
           },
+          "monitored_seconds": {
+            "description": "Seconds of the window covered by a check result.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "unknown_seconds": {
+            "description": "Seconds of the window (after the monitor was created, up to now) that\nno check covered, so Temps cannot say whether the endpoint was up.",
+            "format": "int64",
+            "type": "integer"
+          },
           "uptime_percentage": {
+            "description": "Share of the window's *monitored* time the endpoint was operational,\nweighted by time rather than by check count. Stretches no check covered\n(Temps or its scheduler was down, the deployment was paused, ...) are\nexcluded from the denominator and reported in `unknown_seconds`\ninstead of silently counting as up. `None` when nothing in the window\nwas monitored.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
           "monitor_id",
           "current_status",
-          "uptime_percentage"
+          "monitored_seconds",
+          "downtime_seconds",
+          "unknown_seconds"
         ],
         "type": "object"
       },
@@ -20739,6 +21312,15 @@
           "status"
         ],
         "type": "object"
+      },
+      "DnsHandling": {
+        "description": "Who makes the published hostnames resolve.",
+        "enum": [
+          "automatic",
+          "manual",
+          "provider_hostname"
+        ],
+        "type": "string"
       },
       "DnsLookupError": {
         "description": "Error response for DNS lookup failures",
@@ -24365,6 +24947,14 @@
         ],
         "type": "object"
       },
+      "EnvironmentIngressMode": {
+        "enum": [
+          "legacy",
+          "shadow",
+          "enforce"
+        ],
+        "type": "string"
+      },
       "EnvironmentResponse": {
         "properties": {
           "attack_mode": {
@@ -27479,6 +28069,82 @@
           "context"
         ],
         "type": "object"
+      },
+      "FieldKind": {
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "enum": [
+                  "text"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Stored encrypted, never returned by the API.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "secret"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One of the cluster's DNS providers, of `provider_type` when set.",
+            "properties": {
+              "provider_type": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "dns_provider"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A domain managed by the DNS provider chosen in the field\n`provider_field`, or with `allow_subdomain` a name under one.",
+            "properties": {
+              "allow_subdomain": {
+                "type": "boolean"
+              },
+              "provider_field": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "managed_domain"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_field",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "FieldResponse": {
         "properties": {
@@ -32380,6 +33046,27 @@
           "labels": {
             "description": "Updated node labels for scheduling (allows runtime label changes)."
           },
+          "occupied_ranges": {
+            "description": "The node's occupied IPv4 ranges (ADR 056), sent when they change.",
+            "items": {
+              "$ref": "#/components/schemas/OccupiedRangeReport"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "overlay": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OverlayHeartbeat",
+                "description": "Cross-node overlay state (ADR 056). `None` from older agents leaves the\nstored status untouched."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "public_ingress": {
             "oneOf": [
               {
@@ -32554,6 +33241,30 @@
         ],
         "type": "string"
       },
+      "HostnameCandidate": {
+        "properties": {
+          "auto_publish": {
+            "type": "boolean"
+          },
+          "connector_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "name",
+          "domain",
+          "auto_publish"
+        ],
+        "type": "object"
+      },
       "HostnameChange": {
         "description": "A single generated-hostname change in a flatten preview/apply.",
         "properties": {
@@ -32580,6 +33291,15 @@
           "new"
         ],
         "type": "object"
+      },
+      "HostnameMode": {
+        "description": "How one hostname reaches visitors, as the operator chose it (ADR 058 D9).",
+        "enum": [
+          "automatic",
+          "tunnel",
+          "off"
+        ],
+        "type": "string"
       },
       "HostnamePreviewResponse": {
         "description": "Combined preview of a hostname-mode change.",
@@ -32620,6 +33340,74 @@
           "dns_changes",
           "conflicts",
           "total"
+        ],
+        "type": "object"
+      },
+      "HostnameView": {
+        "description": "Where a hostname stands with the tunnels, and why.",
+        "properties": {
+          "candidates": {
+            "description": "The tunnels whose domain covers it.",
+            "items": {
+              "$ref": "#/components/schemas/HostnameCandidate"
+            },
+            "type": "array"
+          },
+          "chosen_connector_id": {
+            "description": "The tunnel chosen for it, with mode `tunnel`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "connector_id": {
+            "description": "The tunnel that publishes it, or would once `detail` is dealt with.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "connector_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "What is happening; when it is not published, why and what to do.",
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/HostnameMode"
+          },
+          "published_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "served_by_workers": {
+            "description": "Whether workers serve it. A tunnel only publishes those.",
+            "type": "boolean"
+          },
+          "state": {
+            "description": "`published`, `pending`, `error` or `not_published`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "mode",
+          "state",
+          "detail",
+          "served_by_workers",
+          "candidates"
         ],
         "type": "object"
       },
@@ -34154,6 +34942,14 @@
         ],
         "type": "object"
       },
+      "IngestDropReason": {
+        "description": "Which budget a dropped line exceeded.",
+        "enum": [
+          "lines_per_sec",
+          "bytes_per_sec"
+        ],
+        "type": "string"
+      },
       "IngestErrorSummary": {
         "description": "One aggregated ingest-failure group: \"this signal failed this way N times\".\n\nThe pipeline-stats counters say *how many* records were dropped;\nthis says *why*. Rows are grouped by `(signal_type, error_class)` rather\nthan stored per-event, so a sustained outage collapses into one row with a\nrising `count` instead of flooding the table.\n\n`sample_message` is one representative backend error string, kept for the\ndetail a class name cannot carry (the failing column, the refused address).\nIt is a sample, not a guarantee: which occurrence it came from is\nunspecified.",
         "properties": {
@@ -34232,10 +35028,11 @@
         "type": "object"
       },
       "IngressMode": {
+        "description": "What a worker lets its control plane do with public ingress. Set on the\nworker only (`temps join --ingress`, `temps agent ingress`): opening ports\non a machine is its owner's decision, whoever runs the control plane.",
         "enum": [
-          "legacy",
-          "shadow",
-          "enforce"
+          "off",
+          "fixed",
+          "delegated"
         ],
         "type": "string"
       },
@@ -34257,7 +35054,7 @@
             ]
           },
           "mode": {
-            "$ref": "#/components/schemas/IngressMode",
+            "$ref": "#/components/schemas/EnvironmentIngressMode",
             "description": "`legacy`: the existing access chain decides. `shadow`: it still\ndecides, and the compiled endpoint is evaluated alongside and every\ndisagreement counted (`proxy.ingress_shadow_mismatches`). `enforce`:\nthe compiled endpoint decides."
           },
           "project_id": {
@@ -35715,6 +36512,50 @@
         ],
         "type": "object"
       },
+      "LinkView": {
+        "properties": {
+          "client_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "location": {
+            "description": "The provider's data centre, such as `mad01`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "description": "The worker holding it, when its connector could be matched.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "opened_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reconnecting": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reconnecting"
+        ],
+        "type": "object"
+      },
       "ListAgentsResponse": {
         "properties": {
           "items": {
@@ -36921,6 +37762,48 @@
         ],
         "type": "string"
       },
+      "LogIngestBudgetStatus": {
+        "description": "The per-container log ingestion budget and the containers over it now.\nA throttled container has lines dropped (not stored, not indexed), so it\nis reported here for the console to name it rather than leave a gap in\nits history unexplained.",
+        "properties": {
+          "burst_seconds": {
+            "description": "Seconds of budget a container may send at once before it is held to\nthe rate.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_per_sec": {
+            "description": "Bytes per second each container may store; `0` = no byte limit.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines_per_sec": {
+            "description": "Lines per second each container may store; `0` = no line limit.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "setup_path": {
+            "description": "Console path where an administrator changes the budget.",
+            "type": "string"
+          },
+          "throttled": {
+            "description": "Containers that dropped lines in the last minute, noisiest first,\nlimited to the projects and services the caller can read.",
+            "items": {
+              "$ref": "#/components/schemas/ThrottledLogSource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines_per_sec",
+          "bytes_per_sec",
+          "burst_seconds",
+          "setup_path",
+          "throttled"
+        ],
+        "type": "object"
+      },
       "LogLevel": {
         "description": "Normalized log level",
         "enum": [
@@ -37682,6 +38565,111 @@
         ],
         "type": "object"
       },
+      "MeshEnrollApiRequest": {
+        "description": "Body of `POST /internal/nodes/mesh-enroll` (ADR 055).",
+        "properties": {
+          "join_token": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SecretString",
+                "description": "Enrollment token, as for `/internal/nodes/register`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "description": "Scheduling labels the worker will register with; checked against the\ntoken's bound labels and carried over to the pairing's token."
+          },
+          "name": {
+            "description": "The name the worker will register under.",
+            "type": "string"
+          },
+          "wg_public_key": {
+            "description": "The worker's base64 WireGuard public key. The private key never\nleaves the worker.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "wg_public_key"
+        ],
+        "type": "object"
+      },
+      "MeshEnrollResponse": {
+        "description": "What a worker that joins outbound only needs to bring its end of the mesh\nup and register over it (ADR 055): a pairing code without its secret.",
+        "properties": {
+          "ca_fingerprint": {
+            "description": "SHA-256 fingerprint of the cluster CA the node API presents.",
+            "type": "string"
+          },
+          "control_plane_address": {
+            "description": "The control plane's mesh address; the node API listens there.",
+            "type": "string"
+          },
+          "control_plane_endpoint": {
+            "description": "`ip:port` the worker dials.",
+            "type": "string"
+          },
+          "control_plane_public_key": {
+            "type": "string"
+          },
+          "expires_at": {
+            "description": "When the pairing and its token expire (RFC 3339).",
+            "type": "string"
+          },
+          "join_token": {
+            "description": "Single-use join token bound to `name`, accepted only over the mesh\nnode API from `node_address`.",
+            "type": "string"
+          },
+          "listen_port": {
+            "description": "The mesh UDP port.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "The name the pairing's join token is bound to.",
+            "type": "string"
+          },
+          "node_address": {
+            "description": "The worker's mesh address, reserved for it. It registers under it.",
+            "type": "string"
+          },
+          "node_api_port": {
+            "description": "TCP port of the node API on the control plane's mesh address.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pairing_id": {
+            "description": "The pairing created for the worker.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pairing_id",
+          "name",
+          "control_plane_public_key",
+          "control_plane_endpoint",
+          "control_plane_address",
+          "node_address",
+          "prefix_len",
+          "listen_port",
+          "node_api_port",
+          "ca_fingerprint",
+          "join_token",
+          "expires_at"
+        ],
+        "type": "object"
+      },
       "MessageContent": {
         "oneOf": [
           {
@@ -38109,14 +39097,16 @@
             "type": "string"
           },
           "value": {
-            "description": "Metric value at this bucket.",
+            "description": "Metric value at this bucket. `null` when no sample landed in the\nbucket (the sampler, or the server, was not running), so charts break\nthe line instead of interpolating across the outage. Per-interval\nrequest counters read `0` instead: no sample there means no traffic.\nEvery bucket of a window up to 7 days is present.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
-          "time",
-          "value"
+          "time"
         ],
         "type": "object"
       },
@@ -39338,14 +40328,17 @@
             "$ref": "#/components/schemas/MonitorResponse"
           },
           "uptime_percentage": {
+            "description": "Share of the last 30 days' *monitored* time the endpoint was\noperational. `None` when no check covered any of that time -- \"no\ndata\" is not \"100% up\".",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
           "monitor",
-          "current_status",
-          "uptime_percentage"
+          "current_status"
         ],
         "type": "object"
       },
@@ -39564,6 +40557,14 @@
             "default": true,
             "description": "Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations\ndefault to `true`. Existing serialized settings that predate this field\ndeserialize it as `false`, providing an explicit migration window rather\nthan unexpectedly disconnecting legacy workers. When `true`, the CP signs\nnode CSRs, nodes serve mutual TLS, and every CP→agent call uses the\ncluster client cert. Observe-then-enforce: flip this on only once all\nworkers have re-enrolled with certs.",
             "type": "boolean"
+          },
+          "wg_endpoint": {
+            "default": null,
+            "description": "`ip:port` workers dial for the control plane's end of the WireGuard\nmesh, published instead of `private_address` on the mesh port. For a\ncontrol plane reachable only through NAT or a forwarded port.\n\nOwned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start\nrecords the flag's value (clearing it when the flag is absent), and a\nsettings write never changes it. Stored here only so the processes\nthat set the mesh up (the deployer plugin, `temps network\nsetup-multi-node`) read the same value.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -40193,6 +41194,47 @@
         ],
         "type": "object"
       },
+      "NodeCreateAlertRuleRequest": {
+        "description": "Request body for creating a resource alert on a node.\n\nOnly the usage percentages can be alerted on: `node.cpu_percent`,\n`node.memory_percent` and `node.disk_percent`. `threshold` is a percentage\n(0-100). A node has at most one rule per metric.",
+        "properties": {
+          "comparator": {
+            "description": "One of `>`, `<`, `>=`, `<=`.",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "for_duration_secs": {
+            "description": "Seconds the breach must persist before the alarm fires (0 = immediate).",
+            "format": "int32",
+            "type": "integer"
+          },
+          "metric_name": {
+            "description": "One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "severity": {
+            "description": "`\"warning\"` or `\"critical\"`.",
+            "type": "string"
+          },
+          "threshold": {
+            "description": "Percentage between 0 and 100.",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "name",
+          "metric_name",
+          "threshold",
+          "comparator",
+          "severity"
+        ],
+        "type": "object"
+      },
       "NodeDnsStatusEntry": {
         "description": "Per-node DNS resolver health, as last reported by that node's heartbeat.\nPart of `GET /api/cluster/dns/status`.",
         "properties": {
@@ -40387,6 +41429,13 @@
           "capacity": {
             "description": "Resource capacity/usage metrics from the latest heartbeat"
           },
+          "compute_cidr": {
+            "description": "This node's subnet of the cluster compute pool, if allocated.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "created_at": {
             "type": "string"
           },
@@ -40403,6 +41452,27 @@
           },
           "name": {
             "type": "string"
+          },
+          "overlay_last_error": {
+            "description": "Why the overlay is unavailable: the colliding range, its owner and the\nfixes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlay_remediation": {
+            "description": "The last automatic move of this node's allocation, and why.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overlay_status": {
+            "description": "Cross-node overlay (ADR 056): `ready`, `unavailable`, or `None` when\nthe agent never reported it (older agent, or no heartbeat yet).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "private_address": {
             "type": "string"
@@ -40603,8 +41673,11 @@
             "type": "string"
           },
           "node_endpoint": {
-            "description": "`ip:port` the control plane dials.",
-            "type": "string"
+            "description": "`ip:port` the control plane dials; `null` for a worker that joined\noutbound only (ADR 055): it dials the control plane instead.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "node_id": {
             "description": "The node that registered with this pairing.",
@@ -40622,7 +41695,6 @@
         "required": [
           "id",
           "name",
-          "node_endpoint",
           "mesh_address",
           "status",
           "expires_at",
@@ -41712,6 +42784,29 @@
         },
         "type": "object"
       },
+      "OccupiedRangeReport": {
+        "description": "One IPv4 range a node already uses outside Temps (ADR 056).",
+        "properties": {
+          "cidr": {
+            "description": "IPv4 network, e.g. `172.20.0.0/16`.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Device name for a route, network name for a Docker network.",
+            "type": "string"
+          },
+          "source": {
+            "description": "`route` (a host route) or `docker` (a Docker network's subnet).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cidr",
+          "source",
+          "name"
+        ],
+        "type": "object"
+      },
       "OidcProviderResponse": {
         "properties": {
           "client_id": {
@@ -42773,6 +43868,33 @@
         },
         "required": [
           "peer_group_key"
+        ],
+        "type": "object"
+      },
+      "OverlayHeartbeat": {
+        "description": "Cross-node overlay state reported by the agent (ADR 056).",
+        "properties": {
+          "compute_cidr": {
+            "description": "The allocation the agent applied (when `ready`) or tried to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the overlay is unavailable, with the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`ready` or `unavailable`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
         ],
         "type": "object"
       },
@@ -47355,6 +48477,15 @@
               "null"
             ]
           },
+          "github_webhook_id": {
+            "description": "GitHub repository webhook ID Temps registered on the connected\nrepository. Only GitHub connections that are not a GitHub App (personal\naccess token, OAuth) get one; App connections receive pushes through the\nApp webhook. `null` when none is installed (another provider, a GitHub\nApp connection, or registration failed / the hook was never created).",
+            "example": 512345678,
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "gitlab_webhook_id": {
             "description": "GitLab webhook ID installed on the connected repository.\n`null` when no GitLab webhook is installed (not connected to GitLab,\nor webhook was removed / never created).",
             "example": 42,
@@ -48649,6 +49780,62 @@
         ],
         "type": "object"
       },
+      "ProviderInfo": {
+        "description": "What a provider is, for the console.",
+        "properties": {
+          "dns": {
+            "$ref": "#/components/schemas/DnsHandling"
+          },
+          "docs_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/SetupField"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "description": "Stored on the connector, e.g. `cloudflare_tunnel`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "needs_public_ip": {
+            "description": "Whether the worker needs a public address. Tunnels do not.",
+            "type": "boolean"
+          },
+          "requirements": {
+            "description": "What the operator needs before starting, one line each.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "works_behind_cgnat": {
+            "description": "Whether it works when the ISP puts the worker behind carrier-grade NAT.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "name",
+          "summary",
+          "requirements",
+          "needs_public_ip",
+          "works_behind_cgnat",
+          "dns",
+          "fields"
+        ],
+        "type": "object"
+      },
       "ProviderKeyResponse": {
         "properties": {
           "api_key_masked": {
@@ -49587,6 +50774,55 @@
         ],
         "type": "object"
       },
+      "PublicIngressCheck": {
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PublicIngressCheckStep"
+            },
+            "type": "array"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "target": {
+            "description": "The address that was dialled.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "ok",
+          "summary",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "PublicIngressCheckStep": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "step": {
+            "description": "`address`, `http` or `https`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "ok",
+          "message"
+        ],
+        "type": "object"
+      },
       "PublicIngressHeartbeat": {
         "properties": {
           "certificate_count": {
@@ -49622,6 +50858,163 @@
           "certificate_count",
           "route_count",
           "unsupported_route_count"
+        ],
+        "type": "object"
+      },
+      "PublicIngressInterface": {
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "default_route": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/AddressScope"
+          }
+        },
+        "required": [
+          "name",
+          "address",
+          "default_route",
+          "scope"
+        ],
+        "type": "object"
+      },
+      "PublicIngressSettings": {
+        "properties": {
+          "agent_reports": {
+            "description": "Whether the agent reported its addresses: an agent that predates\nconsole-managed ingress never does, and keeps its flag.",
+            "type": "boolean"
+          },
+          "behind_nat": {
+            "description": "The listen address is not public but the public address is: traffic\ncrosses a NAT, so the router must forward the ports.",
+            "type": "boolean"
+          },
+          "checked_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_public_address": {
+            "description": "The address DNS should point at, as far as Temps can tell.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_public_scope": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AddressScope"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "http_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "https_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "interfaces": {
+            "items": {
+              "$ref": "#/components/schemas/PublicIngressInterface"
+            },
+            "type": "array"
+          },
+          "last_check": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PublicIngressCheck"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listen_address": {
+            "description": "Configured listen address; `None` means automatic.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listener_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listening_http": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "listening_https": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IngressMode",
+                "description": "What the worker allows, as it last reported: `off` (no public ports),\n`fixed` (the worker chose its listen address and ports) or `delegated`\n(Temps picks among the worker's addresses). `None` from agents that\npredate ingress modes."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "public_address": {
+            "description": "Configured public address; `None` means the listen address.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "running": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "enabled",
+          "http_port",
+          "https_port",
+          "agent_reports",
+          "interfaces",
+          "behind_nat"
         ],
         "type": "object"
       },
@@ -49906,6 +51299,35 @@
         },
         "required": [
           "configured"
+        ],
+        "type": "object"
+      },
+      "PublicationView": {
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "published_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`published`, `error`, or `stale` (its record points at a tunnel that\nwas replaced; it is being published again).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "state"
         ],
         "type": "object"
       },
@@ -50921,6 +52343,16 @@
             "description": "Unique name for this node",
             "type": "string"
           },
+          "occupied_ranges": {
+            "description": "IPv4 ranges this machine already uses (ADR 056), so its overlay\nallocation avoids them. Absent from older CLIs.",
+            "items": {
+              "$ref": "#/components/schemas/OccupiedRangeReport"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "prior_token": {
             "description": "The node's *current* token, supplied to prove possession when\nre-registering (changing the identity of) a node that already exists.\nOptional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)",
             "type": [
@@ -51032,8 +52464,11 @@
         "description": "Body of `PUT /internal/nodes/{node_id}/network/wireguard`.",
         "properties": {
           "endpoint": {
-            "description": "`ip:port` other nodes dial to reach this node's WireGuard socket.",
-            "type": "string"
+            "description": "`ip:port` other nodes dial to reach this node's WireGuard socket.\nAbsent or `null` for a node nobody can dial (ADR 055): it dials the\ncontrol plane, which learns its address from the handshake.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "public_key": {
             "description": "Base64 WireGuard public key. The private key never leaves the node.",
@@ -51041,8 +52476,7 @@
           }
         },
         "required": [
-          "public_key",
-          "endpoint"
+          "public_key"
         ],
         "type": "object"
       },
@@ -51090,6 +52524,26 @@
           "key_id",
           "payload",
           "signature"
+        ],
+        "type": "object"
+      },
+      "ReinstallGithubWebhookResponse": {
+        "description": "Response for `POST /projects/{project_id}/github/reinstall-webhook`",
+        "properties": {
+          "hook_id": {
+            "description": "The new GitHub repository hook ID that was installed.",
+            "example": 512345678,
+            "format": "int64",
+            "type": "integer"
+          },
+          "message": {
+            "description": "Human-readable status message.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hook_id",
+          "message"
         ],
         "type": "object"
       },
@@ -51248,6 +52702,13 @@
           "id": {
             "format": "int32",
             "type": "integer"
+          },
+          "lost_environments": {
+            "description": "Environments that were still serving from the node when it was\nremoved as gone (`force=true` on an unreachable node, ADR 057). Their\ncontainers there are recorded as orphaned; one with no replicas on\nanother node serves nothing until it is redeployed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "message": {
             "type": "string"
@@ -51901,6 +53362,32 @@
         ],
         "type": "object"
       },
+      "ResetUserMfaResponse": {
+        "description": "Returned when an administrator removes another user's second factor.",
+        "properties": {
+          "mfa_enabled": {
+            "description": "Always false: the user's TOTP secret and recovery codes are gone.",
+            "type": "boolean"
+          },
+          "password_sign_in_blocked": {
+            "description": "True when this instance requires MFA for admins\n(`require_mfa_for_admins`) and the user is an admin: until they enroll\nagain they cannot sign in with a password, so they must sign in\nthrough SSO, or the setting must be turned off while they re-enroll.",
+            "type": "boolean"
+          },
+          "sessions_revoked": {
+            "description": "How many of the user's sessions were signed out by the reset.",
+            "example": 2,
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "mfa_enabled",
+          "sessions_revoked",
+          "password_sign_in_blocked"
+        ],
+        "type": "object"
+      },
       "ResetUserPasswordResponse": {
         "description": "Returned once when an administrator resets another user's password. The\ntemporary password is not stored in retrievable form, so this response is\nthe only place it ever appears. The user must replace it at next sign-in.",
         "properties": {
@@ -52254,7 +53741,8 @@
         "properties": {
           "memory": {
             "format": "int64",
-            "minimum": 0,
+            "maximum": 32768,
+            "minimum": 6,
             "type": [
               "integer",
               "null"
@@ -52262,6 +53750,8 @@
           },
           "vcpus": {
             "format": "double",
+            "maximum": 16,
+            "minimum": 0.01,
             "type": [
               "number",
               "null"
@@ -55397,6 +56887,14 @@
           "name": {
             "type": "string"
           },
+          "project_id": {
+            "description": "Project the secret is scoped to; `null` means instance-wide.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "secret_type": {
             "type": "string"
           },
@@ -58320,6 +59818,21 @@
         },
         "type": "object"
       },
+      "SetConnectorNodesRequest": {
+        "properties": {
+          "node_ids": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "node_ids"
+        ],
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -58389,6 +59902,25 @@
         "required": [
           "group",
           "services"
+        ],
+        "type": "object"
+      },
+      "SetHostnameChoiceRequest": {
+        "properties": {
+          "connector_id": {
+            "description": "Required with mode `tunnel`.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/HostnameMode"
+          }
+        },
+        "required": [
+          "mode"
         ],
         "type": "object"
       },
@@ -58837,6 +60369,43 @@
           "total_records",
           "results",
           "message"
+        ],
+        "type": "object"
+      },
+      "SetupField": {
+        "description": "One question in a provider's setup form.",
+        "properties": {
+          "help": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "description": "The key in `values` of the create request.",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/FieldKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "placeholder": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "label",
+          "kind",
+          "required"
         ],
         "type": "object"
       },
@@ -61053,6 +62622,7 @@
             ]
           },
           "status": {
+            "description": "\"operational\", \"degraded\", \"down\", or \"unknown\" -- the last for a\nbucket no check landed in. Every bucket of the requested range is\nreturned, so a stretch without checks shows up as \"unknown\" rather than\ndisappearing from the timeline.",
             "type": "string"
           },
           "total_checks": {
@@ -61060,8 +62630,12 @@
             "type": "integer"
           },
           "uptime_percentage": {
+            "description": "`None` for a bucket without checks.",
             "format": "double",
-            "type": "number"
+            "type": [
+              "number",
+              "null"
+            ]
           }
         },
         "required": [
@@ -61070,8 +62644,7 @@
           "total_checks",
           "operational_count",
           "degraded_count",
-          "down_count",
-          "uptime_percentage"
+          "down_count"
         ],
         "type": "object"
       },
@@ -63391,6 +64964,104 @@
           "status",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "ThrottledLogSource": {
+        "description": "A container that is dropping lines because it exceeds its budget.",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dropped_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dropped_lines": {
+            "description": "Totals since temps started collecting the container.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "env": {
+            "type": "string"
+          },
+          "external_service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_dropped_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "Worker node, for containers collected from a remote node.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offered_bytes_per_sec": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offered_lines_per_sec": {
+            "description": "What the container is producing, measured over the last few seconds;\n`0` once it has gone quiet.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "description": "`None` for external-service containers.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/IngestDropReason",
+            "description": "Budget the most recent dropped line exceeded."
+          },
+          "service": {
+            "description": "Service label, or the external service's name.",
+            "type": "string"
+          },
+          "throttled_since": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_id",
+          "service",
+          "env",
+          "offered_lines_per_sec",
+          "offered_bytes_per_sec",
+          "dropped_lines",
+          "dropped_bytes",
+          "reason",
+          "throttled_since",
+          "last_dropped_at"
         ],
         "type": "object"
       },
@@ -65898,6 +67569,28 @@
         ],
         "type": "object"
       },
+      "UpdateClusterNetworkRequest": {
+        "description": "Body of `PUT /settings/cluster-network`.",
+        "properties": {
+          "compute_pool_cidr": {
+            "description": "New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.",
+            "type": "string"
+          },
+          "subnet_prefix_len": {
+            "description": "Prefix of each node's subnet; keeps the current one when omitted.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "compute_pool_cidr"
+        ],
+        "type": "object"
+      },
       "UpdateComposeSecurityRequest": {
         "additionalProperties": false,
         "properties": {
@@ -65932,6 +67625,18 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "UpdateConnectorRequest": {
+        "properties": {
+          "auto_publish": {
+            "description": "Publish every worker-served hostname under the domain (true), or only\nhostnames chosen for this tunnel (false).",
+            "type": [
+              "boolean",
+              "null"
             ]
           }
         },
@@ -66780,7 +68485,7 @@
           "mode": {
             "oneOf": [
               {
-                "$ref": "#/components/schemas/IngressMode",
+                "$ref": "#/components/schemas/EnvironmentIngressMode",
                 "description": "Leave out to keep the current mode."
               },
               {
@@ -67699,6 +69404,47 @@
         },
         "type": "object"
       },
+      "UpdatePublicIngressSettingsRequest": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "http_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "https_port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "listen_address": {
+            "description": "Local address to bind, or `None` for automatic.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "public_address": {
+            "description": "What DNS points at, or `None` for the listen address.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "UpdateRouteRequest": {
         "properties": {
           "enabled": {
@@ -68487,6 +70233,14 @@
           },
           "name": {
             "type": "string"
+          },
+          "project_id": {
+            "description": "Project whose agent runs receive the secret. Omit for an instance-wide\nsecret, which is injected into every project's agent runs and so is\nreadable by anyone who can run an agent in any project.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "secret_type": {
             "description": "\"env\" (environment variable) or \"file\" (written to mount_path)",
@@ -71339,7 +73093,11 @@
             "type": "string"
           },
           "endpoint": {
-            "type": "string"
+            "description": "`null` for a node nobody dials (ADR 055): it dials its peers, which\nlearn its address from its handshakes.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "public_key": {
             "type": "string"
@@ -71347,7 +73105,6 @@
         },
         "required": [
           "public_key",
-          "endpoint",
           "address"
         ],
         "type": "object"
@@ -90625,7 +92382,7 @@
                 }
               }
             },
-            "description": "Insufficient permissions"
+            "description": "Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane"
           },
           "409": {
             "content": {
@@ -98721,7 +100478,7 @@
                 }
               }
             },
-            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore"
+            "description": "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted or has not completed (pending, running or failed), or a requested new-service name is already owned by a service or another active restore"
           }
         },
         "security": [
@@ -104173,6 +105930,458 @@
         "x-maturity": "beta"
       }
     },
+    "/ingress/connectors": {
+      "get": {
+        "description": "A tunnel publishes apps under its `domain` without certificates or open\nports. Each node entry says whether that worker's connector is connected.",
+        "operationId": "list_ingress_connectors",
+        "parameters": [
+          {
+            "description": "Page number (1-indexed)",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Number of items per page (default 20, max 100)",
+            "example": 20,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorList"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List tunnels, the workers each runs on and their status.",
+        "tags": [
+          "Ingress"
+        ]
+      },
+      "post": {
+        "description": "Cloudflare Tunnel takes `values.dns_provider_id` (a Cloudflare DNS\nprovider) and `values.domain` (a zone managed by it, or a subdomain of\none). Every worker in `node_ids` must allow ingress\n(`temps agent ingress delegated`). Apps under the domain are then\npublished automatically: adding `app.<domain>` to an environment is\nenough.",
+        "operationId": "create_ingress_connector",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConnectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid name, setup answers or nodes"
+          },
+          "409": {
+            "description": "A worker has not delegated public ingress"
+          },
+          "502": {
+            "description": "The provider refused; the detail says what to fix"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a tunnel for a managed domain and run it on workers.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}": {
+      "delete": {
+        "operationId": "delete_ingress_connector",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {},
+          "404": {},
+          "502": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a tunnel at the provider and unpublish every hostname it carries.",
+        "tags": [
+          "Ingress"
+        ]
+      },
+      "get": {
+        "operationId": "get_ingress_connector",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "404": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get one tunnel.",
+        "tags": [
+          "Ingress"
+        ]
+      },
+      "patch": {
+        "description": "`auto_publish: true` publishes every app under its domain; `false`\npublishes only hostnames chosen for it with\n`set_ingress_hostname_choice`.",
+        "operationId": "update_ingress_connector",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateConnectorRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "404": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change what a tunnel publishes.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/links": {
+      "get": {
+        "description": "Read from the provider on request: each link's data centre, when it\nopened, whether it is reconnecting, and the worker holding it.",
+        "operationId": "get_ingress_connector_links",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorLinksView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The tunnel is not created yet"
+          },
+          "404": {},
+          "502": {
+            "description": "The provider could not be asked"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a tunnel's live connections to the provider's edge.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/nodes": {
+      "put": {
+        "description": "More than one keeps apps reachable when a worker goes down; an empty list\nstops the tunnel everywhere without deleting it.",
+        "operationId": "set_ingress_connector_nodes",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetConnectorNodesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "404": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set the workers a tunnel runs on.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/sync": {
+      "post": {
+        "operationId": "sync_ingress_connector",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectorView"
+                }
+              }
+            }
+          },
+          "404": {},
+          "502": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Re-check a tunnel with its provider and recreate it if it was deleted.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/hostnames": {
+      "get": {
+        "description": "For each: the tunnel carrying it, its state (`published`, `pending`,\n`error`, `not_published`) and, when not published, the reason and what to\ndo.",
+        "operationId": "list_ingress_hostnames",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/HostnameView"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List hostnames tunnels publish or could publish, and why.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
+    "/ingress/hostnames/{hostname}": {
+      "get": {
+        "description": "Works for any hostname, served or not: the tunnels that could carry it\n(`candidates`), the one that does, and why.",
+        "operationId": "get_ingress_hostname",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "hostname",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostnameView"
+                }
+              }
+            }
+          },
+          "400": {}
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Explain how one hostname reaches visitors.",
+        "tags": [
+          "Ingress"
+        ]
+      },
+      "put": {
+        "description": "`automatic` lets the most specific tunnel covering it publish it;\n`tunnel` with `connector_id` pins it to that tunnel (adding a domain\n\"through a tunnel\"); `off` keeps every tunnel away from it, for DNS\nmanaged elsewhere. It is published once an environment serves it.",
+        "operationId": "set_ingress_hostname_choice",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "hostname",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetHostnameChoiceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostnameView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid hostname, or the tunnel cannot publish it"
+          },
+          "404": {
+            "description": "No such tunnel"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Choose how a hostname reaches visitors.",
+        "tags": [
+          "Ingress"
+        ]
+      }
+    },
     "/ingress/login-grants": {
       "post": {
         "operationId": "create_ingress_login_grant",
@@ -104265,6 +106474,35 @@
         ],
         "tags": [
           "Environments"
+        ]
+      }
+    },
+    "/ingress/providers": {
+      "get": {
+        "description": "Each entry describes its setup fields; answer them by key in\n`create_ingress_connector`.",
+        "operationId": "list_ingress_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderInfo"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the tunnel providers this control plane offers.",
+        "tags": [
+          "Ingress"
         ]
       }
     },
@@ -105958,6 +108196,53 @@
         ]
       }
     },
+    "/internal/nodes/mesh-enroll": {
+      "post": {
+        "description": "The worker sends its WireGuard public key with a join token; the control\nplane reserves it a mesh address and answers with what it needs to dial\nthe control plane and register over the mesh node API.",
+        "operationId": "mesh_enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MeshEnrollApiRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeshEnrollResponse"
+                }
+              }
+            },
+            "description": "Pairing created; register over the mesh next"
+          },
+          "400": {
+            "description": "Invalid name or WireGuard key"
+          },
+          "403": {
+            "description": "Missing, unknown or unusable join token"
+          },
+          "409": {
+            "description": "Mesh off or not ready, control plane not dialable, key in use, or too many pairings"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "summary": "Enroll a worker on the WireGuard mesh with no address of its own (ADR 055)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/internal/nodes/register": {
       "post": {
         "operationId": "register_node",
@@ -106021,7 +108306,7 @@
             }
           },
           {
-            "description": "Remove the node even if containers Temps placed on it could not be\nconfirmed removed (e.g. the host is gone for good). Those containers\nare recorded as orphaned instead of being re-homed.",
+            "description": "Remove the node even if containers Temps placed on it could not be\nconfirmed removed (e.g. the host is gone for good). Those containers\nare recorded as orphaned instead of being re-homed. On a node the\ncontrol plane can no longer reach (no heartbeat for 90 seconds) this\nalso covers containers deployments still serve from it:\nthey are recorded as orphaned too and their environments listed in\n`lost_environments` (ADR 057).",
             "in": "query",
             "name": "force",
             "required": false,
@@ -106048,7 +108333,7 @@
             "description": "Node not found"
           },
           "409": {
-            "description": "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)"
+            "description": "Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)"
           },
           "500": {
             "description": "Internal server error"
@@ -106759,6 +109044,134 @@
           },
           "400": {
             "description": "Node is not a worker"
+          },
+          "404": {
+            "description": "Node not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/public-ingress/check": {
+      "post": {
+        "operationId": "admin_check_node_public_ingress",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicIngressCheck"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Node not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/public-ingress/settings": {
+      "get": {
+        "operationId": "admin_get_node_public_ingress_settings",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicIngressSettings"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Node not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Nodes"
+        ]
+      },
+      "put": {
+        "operationId": "admin_update_node_public_ingress_settings",
+        "parameters": [
+          {
+            "description": "Worker node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePublicIngressSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicIngressSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid address or ports, or not a worker"
           },
           "404": {
             "description": "Node not found"
@@ -109461,6 +111874,62 @@
         ]
       }
     },
+    "/logs/ingest-budget": {
+      "get": {
+        "operationId": "log_ingest_budget",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestBudgetStatus"
+                }
+              }
+            },
+            "description": "Budget and throttled containers the caller can read"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller's log access could not be resolved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The ingestion budget and the containers dropping lines over it, for the\nwarnings on the log views. Reads only in-memory state, so the console can\npoll it from every log view; the caller's access scope is resolved only\nwhen some container is throttled.",
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
     "/logs/search": {
       "post": {
         "operationId": "search_logs",
@@ -111456,11 +113925,133 @@
           "Metrics"
         ],
         "x-maturity": "beta"
+      },
+      "post": {
+        "description": "Works for workers as well as the control plane (`0`). A worker's series is\nfed by its heartbeats, so a rule only starts evaluating once the node has\nreported at least once.",
+        "operationId": "NodeMetricsCreateAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NodeCreateAlertRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "Alert rule created"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "409": {
+            "description": "The node already has a rule for this metric"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a resource alert (CPU / memory / disk) on a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/nodes/{id}/metrics/alert-rules/{rule_id}": {
+      "delete": {
+        "description": "Refused for the control plane (`0`): its default rules are re-created on\nevery start, so use `PATCH` with `enabled: false` to silence one.",
+        "operationId": "NodeMetricsDeleteAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Alert rule deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found on this node"
+          },
+          "409": {
+            "description": "Control-plane default rules cannot be deleted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a worker's resource alert.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      },
       "patch": {
-        "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
+        "description": "Worker rules can be deleted. Control-plane defaults are update-only because\nthey are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
         "operationId": "NodeMetricsUpdateAlertRule",
         "parameters": [
           {
@@ -129256,6 +131847,9 @@
           "404": {
             "description": "Project or deployment not found"
           },
+          "409": {
+            "description": "Deployment is not live (only a deployed deployment can be paused)"
+          },
           "500": {
             "description": "Internal server error"
           }
@@ -129367,6 +131961,9 @@
           },
           "404": {
             "description": "Project or deployment not found"
+          },
+          "409": {
+            "description": "Deployment is not paused (only a paused deployment can be resumed)"
           },
           "500": {
             "description": "Internal server error"
@@ -136960,6 +139557,60 @@
           }
         ],
         "summary": "Update git settings for a project",
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/github/reinstall-webhook": {
+      "post": {
+        "description": "For projects on a GitHub connection that is not a GitHub App (personal\naccess token or OAuth). Removes the existing repository webhook (if any)\nand registers a fresh one with a new signing secret. Use this when the\nwebhook could not be registered automatically (the token lacks webhook\npermission) or was deleted on GitHub, and pushes have stopped deploying.",
+        "operationId": "reinstall_github_webhook",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReinstallGithubWebhookResponse"
+                }
+              }
+            },
+            "description": "Webhook installed"
+          },
+          "400": {
+            "description": "Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Install or reinstall the GitHub repository webhook for a project",
         "tags": [
           "Projects"
         ]
@@ -147620,6 +150271,93 @@
         ]
       }
     },
+    "/settings/cluster-network": {
+      "get": {
+        "operationId": "ClusterNetworkGet",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterNetworkStatus"
+                }
+              }
+            },
+            "description": "Cluster network"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The compute pool, whether it can change and what uses it, and each\nmember's cross-node overlay state.",
+        "tags": [
+          "Nodes"
+        ]
+      },
+      "put": {
+        "operationId": "ClusterNetworkUpdate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateClusterNetworkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClusterNetworkChangeResponse"
+                }
+              }
+            },
+            "description": "Pool changed"
+          },
+          "400": {
+            "description": "Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "The pool is in use"
+          },
+          "428": {
+            "description": "Re-authentication required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the cluster compute pool. Allowed while no allocation is in use;\nallocations handed out but never applied move to the new pool.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/settings/disk-status": {
       "get": {
         "description": "Returns live disk usage for the monitored path along with any disks that\nmeet or exceed the configured alert threshold. Read-only — does not send\nnotifications. Used by the dashboard to surface a low-disk-space warning.",
@@ -148271,7 +151009,7 @@
                 }
               }
             },
-            "description": "List of global agent secrets"
+            "description": "Agent secrets in every scope (instance-wide and per project)"
           },
           "401": {
             "description": "Unauthorized"
@@ -148320,6 +151058,9 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
           }
         },
         "security": [
@@ -148343,6 +151084,16 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Project scope; omit for the instance-wide secret.",
+            "in": "query",
+            "name": "project_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
             }
           }
         ],
@@ -151699,6 +154450,63 @@
         ]
       }
     },
+    "/users/{user_id}/mfa": {
+      "delete": {
+        "description": "The recovery path for a user who lost both their authenticator and their\nrecovery codes: their TOTP secret, recovery codes and second-factor\nlockout state are deleted and every session they have is revoked, so they\ncan sign in with their password alone and enroll again. Their password,\nroles and API keys are left alone.\n\nGated exactly like `POST /users/{user_id}/password`: `users:manage`, not\non yourself (use `DELETE /users/me/mfa`, which takes a code), and a recent\nstep-up for an MFA-enrolled administrator. When the instance has no other\nadmin to ask, `temps reset-admin-password --clear-mfa` does the same\noffline.",
+        "operationId": "reset_user_mfa",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResetUserMfaResponse"
+                }
+              }
+            },
+            "description": "MFA removed and the user's sessions revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "409": {
+            "description": "User is deleted, or has no MFA enrolled"
+          },
+          "428": {
+            "description": "Recent identity verification (step-up) required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove another user's second factor (admin only).",
+        "tags": [
+          "Users"
+        ]
+      }
+    },
     "/users/{user_id}/password": {
       "post": {
         "description": "The recovery path for a user who lost their password when outbound email\nis not configured. Every browser session of the user is revoked and they\nmust choose a new password at next sign-in. API keys are deliberately left\nalone, matching `POST /users/me/password`: revoking them would silently\nbreak the user's automation. The temporary password is returned once and\ncannot be retrieved again.\n\nAny `users:manage` principal may reset any other user, including another\nadmin. That is the existing trust model for this permission (it can already\ndelete users and change their roles); only resetting yourself is refused.",
@@ -152232,13 +155040,13 @@
             "description": "Sandbox created"
           },
           "400": {
-            "description": "Validation error"
+            "description": "Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum"
           },
           "401": {
             "description": "Unauthorized"
           },
           "422": {
-            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"
+            "description": "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows"
           },
           "500": {
             "description": "Internal server error"
@@ -155674,6 +158482,10 @@
     {
       "description": "Runtime configuration that changes without a redeploy",
       "name": "Feature Flags"
+    },
+    {
+      "description": "Ingress connectors: tunnels into the cluster (ADR 058)",
+      "name": "Ingress"
     },
     {
       "description": "Environment management operations",

@@ -37,6 +37,9 @@ use utoipa::ToSchema;
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
 #[serde(rename_all = "snake_case")]
+// Named apart from the worker ingress `IngressMode` (off/fixed/delegated)
+// so the two do not collapse into one OpenAPI schema.
+#[schema(as = EnvironmentIngressMode)]
 pub enum IngressMode {
     /// The legacy access chain decides; nothing new runs.
     #[default]

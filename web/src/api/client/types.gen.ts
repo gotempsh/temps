@@ -400,6 +400,11 @@ export type AddStatusPageDomainRequest = {
     verification_method?: VerificationMethod;
 };
 
+/**
+ * Who can reach an address.
+ */
+export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
+
 export type AdminGateResponse = {
     /**
      * `Host` header values allowed. Empty = any host.
@@ -668,6 +673,33 @@ export type AgentSandboxSettings = {
      */
     enabled?: boolean;
     /**
+     * Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.
+     * `cpu_limit` above only sets the default for requests that omit the
+     * field; this is the ceiling. `None` = the built-in ceiling (16 cores).
+     * A value above the built-in ceiling has no effect.
+     */
+    max_cpu_limit?: number | null;
+    /**
+     * Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.
+     * `None` = the built-in ceiling (32768 MB). On the control plane the
+     * host's physical memory is an additional ceiling.
+     */
+    max_memory_limit_mb?: number | null;
+    /**
+     * Highest `pids_limit` a `POST /sandboxes` request may ask for.
+     * `None` = the built-in ceiling (4096).
+     */
+    max_pids_limit?: number | null;
+    /**
+     * Most sandboxes (not destroyed) one user may have created through
+     * `POST /sandboxes` at a time; a create over the cap is refused.
+     * `None` = unlimited. AI application workspaces, agent runs and the
+     * sandboxes the platform creates for AI chat or autofix do not count
+     * and are not refused. Sandboxes created before this setting existed
+     * are not counted either.
+     */
+    max_sandboxes_per_user?: number | null;
+    /**
      * Memory limit in MB for sandbox containers
      */
     memory_limit_mb?: number;
@@ -710,6 +742,22 @@ export type AgentSandboxSettingsMasked = {
     custom_image: string;
     default_provider: string;
     enabled: boolean;
+    /**
+     * Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.
+     */
+    max_cpu_limit?: number | null;
+    /**
+     * Operator ceiling for `memory_limit_mb`; `null` = built-in.
+     */
+    max_memory_limit_mb?: number | null;
+    /**
+     * Operator ceiling for `pids_limit`; `null` = built-in.
+     */
+    max_pids_limit?: number | null;
+    /**
+     * Most live sandboxes per user; `null` = unlimited.
+     */
+    max_sandboxes_per_user?: number | null;
     memory_limit_mb: number;
     network_mode: string;
     providers: {
@@ -1836,6 +1884,13 @@ export type AppSettings = {
      * disables DNS record sync regardless of per-domain opt-in.
      */
     edge_target?: string | null;
+    /**
+     * Label of a new environment's generated hostname under `preview_domain`,
+     * from `{project}` and `{env}` (ADR 058 D9). `None` means
+     * [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+     * environments created after it is set; existing ones keep their names.
+     */
+    environment_hostname_template?: string | null;
     external_url?: string | null;
     /**
      * Geolocation database refresh policy, MaxMind credential (encrypted at
@@ -1908,6 +1963,12 @@ export type AppSettings = {
      * to match; the generic settings update preserves the stored value.
      */
     preview_gateway?: PreviewGatewaySettings;
+    /**
+     * Label for an environment named `production`, when it should differ
+     * (e.g. `{project}` for `app.example.com`). `None` uses
+     * `environment_hostname_template`.
+     */
+    production_hostname_template?: string | null;
     /**
      * Base URL handed to third parties that call back into Temps: email
      * open/click tracking, git provider webhooks, SES/SNS events, revenue
@@ -5008,14 +5069,114 @@ export type ClusterMemberRequest = {
 };
 
 /**
- * Read-only cluster network state. Pool changes are performed on the control
- * plane through `temps network setup-multi-node`, which enforces that no
- * existing node allocation can be stranded by an in-place edit.
+ * `PUT /settings/cluster-network` answer.
+ */
+export type ClusterNetworkChangeResponse = {
+    reassigned: Array<ClusterNetworkReassignment>;
+    status: ClusterNetworkStatus;
+};
+
+/**
+ * The control plane's overlay.
+ */
+export type ClusterNetworkControlPlane = {
+    compute_cidr?: string | null;
+    overlay_ready: boolean;
+    /**
+     * Why its last overlay setup failed, with the fix, when it did.
+     */
+    setup_failure?: string | null;
+};
+
+/**
+ * One worker's view of the overlay.
+ */
+export type ClusterNetworkNode = {
+    /**
+     * Its subnet of the pool, if allocated.
+     */
+    compute_cidr?: string | null;
+    id: number;
+    /**
+     * Whether its allocation locks the pool, and why when it does.
+     */
+    in_use: boolean;
+    in_use_reason?: string | null;
+    name: string;
+    /**
+     * What the node reported it already uses outside Temps.
+     */
+    occupied_ranges: Array<OccupiedRangeReport>;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and
+     * the fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of its allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * `ready`, `unavailable`, or `None` when its agent never reported it.
+     */
+    overlay_status?: string | null;
+};
+
+/**
+ * A node whose allocation a change moved.
+ */
+export type ClusterNetworkReassignment = {
+    from: string;
+    node_id: number;
+    node_name: string;
+    to: string;
+};
+
+/**
+ * Read-only cluster network state. The pool is changed through
+ * `PUT /settings/cluster-network` or `temps network setup-multi-node`, which
+ * refuse while any allocation is in use (ADR 056). `locked` means only that
+ * allocations exist: allocations never applied are re-assigned by a change,
+ * so whether it is allowed now is `GET /settings/cluster-network`'s
+ * `can_change`.
  */
 export type ClusterNetworkSettings = {
     allocation_count: number;
     compute_pool_cidr: string;
     locked: boolean;
+    subnet_prefix_len: number;
+};
+
+/**
+ * `GET /settings/cluster-network`.
+ */
+export type ClusterNetworkStatus = {
+    /**
+     * Whether `PUT` can change the pool now.
+     */
+    can_change: boolean;
+    /**
+     * Why it cannot: the members using the pool, or a control-plane setup
+     * in progress.
+     */
+    change_blocked_by: Array<string>;
+    compute_pool_cidr: string;
+    control_plane: ClusterNetworkControlPlane;
+    /**
+     * What a new cluster starts with.
+     */
+    default_compute_pool_cidr: string;
+    mesh_enabled: boolean;
+    /**
+     * The WireGuard mesh pool; a compute pool may not overlap it.
+     */
+    mesh_pool_cidr: string;
+    nodes: Array<ClusterNetworkNode>;
+    /**
+     * Whether an operator has confirmed the pool, or a member already uses
+     * it. The console asks for it once before adding the first node.
+     */
+    pool_confirmed: boolean;
     subnet_prefix_len: number;
 };
 
@@ -5381,6 +5542,12 @@ export type ComposeCheckReport = {
  */
 export type ComposeHostStatusResponse = {
     /**
+     * False when this process never runs Compose workloads (a hosted control
+     * plane): the CLI is neither probed nor expected, so a missing or old
+     * Compose is not a problem to report there.
+     */
+    applicable: boolean;
+    /**
      * Whether the Compose CLI ran.
      */
     available: boolean;
@@ -5693,6 +5860,58 @@ export type ConnectionTestResult = {
 };
 
 /**
+ * A tunnel's live connections, read from the provider on request.
+ */
+export type ConnectorLinksView = {
+    links: Array<LinkView>;
+    /**
+     * The provider's own word for the tunnel (Cloudflare: `healthy`,
+     * `degraded`, `down`, `inactive`).
+     */
+    status: string;
+};
+
+/**
+ * One page of tunnels, newest first.
+ */
+export type ConnectorList = {
+    connectors: Array<ConnectorView>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type ConnectorNodeView = {
+    driver?: string | null;
+    last_error?: string | null;
+    node_id: number;
+    node_name: string;
+    ready_connections?: number | null;
+    reported_at?: string | null;
+    state: string;
+};
+
+export type ConnectorView = {
+    auto_publish: boolean;
+    created_at: string;
+    dns_provider_id?: number | null;
+    /**
+     * Where published hostnames point.
+     */
+    dns_target?: string | null;
+    domain: string;
+    edge_port: number;
+    external_id?: string | null;
+    id: number;
+    last_error?: string | null;
+    name: string;
+    nodes: Array<ConnectorNodeView>;
+    provider: string;
+    publications: Array<PublicationView>;
+    status: string;
+};
+
+/**
  * Payload for server-side event ingestion via the console API.
  *
  * The app backend reads the encrypted `_temps_visitor_id` and `_temps_sid`
@@ -5962,6 +6181,19 @@ export type ContainerLogSettings = {
      */
     head_buffer_mb?: number;
     /**
+     * Per-container ingestion budget, in KiB per second, enforced alongside
+     * `ingest_lines_per_sec`. `0` disables the byte limit.
+     */
+    ingest_kib_per_sec?: number;
+    /**
+     * Per-container ingestion budget, in lines per second. A container
+     * over budget has its excess lines dropped (not stored or indexed),
+     * a notice written into its log, and is listed as throttled in the log
+     * explorer. Up to 10 seconds of budget may arrive at once. `0` disables
+     * the line limit. Applied within a minute of saving.
+     */
+    ingest_lines_per_sec?: number;
+    /**
      * Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)
      */
     max_file?: number;
@@ -6008,9 +6240,11 @@ export type ContainerMetricHistoryPoint = {
      */
     time: string;
     /**
-     * Averaged metric value for the bucket.
+     * Averaged metric value for the bucket; `null` when the container
+     * reported no sample in it (it was stopped, or the server was down), so
+     * charts show a gap instead of interpolating across it.
      */
-    value: number;
+    value?: number | null;
 };
 
 /**
@@ -6837,6 +7071,28 @@ export type CreateCloudflareProviderRequest = {
     config: CloudflareConfig;
     enabled?: boolean | null;
     name: string;
+};
+
+export type CreateConnectorRequest = {
+    /**
+     * Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.
+     */
+    name: string;
+    /**
+     * Nodes that run a connector replica.
+     */
+    node_ids: Array<number>;
+    /**
+     * The provider's `kind`, from `GET /ingress/providers`.
+     */
+    provider: string;
+    /**
+     * Answers to the provider's setup fields, by field key. DNS provider
+     * fields take the provider's id; every other field takes a string.
+     */
+    values?: {
+        [key: string]: unknown;
+    };
 };
 
 export type CreateConversationRequest = {
@@ -7961,10 +8217,14 @@ export type CreateSandboxBody = {
      * isolation.
      */
     backend?: string | null;
+    /**
+     * CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
+     * Omit for the operator's default.
+     */
     cpu_limit?: number | null;
     /**
-     * Root disk size in MB (Firecracker only; Docker ignores it). Omit for
-     * the platform default (1 GiB).
+     * Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
+     * it). Omit for the platform default (1 GiB).
      */
     disk_size_mb?: number | null;
     /**
@@ -8010,6 +8270,10 @@ export type CreateSandboxBody = {
      * to work on this repo"; leave it unset for throwaway sandboxes.
      */
     lifecycle?: string | null;
+    /**
+     * Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,
+     * and never more than the host has). Omit for the operator's default.
+     */
     memory_limit_mb?: number | null;
     name?: string | null;
     networkPolicy?: unknown;
@@ -8022,6 +8286,11 @@ export type CreateSandboxBody = {
      * with 422 — it never silently falls back to another node.
      */
     node?: string | null;
+    /**
+     * Max processes, `[1, 4096]` (lower if an administrator set a maximum);
+     * `0`/negative (unlimited) is rejected. Omit for the platform default
+     * (512).
+     */
     pids_limit?: number | null;
     /**
      * Ports the sandbox will listen on. Each port becomes a `routes[]`
@@ -8357,9 +8626,30 @@ export type CrossProjectTraceResponse = {
 export type CurrentStatusResponse = {
     avg_response_time_ms?: number | null;
     current_status: string;
+    /**
+     * Seconds of the window covered by a non-operational check result.
+     */
+    downtime_seconds: number;
     last_check_at?: string | null;
     monitor_id: number;
-    uptime_percentage: number;
+    /**
+     * Seconds of the window covered by a check result.
+     */
+    monitored_seconds: number;
+    /**
+     * Seconds of the window (after the monitor was created, up to now) that
+     * no check covered, so Temps cannot say whether the endpoint was up.
+     */
+    unknown_seconds: number;
+    /**
+     * Share of the window's *monitored* time the endpoint was operational,
+     * weighted by time rather than by check count. Stretches no check covered
+     * (Temps or its scheduler was down, the deployment was paused, ...) are
+     * excluded from the denominator and reported in `unknown_seconds`
+     * instead of silently counting as up. `None` when nothing in the window
+     * was monitored.
+     */
+    uptime_percentage?: number | null;
 };
 
 /**
@@ -9965,6 +10255,11 @@ export type DnsCompletionResponse = {
     domain: string;
     status: string;
 };
+
+/**
+ * Who makes the published hostnames resolve.
+ */
+export type DnsHandling = 'automatic' | 'manual' | 'provider_hostname';
 
 /**
  * Error response for DNS lookup failures
@@ -11601,6 +11896,8 @@ export type EnvironmentInfo = {
     name: string;
 };
 
+export type EnvironmentIngressMode = 'legacy' | 'shadow' | 'enforce';
+
 export type EnvironmentResponse = {
     /**
      * Per-environment CAPTCHA attack-mode override.
@@ -12965,6 +13262,19 @@ export type FeedbackView = {
     status: string;
     timestamp: string;
     url?: string | null;
+};
+
+export type FieldKind = {
+    type: 'text';
+} | {
+    type: 'secret';
+} | {
+    provider_type?: string | null;
+    type: 'dns_provider';
+} | {
+    allow_subdomain?: boolean;
+    provider_field: string;
+    type: 'managed_domain';
 };
 
 export type FieldResponse = {
@@ -15139,6 +15449,11 @@ export type HeartbeatApiRequest = {
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
+    /**
+     * The node's occupied IPv4 ranges (ADR 056), sent when they change.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    overlay?: OverlayHeartbeat | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
@@ -15240,6 +15555,13 @@ export type HistogramSummary = {
  */
 export type Hosting = 'hosted' | 'external';
 
+export type HostnameCandidate = {
+    auto_publish: boolean;
+    connector_id: number;
+    domain: string;
+    name: string;
+};
+
 /**
  * A single generated-hostname change in a flatten preview/apply.
  */
@@ -15255,6 +15577,11 @@ export type HostnameChange = {
     new: string;
     old: string;
 };
+
+/**
+ * How one hostname reaches visitors, as the operator chose it (ADR 058 D9).
+ */
+export type HostnameMode = 'automatic' | 'tunnel' | 'off';
 
 /**
  * Combined preview of a hostname-mode change.
@@ -15273,6 +15600,40 @@ export type HostnamePreviewResponse = {
      * Whether the provider token can manage this zone (None if not checked).
      */
     zone_access_ok?: boolean | null;
+};
+
+/**
+ * Where a hostname stands with the tunnels, and why.
+ */
+export type HostnameView = {
+    /**
+     * The tunnels whose domain covers it.
+     */
+    candidates: Array<HostnameCandidate>;
+    /**
+     * The tunnel chosen for it, with mode `tunnel`.
+     */
+    chosen_connector_id?: number | null;
+    /**
+     * The tunnel that publishes it, or would once `detail` is dealt with.
+     */
+    connector_id?: number | null;
+    connector_name?: string | null;
+    /**
+     * What is happening; when it is not published, why and what to do.
+     */
+    detail: string;
+    hostname: string;
+    mode: HostnameMode;
+    published_at?: string | null;
+    /**
+     * Whether workers serve it. A tunnel only publishes those.
+     */
+    served_by_workers: boolean;
+    /**
+     * `published`, `pending`, `error` or `not_published`.
+     */
+    state: string;
 };
 
 export type HourlyPageSessions = {
@@ -16031,6 +16392,11 @@ export type IncrResponse = {
 };
 
 /**
+ * Which budget a dropped line exceeded.
+ */
+export type IngestDropReason = 'lines_per_sec' | 'bytes_per_sec';
+
+/**
  * One aggregated ingest-failure group: "this signal failed this way N times".
  *
  * The pipeline-stats counters say *how many* records were dropped;
@@ -16085,7 +16451,12 @@ export type IngressLoginGrantResponse = {
     redirect_url: string;
 };
 
-export type IngressMode = 'legacy' | 'shadow' | 'enforce';
+/**
+ * What a worker lets its control plane do with public ingress. Set on the
+ * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
+ * on a machine is its owner's decision, whoever runs the control plane.
+ */
+export type IngressMode = 'off' | 'fixed' | 'delegated';
 
 export type IngressSettingsResponse = {
     environment_id: number;
@@ -16103,7 +16474,7 @@ export type IngressSettingsResponse = {
      * disagreement counted (`proxy.ingress_shadow_mismatches`). `enforce`:
      * the compiled endpoint decides.
      */
-    mode: IngressMode;
+    mode: EnvironmentIngressMode;
     project_id: number;
     /**
      * Whether visitors must sign in to Temps.
@@ -16810,6 +17181,21 @@ export type LinkServiceRequest = {
     project_id: number;
 };
 
+export type LinkView = {
+    client_version?: string | null;
+    /**
+     * The provider's data centre, such as `mad01`.
+     */
+    location?: string | null;
+    /**
+     * The worker holding it, when its connector could be matched.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    opened_at?: string | null;
+    reconnecting: boolean;
+};
+
 export type ListAgentsResponse = {
     items: Array<AgentConfigResponse>;
     total: number;
@@ -17272,6 +17658,37 @@ export type LogCollectionCapability = {
 export type LogCollectionState = 'running' | 'recovering' | 'retrying' | 'stopped';
 
 /**
+ * The per-container log ingestion budget and the containers over it now.
+ * A throttled container has lines dropped (not stored, not indexed), so it
+ * is reported here for the console to name it rather than leave a gap in
+ * its history unexplained.
+ */
+export type LogIngestBudgetStatus = {
+    /**
+     * Seconds of budget a container may send at once before it is held to
+     * the rate.
+     */
+    burst_seconds: number;
+    /**
+     * Bytes per second each container may store; `0` = no byte limit.
+     */
+    bytes_per_sec: number;
+    /**
+     * Lines per second each container may store; `0` = no line limit.
+     */
+    lines_per_sec: number;
+    /**
+     * Console path where an administrator changes the budget.
+     */
+    setup_path: string;
+    /**
+     * Containers that dropped lines in the last minute, noisiest first,
+     * limited to the projects and services the caller can read.
+     */
+    throttled: Array<ThrottledLogSource>;
+};
+
+/**
  * Normalized log level
  */
 export type LogLevel = 'TRACE' | 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
@@ -17621,6 +18038,77 @@ export type MemberSyncResult = {
     slug: string;
 };
 
+/**
+ * Body of `POST /internal/nodes/mesh-enroll` (ADR 055).
+ */
+export type MeshEnrollApiRequest = {
+    join_token?: SecretString | null;
+    /**
+     * Scheduling labels the worker will register with; checked against the
+     * token's bound labels and carried over to the pairing's token.
+     */
+    labels?: unknown;
+    /**
+     * The name the worker will register under.
+     */
+    name: string;
+    /**
+     * The worker's base64 WireGuard public key. The private key never
+     * leaves the worker.
+     */
+    wg_public_key: string;
+};
+
+/**
+ * What a worker that joins outbound only needs to bring its end of the mesh
+ * up and register over it (ADR 055): a pairing code without its secret.
+ */
+export type MeshEnrollResponse = {
+    /**
+     * SHA-256 fingerprint of the cluster CA the node API presents.
+     */
+    ca_fingerprint: string;
+    /**
+     * The control plane's mesh address; the node API listens there.
+     */
+    control_plane_address: string;
+    /**
+     * `ip:port` the worker dials.
+     */
+    control_plane_endpoint: string;
+    control_plane_public_key: string;
+    /**
+     * When the pairing and its token expire (RFC 3339).
+     */
+    expires_at: string;
+    /**
+     * Single-use join token bound to `name`, accepted only over the mesh
+     * node API from `node_address`.
+     */
+    join_token: string;
+    /**
+     * The mesh UDP port.
+     */
+    listen_port: number;
+    /**
+     * The name the pairing's join token is bound to.
+     */
+    name: string;
+    /**
+     * The worker's mesh address, reserved for it. It registers under it.
+     */
+    node_address: string;
+    /**
+     * TCP port of the node API on the control plane's mesh address.
+     */
+    node_api_port: number;
+    /**
+     * The pairing created for the worker.
+     */
+    pairing_id: number;
+    prefix_len: number;
+};
+
 export type MessageContent = string | Array<ContentPart>;
 
 /**
@@ -17774,9 +18262,13 @@ export type MetricDataPoint = {
      */
     time: string;
     /**
-     * Metric value at this bucket.
+     * Metric value at this bucket. `null` when no sample landed in the
+     * bucket (the sampler, or the server, was not running), so charts break
+     * the line instead of interpolating across the outage. Per-interval
+     * request counters read `0` instead: no sample there means no traffic.
+     * Every bucket of a window up to 7 days is present.
      */
-    value: number;
+    value?: number | null;
 };
 
 /**
@@ -18285,7 +18777,12 @@ export type MonitorStatus = {
     avg_response_time_ms?: number | null;
     current_status: string;
     monitor: MonitorResponse;
-    uptime_percentage: number;
+    /**
+     * Share of the last 30 days' *monitored* time the endpoint was
+     * operational. `None` when no check covered any of that time -- "no
+     * data" is not "100% up".
+     */
+    uptime_percentage?: number | null;
 };
 
 /**
@@ -18428,6 +18925,18 @@ export type MultiNodeSettings = {
      * workers have re-enrolled with certs.
      */
     require_mtls?: boolean;
+    /**
+     * `ip:port` workers dial for the control plane's end of the WireGuard
+     * mesh, published instead of `private_address` on the mesh port. For a
+     * control plane reachable only through NAT or a forwarded port.
+     *
+     * Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+     * records the flag's value (clearing it when the flag is absent), and a
+     * settings write never changes it. Stored here only so the processes
+     * that set the mesh up (the deployer plugin, `temps network
+     * setup-multi-node`) read the same value.
+     */
+    wg_endpoint?: string | null;
 };
 
 /**
@@ -18755,6 +19264,38 @@ export type NodeCostInfo = {
 };
 
 /**
+ * Request body for creating a resource alert on a node.
+ *
+ * Only the usage percentages can be alerted on: `node.cpu_percent`,
+ * `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
+ * (0-100). A node has at most one rule per metric.
+ */
+export type NodeCreateAlertRuleRequest = {
+    /**
+     * One of `>`, `<`, `>=`, `<=`.
+     */
+    comparator: string;
+    enabled?: boolean;
+    /**
+     * Seconds the breach must persist before the alarm fires (0 = immediate).
+     */
+    for_duration_secs?: number;
+    /**
+     * One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+     */
+    metric_name: string;
+    name: string;
+    /**
+     * `"warning"` or `"critical"`.
+     */
+    severity: string;
+    /**
+     * Percentage between 0 and 100.
+     */
+    threshold: number;
+};
+
+/**
  * Per-node DNS resolver health, as last reported by that node's heartbeat.
  * Part of `GET /api/cluster/dns/status`.
  */
@@ -18859,11 +19400,29 @@ export type NodeInfoResponse = {
      * Resource capacity/usage metrics from the latest heartbeat
      */
     capacity: unknown;
+    /**
+     * This node's subnet of the cluster compute pool, if allocated.
+     */
+    compute_cidr?: string | null;
     created_at: string;
     id: number;
     labels: unknown;
     last_heartbeat?: string | null;
     name: string;
+    /**
+     * Why the overlay is unavailable: the colliding range, its owner and the
+     * fixes.
+     */
+    overlay_last_error?: string | null;
+    /**
+     * The last automatic move of this node's allocation, and why.
+     */
+    overlay_remediation?: string | null;
+    /**
+     * Cross-node overlay (ADR 056): `ready`, `unavailable`, or `None` when
+     * the agent never reported it (older agent, or no heartbeat yet).
+     */
+    overlay_status?: string | null;
     private_address: string;
     public_ingress_certificate_count?: number | null;
     public_ingress_enabled: boolean;
@@ -18939,9 +19498,10 @@ export type NodePairingResponse = {
     mesh_address: string;
     name: string;
     /**
-     * `ip:port` the control plane dials.
+     * `ip:port` the control plane dials; `null` for a worker that joined
+     * outbound only (ADR 055): it dials the control plane instead.
      */
-    node_endpoint: string;
+    node_endpoint?: string | null;
     /**
      * The node that registered with this pairing.
      */
@@ -19417,6 +19977,24 @@ export type ObservabilityRetentionSettings = {
      * Retain proxy request logs for this many days.
      */
     proxy_logs_days?: number;
+};
+
+/**
+ * One IPv4 range a node already uses outside Temps (ADR 056).
+ */
+export type OccupiedRangeReport = {
+    /**
+     * IPv4 network, e.g. `172.20.0.0/16`.
+     */
+    cidr: string;
+    /**
+     * Device name for a route, network name for a Docker network.
+     */
+    name: string;
+    /**
+     * `route` (a host route) or `docker` (a Docker network's subnet).
+     */
+    source: string;
 };
 
 export type OidcProviderResponse = {
@@ -19932,6 +20510,24 @@ export type OutlierParams = {
      * Sensitivity; higher tolerates larger spread before flagging.
      */
     tolerance?: number;
+};
+
+/**
+ * Cross-node overlay state reported by the agent (ADR 056).
+ */
+export type OverlayHeartbeat = {
+    /**
+     * The allocation the agent applied (when `ready`) or tried to.
+     */
+    compute_cidr?: string | null;
+    /**
+     * Why the overlay is unavailable, with the fix.
+     */
+    last_error?: string | null;
+    /**
+     * `ready` or `unavailable`.
+     */
+    status: string;
 };
 
 /**
@@ -22333,6 +22929,14 @@ export type ProjectResponse = {
      */
     git_url?: string | null;
     /**
+     * GitHub repository webhook ID Temps registered on the connected
+     * repository. Only GitHub connections that are not a GitHub App (personal
+     * access token, OAuth) get one; App connections receive pushes through the
+     * App webhook. `null` when none is installed (another provider, a GitHub
+     * App connection, or registration failed / the hook was never created).
+     */
+    github_webhook_id?: number | null;
+    /**
      * GitLab webhook ID installed on the connected repository.
      * `null` when no GitLab webhook is installed (not connected to GitLab,
      * or webhook was removed / never created).
@@ -22993,6 +23597,33 @@ export type ProviderDomainIdentityResponse = {
     status: string;
 };
 
+/**
+ * What a provider is, for the console.
+ */
+export type ProviderInfo = {
+    dns: DnsHandling;
+    docs_url?: string | null;
+    fields: Array<SetupField>;
+    /**
+     * Stored on the connector, e.g. `cloudflare_tunnel`.
+     */
+    kind: string;
+    name: string;
+    /**
+     * Whether the worker needs a public address. Tunnels do not.
+     */
+    needs_public_ip: boolean;
+    /**
+     * What the operator needs before starting, one line each.
+     */
+    requirements: Array<string>;
+    summary: string;
+    /**
+     * Whether it works when the ISP puts the worker behind carrier-grade NAT.
+     */
+    works_behind_cgnat: boolean;
+};
+
 export type ProviderKeyResponse = {
     /**
      * Masked API key (only last 4 chars visible)
@@ -23302,6 +23933,25 @@ export type PublicIncidentUpdate = {
     status: PublicIncidentStatus;
 };
 
+export type PublicIngressCheck = {
+    ok: boolean;
+    steps: Array<PublicIngressCheckStep>;
+    summary: string;
+    /**
+     * The address that was dialled.
+     */
+    target?: string | null;
+};
+
+export type PublicIngressCheckStep = {
+    message: string;
+    ok: boolean;
+    /**
+     * `address`, `http` or `https`.
+     */
+    step: string;
+};
+
 export type PublicIngressHeartbeat = {
     certificate_count: number;
     last_error?: string | null;
@@ -23309,6 +23959,52 @@ export type PublicIngressHeartbeat = {
     running: boolean;
     unsupported_reasons?: Array<string>;
     unsupported_route_count: number;
+};
+
+export type PublicIngressInterface = {
+    address: string;
+    default_route: boolean;
+    name: string;
+    scope: AddressScope;
+};
+
+export type PublicIngressSettings = {
+    /**
+     * Whether the agent reported its addresses: an agent that predates
+     * console-managed ingress never does, and keeps its flag.
+     */
+    agent_reports: boolean;
+    /**
+     * The listen address is not public but the public address is: traffic
+     * crosses a NAT, so the router must forward the ports.
+     */
+    behind_nat: boolean;
+    checked_at?: string | null;
+    /**
+     * The address DNS should point at, as far as Temps can tell.
+     */
+    effective_public_address?: string | null;
+    effective_public_scope?: AddressScope | null;
+    enabled: boolean;
+    http_port: number;
+    https_port: number;
+    interfaces: Array<PublicIngressInterface>;
+    last_check?: PublicIngressCheck | null;
+    last_error?: string | null;
+    /**
+     * Configured listen address; `None` means automatic.
+     */
+    listen_address?: string | null;
+    listener_error?: string | null;
+    listening_http?: string | null;
+    listening_https?: string | null;
+    mode?: IngressMode | null;
+    node_id: number;
+    /**
+     * Configured public address; `None` means the listen address.
+     */
+    public_address?: string | null;
+    running?: boolean | null;
 };
 
 /**
@@ -23494,6 +24190,17 @@ export type PublicUrlStatus = {
      * Console path where the operator sets it. Present whenever `reason` is.
      */
     setup_path?: string | null;
+};
+
+export type PublicationView = {
+    hostname: string;
+    last_error?: string | null;
+    published_at?: string | null;
+    /**
+     * `published`, `error`, or `stale` (its record points at a tunnel that
+     * was replaced; it is being published again).
+     */
+    state: string;
 };
 
 export type PullRequestResponse = {
@@ -23984,6 +24691,11 @@ export type RegisterNodeApiRequest = {
      */
     name: string;
     /**
+     * IPv4 ranges this machine already uses (ADR 056), so its overlay
+     * allocation avoids them. Absent from older CLIs.
+     */
+    occupied_ranges?: Array<OccupiedRangeReport> | null;
+    /**
      * The node's *current* token, supplied to prove possession when
      * re-registering (changing the identity of) a node that already exists.
      * Optional; only needed to rebind a still-live node. (ADR-020 WS-1.2.)
@@ -24044,8 +24756,10 @@ export type RegisterRequest = {
 export type RegisterWireguardMeshRequest = {
     /**
      * `ip:port` other nodes dial to reach this node's WireGuard socket.
+     * Absent or `null` for a node nobody can dial (ADR 055): it dials the
+     * control plane, which learns its address from the handshake.
      */
-    endpoint: string;
+    endpoint?: string | null;
     /**
      * Base64 WireGuard public key. The private key never leaves the node.
      */
@@ -24096,6 +24810,20 @@ export type RegistryPlugin = {
     summary: string;
     title: string;
     version: string;
+};
+
+/**
+ * Response for `POST /projects/{project_id}/github/reinstall-webhook`
+ */
+export type ReinstallGithubWebhookResponse = {
+    /**
+     * The new GitHub repository hook ID that was installed.
+     */
+    hook_id: number;
+    /**
+     * Human-readable status message.
+     */
+    message: string;
 };
 
 /**
@@ -24198,6 +24926,13 @@ export type RemotePullCredentials = {
 
 export type RemoveNodeResponse = {
     id: number;
+    /**
+     * Environments that were still serving from the node when it was
+     * removed as gone (`force=true` on an unreachable node, ADR 057). Their
+     * containers there are recorded as orphaned; one with no replicas on
+     * another node serves nothing until it is redeployed.
+     */
+    lost_environments?: Array<string>;
     message: string;
     /**
      * Containers Temps could not confirm were removed from the node before
@@ -24540,6 +25275,27 @@ export type ResetPgStatStatementsResponse = {
      * Human-readable message confirming the destructive action.
      */
     message: string;
+};
+
+/**
+ * Returned when an administrator removes another user's second factor.
+ */
+export type ResetUserMfaResponse = {
+    /**
+     * Always false: the user's TOTP secret and recovery codes are gone.
+     */
+    mfa_enabled: boolean;
+    /**
+     * True when this instance requires MFA for admins
+     * (`require_mfa_for_admins`) and the user is an admin: until they enroll
+     * again they cannot sign in with a password, so they must sign in
+     * through SSO, or the setting must be turned off while they re-enroll.
+     */
+    password_sign_in_blocked: boolean;
+    /**
+     * How many of the user's sessions were signed out by the reset.
+     */
+    sessions_revoked: number;
 };
 
 /**
@@ -26222,6 +26978,10 @@ export type SecretResponse = {
     id: number;
     mount_path?: string | null;
     name: string;
+    /**
+     * Project the secret is scoped to; `null` means instance-wide.
+     */
+    project_id?: number | null;
     secret_type: string;
     updated_at: string;
     /**
@@ -27489,6 +28249,10 @@ export type SetChatWorkspaceRequest = {
     keep_sandbox?: KeepSandbox;
 };
 
+export type SetConnectorNodesRequest = {
+    node_ids: Array<number>;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -27525,6 +28289,14 @@ export type SetGroupRepositoryResponse = {
      * `error` still points at its previous repository or branch.
      */
     services: Array<MemberSyncResult>;
+};
+
+export type SetHostnameChoiceRequest = {
+    /**
+     * Required with mode `tunnel`.
+     */
+    connector_id?: number | null;
+    mode: HostnameMode;
 };
 
 export type SetHttpCheckEnabled = {
@@ -27798,6 +28570,21 @@ export type SetupDnsResponse = {
      * Total number of records attempted
      */
     total_records: number;
+};
+
+/**
+ * One question in a provider's setup form.
+ */
+export type SetupField = {
+    help?: string | null;
+    /**
+     * The key in `values` of the create request.
+     */
+    key: string;
+    kind: FieldKind;
+    label: string;
+    placeholder?: string | null;
+    required: boolean;
 };
 
 export type SetupMfaRequest = {
@@ -28851,9 +29638,18 @@ export type StatusBucket = {
     p50_response_time_ms?: number | null;
     p95_response_time_ms?: number | null;
     p99_response_time_ms?: number | null;
+    /**
+     * "operational", "degraded", "down", or "unknown" -- the last for a
+     * bucket no check landed in. Every bucket of the requested range is
+     * returned, so a stretch without checks shows up as "unknown" rather than
+     * disappearing from the timeline.
+     */
     status: string;
     total_checks: number;
-    uptime_percentage: number;
+    /**
+     * `None` for a bucket without checks.
+     */
+    uptime_percentage?: number | null;
 };
 
 export type StatusBucketedResponse = {
@@ -30005,6 +30801,46 @@ export type ThreadArtifactResponse = {
     status: string;
     title?: string | null;
     updated_at: string;
+};
+
+/**
+ * A container that is dropping lines because it exceeds its budget.
+ */
+export type ThrottledLogSource = {
+    container_id: string;
+    deploy_id?: number | null;
+    dropped_bytes: number;
+    /**
+     * Totals since temps started collecting the container.
+     */
+    dropped_lines: number;
+    env: string;
+    external_service_id?: number | null;
+    last_dropped_at: string;
+    /**
+     * Worker node, for containers collected from a remote node.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    offered_bytes_per_sec: number;
+    /**
+     * What the container is producing, measured over the last few seconds;
+     * `0` once it has gone quiet.
+     */
+    offered_lines_per_sec: number;
+    /**
+     * `None` for external-service containers.
+     */
+    project_id?: number | null;
+    /**
+     * Budget the most recent dropped line exceeded.
+     */
+    reason: IngestDropReason;
+    /**
+     * Service label, or the external service's name.
+     */
+    service: string;
+    throttled_since: string;
 };
 
 /**
@@ -31191,6 +32027,20 @@ export type UpdateCloudflareProviderRequest = {
     name?: string | null;
 };
 
+/**
+ * Body of `PUT /settings/cluster-network`.
+ */
+export type UpdateClusterNetworkRequest = {
+    /**
+     * New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.
+     */
+    compute_pool_cidr: string;
+    /**
+     * Prefix of each node's subnet; keeps the current one when omitted.
+     */
+    subnet_prefix_len?: number | null;
+};
+
 export type UpdateComposeSecurityRequest = {
     acknowledge_legacy_migration?: boolean;
     acknowledge_risks?: boolean;
@@ -31203,6 +32053,14 @@ export type UpdateComposeSecurityRequest = {
 
 export type UpdateConfigBody = {
     config?: ProviderConfig | null;
+};
+
+export type UpdateConnectorRequest = {
+    /**
+     * Publish every worker-served hostname under the domain (true), or only
+     * hostnames chosen for this tunnel (false).
+     */
+    auto_publish?: boolean | null;
 };
 
 export type UpdateCronMonitor = {
@@ -31599,7 +32457,7 @@ export type UpdateIncidentUpdateVisibilityRequest = {
 };
 
 export type UpdateIngressSettingsRequest = {
-    mode?: IngressMode | null;
+    mode?: EnvironmentIngressMode | null;
     /**
      * Leave out to keep the current setting.
      */
@@ -31988,6 +32846,20 @@ export type UpdateProviderRequest = {
     name?: string | null;
 };
 
+export type UpdatePublicIngressSettingsRequest = {
+    enabled: boolean;
+    http_port?: number | null;
+    https_port?: number | null;
+    /**
+     * Local address to bind, or `None` for automatic.
+     */
+    listen_address?: string | null;
+    /**
+     * What DNS points at, or `None` for the listen address.
+     */
+    public_address?: string | null;
+};
+
 export type UpdateRepositoryRequest = {
     ref_name?: string | null;
 };
@@ -32341,6 +33213,12 @@ export type UpsertSecretRequest = {
      */
     mount_path?: string | null;
     name: string;
+    /**
+     * Project whose agent runs receive the secret. Omit for an instance-wide
+     * secret, which is injected into every project's agent runs and so is
+     * readable by anyone who can run an agent in any project.
+     */
+    project_id?: number | null;
     /**
      * "env" (environment variable) or "file" (written to mount_path)
      */
@@ -33413,7 +34291,11 @@ export type WireguardMeshPeerEntry = {
  */
 export type WireguardMeshSelfEntry = {
     address: string;
-    endpoint: string;
+    /**
+     * `null` for a node nobody dials (ADR 055): it dials its peers, which
+     * learn its address from its handshakes.
+     */
+    endpoint?: string | null;
     public_key: string;
 };
 
@@ -43903,7 +44785,7 @@ export type EnsureCloudBackupScheduleErrors = {
      */
     401: ProblemDetails;
     /**
-     * Insufficient permissions
+     * Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane
      */
     403: ProblemDetails;
     /**
@@ -49384,7 +50266,7 @@ export type StartRestoreErrors = {
      */
     404: ProblemDetails;
     /**
-     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore
+     * Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted or has not completed (pending, running or failed), or a requested new-service name is already owned by a service or another active restore
      */
     409: ProblemDetails;
 };
@@ -53067,6 +53949,238 @@ export type SetIncidentUpdateVisibilityResponses = {
 
 export type SetIncidentUpdateVisibilityResponse = SetIncidentUpdateVisibilityResponses[keyof SetIncidentUpdateVisibilityResponses];
 
+export type ListIngressConnectorsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (1-indexed)
+         */
+        page?: number;
+        /**
+         * Number of items per page (default 20, max 100)
+         */
+        page_size?: number;
+    };
+    url: '/ingress/connectors';
+};
+
+export type ListIngressConnectorsResponses = {
+    200: ConnectorList;
+};
+
+export type ListIngressConnectorsResponse = ListIngressConnectorsResponses[keyof ListIngressConnectorsResponses];
+
+export type CreateIngressConnectorData = {
+    body: CreateConnectorRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/connectors';
+};
+
+export type CreateIngressConnectorErrors = {
+    /**
+     * Invalid name, setup answers or nodes
+     */
+    400: unknown;
+    /**
+     * A worker has not delegated public ingress
+     */
+    409: unknown;
+    /**
+     * The provider refused; the detail says what to fix
+     */
+    502: unknown;
+};
+
+export type CreateIngressConnectorResponses = {
+    201: ConnectorView;
+};
+
+export type CreateIngressConnectorResponse = CreateIngressConnectorResponses[keyof CreateIngressConnectorResponses];
+
+export type DeleteIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type DeleteIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type DeleteIngressConnectorResponses = {
+    204: void;
+};
+
+export type DeleteIngressConnectorResponse = DeleteIngressConnectorResponses[keyof DeleteIngressConnectorResponses];
+
+export type GetIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type GetIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type GetIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type GetIngressConnectorResponse = GetIngressConnectorResponses[keyof GetIngressConnectorResponses];
+
+export type UpdateIngressConnectorData = {
+    body: UpdateConnectorRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}';
+};
+
+export type UpdateIngressConnectorErrors = {
+    404: unknown;
+};
+
+export type UpdateIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
+
+export type GetIngressConnectorLinksData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/links';
+};
+
+export type GetIngressConnectorLinksErrors = {
+    /**
+     * The tunnel is not created yet
+     */
+    400: unknown;
+    404: unknown;
+    /**
+     * The provider could not be asked
+     */
+    502: unknown;
+};
+
+export type GetIngressConnectorLinksResponses = {
+    200: ConnectorLinksView;
+};
+
+export type GetIngressConnectorLinksResponse = GetIngressConnectorLinksResponses[keyof GetIngressConnectorLinksResponses];
+
+export type SetIngressConnectorNodesData = {
+    body: SetConnectorNodesRequest;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/nodes';
+};
+
+export type SetIngressConnectorNodesErrors = {
+    404: unknown;
+};
+
+export type SetIngressConnectorNodesResponses = {
+    200: ConnectorView;
+};
+
+export type SetIngressConnectorNodesResponse = SetIngressConnectorNodesResponses[keyof SetIngressConnectorNodesResponses];
+
+export type SyncIngressConnectorData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/sync';
+};
+
+export type SyncIngressConnectorErrors = {
+    404: unknown;
+    502: unknown;
+};
+
+export type SyncIngressConnectorResponses = {
+    200: ConnectorView;
+};
+
+export type SyncIngressConnectorResponse = SyncIngressConnectorResponses[keyof SyncIngressConnectorResponses];
+
+export type ListIngressHostnamesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/hostnames';
+};
+
+export type ListIngressHostnamesResponses = {
+    200: Array<HostnameView>;
+};
+
+export type ListIngressHostnamesResponse = ListIngressHostnamesResponses[keyof ListIngressHostnamesResponses];
+
+export type GetIngressHostnameData = {
+    body?: never;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type GetIngressHostnameErrors = {
+    400: unknown;
+};
+
+export type GetIngressHostnameResponses = {
+    200: HostnameView;
+};
+
+export type GetIngressHostnameResponse = GetIngressHostnameResponses[keyof GetIngressHostnameResponses];
+
+export type SetIngressHostnameChoiceData = {
+    body: SetHostnameChoiceRequest;
+    path: {
+        hostname: string;
+    };
+    query?: never;
+    url: '/ingress/hostnames/{hostname}';
+};
+
+export type SetIngressHostnameChoiceErrors = {
+    /**
+     * Invalid hostname, or the tunnel cannot publish it
+     */
+    400: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+};
+
+export type SetIngressHostnameChoiceResponses = {
+    200: HostnameView;
+};
+
+export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
+
 export type CreateIngressLoginGrantData = {
     body: CreateIngressLoginGrantRequest;
     path?: never;
@@ -53111,6 +54225,19 @@ export type CreateIngressLoginGrantResponses = {
 };
 
 export type CreateIngressLoginGrantResponse = CreateIngressLoginGrantResponses[keyof CreateIngressLoginGrantResponses];
+
+export type ListIngressProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ingress/providers';
+};
+
+export type ListIngressProvidersResponses = {
+    200: Array<ProviderInfo>;
+};
+
+export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
 
 export type CreateSandboxPreviewSessionData = {
     body: CreateSandboxPreviewSessionRequest;
@@ -54040,6 +55167,45 @@ export type AdminListNodesResponses = {
 
 export type AdminListNodesResponse = AdminListNodesResponses[keyof AdminListNodesResponses];
 
+export type MeshEnrollData = {
+    body: MeshEnrollApiRequest;
+    path?: never;
+    query?: never;
+    url: '/internal/nodes/mesh-enroll';
+};
+
+export type MeshEnrollErrors = {
+    /**
+     * Invalid name or WireGuard key
+     */
+    400: unknown;
+    /**
+     * Missing, unknown or unusable join token
+     */
+    403: unknown;
+    /**
+     * Mesh off or not ready, control plane not dialable, key in use, or too many pairings
+     */
+    409: unknown;
+    /**
+     * Rate limited
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MeshEnrollResponses = {
+    /**
+     * Pairing created; register over the mesh next
+     */
+    201: MeshEnrollResponse;
+};
+
+export type MeshEnrollResponse2 = MeshEnrollResponses[keyof MeshEnrollResponses];
+
 export type RegisterNodeData = {
     body: RegisterNodeApiRequest;
     path?: never;
@@ -54083,7 +55249,11 @@ export type AdminRemoveNodeData = {
         /**
          * Remove the node even if containers Temps placed on it could not be
          * confirmed removed (e.g. the host is gone for good). Those containers
-         * are recorded as orphaned instead of being re-homed.
+         * are recorded as orphaned instead of being re-homed. On a node the
+         * control plane can no longer reach (no heartbeat for 90 seconds) this
+         * also covers containers deployments still serve from it:
+         * they are recorded as orphaned too and their environments listed in
+         * `lost_environments` (ADR 057).
          */
         force?: boolean;
     };
@@ -54100,7 +55270,7 @@ export type AdminRemoveNodeErrors = {
      */
     404: unknown;
     /**
-     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first)
+     * Node still has active containers, live sandboxes, or containers Temps could not confirm were removed (retry with force=true only if the host is gone), or it is the only target node of an environment's placement (`placements` names them; change their target nodes first). For a node the control plane cannot reach that live deployments still serve from, `force_removes_serving` is set and `serving_environments` names them: force=true removes it anyway (ADR 057)
      */
     409: unknown;
     /**
@@ -54652,6 +55822,85 @@ export type AdminSetNodePublicIngressResponses = {
 };
 
 export type AdminSetNodePublicIngressResponse = AdminSetNodePublicIngressResponses[keyof AdminSetNodePublicIngressResponses];
+
+export type AdminCheckNodePublicIngressData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/check';
+};
+
+export type AdminCheckNodePublicIngressErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminCheckNodePublicIngressResponses = {
+    200: PublicIngressCheck;
+};
+
+export type AdminCheckNodePublicIngressResponse = AdminCheckNodePublicIngressResponses[keyof AdminCheckNodePublicIngressResponses];
+
+export type AdminGetNodePublicIngressSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminGetNodePublicIngressSettingsErrors = {
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminGetNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminGetNodePublicIngressSettingsResponse = AdminGetNodePublicIngressSettingsResponses[keyof AdminGetNodePublicIngressSettingsResponses];
+
+export type AdminUpdateNodePublicIngressSettingsData = {
+    body: UpdatePublicIngressSettingsRequest;
+    path: {
+        /**
+         * Worker node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/public-ingress/settings';
+};
+
+export type AdminUpdateNodePublicIngressSettingsErrors = {
+    /**
+     * Invalid address or ports, or not a worker
+     */
+    400: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponses = {
+    200: PublicIngressSettings;
+};
+
+export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
 
 export type AdminGetNodeResourcesData = {
     body?: never;
@@ -56093,6 +57342,39 @@ export type SearchGlobalLogsResponses = {
 
 export type SearchGlobalLogsResponse = SearchGlobalLogsResponses[keyof SearchGlobalLogsResponses];
 
+export type LogIngestBudgetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/logs/ingest-budget';
+};
+
+export type LogIngestBudgetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The caller's log access could not be resolved
+     */
+    500: ProblemDetails;
+};
+
+export type LogIngestBudgetError = LogIngestBudgetErrors[keyof LogIngestBudgetErrors];
+
+export type LogIngestBudgetResponses = {
+    /**
+     * Budget and throttled containers the caller can read
+     */
+    200: LogIngestBudgetStatus;
+};
+
+export type LogIngestBudgetResponse = LogIngestBudgetResponses[keyof LogIngestBudgetResponses];
+
 export type SearchLogsData = {
     body: SearchLogsRequest;
     path?: never;
@@ -57402,6 +58684,102 @@ export type NodeMetricsGetAlertRulesResponses = {
 };
 
 export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsCreateAlertRuleData = {
+    body: NodeCreateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsCreateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * The node already has a rule for this metric
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsCreateAlertRuleResponses = {
+    /**
+     * Alert rule created
+     */
+    201: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsCreateAlertRuleResponse = NodeMetricsCreateAlertRuleResponses[keyof NodeMetricsCreateAlertRuleResponses];
+
+export type NodeMetricsDeleteAlertRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsDeleteAlertRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found on this node
+     */
+    404: unknown;
+    /**
+     * Control-plane default rules cannot be deleted
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsDeleteAlertRuleResponses = {
+    /**
+     * Alert rule deleted
+     */
+    204: void;
+};
+
+export type NodeMetricsDeleteAlertRuleResponse = NodeMetricsDeleteAlertRuleResponses[keyof NodeMetricsDeleteAlertRuleResponses];
 
 export type NodeMetricsUpdateAlertRuleData = {
     body: ServiceUpdateAlertRuleRequest;
@@ -67752,6 +69130,10 @@ export type PauseDeploymentErrors = {
      */
     404: unknown;
     /**
+     * Deployment is not live (only a deployed deployment can be paused)
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -67827,6 +69209,10 @@ export type ResumeDeploymentErrors = {
      * Project or deployment not found
      */
     404: unknown;
+    /**
+     * Deployment is not paused (only a paused deployment can be resumed)
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -72607,6 +73993,50 @@ export type UpdateGitSettingsResponses = {
 };
 
 export type UpdateGitSettingsResponse = UpdateGitSettingsResponses[keyof UpdateGitSettingsResponses];
+
+export type ReinstallGithubWebhookData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/github/reinstall-webhook';
+};
+
+export type ReinstallGithubWebhookErrors = {
+    /**
+     * Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ReinstallGithubWebhookResponses = {
+    /**
+     * Webhook installed
+     */
+    200: ReinstallGithubWebhookResponse;
+};
+
+export type ReinstallGithubWebhookResponse2 = ReinstallGithubWebhookResponses[keyof ReinstallGithubWebhookResponses];
 
 export type ReinstallGitlabWebhookData = {
     body?: never;
@@ -78996,6 +80426,80 @@ export type RotateClusterCaResponses = {
 
 export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
 
+export type ClusterNetworkGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkGetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkGetResponses = {
+    /**
+     * Cluster network
+     */
+    200: ClusterNetworkStatus;
+};
+
+export type ClusterNetworkGetResponse = ClusterNetworkGetResponses[keyof ClusterNetworkGetResponses];
+
+export type ClusterNetworkUpdateData = {
+    body: UpdateClusterNetworkRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-network';
+};
+
+export type ClusterNetworkUpdateErrors = {
+    /**
+     * Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The pool is in use
+     */
+    409: unknown;
+    /**
+     * Re-authentication required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ClusterNetworkUpdateResponses = {
+    /**
+     * Pool changed
+     */
+    200: ClusterNetworkChangeResponse;
+};
+
+export type ClusterNetworkUpdateResponse = ClusterNetworkUpdateResponses[keyof ClusterNetworkUpdateResponses];
+
 export type GetDiskStatusData = {
     body?: never;
     path?: never;
@@ -79498,7 +81002,7 @@ export type ListSecretsErrors = {
 
 export type ListSecretsResponses = {
     /**
-     * List of global agent secrets
+     * Agent secrets in every scope (instance-wide and per project)
      */
     200: ListSecretsResponse;
 };
@@ -79525,6 +81029,10 @@ export type UpsertSecretErrors = {
      * Insufficient permissions
      */
     403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
 };
 
 export type UpsertSecretResponses = {
@@ -79544,7 +81052,12 @@ export type DeleteSecretData = {
          */
         name: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Project scope; omit for the instance-wide secret.
+         */
+        project_id?: number;
+    };
     url: '/settings/secrets/{name}';
 };
 
@@ -81874,6 +83387,54 @@ export type UpdateUserResponses = {
 
 export type UpdateUserResponse = UpdateUserResponses[keyof UpdateUserResponses];
 
+export type ResetUserMfaData = {
+    body?: never;
+    path: {
+        /**
+         * User ID
+         */
+        user_id: number;
+    };
+    query?: never;
+    url: '/users/{user_id}/mfa';
+};
+
+export type ResetUserMfaErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)
+     */
+    403: unknown;
+    /**
+     * User not found
+     */
+    404: unknown;
+    /**
+     * User is deleted, or has no MFA enrolled
+     */
+    409: unknown;
+    /**
+     * Recent identity verification (step-up) required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResetUserMfaResponses = {
+    /**
+     * MFA removed and the user's sessions revoked
+     */
+    200: ResetUserMfaResponse;
+};
+
+export type ResetUserMfaResponse2 = ResetUserMfaResponses[keyof ResetUserMfaResponses];
+
 export type ResetUserPasswordData = {
     body?: never;
     path: {
@@ -82263,7 +83824,7 @@ export type CreateSandboxData = {
 
 export type CreateSandboxErrors = {
     /**
-     * Validation error
+     * Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum
      */
     400: unknown;
     /**
@@ -82271,7 +83832,7 @@ export type CreateSandboxErrors = {
      */
     401: unknown;
     /**
-     * Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible
+     * Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows
      */
     422: unknown;
     /**

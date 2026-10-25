@@ -6,7 +6,7 @@ import {
   updateIngressSettings as updateIngressSettingsOperation,
 } from '@/api/client'
 import type {
-  IngressMode,
+  EnvironmentIngressMode as IngressMode,
   IngressSettingsResponse,
   UpdateIngressSettingsRequest,
 } from '@/api/client'
