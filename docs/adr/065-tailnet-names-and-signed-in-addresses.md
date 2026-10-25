@@ -317,15 +317,30 @@ read from the API when planning (absent, or its `comment`, `ports` and
 | `TailscaleServe {node_id, address_id}` | the desired-entry row, then the agent's report | immediate for the row; the step is done only on the report |
 | `ServiceApproval {name, node_id}` | none: a wait, no side effect | n/a |
 
+- **Who owns a Service: the install; which run wrote it: the run id.**
+  Temps writes `comment: "temps:<install>:<run_id>"`, the ADR 031 marker
+  idea in the one free field a Service has. The two parts answer different
+  questions, as the marker's scope and `run_id` do for DNS in ADR 064:
+  - **Ownership is `<install>`** (ADR 031's `install_id`). Planning,
+    reconciliation and the outside check treat a Service whose marker
+    carries this install as Temps', whatever its run id. A later run, or a
+    retry under a new run id, therefore never sees this install's own
+    Service as foreign;
+  - **the run id says which run created it.** A resumed run keeps its run
+    id, so its own write reads as done. A new run that finds this
+    install's Service for the address (D1, option 1) journals it as found
+    already, not created. It may update the fields Temps sets, under the
+    same checks below, but its undo never deletes it; only the run whose id
+    is in the marker may delete it;
+  - a marker with another install's id, or no marker, is not Temps'. It is
+    never written to or deleted.
 - **A Service is never adopted.** The API's `PUT` creates *or updates*, so
   a `PUT` on someone else's Service would rewrite it. The plan reads the
   name first; one that exists without this install's marker blocks the
   option ("`svc:myapp` already exists in your tailnet and Temps did not
-  create it; pick another name"). Temps writes `comment:
-  "temps:<install>:<run_id>"` (the ADR 031 marker idea in the field the
-  Service has) and re-reads the name immediately before the `PUT`; a
-  Service found there without the marker stops the step as `conflict` and
-  nothing is written.
+  create it; pick another name"). Temps re-reads the name immediately
+  before the `PUT`; a Service found there without this install's marker
+  stops the step as `conflict` and nothing is written.
 - **The create can still overwrite, and the ADR accepts that window.** The
   Services API has no conditional create (no `If-Match`, no
   create-only verb), so a Service someone else creates between that
@@ -340,15 +355,24 @@ read from the API when planning (absent, or its `comment`, `ports` and
   - what the overwrite replaces is the other Service's definition (its
     ports and comment). It moves no traffic by itself: a Service routes
     only to hosts that advertise it and that the tailnet admin approved;
-  - **after the `PUT` the step reads the Service back, including its
-    hosts.** It is `done` only if the marker is this run's *and* every host
-    advertising the name is a worker this run configured. Any other
-    advertising host makes the step `conflict`, even with this run's
-    marker: "`svc:myapp` is also advertised by `nas`, which this setup did
-    not configure. Someone may have created the same name while Temps did;
-    check it before approving." The reconciler and the outside check (D5)
-    keep applying the same rule after the run, so a host that starts
-    advertising the name later is reported too. This check is why reading a
+  - **after the `PUT` the step reads the Service back, the whole
+    definition and its hosts.** It is `done` only if every field matches:
+    - the marker is this run's;
+    - `ports` and `tags` are exactly what the run wrote;
+    - `addrs` is non-empty and inside the Tailscale ranges.
+      Tailscale assigns the TailVIP, so the run records it in the journal
+      here rather than choosing it;
+    - every host advertising the name is a worker this run configured.
+
+    Any mismatch makes the step `conflict`, even with this run's marker,
+    and names the field: "`svc:myapp` now listens on `tcp:8443` as well,
+    which Temps did not set", or "`svc:myapp` is also advertised by `nas`,
+    which this setup did not configure. Someone may have created the same
+    name while Temps did; check it before approving." The reconciler and
+    the outside check (D5) keep comparing the same fields against the
+    journaled definition after the run. So a later change to the ports,
+    the tags or the recorded `addrs`, or a new advertising host, is
+    reported too; it is never accepted as the new truth. This check is why reading a
     Service's hosts is required: if implementation finds that the D2 scopes
     cannot read them, the Service way in is not offered until a way to read
     them without `devices:core` is found;
@@ -375,8 +399,8 @@ read from the API when planning (absent, or its `comment`, `ports` and
   `AdvertiseServices` name (the desired row is deleted; done on the
   agent's report, or at once if the worker is gone from the cluster);
   then a Service this run created is deleted only while its `comment`
-  still holds this run's marker and its hosts are only workers whose
-  entries this run removed. Anything else pauses undo as a conflict ("`svc:myapp`
+  still holds this run's marker, its definition still matches the
+  journal, and its hosts are only workers whose entries this run removed. Anything else pauses undo as a conflict ("`svc:myapp`
   is now also hosted by `nas`, which this setup did not configure. Keep
   it, or delete it anyway?"). A Service the run found already there is
   never deleted. The credential row is removed only if the run created it
@@ -739,7 +763,8 @@ window in which a phase 2 address is unserved.
   and the outside check shows it in red (D3, D5).
 - The agent edits only Serve entries it wrote, with conditional writes,
   and only with the worker owner's consent. A Service is never adopted by
-  name, and only one carrying this install's marker is deleted (D4). The
+  name. Ownership is the install in its marker, and only the run that
+  created a Service may delete it (D4). The
   Services API cannot create conditionally, so a same-name Service created
   within one request of Temps' `PUT` can be overwritten. Temps detects it
   by the Service's hosts rather than its marker, and never approves hosts
