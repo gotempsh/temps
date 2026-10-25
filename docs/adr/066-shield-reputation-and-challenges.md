@@ -768,7 +768,12 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   it counts for, so counts start over each clock hour without a sweep.
   Nothing is evicted, so no amount of other traffic gives a spent clearance
   a fresh budget. Clearances that share cells can only push each other's
-  counts up, which at worst re-challenges a visitor early.
+  counts up, which at worst re-challenges a visitor early. The budget is a
+  soft limit: the four rows are not updated together, so concurrent
+  requests from one clearance can overshoot it, by at most four times per
+  hour. A hard cap (admitting only when every row is under budget) would
+  let one clearance far past its budget lock out anyone sharing a single
+  cell with it.
 - Until JA4 (phase 3), the `ja4_or_source` input of the identity is the
   proxy's existing TLS fingerprint (`tls:<fingerprint>`); attack mode keeps
   answering plain HTTP with 426.

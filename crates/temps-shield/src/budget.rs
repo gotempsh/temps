@@ -43,6 +43,16 @@ impl BudgetCounter {
 
     /// Counts one request for `budget_id` and returns how many it had made
     /// in the current hour before this one.
+    ///
+    /// The budget is a soft limit. Each row is updated atomically but the
+    /// four are not updated together, so concurrent requests can each find
+    /// a different row lowest. Every row hands out each count once, so at
+    /// most `budget` requests see a count under `budget` in any one row: the
+    /// overshoot is bounded at `ROWS` times the budget per hour. Sequential
+    /// requests are counted exactly. Admitting only when every row is under
+    /// the budget would make it a hard cap, but then one clearance spending
+    /// far past its budget would push out everyone sharing a single cell
+    /// with it, rather than all four.
     pub(crate) fn record(&self, budget_id: &[u8; 8], now: u64) -> u32 {
         let window = u32::try_from(now / SECONDS_PER_WINDOW).unwrap_or(u32::MAX);
         let id = u64::from_le_bytes(*budget_id);
