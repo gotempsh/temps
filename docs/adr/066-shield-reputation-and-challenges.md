@@ -347,18 +347,24 @@ Cloudflare without Bot Management".
 - **Verification.** `POST /api/_temps/captcha/verify` takes only the token,
   the nonce and the reported solve time (`solve_ms`, optional, used only for
   the D6 measurements). The ingress recomputes the identity from the
-  connection and checks, in order: MAC, expiry, environment and identity
-  match, then the proof-of-work bits. That is one HMAC and one SHA-256 per
-  attempt, with no database.
-- **Clearance.** Success sets `__Host-temps_clr`: environment, identity,
-  issue and expiry times and a random budget id, signed. `Secure`,
-  `HttpOnly`, `SameSite=Lax`, `Path=/`, valid 24 hours. The `__Host-` prefix
-  makes browsers refuse a `Domain` attribute, so a sibling subdomain can
-  neither set nor shadow it. Any ingress verifies it locally.
+  connection and checks, in order: MAC, expiry, identity match, then the
+  proof-of-work bits. That is one HMAC and one SHA-256 per attempt, with no
+  database. The clearance is for the environment named in the signed token,
+  not the one the verify request resolved to: on a host with path routes
+  (ADR 050) the fixed verify path resolves to the host's environment, while
+  the page under `/docs` was served for the routed one. A visitor holds only
+  tokens the server issued to them, so this adds no reach.
+- **Clearance.** Success sets `__Host-temps_clr_<env_id>`: environment,
+  identity, issue and expiry times and a random budget id, signed. One
+  cookie per environment, so on a host that serves several through path
+  routes, clearing one does not replace another's. `Secure`, `HttpOnly`,
+  `SameSite=Lax`, `Path=/`, valid 24 hours. The `__Host-` prefix makes
+  browsers refuse a `Domain` attribute, so a sibling subdomain can neither
+  set nor shadow it. Any ingress verifies it locally.
 - **Request budget.** Each clearance allows a number of requests per hour on
-  each ingress (default 3,000; every request counts, page assets
-  included). Past the budget, the clearance stops
-  counting and the next page load gets a new challenge at higher difficulty.
+  each ingress (default 3,000; every request counts, page assets included).
+  Past the budget, the clearance stops counting and the next page load gets
+  a new challenge at higher difficulty.
 - **Keys.** Derived from the control plane's master key with
   `EncryptionService::derive_subkey`, one per purpose (challenge,
   clearance) and generation: `temps-shield/<purpose>/k<kid>`. Nothing is
@@ -481,7 +487,7 @@ pub struct ShieldInput<'a> {
     pub path_and_query: &'a str,
     pub accepts_html: bool,
     pub headers: &'a [(&'a str, &'a str)], // the few D8 reads
-    pub clearance: Option<&'a str>,        // __Host-temps_clr
+    pub clearance: Option<&'a str>,        // __Host-temps_clr_<env_id>
     pub bypass_token: Option<&'a str>,     // X-Temps-Shield-Token
     pub environment_id: i32,
     pub now: i64,
@@ -724,7 +730,7 @@ challenge token (60 bytes → 80 chars)
 proof:     sha256(token_string ‖ nonce_decimal) has ≥ difficulty leading zero bits
 validity:  issued_at ≤ now + 30 s skew, and now < issued_at + 300
 
-clearance __Host-temps_clr (56 bytes → 75 chars)
+clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   ver u8 = 1 | kid u8 | env_id u32 | identity [16] | issued_at u32
   | expires_at u32 | budget_id [8] | flags u8 | reserved u8 | mac [16]
 ```

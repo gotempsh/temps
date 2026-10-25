@@ -15,10 +15,37 @@ use crate::token::{
     CLOCK_SKEW_SECS,
 };
 
-/// The clearance cookie. The `__Host-` prefix makes the browser require
-/// `Secure`, `Path=/` and no `Domain`, so a sibling subdomain can neither
-/// set nor shadow it.
-pub const CLEARANCE_COOKIE_NAME: &str = "__Host-temps_clr";
+/// Prefix of the clearance cookie names. The `__Host-` prefix makes the
+/// browser require `Secure`, `Path=/` and no `Domain`, so a sibling
+/// subdomain can neither set nor shadow a clearance.
+pub const CLEARANCE_COOKIE_PREFIX: &str = "__Host-temps_clr_";
+
+/// The clearance cookie for one environment. Each environment has its own,
+/// so on a host that serves several through path routes (ADR 050), clearing
+/// one does not replace another's clearance.
+pub fn clearance_cookie_name(env_id: i32) -> String {
+    format!("{CLEARANCE_COOKIE_PREFIX}{env_id}")
+}
+
+/// A clearance earned by redeeming a challenge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Clearance {
+    /// The environment the challenge was issued for.
+    pub env_id: i32,
+    /// The signed cookie value.
+    pub value: String,
+}
+
+impl Clearance {
+    /// The `Set-Cookie` value that stores this clearance.
+    pub fn set_cookie(&self) -> String {
+        format!(
+            "{}={}; Path=/; Max-Age={CLEARANCE_TTL_SECS}; Secure; HttpOnly; SameSite=Lax",
+            clearance_cookie_name(self.env_id),
+            self.value
+        )
+    }
+}
 
 /// Requests one clearance may make per hour on one ingress. Every request
 /// counts, page assets included, so this is well above what one person
@@ -93,26 +120,27 @@ impl ChallengeGate {
         )
     }
 
-    /// Verifies a solved challenge and returns a clearance cookie value.
+    /// Verifies a solved challenge and returns a clearance for the
+    /// environment the token was issued for.
     ///
-    /// `env_id` and `identity` are what the ingress computed for this
-    /// request; nothing in the request body is trusted. The checks run
-    /// cheapest first: signature, expiry, environment, visitor, proof of
+    /// `identity` is what the ingress computed for this request's
+    /// connection; nothing in the request body is trusted. The environment
+    /// comes from the signed token, not from how the verify request was
+    /// routed: the server issued that token to this visitor for that
+    /// environment, and on a host with path routes (ADR 050) the verify
+    /// path resolves to the host's environment, not the routed one. The
+    /// checks run cheapest first: signature, expiry, visitor, proof of
     /// work, and last whether the token was already redeemed.
     pub fn redeem(
         &self,
         token: &str,
         nonce: &str,
-        env_id: i32,
         identity: &VisitorIdentity,
         now: u64,
-    ) -> Result<String, ChallengeError> {
+    ) -> Result<Clearance, ChallengeError> {
         let claims = open_challenge(&self.keys, token)?;
         if !is_fresh(claims.issued_at, CHALLENGE_TTL_SECS, now) {
             return Err(ChallengeError::Expired);
-        }
-        if claims.env_id != env_id {
-            return Err(ChallengeError::WrongEnvironment);
         }
         if claims.identity != *identity {
             return Err(ChallengeError::WrongVisitor);
@@ -129,16 +157,20 @@ impl ChallengeGate {
         {
             return Err(ChallengeError::Replayed);
         }
-        seal_clearance(
+        let value = seal_clearance(
             &self.keys,
             &ClearanceClaims {
-                env_id,
+                env_id: claims.env_id,
                 identity: *identity,
                 issued_at: now,
                 expires_at: now.saturating_add(CLEARANCE_TTL_SECS),
                 budget_id: rand::random(),
             },
-        )
+        )?;
+        Ok(Clearance {
+            env_id: claims.env_id,
+            value,
+        })
     }
 
     /// Checks a clearance cookie value and, if valid, counts this request
@@ -170,13 +202,6 @@ impl ChallengeGate {
             Admission::BudgetSpent
         }
     }
-}
-
-/// The `Set-Cookie` value that stores a clearance.
-pub fn clearance_set_cookie(value: &str) -> String {
-    format!(
-        "{CLEARANCE_COOKIE_NAME}={value}; Path=/; Max-Age={CLEARANCE_TTL_SECS}; Secure; HttpOnly; SameSite=Lax"
-    )
 }
 
 #[cfg(test)]
@@ -217,7 +242,9 @@ mod tests {
     fn clearance(gate: &ChallengeGate, env_id: i32, who: &VisitorIdentity) -> String {
         let token = gate.issue(env_id, who, DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
-        gate.redeem(&token, &nonce, env_id, who, NOW + 1).unwrap()
+        let clearance = gate.redeem(&token, &nonce, who, NOW + 1).unwrap();
+        assert_eq!(clearance.env_id, env_id);
+        clearance.value
     }
 
     #[test]
@@ -238,12 +265,12 @@ mod tests {
         let gate = gate();
         let who = visitor(1);
         assert_eq!(
-            gate.redeem("anything", "0", 1, &who, NOW),
+            gate.redeem("anything", "0", &who, NOW),
             Err(ChallengeError::Malformed)
         );
         let forged = "A".repeat(80);
         let nonce = solve(&forged, DIFFICULTY);
-        assert!(gate.redeem(&forged, &nonce, 1, &who, NOW).is_err());
+        assert!(gate.redeem(&forged, &nonce, &who, NOW).is_err());
 
         let token = gate.issue(1, &who, 20, NOW).unwrap();
         let unsolved = (0u64..)
@@ -254,23 +281,29 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            gate.redeem(&token, &unsolved, 1, &who, NOW),
+            gate.redeem(&token, &unsolved, &who, NOW),
             Err(ChallengeError::InsufficientWork)
         );
     }
 
     #[test]
-    fn a_token_is_bound_to_its_environment_and_visitor() {
+    fn a_token_is_bound_to_its_visitor_and_clears_its_own_environment() {
         let gate = gate();
-        let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
+        let token = gate.issue(7, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
         assert_eq!(
-            gate.redeem(&token, &nonce, 2, &visitor(1), NOW),
-            Err(ChallengeError::WrongEnvironment)
+            gate.redeem(&token, &nonce, &visitor(2), NOW),
+            Err(ChallengeError::WrongVisitor)
+        );
+        let clearance = gate.redeem(&token, &nonce, &visitor(1), NOW).unwrap();
+        assert_eq!(clearance.env_id, 7);
+        assert_eq!(
+            gate.admit(&clearance.value, 7, &visitor(1), NOW),
+            Admission::Admitted
         );
         assert_eq!(
-            gate.redeem(&token, &nonce, 1, &visitor(2), NOW),
-            Err(ChallengeError::WrongVisitor)
+            gate.admit(&clearance.value, 8, &visitor(1), NOW),
+            Admission::NotCleared
         );
     }
 
@@ -280,7 +313,7 @@ mod tests {
         let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
         assert_eq!(
-            gate.redeem(&token, &nonce, 1, &visitor(1), NOW + CHALLENGE_TTL_SECS),
+            gate.redeem(&token, &nonce, &visitor(1), NOW + CHALLENGE_TTL_SECS),
             Err(ChallengeError::Expired)
         );
     }
@@ -290,9 +323,9 @@ mod tests {
         let gate = gate();
         let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
-        assert!(gate.redeem(&token, &nonce, 1, &visitor(1), NOW).is_ok());
+        assert!(gate.redeem(&token, &nonce, &visitor(1), NOW).is_ok());
         assert_eq!(
-            gate.redeem(&token, &nonce, 1, &visitor(1), NOW),
+            gate.redeem(&token, &nonce, &visitor(1), NOW),
             Err(ChallengeError::Replayed)
         );
     }
@@ -311,7 +344,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        gate.redeem(&token, &nonce, 1, &visitor(1), NOW).is_ok()
+                        gate.redeem(&token, &nonce, &visitor(1), NOW).is_ok()
                     })
                 })
                 .collect();
@@ -372,9 +405,13 @@ mod tests {
     }
 
     #[test]
-    fn set_cookie_has_the_host_prefix_attributes() {
-        let header = clearance_set_cookie("v");
-        assert!(header.starts_with("__Host-temps_clr=v; Path=/;"));
+    fn set_cookie_is_per_environment_with_the_host_prefix_attributes() {
+        let header = Clearance {
+            env_id: 42,
+            value: "v".to_string(),
+        }
+        .set_cookie();
+        assert!(header.starts_with("__Host-temps_clr_42=v; Path=/;"));
         assert!(header.contains("; Secure"));
         assert!(header.contains("; HttpOnly"));
         assert!(!header.contains("Domain"));

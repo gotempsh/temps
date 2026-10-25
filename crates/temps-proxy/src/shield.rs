@@ -10,9 +10,7 @@
 //! in a body decides who it is or which environment it cleared.
 
 use serde::Deserialize;
-use temps_shield::{
-    clearance_set_cookie, ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity,
-};
+use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity};
 
 /// Where the challenge page posts its solution. Answered by the proxy on
 /// every project host; it never reaches the console or the application.
@@ -64,8 +62,10 @@ struct VerifyBody {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum VerifyOutcome {
-    /// The solution holds: store this `Set-Cookie` value.
+    /// The solution holds: store this `Set-Cookie` value, the clearance for
+    /// `env_id`.
     Cleared {
+        env_id: i32,
         set_cookie: String,
         solve_ms: Option<u64>,
     },
@@ -75,21 +75,22 @@ pub enum VerifyOutcome {
     BadRequest,
 }
 
-/// Verifies a posted solution for the environment and visitor the proxy
-/// resolved for this request.
+/// Verifies a posted solution for the visitor the proxy resolved for this
+/// request. The clearance is for the environment the signed token names,
+/// whichever environment the verify path itself resolved to.
 pub fn verify(
     gate: &ChallengeGate,
     body: &[u8],
-    env_id: i32,
     identity: &VisitorIdentity,
     now: u64,
 ) -> VerifyOutcome {
     let Ok(body) = serde_json::from_slice::<VerifyBody>(body) else {
         return VerifyOutcome::BadRequest;
     };
-    match gate.redeem(&body.token, &body.nonce, env_id, identity, now) {
+    match gate.redeem(&body.token, &body.nonce, identity, now) {
         Ok(clearance) => VerifyOutcome::Cleared {
-            set_cookie: clearance_set_cookie(&clearance),
+            env_id: clearance.env_id,
+            set_cookie: clearance.set_cookie(),
             solve_ms: body.solve_ms,
         },
         Err(error) => VerifyOutcome::Rejected(error),
@@ -180,13 +181,13 @@ mod tests {
     fn verify_rejects_bodies_that_are_not_solutions() {
         let gate = test_gate();
         let who = visitor_identity(Some("203.0.113.9"), "ua", Some("t13_aa"));
-        assert_eq!(verify(&gate, b"", 1, &who, 0), VerifyOutcome::BadRequest);
+        assert_eq!(verify(&gate, b"", &who, 0), VerifyOutcome::BadRequest);
         assert_eq!(
-            verify(&gate, br#"{"challenge":"x","nonce":"1"}"#, 1, &who, 0),
+            verify(&gate, br#"{"challenge":"x","nonce":"1"}"#, &who, 0),
             VerifyOutcome::BadRequest
         );
         assert_eq!(
-            verify(&gate, br#"{"token":"x","nonce":"1"}"#, 1, &who, 0),
+            verify(&gate, br#"{"token":"x","nonce":"1"}"#, &who, 0),
             VerifyOutcome::Rejected(ChallengeError::Malformed)
         );
     }

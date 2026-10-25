@@ -16,7 +16,8 @@ mod keys;
 mod token;
 
 pub use gate::{
-    clearance_set_cookie, Admission, ChallengeGate, CLEARANCE_COOKIE_NAME, DEFAULT_BUDGET_PER_HOUR,
+    clearance_cookie_name, Admission, ChallengeGate, Clearance, CLEARANCE_COOKIE_PREFIX,
+    DEFAULT_BUDGET_PER_HOUR,
 };
 pub use identity::VisitorIdentity;
 pub use keys::ShieldKeys;

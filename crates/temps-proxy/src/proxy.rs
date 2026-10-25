@@ -3368,13 +3368,16 @@ impl LoadBalancer {
     }
 
     /// Answers the challenge page's verify POST (ADR 066): reads the
-    /// solution, checks it against the environment and the visitor resolved
-    /// for this connection, and on success sets the clearance cookie.
+    /// solution, checks it against the visitor resolved for this connection,
+    /// and on success sets the clearance cookie for the environment the
+    /// signed token names. That environment is not taken from how this
+    /// request was routed: on a host with path routes (ADR 050) the verify
+    /// path resolves to the host's own environment, not the routed one the
+    /// challenge was served for.
     async fn answer_challenge_verify(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
-        env_id: i32,
     ) -> Result<bool> {
         let mut body = Vec::new();
         let mut too_large = false;
@@ -3409,11 +3412,11 @@ impl LoadBalancer {
             match crate::shield::verify(
                 &self.challenge_gate,
                 &body,
-                env_id,
                 &identity,
                 temps_shield::unix_now(),
             ) {
                 crate::shield::VerifyOutcome::Cleared {
+                    env_id,
                     set_cookie,
                     solve_ms,
                 } => {
@@ -3429,7 +3432,7 @@ impl LoadBalancer {
                     )
                 }
                 crate::shield::VerifyOutcome::Rejected(error) => {
-                    debug!(environment_id = env_id, %error, "Attack mode: challenge rejected");
+                    debug!(%error, "Attack mode: challenge rejected");
                     (
                         StatusCode::FORBIDDEN,
                         None,
@@ -6442,13 +6445,13 @@ impl ProxyHttp for LoadBalancer {
                 }
             }
 
-            // The verify POST is answered here, for any environment: a page
-            // served just before attack mode was switched off can still
-            // finish. The WASM solver the page loads is never challenged.
+            // The verify POST is answered here, whichever environment this
+            // host or path resolved to: the clearance is for the environment
+            // in the signed token, and a page served just before attack mode
+            // was switched off can still finish. The WASM solver the page
+            // loads is never challenged.
             if ctx.path == crate::shield::VERIFY_PATH {
-                return self
-                    .answer_challenge_verify(session, ctx, project_ctx.environment.id)
-                    .await;
+                return self.answer_challenge_verify(session, ctx).await;
             }
             let is_captcha_endpoint = ctx.path.starts_with("/api/__temps/temps_captcha_wasm");
 
@@ -6530,7 +6533,7 @@ impl ProxyHttp for LoadBalancer {
                 let now = temps_shield::unix_now();
                 let admission = find_request_cookie(
                     session.req_header(),
-                    temps_shield::CLEARANCE_COOKIE_NAME,
+                    &temps_shield::clearance_cookie_name(env_id),
                     |value| match self.challenge_gate.admit(value, env_id, &identity, now) {
                         temps_shield::Admission::NotCleared => None,
                         admission => Some(admission),
@@ -11663,12 +11666,28 @@ mod attack_mode_challenge_tests {
     }
 
     fn get(user_agent: &str, cookie: Option<&str>) -> String {
+        get_path("/", user_agent, cookie)
+    }
+
+    fn get_path(path: &str, user_agent: &str, cookie: Option<&str>) -> String {
         let cookie = cookie
             .map(|c| format!("Cookie: {c}\r\n"))
             .unwrap_or_default();
         format!(
-            "GET / HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {user_agent}\r\nAccept: text/html\r\n{cookie}\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {user_agent}\r\nAccept: text/html\r\n{cookie}\r\n"
         )
+    }
+
+    /// The `name=value` pair of the `Set-Cookie` header in `head`.
+    fn set_cookie_pair(head: &str) -> String {
+        head.lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("set-cookie:")
+                    .then(|| line["set-cookie:".len()..].trim().to_string())
+            })
+            .and_then(|cookie| cookie.split(';').next().map(str::to_string))
+            .unwrap_or_default()
     }
 
     fn post_verify(body: &str) -> String {
@@ -11688,17 +11707,26 @@ mod attack_mode_challenge_tests {
 
     /// A host in attack mode, backed by real project rows.
     async fn shielded(h: &Harness) -> Result<i32> {
+        let (route, env_id) = attack_mode_route(h, HOST).await?;
+        h.route_table.insert_route_for_test(HOST, route);
+        Ok(env_id)
+    }
+
+    /// The route of a new project in attack mode, created with `domain`.
+    async fn attack_mode_route(
+        h: &Harness,
+        domain: &str,
+    ) -> Result<(temps_routes::RouteInfo, i32)> {
         let ops = crate::test_utils::TestDBMockOperations::new(h._db.connection_arc().clone())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let (mut project, environment, deployment) = ops
-            .create_test_project_with_domain(HOST)
+            .create_test_project_with_domain(domain)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         project.attack_mode = true;
         let env_id = environment.id;
-        h.route_table.insert_route_for_test(
-            HOST,
+        Ok((
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
                     backends: vec![temps_routes::BackendEntry {
@@ -11715,8 +11743,20 @@ mod attack_mode_challenge_tests {
                 deployment: Some(Arc::new(deployment)),
                 cert_eligible: false,
             },
-        );
-        Ok(env_id)
+            env_id,
+        ))
+    }
+
+    /// A low-difficulty token for `env_id`, solved and posted as `user_agent`
+    /// would. Same keys as the proxy's gate.
+    fn solved_verify(env_id: i32, user_agent: &str) -> Result<String> {
+        let identity = crate::shield::visitor_identity(None, user_agent, Some(FINGERPRINT));
+        let token =
+            crate::shield::test_gate().issue(env_id, &identity, 4, temps_shield::unix_now())?;
+        Ok(format!(
+            r#"{{"token":"{token}","nonce":"{}"}}"#,
+            solve(&token, 4)
+        ))
     }
 
     fn solve(token: &str, difficulty: u8) -> String {
@@ -11793,20 +11833,15 @@ mod attack_mode_challenge_tests {
         );
         let (head, _) = answered(send(&h, post_verify(&solved)).await?);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
-        let cookie = head
-            .lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .starts_with("set-cookie:")
-                    .then(|| line["set-cookie:".len()..].trim().to_string())
-            })
-            .unwrap_or_default();
-        assert!(cookie.starts_with("__Host-temps_clr="), "{head}");
         assert!(
-            cookie.contains("Secure") && cookie.contains("HttpOnly"),
-            "{cookie}"
+            head.contains("Secure") && head.contains("HttpOnly"),
+            "{head}"
         );
-        let pair = cookie.split(';').next().unwrap_or_default().to_string();
+        let pair = set_cookie_pair(&head);
+        assert!(
+            pair.starts_with(&format!("__Host-temps_clr_{env_id}=")),
+            "{head}"
+        );
 
         // 6. The same token cannot be redeemed twice.
         let (head, _) = answered(send(&h, post_verify(&solved)).await?);
@@ -11818,6 +11853,65 @@ mod attack_mode_challenge_tests {
             Outcome::Forwarded
         ));
         let (head, _) = answered(send(&h, get("curl/8.5.0", Some(&pair))).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        Ok(())
+    }
+
+    /// Path routes (ADR 050): the host's environment at `/` and another at
+    /// `/docs`, both in attack mode. The page under `/docs` posts to the one
+    /// verify path, which resolves to the host's environment; the clearance
+    /// still goes to the environment the token was issued for, and each
+    /// environment keeps its own cookie.
+    #[tokio::test]
+    async fn path_routed_environments_keep_their_own_clearance() -> Result<()> {
+        let Some(h) = harness(None, true).await? else {
+            return Ok(());
+        };
+        let host_env = shielded(&h).await?;
+        let (docs_route, docs_env) = attack_mode_route(&h, "docs-target.example.com").await?;
+        h.route_table.insert_path_routes_for_test(
+            host_env,
+            vec![temps_routes::PathRoute {
+                prefix: "/docs".to_string(),
+                strip_prefix: false,
+                target_service: "docs".to_string(),
+                target: Some(docs_route),
+                sleeping_environment_id: None,
+            }],
+        );
+
+        let (head, _) = answered(send(&h, get_path("/docs/", UA, None)).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+
+        let (head, _) = answered(send(&h, post_verify(&solved_verify(docs_env, UA)?)).await?);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let docs_pair = set_cookie_pair(&head);
+        assert!(
+            docs_pair.starts_with(&format!("__Host-temps_clr_{docs_env}=")),
+            "{head}"
+        );
+
+        let (head, _) = answered(send(&h, post_verify(&solved_verify(host_env, UA)?)).await?);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        let host_pair = set_cookie_pair(&head);
+        assert!(
+            host_pair.starts_with(&format!("__Host-temps_clr_{host_env}=")),
+            "{head}"
+        );
+
+        // Each cookie admits its own environment only; together, both.
+        let both = format!("{host_pair}; {docs_pair}");
+        assert!(matches!(
+            send(&h, get_path("/docs/", UA, Some(&both))).await?,
+            Outcome::Forwarded
+        ));
+        assert!(matches!(
+            send(&h, get_path("/", UA, Some(&both))).await?,
+            Outcome::Forwarded
+        ));
+        let (head, _) = answered(send(&h, get_path("/docs/", UA, Some(&host_pair))).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        let (head, _) = answered(send(&h, get_path("/", UA, Some(&docs_pair))).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         Ok(())
     }

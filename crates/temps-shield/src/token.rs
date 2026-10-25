@@ -48,8 +48,6 @@ pub enum ChallengeError {
     BadSignature,
     #[error("the token has expired")]
     Expired,
-    #[error("the token was issued for another environment")]
-    WrongEnvironment,
     #[error("the token was issued to another visitor")]
     WrongVisitor,
     #[error("the nonce is not a decimal number")]
