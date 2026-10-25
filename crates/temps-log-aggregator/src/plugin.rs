@@ -22,8 +22,9 @@ use crate::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
 use crate::index::timescale::TimescaleLineIndex;
 use crate::index::{LineIndex, NoLineIndex};
 use crate::services::{
-    ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
-    RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
+    ChunkWriterService, CollectorService, CompactorService, IngestBudget, IngestLimits,
+    LogMetadataService, LogSearchService, RemoteContainerLogSource, RemoteLogCollectorService,
+    RetentionService, TailService,
 };
 use crate::services::{
     ForgetSweeper, ReindexService, DEFAULT_FORGET_BATCH, DEFAULT_REINDEX_BATCH,
@@ -262,6 +263,14 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Metadata service (used by collector to resume from last known position on restart)
             let collector_metadata = Arc::new(LogMetadataService::new(db.clone()));
 
+            // Per-container ingestion budget, shared by the local and remote
+            // collectors. Starts at the defaults; the budget sync below
+            // applies the saved settings.
+            let ingest_budget = Arc::new(IngestBudget::new(IngestLimits::from_settings(
+                &temps_core::ContainerLogSettings::default(),
+            )));
+            context.register_service(ingest_budget.clone());
+
             // Collector service. The chunk writer now owns the whole seal
             // pipeline (object write + manifest insert) itself, so the
             // collector no longer needs an on-chunk-flushed callback.
@@ -269,6 +278,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 docker_handle,
                 chunk_writer.clone(),
                 collector_metadata,
+                ingest_budget.clone(),
                 10_000,
             )
             .with_db(db.clone());
@@ -340,6 +350,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 db.clone(),
                 line_index,
                 chunk_writer.clone(),
+                ingest_budget,
             )
             .await;
             context.register_service(app_state);
@@ -409,10 +420,12 @@ impl TempsPlugin for LogAggregatorPlugin {
                 let remote_chunk_writer = context.require_service::<ChunkWriterService>();
                 let remote_metadata = context.require_service::<LogMetadataService>();
                 let remote_tail_tx = context.require_service::<CollectorService>().tail_sender();
+                let remote_ingest_budget = context.require_service::<IngestBudget>();
                 let remote_collector = Arc::new(RemoteLogCollectorService::new(
                     remote_source,
                     remote_chunk_writer,
                     remote_metadata,
+                    remote_ingest_budget,
                     remote_tail_tx,
                 ));
                 let recovery_writer = chunk_writer.clone();
@@ -461,12 +474,13 @@ impl TempsPlugin for LogAggregatorPlugin {
             }
 
             // ── Budget sync ─────────────────────────────────────────────
-            // Settings → Monitoring → container logs: read cache size and
-            // per-container head buffer. Applied now and re-read every
-            // minute so a saved setting never needs a restart.
+            // Settings → Monitoring → container logs: read cache size,
+            // per-container head buffer and ingestion budget. Applied now and
+            // re-read every minute so a saved setting never needs a restart.
             if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
                 let cache = context.require_service::<ChunkCache>();
                 let writer = context.require_service::<ChunkWriterService>();
+                let ingest_budget = context.require_service::<IngestBudget>();
                 let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
                     recovery_writer.wait_for_recovery().await;
@@ -491,6 +505,15 @@ impl TempsPlugin for LogAggregatorPlugin {
                                         "log head buffer cap applied"
                                     );
                                     writer.set_head_max_bytes(head_bytes);
+                                }
+                                let ingest_limits = IngestLimits::from_settings(logs);
+                                if ingest_budget.limits() != ingest_limits {
+                                    tracing::info!(
+                                        ingest_lines_per_sec = logs.ingest_lines_per_sec,
+                                        ingest_kib_per_sec = logs.ingest_kib_per_sec,
+                                        "per-container log ingestion budget applied"
+                                    );
+                                    ingest_budget.set_limits(ingest_limits);
                                 }
                             }
                             Err(e) => {
@@ -691,6 +714,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             line_index: old.line_index.clone(),
             manifests: old.manifests.clone(),
             chunk_writer: old.chunk_writer.clone(),
+            ingest_budget: old.ingest_budget.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 

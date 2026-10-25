@@ -12,6 +12,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ServiceHealthBadge } from '@/components/storage/ServiceHealthCard'
+import { ScopedLogIngestBudgetNotice } from '@/components/observability/LogIngestBudgetNotice'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -394,6 +395,8 @@ export function ServiceLogs() {
             </Button>
           </div>
         </div>
+
+        <ScopedLogIngestBudgetNotice scope={{ externalServiceId: serviceId }} />
 
         {/* Filter bar */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:flex-wrap">

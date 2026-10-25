@@ -156,6 +156,10 @@ export interface ContainerLogSettings {
   cache_mb: number
   /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
   head_buffer_mb: number
+  /** Per-container ingestion budget in lines/s; 0 = no line limit. */
+  ingest_lines_per_sec: number
+  /** Per-container ingestion budget in KiB/s; 0 = no byte limit. */
+  ingest_kib_per_sec: number
 }
 
 export interface ObservabilityRetentionSettings {

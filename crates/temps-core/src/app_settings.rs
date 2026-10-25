@@ -1081,6 +1081,17 @@ pub struct ContainerLogSettings {
     /// mean fewer, bigger chunks; smaller ones bound memory per container.
     #[schema(minimum = 1, maximum = 256, example = 8)]
     pub head_buffer_mb: u32,
+    /// Per-container ingestion budget, in lines per second. A container
+    /// over budget has its excess lines dropped (not stored or indexed),
+    /// a notice written into its log, and is listed as throttled in the log
+    /// explorer. Up to 10 seconds of budget may arrive at once. `0` disables
+    /// the line limit. Applied within a minute of saving.
+    #[schema(minimum = 0, maximum = 1000000, example = 250)]
+    pub ingest_lines_per_sec: u32,
+    /// Per-container ingestion budget, in KiB per second, enforced alongside
+    /// `ingest_lines_per_sec`. `0` disables the byte limit.
+    #[schema(minimum = 0, maximum = 1048576, example = 256)]
+    pub ingest_kib_per_sec: u32,
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -2467,6 +2478,11 @@ impl Default for ContainerLogSettings {
             service_max_file: 3,
             cache_mb: 2048,
             head_buffer_mb: 8,
+            // ~21M lines and ~21 GiB per container per day: far above what a
+            // healthy service logs, low enough that one runaway container
+            // cannot become the node's whole log volume.
+            ingest_lines_per_sec: 250,
+            ingest_kib_per_sec: 256,
         }
     }
 }

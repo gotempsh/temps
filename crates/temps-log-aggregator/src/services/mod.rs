@@ -8,6 +8,7 @@ mod collector;
 mod compactor;
 mod forget_sweeper;
 pub(crate) mod global_search;
+mod ingest_budget;
 mod metadata;
 mod reindexer;
 mod remote_collector;
@@ -25,6 +26,10 @@ pub use compactor::{CompactorService, GC_GRACE};
 pub use forget_sweeper::{
     ForgetSweepReport, ForgetSweeper, DEFAULT_FORGET_BATCH, FORGET_SWEEP_BURST_PAUSE,
     FORGET_SWEEP_INTERVAL,
+};
+pub use ingest_budget::{
+    Admission, IngestBudget, IngestDropReason, IngestLimiter, IngestLimits, IngestSource,
+    ThrottledLogSource, BURST_SECONDS,
 };
 pub use metadata::{LogEventsQuery, LogMetadataService};
 pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};

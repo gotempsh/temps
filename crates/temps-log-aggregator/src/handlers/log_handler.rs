@@ -439,6 +439,9 @@ pub struct PurgeLogsRequest {
             super::global::LogCollectionCapability,
             super::global::LogCollectionState,
             super::global::DeferredWalGeneration,
+            super::global::LogIngestBudgetCapability,
+            crate::services::ThrottledLogSource,
+            crate::services::IngestDropReason,
             AttributeKeysResponse,
             FacetsAttrsResponse,
             HistogramResponse,
@@ -982,6 +985,9 @@ mod tests {
                 db.connection_arc(),
             )),
             chunk_writer: chunk_writer.clone(),
+            ingest_budget: Arc::new(crate::services::IngestBudget::new(
+                crate::services::IngestLimits::UNLIMITED,
+            )),
         });
 
         TestContext {
@@ -2198,6 +2204,7 @@ mod tests {
             line_index: base_state.line_index.clone(),
             manifests: base_state.manifests.clone(),
             chunk_writer: base_state.chunk_writer.clone(),
+            ingest_budget: base_state.ingest_budget.clone(),
         });
         build_test_server_with_role(app_state, temps_auth::Role::User)
     }
