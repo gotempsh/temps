@@ -388,8 +388,13 @@ read from the API when planning (absent, or its `comment`, `ports`,
   - **when it was found:** the marker carries this install (any creator),
     `ports` and `tags` are the fixed definition, and `addrs` equals the
     `addrs` journaled by the run that created it;
-  - **in both cases:** every host advertising the name has a
-    `tailnet_serve_entries` row.
+  - **in both cases:** every host advertising the name matches a
+    `tailnet_serve_entries` row on *both* that host's node and this
+    Service's name. A row for the same node that names another Service, or
+    none (a machine-name entry), does not make the host valid. The API
+    lists hosts as devices without an address, so the address is matched
+    on the Temps side: the Service belongs to one address (its
+    `private_service`), and the row must be for that address.
 
   Any mismatch makes the step `conflict`, even with this install's marker,
   and names the field: "`svc:myapp` now listens on `tcp:8443` as well,
@@ -407,21 +412,32 @@ read from the API when planning (absent, or its `comment`, `ports`,
   that worker must configure, and the route snapshot carries it to that
   worker only. Runs do not own the row; they reference it. Each run that
   needs it writes a `tailnet_serve_refs` row (entry, run, `created` or
-  `found`) in the same transaction:
+  `found`) in the same transaction. The rows are unique on
+  `(node_id, address_id)`. Every change to an entry's references, and the
+  last-reference check that deletes the entry, runs in one transaction
+  that first takes a transaction-scoped advisory lock keyed on
+  `(node_id, address_id)`. The lock is taken even when no row exists yet,
+  so a run adding a reference and an undo removing the last one can never
+  interleave. Inside that lock:
   - **no row yet:** the run creates the row and a `created` reference;
   - **a matching row** (same way in and Service name), for example a
     re-run for the address on the same worker: the run adds a `found`
     reference and changes nothing;
   - **a row that differs:** the step is `conflict` and names what the
-    worker serves now. Two runs never hold different wishes for one slot.
+    worker serves now. Two runs never hold different wishes for one slot;
+  - **a row being removed** (`removing`, below): the step waits until the
+    agent reports the removal, then starts again with no row. It never
+    revives a row whose configuration the agent is taking off the worker.
 
   The agent applies the row with `If-Match` (D2) and reports, per entry,
   `applied` with the config's `Etag`, `conflict` naming what holds the slot
   ("a `tailscale serve` entry proxying to `http://127.0.0.1:3000`"), or
   `error` with the reason. The step is `done` on `applied` and `conflict`
   on `conflict`; it never overwrites. Since tailscaled's write is
-  conditional, there is no lost-update window on the worker. The same rule
-  covers the machine-name way in, which has entries but no Service.
+  conditional, there is no lost-update window on the worker. On `applied`
+  the row records `applied_etag` and that the agent wrote the entry; on
+  `conflict` or `error` it records that the agent wrote nothing. The same
+  rule covers the machine-name way in, which has entries but no Service.
 - **Approval is waited for, never done.** The step shows the admin-console
   link and the policy entry to paste:
   `"autoApprovers": {"services": {"svc:myapp": ["tag:temps"]}}`. Whether
@@ -431,16 +447,31 @@ read from the API when planning (absent, or its `comment`, `ports`,
   failure.
 - **Undo, newest first.**
   - **References first, worker configuration with the last one.** Undo
-    deletes this run's `tailnet_serve_refs` rows. An entry that still has
-    another run's reference is left exactly as it is, and the worker keeps
-    serving. An entry left with no reference is deleted, so the agent
-    removes its Serve entry and its `AdvertiseServices` name. That step is
-    done on the agent's report, or at once if the worker is gone from the
-    cluster. Undo never removes worker configuration another run still
-    references.
+    deletes this run's `tailnet_serve_refs` rows under the lock above. An
+    entry that still has another run's reference is left exactly as it is,
+    and the worker keeps serving. Undo never removes worker configuration
+    another run still references. An entry left with no reference is
+    handled by what the agent last reported for it:
+    - **the agent wrote it** (`applied`, with an `applied_etag`): the row
+      becomes `removing`, and the agent removes only that entry and its
+      `AdvertiseServices` name, with `If-Match`. It removes only a handler
+      whose target is this address's socket, the D2 ownership rule. The row
+      is deleted when the agent reports `removed`. If the slot now holds
+      something the agent did not write, it removes nothing and reports it.
+      The step then becomes `conflict` naming what is there, and the row
+      stays until the user decides;
+    - **the agent wrote nothing** (it reported `conflict` or `error`, or
+      never reported): there is nothing of Temps' on the worker. The row is
+      deleted without any instruction to the agent, so pre-existing
+      configuration is never touched;
+    - **the worker is gone from the cluster:** the row is deleted at once.
+
+    The step is pending until one of these ends it. It is never done just
+    because the row was deleted.
   - **Then the Service, only once it has no entries left.** It is deleted by
     the undo that removes its last entry, whichever run of this install
-    that is. Deleting it also needs three things:
+    that is, and only with the user's explicit confirmation (below). Deleting
+    it also needs three things:
     - a journal entry of this install recording `created` for it, with the
       run id in its marker;
     - its definition still matches that entry;
@@ -448,6 +479,23 @@ read from the API when planning (absent, or its `comment`, `ports`,
 
     This way neither the creator's undo nor a later run's undo leaves an
     orphan.
+  - **Deleting a Service has a window, so a person confirms it.** The
+    Services API has no conditional `DELETE` either. The checks above run
+    on a read made immediately before the `DELETE`, but someone with the
+    `services` scope can still change the Service in between, and the
+    delete would remove their change with it. Temps does not close that
+    window; it puts a person in front of it:
+    - undo never deletes a Service on its own, and the reconciler never
+      deletes one at all. The step stops as `waiting` with what it will do:
+      "Delete `svc:myapp` from tailnet `example.ts.net`? It was created by
+      this Temps install on 3 May and nothing uses it now." It deletes only
+      when the user confirms;
+    - confirming is a sensitive action (step-up), journaled with the
+      definition the user was shown. The `DELETE` is sent only if a fresh
+      read still equals it;
+    - declining, or a read that changed, keeps the Service and ends the
+      step as "kept", naming it, so the user can remove it in the admin
+      console.
   - **A Service still in use is kept.** If entries other runs reference remain, undo
     reports "kept: `svc:myapp` still serves `myapp` on `nas` (set up on
     3 May)" and is done. That is expected, not a conflict.
@@ -497,7 +545,7 @@ device can give.
 **Outside (the control plane):** no tunnel publishes or is publishing the
 name; public DNS returns nothing for it or only Tailscale addresses; and
 the agent reports Funnel off for it; and, for a Service, every host
-advertising it has a `tailnet_serve_entries` row (D4), read
+advertising it matches a `tailnet_serve_entries` row on its node and this Service (D4), read
 from the API with the D2 credential. A foreign host is shown with its name
 and is a failure. A Funnel entry for the name, or a
 `Tailscale-Funnel-Request` seen at the socket, is shown in red ("This
