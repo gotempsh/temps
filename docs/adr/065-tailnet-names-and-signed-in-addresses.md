@@ -323,10 +323,38 @@ read from the API when planning (absent, or its `comment`, `ports` and
   option ("`svc:myapp` already exists in your tailnet and Temps did not
   create it; pick another name"). Temps writes `comment:
   "temps:<install>:<run_id>"` (the ADR 031 marker idea in the field the
-  Service has) and re-reads the name immediately before the `PUT`; the
-  Services API has no `If-Match`, so the window is one request long, as
-  for Cloudflare DNS, and a Service found afterwards without the marker
-  makes the step `conflict`.
+  Service has) and re-reads the name immediately before the `PUT`; a
+  Service found there without the marker stops the step as `conflict` and
+  nothing is written.
+- **The create can still overwrite, and the ADR accepts that window.** The
+  Services API has no conditional create (no `If-Match`, no
+  create-only verb), so a Service someone else creates between that
+  re-read and the `PUT` is replaced by this run's definition and then
+  carries this run's marker. The marker alone cannot reveal it, and the
+  pre-`PUT` read, which saw nothing, cannot either. Generated names would
+  close the window, but the name is the address the user picked (D1), so
+  Temps keeps user-chosen names and bounds the damage instead:
+  - the window is one request long, the same as for Cloudflare DNS in
+    ADR 064 D4, and only an actor who already has a `services`-scoped
+    credential for the tailnet can use it;
+  - what the overwrite replaces is the other Service's definition (its
+    ports and comment). It moves no traffic by itself: a Service routes
+    only to hosts that advertise it and that the tailnet admin approved;
+  - **after the `PUT` the step reads the Service back, including its
+    hosts.** It is `done` only if the marker is this run's *and* every host
+    advertising the name is a worker this run configured. Any other
+    advertising host makes the step `conflict`, even with this run's
+    marker: "`svc:myapp` is also advertised by `nas`, which this setup did
+    not configure. Someone may have created the same name while Temps did;
+    check it before approving." The reconciler and the outside check (D5)
+    keep applying the same rule after the run, so a host that starts
+    advertising the name later is reported too. This check is why reading a
+    Service's hosts is required: if implementation finds that the D2 scopes
+    cannot read them, the Service way in is not offered until a way to read
+    them without `devices:core` is found;
+  - the run never approves hosts (below), so an overwritten name cannot be
+    turned into traffic to Temps' worker without the tailnet admin
+    approving it.
 - **The Serve entry is declared, and applied by the agent.** The run writes
   a desired-entry row (`tailnet_serve_entries`: node, address, way in,
   Service name) and the route snapshot carries it to that worker only. The
@@ -391,7 +419,10 @@ device can give.
 
 **Outside (the control plane):** no tunnel publishes or is publishing the
 name; public DNS returns nothing for it or only Tailscale addresses; and
-the agent reports Funnel off for it. A Funnel entry for the name, or a
+the agent reports Funnel off for it; and, for a Service, every host
+advertising it is a worker Temps configured for this address (D4), read
+from the API with the D2 credential. A foreign host is shown with its name
+and is a failure. A Funnel entry for the name, or a
 `Tailscale-Funnel-Request` seen at the socket, is shown in red ("This
 private address is also on Tailscale Funnel, which makes it public. Run
 `tailscale funnel --https=443 off` on `master`.") and the agent stops
@@ -438,8 +469,10 @@ people or devices.
   `alice@github`) or `tag` (`tag:ci`). Logins are compared exactly after
   ASCII lower-casing; a Q-encoded header is decoded first and one that
   does not decode is refused. Shared-in users carry their own login and
-  are admitted only if listed. An empty list is refused by the plan, and a
-  route with one admits nobody. Editing the list is a sensitive action
+  are admitted only if listed. One principal is a valid list. An empty list
+  is refused by the plan, and a route that arrives with no principals (a
+  bug, or rows removed outside a run) admits nobody: it fails closed rather
+  than falling back to the whole range. Editing the list is a sensitive action
   (step-up), like changing the audience, and is journaled on the run that
   sets it so undo restores the previous list.
 - **Tagged devices carry no user.** Serve sets no identity headers for them
@@ -651,12 +684,38 @@ cross-site `POST`s, so a forged form posts as a signed-out visitor.
 
 ### D11. Self-hosted installs that never opt in are unchanged
 
-Nothing here acts unless a user picks a tailnet name, `tailnet_users` or
-`signed_in`, and the worker owner allowed Serve with `--tailscale-serve`.
-Without that the agent never opens tailscaled's socket, no listener reads a
-`Tailscale-*` header (they are only stripped), no gate path is reserved,
-and password protection behaves as it does today. The new columns default
-to empty, and existing addresses keep their audience.
+Each part acts only when someone opts into it, and the two opt-ins are
+independent:
+
+- **Tailscale (D1–D6).** A tailnet name, or `tailnet_users` on any way in,
+  needs a user to pick it for an address *and* the worker owner to allow it
+  with `--tailscale-serve` (D2). Without both, the agent never opens
+  tailscaled's socket and no listener reads a `Tailscale-*` header (they
+  are only stripped).
+- **Signed in (D7–D10).** `signed_in` needs only a user picking it for an
+  address and an agent that reports `gate.v1`. It never needs
+  `--tailscale-serve` or Tailscale at all, and works on the direct,
+  tunnel and control-plane listeners (D7) of an install that never touches
+  Tailscale. `/_temps/gate/*` is reserved only on the hostnames of
+  addresses whose audience is `signed_in`; every other host passes those
+  paths to the app as today.
+
+Password protection behaves as it does today on every address. Existing
+addresses keep their audience and their phase 2 behaviour (below), and the
+new columns are empty on every address that is not private.
+
+**Migrating phase 2 addresses.** The migration that adds `private_via` (on
+`project_custom_domains` and `environment_domains`, next to
+`private_range`, `private_node_id` and `private_listener`) backfills
+`private_via = 'listener'` on every row whose audience is `private`, since
+the phase 2 listener is the only way in such a row can have. It then adds a
+check that a `private` or `tailnet_users` row has a non-null `private_via`
+and that any other row has none, so no later write can leave a private
+address without one. Routing does not default a missing value: a private
+row that somehow reads with no `private_via` is served by no listener and
+is reported, the same fail-closed rule `Audience::parse` follows (D6).
+Because the backfill and the check land in one migration, there is no
+window in which a phase 2 address is unserved.
 
 ## Security
 
@@ -680,7 +739,11 @@ to empty, and existing addresses keep their audience.
   and the outside check shows it in red (D3, D5).
 - The agent edits only Serve entries it wrote, with conditional writes,
   and only with the worker owner's consent. A Service is never adopted by
-  name, and only one carrying this install's marker is deleted (D4).
+  name, and only one carrying this install's marker is deleted (D4). The
+  Services API cannot create conditionally, so a same-name Service created
+  within one request of Temps' `PUT` can be overwritten. Temps detects it
+  by the Service's hosts rather than its marker, and never approves hosts
+  itself (D4).
 - The Tailscale OAuth client gets `services` and `devices:core:read`, never
   `devices:core`; host approval stays with the tailnet admin (D2). The
   `services` scope is tailnet-wide, and the console says so before saving.
