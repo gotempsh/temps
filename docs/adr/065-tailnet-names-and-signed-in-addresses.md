@@ -246,9 +246,11 @@ Tailscale's token endpoint and keeps those in memory only.
   approval is the tailnet admin's, through the admin console or an
   `autoApprovers` entry the plan shows ready to paste (D4). Whether
   `devices:core:read` is enough to read a Service's hosts is confirmed
-  during implementation; if it is not, the approval step reads approval
-  from what tailscaled reports on the worker (open question 2) instead of
-  asking for a broader scope.
+  during implementation. If it is not, the Service way in stays unavailable
+  until a way to read hosts without `devices:core` is found (D4); Temps does
+  not ask for a broader scope. Approval seen locally on the worker (open
+  question 2) could end the approval wait, but it cannot replace the host
+  read that the Service `done` check and the D5 outside check need.
 - **Each scope is verified before anything is created**, the D8 way: a
   list call for read, and for `services` a `PUT` of a deliberately invalid
   Service name, where "forbidden" proves the scope missing and a validation
@@ -462,10 +464,20 @@ read from the API when planning (absent, or its `comment`, `ports`,
       something the agent did not write, it removes nothing and reports it.
       The step then becomes `conflict` naming what is there, and the row
       stays until the user decides;
-    - **the agent wrote nothing** (it reported `conflict` or `error`, or
-      never reported): there is nothing of Temps' on the worker. The row is
-      deleted without any instruction to the agent, so pre-existing
-      configuration is never touched;
+    - **the agent wrote nothing** (it reported `conflict` or `error`):
+      there is nothing of Temps' on the worker. The row is deleted without
+      any instruction to the agent, so pre-existing configuration is never
+      touched;
+    - **no report arrived:** the agent may have written the entry and lost
+      the report, so silence is not "wrote nothing". The row becomes
+      `removing` with no `applied_etag`. The agent reads its current
+      config, removes a handler only if its target is this address's
+      socket (the D2 ownership rule), and writes with `If-Match` on the
+      `Etag` of that read. It drops the `AdvertiseServices` name only if no
+      handler for that Service is left. It reports `removed`, or `absent`
+      when no such handler was there, and the row is deleted on either.
+      Until a report arrives the step stays pending, like any step the
+      reconciler is waiting on;
     - **the worker is gone from the cluster:** the row is deleted at once.
 
     The step is pending until one of these ends it. It is never done just
@@ -840,7 +852,8 @@ independent:
 
 Password protection behaves as it does today on every address. Existing
 addresses keep their audience and their phase 2 behaviour (below), and the
-new columns are empty on every address that is not private.
+new columns are empty on every address whose audience is neither `private`
+nor `tailnet_users`.
 
 **Migrating phase 2 addresses.** The migration that adds `private_via` (on
 `project_custom_domains` and `environment_domains`, next to
