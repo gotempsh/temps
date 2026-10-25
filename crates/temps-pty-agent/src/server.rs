@@ -164,19 +164,13 @@ impl Tabs {
             return Ok((existing, true));
         }
 
-        // Default env — replicates the shape session_manager gives the
-        // sandbox. Caller can override via the OPEN payload (tests on
-        // macOS need a minimal PATH + their own HOME).
-        let env = req.env.clone().unwrap_or_else(|| {
-            vec![
-                ("TERM".into(), "xterm-256color".into()),
-                (
-                    "PATH".into(),
-                    "/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-                ),
-                ("HOME".into(), std::env::var("HOME").unwrap_or_else(|_| "/home/temps".into())),
-            ]
-        });
+        // Caller can override via the OPEN payload (tests on macOS need a
+        // minimal PATH + their own HOME); otherwise the shell gets the
+        // sandbox's own environment, see `default_shell_env`.
+        let env = req
+            .env
+            .clone()
+            .unwrap_or_else(|| default_shell_env(std::env::vars()));
         let cwd = req.cwd.as_deref().unwrap_or("/workspace");
         let pty = spawn_pty(&req.cmd, cwd, &env, req.cols.max(1), req.rows.max(1))?;
         let Pty {
@@ -529,6 +523,45 @@ pub async fn run(socket_path: &str) -> io::Result<()> {
     }
 }
 
+/// `PATH` every terminal shell gets: the sandbox user's tool directories
+/// first, then the system ones. Pinned rather than inherited because the
+/// agent's own `PATH` can be the minimal one its supervisor started with.
+const SHELL_PATH: &str = "/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Variables the shell maintains itself; inheriting the agent's copies
+/// would start every tab with the agent's working directory and depth.
+const SHELL_OWNED_VARS: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// Environment for a tab opened without an explicit `env`.
+///
+/// Starts from the agent's own environment, which is the sandbox
+/// container's: the egress proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`
+/// and their lowercase forms) and the variables the sandbox owner set.
+/// Dropping those leaves a terminal where `curl`, `git clone` and
+/// `npm install` cannot reach the internet, because a managed sandbox
+/// network only routes outbound traffic through the proxy. `TERM` and
+/// `PATH` are then pinned, and `HOME` defaults to the sandbox user's.
+fn default_shell_env(
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = inherited
+        .into_iter()
+        .filter(|(key, _)| {
+            key != "TERM" && key != "PATH" && !SHELL_OWNED_VARS.contains(&key.as_str())
+        })
+        .collect();
+    if !env
+        .iter()
+        .any(|(key, value)| key == "HOME" && !value.is_empty())
+    {
+        env.retain(|(key, _)| key != "HOME");
+        env.push(("HOME".into(), "/home/temps".into()));
+    }
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("PATH".into(), SHELL_PATH.into()));
+    env
+}
+
 // PermissionsExt import sugar so the single use above reads clean.
 #[allow(unused_imports)]
 use std::os::unix::fs::PermissionsExt;
@@ -674,5 +707,64 @@ mod tests {
         let tail = r.tail(10);
         assert_eq!(tail.len(), 10);
         assert!(tail.iter().all(|&b| b == b'a'));
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn lookup<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn default_shell_env_keeps_the_sandbox_egress_proxy_and_owner_vars() {
+        let env = default_shell_env(pairs(&[
+            ("HTTP_PROXY", "http://temps-sandbox-egress-proxy:3128"),
+            ("https_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("NO_PROXY", "localhost,127.0.0.1"),
+            ("DATABASE_URL", "postgres://db/app"),
+            ("HOME", "/home/temps"),
+        ]));
+        assert_eq!(
+            lookup(&env, "HTTP_PROXY"),
+            Some("http://temps-sandbox-egress-proxy:3128")
+        );
+        assert_eq!(
+            lookup(&env, "https_proxy"),
+            Some("http://temps-sandbox-egress-proxy:3128")
+        );
+        assert_eq!(lookup(&env, "NO_PROXY"), Some("localhost,127.0.0.1"));
+        assert_eq!(lookup(&env, "DATABASE_URL"), Some("postgres://db/app"));
+        assert_eq!(lookup(&env, "HOME"), Some("/home/temps"));
+    }
+
+    #[test]
+    fn default_shell_env_pins_term_and_path_over_the_inherited_ones() {
+        let env = default_shell_env(pairs(&[
+            ("PATH", "/usr/bin"),
+            ("TERM", "dumb"),
+            ("PWD", "/"),
+            ("SHLVL", "3"),
+        ]));
+        assert_eq!(lookup(&env, "PATH"), Some(SHELL_PATH));
+        assert_eq!(lookup(&env, "TERM"), Some("xterm-256color"));
+        assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
+        assert_eq!(lookup(&env, "PWD"), None);
+        assert_eq!(lookup(&env, "SHLVL"), None);
+    }
+
+    #[test]
+    fn default_shell_env_defaults_a_missing_or_empty_home() {
+        let missing = default_shell_env(Vec::new());
+        assert_eq!(lookup(&missing, "HOME"), Some("/home/temps"));
+
+        let empty = default_shell_env(pairs(&[("HOME", "")]));
+        assert_eq!(lookup(&empty, "HOME"), Some("/home/temps"));
+        assert_eq!(empty.iter().filter(|(k, _)| k == "HOME").count(), 1);
     }
 }
