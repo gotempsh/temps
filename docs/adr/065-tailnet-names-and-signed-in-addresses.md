@@ -418,7 +418,9 @@ read from the API when planning (absent, or its `comment`, `ports`,
   that first takes a transaction-scoped advisory lock keyed on
   `(node_id, address_id)`. The lock is taken even when no row exists yet,
   so a run adding a reference and an undo removing the last one can never
-  interleave. Inside that lock:
+  interleave. A run whose entry names a Service first takes that
+  Service's lock (see "Deleting a Service", below), then this one, always
+  in that order. Inside that lock:
   - **no row yet:** the run creates the row and a `created` reference;
   - **a matching row** (same way in and Service name), for example a
     re-run for the address on the same worker: the run adds a `found`
@@ -491,11 +493,22 @@ read from the API when planning (absent, or its `comment`, `ports`,
       this Temps install on 3 May and nothing uses it now." It deletes only
       when the user confirms;
     - confirming is a sensitive action (step-up), journaled with the
-      definition the user was shown. The `DELETE` is sent only if a fresh
-      read still equals it;
-    - declining, or a read that changed, keeps the Service and ends the
-      step as "kept", naming it, so the user can remove it in the admin
-      console.
+      definition the user was shown;
+    - the confirmed delete runs in one transaction holding a
+      transaction-scoped advisory lock keyed on (tailnet, Service name).
+      A run takes the same lock before it adds an entry or a reference
+      for that Service, so none can be added between the checks and the
+      `DELETE`. Under the lock, Temps checks again that no
+      `tailnet_serve_entries` row names the Service on any node, so no
+      `tailnet_serve_refs` row reaches it, and that no host advertises it.
+      It then reads the Service and sends the `DELETE` only if the read
+      still equals the definition the user was shown;
+    - declining, a read that changed, or a check that no longer holds
+      keeps the Service and ends the step as "kept", naming the reason
+      ("`svc:myapp` is used again, by `myapp` on `nas`"). The user can
+      remove a Service that is truly unused in the admin console. A run
+      that waited on the lock and finds the Service deleted creates it
+      afresh, as in "Create only when absent".
   - **A Service still in use is kept.** If entries other runs reference remain, undo
     reports "kept: `svc:myapp` still serves `myapp` on `nas` (set up on
     3 May)" and is done. That is expected, not a conflict.
