@@ -3723,6 +3723,15 @@
               "service_max_size": "20m"
             }
           },
+          "control_plane_resources": {
+            "$ref": "#/components/schemas/ControlPlaneResourceSettings",
+            "default": {
+              "enforce_reservations": false,
+              "system_reserved_cpu_millis": null,
+              "system_reserved_memory_mb": null
+            },
+            "description": "The control plane's (node 0's) scheduling settings, the counterpart\nof `nodes.resource_policy` / `nodes.system_reserved` on worker rows\n(ADR-055 §5). Stored here because node 0 is not a `nodes` row; changed\nthrough `PUT /nodes/0/resources`."
+          },
           "disk_space_alert": {
             "$ref": "#/components/schemas/DiskSpaceAlertSettings",
             "default": {
@@ -5025,6 +5034,20 @@
         "required": [
           "user_id",
           "role_type"
+        ],
+        "type": "object"
+      },
+      "AttachEnvironmentVolumeRequest": {
+        "properties": {
+          "mount_path": {
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mount_path"
         ],
         "type": "object"
       },
@@ -10181,6 +10204,13 @@
             "description": "Whether cluster DNS is currently enabled cluster-wide\n(`AppSettings.cluster_dns.enabled`). When `false`, every node's\nper-node values below are expected to show `dns_resolver_running:\nSome(false)` (or `None` if a node has never reported).",
             "type": "boolean"
           },
+          "name_conflicts": {
+            "description": "Names refused because another owner holds them. Empty on a healthy\ncluster; each entry needs one side renamed or removed.",
+            "items": {
+              "$ref": "#/components/schemas/DnsNameConflictEntry"
+            },
+            "type": "array"
+          },
           "nodes": {
             "items": {
               "$ref": "#/components/schemas/NodeDnsStatusEntry"
@@ -10196,7 +10226,8 @@
         "required": [
           "cluster_dns_enabled",
           "total_record_count",
-          "nodes"
+          "nodes",
+          "name_conflicts"
         ],
         "type": "object"
       },
@@ -12967,6 +12998,37 @@
         ],
         "type": "object"
       },
+      "ControlPlaneResourceSettings": {
+        "description": "The control plane's scheduling settings (ADR-055 §5).\n\n`None` reserves take the §5 default for the control plane, which depends\non whether its PostgreSQL runs on the same host (0.5 vCPU / 1 GB) or not\n(0.25 vCPU / 512 MB). Those defaults are estimates.",
+        "properties": {
+          "enforce_reservations": {
+            "default": false,
+            "description": "`true` = `enforced`: refuse a placement on the control plane whose\nreservations exceed its capacity minus the reserve. `false` (the\ndefault) = `best_effort`.",
+            "type": "boolean"
+          },
+          "system_reserved_cpu_millis": {
+            "default": null,
+            "description": "CPU kept for Temps itself, in millicores. `None` = the default.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "system_reserved_memory_mb": {
+            "default": null,
+            "description": "Memory kept for Temps itself, in megabytes. `None` = the default.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ConversationContext": {
         "description": "How much of the model's context the chat fills right now: the prompt size\nof its latest request, which is the whole conversation, the system framing\nand the tool definitions as the model last saw them.",
         "properties": {
@@ -14664,6 +14726,30 @@
         ],
         "type": "object"
       },
+      "CreateEnvironmentVolumeRequest": {
+        "properties": {
+          "name": {
+            "description": "2-64 characters of `[a-z0-9_.-]`, starting with a letter or digit;\nunique per environment.",
+            "type": "string"
+          },
+          "retain_on_delete": {
+            "description": "Keep the data when the volume is deleted.",
+            "type": "boolean"
+          },
+          "size_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateExternalServiceRequest": {
         "properties": {
           "members": {
@@ -14764,6 +14850,68 @@
           "key",
           "value_type",
           "default_value"
+        ],
+        "type": "object"
+      },
+      "CreateFunctionRequest": {
+        "description": "Exactly one of `wasm_base64` and `image`.",
+        "properties": {
+          "idle_timeout_seconds": {
+            "description": "Seconds without a request before it is stopped. 10..=86400, default 300.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "An OCI image reference that serves HTTP on `port`.",
+            "example": "registry.example.com/team/fn:1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit_mb": {
+            "description": "Memory limit in MiB. 1..=4096.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Lowercase letters, digits and single inner hyphens; unique in the\nproject. Part of the hostname.",
+            "example": "resize-image",
+            "type": "string"
+          },
+          "port": {
+            "description": "Port the function serves on. Default 8080.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wake_timeout_seconds": {
+            "description": "Seconds the first request waits for it to start. 1..=300, default 30.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wasm_base64": {
+            "description": "A WASI preview 1 core module (`wasm32-wasip1`), base64. It serves\nHTTP CGI-style: the request body on stdin, the response on stdout.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -15085,6 +15233,60 @@
         ],
         "type": "object"
       },
+      "CreateIngressLoginGrantRequest": {
+        "description": "The proxy's signed login request, as the `/ingress/login` page received\nit in its query string.",
+        "properties": {
+          "host": {
+            "description": "The hostname, without a port.",
+            "type": "string"
+          },
+          "next": {
+            "description": "Path on the host to return to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "owner_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "owner_kind": {
+            "description": "`environment` or `sandbox` (a sandbox preview host).",
+            "type": "string"
+          },
+          "port": {
+            "description": "The port the visitor reached the host on, when the proxy's request\ncarries one (it leaves out the scheme's default). Pass it through\nunchanged: it is part of the signature.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scheme": {
+            "description": "`http` or `https`: how the visitor reached the host.",
+            "type": "string"
+          },
+          "sig": {
+            "type": "string"
+          },
+          "ts": {
+            "description": "Unix seconds the proxy signed the request at.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "owner_kind",
+          "owner_id",
+          "scheme",
+          "host",
+          "ts",
+          "sig"
+        ],
+        "type": "object"
+      },
       "CreateIntegrationBody": {
         "properties": {
           "provider": {
@@ -15272,6 +15474,78 @@
           "name",
           "monitor_type",
           "environment_id"
+        ],
+        "type": "object"
+      },
+      "CreateNetworkPolicyRuleRequest": {
+        "properties": {
+          "action": {
+            "description": "`allow` or `deny`.",
+            "example": "allow",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "direction": {
+            "description": "`egress` or `ingress`.",
+            "example": "egress",
+            "type": "string"
+          },
+          "peer_kind": {
+            "description": "`service` (by id), `workload` (`<kind>/<id>`) or `cidr`. `host`\nparses but is refused with 409 until a node runs the shared egress\nproxy that enforces hostname rules.",
+            "example": "host",
+            "type": "string"
+          },
+          "peer_ref": {
+            "example": "registry.example.test",
+            "type": "string"
+          },
+          "port_end": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "port_start": {
+            "description": "Omit both ports for every port (80/443 for a `host` rule).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "protocol": {
+            "description": "`tcp` (default), `udp` or `any`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "subject_id": {
+            "description": "Environment id for `deployment`; the row id for the other kinds.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "subject_kind": {
+            "description": "`deployment` (an environment), `sandbox`, `service`, `function` or `job`.",
+            "example": "sandbox",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_kind",
+          "subject_id",
+          "direction",
+          "peer_kind",
+          "peer_ref",
+          "action"
         ],
         "type": "object"
       },
@@ -16201,6 +16475,10 @@
               "null"
             ]
           },
+          "egress_policy": {
+            "$ref": "#/components/schemas/SandboxEgressPolicy",
+            "description": "Which outside destinations the sandbox may reach (temps-native).\nOmit for `{\"mode\": \"internet\"}`: any public destination on ports 80\nand 443. `{\"mode\": \"restricted\", \"rules\": [...]}` allows only the\nlisted hosts (`api.example.com`, or `*.example.com` for subdomains)\nand CIDR blocks, each on its `ports` (default 80 and 443). Private,\nloopback, link-local and metadata addresses are never reachable.\nA restricted policy needs the docker backend; elsewhere the create\nfails with 422. Change it later with `PUT /v1/sandboxes/{id}/egress-policy`."
+          },
           "env": {
             "additionalProperties": {
               "type": "string"
@@ -16337,6 +16615,24 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "CreateSandboxPreviewSessionRequest": {
+        "description": "The console asking to frame a sandbox's preview page.",
+        "properties": {
+          "sandbox_id": {
+            "description": "The sandbox's public id (`sbx_<hex>`).",
+            "type": "string"
+          },
+          "url": {
+            "description": "The preview page to open, as the console would frame it:\n`http(s)://ws-<hex>-<port>.<preview domain>[:port]/path?query`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "url"
+        ],
         "type": "object"
       },
       "CreateSkillRequest": {
@@ -16645,6 +16941,14 @@
       },
       "CronExecutionInfo": {
         "properties": {
+          "attempt": {
+            "description": "Attempts made (1 + retries).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "cron_id": {
             "format": "int32",
             "type": "integer"
@@ -16658,6 +16962,21 @@
           "executed_at": {
             "type": "string"
           },
+          "exit_code": {
+            "description": "Exit code of the run's last attempt.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "description": "When a `job` run finished, ISO 8601 UTC.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "headers": {
             "type": "string"
           },
@@ -16665,9 +16984,23 @@
             "format": "int32",
             "type": "integer"
           },
+          "output_tail": {
+            "description": "The last lines of the run's output, with secret values redacted.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "response_time_ms": {
             "format": "int32",
             "type": "integer"
+          },
+          "state": {
+            "description": "`running | succeeded | failed | skipped` for a `job` run; absent\nfor an `http` call, whose outcome is `status_code`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status_code": {
             "format": "int32",
@@ -16675,6 +17008,14 @@
           },
           "url": {
             "type": "string"
+          },
+          "workload_id": {
+            "description": "The workload the `job` run executed as.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -16690,6 +17031,21 @@
       },
       "CronInfo": {
         "properties": {
+          "command": {
+            "description": "The argv a `job` cron runs. Absent for `http`.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "concurrency_policy": {
+            "description": "`allow | forbid | replace`: what a `job` run does while the previous\none is still active.",
+            "example": "forbid",
+            "type": "string"
+          },
           "created_at": {
             "type": "string"
           },
@@ -16707,6 +17063,11 @@
             "format": "int32",
             "type": "integer"
           },
+          "mode": {
+            "description": "`http` (a GET to `path` on the running deployment) or `job`\n(`command` run in the environment's image until it exits). For a\n`job`, `path` is the cron's key, `job:<name>`.",
+            "example": "http",
+            "type": "string"
+          },
           "next_run": {
             "type": [
               "string",
@@ -16720,8 +17081,37 @@
             "format": "int32",
             "type": "integer"
           },
+          "retry_limit": {
+            "description": "Attempts after the first when a `job` run fails.",
+            "format": "int32",
+            "type": "integer"
+          },
           "schedule": {
             "type": "string"
+          },
+          "starting_deadline_seconds": {
+            "description": "A `job` run that cannot start within this many seconds of its\nscheduled time is skipped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timeout_seconds": {
+            "description": "Maximum run time of a `job` run; absent takes the default (3600).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ttl_seconds_after_finished": {
+            "description": "How long a finished `job` run's container is kept; absent takes the\ndefault (600).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "updated_at": {
             "type": "string"
@@ -16734,7 +17124,10 @@
           "path",
           "schedule",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "mode",
+          "concurrency_policy",
+          "retry_limit"
         ],
         "type": "object"
       },
@@ -17933,6 +18326,29 @@
         },
         "required": [
           "deleted"
+        ],
+        "type": "object"
+      },
+      "DeletedEnvironmentVolumeResponse": {
+        "properties": {
+          "backing_kept_reason": {
+            "description": "Why the data was kept, when it was.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backing_removed": {
+            "description": "The Docker volume (and its data) was removed.",
+            "type": "boolean"
+          },
+          "volume": {
+            "$ref": "#/components/schemas/EnvironmentVolumeResponse"
+          }
+        },
+        "required": [
+          "volume",
+          "backing_removed"
         ],
         "type": "object"
       },
@@ -20402,6 +20818,47 @@
         ],
         "type": "object"
       },
+      "DnsNameConflictEntry": {
+        "description": "An internal DNS name two owners publish (ADR-055 §10). The holder's\nrecords are served; the other owner's publishes are refused, and any\nrecords it had before the conflict was found stay in the zone untouched.\nPart of `GET /api/cluster/dns/status`.",
+        "properties": {
+          "first_seen_at": {
+            "type": "string"
+          },
+          "fqdn": {
+            "description": "The contested name, normalised (lower case, no trailing dot).",
+            "type": "string"
+          },
+          "holder_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "holder_kind": {
+            "description": "Owner that holds the name.",
+            "type": "string"
+          },
+          "last_seen_at": {
+            "type": "string"
+          },
+          "owner_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "owner_kind": {
+            "description": "Owner whose publish is refused: `environment`, `service_role`,\n`service_member`, `node` or `static`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "fqdn",
+          "owner_kind",
+          "owner_id",
+          "holder_kind",
+          "holder_id",
+          "first_seen_at",
+          "last_seen_at"
+        ],
+        "type": "object"
+      },
       "DnsProviderCredentials": {
         "description": "DNS provider credentials (API-facing)",
         "oneOf": [
@@ -22347,6 +22804,95 @@
         ],
         "type": "object"
       },
+      "EffectivePolicyResponse": {
+        "properties": {
+          "enforced": {
+            "type": "boolean"
+          },
+          "enforcing_nodes": {
+            "description": "Nodes whose mode is `enforce`. Empty: the policy is shown but not\nenforced anywhere yet (every node is `legacy` or `shadow`).",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "inbound_links": {
+            "description": "Link rules of other workloads that name this one; they are accepted\neven when this workload's ingress is restricted.",
+            "items": {
+              "$ref": "#/components/schemas/NetworkPolicyRuleResponse"
+            },
+            "type": "array"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/ProfileResponse"
+          },
+          "rules": {
+            "description": "Rules whose subject is this workload.",
+            "items": {
+              "$ref": "#/components/schemas/NetworkPolicyRuleResponse"
+            },
+            "type": "array"
+          },
+          "subject_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "subject_kind": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject_kind",
+          "subject_id",
+          "profile",
+          "rules",
+          "inbound_links",
+          "enforcing_nodes",
+          "enforced"
+        ],
+        "type": "object"
+      },
+      "EgressMode": {
+        "description": "How a sandbox may reach the outside world.",
+        "enum": [
+          "internet",
+          "restricted"
+        ],
+        "type": "string"
+      },
+      "EgressRule": {
+        "additionalProperties": false,
+        "description": "One allowed destination. Exactly one of `host` or `cidr` is set.",
+        "properties": {
+          "cidr": {
+            "description": "An IPv4 or IPv6 address or CIDR block (`198.51.100.7`,\n`2606:4700::/32`), matched against a literal IP the sandbox asked for\nor the address a hostname resolved to.",
+            "example": "1.1.1.0/24",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "description": "A hostname, matched case-insensitively against the name the sandbox\nasked for (`api.example.com`). A leading `*.` matches subdomains only:\n`*.example.com` matches `a.example.com` and `a.b.example.com`, never\n`example.com` itself.",
+            "example": "api.example.com",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ports": {
+            "description": "Destination ports this rule permits, 1-65535. Empty means 80 and 443.",
+            "items": {
+              "format": "int32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "EligibleGitRepositoryResponse": {
         "properties": {
           "accountName": {
@@ -24044,6 +24590,173 @@
           "value"
         ],
         "type": "object"
+      },
+      "EnvironmentVolumeListResponse": {
+        "properties": {
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volumes": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentVolumeResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "volumes",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "EnvironmentVolumeResponse": {
+        "properties": {
+          "attachment": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/VolumeAttachmentDto",
+                "description": "Where replicas mount it; `null` when detached."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "backing": {
+            "description": "`named` (a Docker named volume).",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "ISO 8601, UTC.",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The node holding the data: `null` until first created, `0` for the\ncontrol plane. A replica that mounts it is pinned there.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pin_reason": {
+            "description": "The pin the console shows, e.g. \"pinned to node 0 by volume `data`\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "retain_on_delete": {
+            "type": "boolean"
+          },
+          "size_mb": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "environment_id",
+          "name",
+          "backing",
+          "retain_on_delete",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "EnvironmentVolumeStatusResponse": {
+        "properties": {
+          "active": {
+            "description": "Whether the next deploy mounts them.",
+            "type": "boolean"
+          },
+          "attached": {
+            "description": "Attached volumes.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why they would not be mounted (the next deploy fails with it).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "replicas": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "setup_path": {
+            "description": "Console path that fixes it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "workload_mode": {
+            "$ref": "#/components/schemas/EnvironmentWorkloadMode"
+          }
+        },
+        "required": [
+          "environment_id",
+          "workload_mode",
+          "replicas",
+          "attached",
+          "active"
+        ],
+        "type": "object"
+      },
+      "EnvironmentWorkloadIsolation": {
+        "enum": [
+          "process",
+          "micro_vm"
+        ],
+        "type": "string"
+      },
+      "EnvironmentWorkloadMode": {
+        "enum": [
+          "legacy",
+          "shadow",
+          "enforce"
+        ],
+        "type": "string"
       },
       "ErrorDashboardStatsQuery": {
         "properties": {
@@ -27471,6 +28184,183 @@
           "host",
           "path",
           "status"
+        ],
+        "type": "object"
+      },
+      "FunctionListResponse": {
+        "properties": {
+          "functions": {
+            "items": {
+              "$ref": "#/components/schemas/FunctionResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "functions",
+          "total",
+          "page",
+          "page_size",
+          "total_pages"
+        ],
+        "type": "object"
+      },
+      "FunctionResponse": {
+        "properties": {
+          "artifact_kind": {
+            "description": "`wasm` or `oci`.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hostname": {
+            "description": "Requests to this hostname reach the function.",
+            "type": "string"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "idle_timeout_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "image_reference": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit_mb": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "port": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "ready_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ready_reason": {
+            "description": "Why it is not serving (the plane's `Ready` reason), on the detail view.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "`asleep`, `waking`, `awake`, `sleeping`, or `unregistered`.",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "wake_timeout_seconds": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "wasm_digest": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wasm_size_bytes": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "workload_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "artifact_kind",
+          "port",
+          "idle_timeout_seconds",
+          "wake_timeout_seconds",
+          "hostname",
+          "state",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "FunctionsCapabilityResponse": {
+        "description": "Whether functions can be created here, and what is missing if not.",
+        "properties": {
+          "configured": {
+            "type": "boolean"
+          },
+          "oci": {
+            "$ref": "#/components/schemas/RuntimeAvailabilityResponse"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wasm": {
+            "$ref": "#/components/schemas/RuntimeAvailabilityResponse"
+          }
+        },
+        "required": [
+          "configured",
+          "wasm",
+          "oci"
         ],
         "type": "object"
       },
@@ -31477,6 +32367,16 @@
               "null"
             ]
           },
+          "instances": {
+            "description": "What the node runtime observed of the workload instances assigned to\nthis node (ADR-055 §7), only those that changed since its last\naccepted heartbeat. Sent by agents that advertise the `state_stream`\ncapability; absent from older agents. A report this control plane\ncannot read is dropped (and logged), never the heartbeat.",
+            "items": {
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "labels": {
             "description": "Updated node labels for scheduling (allows runtime label changes)."
           },
@@ -31495,6 +32395,10 @@
       },
       "HeartbeatResponse": {
         "properties": {
+          "instances_accepted": {
+            "description": "Whether the instance reports in this heartbeat (ADR-055 §7) were\nrecorded. `false` when it carried none, when recording them failed,\nor when this process runs no node state stream: the node must keep\nresending them until a heartbeat answers `true`. The heartbeat itself\nstill succeeds, so a failed ingest never costs the node its liveness.\nAbsent from older servers, which agents read as `false`.",
+            "type": "boolean"
+          },
           "message": {
             "type": "string"
           },
@@ -31504,7 +32408,8 @@
         },
         "required": [
           "status",
-          "message"
+          "message",
+          "instances_accepted"
         ],
         "type": "object"
       },
@@ -33301,6 +34206,75 @@
         },
         "required": [
           "errors"
+        ],
+        "type": "object"
+      },
+      "IngressLoginGrantResponse": {
+        "properties": {
+          "expires_at": {
+            "description": "When the session this grant can start expires.\nISO 8601, UTC.",
+            "type": "string"
+          },
+          "grant_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "redirect_url": {
+            "description": "Where the browser goes next: the host's exchange path with a\nshort-lived grant. Contains a credential; do not store it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "redirect_url",
+          "grant_id",
+          "expires_at"
+        ],
+        "type": "object"
+      },
+      "IngressMode": {
+        "enum": [
+          "legacy",
+          "shadow",
+          "enforce"
+        ],
+        "type": "string"
+      },
+      "IngressSettingsResponse": {
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "login_enforced": {
+            "description": "Whether the proxy asks for the login right now: only in `enforce`.",
+            "type": "boolean"
+          },
+          "login_permission": {
+            "description": "The console permission a visitor needs, when a login is required.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IngressMode",
+            "description": "`legacy`: the existing access chain decides. `shadow`: it still\ndecides, and the compiled endpoint is evaluated alongside and every\ndisagreement counted (`proxy.ingress_shadow_mismatches`). `enforce`:\nthe compiled endpoint decides."
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "require_login": {
+            "description": "Whether visitors must sign in to Temps.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_id",
+          "mode",
+          "require_login",
+          "login_enforced"
         ],
         "type": "object"
       },
@@ -38804,6 +39778,146 @@
           }
         ]
       },
+      "NetworkPolicyRuleListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/NetworkPolicyRuleResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "NetworkPolicyRuleResponse": {
+        "properties": {
+          "action": {
+            "example": "allow",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "direction": {
+            "example": "egress",
+            "type": "string"
+          },
+          "enforceable": {
+            "description": "False for a `host` rule: hostname rules are enforced only by the\nshared egress proxy, which no node runs yet, so such a rule (stored\nbefore new ones were refused) is shown but never enforced.",
+            "type": "boolean"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "link_id": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "link_table": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "origin": {
+            "description": "`link` rules are removed by unlinking, not deleted directly.",
+            "example": "operator",
+            "type": "string"
+          },
+          "peer_kind": {
+            "example": "service",
+            "type": "string"
+          },
+          "peer_ref": {
+            "example": "12",
+            "type": "string"
+          },
+          "port_end": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "port_start": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "protocol": {
+            "example": "tcp",
+            "type": "string"
+          },
+          "subject_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "subject_kind": {
+            "example": "sandbox",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "subject_kind",
+          "subject_id",
+          "direction",
+          "peer_kind",
+          "peer_ref",
+          "protocol",
+          "action",
+          "origin",
+          "created_at",
+          "updated_at",
+          "enforceable"
+        ],
+        "type": "object"
+      },
       "NetworkPoolEntry": {
         "description": "Cluster-wide pool which every node must use. This is intentionally sent\nalongside the local allocation so operators and agents can detect stale or\nindependently configured nodes before routes are changed.",
         "properties": {
@@ -39225,6 +40339,36 @@
         ],
         "type": "object"
       },
+      "NodeExclusionDto": {
+        "properties": {
+          "excluded": {
+            "description": "`false` when the node was kept with a warning.",
+            "type": "boolean"
+          },
+          "message": {
+            "type": "string"
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "The `Scheduled` condition reason, e.g. `NodeDraining`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "reason",
+          "message",
+          "excluded"
+        ],
+        "type": "object"
+      },
       "NodeInfoResponse": {
         "properties": {
           "address": {
@@ -39347,6 +40491,63 @@
         ],
         "type": "object"
       },
+      "NodeNetworkPolicyModeListResponse": {
+        "properties": {
+          "nodes": {
+            "items": {
+              "$ref": "#/components/schemas/NodeNetworkPolicyModeResponse"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "nodes"
+        ],
+        "type": "object"
+      },
+      "NodeNetworkPolicyModeResponse": {
+        "properties": {
+          "enforcement_unavailable_reason": {
+            "description": "Why `shadow`/`enforce` is unavailable, when `supports_enforcement`\nis false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "description": "`legacy` (today's behaviour), `shadow` (computed and logged, not\napplied) or `enforce`.",
+            "example": "legacy",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "node_id": {
+            "description": "0 is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "role": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "supports_enforcement": {
+            "description": "Whether this node can run `shadow` or `enforce`. False on workers:\nno enforcer runs there yet, and a stored non-legacy mode on a worker\nis never counted as enforcing.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id",
+          "name",
+          "role",
+          "status",
+          "mode",
+          "supports_enforcement"
+        ],
+        "type": "object"
+      },
       "NodePairingListResponse": {
         "properties": {
           "pairings": {
@@ -39466,6 +40667,68 @@
           "project_id",
           "project_name",
           "target_nodes"
+        ],
+        "type": "object"
+      },
+      "NodeRecommendationDto": {
+        "properties": {
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "score": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "score",
+          "reasons"
+        ],
+        "type": "object"
+      },
+      "NodeResourcePolicy": {
+        "description": "Whether the scheduler counts reservations against a node's capacity.",
+        "enum": [
+          "best_effort",
+          "enforced"
+        ],
+        "type": "string"
+      },
+      "NodeResourcesResponse": {
+        "properties": {
+          "node_id": {
+            "description": "`0` is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "resource_policy": {
+            "$ref": "#/components/schemas/NodeResourcePolicy"
+          },
+          "system_reserved": {
+            "$ref": "#/components/schemas/SystemReserved"
+          },
+          "system_reserved_is_default": {
+            "description": "Whether `system_reserved` is the default for the node's role. The\ndefaults are ADR-055 §5 estimates, not measurements.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "node_id",
+          "resource_policy",
+          "system_reserved",
+          "system_reserved_is_default"
         ],
         "type": "object"
       },
@@ -39903,6 +41166,51 @@
           "address",
           "algorithm",
           "fingerprint"
+        ],
+        "type": "object"
+      },
+      "NodeStateStatusResponse": {
+        "description": "The stream's state and metrics.",
+        "properties": {
+          "configured": {
+            "description": "Whether the workload plane (and so the stream) runs in this process.",
+            "type": "boolean"
+          },
+          "full_snapshots": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "markers_swept": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reads": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why not, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "watermark_lag_ms": {
+            "description": "How far the visibility watermark lags behind the oldest marker it\nholds back, in milliseconds (an old open transaction holds it).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "configured",
+          "watermark_lag_ms",
+          "reads",
+          "full_snapshots",
+          "markers_swept"
         ],
         "type": "object"
       },
@@ -43154,6 +44462,67 @@
         ],
         "type": "object"
       },
+      "PendingChanges": {
+        "description": "What recreating a database's container from its workload spec would\nchange, listed before anything is changed. A recreate is only accepted\nwith this response's `fingerprint`, so what the administrator confirmed\nis what is applied.",
+        "properties": {
+          "changes": {
+            "items": {
+              "$ref": "#/components/schemas/WorkloadChange"
+            },
+            "type": "array"
+          },
+          "computed_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "container_found": {
+            "description": "Whether the database's container exists to compare against.",
+            "type": "boolean"
+          },
+          "container_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fingerprint": {
+            "description": "Identifies `changes`: pass it back to confirm a recreate.",
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ServiceWorkloadMode"
+          },
+          "node_id": {
+            "description": "`None`: the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "support": {
+            "$ref": "#/components/schemas/WorkloadSupport"
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "mode",
+          "support",
+          "container_found",
+          "changes",
+          "fingerprint",
+          "computed_at"
+        ],
+        "type": "object"
+      },
       "PerformanceMetricsQuery": {
         "allOf": [
           {
@@ -43707,6 +45076,66 @@
         ],
         "type": "object"
       },
+      "PinningRecommendationResponse": {
+        "properties": {
+          "changes_placement": {
+            "type": "boolean"
+          },
+          "current_nodes": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "moved_between_nodes": {
+            "description": "Unpinned and moved between nodes: show the recommendation.",
+            "type": "boolean"
+          },
+          "nodes_used": {
+            "description": "Distinct nodes the environment ran on in the window.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "recommended_nodes": {
+            "description": "The recommended `target_nodes`. Recommended, never applied.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "window_days": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "environment_id",
+          "window_days",
+          "nodes_used",
+          "moved_between_nodes",
+          "recommended_nodes",
+          "reasons",
+          "current_nodes",
+          "changes_placement"
+        ],
+        "type": "object"
+      },
       "PipelineHistoryPoint": {
         "description": "One `(timestamp, value)` sample in a pipeline series.",
         "properties": {
@@ -43895,6 +45324,70 @@
         },
         "required": [
           "stats"
+        ],
+        "type": "object"
+      },
+      "PlacementExplanationResponse": {
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "excluded": {
+            "items": {
+              "$ref": "#/components/schemas/NodeExclusionDto"
+            },
+            "type": "array"
+          },
+          "pinned_by": {
+            "description": "Why the environment is pinned by its volumes, e.g. \"pinned to node 0\nby volume `data`\" (ADR-055 §12). `null` without attached volumes.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "placement": {
+            "description": "Where the unified scheduler would put each replica now (`0` = the\ncontrol plane).",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "recommended": {
+            "description": "Eligible nodes, best first.",
+            "items": {
+              "$ref": "#/components/schemas/NodeRecommendationDto"
+            },
+            "type": "array"
+          },
+          "unschedulable": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unschedulable_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "environment_id",
+          "recommended",
+          "excluded",
+          "warnings"
         ],
         "type": "object"
       },
@@ -44454,6 +45947,38 @@
         ],
         "type": "object"
       },
+      "PreviewAccessResponse": {
+        "description": "A sandbox's preview access settings.",
+        "properties": {
+          "id": {
+            "description": "Sandbox public id (`sbx_...`).",
+            "type": "string"
+          },
+          "preview_access": {
+            "$ref": "#/components/schemas/SandboxPreviewAccess"
+          },
+          "preview_allowed_cidrs": {
+            "description": "Normalised CIDRs. Empty = any client address.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "preview_password_hint": {
+            "description": "Last 4 characters of the preview password, when one is set.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "preview_access",
+          "preview_allowed_cidrs"
+        ],
+        "type": "object"
+      },
       "PreviewDomainDeliveryBindingRequest": {
         "properties": {
           "delivery_profile_id": {
@@ -44774,6 +46299,32 @@
         "required": [
           "title",
           "extensions"
+        ],
+        "type": "object"
+      },
+      "ProfileResponse": {
+        "properties": {
+          "egress": {
+            "example": "restricted",
+            "type": "string"
+          },
+          "egress_source": {
+            "description": "`default` (the kind's) or `override`.",
+            "type": "string"
+          },
+          "ingress": {
+            "example": "open",
+            "type": "string"
+          },
+          "ingress_source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "egress",
+          "ingress",
+          "egress_source",
+          "ingress_source"
         ],
         "type": "object"
       },
@@ -49155,6 +50706,53 @@
           }
         ]
       },
+      "RecreateFromWorkloadSpecRequest": {
+        "properties": {
+          "confirmed_fingerprint": {
+            "description": "The `fingerprint` of the pending changes being confirmed. Leave out\nto only list them: nothing is recreated without it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "RecreateFromWorkloadSpecResponse": {
+        "properties": {
+          "pending_changes": {
+            "$ref": "#/components/schemas/PendingChanges",
+            "description": "The changes to confirm, or the changes that were applied."
+          },
+          "remaining_changes": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PendingChanges",
+                "description": "After a recreate: what still differs (empty when it worked)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/RecreateStatus"
+          }
+        },
+        "required": [
+          "status",
+          "pending_changes"
+        ],
+        "type": "object"
+      },
+      "RecreateStatus": {
+        "description": "What a recreate request did.",
+        "enum": [
+          "confirmation_required",
+          "recreated"
+        ],
+        "type": "string"
+      },
       "ReferrerCount": {
         "properties": {
           "count": {
@@ -51906,6 +53504,23 @@
         ],
         "type": "object"
       },
+      "RuntimeAvailabilityResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "available"
+        ],
+        "type": "object"
+      },
       "RuntimeCoverage": {
         "properties": {
           "availability_percent": {
@@ -52452,6 +54067,23 @@
         ],
         "type": "object"
       },
+      "SandboxEgressPolicy": {
+        "additionalProperties": false,
+        "description": "A sandbox's egress policy. Build it from untrusted input with\n[`SandboxEgressPolicy::normalized`], which validates it and puts it in its\ncanonical form; only a normalized policy is stored or enforced.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/EgressMode"
+          },
+          "rules": {
+            "description": "Allowed destinations, in `restricted` mode. At most 100.",
+            "items": {
+              "$ref": "#/components/schemas/EgressRule"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
       "SandboxEntry": {
         "description": "One entry of a sandbox directory.",
         "properties": {
@@ -52641,6 +54273,10 @@
               "null"
             ]
           },
+          "egress_policy": {
+            "$ref": "#/components/schemas/SandboxEgressPolicy",
+            "description": "Which outside destinations the sandbox may reach (temps-native)."
+          },
           "id": {
             "type": "string"
           },
@@ -52673,6 +54309,17 @@
           "node_name": {
             "description": "Name of the hosting node; `\"control-plane\"` for control-plane\nsandboxes.",
             "type": "string"
+          },
+          "preview_access": {
+            "$ref": "#/components/schemas/SandboxPreviewAccess",
+            "description": "Who may open the preview URLs: `temps_login` (a signed-in Temps user\nwho may read this sandbox; the default), `password` (whoever knows the\npreview password) or `public` (anyone)."
+          },
+          "preview_allowed_cidrs": {
+            "description": "Client networks allowed to open the preview URLs, as normalised\nCIDRs. Checked before `preview_access`; empty = any address.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "preview_password_hint": {
             "type": [
@@ -52742,8 +54389,11 @@
           "cwd",
           "name",
           "preview_url_template",
+          "preview_access",
+          "preview_allowed_cidrs",
           "lifecycle",
-          "node_name"
+          "node_name",
+          "egress_policy"
         ],
         "type": "object"
       },
@@ -52797,6 +54447,15 @@
           "nodes"
         ],
         "type": "object"
+      },
+      "SandboxPreviewAccess": {
+        "description": "Who may open a sandbox's preview URLs (ADR-055 §11: sandboxes default to\n`TempsLogin`, never anonymous by default).\n\nStored on the sandbox row (`sandboxes.preview_access`). The sandbox's IP\nallow-list (`sandboxes.preview_allowed_cidrs`) is checked before any of\nthese, so `Public` plus an allow-list means \"anyone from these networks\".",
+        "enum": [
+          "temps_login",
+          "password",
+          "public"
+        ],
+        "type": "string"
       },
       "SandboxResponse": {
         "description": "`@vercel/sandbox` wraps every single-sandbox response as\n`{ sandbox: {...}, routes: [...] }`. The SDK reads both.",
@@ -55697,6 +57356,53 @@
         },
         "type": "object"
       },
+      "ServiceWorkloadMode": {
+        "enum": [
+          "legacy",
+          "shadow",
+          "enforce"
+        ],
+        "type": "string"
+      },
+      "ServiceWorkloadModeResponse": {
+        "description": "A database's workload mode.",
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ServiceWorkloadMode",
+            "description": "`legacy`: the engine (or the worker's agent) builds its own\ncontainer request. `shadow`: the same, and a background pass logs\nwhere the running container differs from its workload spec.\n`enforce`: the container is created from its admitted spec through\nthe Docker driver, the next time it is created or recreated."
+          },
+          "node_id": {
+            "description": "`None`: the database runs on the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "service_name": {
+            "type": "string"
+          },
+          "service_type": {
+            "type": "string"
+          },
+          "support": {
+            "$ref": "#/components/schemas/WorkloadSupport",
+            "description": "Whether the database can leave `legacy`, and why not."
+          }
+        },
+        "required": [
+          "service_id",
+          "service_name",
+          "service_type",
+          "mode",
+          "support"
+        ],
+        "type": "object"
+      },
       "SesCredentialsRequest": {
         "properties": {
           "access_key_id": {
@@ -56754,6 +58460,18 @@
         ],
         "type": "object"
       },
+      "SetNodeNetworkPolicyModeRequest": {
+        "properties": {
+          "mode": {
+            "example": "shadow",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode"
+        ],
+        "type": "object"
+      },
       "SetNodePublicIngressRequest": {
         "properties": {
           "enabled": {
@@ -56781,6 +58499,33 @@
         ],
         "type": "object"
       },
+      "SetNodeResourcesRequest": {
+        "properties": {
+          "resource_policy": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NodeResourcePolicy",
+                "description": "`best_effort` (default: reservations are not checked) or `enforced`\n(a placement that does not fit the schedulable capacity is refused)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "system_reserved": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SystemReserved",
+                "description": "What to keep for the OS and Temps itself; deducted before the load\nthreshold and, on an enforced node, before reservations."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SetPreviewPasswordBody": {
         "properties": {
           "password": {
@@ -56803,6 +58548,24 @@
         "required": [
           "preview_password_hint"
         ],
+        "type": "object"
+      },
+      "SetProfileRequest": {
+        "properties": {
+          "egress": {
+            "description": "`open`, `restricted`, `none`, or omitted for the kind's default.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ingress": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "SetProjectHostingRequest": {
@@ -56930,6 +58693,30 @@
         },
         "required": [
           "hub"
+        ],
+        "type": "object"
+      },
+      "SetWorkloadIsolationRequest": {
+        "properties": {
+          "workload_isolation": {
+            "$ref": "#/components/schemas/EnvironmentWorkloadIsolation",
+            "description": "`process` (a container, the default and the rollback) or `micro_vm`\n(a Firecracker microVM; placed only on a node whose runtime provides\nit, refused with the scheduler's reason otherwise). Honoured only\nwhen the environment's `workload_mode` is `enforce`."
+          }
+        },
+        "required": [
+          "workload_isolation"
+        ],
+        "type": "object"
+      },
+      "SetWorkloadModeRequest": {
+        "properties": {
+          "workload_mode": {
+            "$ref": "#/components/schemas/EnvironmentWorkloadMode",
+            "description": "`legacy` (today's deploy path), `shadow` (legacy, plus a logged\nunified-scheduler comparison) or `enforce` (control-plane replicas run\nthrough the workload plane). `legacy` is the rollback."
+          }
+        },
+        "required": [
+          "workload_mode"
         ],
         "type": "object"
       },
@@ -57242,6 +59029,22 @@
         },
         "required": [
           "webhook_url"
+        ],
+        "type": "object"
+      },
+      "SleepFunctionResponse": {
+        "properties": {
+          "function": {
+            "$ref": "#/components/schemas/FunctionResponse"
+          },
+          "slept": {
+            "description": "Whether it was running and is now stopped.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "function",
+          "slept"
         ],
         "type": "object"
       },
@@ -60097,6 +61900,26 @@
         },
         "required": [
           "is_valid_syntax"
+        ],
+        "type": "object"
+      },
+      "SystemReserved": {
+        "description": "The capacity Temps keeps for itself on a node: a scheduling deduction,\nnot a CPU priority (ADR-055 §5).",
+        "properties": {
+          "cpu_millis": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "memory_mb": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cpu_millis",
+          "memory_mb"
         ],
         "type": "object"
       },
@@ -64952,6 +66775,29 @@
         ],
         "type": "object"
       },
+      "UpdateIngressSettingsRequest": {
+        "properties": {
+          "mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/IngressMode",
+                "description": "Leave out to keep the current mode."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "require_login": {
+            "description": "Leave out to keep the current setting.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateIpAccessControlRequest": {
         "description": "Request to update an IP access control rule",
         "properties": {
@@ -65386,6 +67232,28 @@
         },
         "required": [
           "preferences"
+        ],
+        "type": "object"
+      },
+      "UpdatePreviewAccessBody": {
+        "additionalProperties": false,
+        "description": "Request body for `PUT /v1/sandboxes/{id}/preview-access`. Both members\nare required: the call replaces the whole setting, so an omitted\nallow-list can never be read as \"clear it\".",
+        "properties": {
+          "access": {
+            "$ref": "#/components/schemas/SandboxPreviewAccess",
+            "description": "`temps_login` | `password` | `public`. `password` is refused while\nthe sandbox has no preview password (set one with\n`PUT /v1/sandboxes/{id}/preview-password`, which also selects it)."
+          },
+          "allowed_cidrs": {
+            "description": "IPv4/IPv6 addresses or CIDRs allowed to open the preview URLs, at\nmost 50. A single address is stored as a `/32` or `/128`; a CIDR as\nits network address. Empty = any client address.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "access",
+          "allowed_cidrs"
         ],
         "type": "object"
       },
@@ -66392,6 +68260,17 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateWorkloadModeRequest": {
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/ServiceWorkloadMode"
+          }
+        },
+        "required": [
+          "mode"
+        ],
         "type": "object"
       },
       "UpgradeExternalServiceRequest": {
@@ -68599,6 +70478,22 @@
         ],
         "type": "object"
       },
+      "VolumeAttachmentDto": {
+        "properties": {
+          "mount_path": {
+            "description": "Absolute path inside every replica.",
+            "type": "string"
+          },
+          "read_only": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mount_path",
+          "read_only"
+        ],
+        "type": "object"
+      },
       "VolumeMount": {
         "description": "Volume mount in deployment",
         "properties": {
@@ -69610,6 +71505,29 @@
         ],
         "type": "object"
       },
+      "WorkloadChange": {
+        "description": "One thing a recreate from the spec would change.",
+        "properties": {
+          "after_recreate": {
+            "description": "What the container will have once recreated from its spec.",
+            "type": "string"
+          },
+          "current": {
+            "description": "What the running container has. Secrets are shown as `***`.",
+            "type": "string"
+          },
+          "field": {
+            "description": "`labels`, `restart_policy`, `pids_limit`, `no_new_privileges`,\n`healthcheck`, `log_config`, ...",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field",
+          "current",
+          "after_recreate"
+        ],
+        "type": "object"
+      },
       "WorkloadDescriptor": {
         "description": "Brief descriptor for discovered workloads (used in listing)",
         "properties": {
@@ -69670,6 +71588,69 @@
         "description": "Unique identifier for a workload in the source system",
         "type": "string"
       },
+      "WorkloadIsolationResponse": {
+        "properties": {
+          "applies": {
+            "description": "Whether the setting takes effect: only `enforce` deployments run\nthrough the plane, so `legacy` and `shadow` keep a container.",
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "workload_isolation": {
+            "$ref": "#/components/schemas/EnvironmentWorkloadIsolation"
+          }
+        },
+        "required": [
+          "environment_id",
+          "workload_isolation",
+          "applies"
+        ],
+        "type": "object"
+      },
+      "WorkloadModeChangeResponse": {
+        "properties": {
+          "pending_changes": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PendingChanges",
+                "description": "What a recreate from the spec would change, when the new mode is not\n`legacy` and the container could be read. Nothing has changed yet."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "previous_mode": {
+            "$ref": "#/components/schemas/ServiceWorkloadMode"
+          },
+          "workload": {
+            "$ref": "#/components/schemas/ServiceWorkloadModeResponse"
+          }
+        },
+        "required": [
+          "previous_mode",
+          "workload"
+        ],
+        "type": "object"
+      },
+      "WorkloadModeResponse": {
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "workload_mode": {
+            "$ref": "#/components/schemas/EnvironmentWorkloadMode"
+          }
+        },
+        "required": [
+          "environment_id",
+          "workload_mode"
+        ],
+        "type": "object"
+      },
       "WorkloadStatus": {
         "description": "Workload status in source system",
         "enum": [
@@ -69683,6 +71664,25 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "WorkloadSupport": {
+        "description": "Whether a database can leave `legacy`, and why not.",
+        "properties": {
+          "reason": {
+            "description": "Why the database stays on its engine's own path, when unsupported.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "supported": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported"
+        ],
+        "type": "object"
       },
       "WorkloadType": {
         "description": "Workload type",
@@ -97275,6 +99275,372 @@
         ]
       }
     },
+    "/external-services/{id}/workload-mode": {
+      "get": {
+        "operationId": "get_workload_mode",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceWorkloadModeResponse"
+                }
+              }
+            },
+            "description": "The database's workload mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "operationId": "update_workload_mode",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateWorkloadModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadModeChangeResponse"
+                }
+              }
+            },
+            "description": "Mode changed; nothing running changed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The database cannot use this mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/workload-mode/pending-changes": {
+      "get": {
+        "operationId": "get_workload_pending_changes",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PendingChanges"
+                }
+              }
+            },
+            "description": "What a recreate from the workload spec would change"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The node's agent must be upgraded"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
+    "/external-services/{id}/workload-mode/recreate": {
+      "post": {
+        "operationId": "recreate_from_workload_spec",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RecreateFromWorkloadSpecRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RecreateFromWorkloadSpecResponse"
+                }
+              }
+            },
+            "description": "The changes to confirm, or the recreate's result"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrator required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Service not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not in enforce mode, or the pending changes changed since they were shown"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The workload spec was refused at admission"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The recreate failed; the original container was kept"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{service_id}/pg-stat-statements/enable": {
       "post": {
         "description": "Stops the container and restarts it so that the\n`shared_preload_libraries=pg_stat_statements` CMD flag (baked into every\nnew standalone Postgres container) takes effect. The named data volume is\nreused unchanged — no data is lost.\n\n**Clustered (HA) services are rejected** with 422 — a blind single-container\nrestart bypasses controlled failover. For clustered services the response\nbody describes the manual rolling-restart steps.\n\nConfirmation is the caller's responsibility (UI dialog / CLI `--yes` flag)\nbefore invoking this endpoint.",
@@ -98807,6 +101173,37 @@
         "summary": "Every flag for the caller's environment, collapsed to what the evaluator\nneeds.",
         "tags": [
           "Feature Flags"
+        ]
+      }
+    },
+    "/functions/capability": {
+      "get": {
+        "operationId": "get_capability",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionsCapabilityResponse"
+                }
+              }
+            },
+            "description": "Whether functions can run here"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
         ]
       }
     },
@@ -101776,6 +104173,197 @@
         "x-maturity": "beta"
       }
     },
+    "/ingress/login-grants": {
+      "post": {
+        "operationId": "create_ingress_login_grant",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateIngressLoginGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressLoginGrantResponse"
+                }
+              }
+            },
+            "description": "Grant issued; send the browser to redirect_url"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Malformed login request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a browser session, a bad or expired signature, or insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment or sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The environment or sandbox preview does not require a Temps login"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Environments"
+        ]
+      }
+    },
+    "/ingress/sandbox-preview-sessions": {
+      "post": {
+        "operationId": "create_sandbox_preview_session",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSandboxPreviewSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressLoginGrantResponse"
+                }
+              }
+            },
+            "description": "Grant issued; load redirect_url in the frame (or tab) that shows the preview. It signs the browser in to that preview host and lands on the requested page"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The URL is not one of the sandbox's preview pages"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a browser session, not the sandbox's owner, or insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox's preview does not ask for a Temps login (it is public or password-protected): load the URL as it is, or use a preview link"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Signs the console's own browser in to a `temps_login` sandbox preview\nwithout showing the sign-in page: the same grant `/ingress/login-grants`\nissues after that page, for a console that already has a session and\nwants to frame the preview.",
+        "tags": [
+          "Sandboxes"
+        ]
+      }
+    },
     "/instantiations": {
       "get": {
         "operationId": "list_instantiations",
@@ -102229,6 +104817,1112 @@
         ],
         "tags": [
           "CI runner"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/placement/explain": {
+      "get": {
+        "operationId": "admin_explain_environment_placement",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PlacementExplanationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid placement settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/placement/recommendation": {
+      "get": {
+        "operationId": "admin_environment_pinning_recommendation",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "History window in days (1-90, default 7).",
+            "in": "query",
+            "name": "window_days",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PinningRecommendationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid window"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/volumes": {
+      "get": {
+        "operationId": "admin_list_environment_volumes",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, at most 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVolumeListResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      },
+      "post": {
+        "operationId": "admin_create_environment_volume",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateEnvironmentVolumeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVolumeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid volume"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Name taken"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/volumes/status": {
+      "get": {
+        "operationId": "admin_environment_volume_status",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVolumeStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/volumes/{volume_id}": {
+      "delete": {
+        "operationId": "admin_delete_environment_volume",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Volume ID",
+            "in": "path",
+            "name": "volume_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeletedEnvironmentVolumeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Volume not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Volume still mounted"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/volumes/{volume_id}/attachment": {
+      "delete": {
+        "operationId": "admin_detach_environment_volume",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Volume ID",
+            "in": "path",
+            "name": "volume_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVolumeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Volume not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      },
+      "put": {
+        "operationId": "admin_attach_environment_volume",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Volume ID",
+            "in": "path",
+            "name": "volume_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachEnvironmentVolumeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentVolumeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mount path"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment or volume not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Mount path taken"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Volumes"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/workload-isolation": {
+      "get": {
+        "operationId": "admin_get_environment_workload_isolation",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadIsolationResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      },
+      "put": {
+        "operationId": "admin_set_environment_workload_isolation",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetWorkloadIsolationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadIsolationResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid isolation"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      }
+    },
+    "/internal/environments/{environment_id}/workload-mode": {
+      "get": {
+        "operationId": "admin_get_environment_workload_mode",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadModeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      },
+      "put": {
+        "operationId": "admin_set_environment_workload_mode",
+        "parameters": [
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetWorkloadModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkloadModeResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
         ]
       }
     },
@@ -102827,6 +106521,61 @@
         ]
       }
     },
+    "/internal/nodes/{node_id}/instances/{instance_id}/env": {
+      "get": {
+        "operationId": "node_instance_env",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Workload instance ID",
+            "in": "path",
+            "name": "instance_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "The instance's environment (not cacheable)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Not an unfinished instance of this node"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "The workload plane is not running"
+          }
+        },
+        "summary": "The environment of one of a node's instances, to create it",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
     "/internal/nodes/{node_id}/network/peers": {
       "get": {
         "operationId": "list_peers",
@@ -103025,6 +106774,176 @@
         ]
       }
     },
+    "/internal/nodes/{node_id}/resources": {
+      "get": {
+        "operationId": "admin_get_node_resources",
+        "parameters": [
+          {
+            "description": "Node ID; 0 is the control plane",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeResourcesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Node not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      },
+      "put": {
+        "operationId": "admin_set_node_resources",
+        "parameters": [
+          {
+            "description": "Node ID; 0 is the control plane",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetNodeResourcesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeResourcesResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid reserve"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance admin required"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Node not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Storage failed"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Workload Placement"
+        ]
+      }
+    },
     "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}": {
       "get": {
         "description": "Agents call this endpoint to receive the S3 credentials they need to upload\nor download backups. The credentials are decrypted from the stored S3 source\nand returned over the authenticated TLS/WireGuard channel.",
@@ -103073,6 +106992,131 @@
           }
         },
         "summary": "Get decrypted S3 credentials for a backup/restore operation.",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/state": {
+      "get": {
+        "operationId": "read_node_state",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The cursor of the last answer applied (`0` or absent: the whole view).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "How long to wait for a change, in seconds (at most 25).",
+            "in": "query",
+            "name": "wait_secs",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Changes since the cursor, or the whole view"
+          },
+          "400": {
+            "description": "Invalid cursor"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "The workload plane is not running"
+          }
+        },
+        "summary": "Read a node's desired state since a cursor (long-poll)",
+        "tags": [
+          "Nodes"
+        ]
+      }
+    },
+    "/internal/nodes/{node_id}/state/ack": {
+      "post": {
+        "operationId": "ack_node_state",
+        "parameters": [
+          {
+            "description": "Node ID",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Recorded"
+          },
+          "400": {
+            "description": "Invalid cursor"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Node not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "The workload plane is not running"
+          }
+        },
+        "summary": "Record the cursors a node applied, per object kind",
         "tags": [
           "Nodes"
         ]
@@ -105992,6 +110036,730 @@
         "summary": "Get uptime history for a monitor",
         "tags": [
           "Status Page"
+        ]
+      }
+    },
+    "/network-policy/nodes": {
+      "get": {
+        "operationId": "list_node_modes",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeNetworkPolicyModeListResponse"
+                }
+              }
+            },
+            "description": "Every node's mode; node 0 is the control plane"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/network-policy/nodes/{node_id}": {
+      "patch": {
+        "operationId": "set_node_mode",
+        "parameters": [
+          {
+            "description": "Node id; 0 is the control plane",
+            "in": "path",
+            "name": "node_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetNodeNetworkPolicyModeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeNetworkPolicyModeResponse"
+                }
+              }
+            },
+            "description": "The node's mode now"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown mode"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrators only"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such node"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/network-policy/rules": {
+      "get": {
+        "operationId": "list_rules",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "subject_kind",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "subject_id",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "`link`, `operator` or `system`.",
+            "in": "query",
+            "name": "origin",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, max 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkPolicyRuleListResponse"
+                }
+              }
+            },
+            "description": "Rules, newest first"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid filter"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      },
+      "post": {
+        "operationId": "create_rule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateNetworkPolicyRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkPolicyRuleResponse"
+                }
+              }
+            },
+            "description": "Rule created"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrators only"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/network-policy/rules/{rule_id}": {
+      "delete": {
+        "operationId": "delete_rule",
+        "parameters": [
+          {
+            "description": "Rule id",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Rule deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrators only"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such rule"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The rule belongs to a link; unlink instead"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      },
+      "get": {
+        "operationId": "get_rule",
+        "parameters": [
+          {
+            "description": "Rule id",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NetworkPolicyRuleResponse"
+                }
+              }
+            },
+            "description": "The rule"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such rule"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/network-policy/subjects/{subject_kind}/{subject_id}": {
+      "get": {
+        "operationId": "get_effective_policy",
+        "parameters": [
+          {
+            "description": "deployment, sandbox, service, function or job",
+            "in": "path",
+            "name": "subject_kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Environment id for deployments; row id otherwise",
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectivePolicyResponse"
+                }
+              }
+            },
+            "description": "What this workload may reach, and where it is enforced"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unknown kind or missing workload"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/network-policy/subjects/{subject_kind}/{subject_id}/profile": {
+      "put": {
+        "operationId": "set_profile",
+        "parameters": [
+          {
+            "description": "deployment, sandbox, service, function or job",
+            "in": "path",
+            "name": "subject_kind",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Environment id for deployments; row id otherwise",
+            "in": "path",
+            "name": "subject_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProfileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileResponse"
+                }
+              }
+            },
+            "description": "The profile now in effect"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid profile or missing workload"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Instance administrators only"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Network Policy"
+        ]
+      }
+    },
+    "/node-state/status": {
+      "get": {
+        "operationId": "node_state_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeStateStatusResponse"
+                }
+              }
+            },
+            "description": "Stream status"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The node state stream's status and metrics",
+        "tags": [
+          "Nodes"
         ]
       }
     },
@@ -126568,6 +131336,188 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{env_id}/ingress": {
+      "get": {
+        "operationId": "get_ingress_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "env_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressSettingsResponse"
+                }
+              }
+            },
+            "description": "Ingress settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Environments"
+        ]
+      },
+      "put": {
+        "operationId": "update_ingress_settings",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "env_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateIngressSettingsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngressSettingsResponse"
+                }
+              }
+            },
+            "description": "Ingress settings updated"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Environments"
+        ]
+      }
+    },
     "/projects/{project_id}/environments/{env_id}/settings": {
       "put": {
         "operationId": "update_environment_settings",
@@ -131199,6 +136149,379 @@
         "summary": "Bring an archived flag back.",
         "tags": [
           "Feature Flags"
+        ]
+      }
+    },
+    "/projects/{project_id}/functions": {
+      "get": {
+        "operationId": "list_functions",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "1-based page. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Default 20, max 100.",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionListResponse"
+                }
+              }
+            },
+            "description": "Functions, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
+        ]
+      },
+      "post": {
+        "operationId": "create_function",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateFunctionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            },
+            "description": "Function created; it starts on its first request"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "Name taken, or no runtime runs this artifact"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "The workload plane is not running"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
+        ]
+      }
+    },
+    "/projects/{project_id}/functions/{function_id}": {
+      "delete": {
+        "operationId": "delete_function",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Function ID",
+            "in": "path",
+            "name": "function_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Function deleted; its instance is removed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Function not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "The workload plane is not running"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
+        ]
+      },
+      "get": {
+        "operationId": "get_function",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Function ID",
+            "in": "path",
+            "name": "function_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            },
+            "description": "The function and its state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Function not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
+        ]
+      }
+    },
+    "/projects/{project_id}/functions/{function_id}/sleep": {
+      "post": {
+        "operationId": "sleep_function",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Function ID",
+            "in": "path",
+            "name": "function_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SleepFunctionResponse"
+                }
+              }
+            },
+            "description": "The function is stopped"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Function not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
+        ]
+      }
+    },
+    "/projects/{project_id}/functions/{function_id}/wake": {
+      "post": {
+        "operationId": "wake_function",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Function ID",
+            "in": "path",
+            "name": "function_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FunctionResponse"
+                }
+              }
+            },
+            "description": "The function is running"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Function not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "It could not be started; the detail says why"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Functions"
         ]
       }
     },
@@ -147459,6 +152782,125 @@
         "x-maturity": "experimental"
       }
     },
+    "/v1/sandboxes/{id}/egress-policy": {
+      "put": {
+        "description": "`{\"mode\": \"internet\"}` allows any public destination on ports 80 and 443;\n`{\"mode\": \"restricted\", \"rules\": [{\"host\": \"api.example.com\", \"ports\": [443]},\n{\"cidr\": \"1.1.1.0/24\"}]}` allows only what a rule lists (`*.example.com`\nmatches subdomains; `ports` defaults to 80 and 443). Private, loopback,\nlink-local and metadata destinations are refused in every mode, and the\nTemps model, MCP and git relays keep working whatever the policy. A\nrefused request gets a 403 from the sandbox's proxy naming the\ndestination and the policy.\n\nApplied before it is stored: on a running Docker sandbox the egress proxy\nis replaced, which interrupts outbound connections for a second or two\nand closes open tunnels; a stopped sandbox gets it on its next start.",
+        "operationId": "set_egress_policy",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SandboxEgressPolicy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SandboxResponse"
+                }
+              }
+            },
+            "description": "Policy applied and stored"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid policy (the detail names the rule and value)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox is not running or stopped, or belongs to an agent run"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox's backend cannot enforce a restricted policy"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The sandbox's backend or node is unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace which outside destinations the sandbox may reach.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/v1/sandboxes/{id}/events": {
       "get": {
         "operationId": "list_events",
@@ -148185,6 +153627,70 @@
         "x-maturity": "experimental"
       }
     },
+    "/v1/sandboxes/{id}/preview-access": {
+      "put": {
+        "description": "The proxy applies the change within 30 seconds (its sandbox lookup\ncache). A visitor refused by the allow-list gets a 403 naming their\naddress and this endpoint.",
+        "operationId": "update_preview_access",
+        "parameters": [
+          {
+            "description": "Sandbox public id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdatePreviewAccessBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewAccessResponse"
+                }
+              }
+            },
+            "description": "Preview access updated"
+          },
+          "400": {
+            "description": "Invalid CIDR, more than 50 networks, or `password` without a preview password"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Set who may open the sandbox's preview URLs and from which networks.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
     "/v1/sandboxes/{id}/preview-link": {
       "post": {
         "description": "`GET /domain` returns the bare preview URL, which is useless to anyone who\ndoes not already hold the sandbox's preview password — so sharing a\nprotected preview meant sharing that password, which is the same secret for\nevery recipient and can only be withdrawn by rotating it for all of them.\n\nThis returns the same URL carrying a short-lived, sandbox-scoped grant. The\nrecipient's browser exchanges it for the ordinary preview cookie and lands\non `path`. The grant never reaches the sandbox, so preview application code\ncannot read it and re-share it.\n\nAnyone holding the returned URL can view the preview until it expires;\nthere is no per-link revocation short of rotating the preview password.",
@@ -148260,7 +153766,7 @@
         ],
         "responses": {
           "204": {
-            "description": "Preview password removed (sandbox is now URL-only protected)"
+            "description": "Preview password removed; a sandbox in `password` access returns to `temps_login`"
           },
           "404": {
             "description": "Sandbox not found"
@@ -150202,6 +155708,18 @@
       "name": "error-tracking"
     },
     {
+      "description": "Native project feedback inbox",
+      "name": "feedback"
+    },
+    {
+      "description": "Release correlation across native telemetry",
+      "name": "releases"
+    },
+    {
+      "description": "Approximate SDK-reported telemetry discards",
+      "name": "ingestion-health"
+    },
+    {
       "description": "Vulnerability scan management endpoints",
       "name": "Vulnerability Scans"
     },
@@ -150248,6 +155766,18 @@
     {
       "description": "Docker Compose configuration diagnostics",
       "name": "Compose"
+    },
+    {
+      "description": "ADR-055 deployments on the workload plane: modes, node reserves, scheduler explanations",
+      "name": "Workload Placement"
+    },
+    {
+      "description": "ADR-055 opt-in volumes for single-container deployments",
+      "name": "Workload Volumes"
+    },
+    {
+      "description": "Upload a WASM module or an OCI image and serve it on its own hostname; it runs only while requests arrive",
+      "name": "Functions"
     },
     {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
@@ -150346,16 +155876,8 @@
       "name": "External Plugins"
     },
     {
-      "description": "Native project feedback inbox",
-      "name": "feedback"
-    },
-    {
-      "description": "Release correlation across native telemetry",
-      "name": "releases"
-    },
-    {
-      "description": "Approximate SDK-reported telemetry discards",
-      "name": "ingestion-health"
+      "description": "What each workload may reach, and whether a node enforces it",
+      "name": "Network Policy"
     }
   ]
 }

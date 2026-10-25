@@ -7275,6 +7275,9 @@ export type CreateIncidentRequest = {
  * it in its query string.
  */
 export type CreateIngressLoginGrantRequest = {
+    /**
+     * The hostname, without a port.
+     */
     host: string;
     /**
      * Path on the host to return to.
@@ -7282,9 +7285,15 @@ export type CreateIngressLoginGrantRequest = {
     next?: string | null;
     owner_id: number;
     /**
-     * Only `environment` is supported.
+     * `environment` or `sandbox` (a sandbox preview host).
      */
     owner_kind: string;
+    /**
+     * The port the visitor reached the host on, when the proxy's request
+     * carries one (it leaves out the scheme's default). Pass it through
+     * unchanged: it is part of the signature.
+     */
+    port?: number | null;
     /**
      * `http` or `https`: how the visitor reached the host.
      */
@@ -7959,6 +7968,17 @@ export type CreateSandboxBody = {
      */
     disk_size_mb?: number | null;
     /**
+     * Which outside destinations the sandbox may reach (temps-native).
+     * Omit for `{"mode": "internet"}`: any public destination on ports 80
+     * and 443. `{"mode": "restricted", "rules": [...]}` allows only the
+     * listed hosts (`api.example.com`, or `*.example.com` for subdomains)
+     * and CIDR blocks, each on its `ports` (default 80 and 443). Private,
+     * loopback, link-local and metadata addresses are never reachable.
+     * A restricted policy needs the docker backend; elsewhere the create
+     * fails with 422. Change it later with `PUT /v1/sandboxes/{id}/egress-policy`.
+     */
+    egress_policy?: SandboxEgressPolicy;
+    /**
      * Extra env vars baked into the container on create.
      */
     env?: {
@@ -8034,6 +8054,21 @@ export type CreateSandboxBody = {
      * Idle timeout in seconds (temps-native). Clamped to `[60, 86400]`.
      */
     timeout_secs?: number | null;
+};
+
+/**
+ * The console asking to frame a sandbox's preview page.
+ */
+export type CreateSandboxPreviewSessionRequest = {
+    /**
+     * The sandbox's public id (`sbx_<hex>`).
+     */
+    sandbox_id: string;
+    /**
+     * The preview page to open, as the console would frame it:
+     * `http(s)://ws-<hex>-<port>.<preview domain>[:port]/path?query`.
+     */
+    url: string;
 };
 
 export type CreateSkillRequest = {
@@ -10888,6 +10923,34 @@ export type EffectivePolicyResponse = {
     rules: Array<NetworkPolicyRuleResponse>;
     subject_id: number;
     subject_kind: string;
+};
+
+/**
+ * How a sandbox may reach the outside world.
+ */
+export type EgressMode = 'internet' | 'restricted';
+
+/**
+ * One allowed destination. Exactly one of `host` or `cidr` is set.
+ */
+export type EgressRule = {
+    /**
+     * An IPv4 or IPv6 address or CIDR block (`198.51.100.7`,
+     * `2606:4700::/32`), matched against a literal IP the sandbox asked for
+     * or the address a hostname resolved to.
+     */
+    cidr?: string | null;
+    /**
+     * A hostname, matched case-insensitively against the name the sandbox
+     * asked for (`api.example.com`). A leading `*.` matches subdomains only:
+     * `*.example.com` matches `a.example.com` and `a.b.example.com`, never
+     * `example.com` itself.
+     */
+    host?: string | null;
+    /**
+     * Destination ports this rule permits, 1-65535. Empty means 80 and 443.
+     */
+    ports?: Array<number>;
 };
 
 export type EligibleGitRepositoryResponse = {
@@ -15080,6 +15143,15 @@ export type HeartbeatApiRequest = {
 };
 
 export type HeartbeatResponse = {
+    /**
+     * Whether the instance reports in this heartbeat (ADR-055 §7) were
+     * recorded. `false` when it carried none, when recording them failed,
+     * or when this process runs no node state stream: the node must keep
+     * resending them until a heartbeat answers `true`. The heartbeat itself
+     * still succeeds, so a failed ingest never costs the node its liveness.
+     * Absent from older servers, which agents read as `false`.
+     */
+    instances_accepted: boolean;
     message: string;
     status: string;
 };
@@ -21492,6 +21564,25 @@ export type PresetResponse = {
     slug: string;
 };
 
+/**
+ * A sandbox's preview access settings.
+ */
+export type PreviewAccessResponse = {
+    /**
+     * Sandbox public id (`sbx_...`).
+     */
+    id: string;
+    preview_access: SandboxPreviewAccess;
+    /**
+     * Normalised CIDRs. Empty = any client address.
+     */
+    preview_allowed_cidrs: Array<string>;
+    /**
+     * Last 4 characters of the preview password, when one is set.
+     */
+    preview_password_hint?: string | null;
+};
+
 export type PreviewDomainDeliveryBindingRequest = {
     delivery_profile_id?: number | null;
     dns_provider_id: number;
@@ -25400,25 +25491,17 @@ export type SandboxDomainResponse = {
     url: string;
 };
 
-export type SandboxDriverModeResponse = {
+/**
+ * A sandbox's egress policy. Build it from untrusted input with
+ * [`SandboxEgressPolicy::normalized`], which validates it and puts it in its
+ * canonical form; only a normalized policy is stored or enforced.
+ */
+export type SandboxEgressPolicy = {
+    mode?: EgressMode;
     /**
-     * `legacy`, `shadow` or `enforce`.
+     * Allowed destinations, in `restricted` mode. At most 100.
      */
-    mode: string;
-    /**
-     * `0` is the control plane.
-     */
-    node_id: number;
-    node_name: string;
-    /**
-     * Longest delay before a change reaches calls already being served.
-     */
-    propagation_secs: number;
-    /**
-     * Whether the driver facade serves this node's sandboxes (only in
-     * `enforce`).
-     */
-    uses_drivers: boolean;
+    rules?: Array<EgressRule>;
 };
 
 /**
@@ -25544,6 +25627,10 @@ export type SandboxInner = {
      * the default.
      */
     disk_size_mb?: number | null;
+    /**
+     * Which outside destinations the sandbox may reach (temps-native).
+     */
+    egress_policy: SandboxEgressPolicy;
     id: string;
     image?: string | null;
     /**
@@ -25563,6 +25650,17 @@ export type SandboxInner = {
      * sandboxes.
      */
     node_name: string;
+    /**
+     * Who may open the preview URLs: `temps_login` (a signed-in Temps user
+     * who may read this sandbox; the default), `password` (whoever knows the
+     * preview password) or `public` (anyone).
+     */
+    preview_access: SandboxPreviewAccess;
+    /**
+     * Client networks allowed to open the preview URLs, as normalised
+     * CIDRs. Checked before `preview_access`; empty = any address.
+     */
+    preview_allowed_cidrs: Array<string>;
     preview_password_hint?: string | null;
     preview_url_template: string;
     /**
@@ -25620,6 +25718,16 @@ export type SandboxPlacementResponse = {
      */
     nodes: Array<PlacementNode>;
 };
+
+/**
+ * Who may open a sandbox's preview URLs (ADR-055 §11: sandboxes default to
+ * `TempsLogin`, never anonymous by default).
+ *
+ * Stored on the sandbox row (`sandboxes.preview_access`). The sandbox's IP
+ * allow-list (`sandboxes.preview_allowed_cidrs`) is checked before any of
+ * these, so `Public` plus an allow-list means "anyone from these networks".
+ */
+export type SandboxPreviewAccess = 'temps_login' | 'password' | 'public';
 
 /**
  * `@vercel/sandbox` wraps every single-sandbox response as
@@ -27585,13 +27693,6 @@ export type SetResponse = {
      * Always "OK" on success
      */
     result: string;
-};
-
-export type SetSandboxDriverModeRequest = {
-    /**
-     * `legacy`, `shadow` or `enforce`.
-     */
-    mode: string;
 };
 
 /**
@@ -31678,6 +31779,26 @@ export type UpdatePermissionModeRequest = {
 
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
+};
+
+/**
+ * Request body for `PUT /v1/sandboxes/{id}/preview-access`. Both members
+ * are required: the call replaces the whole setting, so an omitted
+ * allow-list can never be read as "clear it".
+ */
+export type UpdatePreviewAccessBody = {
+    /**
+     * `temps_login` | `password` | `public`. `password` is refused while
+     * the sandbox has no preview password (set one with
+     * `PUT /v1/sandboxes/{id}/preview-password`, which also selects it).
+     */
+    access: SandboxPreviewAccess;
+    /**
+     * IPv4/IPv6 addresses or CIDRs allowed to open the preview URLs, at
+     * most 50. A single address is stored as a `/32` or `/128`; a CIDR as
+     * its network address. Empty = any client address.
+     */
+    allowed_cidrs: Array<string>;
 };
 
 /**
@@ -52967,11 +53088,11 @@ export type CreateIngressLoginGrantErrors = {
      */
     403: ProblemDetails;
     /**
-     * Environment not found
+     * Environment or sandbox not found
      */
     404: ProblemDetails;
     /**
-     * The environment does not require a Temps login
+     * The environment or sandbox preview does not require a Temps login
      */
     409: ProblemDetails;
     /**
@@ -52990,6 +53111,51 @@ export type CreateIngressLoginGrantResponses = {
 };
 
 export type CreateIngressLoginGrantResponse = CreateIngressLoginGrantResponses[keyof CreateIngressLoginGrantResponses];
+
+export type CreateSandboxPreviewSessionData = {
+    body: CreateSandboxPreviewSessionRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/sandbox-preview-sessions';
+};
+
+export type CreateSandboxPreviewSessionErrors = {
+    /**
+     * The URL is not one of the sandbox's preview pages
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Not a browser session, not the sandbox's owner, or insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The sandbox's preview does not ask for a Temps login (it is public or password-protected): load the URL as it is, or use a preview link
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateSandboxPreviewSessionError = CreateSandboxPreviewSessionErrors[keyof CreateSandboxPreviewSessionErrors];
+
+export type CreateSandboxPreviewSessionResponses = {
+    /**
+     * Grant issued; load redirect_url in the frame (or tab) that shows the preview. It signs the browser in to that preview host and lands on the requested page
+     */
+    201: IngressLoginGrantResponse;
+};
+
+export type CreateSandboxPreviewSessionResponse = CreateSandboxPreviewSessionResponses[keyof CreateSandboxPreviewSessionResponses];
 
 export type ListInstantiationsData = {
     body?: never;
@@ -54608,94 +54774,6 @@ export type GetS3CredentialsResponses = {
 };
 
 export type GetS3CredentialsResponse = GetS3CredentialsResponses[keyof GetS3CredentialsResponses];
-
-export type GetNodeSandboxDriverModeData = {
-    body?: never;
-    path: {
-        /**
-         * Worker node id; 0 for the control plane
-         */
-        node_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/sandbox-driver-mode';
-};
-
-export type GetNodeSandboxDriverModeErrors = {
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Node not found
-     */
-    404: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type GetNodeSandboxDriverModeResponses = {
-    /**
-     * The node's sandbox driver mode
-     */
-    200: SandboxDriverModeResponse;
-};
-
-export type GetNodeSandboxDriverModeResponse = GetNodeSandboxDriverModeResponses[keyof GetNodeSandboxDriverModeResponses];
-
-export type SetNodeSandboxDriverModeData = {
-    body: SetSandboxDriverModeRequest;
-    path: {
-        /**
-         * Worker node id; 0 for the control plane
-         */
-        node_id: number;
-    };
-    query?: never;
-    url: '/internal/nodes/{node_id}/sandbox-driver-mode';
-};
-
-export type SetNodeSandboxDriverModeErrors = {
-    /**
-     * The node does not host sandboxes
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Node not found
-     */
-    404: unknown;
-    /**
-     * Unknown mode
-     */
-    422: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type SetNodeSandboxDriverModeResponses = {
-    /**
-     * The node's new sandbox driver mode
-     */
-    200: SandboxDriverModeResponse;
-};
-
-export type SetNodeSandboxDriverModeResponse = SetNodeSandboxDriverModeResponses[keyof SetNodeSandboxDriverModeResponses];
 
 export type ReadNodeStateData = {
     body?: never;
@@ -82563,6 +82641,60 @@ export type DomainResponses = {
 
 export type DomainResponse2 = DomainResponses[keyof DomainResponses];
 
+export type SetEgressPolicyData = {
+    body: SandboxEgressPolicy;
+    path: {
+        /**
+         * Sandbox id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/egress-policy';
+};
+
+export type SetEgressPolicyErrors = {
+    /**
+     * Invalid policy (the detail names the rule and value)
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Sandbox is not running or stopped, or belongs to an agent run
+     */
+    409: ProblemDetails;
+    /**
+     * The sandbox's backend cannot enforce a restricted policy
+     */
+    422: ProblemDetails;
+    /**
+     * The sandbox's backend or node is unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type SetEgressPolicyError = SetEgressPolicyErrors[keyof SetEgressPolicyErrors];
+
+export type SetEgressPolicyResponses = {
+    /**
+     * Policy applied and stored
+     */
+    200: SandboxResponse;
+};
+
+export type SetEgressPolicyResponse = SetEgressPolicyResponses[keyof SetEgressPolicyResponses];
+
 export type ListEventsData = {
     body?: never;
     path: {
@@ -82987,6 +83119,50 @@ export type PauseSandboxResponses = {
 
 export type PauseSandboxResponse = PauseSandboxResponses[keyof PauseSandboxResponses];
 
+export type UpdatePreviewAccessData = {
+    body: UpdatePreviewAccessBody;
+    path: {
+        /**
+         * Sandbox public id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/preview-access';
+};
+
+export type UpdatePreviewAccessErrors = {
+    /**
+     * Invalid CIDR, more than 50 networks, or `password` without a preview password
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdatePreviewAccessResponses = {
+    /**
+     * Preview access updated
+     */
+    200: PreviewAccessResponse;
+};
+
+export type UpdatePreviewAccessResponse = UpdatePreviewAccessResponses[keyof UpdatePreviewAccessResponses];
+
 export type SandboxCreatePreviewLinkData = {
     body: PreviewShareLinkBody;
     path: {
@@ -83042,7 +83218,7 @@ export type ClearPreviewPasswordErrors = {
 
 export type ClearPreviewPasswordResponses = {
     /**
-     * Preview password removed (sandbox is now URL-only protected)
+     * Preview password removed; a sandbox in `password` access returns to `temps_login`
      */
     204: void;
 };
