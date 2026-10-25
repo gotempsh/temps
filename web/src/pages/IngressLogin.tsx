@@ -20,6 +20,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { problemDetail } from '@/lib/api-problem'
 import {
   createIngressLoginGrant,
+  ingressLoginAuthority,
   parseIngressLoginRequest,
 } from '@/lib/ingress-login'
 
@@ -41,6 +42,7 @@ export function IngressLogin() {
     () => parseIngressLoginRequest(location.search),
     [location.search]
   )
+  const site = request ? ingressLoginAuthority(request) : null
 
   const grant = useMutation({
     mutationFn: createIngressLoginGrant,
@@ -73,7 +75,7 @@ export function IngressLogin() {
                 Site
               </div>
               <div className="mt-1 break-all font-mono text-lg font-semibold">
-                {request.host}
+                {site}
               </div>
             </div>
           ) : (
@@ -97,7 +99,7 @@ export function IngressLogin() {
             {grant.isPending || grant.isSuccess ? (
               <Loader2 className="mr-2 h-4 w-4 animate-spin" />
             ) : null}
-            Continue to {request?.host ?? 'site'}
+            Continue to {site ?? 'site'}
           </Button>
         </CardFooter>
       </Card>

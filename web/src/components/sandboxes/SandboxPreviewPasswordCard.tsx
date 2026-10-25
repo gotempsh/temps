@@ -146,7 +146,7 @@ export function SandboxPreviewPasswordCard({
         <div className="flex items-center justify-between gap-2">
           <CardTitle className="text-sm font-medium flex items-center gap-2">
             <KeyRound className="h-4 w-4" />
-            Preview access
+            Preview password
           </CardTitle>
           {hint && !disabled && (
             <Button
@@ -177,9 +177,9 @@ export function SandboxPreviewPasswordCard({
             </>
           ) : (
             <>
-              No password set. Preview URLs are reachable by anyone who knows
-              the sandbox ID. Set a password to add a login gate on every
-              preview port.
+              No password set. Set one to let people without a Temps account
+              open the previews; setting it switches access to &ldquo;Anyone
+              with the password&rdquo;.
             </>
           )}
         </div>

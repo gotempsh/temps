@@ -15,6 +15,7 @@ import {
   type PreviewTarget,
 } from './chat-preview'
 import { CreateSandboxAction } from './ChatSandbox'
+import { previewFrameSource } from './preview-session'
 import { useChatSandboxWake } from './chat-sandbox-wake'
 
 function PreviewOnboarding({ reason }: { reason: string }) {
@@ -223,13 +224,11 @@ export function ChatPreviewTab({
           and show it. It appears here as soon as the assistant confirms it
           answers.
         </p>
-      ) : embeddable ? (
-        <iframe
-          key={`${url}:${reloads}`}
-          src={url}
-          title="Preview of the app running in this chat's sandbox"
-          className="min-h-0 w-full flex-1 bg-white"
-          sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+      ) : embeddable && linked ? (
+        <PreviewFrame
+          sandboxId={linked.sandbox_id}
+          url={url}
+          reloads={reloads}
         />
       ) : (
         <p className="p-4 text-sm text-muted-foreground">
@@ -238,5 +237,59 @@ export function ChatPreviewTab({
         </p>
       )}
     </div>
+  )
+}
+
+/**
+ * The frame showing `url`. It loads through a fresh one-time preview
+ * session (see `previewFrameSource`) on every load, so a sandbox whose
+ * preview asks for a Temps login shows the page, not a sign-in redirect.
+ */
+function PreviewFrame({
+  sandboxId,
+  url,
+  reloads,
+}: {
+  sandboxId: string
+  url: string
+  reloads: number
+}) {
+  const source = useQuery({
+    queryKey: ['sandbox-preview-frame', sandboxId, url, reloads],
+    queryFn: () => previewFrameSource(sandboxId, url),
+    // A session is single use: never reuse one, and never swap the frame's
+    // page in the background.
+    gcTime: 0,
+    staleTime: Infinity,
+    retry: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false,
+  })
+  if (source.isPending) {
+    return (
+      <div
+        className="space-y-3 p-4"
+        role="status"
+        aria-label="Opening the preview"
+      >
+        <Skeleton className="h-64 w-full" />
+      </div>
+    )
+  }
+  if (source.isError) {
+    return (
+      <p role="alert" className="p-4 text-sm text-muted-foreground">
+        {source.error.message} Open it in a new tab instead.
+      </p>
+    )
+  }
+  return (
+    <iframe
+      key={`${url}:${reloads}`}
+      src={source.data}
+      title="Preview of the app running in this chat's sandbox"
+      className="min-h-0 w-full flex-1 bg-white"
+      sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-modals"
+    />
   )
 }

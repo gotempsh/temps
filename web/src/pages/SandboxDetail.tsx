@@ -88,6 +88,8 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
+import { SandboxPreviewAccessCard } from '@/components/sandboxes/SandboxPreviewAccessCard'
+import { SandboxEgressCard } from '@/components/sandboxes/SandboxEgressCard'
 import { SandboxFilesCard } from '@/components/sandboxes/SandboxFilesCard'
 import {
   PREVIEW_ACCESS_ANCHOR,
@@ -1093,7 +1095,14 @@ export default function SandboxDetail() {
               configured={Boolean(sandbox.preview_url_template)}
             />
             {Boolean(sandbox.preview_url_template) && (
-              <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4">
+              <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4 space-y-4">
+                <SandboxPreviewAccessCard
+                  sandboxId={sandbox.id}
+                  access={sandbox.preview_access}
+                  allowedCidrs={sandbox.preview_allowed_cidrs}
+                  hasPassword={Boolean(sandbox.preview_password_hint)}
+                  disabled={destroyed}
+                />
                 <SandboxPreviewPasswordCard
                   sandboxId={sandbox.id}
                   hint={sandbox.preview_password_hint ?? undefined}
@@ -1101,6 +1110,12 @@ export default function SandboxDetail() {
                 />
               </div>
             )}
+            <SandboxEgressCard
+              sandboxId={sandbox.id}
+              policy={sandbox.egress_policy}
+              backend={sandbox.backend}
+              disabled={destroyed}
+            />
 
             <SandboxFilesCard
               sandboxId={sandbox.id}

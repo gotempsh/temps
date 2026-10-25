@@ -19,25 +19,33 @@ export type IngressLoginGrant = IngressLoginGrantResponse
 
 /**
  * Reads the login request from the page's query string, or `null` when a
- * required field is missing or not a number.
+ * required field is missing or malformed.
+ *
+ * `port` is present when the visitor reached the site on a non-default port
+ * (the proxy signs `host:port`), and is passed through unchanged so the
+ * grant sends them back to that port.
  */
 export function parseIngressLoginRequest(
   search: string
 ): IngressLoginRequest | null {
   const params = new URLSearchParams(search)
   const ownerKind = params.get('owner_kind')
-  const ownerId = Number(params.get('owner_id'))
+  const ownerId = integerParam(params, 'owner_id')
   const scheme = params.get('scheme')
   const host = params.get('host')
-  const ts = Number(params.get('ts'))
+  const ts = integerParam(params, 'ts')
   const sig = params.get('sig')
+  const rawPort = params.get('port')
+  const port = rawPort === null ? undefined : integerParam(params, 'port')
   if (
     !ownerKind ||
     !scheme ||
     !host ||
     !sig ||
-    !Number.isSafeInteger(ownerId) ||
-    !Number.isSafeInteger(ts)
+    ownerId === null ||
+    ts === null ||
+    port === null ||
+    (port !== undefined && (port < 1 || port > 65535))
   ) {
     return null
   }
@@ -46,10 +54,23 @@ export function parseIngressLoginRequest(
     owner_id: ownerId,
     scheme,
     host,
+    ...(port === undefined ? {} : { port }),
     next: params.get('next') ?? undefined,
     ts,
     sig,
   }
+}
+
+/** The site as the visitor reached it: `host`, or `host:port`. */
+export function ingressLoginAuthority(request: IngressLoginRequest): string {
+  return request.port ? `${request.host}:${request.port}` : request.host
+}
+
+function integerParam(params: URLSearchParams, name: string): number | null {
+  const raw = params.get(name)
+  if (raw === null || !/^[0-9]+$/.test(raw)) return null
+  const value = Number(raw)
+  return Number.isSafeInteger(value) ? value : null
 }
 
 export async function createIngressLoginGrant(
