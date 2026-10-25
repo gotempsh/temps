@@ -152,7 +152,7 @@ tailscaled, never the visitor.
 **How Temps chooses.** The plan offers what fits, in this order, and the
 user may pick another:
 
-1. An existing Service this run's address already uses (re-run).
+1. The Service the address already has (a re-run of an earlier setup).
 2. **A Service**, when the cluster has a Tailscale credential (D2) and the
    worker reports itself tagged, on tailscaled v1.94 or later. It is the
    default because the name is the app's, not the machine's: it survives
@@ -430,8 +430,9 @@ people or devices.
   listener bound on `tailscale0` (`private_via = listener`), there are no
   Serve headers and none are read: the agent asks the LocalAPI `whois` for
   the TCP peer address, which tailscaled answers from its own view of the
-  tailnet. A private listener on a LAN range cannot serve `tailnet_users`;
-  the plan refuses it.
+  tailnet. Asking whois is talking to tailscaled, so this too needs the
+  worker's `--tailscale-serve` consent (D2). A private listener on a LAN
+  range cannot serve `tailnet_users`; the plan refuses it.
 - **Who may be listed.** `address_tailnet_principals` rows per address:
   `kind` = `login` (a Tailscale login name, e.g. `alice@example.com` or
   `alice@github`) or `tag` (`tag:ci`). Logins are compared exactly after
@@ -457,7 +458,7 @@ people or devices.
   lives (open question 3).
 - **What the app receives.** On the socket the agent passes Serve's
   `Tailscale-User-*` headers through to the app, since apps written for
-  Serve expect them, and on every way in it sets `x-temps-user-login`
+  Serve expect them, and on both ways in it sets `x-temps-user-login`
   for an admitted identity. Both are stripped from client input everywhere
   else (D3, and `x-temps-*` is already stripped).
 - **Agents that cannot enforce it never get it.** The control plane sends a
