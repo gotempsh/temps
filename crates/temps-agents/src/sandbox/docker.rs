@@ -1312,6 +1312,8 @@ async function forward(request, response, target, allowPrivate) {
     path: `${target.pathname}${target.search}`,
     headers,
   }, (upstreamResponse) => {
+    // An upstream that drops mid-body must end this response, not the proxy.
+    upstreamResponse.on("error", () => response.destroy());
     response.writeHead(upstreamResponse.statusCode || 502, upstreamResponse.headers);
     upstreamResponse.pipe(response);
   });
@@ -1319,6 +1321,7 @@ async function forward(request, response, target, allowPrivate) {
     if (!response.headersSent) response.writeHead(502);
     response.end();
   });
+  request.on("error", () => upstream.destroy());
   request.pipe(upstream);
 }
 
@@ -1356,19 +1359,27 @@ const server = http.createServer(handleRequest);
 
 server.on("connect", async (request, client, head) => {
   let destination = String(request.url).slice(0, 256);
+  let upstream = null;
+  // Listeners go on before anything that waits. Once "connect" fires the
+  // HTTP server no longer handles errors on this socket, and a client that
+  // resets it -- curl does, right after reading a 403 -- would otherwise
+  // be an unhandled ECONNRESET that exits the proxy and cuts every
+  // connection the sandbox has.
+  client.on("error", () => upstream?.destroy());
+  client.on("close", () => upstream?.destroy());
+  client.setTimeout(60_000, () => client.destroy());
   try {
     const { hostname, port } = parseAuthority(request.url, 443);
     destination = formatDestination(hostname, port);
     const address = await admit(hostname, port);
-    const upstream = net.connect({ host: address, port }, () => {
+    if (client.destroyed) return;
+    upstream = net.connect({ host: address, port }, () => {
       client.write("HTTP/1.1 200 Connection Established\r\n\r\n");
       if (head.length) upstream.write(head);
       client.pipe(upstream);
       upstream.pipe(client);
     });
-    client.setTimeout(60_000, () => client.destroy());
     upstream.setTimeout(60_000, () => upstream.destroy());
-    client.on("error", () => upstream.destroy());
     upstream.on("error", () => client.destroy());
   } catch (error) {
     const body = denial(error, destination, "CONNECT");
@@ -11036,6 +11047,79 @@ const expectDenied = async (host, port, reason) => {{
         assert!(refusals
             .iter()
             .all(|line| line["sandbox"] == "sbx-egress-test" && line["reason"] == "policy"));
+    }
+
+    /// A client that resets its tunnel must not take the proxy down. curl
+    /// resets the socket right after reading a refusal, and the proxy used
+    /// to exit on the unhandled ECONNRESET -- cutting every connection the
+    /// sandbox had, allowed ones included. Resets land both before the
+    /// refusal is written (while the policy is being checked) and after it.
+    #[test]
+    fn the_proxy_process_survives_clients_that_reset_their_tunnel() {
+        let listen = "server.listen(3128, \"0.0.0.0\");";
+        let client = r#"server.listen(0, "127.0.0.1", async () => {
+  const { port } = server.address();
+  const refused = "CONNECT other.example.net:443 HTTP/1.1\r\nHost: other.example.net:443\r\n\r\n";
+  for (let i = 0; i < 10; i += 1) {
+    await new Promise((resolve) => {
+      const socket = net.connect(port, "127.0.0.1", () => {
+        socket.write(refused);
+        if (i % 2 === 0) socket.resetAndDestroy();
+      });
+      socket.on("data", () => socket.resetAndDestroy());
+      socket.on("close", resolve);
+      socket.on("error", () => {});
+    });
+  }
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  const answer = await new Promise((resolve, reject) => {
+    const socket = net.connect(port, "127.0.0.1", () => socket.write(refused));
+    const chunks = [];
+    socket.on("data", (chunk) => chunks.push(chunk));
+    socket.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    socket.on("error", reject);
+    socket.setTimeout(5000, () => reject(new Error("proxy stopped answering")));
+  });
+  process.stdout.write("RESPONSE " + JSON.stringify(answer) + "\n");
+  process.exit(0);
+});"#;
+        let script = SANDBOX_EGRESS_PROXY_SCRIPT.replace(listen, client);
+        let policy = SandboxEgressPolicy::restricted(vec![temps_workload::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+        .normalized()
+        .expect("valid policy");
+        let output = match std::process::Command::new("node")
+            .args(["-e", &script])
+            .env("TEMPS_CONTROL_PLANE_URL", "http://127.0.0.1:9")
+            .env("TEMPS_SANDBOX_NAME", "sbx-egress-test")
+            .env(
+                "TEMPS_SANDBOX_EGRESS_POLICY",
+                serde_json::to_string(&policy).expect("policy json"),
+            )
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!("skipping proxy reset test: Node.js is unavailable");
+                return;
+            }
+            Err(error) => panic!("failed to execute Node.js: {error}"),
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "proxy exited after a client reset (status {:?}): {}\n{stdout}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let response = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("RESPONSE "))
+            .map(|json| serde_json::from_str::<String>(json).expect("response json"))
+            .expect("the proxy answered after the resets");
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
     }
 
     /// The default policy: public destinations on 80 and 443 only, and the
