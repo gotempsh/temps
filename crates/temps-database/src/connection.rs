@@ -2164,6 +2164,26 @@ mod tests {
         }
     }
 
+    /// Keep a second tracing dispatcher registered for the life of the test
+    /// process, so a scoped subscriber is never the only one.
+    ///
+    /// While exactly one dispatcher is registered, `tracing-core` computes the
+    /// "interest" of a callsite that registers for the first time from the
+    /// *calling thread's* default subscriber, and caches the answer for every
+    /// thread. The tests in this crate run in parallel: when another test's
+    /// first query registers sqlx's `sqlx::query` callsites on a thread with
+    /// no subscriber, the cached answer is "never", and the capture below
+    /// then records nothing at all, not even the slow-statement warning. With a
+    /// second dispatcher registered, `tracing-core` combines every registered
+    /// dispatcher instead, and each event is checked against the subscriber of
+    /// the thread that emits it.
+    fn keep_dispatchers_from_being_alone() {
+        static SECOND_DISPATCHER: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        SECOND_DISPATCHER
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     /// Runs `queries` over a `connect_options` connection with a subscriber
     /// using `filter`, returning everything it logged.
     async fn capture_sql_logs(
@@ -2171,6 +2191,7 @@ mod tests {
         filter: &str,
         queries: &[&str],
     ) -> anyhow::Result<String> {
+        keep_dispatchers_from_being_alone();
         let buffer = LogBuffer::default();
         let writer = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
