@@ -34,12 +34,16 @@ Python 3.9+ for the bundled read-only capability detector.
 
 ## Application capability checkpoint
 
-When creating, linking, migrating, reviewing, or deploying an application,
+When creating, linking, migrating, reviewing, or deploying a source-backed application,
 inspect its observability setup before the final deployment step:
 
 ```bash
 python3 skills/temps/scripts/detect_project_capabilities.py --root .
 ```
+
+Curated template provisioning is exempt from this checkpoint. Follow the
+[curated-services verification steps](howtos/curated-services.md#verify-creation-and-deployment-separately)
+instead.
 
 Resolve the script relative to this skill directory when the current working
 directory is elsewhere. The detector is read-only and reports `missing`,
