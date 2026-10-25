@@ -600,15 +600,28 @@ pub fn shadow_step(
     )
 }
 
+/// The site a visitor was challenged on, as their browser reached it.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginSite<'a> {
+    pub scheme: LoginScheme,
+    /// The hostname, without a port.
+    pub host: &'a str,
+    /// The port the `Host` header named, if any. Kept apart from `host`
+    /// because the proxy stores the hostname port-less.
+    pub port: Option<u16>,
+}
+
 /// The console page a `TempsLogin` challenge sends the visitor to: it signs
 /// them in if needed, checks the permission, and sends them back to
 /// [`GRANT_EXCHANGE_PATH`] on `host` with an exchange grant. `None` when the
 /// instance's external URL is not an absolute `http(s)` URL.
 ///
-/// `host` is the authority the browser used (the `Host` header). A port
-/// other than the scheme's default travels as `port`, so the console sends
-/// the visitor back to the port they came from; the hostname alone is what
-/// the grant is bound to.
+/// `site.host` is the hostname the browser used and `site.port` the port
+/// its `Host` header named, if any. A port other than the scheme's default travels as
+/// `port`, so the console sends the visitor back to the port they came
+/// from; the hostname alone is what the grant is bound to. The port is a
+/// parameter of its own because the proxy keeps the hostname port-less: a
+/// caller passing only that would drop it.
 ///
 /// The request is signed with the owner's grant key
 /// ([`grant::sign_login_request`], over [`grant::login_authority`]), so the
@@ -620,16 +633,16 @@ pub fn login_redirect_url(
     external_url: &str,
     master: &[u8; 32],
     owner: ProductRef,
-    scheme: LoginScheme,
-    host: &str,
+    site: LoginSite<'_>,
     next: &str,
     now_secs: u64,
 ) -> Option<String> {
+    let LoginSite { scheme, host, port } = site;
     let base = url::Url::parse(external_url.trim()).ok()?;
     if !matches!(base.scheme(), "http" | "https") || base.host_str().is_none() {
         return None;
     }
-    let port = scheme.explicit_port(authority_port(host));
+    let port = scheme.explicit_port(port);
     let mut buffer = [0u8; 256];
     let host = grant_host(host, &mut buffer)?;
     let signature = grant::sign_login_request(
@@ -659,16 +672,6 @@ pub fn login_redirect_url(
             .append_pair("sig", &signature);
     }
     Some(url.into())
-}
-
-/// The port of a `Host` authority (`name:port`), when it has a valid one.
-/// IPv6 literals without brackets and out-of-range ports have none.
-fn authority_port(authority: &str) -> Option<u16> {
-    let (name, port) = authority.rsplit_once(':')?;
-    if name.contains(':') && !name.ends_with(']') {
-        return None;
-    }
-    port.parse().ok()
 }
 
 /// `next` when it is a path on this host, `/` otherwise: never an absolute
@@ -1377,8 +1380,11 @@ mod tests {
             "https://console.example.test/",
             &master,
             owner,
-            LoginScheme::Https,
-            "App.Example.Test:443",
+            LoginSite {
+                scheme: LoginScheme::Https,
+                host: "App.Example.Test",
+                port: Some(443),
+            },
             "/a?b=c",
             T0,
         )
@@ -1400,8 +1406,11 @@ mod tests {
             "https://console.example.test/base",
             &master,
             owner,
-            LoginScheme::Http,
-            "app.example.test",
+            LoginSite {
+                scheme: LoginScheme::Http,
+                host: "app.example.test",
+                port: None,
+            },
             "//elsewhere.example.test/",
             T0,
         )
@@ -1414,8 +1423,11 @@ mod tests {
                     external,
                     &master,
                     owner,
-                    LoginScheme::Https,
-                    "app.example.test",
+                    LoginSite {
+                        scheme: LoginScheme::Https,
+                        host: "app.example.test",
+                        port: None,
+                    },
                     "/",
                     T0
                 ),
@@ -1933,8 +1945,11 @@ mod tests {
             "https://console.example.test/",
             &master,
             sandbox_owner(5),
-            LoginScheme::Https,
-            "WS-AABBCCDD11223344-3000.preview.example.test:443",
+            LoginSite {
+                scheme: LoginScheme::Https,
+                host: "WS-AABBCCDD11223344-3000.preview.example.test",
+                port: Some(443),
+            },
             "/app?x=1",
             T0,
         )
@@ -1975,8 +1990,11 @@ mod tests {
             "http://console.example.test:8081/",
             &master,
             sandbox_owner(5),
-            LoginScheme::Http,
-            "ws-aabbccdd11223344-3000.preview.example.test:8055",
+            LoginSite {
+                scheme: LoginScheme::Http,
+                host: PREVIEW_HOST,
+                port: Some(8055),
+            },
             "/",
             T0,
         )
@@ -2009,22 +2027,35 @@ mod tests {
             ));
         }
 
-        // HTTPS on a non-default port, and an out-of-range port (no port).
+        // HTTPS on a non-default port; HTTP's default port is left out.
         let url = login_redirect_url(
             "https://console.example.test/",
             &master,
             sandbox_owner(5),
-            LoginScheme::Https,
-            "ws-aabbccdd11223344-3000.preview.example.test:8443",
+            LoginSite {
+                scheme: LoginScheme::Https,
+                host: PREVIEW_HOST,
+                port: Some(8443),
+            },
             "/",
             T0,
         )
         .expect("redirect url");
         assert!(url.contains("&port=8443&"), "{url}");
-        assert_eq!(authority_port("example.test:70000"), None);
-        assert_eq!(authority_port("example.test"), None);
-        assert_eq!(authority_port("[::1]:8055"), Some(8055));
-        assert_eq!(authority_port("::1"), None);
+        let url = login_redirect_url(
+            "https://console.example.test/",
+            &master,
+            sandbox_owner(5),
+            LoginSite {
+                scheme: LoginScheme::Http,
+                host: PREVIEW_HOST,
+                port: Some(80),
+            },
+            "/",
+            T0,
+        )
+        .expect("redirect url");
+        assert!(!url.contains("port="), "{url}");
     }
 
     #[test]

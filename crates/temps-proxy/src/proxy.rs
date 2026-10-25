@@ -4701,13 +4701,22 @@ impl LoadBalancer {
                 } else {
                     crate::ingress::LoginScheme::Http
                 };
+                // `ctx.host` has no port; the visitor's port comes from the
+                // request so the sign-in returns them to it.
+                let port = self
+                    .request_authority(session)
+                    .ok()
+                    .and_then(|authority| authority.port);
                 let location = settings.external_url.as_deref().and_then(|base| {
                     crate::ingress::login_redirect_url(
                         base,
                         self.crypto.ingress_grant_master_key(),
                         crate::ingress::sandbox_owner(sandbox_id),
-                        scheme,
-                        &ctx.host,
+                        crate::ingress::LoginSite {
+                            scheme,
+                            host: &ctx.host,
+                            port,
+                        },
                         &next,
                         now_secs,
                     )
@@ -7278,6 +7287,10 @@ impl ProxyHttp for LoadBalancer {
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
+                    let port = self
+                        .request_authority(session)
+                        .ok()
+                        .and_then(|authority| authority.port);
                     let location = external_url.as_deref().and_then(|base| {
                         crate::ingress::login_redirect_url(
                             base,
@@ -7286,8 +7299,11 @@ impl ProxyHttp for LoadBalancer {
                                 kind: temps_workload_ingress::ProductKind::Environment,
                                 id: i64::from(project_ctx.environment.id),
                             },
-                            scheme,
-                            &ctx.host,
+                            crate::ingress::LoginSite {
+                                scheme,
+                                host: &ctx.host,
+                                port,
+                            },
                             &next,
                             now_secs,
                         )
