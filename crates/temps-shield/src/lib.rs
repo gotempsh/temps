@@ -10,9 +10,11 @@
 //! environment and identity, valid for 24 hours, and limited to a number of
 //! requests per hour on each ingress.
 
+mod budget;
 mod gate;
 mod identity;
 mod keys;
+mod redeemed;
 mod token;
 
 pub use gate::{

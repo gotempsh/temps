@@ -14,7 +14,6 @@ description = "Shield: signed proof-of-work challenges and clearance cookies (AD
 [dependencies]
 base64 = { workspace = true }
 hmac = "0.13"
-moka = { version = "0.12", features = ["sync"] }
 rand = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }

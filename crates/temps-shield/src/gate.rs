@@ -1,14 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-
-use moka::sync::Cache;
-
+use crate::budget::BudgetCounter;
 use crate::identity::VisitorIdentity;
 use crate::keys::ShieldKeys;
+use crate::redeemed::{NotRecorded, RedeemedSalts};
 use crate::token::{
     check_work, is_fresh, open_challenge, open_clearance, seal_challenge, seal_clearance,
     ChallengeClaims, ChallengeError, ClearanceClaims, CHALLENGE_TTL_SECS, CLEARANCE_TTL_SECS,
@@ -52,10 +48,9 @@ impl Clearance {
 /// browsing produces.
 pub const DEFAULT_BUDGET_PER_HOUR: u32 = 3_000;
 
-/// Upper bound on entries in each in-memory set, so a flood of distinct
-/// tokens or clearances cannot grow memory without limit.
-const MAX_TRACKED: u64 = 200_000;
-const BUDGET_WINDOW: Duration = Duration::from_secs(60 * 60);
+/// Upper bound on redeemed salts held at once, so a flood of solved tokens
+/// cannot grow memory without limit.
+const MAX_REDEEMED: usize = 200_000;
 
 /// What a request's clearance cookie allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,13 +66,12 @@ pub enum Admission {
 /// Issues and verifies challenges and clearances for one ingress.
 ///
 /// Verification needs no database: tokens are signed, and the only state is
-/// two bounded in-memory sets, the tokens already redeemed (so one solution
-/// mints one clearance per ingress) and the per-clearance request counters.
+/// in memory and bounded: the tokens already redeemed (so one solution mints
+/// one clearance per ingress) and the per-clearance request counts.
 pub struct ChallengeGate {
     keys: ShieldKeys,
-    redeemed: Cache<[u8; 16], ()>,
-    redeemed_capacity: u64,
-    budgets: Cache<[u8; 8], Arc<AtomicU32>>,
+    redeemed: RedeemedSalts,
+    budgets: BudgetCounter,
     budget_per_hour: u32,
 }
 
@@ -89,18 +83,8 @@ impl ChallengeGate {
     pub fn with_budget(keys: ShieldKeys, budget_per_hour: u32) -> Self {
         Self {
             keys,
-            // No `max_capacity`: a size-evicted salt could be redeemed
-            // again before its token expires. Entries leave only by TTL,
-            // which outlives every token, and `redeem` refuses new entries
-            // once the set holds `redeemed_capacity`.
-            redeemed: Cache::builder()
-                .time_to_live(Duration::from_secs(CHALLENGE_TTL_SECS + 60))
-                .build(),
-            redeemed_capacity: MAX_TRACKED,
-            budgets: Cache::builder()
-                .max_capacity(MAX_TRACKED)
-                .time_to_live(BUDGET_WINDOW)
-                .build(),
+            redeemed: RedeemedSalts::new(MAX_REDEEMED),
+            budgets: BudgetCounter::new(),
             budget_per_hour,
         }
     }
@@ -151,23 +135,14 @@ impl ChallengeGate {
             return Err(ChallengeError::WrongVisitor);
         }
         check_work(token, nonce, claims.difficulty)?;
-        // The count is approximate and concurrent callers can pass together,
-        // so this bounds memory loosely; replay protection does not depend
-        // on it.
-        if self.redeemed.entry_count() >= self.redeemed_capacity {
-            return Err(ChallengeError::Busy);
-        }
-        // `or_insert_with` coalesces concurrent callers on one key, so exactly
-        // one sees a fresh entry. `or_insert` does not: racing submissions of
-        // one solution would each mint a clearance.
-        if !self
-            .redeemed
-            .entry(claims.salt)
-            .or_insert_with(|| ())
-            .is_fresh()
-        {
-            return Err(ChallengeError::Replayed);
-        }
+        // A full set refuses rather than forgetting a salt whose token is
+        // still valid, which would let that token be redeemed again.
+        self.redeemed
+            .record(claims.salt, claims.issued_at, now)
+            .map_err(|refusal| match refusal {
+                NotRecorded::Replayed => ChallengeError::Replayed,
+                NotRecorded::Full => ChallengeError::Busy,
+            })?;
         let value = seal_clearance(
             &self.keys,
             &ClearanceClaims {
@@ -203,11 +178,7 @@ impl ChallengeGate {
         if !valid {
             return Admission::NotCleared;
         }
-        let used = self
-            .budgets
-            .get_with(claims.budget_id, || Arc::new(AtomicU32::new(0)))
-            .fetch_add(1, Ordering::Relaxed);
-        if used < self.budget_per_hour {
+        if self.budgets.record(&claims.budget_id, now) < self.budget_per_hour {
             Admission::Admitted
         } else {
             Admission::BudgetSpent
@@ -368,39 +339,39 @@ mod tests {
         assert_eq!(successes, 1);
     }
 
+    fn solved(gate: &ChallengeGate, now: u64) -> (String, String) {
+        let token = gate.issue(1, &visitor(1), DIFFICULTY, now).unwrap();
+        let nonce = solve(&token, DIFFICULTY);
+        (token, nonce)
+    }
+
     /// A full redeemed set refuses new tokens rather than forgetting old
-    /// ones, so a token cannot be replayed after a flood of redemptions.
+    /// ones, so a token cannot be replayed after a flood of redemptions,
+    /// and it takes new ones again once the tokens it holds have expired.
     #[test]
-    fn a_full_redeemed_set_refuses_instead_of_forgetting() {
+    fn a_full_redeemed_set_refuses_until_its_tokens_expire() {
         let mut gate = gate();
-        gate.redeemed_capacity = 2;
-        let solved: Vec<_> = (0..3)
-            .map(|_| {
-                let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
-                let nonce = solve(&token, DIFFICULTY);
-                (token, nonce)
-            })
-            .collect();
-        for (token, nonce) in &solved[..2] {
-            assert!(gate.redeem(token, nonce, &visitor(1), NOW).is_ok());
-        }
-        gate.redeemed.run_pending_tasks();
-        let (token, nonce) = &solved[2];
+        gate.redeemed = RedeemedSalts::new(2);
+        let (first, first_nonce) = solved(&gate, NOW);
+        let (second, second_nonce) = solved(&gate, NOW);
+        let (third, third_nonce) = solved(&gate, NOW);
+        assert!(gate.redeem(&first, &first_nonce, &visitor(1), NOW).is_ok());
+        assert!(gate
+            .redeem(&second, &second_nonce, &visitor(1), NOW)
+            .is_ok());
         assert_eq!(
-            gate.redeem(token, nonce, &visitor(1), NOW),
+            gate.redeem(&third, &third_nonce, &visitor(1), NOW),
             Err(ChallengeError::Busy)
         );
-        let (first, first_nonce) = &solved[0];
         assert_eq!(
-            gate.redeem(first, first_nonce, &visitor(1), NOW),
-            Err(ChallengeError::Busy)
-        );
-        gate.redeemed_capacity = 3;
-        assert_eq!(
-            gate.redeem(first, first_nonce, &visitor(1), NOW),
+            gate.redeem(&first, &first_nonce, &visitor(1), NOW),
             Err(ChallengeError::Replayed)
         );
-        assert!(gate.redeem(token, nonce, &visitor(1), NOW).is_ok());
+        let later = NOW + 60 + CHALLENGE_TTL_SECS;
+        let (fresh, fresh_nonce) = solved(&gate, later);
+        assert!(gate
+            .redeem(&fresh, &fresh_nonce, &visitor(1), later)
+            .is_ok());
     }
 
     #[test]
@@ -448,6 +419,11 @@ mod tests {
         // A fresh clearance has its own budget.
         let next = clearance(&gate, 1, &visitor(1));
         assert_eq!(gate.admit(&next, 1, &visitor(1), NOW), Admission::Admitted);
+        // The spent clearance gets a new budget the next hour.
+        assert_eq!(
+            gate.admit(&cookie, 1, &visitor(1), NOW + 60 * 60),
+            Admission::Admitted
+        );
     }
 
     #[test]

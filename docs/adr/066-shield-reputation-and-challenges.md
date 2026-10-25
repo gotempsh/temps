@@ -472,7 +472,9 @@ dependency in its default features, so the agent can use it:
 | `token` | Challenge token and clearance cookie: encode, verify, derived keys (phase 1) |
 | `ja4` | ClientHello parser and JA4 string |
 | `signatures` | Exploit signatures and matcher, moved from netwatch (MIT/Apache) |
-| `gate` | Issue, redeem and admit; the redeemed-token set and the per-clearance budget counters (moka, 1-hour windows) (phase 1) |
+| `gate` | Issue, redeem and admit (phase 1) |
+| `redeemed` | Salts of redeemed tokens, grouped by issue minute and dropped once expired (phase 1) |
+| `budget` | Per-clearance hourly request counts in a fixed-size count-min sketch (phase 1) |
 | `identity` | The D3 visitor identity (phase 1) |
 | `crawlers` | Reverse-DNS verification with a moka cache (hickory resolver) |
 | `assets` | `challenge.html` (escaped templating) and the WASM solver bytes |
@@ -746,15 +748,21 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
 - The challenge page carries the token and difficulty in escaped `data-`
   attributes, never in inline script literals, and is sent with
   `Cache-Control: no-store`, since its token is bound to one visitor.
-- Each ingress keeps a 6-minute set of redeemed token salts, so one solved
-  token mints one clearance per ingress. Salts leave the set only when they
-  expire, never to make room, since a forgotten salt could be redeemed
-  again. Once the set holds 200,000 salts, verify answers 503 `busy` until
-  older salts expire.
-- The budget counter is keyed by `budget_id` and lives in a moka cache
-  bounded at 200,000 entries per ingress. Evicting a counter restarts that
-  clearance's hour, which weakens the budget but not the challenge: every
-  clearance still costs a solve.
+- Each ingress keeps the salts of redeemed tokens, so one solved token
+  mints one clearance per ingress. Salts are grouped by the minute their
+  token was issued, and a group is dropped once all its tokens have
+  expired (at most 6 minutes); salts never leave to make room, since a
+  forgotten salt could be redeemed again. Expiry follows the same clock as
+  the token checks. Once 200,000 unexpired salts are held, verify answers
+  503 `busy` until the oldest group expires. Checking and recording a salt
+  happen under one lock, taken only for tokens that passed the signature,
+  visitor and proof-of-work checks.
+- Budget counts are keyed by `budget_id` in a count-min sketch per ingress:
+  4 rows of 2^18 lock-free cells, 8 MiB fixed. Each cell carries the hour
+  it counts for, so counts start over each clock hour without a sweep.
+  Nothing is evicted, so no amount of other traffic gives a spent clearance
+  a fresh budget. Clearances that share cells can only push each other's
+  counts up, which at worst re-challenges a visitor early.
 - Until JA4 (phase 3), the `ja4_or_source` input of the identity is the
   proxy's existing TLS fingerprint (`tls:<fingerprint>`); attack mode keeps
   answering plain HTTP with 426.
