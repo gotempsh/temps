@@ -3434,22 +3434,8 @@ impl LoadBalancer {
                 }
                 crate::shield::VerifyOutcome::Rejected(error) => {
                     debug!(%error, "Attack mode: challenge rejected");
-                    // A full redeemed set is the ingress's limit and a full
-                    // network share is a rate limit, not a bad solution; the
-                    // page offers a retry for both.
-                    let status = match error {
-                        temps_shield::ChallengeError::Busy => StatusCode::SERVICE_UNAVAILABLE,
-                        temps_shield::ChallengeError::NetworkBusy => StatusCode::TOO_MANY_REQUESTS,
-                        _ => StatusCode::FORBIDDEN,
-                    };
-                    (
-                        status,
-                        None,
-                        format!(
-                            r#"{{"ok":false,"error":"{}"}}"#,
-                            crate::shield::rejection_code(error)
-                        ),
-                    )
+                    let (status, code) = crate::shield::rejection_response(error);
+                    (status, None, format!(r#"{{"ok":false,"error":"{code}"}}"#))
                 }
                 crate::shield::VerifyOutcome::BadRequest => (
                     StatusCode::BAD_REQUEST,

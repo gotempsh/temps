@@ -9,6 +9,7 @@
 //! bound to is computed here from the connection; nothing the client sends
 //! in a body decides who it is or which environment it cleared.
 
+use pingora::http::StatusCode;
 use serde::Deserialize;
 use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity, VisitorNetwork};
 
@@ -104,15 +105,22 @@ pub fn verify(
     }
 }
 
-/// The short reason a rejected verify returns to the page.
-pub fn rejection_code(error: ChallengeError) -> &'static str {
+/// The status and short reason a rejected verify returns to the page. A
+/// full redeemed set is the ingress's limit and a full network share is a
+/// rate limit, not a bad solution; the page offers a retry for every one.
+pub fn rejection_response(error: ChallengeError) -> (StatusCode, &'static str) {
     match error {
-        ChallengeError::Expired => "expired",
-        ChallengeError::Replayed => "replayed",
-        ChallengeError::Busy => "busy",
-        ChallengeError::NetworkBusy => "rate_limited",
-        ChallengeError::InsufficientWork | ChallengeError::BadNonce => "unsolved",
-        _ => "invalid",
+        ChallengeError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
+        ChallengeError::NetworkBusy => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        ChallengeError::Expired => (StatusCode::FORBIDDEN, "expired"),
+        ChallengeError::Replayed => (StatusCode::FORBIDDEN, "replayed"),
+        ChallengeError::InsufficientWork | ChallengeError::BadNonce => {
+            (StatusCode::FORBIDDEN, "unsolved")
+        }
+        ChallengeError::Malformed
+        | ChallengeError::BadSignature
+        | ChallengeError::WrongVisitor
+        | ChallengeError::Key => (StatusCode::FORBIDDEN, "invalid"),
     }
 }
 
@@ -184,6 +192,22 @@ mod tests {
         );
         assert_ne!(a, visitor_identity(Some("203.0.113.9"), ua, Some("t13_bb")));
         assert_ne!(a, visitor_identity(Some("203.0.113.9"), ua, None));
+    }
+
+    #[test]
+    fn capacity_refusals_are_not_forbidden() {
+        assert_eq!(
+            rejection_response(ChallengeError::Busy),
+            (StatusCode::SERVICE_UNAVAILABLE, "busy")
+        );
+        assert_eq!(
+            rejection_response(ChallengeError::NetworkBusy),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
+        );
+        assert_eq!(
+            rejection_response(ChallengeError::WrongVisitor),
+            (StatusCode::FORBIDDEN, "invalid")
+        );
     }
 
     #[test]

@@ -55,10 +55,14 @@ impl BudgetCounter {
     }
 }
 
-/// Adds one to `cell` for `window` and returns its count before.
+/// Adds one to `cell` for `window` and returns its count before. A request
+/// stamped just before the hour turned can land after one stamped just
+/// after; it counts toward the cell's newer hour rather than moving the
+/// cell back and wiping that hour's count.
 fn increment(cell: &AtomicU64, window: u32) -> u32 {
     let mut packed = cell.load(Ordering::Relaxed);
     loop {
+        let window = window.max((packed >> 32) as u32);
         let before = count_in(packed, window);
         let next = pack(window, before.saturating_add(1));
         match cell.compare_exchange_weak(packed, next, Ordering::Relaxed, Ordering::Relaxed) {
@@ -113,6 +117,18 @@ mod tests {
         counter.record(&[1; 8], hour);
         assert_eq!(counter.record(&[1; 8], hour + SECONDS_PER_WINDOW - 1), 1);
         assert_eq!(counter.record(&[1; 8], hour + SECONDS_PER_WINDOW), 0);
+    }
+
+    #[test]
+    fn a_late_request_from_the_previous_hour_keeps_the_new_count() {
+        let counter = BudgetCounter::new();
+        let hour = NOW - NOW % SECONDS_PER_WINDOW;
+        let next = hour + SECONDS_PER_WINDOW;
+        counter.record(&[1; 8], next);
+        counter.record(&[1; 8], next);
+        // Stamped in the old hour, counted after the rollover.
+        assert_eq!(counter.record(&[1; 8], next - 1), 2);
+        assert_eq!(counter.record(&[1; 8], next), 3);
     }
 
     /// The defect a size-bounded cache has: enough other clearances push a
