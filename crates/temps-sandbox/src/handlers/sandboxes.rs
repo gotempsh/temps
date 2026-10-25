@@ -280,6 +280,17 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Placement Settings Unavailable")
                     .with_detail(error.to_string())
             }
+            SandboxError::LimitSettings { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Sandbox Limit Settings Unavailable")
+                    .with_detail(error.to_string())
+            }
+            SandboxError::UserSandboxLimitReached { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-limit-reached")
+                    .with_title("Sandbox Limit Reached")
+                    .with_detail(error.to_string())
+            }
         }
     }
 }
@@ -523,8 +534,10 @@ impl From<SourceBody> for SandboxSource {
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct ResourcesBody {
     #[serde(default)]
+    #[schema(minimum = 6, maximum = 32768)]
     pub memory: Option<u64>,
     #[serde(default)]
+    #[schema(minimum = 0.01, maximum = 16.0)]
     pub vcpus: Option<f64>,
 }
 
@@ -549,14 +562,25 @@ pub struct CreateSandboxBody {
     /// Extra env vars baked into the container on create.
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
+    /// Omit for the operator's default.
+    #[schema(minimum = 0.01, maximum = 16.0)]
     #[serde(default)]
     pub cpu_limit: Option<f64>,
+    /// Memory in MB, `[6, 32768]` (lower if an administrator set a maximum,
+    /// and never more than the host has). Omit for the operator's default.
+    #[schema(minimum = 6, maximum = 32768)]
     #[serde(default)]
     pub memory_limit_mb: Option<u64>,
+    /// Max processes, `[1, 4096]` (lower if an administrator set a maximum);
+    /// `0`/negative (unlimited) is rejected. Omit for the platform default
+    /// (512).
+    #[schema(minimum = 1, maximum = 4096)]
     #[serde(default)]
     pub pids_limit: Option<i64>,
-    /// Root disk size in MB (Firecracker only; Docker ignores it). Omit for
-    /// the platform default (1 GiB).
+    /// Root disk size in MB, `[1, 65536]` (Firecracker only; Docker ignores
+    /// it). Omit for the platform default (1 GiB).
+    #[schema(minimum = 1, maximum = 65536)]
     #[serde(default)]
     pub disk_size_mb: Option<u64>,
     /// `@vercel/sandbox`'s nested resources object. When present, its
@@ -675,12 +699,76 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             project_id: b.project_id,
             // Snapshot artifact is resolved and injected by the handler;
             // the `From` impl starts with None and the handler sets it.
+            // Every request built from an HTTP body is subject to the
+            // operator's maximums and per-user cap; the service applies them
+            // once it knows which node the sandbox lands on.
+            enforce_operator_limits: true,
             from_snapshot_artifact: None,
             host_work_dir_override: None,
             node: b.node,
             egress_policy: b.egress_policy,
         }
     }
+}
+
+/// Ceilings for the resource limits a caller may request on create. The
+/// provider treats a request value as authoritative (the operator's
+/// `agent_sandbox` settings are only the defaults for omitted fields), so
+/// without a ceiling here any `sandboxes:write` key could ask for no process
+/// cap (`pids_limit <= 0` means "unlimited" to Docker) or for more memory than
+/// the host has. Generous enough for real workloads, finite so the host's
+/// pid table and memory stay protected from untrusted code.
+pub const MAX_SANDBOX_CPU_CORES: f64 = 16.0;
+/// Floors below which the request cannot be enforced. Docker takes CPU as
+/// integer NanoCPUs, so a tiny positive value truncates to 0, which Docker
+/// reads as "no CPU quota"; it also rejects memory limits under 6 MB.
+pub const MIN_SANDBOX_CPU_CORES: f64 = 0.01;
+pub const MIN_SANDBOX_MEMORY_MB: u64 = 6;
+pub const MAX_SANDBOX_MEMORY_MB: u64 = 32 * 1024;
+pub const MAX_SANDBOX_PIDS_LIMIT: i64 = 4096;
+pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
+
+/// Reject caller-supplied resource limits that are non-positive, non-finite
+/// or above the ceilings. `None` is always accepted: it selects the
+/// operator's defaults.
+fn validate_resource_limits(req: &CreateSandboxRequest) -> Result<(), SandboxError> {
+    if let Some(cpu) = req.cpu_limit {
+        if !cpu.is_finite() || !(MIN_SANDBOX_CPU_CORES..=MAX_SANDBOX_CPU_CORES).contains(&cpu) {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "cpu_limit/vcpus must be between {MIN_SANDBOX_CPU_CORES} and {MAX_SANDBOX_CPU_CORES}, got {cpu}"
+                ),
+            });
+        }
+    }
+    if let Some(memory) = req.memory_limit_mb {
+        if !(MIN_SANDBOX_MEMORY_MB..=MAX_SANDBOX_MEMORY_MB).contains(&memory) {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "memory_limit_mb/memory must be between {MIN_SANDBOX_MEMORY_MB} and {MAX_SANDBOX_MEMORY_MB} MB, got {memory}"
+                ),
+            });
+        }
+    }
+    if let Some(pids) = req.pids_limit {
+        if pids <= 0 || pids > MAX_SANDBOX_PIDS_LIMIT {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "pids_limit must be between 1 and {MAX_SANDBOX_PIDS_LIMIT} (0 and negative values mean unlimited and are not accepted), got {pids}"
+                ),
+            });
+        }
+    }
+    if let Some(disk) = req.disk_size_mb {
+        if disk == 0 || disk > MAX_SANDBOX_DISK_MB {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "disk_size_mb must be between 1 and {MAX_SANDBOX_DISK_MB} MB, got {disk}"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Map our internal status to the Vercel SDK status enum
@@ -1214,9 +1302,9 @@ async fn build_summary_responses(
     request_body = CreateSandboxBody,
     responses(
         (status = 201, description = "Sandbox created", body = SandboxResponse),
-        (status = 400, description = "Validation error"),
+        (status = 400, description = "Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum"),
         (status = 401, description = "Unauthorized"),
-        (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible"),
+        (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -1266,6 +1354,7 @@ pub async fn create_sandbox(
     let user_id = auth.user_id();
     let from_snapshot_id = body.from_snapshot.clone();
     let mut req: crate::services::sandbox_service::CreateSandboxRequest = body.into();
+    validate_resource_limits(&req)?;
     // Held through provider restore so a concurrent delete cannot remove the
     // verified artifact after resolution but before it is consumed.
     let mut artifact_lifecycle_guard = None;
@@ -3500,6 +3589,256 @@ mod tests {
         let req: CreateSandboxRequest = body.into();
         assert_eq!(req.image.as_deref(), Some("node:20"));
         assert_eq!(req.timeout_secs, Some(120));
+    }
+
+    fn request_with_limits(
+        cpu: Option<f64>,
+        memory: Option<u64>,
+        pids: Option<i64>,
+        disk: Option<u64>,
+    ) -> CreateSandboxRequest {
+        CreateSandboxRequest::from(CreateSandboxBody {
+            cpu_limit: cpu,
+            memory_limit_mb: memory,
+            pids_limit: pids,
+            disk_size_mb: disk,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn resource_limits_default_and_in_range_are_accepted() {
+        assert!(validate_resource_limits(&request_with_limits(None, None, None, None)).is_ok());
+        assert!(validate_resource_limits(&request_with_limits(
+            Some(MAX_SANDBOX_CPU_CORES),
+            Some(MAX_SANDBOX_MEMORY_MB),
+            Some(MAX_SANDBOX_PIDS_LIMIT),
+            Some(MAX_SANDBOX_DISK_MB),
+        ))
+        .is_ok());
+        assert!(validate_resource_limits(&request_with_limits(
+            Some(MIN_SANDBOX_CPU_CORES),
+            Some(MIN_SANDBOX_MEMORY_MB),
+            Some(1),
+            Some(1)
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn unlimited_pids_limit_is_rejected() {
+        for pids in [-1, 0, MAX_SANDBOX_PIDS_LIMIT + 1] {
+            let err = validate_resource_limits(&request_with_limits(None, None, Some(pids), None))
+                .unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::Validation { message } if message.contains("pids_limit")),
+                "pids_limit {pids} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_or_zero_memory_is_rejected() {
+        // The value from the report: 4 TiB.
+        for memory in [
+            0,
+            MIN_SANDBOX_MEMORY_MB - 1,
+            MAX_SANDBOX_MEMORY_MB + 1,
+            4_194_304,
+        ] {
+            let err =
+                validate_resource_limits(&request_with_limits(None, Some(memory), None, None))
+                    .unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::Validation { message } if message.contains("memory_limit_mb")),
+                "memory_limit_mb {memory} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_cpu_is_rejected() {
+        for cpu in [
+            0.0,
+            -1.0,
+            1e-12,
+            MIN_SANDBOX_CPU_CORES / 2.0,
+            f64::NAN,
+            f64::INFINITY,
+            MAX_SANDBOX_CPU_CORES + 0.5,
+        ] {
+            let err = validate_resource_limits(&request_with_limits(Some(cpu), None, None, None))
+                .unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::Validation { message } if message.contains("cpu_limit")),
+                "cpu_limit {cpu} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn oversized_or_zero_disk_is_rejected() {
+        for disk in [0, MAX_SANDBOX_DISK_MB + 1] {
+            let err = validate_resource_limits(&request_with_limits(None, None, None, Some(disk)))
+                .unwrap_err();
+            assert!(
+                matches!(&err, SandboxError::Validation { message } if message.contains("disk_size_mb")),
+                "disk_size_mb {disk} must be rejected, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sdk_resources_object_is_subject_to_the_same_ceilings() {
+        let body = CreateSandboxBody {
+            resources: Some(ResourcesBody {
+                memory: Some(MAX_SANDBOX_MEMORY_MB + 1),
+                vcpus: Some(1.0),
+            }),
+            ..Default::default()
+        };
+        let req = CreateSandboxRequest::from(body);
+        assert!(validate_resource_limits(&req).is_err());
+    }
+
+    // ── POST /v1/sandboxes, through the router ──────────────────────────────
+    //
+    // These send real requests so the handler wiring is covered, not only the
+    // validator: an account holding the default `user` role must get a 4xx for
+    // limits that would otherwise reach the container runtime.
+
+    struct AllowAll;
+
+    #[async_trait::async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowAll {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
+    fn settings_row(agent_sandbox: serde_json::Value) -> temps_entities::settings::Model {
+        temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({ "agent_sandbox": agent_sandbox }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn live_count_row(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([("num_items".to_string(), count.into())])
+    }
+
+    /// Router over `db`, authenticated as a default-role user.
+    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+        let service = Arc::new(
+            crate::services::sandbox_service::tests::preview_test_service_with_db(Arc::new(db)),
+        );
+        let state = Arc::new(SandboxAppState {
+            sandbox_service: service,
+            snapshot_service: None,
+            project_access_checker: None,
+            audit_service: None,
+            sensitive_action_authorizer: Arc::new(AllowAll),
+        });
+        crate::handlers::configure_routes()
+            .with_state(state)
+            .layer(axum::Extension(AuthContext::new_session(
+                test_user(),
+                Role::User,
+            )))
+    }
+
+    /// Status and parsed Problem body of `POST /v1/sandboxes`.
+    async fn post_create(
+        app: axum::Router,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/sandboxes")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unbounded_limits_before_touching_the_database() {
+        // A database that answers nothing: every case must be decided by the
+        // handler, or the unanswered query would surface as a 500.
+        for body in [
+            serde_json::json!({ "pids_limit": -1, "memory_limit_mb": 4_194_304, "cpu_limit": 1 }),
+            serde_json::json!({ "pids_limit": 0 }),
+            serde_json::json!({ "memory_limit_mb": 4_194_304 }),
+            serde_json::json!({ "memory_limit_mb": 5 }),
+            serde_json::json!({ "cpu_limit": 1e-12 }),
+            serde_json::json!({ "resources": { "memory": 4_194_304 } }),
+        ] {
+            let db =
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+            let (status, problem) = post_create(create_app(db), body.clone()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {problem}");
+            assert_eq!(problem["title"], "Validation Error", "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_a_request_over_the_operator_maximum() {
+        // Query order: the placement allow-list, then the limit settings.
+        let row = settings_row(serde_json::json!({ "max_memory_limit_mb": 1024 }));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            .into_connection();
+
+        let (status, problem) = post_create(
+            create_app(db),
+            serde_json::json!({ "memory_limit_mb": 2048 }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{problem}");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("max_memory_limit_mb"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_user_who_is_at_the_sandbox_cap() {
+        let row = settings_row(serde_json::json!({ "max_sandboxes_per_user": 2 }));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            // The user already has two live sandboxes.
+            .append_query_results([vec![live_count_row(2)]])
+            // The per-user advisory lock taken before the count.
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let (status, problem) = post_create(create_app(db), serde_json::json!({})).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{problem}");
+        assert_eq!(problem["title"], "Sandbox Limit Reached");
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("already has 2") && detail.contains("limit is 2"),
+            "{detail}"
+        );
     }
 
     // ── DTO stability: unknown fields ───────────────────────────────────────

@@ -10,6 +10,7 @@
 //! control plane.
 
 use temps_config::ConfigService;
+use temps_core::node_address::NodeAgentEndpoint;
 use temps_core::EncryptionService;
 use temps_deployer::remote::RemoteNodeDeployer;
 use temps_deployer::DeployerError;
@@ -50,7 +51,13 @@ pub fn cp_client_identity(ca: &ClusterCa) -> Result<String, ClusterCaError> {
 /// it presents the CP's cluster-CA-signed client identity and trusts ONLY the
 /// cluster CA. Relies on the process-default crypto provider the CLI installs at
 /// startup (same as every other `ClientConfig::builder()` in the workspace).
+///
+/// `endpoint` is where the terminal connects ([`node_agent_endpoint`]): when it
+/// dials the node's mesh address, the agent's certificate is verified for the
+/// node's registered host instead of the dialed address, exactly as for the
+/// node's HTTP clients.
 pub async fn cp_ws_client_config(
+    endpoint: &NodeAgentEndpoint,
     config_service: &ConfigService,
     encryption_service: &EncryptionService,
 ) -> Result<rustls::ClientConfig, ClusterCaError> {
@@ -61,6 +68,18 @@ pub async fn cp_ws_client_config(
     // Combined PEM (cert chain followed by key) — each parser ignores the
     // other's blocks, so we feed the same buffer to both.
     let identity_pem = cp_client_identity(&ca)?;
+    if let Some(server_name) = endpoint.server_name.as_deref() {
+        let mut config = temps_core::node_pki::node_agent_client_config(
+            &identity_pem,
+            &ca.cert_pem,
+            server_name,
+        )
+        .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))?;
+        // The terminal speaks HTTP/1.1 WebSocket upgrades only, like the
+        // direct-dial config below (which offers no ALPN).
+        config.alpn_protocols.clear();
+        return Ok(config);
+    }
 
     let cert_chain: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut BufReader::new(identity_pem.as_bytes()))
@@ -85,6 +104,26 @@ pub async fn cp_ws_client_config(
         .map_err(|e| ClusterCaError::Client(format!("build WS client config: {e}")))
 }
 
+/// Where the control plane reaches `node`'s agent: its registered address, or
+/// its WireGuard mesh address for a node that joined with a public one (see
+/// [`temps_core::node_address::node_agent_endpoint`]). Every CP→agent client
+/// in this module is built from it, so the HTTP, deployer and terminal paths
+/// always agree on the address and on the name the certificate is verified
+/// for.
+pub fn node_agent_endpoint(node: &temps_entities::nodes::Model) -> NodeAgentEndpoint {
+    let endpoint = node.agent_endpoint();
+    if endpoint.via_mesh() {
+        tracing::debug!(
+            node_id = node.id,
+            node = %node.name,
+            registered = %node.address,
+            dial = %endpoint.dial_url,
+            "reaching the node agent over the WireGuard mesh"
+        );
+    }
+    endpoint
+}
+
 /// TCP/TLS connect timeout for control-plane → node HTTP clients.
 pub const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -100,12 +139,16 @@ pub const NODE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// CP→agent paths that don't go through `RemoteNodeDeployer` (log streaming,
 /// edge-analytics ingest) so they don't silently fall back to plaintext
 /// against an mTLS-enforcing node.
+///
+/// The client is for `endpoint` ([`node_agent_endpoint`]); build request URLs
+/// from `endpoint.dial_url`.
 pub async fn build_node_http_client(
-    address: &str,
+    endpoint: &NodeAgentEndpoint,
     config_service: &ConfigService,
     encryption_service: &EncryptionService,
     timeout: Option<std::time::Duration>,
 ) -> Result<reqwest::Client, ClusterCaError> {
+    let address = endpoint.dial_url.as_str();
     // A worker that accepts the TCP connection but never answers must not
     // hold a caller for the whole request timeout, and nothing on a node
     // legitimately redirects: following one would replay the bearer token.
@@ -115,7 +158,18 @@ pub async fn build_node_http_client(
     if let Some(t) = timeout {
         builder = builder.timeout(t);
     }
-    if is_https_address(address) {
+    if let (true, Some(server_name)) = (is_https_address(address), endpoint.server_name.as_deref())
+    {
+        let ca = ensure_cluster_ca(config_service, encryption_service).await?;
+        let identity_pem = cp_client_identity(&ca)?;
+        let tls = temps_core::node_pki::node_agent_client_config(
+            &identity_pem,
+            &ca.cert_pem,
+            server_name,
+        )
+        .map_err(|e| ClusterCaError::Client(e.to_string()))?;
+        builder = builder.use_preconfigured_tls(tls);
+    } else if is_https_address(address) {
         let ca = ensure_cluster_ca(config_service, encryption_service).await?;
         let identity_pem = cp_client_identity(&ca)?;
         let identity = reqwest::Identity::from_pem(identity_pem.as_bytes())
@@ -140,24 +194,23 @@ pub async fn build_node_http_client(
 /// control plane's client identity too: every caller deciding whether to talk
 /// mTLS to a node goes through this one check, so they can never disagree.
 pub fn is_https_address(address: &str) -> bool {
-    address
-        .trim_start()
-        .get(..8)
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+    temps_core::node_address::is_https_agent_address(address)
 }
 
 /// Build a `ContainerDeployer` for a remote node, transparently using mutual TLS
 /// when the node's `address` is `https://` (ADR-020 WS-2.1) and plain HTTP
 /// otherwise. This is the single place every CP→agent deployer is constructed so
 /// no call site can accidentally fall back to plaintext against an mTLS node.
+/// The agent is dialed at [`node_agent_endpoint`].
 pub async fn build_node_deployer(
-    address: &str,
+    node: &temps_entities::nodes::Model,
     token: String,
-    node_name: String,
     config_service: &ConfigService,
     encryption_service: &EncryptionService,
 ) -> Result<RemoteNodeDeployer, DeployerError> {
-    if is_https_address(address) {
+    let node_name = node.name.clone();
+    let endpoint = node_agent_endpoint(node);
+    if is_https_address(&endpoint.dial_url) {
         let ca = ensure_cluster_ca(config_service, encryption_service)
             .await
             .map_err(|e| {
@@ -172,15 +225,9 @@ pub async fn build_node_deployer(
                 node_name, e
             ))
         })?;
-        RemoteNodeDeployer::new_mtls(
-            address.to_string(),
-            token,
-            node_name,
-            &identity,
-            &ca.cert_pem,
-        )
+        RemoteNodeDeployer::new_mtls_at(&endpoint, token, node_name, &identity, &ca.cert_pem)
     } else {
-        RemoteNodeDeployer::new(address.to_string(), token, node_name)
+        RemoteNodeDeployer::new(endpoint.dial_url, token, node_name)
     }
 }
 

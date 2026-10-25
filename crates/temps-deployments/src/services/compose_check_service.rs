@@ -134,6 +134,10 @@ impl From<ComposeCheckServiceError> for ComposeContextError {
 /// The host's Docker Compose CLI as probed at startup.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ComposeHostStatusResponse {
+    /// False when this process never runs Compose workloads (a hosted control
+    /// plane): the CLI is neither probed nor expected, so a missing or old
+    /// Compose is not a problem to report there.
+    pub applicable: bool,
     /// False until the startup probe finishes.
     pub probed: bool,
     /// Whether the Compose CLI ran.
@@ -195,6 +199,9 @@ pub struct ComposeCheckService {
     executor: Arc<ComposeExecutor>,
     /// Written once by the startup probe; read by the status endpoint.
     host_status: RwLock<Option<(ComposeSupport, DateTime<Utc>)>>,
+    /// Whether this process may run Compose workloads at all. Off for a
+    /// control-plane profile, which has no Docker and deploys nothing locally.
+    local_workloads_enabled: bool,
 }
 
 impl ComposeCheckService {
@@ -210,12 +217,30 @@ impl ComposeCheckService {
             git_provider_manager,
             executor,
             host_status: RwLock::new(None),
+            local_workloads_enabled: true,
         }
+    }
+
+    /// Declare whether this process runs workloads itself. When it does not,
+    /// the Compose CLI is not probed and the host status reports
+    /// `applicable: false`.
+    pub fn with_local_workloads_enabled(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 
     /// Probe the Compose CLI and remember the result. Logs a warning when
     /// Compose deployments that need resolution would fail on this host.
     pub async fn probe_host(&self) -> ComposeSupport {
+        if !self.local_workloads_enabled {
+            info!("Skipping the Docker Compose probe: this process runs no local workloads");
+            return ComposeSupport {
+                available: false,
+                version: None,
+                missing_flags: Vec::new(),
+                problem: None,
+            };
+        }
         let support = ComposeExecutor::probe_compose_support().await;
         match &support.problem {
             Some(problem) => warn!(
@@ -237,12 +262,26 @@ impl ComposeCheckService {
     }
 
     pub fn host_status(&self) -> ComposeHostStatusResponse {
+        if !self.local_workloads_enabled {
+            return ComposeHostStatusResponse {
+                applicable: false,
+                probed: true,
+                available: false,
+                supported: false,
+                version: None,
+                minimum_version: MIN_COMPOSE_VERSION.to_string(),
+                missing_flags: Vec::new(),
+                problem: None,
+                checked_at: None,
+            };
+        }
         let status = match self.host_status.read() {
             Ok(status) => status.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         match status {
             Some((support, checked_at)) => ComposeHostStatusResponse {
+                applicable: true,
                 probed: true,
                 available: support.available,
                 supported: support.supported(),
@@ -253,6 +292,7 @@ impl ComposeCheckService {
                 checked_at: Some(checked_at),
             },
             None => ComposeHostStatusResponse {
+                applicable: true,
                 probed: false,
                 available: false,
                 supported: false,
@@ -1347,9 +1387,26 @@ mod tests {
     fn host_status_is_unprobed_until_the_probe_runs() {
         let service = service(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let status = service.host_status();
+        assert!(status.applicable);
         assert!(!status.probed);
         assert!(!status.supported);
         assert_eq!(status.minimum_version, MIN_COMPOSE_VERSION);
+    }
+
+    #[tokio::test]
+    async fn a_process_with_no_local_workloads_reports_compose_as_not_applicable() {
+        // A hosted control plane has no Docker. A missing Compose CLI there is
+        // expected, so it must be neither probed nor reported as a problem.
+        let service = service(MockDatabase::new(DatabaseBackend::Postgres).into_connection())
+            .with_local_workloads_enabled(false);
+        let probed = service.probe_host().await;
+        assert!(!probed.available);
+        assert!(probed.problem.is_none());
+
+        let status = service.host_status();
+        assert!(!status.applicable);
+        assert!(status.problem.is_none());
+        assert!(status.missing_flags.is_empty());
     }
 
     #[tokio::test]

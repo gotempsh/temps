@@ -7,9 +7,12 @@ import {
   canAddWorkerNode,
   isWorkerNodeRequiredProblem,
   NODE_CAPABILITY_POLL_MS,
+  NODE_HEARTBEAT_STALE_SECS,
+  nodeIsUnreachable,
   nodeCapabilityRefetchInterval,
   problemErrorCode,
   sameOriginSetupPath,
+  servingOnUnreachableNode,
   shouldPromptForFirstWorkerNode,
   shouldShowWorkerNodeBanner,
   unremovedNodeContainers,
@@ -198,5 +201,63 @@ describe('sameOriginSetupPath', () => {
     ]) {
       expect(sameOriginSetupPath(bad)).toBe('/settings/nodes')
     }
+  })
+})
+
+describe('nodeIsUnreachable', () => {
+  const now = Date.parse('2026-10-20T12:00:00Z')
+  const ago = (seconds: number) => new Date(now - seconds * 1000).toISOString()
+
+  test('a never-heard-from node is unreachable; a fresh heartbeat is not', () => {
+    expect(nodeIsUnreachable({ last_heartbeat: null }, now)).toBe(true)
+    expect(nodeIsUnreachable({ last_heartbeat: ago(1) }, now)).toBe(false)
+  })
+
+  test('a node silent past the threshold is unreachable', () => {
+    expect(
+      nodeIsUnreachable(
+        { last_heartbeat: ago(NODE_HEARTBEAT_STALE_SECS + 1) },
+        now
+      )
+    ).toBe(true)
+    expect(
+      nodeIsUnreachable(
+        { last_heartbeat: ago(NODE_HEARTBEAT_STALE_SECS - 1) },
+        now
+      )
+    ).toBe(false)
+  })
+})
+
+describe('servingOnUnreachableNode', () => {
+  test('reads the environments an unreachable node still serves', () => {
+    expect(
+      servingOnUnreachableNode({
+        force_removes_serving: true,
+        serving_containers: 2,
+        serving_environments: ["environment 'prod' of project 'api'", 7],
+      })
+    ).toEqual({
+      count: 2,
+      environments: ["environment 'prod' of project 'api'"],
+    })
+    expect(
+      servingOnUnreachableNode({
+        extensions: {
+          force_removes_serving: true,
+          serving_environments: ['a', 'b'],
+        },
+      })
+    ).toEqual({ count: 2, environments: ['a', 'b'] })
+  })
+
+  test('ignores a still-serving refusal for a reachable node', () => {
+    expect(
+      servingOnUnreachableNode({
+        serving_containers: 1,
+        title: 'Node Has Active Containers',
+      })
+    ).toBeUndefined()
+    expect(servingOnUnreachableNode(null)).toBeUndefined()
   })
 })

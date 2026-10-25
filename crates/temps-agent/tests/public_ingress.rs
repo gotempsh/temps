@@ -47,6 +47,7 @@ impl IngressHarness {
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
+            listen: None,
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -140,6 +141,7 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         certificates: None,
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
+        listen: None,
     });
     store
 }
@@ -383,6 +385,7 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
+            listen: None,
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -579,6 +582,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         }),
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
+        listen: None,
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -721,6 +725,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         certificates: None,
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
+        listen: None,
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(

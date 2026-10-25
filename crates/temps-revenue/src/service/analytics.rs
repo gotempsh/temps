@@ -128,6 +128,19 @@ pub struct RevenueAnalyticsService {
     db: Arc<DatabaseConnection>,
 }
 
+/// `aggregate` (a `SUM` over BIGINT, which Postgres returns as NUMERIC)
+/// cast to BIGINT, saturating at the BIGINT bounds instead of failing the
+/// whole query with "bigint out of range". NULL stays NULL, which is why
+/// this is a CASE and not GREATEST/LEAST, which skip NULLs. Postgres
+/// evaluates the repeated identical aggregate once.
+fn saturating_bigint_sql(aggregate: &str) -> String {
+    format!(
+        "(CASE WHEN {aggregate} > 9223372036854775807 THEN 9223372036854775807 \
+         WHEN {aggregate} < -9223372036854775808 THEN -9223372036854775808 \
+         ELSE {aggregate} END)::bigint"
+    )
+}
+
 impl RevenueAnalyticsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
@@ -142,11 +155,12 @@ impl RevenueAnalyticsService {
             .all(self.db.as_ref())
             .await?;
 
+        // Saturating: rows from every project of the install are summed, and
+        // release builds do not check overflow, so a plain `sum` would wrap.
         let mrr = subs
             .iter()
             .filter(|s| matches!(s.status.as_str(), "active" | "trialing" | "past_due"))
-            .map(|s| s.mrr_minor)
-            .sum();
+            .fold(0i64, |total, s| total.saturating_add(s.mrr_minor));
         Ok(mrr)
     }
 
@@ -165,8 +179,9 @@ impl RevenueAnalyticsService {
             total: Option<i64>,
         }
 
-        let sql = r#"
-            SELECT SUM(mrr_minor)::bigint AS total
+        let sql = format!(
+            r#"
+            SELECT {total} AS total
             FROM revenue_events
             WHERE currency = $1
               AND occurred_at <= $2
@@ -176,11 +191,13 @@ impl RevenueAnalyticsService {
                   'subscription.canceled',
                   'mrr.realized'
               )
-        "#;
+        "#,
+            total = saturating_bigint_sql("SUM(mrr_minor)")
+        );
 
         let stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            sql,
+            &sql,
             [currency.to_lowercase().into(), as_of.into()],
         );
         let row = Row::find_by_statement(stmt).one(self.db.as_ref()).await?;
@@ -206,30 +223,36 @@ impl RevenueAnalyticsService {
             transactions_last_30d: Option<i64>,
         }
 
-        let cash_sql = r#"
+        let cash_sql = format!(
+            r#"
             SELECT
-                SUM(amount_minor) FILTER (
-                    WHERE event_type = 'charge.succeeded' AND occurred_at >= $2
-                )::bigint AS paid_last_30d,
-                SUM(amount_minor) FILTER (
-                    WHERE event_type = 'charge.refunded' AND occurred_at >= $2
-                )::bigint AS refunded_last_30d,
-                SUM(amount_minor) FILTER (
-                    WHERE event_type = 'charge.succeeded'
-                )::bigint AS paid_all_time,
-                SUM(amount_minor) FILTER (
-                    WHERE event_type = 'charge.refunded'
-                )::bigint AS refunded_all_time,
+                {paid_last_30d} AS paid_last_30d,
+                {refunded_last_30d} AS refunded_last_30d,
+                {paid_all_time} AS paid_all_time,
+                {refunded_all_time} AS refunded_all_time,
                 COUNT(*) FILTER (
                     WHERE event_type = 'charge.succeeded' AND occurred_at >= $2
                 )::bigint AS transactions_last_30d
             FROM revenue_events
             WHERE currency = $1
-        "#;
+        "#,
+            paid_last_30d = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.succeeded' AND occurred_at >= $2)"
+            ),
+            refunded_last_30d = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.refunded' AND occurred_at >= $2)"
+            ),
+            paid_all_time = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.succeeded')"
+            ),
+            refunded_all_time = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.refunded')"
+            ),
+        );
         let thirty_days_ago = Utc::now() - chrono::Duration::days(30);
         let cash_stmt = Statement::from_sql_and_values(
             DbBackend::Postgres,
-            cash_sql,
+            &cash_sql,
             [currency.clone().into(), thirty_days_ago.into()],
         );
         let cash = CashRow::find_by_statement(cash_stmt)
@@ -285,7 +308,7 @@ impl RevenueAnalyticsService {
         let mut active_subs: i64 = 0;
         for s in &subs {
             if matches!(s.status.as_str(), "active" | "trialing" | "past_due") {
-                mrr += s.mrr_minor;
+                mrr = mrr.saturating_add(s.mrr_minor);
                 active_subs += 1;
             }
         }
@@ -368,16 +391,9 @@ impl RevenueAnalyticsService {
             r#"
             SELECT
                 date_trunc('{granularity}', occurred_at) AS bucket,
-                SUM(mrr_minor) FILTER (
-                    WHERE event_type IN (
-                        'subscription.created',
-                        'subscription.updated',
-                        'subscription.canceled',
-                        'mrr.realized'
-                    )
-                )::bigint AS mrr_minor,
-                SUM(amount_minor) FILTER (WHERE event_type = 'charge.succeeded')::bigint AS charge_total_minor,
-                SUM(amount_minor) FILTER (WHERE event_type = 'charge.refunded')::bigint AS refund_total_minor,
+                {mrr_minor} AS mrr_minor,
+                {charge_total_minor} AS charge_total_minor,
+                {refund_total_minor} AS refund_total_minor,
                 COUNT(*) FILTER (WHERE event_type = 'charge.succeeded')::bigint AS charge_count
             FROM revenue_events
             WHERE project_id = $1
@@ -391,7 +407,17 @@ impl RevenueAnalyticsService {
                 Bucket::Day => "day",
                 Bucket::Week => "week",
                 Bucket::Month => "month",
-            }
+            },
+            mrr_minor = saturating_bigint_sql(
+                "SUM(mrr_minor) FILTER (WHERE event_type IN ('subscription.created', \
+                 'subscription.updated', 'subscription.canceled', 'mrr.realized'))"
+            ),
+            charge_total_minor = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.succeeded')"
+            ),
+            refund_total_minor = saturating_bigint_sql(
+                "SUM(amount_minor) FILTER (WHERE event_type = 'charge.refunded')"
+            ),
         );
         // interval usage lives in Bucket::pg_interval for the continuous
         // aggregate; date_trunc is what we use against raw events.
@@ -611,6 +637,7 @@ mod tests {
             started_at: None,
             canceled_at: None,
             updated_at: Utc::now(),
+            last_event_at: None,
         }
     }
 
@@ -631,6 +658,36 @@ mod tests {
 
         let total = svc.global_mrr("usd").await.expect("global_mrr succeeds");
         assert_eq!(total, 1500 + 500 + 200);
+    }
+
+    #[tokio::test]
+    async fn global_mrr_saturates_instead_of_overflowing() {
+        // Rows written before amounts were bounded can still hold i64::MAX.
+        // A plain sum panics in debug and wraps negative in release.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    sub(1, 10, "active", i64::MAX),
+                    sub(2, 11, "active", 1500),
+                ]])
+                .into_connection(),
+        );
+        let svc = RevenueAnalyticsService::new(db);
+
+        let total = svc.global_mrr("usd").await.expect("global_mrr succeeds");
+        assert_eq!(total, i64::MAX);
+    }
+
+    #[test]
+    fn sql_sums_saturate_and_keep_null() {
+        let sql = saturating_bigint_sql("SUM(mrr_minor)");
+        assert!(
+            sql.starts_with("(CASE WHEN SUM(mrr_minor) > 9223372036854775807"),
+            "{sql}"
+        );
+        assert!(sql.contains("ELSE SUM(mrr_minor) END)::bigint"), "{sql}");
+        // GREATEST/LEAST would turn an empty (NULL) sum into a bound.
+        assert!(!sql.contains("GREATEST") && !sql.contains("LEAST"), "{sql}");
     }
 
     #[tokio::test]

@@ -193,9 +193,10 @@ mod public_route_tests {
             .expect("request builds")
     }
 
-    const RECEIVERS: [&str; 6] = [
+    const RECEIVERS: [&str; 7] = [
         "/webhook/git/github/events",
         "/webhook/source/github/events",
+        "/webhook/git/github/repo-events",
         "/webhook/git/gitlab/events",
         "/webhook/git/gitea/events",
         "/webhook/git/bitbucket/events/not-a-registered-token",
@@ -257,6 +258,33 @@ mod public_route_tests {
             }
             let request = request
                 .body(Body::from(r#"{"ref":"refs/heads/main"}"#))
+                .expect("request builds");
+            assert_eq!(
+                status(configure_public_routes(), request).await,
+                StatusCode::UNAUTHORIZED,
+                "signature {signature:?} must not be accepted"
+            );
+        }
+    }
+
+    /// A repository webhook delivery is authenticated against the secret of
+    /// a project connected to the repository it names. One that carries no
+    /// usable `X-Hub-Signature-256` is turned away before any lookup (the
+    /// state's database fails every query, so a 401 proves none was made).
+    #[tokio::test]
+    async fn a_github_repo_delivery_without_a_signature_is_rejected_before_lookup() {
+        for signature in [None, Some("not-a-signature"), Some("sha1=deadbeef")] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/webhook/git/github/repo-events")
+                .header("X-GitHub-Event", "push");
+            if let Some(signature) = signature {
+                request = request.header("X-Hub-Signature-256", signature);
+            }
+            let request = request
+                .body(Body::from(
+                    r#"{"ref":"refs/heads/main","after":"abc","repository":{"name":"r","owner":{"login":"o"}}}"#,
+                ))
                 .expect("request builds");
             assert_eq!(
                 status(configure_public_routes(), request).await,

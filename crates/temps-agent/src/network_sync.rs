@@ -83,6 +83,178 @@ pub struct DnsResolverHeartbeat {
 /// used in this module.
 pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 
+/// `overlay` in the heartbeat (ADR 056): whether this node's cross-node
+/// overlay is up, on which allocation, and why not when it is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverlayHeartbeat {
+    /// `ready` or `unavailable`.
+    pub status: &'static str,
+    /// The allocation the overlay runs on (`ready`) or was tried on.
+    pub compute_cidr: Option<String>,
+    /// The cause and the fix, when `unavailable`.
+    pub last_error: Option<String>,
+}
+
+impl OverlayHeartbeat {
+    pub const READY: &'static str = "ready";
+    pub const UNAVAILABLE: &'static str = "unavailable";
+
+    fn ready(compute_cidr: Ipv4Net) -> Self {
+        Self {
+            status: Self::READY,
+            compute_cidr: Some(compute_cidr.to_string()),
+            last_error: None,
+        }
+    }
+
+    fn unavailable(compute_cidr: Option<String>, error: String) -> Self {
+        Self {
+            status: Self::UNAVAILABLE,
+            compute_cidr,
+            last_error: Some(error),
+        }
+    }
+}
+
+/// What the network-sync loop tells the heartbeat about the overlay and the
+/// ranges this host already uses. Both `None` until the loop first ran.
+#[derive(Debug, Clone, Default)]
+pub struct OverlayReport {
+    pub overlay: Option<OverlayHeartbeat>,
+    /// This host's occupied IPv4 ranges (ADR 056), already normalized; the
+    /// heartbeat sends them when they differ from what it last sent.
+    pub occupied_ranges: Option<Vec<temps_network::occupied::OccupiedRange>>,
+}
+
+pub type SharedOverlayReport = Arc<std::sync::RwLock<OverlayReport>>;
+
+/// The health slots the network-sync loop publishes into and the heartbeat
+/// loop reads from.
+#[derive(Clone, Default)]
+pub struct HealthSlots {
+    pub dns: SharedDnsHealth,
+    pub overlay: SharedOverlayReport,
+}
+
+/// Longest wait between overlay attempts while the same failure persists.
+const OVERLAY_RETRY_CAP: Duration = Duration::from_secs(300);
+
+/// A persisting failure is logged again at most this often.
+const OVERLAY_RELOG_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Retry policy for bringing the overlay up (ADR 056): exponential backoff
+/// from [`BACKOFF_INTERVAL`] to [`OVERLAY_RETRY_CAP`] while nothing that could
+/// fix it changed, an immediate retry when the inputs (allocation, peers,
+/// occupied ranges) change, and one log line per change of cause, then at
+/// most one per [`OVERLAY_RELOG_INTERVAL`].
+#[derive(Debug, Default)]
+struct OverlayRetry {
+    failures: u32,
+    cause: Option<String>,
+    fingerprint: Option<u64>,
+    next_attempt: Option<std::time::Instant>,
+    last_logged: Option<std::time::Instant>,
+}
+
+/// What to do after a failed attempt.
+#[derive(Debug, PartialEq, Eq)]
+struct RetryStep {
+    delay: Duration,
+    /// Log this failure at warn level (else debug).
+    log: bool,
+}
+
+impl OverlayRetry {
+    /// Whether to try now: always when the inputs changed, else once the
+    /// backoff has passed.
+    fn due(&self, fingerprint: u64, now: std::time::Instant) -> bool {
+        self.fingerprint != Some(fingerprint) || self.next_attempt.is_none_or(|at| now >= at)
+    }
+
+    /// How long until the next attempt is due with unchanged inputs.
+    fn remaining(&self, now: std::time::Instant) -> Duration {
+        self.next_attempt
+            .map(|at| at.saturating_duration_since(now))
+            .unwrap_or_default()
+    }
+
+    fn failed(&mut self, cause: &str, fingerprint: u64, now: std::time::Instant) -> RetryStep {
+        if self.fingerprint != Some(fingerprint) {
+            self.failures = 0;
+        }
+        self.fingerprint = Some(fingerprint);
+        self.failures = self.failures.saturating_add(1);
+        let delay = BACKOFF_INTERVAL
+            .saturating_mul(1u32 << (self.failures - 1).min(10))
+            .min(OVERLAY_RETRY_CAP);
+        self.next_attempt = Some(now + delay);
+        let log = self.cause.as_deref() != Some(cause)
+            || self
+                .last_logged
+                .is_none_or(|at| now.saturating_duration_since(at) >= OVERLAY_RELOG_INTERVAL);
+        if log {
+            self.last_logged = Some(now);
+        }
+        self.cause = Some(cause.to_owned());
+        RetryStep { delay, log }
+    }
+
+    /// Reset after a success. Returns the failures it ends, for the
+    /// "recovered after N attempts" line.
+    fn succeeded(&mut self) -> u32 {
+        let failures = self.failures;
+        *self = Self::default();
+        failures
+    }
+}
+
+/// Identity of the inputs an overlay attempt depends on.
+fn overlay_fingerprint(
+    payload: &WirePeerListResponse,
+    occupied: Option<&[temps_network::occupied::OccupiedRange]>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serde_json::to_string(&(
+        &payload.network,
+        &payload.alloc,
+        &payload.peers,
+        &payload.wireguard,
+    ))
+    .unwrap_or_default()
+    .hash(&mut hasher);
+    occupied.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// The ranges this host already uses outside Temps, for the control plane
+/// (ADR 056). Routes the overlay itself installed towards peers (a native
+/// transport puts them on the underlay device) are left out: they are
+/// Temps' own, not a collision.
+async fn collect_occupied_ranges(
+    config: &NetworkConfig,
+    routed_peers: &[Ipv4Net],
+) -> Result<Vec<temps_network::occupied::OccupiedRange>, String> {
+    let docker = Docker::connect_with_local_defaults().ok();
+    let owned_devices = [
+        config.bridge_name.as_str(),
+        config.vxlan_dev_name.as_str(),
+        temps_network::mesh::MESH_INTERFACE,
+    ];
+    let mut ranges = temps_network::occupied::collect(
+        docker.as_ref(),
+        &owned_devices,
+        &config.docker_network_name,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    ranges.retain(|range| {
+        range.source != temps_network::occupied::OccupiedSource::Route
+            || !routed_peers.contains(&range.cidr)
+    });
+    Ok(ranges)
+}
+
 /// Wire types — match the server's `handlers::network::PeerListResponse`.
 /// We re-declare them here rather than depending on `temps-deployments`
 /// because that crate transitively pulls in sea-orm and we don't want it
@@ -128,7 +300,9 @@ struct WireMesh {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 struct WireMeshSelf {
     public_key: String,
-    endpoint: String,
+    /// `None` for a node nobody dials (ADR 055).
+    #[serde(default)]
+    endpoint: Option<String>,
     address: String,
 }
 
@@ -213,13 +387,18 @@ pub fn initial_bind_address(private_address: Option<&str>) -> String {
 /// `containers` is only used to name the containers still publishing on the
 /// previous address when `bind_address` moves (see
 /// [`warn_containers_on_previous_bind_address`]).
+///
+/// `mesh_address` receives this node's mesh address once its end of the
+/// mesh is up, and `None` when the cluster has no mesh (see
+/// [`crate::mesh_listener`]).
 pub fn spawn(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     peers: SharedPeers,
-    dns_health: SharedDnsHealth,
+    health: HealthSlots,
     bind_address: SharedBindAddress,
     containers: Arc<dyn ContainerDeployer>,
+    mesh_address: crate::mesh_listener::MeshAddressSender,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
@@ -227,9 +406,10 @@ pub fn spawn(
             cfg,
             overlay_bridge_address,
             peers,
-            dns_health,
+            health,
             bind_address,
             containers,
+            mesh_address,
         )
         .await
         {
@@ -299,10 +479,15 @@ async fn run(
     config: AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: SharedPeers,
-    dns_health: SharedDnsHealth,
+    health: HealthSlots,
     bind_address: SharedBindAddress,
     containers: Arc<dyn ContainerDeployer>,
+    mesh_address: crate::mesh_listener::MeshAddressSender,
 ) -> Result<(), SyncError> {
+    let HealthSlots {
+        dns: dns_health,
+        overlay: overlay_report,
+    } = health;
     info!(
         node_id = config.node_id,
         control_plane = %config.control_plane_url,
@@ -322,7 +507,17 @@ async fn run(
         config.node_id
     );
 
-    let mut bootstrapped = false;
+    // The allocation the overlay is up on, once it is.
+    let mut bootstrapped: Option<Ipv4Net> = None;
+    // Containers taken off the overlay network when the control plane moved
+    // this node's allocation; they rejoin once the overlay is up again.
+    let mut detached: Vec<temps_network::docker::DetachedMember> = Vec::new();
+    // ADR 056: backoff and log policy for an overlay that cannot come up,
+    // the peers' subnets last seen (left out of the occupied report), and
+    // the last occupied-range collection error (logged once per change).
+    let mut overlay_retry = OverlayRetry::default();
+    let mut peer_subnets: Vec<Ipv4Net> = Vec::new();
+    let mut occupied_error: Option<String> = None;
     // Started after first successful bootstrap. Held here (not dropped)
     // so the resolver tasks stay alive for the lifetime of the agent.
     let mut _resolver_handle: Option<DnsResolverHandle> = None;
@@ -351,6 +546,35 @@ async fn run(
     let mut saved: Option<WirePeerListResponse> = None;
 
     loop {
+        let occupied = {
+            let net_config = manager
+                .as_ref()
+                .map(|(manager, _)| manager.config().clone())
+                .unwrap_or_default();
+            match collect_occupied_ranges(&net_config, &peer_subnets).await {
+                Ok(ranges) => {
+                    if occupied_error.take().is_some() {
+                        info!("collecting this host's occupied network ranges works again");
+                    }
+                    if let Ok(mut report) = overlay_report.write() {
+                        report.occupied_ranges = Some(ranges.clone());
+                    }
+                    Some(ranges)
+                }
+                Err(error) => {
+                    if occupied_error.as_deref() != Some(error.as_str()) {
+                        warn!(
+                            error = %error,
+                            "could not list this host's routes and Docker networks; the control \
+                             plane keeps the last report and cannot steer overlay allocations \
+                             around ranges added since. Retrying every poll"
+                        );
+                        occupied_error = Some(error);
+                    }
+                    None
+                }
+            }
+        };
         let (polled, offline) = match poll_once(&client, &url, &config.token).await {
             Ok(payload) => (Ok(payload), false),
             Err(e) if !applied_once && !restore_attempted && e.control_plane_unreachable() => {
@@ -378,6 +602,19 @@ async fn run(
         match polled {
             Ok(Some(payload)) => {
                 let on_mesh = payload.wireguard.is_some();
+                let fingerprint = overlay_fingerprint(&payload, occupied.as_deref());
+                let attempted_cidr = payload
+                    .alloc
+                    .as_ref()
+                    .map(|alloc| alloc.compute_cidr.clone());
+                peer_subnets = payload
+                    .peers
+                    .iter()
+                    .filter_map(|peer| Ipv4Net::from_str(&peer.compute_cidr).ok())
+                    .collect();
+                if !on_mesh {
+                    publish_mesh_address(&mesh_address, None);
+                }
                 if let Some(wire) = &payload.wireguard {
                     let compute_pool = payload
                         .network
@@ -395,6 +632,10 @@ async fn run(
                     .await
                     {
                         Ok(MeshTick::Ready { rebuilt, report }) => {
+                            publish_mesh_address(
+                                &mesh_address,
+                                mesh.configured.as_ref().map(|interface| interface.address),
+                            );
                             if let Some(moved) =
                                 publish_mesh_bind_address(&bind_address, &config, &mesh)
                             {
@@ -415,7 +656,7 @@ async fn run(
                                     "the WireGuard interface changed; rebuilding the overlay on it"
                                 );
                                 manager = None;
-                                bootstrapped = false;
+                                bootstrapped = None;
                             }
                         }
                         Ok(MeshTick::Registered) => {
@@ -435,8 +676,15 @@ async fn run(
                             warn!(error = %e, "WireGuard mesh sync failed; will retry");
                         }
                         Err(e) => {
-                            warn!(error = %e, "WireGuard mesh sync failed; will retry");
-                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            // The overlay runs on the mesh, so it is down too.
+                            let wait = overlay_failed(
+                                &mut overlay_retry,
+                                &overlay_report,
+                                attempted_cidr,
+                                format!("the WireGuard mesh is not up on this node: {e}"),
+                                fingerprint,
+                            );
+                            tokio::time::sleep(wait).await;
                             continue;
                         }
                     }
@@ -444,6 +692,13 @@ async fn run(
                 if payload.alloc.is_none() {
                     debug!("network sync: no compute_cidr allocated yet");
                     tokio::time::sleep(POLL_INTERVAL).await;
+                    continue;
+                }
+                let now = std::time::Instant::now();
+                if !overlay_retry.due(fingerprint, now) {
+                    // Backing off an unchanged failure; nothing that could
+                    // fix it changed since the last attempt.
+                    tokio::time::sleep(overlay_retry.remaining(now).min(POLL_INTERVAL)).await;
                     continue;
                 }
                 if manager
@@ -458,15 +713,21 @@ async fn run(
                          the new underlay"
                     );
                     manager = None;
-                    bootstrapped = false;
+                    bootstrapped = None;
                 }
                 let manager = match &manager {
                     Some((manager, _)) => manager,
                     None => match build_manager(&config, on_mesh).await {
                         Ok(built) => &manager.insert((built, on_mesh)).0,
                         Err(e) => {
-                            warn!(error = %e, "overlay setup failed; will retry");
-                            tokio::time::sleep(BACKOFF_INTERVAL).await;
+                            let wait = overlay_failed(
+                                &mut overlay_retry,
+                                &overlay_report,
+                                attempted_cidr,
+                                e.to_string(),
+                                fingerprint,
+                            );
+                            tokio::time::sleep(wait).await;
                             continue;
                         }
                     },
@@ -476,17 +737,34 @@ async fn run(
                     manager,
                     payload,
                     &mut bootstrapped,
+                    &mut detached,
                     &mut _resolver_handle,
                     &config,
                     &slots,
                 )
                 .await
                 {
-                    warn!(error = %e, "network sync apply failed; will retry");
-                    tokio::time::sleep(BACKOFF_INTERVAL).await;
+                    let wait = overlay_failed(
+                        &mut overlay_retry,
+                        &overlay_report,
+                        attempted_cidr,
+                        e.to_string(),
+                        fingerprint,
+                    );
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
                 applied_once = true;
+                let failures = overlay_retry.succeeded();
+                if failures > 0 {
+                    info!(
+                        failed_attempts = failures,
+                        "cross-node overlay is up after {failures} failed attempt(s)"
+                    );
+                }
+                if let (Some(cidr), Ok(mut report)) = (bootstrapped, overlay_report.write()) {
+                    report.overlay = Some(OverlayHeartbeat::ready(cidr));
+                }
                 match snapshot {
                     Some(snapshot) if saved.as_ref() == Some(&snapshot) => {}
                     Some(snapshot) => {
@@ -515,6 +793,7 @@ async fn run(
             }
             Ok(None) => {
                 // No allocation yet — single-host mode for this node.
+                publish_mesh_address(&mesh_address, None);
                 debug!("network sync: no compute_cidr allocated yet");
             }
             Err(e) => {
@@ -526,6 +805,35 @@ async fn run(
 
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// Record a failed overlay attempt (ADR 056): publish the cause for the
+/// heartbeat, log it per [`OverlayRetry`], and return how long to wait
+/// before polling again.
+fn overlay_failed(
+    retry: &mut OverlayRetry,
+    report: &SharedOverlayReport,
+    compute_cidr: Option<String>,
+    error: String,
+    fingerprint: u64,
+) -> Duration {
+    let error = temps_network::with_permission_hint(error);
+    let step = retry.failed(&error, fingerprint, std::time::Instant::now());
+    if step.log {
+        warn!(
+            error = %error,
+            retry_secs = step.delay.as_secs(),
+            "cross-node overlay unavailable on this node; its deployments keep working. \
+             Retrying with backoff, and at once when its allocation, peers or occupied \
+             ranges change"
+        );
+    } else {
+        debug!(error = %error, retry_secs = step.delay.as_secs(), "cross-node overlay still unavailable");
+    }
+    if let Ok(mut slot) = report.write() {
+        slot.overlay = Some(OverlayHeartbeat::unavailable(compute_cidr, error));
+    }
+    step.delay.min(POLL_INTERVAL)
 }
 
 /// Build the overlay manager. On the WireGuard mesh the underlay is the mesh
@@ -684,7 +992,41 @@ enum MeshTick {
 #[derive(Debug, Serialize)]
 struct MeshRegistrationBody<'a> {
     public_key: &'a str,
-    endpoint: String,
+    /// Omitted for a node nobody dials (ADR 055).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+}
+
+/// Where other members dial this node: `--wg-endpoint`, else its registered
+/// private address on the mesh port. `None` when the private address is the
+/// node's own mesh address (a worker that joined outbound only, ADR 055):
+/// nobody can dial it, it dials its peers and keeps the path open with
+/// keepalives.
+fn mesh_endpoint(
+    config: &AgentConfig,
+    wire: &WireMesh,
+) -> Result<Option<std::net::SocketAddr>, SyncError> {
+    if let Some(value) = &config.wg_endpoint {
+        return temps_network::mesh::parse_endpoint(value)
+            .map(Some)
+            .map_err(|e| SyncError::Mesh(e.to_string()));
+    }
+    let registered = config.private_address.as_deref().ok_or_else(|| {
+        SyncError::Mesh(
+            "no WireGuard endpoint: this node has no registered private address; \
+             set --wg-endpoint <ip:port>"
+                .into(),
+        )
+    })?;
+    let on_mesh = Ipv4Net::from_str(&wire.cidr).is_ok_and(|cidr| {
+        temps_network::mesh::identity_ipv4(registered).is_some_and(|ip| cidr.contains(&ip))
+    });
+    if on_mesh {
+        return Ok(None);
+    }
+    temps_network::mesh::default_endpoint(registered, wire.listen_port)
+        .map(Some)
+        .map_err(|e| SyncError::Mesh(e.to_string()))
 }
 
 /// Bring this node's end of the WireGuard mesh in line with the control
@@ -718,25 +1060,13 @@ async fn reconcile_mesh(
             key
         }
     };
-    let endpoint = match &config.wg_endpoint {
-        Some(value) => temps_network::mesh::parse_endpoint(value),
-        None => {
-            let registered = config.private_address.as_deref().ok_or_else(|| {
-                SyncError::Mesh(
-                    "no WireGuard endpoint: this node has no registered private address; \
-                     set --wg-endpoint <ip:port>"
-                        .into(),
-                )
-            })?;
-            temps_network::mesh::default_endpoint(registered, wire.listen_port)
-        }
-    }
-    .map_err(|e| SyncError::Mesh(e.to_string()))?;
+    let endpoint = mesh_endpoint(config, wire)?;
+    let endpoint_text = endpoint.map(|endpoint| endpoint.to_string());
 
     let registered = wire
         .self_entry
         .as_ref()
-        .filter(|me| me.public_key == key.public_key() && me.endpoint == endpoint.to_string());
+        .filter(|me| me.public_key == key.public_key() && me.endpoint == endpoint_text);
     let Some(me) = registered else {
         if offline {
             return Err(SyncError::Mesh(
@@ -750,7 +1080,7 @@ async fn reconcile_mesh(
             .bearer_auth(&config.token)
             .json(&MeshRegistrationBody {
                 public_key: key.public_key(),
-                endpoint: endpoint.to_string(),
+                endpoint: endpoint_text,
             })
             .send()
             .await
@@ -760,7 +1090,11 @@ async fn reconcile_mesh(
             let body = response.text().await.unwrap_or_default();
             return Err(SyncError::HttpStatus { status, body });
         }
-        info!(%endpoint, public_key = key.public_key(), "registered with the WireGuard mesh");
+        info!(
+            endpoint = endpoint.map_or_else(|| "none".to_string(), |e| e.to_string()),
+            public_key = key.public_key(),
+            "registered with the WireGuard mesh"
+        );
         return Ok(MeshTick::Registered);
     };
 
@@ -777,14 +1111,9 @@ async fn reconcile_mesh(
     // The lockdown comes before the interface: the tunnel must never exist
     // as an open way into this host. Checked every tick so a flushed
     // ruleset is repaired.
-    temps_network::mesh::ensure_lockdown(&temps_network::mesh::MeshLockdown {
-        vxlan_port: overlay_vxlan_port(),
-        mesh: cidr,
-        node_api_port: None,
-        relay: wire.hub,
-    })
-    .await
-    .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
+    temps_network::mesh::ensure_lockdown(&mesh_lockdown(config, cidr, wire.hub))
+        .await
+        .map_err(|e| SyncError::Mesh(format!("mesh firewall: {e}")))?;
 
     let mtu = match state.mtu {
         Some(mtu) => mtu,
@@ -940,6 +1269,42 @@ struct BindAddressMove {
 /// `DockerRuntime`, services through the agent API — reads this slot and
 /// publishes on the mesh address. Returns the move when the address changed,
 /// so the caller can name the containers left on the previous one.
+/// The mesh firewall for this node: what every member needs, plus the agent
+/// API from the control plane when the agent serves it on the mesh
+/// ([`crate::mesh_listener`]).
+fn mesh_lockdown(
+    config: &AgentConfig,
+    cidr: Ipv4Net,
+    relay: bool,
+) -> temps_network::mesh::MeshLockdown {
+    temps_network::mesh::MeshLockdown {
+        vxlan_port: overlay_vxlan_port(),
+        mesh: cidr,
+        node_api_port: None,
+        agent_api: crate::mesh_listener::mesh_agent_api(config, cidr),
+        relay,
+    }
+}
+
+/// Tell the mesh listener where this node is on the mesh, waking it only on
+/// a change.
+fn publish_mesh_address(
+    sender: &crate::mesh_listener::MeshAddressSender,
+    address: Option<std::net::Ipv4Addr>,
+) {
+    let address = match address {
+        Some(address) => crate::mesh_listener::MeshAddress::At(address),
+        None => crate::mesh_listener::MeshAddress::Off,
+    };
+    sender.send_if_modified(|current| {
+        if *current == address {
+            return false;
+        }
+        *current = address;
+        true
+    });
+}
+
 fn publish_mesh_bind_address(
     slot: &SharedBindAddress,
     config: &AgentConfig,
@@ -1159,8 +1524,9 @@ fn check_mesh_addresses(
 pub struct MeshBootstrap {
     pub cidr: Ipv4Net,
     pub listen_port: u16,
-    /// Where other members dial this node.
-    pub endpoint: std::net::SocketAddr,
+    /// Where other members dial this node; `None` when nobody can (it joined
+    /// outbound only, ADR 055).
+    pub endpoint: Option<std::net::SocketAddr>,
     pub address: std::net::Ipv4Addr,
     pub control_plane_public_key: String,
     /// `None` when the control plane cannot be dialed (it dials us).
@@ -1183,7 +1549,7 @@ pub async fn bootstrap_mesh(
         listen_port: bootstrap.listen_port,
         self_entry: Some(WireMeshSelf {
             public_key: key.public_key().to_string(),
-            endpoint: bootstrap.endpoint.to_string(),
+            endpoint: bootstrap.endpoint.map(|endpoint| endpoint.to_string()),
             address: bootstrap.address.to_string(),
         }),
         peers: vec![WireMeshPeer {
@@ -1223,7 +1589,7 @@ pub async fn bootstrap_mesh(
 pub enum MeshBootstrapError {
     #[error("could not load or create the mesh key: {0}")]
     Key(#[from] temps_wireguard::WireGuardError),
-    #[error("{0}")]
+    #[error("{}", temps_network::with_permission_hint(.0.to_string()))]
     Mesh(#[source] SyncError),
     #[error("could not save the network snapshot: {0}")]
     Snapshot(#[source] std::io::Error),
@@ -1275,14 +1641,12 @@ pub fn mesh_doctor_expectations(
             .map_err(|e| format!("wireguard.self.address: {e}"))?,
         prefix_len: cidr.prefix_len(),
         listen_port: wire.listen_port,
-        endpoint: temps_network::mesh::parse_endpoint(&me.endpoint).ok(),
+        endpoint: me
+            .endpoint
+            .as_deref()
+            .and_then(|endpoint| temps_network::mesh::parse_endpoint(endpoint).ok()),
         peers,
-        lockdown: temps_network::mesh::MeshLockdown {
-            vxlan_port: overlay_vxlan_port(),
-            mesh: cidr,
-            node_api_port: None,
-            relay: wire.hub,
-        },
+        lockdown: mesh_lockdown(config, cidr, wire.hub),
     }))
 }
 
@@ -1371,7 +1735,8 @@ struct SharedSlots<'a> {
 async fn apply(
     manager: &NetworkManager,
     payload: WirePeerListResponse,
-    bootstrapped: &mut bool,
+    bootstrapped: &mut Option<Ipv4Net>,
+    detached: &mut Vec<temps_network::docker::DetachedMember>,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
     slots: &SharedSlots<'_>,
@@ -1382,10 +1747,11 @@ async fn apply(
     let alloc = parse_alloc(&alloc_wire)?;
     let peers: Result<Vec<Peer>, _> = payload.peers.iter().map(parse_peer).collect();
     let peers = peers?;
-    let authoritative_pool = match payload.network.as_ref() {
-        Some(network) => validate_cluster_topology(network, &alloc, &peers)?,
-        None => alloc.compute_cidr,
-    };
+    // The allocations must sit inside the cluster's pool and not overlap:
+    // a corrupted or hostile peer list must not install arbitrary routes.
+    if let Some(network) = payload.network.as_ref() {
+        validate_cluster_topology(network, &alloc, &peers)?;
+    }
     // Captured before `bootstrap()` consumes `alloc` below. Needed every
     // tick (not just the first) since resolver reconciliation now runs
     // unconditionally — see the `reconcile_resolver` call at the bottom.
@@ -1398,17 +1764,51 @@ async fn apply(
         IpAddr::V6(_) => return Ok(()),
     };
 
-    // Re-check the complete authoritative pool on every snapshot, not only
-    // initial bootstrap. A local Docker network or route created later must
-    // be rejected before a newly allocated peer route can be installed.
-    let alloc_for_docker = alloc.clone();
-    temps_network::preflight_compute_pool_routes(manager.config(), authoritative_pool)
-        .await
-        .map_err(|error| SyncError::Bootstrap(format!("host route preflight: {error}")))?;
-    preflight_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
-        .await?;
+    // The control plane moved this node's allocation (a pool change or an
+    // automatic move off a colliding range, ADR 056). It only moves one it
+    // never saw applied, so this is the narrow race where the move crossed a
+    // successful bootstrap: take the overlay down and bring it up on the new
+    // subnet rather than reconciling peers against the old one. The Docker
+    // network goes too: Docker cannot change its subnet, and the preflight
+    // below refuses one on the old subnet. `bootstrapped` is cleared only
+    // once both are gone, so a failure here is retried on the next tick.
+    if let Some(previous) = *bootstrapped {
+        if previous != alloc.compute_cidr {
+            warn!(
+                from = %previous,
+                to = %alloc.compute_cidr,
+                "the control plane moved this node's overlay subnet; rebuilding the overlay on it"
+            );
+            manager
+                .teardown()
+                .await
+                .map_err(|e| SyncError::Bootstrap(format!("tearing down the old overlay: {e}")))?;
+            let docker = Docker::connect_with_local_defaults()
+                .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
+            temps_network::docker::retire_network_for_move(&docker, manager.config(), detached)
+                .await
+                .map_err(|e| {
+                    SyncError::Bootstrap(format!(
+                        "replacing the overlay Docker network on the old subnet: {e}"
+                    ))
+                })?;
+            *bootstrapped = None;
+        }
+    }
 
-    if !*bootstrapped {
+    // Re-check what this node routes on every snapshot, not only at
+    // bootstrap: a local Docker network or route created later must be
+    // rejected before a newly allocated peer route is installed. Only the
+    // node's own subnet and its peers' are checked (ADR 056): a network
+    // elsewhere in the pool is never routed here and cannot collide.
+    let routed = routed_subnets(&alloc, &peers);
+    let alloc_for_docker = alloc.clone();
+    temps_network::preflight_compute_routes(manager.config(), &routed)
+        .await
+        .map_err(|error| SyncError::Preflight(error.to_string()))?;
+    preflight_overlay_docker_network(manager.config(), &alloc_for_docker, &routed).await?;
+
+    if bootstrapped.is_none() {
         info!(
             cidr = %alloc.compute_cidr,
             peers = peers.len(),
@@ -1417,6 +1817,7 @@ async fn apply(
         // Refuse address-space collisions before mutating kernel state. The
         // control plane allocation remains authoritative; this node must fix
         // its local Docker pools rather than silently choosing another CIDR.
+        let compute_cidr = alloc.compute_cidr;
         manager
             .bootstrap(alloc, peers.clone())
             .await
@@ -1429,12 +1830,10 @@ async fn apply(
         // created here so the deployer + service handlers can attach
         // containers to it. Without this, `compute_ip` is always None
         // and the DNS registry never gets per-container records.
-        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
-            .await?;
-        *bootstrapped = true;
+        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, &routed).await?;
+        *bootstrapped = Some(compute_cidr);
     } else {
-        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, authoritative_pool)
-            .await?;
+        ensure_overlay_docker_network(manager.config(), &alloc_for_docker, &routed).await?;
         let changed = manager
             .reconcile_peers(peers.clone())
             .await
@@ -1442,6 +1841,14 @@ async fn apply(
         if changed {
             info!("multi-host peer list updated");
         }
+    }
+
+    if !detached.is_empty() {
+        let docker = Docker::connect_with_local_defaults()
+            .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
+        temps_network::docker::reattach_members(&docker, manager.config(), detached)
+            .await
+            .map_err(|e| SyncError::Bootstrap(e.to_string()))?;
     }
 
     // Publish only the peer view that the host data plane accepted. Container
@@ -1541,13 +1948,21 @@ fn validate_cluster_topology(
 async fn preflight_overlay_docker_network(
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    authoritative_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> Result<(), SyncError> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|error| SyncError::DockerConnect(error.to_string()))?;
-    temps_network::docker::preflight_network_for_pool(&docker, config, alloc, authoritative_pool)
+    temps_network::docker::preflight_network_for_subnets(&docker, config, alloc, routed)
         .await
-        .map_err(|error| SyncError::Bootstrap(format!("docker network preflight: {error}")))
+        .map_err(|error| SyncError::Preflight(error.to_string()))
+}
+
+/// The overlay subnets this node routes: its own and every peer's (the
+/// control plane's included, when it runs the overlay).
+fn routed_subnets(alloc: &NodeAlloc, peers: &[Peer]) -> Vec<Ipv4Net> {
+    std::iter::once(alloc.compute_cidr)
+        .chain(peers.iter().map(|peer| peer.compute_cidr))
+        .collect()
 }
 
 /// Walk every container currently attached to `temps0` and re-install
@@ -1843,11 +2258,11 @@ fn publish_dns_health(
 async fn ensure_overlay_docker_network(
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    authoritative_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> Result<(), SyncError> {
     let docker = Docker::connect_with_local_defaults()
         .map_err(|e| SyncError::DockerConnect(e.to_string()))?;
-    temps_network::docker::ensure_network_for_pool(&docker, config, alloc, authoritative_pool)
+    temps_network::docker::ensure_network_for_subnets(&docker, config, alloc, routed)
         .await
         .map_err(|e| SyncError::Bootstrap(format!("docker network: {}", e)))?;
     info!(
@@ -1910,6 +2325,11 @@ pub enum SyncError {
 
     #[error("bootstrap failed: {0}")]
     Bootstrap(String),
+
+    /// The overlay would collide with this host's routes or Docker networks.
+    /// The message already names the range, its owner and the fixes.
+    #[error("{0}")]
+    Preflight(String),
 
     #[error("reconcile failed: {0}")]
     Reconcile(String),
@@ -2568,6 +2988,58 @@ mod tests {
         );
     }
 
+    /// ADR 055: a worker that joined outbound only registered its mesh
+    /// address as its private address. Nobody can dial it, so it publishes
+    /// no endpoint instead of `<mesh address>:<port>`.
+    #[test]
+    fn a_node_registered_under_its_mesh_address_publishes_no_endpoint() {
+        let wire = WireMesh {
+            cidr: "10.201.0.0/24".into(),
+            listen_port: 51820,
+            self_entry: None,
+            peers: Vec::new(),
+            hub: false,
+        };
+        let endpoint = |config: &AgentConfig| mesh_endpoint(config, &wire).unwrap();
+        assert_eq!(endpoint(&agent_config_joined_at("10.201.0.4")), None);
+        assert_eq!(
+            endpoint(&agent_config_joined_at("203.0.113.5")),
+            Some("203.0.113.5:51820".parse().unwrap())
+        );
+        assert_eq!(
+            endpoint(&agent_config_joined_at("10.0.0.5")),
+            Some("10.0.0.5:51820".parse().unwrap()),
+            "a private address outside the mesh pool is still dialed"
+        );
+        // `--wg-endpoint` always wins: a worker with a public address may
+        // let other workers dial it directly.
+        let mut config = agent_config_joined_at("10.201.0.4");
+        config.wg_endpoint = Some("198.51.100.7:4000".into());
+        assert_eq!(
+            endpoint(&config),
+            Some("198.51.100.7:4000".parse().unwrap())
+        );
+
+        // The registration omits the endpoint; a stored entry without one
+        // (or from an older control plane, with one) still parses.
+        let body = serde_json::to_value(MeshRegistrationBody {
+            public_key: "k",
+            endpoint: None,
+        })
+        .unwrap();
+        assert_eq!(body, serde_json::json!({ "public_key": "k" }));
+        let me: WireMeshSelf = serde_json::from_value(
+            serde_json::json!({ "public_key": "k", "endpoint": null, "address": "10.201.0.4" }),
+        )
+        .unwrap();
+        assert_eq!(me.endpoint, None);
+        let me: WireMeshSelf = serde_json::from_value(
+            serde_json::json!({ "public_key": "k", "address": "10.201.0.4" }),
+        )
+        .unwrap();
+        assert_eq!(me.endpoint, None);
+    }
+
     #[tokio::test]
     async fn a_bad_mesh_pool_is_refused_before_the_host_is_touched() {
         let key_dir = tempfile::tempdir().unwrap();
@@ -2578,7 +3050,7 @@ mod tests {
             listen_port: 51820,
             self_entry: Some(WireMeshSelf {
                 public_key: key.public_key().to_string(),
-                endpoint: "203.0.113.5:51820".into(),
+                endpoint: Some("203.0.113.5:51820".into()),
                 address: "198.51.100.4".into(),
             }),
             peers: Vec::new(),
@@ -2641,5 +3113,114 @@ mod tests {
         assert!(load_snapshot(&path).is_none());
         assert!(load_snapshot(&dir.join("missing.json")).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_overlay_failure_backs_off_to_five_minutes_and_logs_sparingly() {
+        let start = std::time::Instant::now();
+        let mut retry = OverlayRetry::default();
+        let collision = "overlay subnet 10.202.0.0/24 overlaps host route 10.0.0.0/8";
+
+        let first = retry.failed(collision, 1, start);
+        assert_eq!(
+            first,
+            RetryStep {
+                delay: Duration::from_secs(5),
+                log: true
+            }
+        );
+        assert!(!retry.due(1, start), "backing off");
+        assert!(retry.due(1, start + Duration::from_secs(5)));
+
+        let mut now = start;
+        let mut delays = Vec::new();
+        let mut logged = Vec::new();
+        for _ in 0..10 {
+            now += retry.remaining(now);
+            let step = retry.failed(collision, 1, now);
+            delays.push(step.delay.as_secs());
+            logged.push(step.log);
+        }
+        assert_eq!(delays, [10, 20, 40, 80, 160, 300, 300, 300, 300, 300]);
+        // Re-logged only once five minutes passed since the last line (the
+        // attempt at 315 s), then once per capped attempt.
+        assert_eq!(
+            logged,
+            [false, false, false, false, false, true, true, true, true, true]
+        );
+
+        // A new cause is logged at once.
+        assert!(retry.failed("docker network 'shop' collides", 1, now).log);
+    }
+
+    #[test]
+    fn a_change_in_allocation_peers_or_occupied_ranges_retries_at_once() {
+        let now = std::time::Instant::now();
+        let mut retry = OverlayRetry::default();
+        for _ in 0..6 {
+            retry.failed("collision", 1, now);
+        }
+        assert!(!retry.due(1, now));
+        assert!(retry.due(2, now), "new inputs are tried immediately");
+        let step = retry.failed("collision", 2, now);
+        assert_eq!(step.delay, Duration::from_secs(5), "backoff restarts");
+        assert!(!step.log, "same cause, just logged");
+
+        assert_eq!(retry.succeeded(), 1, "failures since the inputs changed");
+        assert!(retry.due(2, now));
+        assert!(
+            retry.failed("collision", 2, now).log,
+            "a new failure after success is logged"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_follows_allocation_peers_and_occupied_ranges() {
+        let mut payload = WirePeerListResponse {
+            network: None,
+            alloc: Some(wire_alloc()),
+            peers: vec![wire_peer()],
+            cluster_dns_enabled: false,
+            wireguard: None,
+        };
+        let base = overlay_fingerprint(&payload, None);
+        assert_eq!(base, overlay_fingerprint(&payload.clone(), None));
+        let occupied = [temps_network::occupied::OccupiedRange::docker(
+            "172.20.0.0/16".parse().unwrap(),
+            "shop_default",
+        )];
+        assert_ne!(base, overlay_fingerprint(&payload, Some(&occupied)));
+        payload.cluster_dns_enabled = true;
+        assert_eq!(
+            base,
+            overlay_fingerprint(&payload, None),
+            "DNS is not an overlay input"
+        );
+        payload.alloc.as_mut().unwrap().compute_cidr = "10.202.9.0/24".into();
+        assert_ne!(base, overlay_fingerprint(&payload, None));
+    }
+
+    #[test]
+    fn only_the_own_and_peer_subnets_are_routed() {
+        let alloc = parse_alloc(&wire_alloc()).unwrap();
+        let peer = parse_peer(&wire_peer()).unwrap();
+        assert_eq!(
+            routed_subnets(&alloc, std::slice::from_ref(&peer)),
+            vec![alloc.compute_cidr, peer.compute_cidr]
+        );
+    }
+
+    #[test]
+    fn overlay_heartbeat_wire_form() {
+        let ready = OverlayHeartbeat::ready("10.202.3.0/24".parse().unwrap());
+        assert_eq!(
+            serde_json::to_value(&ready).unwrap(),
+            serde_json::json!({"status": "ready", "compute_cidr": "10.202.3.0/24", "last_error": null})
+        );
+        let down = OverlayHeartbeat::unavailable(None, "cause. Fix: x".into());
+        assert_eq!(
+            serde_json::to_value(&down).unwrap()["status"],
+            "unavailable"
+        );
     }
 }

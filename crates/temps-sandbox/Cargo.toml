@@ -44,6 +44,7 @@ tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
 flate2 = { workspace = true }
+sysinfo = { workspace = true }
 tar = { workspace = true }
 
 [dev-dependencies]

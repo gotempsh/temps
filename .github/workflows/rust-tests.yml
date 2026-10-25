@@ -220,10 +220,15 @@ jobs:
     outputs:
       # The main commit whose binary was reused, or empty when it was built.
       reused-from: ${{ steps.binary-source.outputs.reused-from }}
-    # Warm this is ~5 minutes. The ceiling is sized for a fully cold cache,
-    # which took 81 minutes the last time the cargo cache was evicted — a
-    # tighter bound would turn a slow run into a failed one.
-    timeout-minutes: 100
+    # Measured, not warm-cache folklore: on `main` with an exact cache hit this
+    # job takes 65-83 minutes, because every one of the ~95 workspace crates
+    # recompiles on each run. A pull request that moves Cargo.lock also
+    # recompiles the dependencies that changed (172 crates for a RustCrypto
+    # bump) on top of that, and pull requests never save the cache, so every
+    # push pays it again. One such run needed 93.5 minutes and was cancelled
+    # by the old 100 minute ceiling in the same second cargo finished, before
+    # the artifact upload. 130 leaves room for that case.
+    timeout-minutes: 130
     steps:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
@@ -1154,6 +1159,12 @@ jobs:
             # group at all (its tests only ever got compiled, never run), and
             # the platform-detection tests it now carries assert against a
             # real `docker info`.
+            #
+            # temps-metrics is here for the same reason: no group ran it, so
+            # its TestDatabase-backed store tests and the ClickHouse
+            # testcontainers tests (which check rows read via
+            # system.query_log) never executed. kind(=lib) keeps its
+            # tests/*.rs binary out until that is shown to be green.
             archive: default
             filter: >-
               package(temps-deployments) or package(temps-backup) or
@@ -1165,7 +1176,8 @@ jobs:
               package(temps-config) or package(temps-notifications) or
               package(temps-deployer) or package(temps-logs) or
               package(temps-domains) or package(temps-projects) or
-              package(temps-agent)
+              package(temps-agent) or
+              (package(temps-metrics) and kind(=lib))
             test_threads: "1"
           - group: migrations
             # temps-migrations' up()/down() tests guard on
@@ -1401,7 +1413,10 @@ jobs:
     needs: [changes, build-test-binaries]
     if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' && needs.build-test-binaries.result == 'success' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The tests themselves take ~5 minutes, but the apt install and the
+    # shared test-archive download each vary from seconds to ~10 minutes on
+    # hosted runners; 20 minutes left the tests no room when both were slow.
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:

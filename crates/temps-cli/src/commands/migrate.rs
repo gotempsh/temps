@@ -273,21 +273,47 @@ impl MigrateCommand {
                 .await
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            if pending.is_empty() {
+            // A database migrated by a newer release is not "up to date" for
+            // this binary, even with nothing of its own to apply: say so on
+            // stdout, not only in the stderr log.
+            let schema_status = temps_database::check_schema_compatibility(&db)
+                .await
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if let Some(warning) = schema_status.newer_schema_warning() {
                 if use_json {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "event": "up_to_date",
-                            "message": "Database already up to date — no migrations to apply."
+                            "event": "schema_newer_than_binary",
+                            "message": warning,
                         })
                     );
                     let _ = std::io::stdout().flush();
                 } else {
+                    println!("{} {}", "⚠".yellow(), warning.yellow());
+                }
+            }
+
+            if pending.is_empty() {
+                let schema_ahead = schema_status.newer_schema_warning().is_some();
+                // The JSON event stays `up_to_date` (nothing to apply): the
+                // newer schema is reported by its own event above.
+                let message = if schema_ahead {
+                    "No migrations of this binary to apply — the database schema is ahead \
+                     of it (see the warning above)."
+                } else {
+                    "Database already up to date — no migrations to apply."
+                };
+                if use_json {
                     println!(
                         "{}",
-                        "✓ Database already up to date — no migrations to apply.".green()
+                        serde_json::json!({ "event": "up_to_date", "message": message })
                     );
+                    let _ = std::io::stdout().flush();
+                } else if schema_ahead {
+                    println!("{} {}", "⚠".yellow(), message.yellow());
+                } else {
+                    println!("{} {}", "✓".green(), message.green());
                 }
                 if !self.dry_run {
                     // Non-transactional maintenance must remain retryable even

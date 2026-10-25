@@ -73,11 +73,16 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Discovery is deferred to a background task because the
             // per-plugin handshake timeout (default 30s) would otherwise
             // block the console API from coming up.
-            let service = Arc::new(ExternalPluginsService::new_empty(
-                self.config.clone(),
-                queue,
-                db,
-            ));
+            // A process with no Docker of its own (a hosted control plane)
+            // compiles plugins on a joined worker node. Registered by the
+            // deployments plugin, which runs earlier; absent where the node
+            // machinery is not part of the build.
+            let remote_builder =
+                context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
+            let service = Arc::new(
+                ExternalPluginsService::new_empty(self.config.clone(), queue, db)
+                    .with_remote_builder(remote_builder),
+            );
             service
                 .manager()
                 .set_ai_service(context.require_service::<dyn temps_ai::AiService>())

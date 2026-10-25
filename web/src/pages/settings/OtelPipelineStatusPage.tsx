@@ -163,7 +163,7 @@ function seriesSlotKeys(series: TrendSeriesDef[]): Map<string, string> {
  * `start_time`/`end_time`/`step_seconds` (server-clamped, so this is at most
  * a few hundred rows even for the 7-day preset) pre-seed one slot per step;
  * a bucket the API has no data for then stays `undefined`, which the chart
- * renders as a break in the line via `connectNulls`, instead of a false
+ * renders as a break in the line (`connectNulls={false}`), instead of a false
  * zero.
  *
  * The grid must align to the SAME boundaries the backend's `time_bucket()`
@@ -284,6 +284,9 @@ function TrendPanel({
             xKey="label"
             series={series}
             height={180}
+            // Empty slots are `undefined` (see buildTrendRows): break the
+            // line there. ThresholdLineChart bridges nulls by default.
+            connectNulls={false}
             // Pipeline counts are always integers — recharts' default tick
             // step otherwise picks non-round values (e.g. "93.988...") since
             // ThresholdLineChart doesn't set `allowDecimals={false}`.

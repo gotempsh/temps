@@ -1187,6 +1187,7 @@ impl AuthService {
                         .to_string();
 
                     // Update user password and clear reset token
+                    let user_id = user.id;
                     let mut user_update: temps_entities::users::ActiveModel = user.into();
                     user_update.password_hash = Set(Some(password_hash));
                     user_update.password_reset_token = Set(None);
@@ -1194,6 +1195,13 @@ impl AuthService {
                     user_update.must_change_password = Set(false);
                     user_update.updated_at = Set(Utc::now());
                     let updated = user_update.update(transaction).await?;
+
+                    // A reset is the recovery action for a compromised account,
+                    // so every session minted under the old password ends here,
+                    // in the same transaction as the hash change (as
+                    // `admin_reset_password` does). Otherwise a stolen cookie
+                    // outlives the recovery for the rest of its lifetime.
+                    crate::user_service::revoke_sessions_except(transaction, user_id, None).await?;
 
                     // An email reset is how a user recovers an account whose
                     // password they lost or suspect is known. Ingress login
@@ -1261,13 +1269,19 @@ impl AuthService {
                         .map_err(|_| UserAuthError::PasswordHashError)?
                         .to_string();
 
+                    let user_id = user.id;
                     let mut user_update: temps_entities::users::ActiveModel = user.into();
                     user_update.password_hash = Set(Some(password_hash));
                     user_update.password_reset_token = Set(None);
                     user_update.password_reset_expires = Set(None);
                     user_update.must_change_password = Set(false);
                     user_update.updated_at = Set(Utc::now());
-                    user_update.update(transaction).await.map_err(Into::into)
+                    let updated = user_update.update(transaction).await?;
+
+                    // Same revocation as `reset_password`: no session issued
+                    // before the forced change survives it.
+                    crate::user_service::revoke_sessions_except(transaction, user_id, None).await?;
+                    Ok(updated)
                 })
             })
             .await
@@ -2658,6 +2672,82 @@ mod tests {
             password: "newSecurePassword123!".to_string(),
         };
         auth_service.login(login).await.unwrap();
+    }
+
+    /// F3: a self-service reset is the recovery action for a compromised
+    /// account, so a session minted under the old password must not survive
+    /// it -- matching `admin_reset_password`.
+    #[tokio::test]
+    async fn email_reset_revokes_existing_sessions() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "reset-revokes@example.com", "OldPassword123!").await;
+        let stolen_session = auth_service.create_session(user.id).await.unwrap();
+        assert!(auth_service
+            .verify_session_details(&stolen_session)
+            .await
+            .is_ok());
+
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        auth_service
+            .reset_password(ResetPasswordRequest {
+                token: reset_token,
+                new_password: "NewSecurePassword123!".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let remaining_sessions = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining_sessions, 0, "reset must revoke existing sessions");
+        assert!(auth_service
+            .verify_session_details(&stolen_session)
+            .await
+            .is_err());
+    }
+
+    /// F3: the forced first-login change revokes sessions too, so a session
+    /// that predates the flag cannot outlive the password it was issued under.
+    #[tokio::test]
+    async fn required_password_change_revokes_existing_sessions() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "forced-revokes@example.com", "Temporary123!").await;
+        let earlier_session = auth_service.create_session(user.id).await.unwrap();
+
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::FirstLogin.stored_value(&reset_token),
+        ));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: reset_token,
+                new_password: "DifferentPassword123!".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(sessions::Entity::find()
+            .filter(sessions::Column::SessionToken.eq(&earlier_session))
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        // A fresh session after the change is still allowed.
+        assert!(auth_service.create_session(user.id).await.is_ok());
     }
 
     /// Issue #1078: a user who lost their password (no email provider

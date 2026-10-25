@@ -66,7 +66,7 @@ interface MonitoringFormData {
  */
 type ContainerLogBudgetFormData = Pick<
   ContainerLogSettings,
-  'cache_mb' | 'head_buffer_mb'
+  'cache_mb' | 'head_buffer_mb' | 'ingest_lines_per_sec' | 'ingest_kib_per_sec'
 >
 
 /**
@@ -110,6 +110,8 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
 const CONTAINER_LOG_BUDGET_DEFAULTS: ContainerLogBudgetFormData = {
   cache_mb: 2048,
   head_buffer_mb: 8,
+  ingest_lines_per_sec: 250,
+  ingest_kib_per_sec: 256,
 }
 
 // `null` means "use the server default" for both knobs, which is also what
@@ -126,7 +128,7 @@ const BYTES_PER_ROW = 100
 // Approximate number of metrics tracked per monitored service
 const METRICS_PER_SERVICE = 15
 
-type DurationUnit = 'hours' | 'days' | 'years' | 'MiB'
+type DurationUnit = 'hours' | 'days' | 'years' | 'MiB' | 'lines/s' | 'KiB/s'
 
 interface DurationInputProps extends ComponentProps<'input'> {
   unit: DurationUnit
@@ -323,6 +325,12 @@ export function MonitoringSettingsPage() {
           head_buffer_mb:
             settings.container_logs?.head_buffer_mb ??
             CONTAINER_LOG_BUDGET_DEFAULTS.head_buffer_mb,
+          ingest_lines_per_sec:
+            settings.container_logs?.ingest_lines_per_sec ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.ingest_lines_per_sec,
+          ingest_kib_per_sec:
+            settings.container_logs?.ingest_kib_per_sec ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.ingest_kib_per_sec,
         },
         geo: {
           refresh_interval_hours: settings.geo?.refresh_interval_hours ?? null,
@@ -1040,6 +1048,67 @@ export function MonitoringSettingsPage() {
                 {errors.container_logs?.head_buffer_mb && (
                   <p className="text-xs text-destructive">
                     {errors.container_logs.head_buffer_mb.message}
+                  </p>
+                )}
+              </div>
+
+              <div
+                id="container-log-ingest-budget"
+                className="space-y-3 rounded-lg border p-4"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="container-log-ingest-lines">
+                    Container log ingestion budget
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    per container
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  The most each container may store. Lines over it are dropped,
+                  a notice is written into that container&apos;s log, and it is
+                  listed as throttled on the Logs page. Up to 10 seconds of
+                  budget may arrive at once, so short bursts pass intact.
+                </p>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <DurationInput
+                    id="container-log-ingest-lines"
+                    unit="lines/s"
+                    min={0}
+                    max={1000000}
+                    {...register('container_logs.ingest_lines_per_sec', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 0, message: 'Min 0 (no limit)' },
+                      max: { value: 1000000, message: 'Max 1,000,000' },
+                    })}
+                  />
+                  <DurationInput
+                    id="container-log-ingest-kib"
+                    unit="KiB/s"
+                    min={0}
+                    max={1048576}
+                    aria-label="Container log ingestion budget in KiB per second"
+                    {...register('container_logs.ingest_kib_per_sec', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 0, message: 'Min 0 (no limit)' },
+                      max: { value: 1048576, message: 'Max 1 GiB/s' },
+                    })}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Applied to running containers within a minute of saving. 0
+                  disables that limit; defaults 250 lines/s and 256 KiB/s.
+                </p>
+                {errors.container_logs?.ingest_lines_per_sec && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.ingest_lines_per_sec.message}
+                  </p>
+                )}
+                {errors.container_logs?.ingest_kib_per_sec && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.ingest_kib_per_sec.message}
                   </p>
                 )}
               </div>

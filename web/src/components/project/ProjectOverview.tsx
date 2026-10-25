@@ -538,7 +538,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
     () =>
       sumMetricSeries(memQueries.map((q) => q.data ?? [])).map((point) => ({
         time: format(new Date(point.time), 'HH:mm'),
-        value: point.value / (1024 * 1024),
+        value: point.value == null ? null : point.value / (1024 * 1024),
       })),
     [memQueries]
   )
@@ -553,8 +553,10 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
         q.isError &&
         metricsErrorDetail(q.error).toLowerCase().includes('not enabled')
     )
-  const hasCpuTrend = cpuData.length >= 4
-  const hasMemTrend = memData.length >= 4
+  const cpuSamples = cpuData.filter((p) => p.value != null).length
+  const memSamples = memData.filter((p) => p.value != null).length
+  const hasCpuTrend = cpuSamples >= 4
+  const hasMemTrend = memSamples >= 4
 
   return (
     <Card className="@5xl/overview:col-span-5">
@@ -609,6 +611,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   xKey="time"
                   series={{ dataKey: 'value', label: 'CPU', tone: 'neutral' }}
                   height={150}
+                  connectNulls={false}
                   yTickFormatter={(value, ctx) =>
                     `${formatAxisNumber(value, ctx.decimals)}%`
                   }
@@ -616,7 +619,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   emptyMessage={<CompactEmpty label="No CPU samples" />}
                 />
               ) : (
-                <SparseTrendState samples={cpuData.length} label="CPU" />
+                <SparseTrendState samples={cpuSamples} label="CPU" />
               )}
             </div>
             <div className="min-w-0">
@@ -631,6 +634,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                     tone: 'neutral',
                   }}
                   height={150}
+                  connectNulls={false}
                   yTickFormatter={(value, ctx) =>
                     `${formatAxisNumber(value, ctx.decimals)} MB`
                   }
@@ -638,7 +642,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   emptyMessage={<CompactEmpty label="No memory samples" />}
                 />
               ) : (
-                <SparseTrendState samples={memData.length} label="memory" />
+                <SparseTrendState samples={memSamples} label="memory" />
               )}
             </div>
           </div>
@@ -906,14 +910,20 @@ function SignalError({ message }: { message: string }) {
   )
 }
 
-/** Sums same-timestamp points across containers into one aggregate series. */
+/** Sums same-timestamp points across containers into one aggregate series.
+ *  A bucket no container reported a sample in stays `null` (a gap), rather
+ *  than reading as 0 or vanishing from the axis. */
 function sumMetricSeries(
-  seriesList: { time: string; value: number }[][]
-): { time: string; value: number }[] {
-  const sums = new Map<string, number>()
+  seriesList: { time: string; value?: number | null }[][]
+): { time: string; value: number | null }[] {
+  const sums = new Map<string, number | null>()
   for (const points of seriesList) {
     for (const point of points) {
-      sums.set(point.time, (sums.get(point.time) ?? 0) + point.value)
+      const previous = sums.get(point.time) ?? null
+      sums.set(
+        point.time,
+        point.value == null ? previous : (previous ?? 0) + point.value
+      )
     }
   }
   return Array.from(sums.entries())

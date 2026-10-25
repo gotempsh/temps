@@ -682,6 +682,19 @@ impl TempsPlugin for DeploymentsPlugin {
                 volume_provider,
             )));
             context.register_service(Arc::new(temps_workload_plane::PlaneSlot::new()));
+            // A process with no Docker compiles external plugins on a joined
+            // worker; the external-plugins plugin looks this service up.
+            if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
+            {
+                let builder: Arc<dyn temps_core::plugin_builder::RemotePluginBuilder> = Arc::new(
+                    crate::services::node_plugin_builder::NodePluginBuilder::new(
+                        node_scheduler.clone(),
+                        config_service.clone(),
+                        encryption_service,
+                    ),
+                );
+                context.register_service(builder);
+            }
             deployment_service.set_node_scheduler(node_scheduler);
 
             // Wire encryption service for decrypting node tokens during remote deployments
@@ -846,6 +859,12 @@ impl TempsPlugin for DeploymentsPlugin {
                         context.require_service::<temps_core::DockerHandle>(),
                         config_service.data_dir(),
                     )),
+                )
+                .with_local_workloads_enabled(
+                    temps_core::policy_or_default(
+                        context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                    )
+                    .local_workloads_enabled(),
                 ),
             );
             context.register_service(compose_check_service.clone());
@@ -1237,6 +1256,13 @@ impl TempsPlugin for DeploymentsPlugin {
             audit_service: audit_service.clone(),
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
         };
+        let cluster_network_state = handlers::cluster_network::ClusterNetworkAdminState {
+            service: Arc::new(
+                crate::services::cluster_network::ClusterNetworkService::new(db.clone()),
+            ),
+            audit_service: audit_service.clone(),
+            sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+        };
         let node_pairing_admin = Arc::new(
             crate::services::node_pairing_admin::NodePairingAdminService::new(
                 db.clone(),
@@ -1251,6 +1277,12 @@ impl TempsPlugin for DeploymentsPlugin {
             sensitive_action_authorizer: sensitive_action_authorizer.clone(),
         };
 
+        let node_public_ingress_service = Arc::new(
+            crate::services::node_public_ingress::NodePublicIngressService::new(
+                db.clone(),
+                node_service.clone(),
+            ),
+        );
         let app_state = Arc::new(handlers::types::AppState {
             deployment_service,
             log_service,
@@ -1266,6 +1298,7 @@ impl TempsPlugin for DeploymentsPlugin {
             data_dir,
             image_builder,
             audit_service,
+            node_public_ingress_service,
             node_service,
             node_scheduler,
             encryption_service,
@@ -1325,6 +1358,7 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_routes = handlers::remote_deployments::configure_routes();
         let admin_node_routes = handlers::nodes::configure_admin_routes()
             .layer(axum::Extension(wireguard_mesh_state))
+            .layer(axum::Extension(cluster_network_state))
             .layer(axum::Extension(node_pairing_state));
 
         // Token routes use their own state; apply it before merging so the

@@ -66,6 +66,60 @@ pub(crate) fn normalize_user_email(email: &str) -> Option<String> {
     Some(normalized)
 }
 
+/// Result of [`clear_mfa_enrollment`].
+#[derive(Debug, Clone)]
+pub struct ClearedMfaEnrollment {
+    /// The user row as it stands after the reset.
+    pub user: temps_entities::users::Model,
+    /// Number of sessions (signed-in, pending sign-in challenges and
+    /// step-up grants) that were revoked.
+    pub sessions_revoked: u64,
+}
+
+/// Remove a user's second factor entirely so they can sign in with their
+/// password alone and enroll again.
+///
+/// Clears the TOTP secret (including one from an unfinished enrollment), the
+/// recovery codes and `mfa_enabled`, drops the user's second-factor guard
+/// state (replay watermark, failure counter and any lockout, all of which
+/// describe the removed factor), and deletes every session of the user:
+/// signed-in sessions, sign-in challenges still waiting for a code, and with
+/// them any step-up grant.
+///
+/// This is the recovery path for a user who lost both their authenticator
+/// and their recovery codes. It deliberately does not take a code: callers
+/// are an administrator acting on another account (`UserService::admin_reset_mfa`)
+/// or an operator with database access (`temps reset-admin-password --clear-mfa`).
+/// The caller must run it inside a transaction holding the `users` row lock
+/// (`SELECT ... FOR UPDATE`), the same lock every second-factor check takes.
+pub async fn clear_mfa_enrollment<C: sea_orm::ConnectionTrait>(
+    conn: &C,
+    user: temps_entities::users::Model,
+) -> Result<ClearedMfaEnrollment, sea_orm::DbErr> {
+    let user_id = user.id;
+    let mut user_update: temps_entities::users::ActiveModel = user.into();
+    user_update.mfa_secret = Set(None);
+    user_update.mfa_enabled = Set(false);
+    user_update.mfa_recovery_codes = Set(None);
+    user_update.updated_at = Set(Utc::now());
+    let user = user_update.update(conn).await?;
+
+    temps_entities::user_mfa_guards::Entity::delete_many()
+        .filter(temps_entities::user_mfa_guards::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await?;
+
+    let sessions = temps_entities::sessions::Entity::delete_many()
+        .filter(temps_entities::sessions::Column::UserId.eq(user_id))
+        .exec(conn)
+        .await?;
+
+    Ok(ClearedMfaEnrollment {
+        user,
+        sessions_revoked: sessions.rows_affected,
+    })
+}
+
 // First add the custom error type at the top of the file
 #[derive(Error, Debug)]
 pub enum UserServiceError {
@@ -125,6 +179,12 @@ pub enum UserServiceError {
 
     #[error("Cannot reset the password of deleted user {user_id}")]
     PasswordResetOnDeletedUser { user_id: i32 },
+
+    #[error("Cannot reset the MFA of deleted user {user_id}")]
+    MfaResetOnDeletedUser { user_id: i32 },
+
+    #[error("User {user_id} has no MFA enrolled, so there is nothing to reset")]
+    MfaNotEnrolled { user_id: i32 },
 
     #[error(
         "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
@@ -1071,6 +1131,45 @@ impl UserService {
             user_id
         );
         Ok((updated_user, temporary_password))
+    }
+
+    /// Remove another user's second factor (admin recovery for a user who
+    /// lost both their authenticator and their recovery codes).
+    ///
+    /// See [`clear_mfa_enrollment`] for exactly what is cleared. Every session
+    /// of the user is revoked, so nothing signed in or half-way through a
+    /// sign-in challenge under the old factor keeps working. The password is
+    /// left alone: the user signs in with it and can enroll again.
+    ///
+    /// Refuses a deleted user (restore them first) and a user with no
+    /// factor at all, so an administrator who picked the wrong account is
+    /// told so instead of silently signing that user out everywhere.
+    pub async fn admin_reset_mfa(
+        &self,
+        user_id: i32,
+    ) -> Result<ClearedMfaEnrollment, UserServiceError> {
+        let transaction = self.db.begin().await?;
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .lock_exclusive()
+            .one(&transaction)
+            .await?
+            .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+
+        if user.deleted_at.is_some() {
+            return Err(UserServiceError::MfaResetOnDeletedUser { user_id });
+        }
+        if !user.mfa_enabled {
+            return Err(UserServiceError::MfaNotEnrolled { user_id });
+        }
+
+        let cleared = clear_mfa_enrollment(&transaction, user).await?;
+        transaction.commit().await?;
+
+        info!(
+            "MFA removed from user {}; {} session(s) revoked",
+            user_id, cleared.sessions_revoked
+        );
+        Ok(cleared)
     }
 
     pub async fn restore_user(&self, user_id: i32) -> Result<UserWithRoles, UserServiceError> {

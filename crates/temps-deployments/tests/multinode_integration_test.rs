@@ -60,6 +60,11 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         public_ingress_route_count: None,
         public_ingress_unsupported_route_count: None,
         public_ingress_unsupported_reasons: serde_json::json!([]),
+        occupied_ranges: None,
+        overlay_status: None,
+        overlay_last_error: None,
+        overlay_ready_cidr: None,
+        overlay_remediation: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     }
@@ -446,6 +451,8 @@ async fn test_heartbeat_reactivates_offline_node() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
                 public_ingress: None,
             },
         )
@@ -474,6 +481,8 @@ async fn test_heartbeat_preserves_draining_status() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
                 public_ingress: None,
             },
         )
@@ -558,6 +567,8 @@ async fn test_heartbeat_records_reported_architecture() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
                 public_ingress: None,
             },
         )
@@ -593,6 +604,8 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
                 labels: None,
                 dns_resolver: None,
                 docker_socket_projects: None,
+                overlay: None,
+                occupied_ranges: None,
                 public_ingress: None,
             },
         )

@@ -281,7 +281,13 @@ async fn cleanup_all() {
         .await;
     // Devices a test set up beside Temps' own: a foreign VXLAN and the
     // dummy parent standing in for a previous underlay.
-    for device in ["temps-it-vx0", "temps-it-d0"] {
+    for netns in [PEER_NETNS, FOREIGN_NETNS] {
+        let _ = Command::new("ip")
+            .args(["netns", "del", netns])
+            .output()
+            .await;
+    }
+    for device in ["temps-it-vx0", "temps-it-d0", PEER_VETH, FOREIGN_VETH] {
         let _ = Command::new("ip")
             .args(["link", "del", device])
             .output()
@@ -299,6 +305,16 @@ async fn cleanup_all() {
 
 /// Dummy parent device for the underlay-migration test.
 const OLD_UNDERLAY: &str = "temps-old-ul0";
+
+/// Network namespace standing in for a peer on the underlay network, and the
+/// host's end of the veth that reaches it.
+const PEER_NETNS: &str = "temps-it-peer";
+const PEER_VETH: &str = "temps-it-u0";
+
+/// Network namespace standing in for a host on another network (the public
+/// one), and the host's end of the veth that reaches it.
+const FOREIGN_NETNS: &str = "temps-it-far";
+const FOREIGN_VETH: &str = "temps-it-h0";
 
 struct Cleanup;
 impl Drop for Cleanup {
@@ -430,6 +446,24 @@ async fn bootstrap_creates_all_kernel_state() {
         !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &["-o vxlan-temps0"]).await,
         "Temps must not bypass Docker isolation for locally spoofed VXLAN egress"
     );
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!(" local {} ", env.local_underlay)),
+        "vxlan must source its packets from the underlay address: {detail}"
+    );
+    assert!(
+        nft_table_contains(
+            "inet",
+            "temps_network",
+            &[
+                "@vxlan_peers",
+                "fib saddr . iif oif exists",
+                "udp dport 4789 @th,96,24"
+            ]
+        )
+        .await,
+        "VXLAN must be admitted only from known peers"
+    );
 }
 
 #[tokio::test]
@@ -539,6 +573,345 @@ async fn a_replacement_that_cannot_be_built_keeps_the_working_vxlan() {
     assert!(has_pair("dev", &env.underlay_dev), "{detail}");
     assert!(has_pair("master", "br-temps0"), "{detail}");
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+#[tokio::test]
+async fn bootstrap_sets_the_local_address_of_an_existing_vxlan_in_place() {
+    // Every node set up before the local address was set has a device like
+    // this one. An upgrade sets the address on it in place: same device, same
+    // FDB, so the overlay is not interrupted.
+    let (env, mgr, _cleanup) = fixture().await;
+    ip(&[
+        "link",
+        "add",
+        "vxlan-temps0",
+        "type",
+        "vxlan",
+        "id",
+        "42",
+        "dev",
+        &env.underlay_dev,
+        "dstport",
+        "4789",
+        "nolearning",
+    ])
+    .await;
+    // An entry bootstrap would not write itself, so only an untouched FDB
+    // still has it afterwards.
+    let kept = "127.0.0.9";
+    let output = Command::new("bridge")
+        .args([
+            "fdb",
+            "append",
+            "00:00:00:00:00:00",
+            "dev",
+            "vxlan-temps0",
+            "dst",
+            kept,
+        ])
+        .output()
+        .await
+        .expect("spawn bridge");
+    assert!(
+        output.status.success(),
+        "bridge fdb append: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!link_detail("vxlan-temps0").await.contains(" local "));
+    let index = link_index("vxlan-temps0").await;
+
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("bootstrap sets the local address");
+
+    let detail = link_detail("vxlan-temps0").await;
+    assert!(
+        detail.contains(&format!(" local {} ", env.local_underlay)),
+        "local address not set: {detail}"
+    );
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "device was rebuilt"
+    );
+    assert!(
+        fdb_has_entry("vxlan-temps0", kept).await,
+        "FDB was not kept"
+    );
+    assert!(
+        detail.contains("nolearning"),
+        "learning was turned on: {detail}"
+    );
+    assert!(
+        detail.contains("master br-temps0"),
+        "not enslaved: {detail}"
+    );
+    assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+
+    // Now simply compatible.
+    mgr.bootstrap(env.alloc(), vec![env.peer()])
+        .await
+        .expect("second bootstrap");
+    assert_eq!(
+        link_index("vxlan-temps0").await,
+        index,
+        "device was rebuilt"
+    );
+}
+
+/// Packets the VXLAN device has decapsulated so far.
+async fn vxlan_rx_packets() -> u64 {
+    tokio::fs::read_to_string("/sys/class/net/vxlan-temps0/statistics/rx_packets")
+        .await
+        .expect("read vxlan rx_packets")
+        .trim()
+        .parse()
+        .expect("rx_packets is a number")
+}
+
+/// Packets the rule dropping this overlay's VXLAN has dropped so far.
+async fn vxlan_drops() -> u64 {
+    let output = Command::new("nft")
+        .args(["list", "chain", "inet", "temps_network", "input"])
+        .output()
+        .await
+        .expect("list the input chain");
+    let listing = String::from_utf8_lossy(&output.stdout);
+    let rule = listing
+        .lines()
+        .find(|line| {
+            // The VNI prints in decimal or hex depending on the nft version.
+            line.trim_start().starts_with("udp dport 4789 @th,96,24 ") && line.ends_with("drop")
+        })
+        .unwrap_or_else(|| panic!("no VXLAN drop rule in:\n{listing}"));
+    let tokens: Vec<&str> = rule.split_whitespace().collect();
+    tokens
+        .windows(2)
+        .find(|pair| pair[0] == "packets")
+        .and_then(|pair| pair[1].parse().ok())
+        .unwrap_or_else(|| panic!("no packet count in: {rule}"))
+}
+
+/// What became of one injected VXLAN frame.
+#[derive(Debug, PartialEq, Eq)]
+struct Injection {
+    /// The VXLAN device decapsulated something meanwhile.
+    decapsulated: bool,
+    /// The overlay's drop rule dropped it.
+    dropped: bool,
+}
+
+/// Send `frame` from `source` to `destination`:4789 from inside network
+/// namespace `netns`. Entering a namespace affects only the calling thread,
+/// so the send happens on a thread of its own.
+///
+/// Senders always live in a namespace the test built, holding addresses the
+/// test chose: the harness's own addresses differ between the single- and
+/// two-node runs, and the two-node peer is not even on this host.
+fn send_udp(netns: &str, source: IpAddr, destination: IpAddr, frame: Vec<u8>) {
+    let netns = netns.to_owned();
+    std::thread::spawn(move || {
+        let namespace = std::fs::File::open(format!("/run/netns/{netns}"))
+            .unwrap_or_else(|error| panic!("open netns {netns}: {error}"));
+        nix::sched::setns(&namespace, nix::sched::CloneFlags::CLONE_NEWNET)
+            .unwrap_or_else(|error| panic!("enter netns {netns}: {error}"));
+        let socket = std::net::UdpSocket::bind((source, 0))
+            .unwrap_or_else(|error| panic!("bind {source}: {error}"));
+        socket
+            .send_to(&frame, (destination, 4789))
+            .unwrap_or_else(|error| panic!("send to {destination}: {error}"));
+    })
+    .join()
+    .expect("injection thread");
+}
+
+/// Send one VXLAN-encapsulated broadcast ARP frame for `vni` from `source` to
+/// `destination`:4789, from inside network namespace `netns`.
+async fn inject_vxlan(netns: &str, source: IpAddr, destination: IpAddr, vni: u32) -> Injection {
+    let (rx, drops) = (vxlan_rx_packets().await, vxlan_drops().await);
+    let vni = vni.to_be_bytes();
+    let mut frame = vec![0x08, 0, 0, 0, vni[1], vni[2], vni[3], 0];
+    frame.extend_from_slice(&[0xff; 6]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99]);
+    frame.extend_from_slice(&[0x08, 0x06, 0, 1, 0x08, 0, 6, 4, 0, 1]);
+    frame.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99, 172, 20, 1, 99]);
+    frame.extend_from_slice(&[0; 6]);
+    frame.extend_from_slice(&[172, 20, 1, 1]);
+    send_udp(netns, source, destination, frame);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Injection {
+        decapsulated: vxlan_rx_packets().await > rx,
+        dropped: vxlan_drops().await == drops + 1,
+    }
+}
+
+/// Restores `net.ipv4.conf.all.rp_filter` when dropped.
+struct RpFilter(String);
+impl Drop for RpFilter {
+    fn drop(&mut self) {
+        let _ = std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", &self.0);
+    }
+}
+
+/// Turn the kernel's own reverse-path filter off for `device` (the effective
+/// value is the larger of `all` and the device's), so that what a test sees
+/// dropped is dropped by the overlay's rules and not before them — as on the
+/// many hosts that run it loose or off.
+fn disable_rp_filter(device: &str) -> RpFilter {
+    let all = "/proc/sys/net/ipv4/conf/all/rp_filter";
+    let previous = std::fs::read_to_string(all).expect("read rp_filter");
+    std::fs::write(all, "0").expect("disable rp_filter");
+    std::fs::write(format!("/proc/sys/net/ipv4/conf/{device}/rp_filter"), "0")
+        .expect("disable the device's rp_filter");
+    RpFilter(previous.trim().to_string())
+}
+
+#[tokio::test]
+async fn a_peer_address_forged_from_another_network_is_dropped() {
+    // A real peer on the underlay network, and a host on another network —
+    // the public one. The kernel binds the VXLAN socket to the wildcard
+    // address whatever the device's local address, so without the ingress
+    // rules it would decapsulate everything below: the peer's address claimed
+    // from the other network, VXLAN to the public address, and an unknown
+    // sender's VXLAN to the underlay address. Only the peer's own frame may
+    // reach the overlay. A frame for another VNI is no business of this
+    // overlay's rules, whoever sends it.
+    //
+    // A rejected frame is recognised by the drop rule's counter (a drop is
+    // final: such a frame never reaches the socket); the receive count is the
+    // positive control.
+    let (env, mgr, _cleanup) = fixture().await;
+    let underlay: IpAddr = "10.123.45.1".parse().unwrap();
+    let peer: IpAddr = "10.123.45.2".parse().unwrap();
+    let public: IpAddr = "198.51.100.1".parse().unwrap();
+    let foreign: IpAddr = "198.51.100.2".parse().unwrap();
+    for args in [
+        vec!["netns", "add", PEER_NETNS],
+        vec!["netns", "add", FOREIGN_NETNS],
+        vec![
+            "link",
+            "add",
+            PEER_VETH,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "temps-it-p0",
+            "netns",
+            PEER_NETNS,
+        ],
+        vec!["addr", "add", "10.123.45.1/24", "dev", PEER_VETH],
+        vec!["link", "set", PEER_VETH, "up"],
+        vec![
+            "-n",
+            PEER_NETNS,
+            "addr",
+            "add",
+            "10.123.45.2/24",
+            "dev",
+            "temps-it-p0",
+        ],
+        vec!["-n", PEER_NETNS, "link", "set", "temps-it-p0", "up"],
+        vec![
+            "link",
+            "add",
+            FOREIGN_VETH,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            "temps-it-a0",
+            "netns",
+            FOREIGN_NETNS,
+        ],
+        vec!["addr", "add", "198.51.100.1/24", "dev", FOREIGN_VETH],
+        vec!["link", "set", FOREIGN_VETH, "up"],
+        vec![
+            "-n",
+            FOREIGN_NETNS,
+            "addr",
+            "add",
+            "198.51.100.2/24",
+            "dev",
+            "temps-it-a0",
+        ],
+        vec!["-n", FOREIGN_NETNS, "link", "set", "temps-it-a0", "up"],
+        vec!["-n", FOREIGN_NETNS, "link", "set", "lo", "up"],
+        // The forger holds the peer's address and routes the underlay
+        // address through this host's public end.
+        vec![
+            "-n",
+            FOREIGN_NETNS,
+            "addr",
+            "add",
+            "10.123.45.2/32",
+            "dev",
+            "lo",
+        ],
+        vec![
+            "-n",
+            FOREIGN_NETNS,
+            "route",
+            "add",
+            "10.123.45.1/32",
+            "via",
+            "198.51.100.1",
+        ],
+    ] {
+        ip(&args).await;
+    }
+    let _rp_filter = disable_rp_filter(FOREIGN_VETH);
+
+    let alloc = NodeAlloc {
+        underlay_address: underlay,
+        ..env.alloc()
+    };
+    let overlay_peer = Peer {
+        underlay_address: peer,
+        ..env.peer()
+    };
+    mgr.bootstrap(alloc, vec![overlay_peer])
+        .await
+        .expect("bootstrap");
+
+    assert_eq!(
+        inject_vxlan(PEER_NETNS, peer, underlay, 42).await,
+        Injection {
+            decapsulated: true,
+            dropped: false
+        },
+        "the peer's VXLAN must be admitted"
+    );
+    assert_eq!(
+        inject_vxlan(FOREIGN_NETNS, peer, underlay, 42).await,
+        Injection {
+            decapsulated: false,
+            dropped: true
+        },
+        "the peer's address arriving from another network must be dropped"
+    );
+    assert_eq!(
+        inject_vxlan(FOREIGN_NETNS, foreign, public, 42).await,
+        Injection {
+            decapsulated: false,
+            dropped: true
+        },
+        "VXLAN to the public address must be dropped"
+    );
+    assert_eq!(
+        inject_vxlan(FOREIGN_NETNS, foreign, underlay, 42).await,
+        Injection {
+            decapsulated: false,
+            dropped: true
+        },
+        "an unknown sender's VXLAN to the underlay address must be dropped"
+    );
+    assert!(
+        !inject_vxlan(FOREIGN_NETNS, foreign, public, 4242)
+            .await
+            .dropped,
+        "another VNI is left to whoever uses it"
+    );
 }
 
 /// Run `ip` with `args`, failing the test with its stderr if it fails.
@@ -1152,7 +1525,7 @@ async fn bridge_address_outside_cidr_rejected() {
 }
 
 #[tokio::test]
-async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
+async fn routed_subnet_collision_is_rejected_without_partial_kernel_state() {
     if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
         return;
     }
@@ -1186,14 +1559,33 @@ async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
     );
 
     let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
-    let error = temps_network::docker::preflight_network_for_pool(
+    let occupied: Ipv4Net = existing_cidr.parse().expect("valid existing CIDR");
+    // ADR 056: only routed subnets matter. With no peer on the occupied
+    // range, the rest of the pool is irrelevant.
+    let own_only = [env.alloc().compute_cidr];
+    if !own_only
+        .iter()
+        .any(|own| own.contains(&occupied.network()) || occupied.contains(&own.network()))
+    {
+        temps_network::docker::preflight_network_for_subnets(
+            &docker,
+            &env.config(),
+            &env.alloc(),
+            &own_only,
+        )
+        .await
+        .expect("a Docker network elsewhere in the pool must not block this node");
+    }
+    assert!(pool.contains(&occupied.network()) || occupied.contains(&pool.network()));
+    // A peer routed over the occupied range is refused, naming the network.
+    let error = temps_network::docker::preflight_network_for_subnets(
         &docker,
         &env.config(),
         &env.alloc(),
-        pool,
+        &[env.alloc().compute_cidr, occupied],
     )
     .await
-    .expect_err("the full cluster pool must reject an occupied future peer subnet");
+    .expect_err("a routed peer subnet over a Docker network must be refused");
     assert!(error.to_string().contains(existing));
     assert!(!link_exists("br-temps0").await);
     assert!(!link_exists("vxlan-temps0").await);
@@ -1274,7 +1666,7 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
     assert!(route_exists(&existing_app_cidr).await);
     assert!(route_exists(&existing_custom_route).await);
     assert!(docker_container_running(&existing_app_container).await);
-    temps_network::preflight_compute_pool_routes(&cfg, pool)
+    temps_network::preflight_compute_routes(&cfg, &[env.alloc().compute_cidr, env.peer_cidr, pool])
         .await
         .expect("safe cluster pool must not overlap host routes");
     let alloc = env.alloc();
@@ -1317,7 +1709,6 @@ async fn control_plane_stays_running_and_reconciles_worker_later() {
         &docker,
         &cfg,
         &alloc,
-        pool,
         vec![peer.clone()],
     )
     .await

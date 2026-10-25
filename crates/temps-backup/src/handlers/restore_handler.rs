@@ -49,6 +49,9 @@ impl From<RestoreError> for Problem {
             RestoreError::BackupDeleting { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Backup deletion in progress")
                 .with_detail(error.to_string()),
+            RestoreError::BackupNotRestorable { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Backup Not Restorable")
+                .with_detail(error.to_string()),
             RestoreError::CrossServiceRestoreNotConfirmed { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_type("https://temps.sh/probs/cross-service-restore-not-confirmed")
@@ -385,7 +388,7 @@ use crate::handlers::authz::{
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
-        (status = 409, description = "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted, or a requested new-service name is already owned by a service or another active restore", body = ProblemDetails),
+        (status = 409, description = "Conflict: a destructive cross-service restore requires explicit confirmation (`cross-service-restore-not-confirmed`), another restore is already active on this service (`restore-already-active`, with `active_restore_run_id`), data is being imported into it (`data-import-active`, with `active_data_import_run_id`), the backup is being deleted or has not completed (pending, running or failed), or a requested new-service name is already owned by a service or another active restore", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -1170,6 +1173,17 @@ mod tests {
     fn deleting_backup_maps_to_conflict() {
         assert_eq!(
             status_for(RestoreError::BackupDeleting { backup_id: 1 }),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[test]
+    fn non_completed_backup_maps_to_conflict() {
+        assert_eq!(
+            status_for(RestoreError::BackupNotRestorable {
+                backup_id: 1,
+                state: "running".into(),
+            }),
             StatusCode::CONFLICT
         );
     }

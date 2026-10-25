@@ -151,7 +151,8 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
 
 ## Secure accounts {{ anchor: true, id: 'accounts' }}
 
-- **MFA.** Any account, `admin` or `user`, can enroll a TOTP authenticator from its **Account** page and receives eight single-use recovery codes. A recovery code works in place of an authenticator code, including at sign-in, so keep them somewhere other than the phone: an admin cannot remove another account's MFA. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **MFA.** Any account, `admin` or `user`, can enroll a TOTP authenticator from its **Account** page and receives eight single-use recovery codes. A recovery code works in place of an authenticator code, including at sign-in, so keep them somewhere other than the phone. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **Lost authenticator and recovery codes.** An admin can remove another account's MFA from **Settings → Users**: open the user's menu and choose **Reset MFA** (`DELETE /api/users/{user_id}/mfa`). The user's authenticator and recovery codes stop working, every session they have is signed out, and they sign in with their password and enroll again. Their password, roles and API keys are unchanged, and the reset is recorded in the audit log as `ADMIN_MFA_RESET`. An admin cannot reset their own MFA this way. If you are the only admin, run `temps reset-admin-password --clear-mfa` on the server instead (see [Troubleshooting](/docs/troubleshooting)).
 - **Require MFA for admins.** Once every admin has enrolled, turn on `require_mfa_for_admins`. Password logins by Admin users without MFA are then rejected. The setting is not in the console yet. Set it through the settings API with an admin API key:
 
   ```bash
@@ -161,7 +162,7 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
     -d '{"require_mfa_for_admins": true}'
   ```
 
-  It applies to password logins only. SSO logins rely on your identity provider's MFA.
+  It applies to password logins only. SSO logins rely on your identity provider's MFA. While it is on, an admin whose MFA was reset cannot sign in with a password until they enroll again: they have to sign in through SSO, or you turn the setting off until they have enrolled. `temps reset-admin-password --clear-mfa` turns it off for you.
 - **Single sign-on.** To manage access from an identity provider, add an OIDC provider under **Settings → Authentication**.
 - **Least privilege.** Accounts are either `admin` or `user`. Give admin only to the people who run the instance, use [Teams](/docs/teams) to limit which projects `user` accounts can change, and remove accounts when people leave. See [Manage team access](/docs/manage-team-access).
 - **Initial admin.** For unattended installs, supply the first admin password through `TEMPS_ADMIN_PASSWORD_FILE` rather than a command-line flag. It must be 8 to 128 characters and contain an uppercase letter, a lowercase letter, a digit and a special character.

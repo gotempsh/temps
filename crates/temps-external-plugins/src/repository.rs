@@ -66,6 +66,84 @@ const BUILD_CONTAINER_ARGS: &[&str] = &[
     "sleep 660",
 ];
 
+/// The container engine that compiles a plugin. Docker is preferred so a host
+/// that has always built with Docker keeps doing exactly that; Podman is the
+/// daemonless engine a hosted control plane carries instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerRuntime {
+    Docker,
+    Podman,
+}
+
+impl ContainerRuntime {
+    const PREFERENCE: [Self; 2] = [Self::Docker, Self::Podman];
+
+    fn program(self) -> &'static str {
+        match self {
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+
+    /// The pinned image, spelled so the engine resolves it without a search
+    /// registry: Podman has no implicit `docker.io`.
+    fn builder_image(self) -> String {
+        match self {
+            Self::Docker => BUILDER_IMAGE.to_string(),
+            Self::Podman => format!("docker.io/{BUILDER_IMAGE}"),
+        }
+    }
+
+    /// The network the build container is attached to, which is what gets
+    /// disconnected before attacker-controlled source is compiled.
+    fn build_network(self) -> &'static str {
+        match self {
+            Self::Docker => "bridge",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+/// `BUILD_CONTAINER_ARGS` with the image spelled for `runtime`.
+fn build_container_args(runtime: ContainerRuntime) -> Vec<String> {
+    let image = runtime.builder_image();
+    BUILD_CONTAINER_ARGS
+        .iter()
+        .map(|arg| {
+            if *arg == BUILDER_IMAGE {
+                image.clone()
+            } else {
+                (*arg).to_string()
+            }
+        })
+        .collect()
+}
+
+/// The first container engine this machine has. `RuntimeMissing` means none is
+/// installed, which sends the build to a worker; any other spawn failure is a
+/// real error.
+async fn resolve_container_runtime() -> Result<ContainerRuntime, LocalBuildError> {
+    for runtime in ContainerRuntime::PREFERENCE {
+        match Command::new(runtime.program())
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+        {
+            Ok(_) => return Ok(runtime),
+            Err(error) if docker_cli_is_missing(&error) => continue,
+            Err(error) => {
+                return Err(LocalBuildError::Failed(format!(
+                    "start {}: {error}",
+                    runtime.program()
+                )))
+            }
+        }
+    }
+    Err(LocalBuildError::RuntimeMissing)
+}
+
 #[derive(Debug, Error)]
 pub enum RepositoryError {
     #[error("Unsafe GitHub repository URL: expected https://github.com/owner/repo without credentials or query")]
@@ -98,6 +176,21 @@ pub enum RepositoryError {
         commit: String,
         reason: String,
     },
+    /// The instance has no plugin builder: plugins are compiled in an isolated
+    /// Docker container and this process has no Docker CLI. Not a build
+    /// failure, so it must not be reported as one.
+    /// Nothing can compile the plugin: this server has no Docker and no
+    /// worker node took the build. `reason` is composed of fixed text and is
+    /// safe to show.
+    #[error("Repository '{repository}' at commit {commit} cannot be built: {reason}")]
+    BuilderUnavailable {
+        repository: String,
+        commit: String,
+        reason: String,
+    },
+    /// This server has no `git` executable, so it cannot fetch the source.
+    #[error("Repository '{repository}' cannot be fetched: this server has no `git` executable")]
+    GitUnavailable { repository: String },
     #[error("Plugin '{name}' is already installed from a different source than '{repository}'")]
     SourceConflict { name: String, repository: String },
 }
@@ -449,6 +542,27 @@ fn safe_git_command(git_dir: &Path) -> Command {
     command
 }
 
+/// A missing `git` binary is a property of this server (a hosted control plane
+/// image ships none), not of the repository, so it must not read as "GitHub
+/// could not be reached".
+fn git_spawn_error(
+    repository: &str,
+    operation: &'static str,
+    error: std::io::Error,
+) -> RepositoryError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        RepositoryError::GitUnavailable {
+            repository: repository.into(),
+        }
+    } else {
+        RepositoryError::GitHub {
+            repository: repository.into(),
+            operation,
+            reason: error.to_string(),
+        }
+    }
+}
+
 async fn git_command(
     repository: &str,
     operation: &'static str,
@@ -471,11 +585,9 @@ async fn git_command(
         },
     );
     if operation == "fetch ref" {
-        let mut child = command.spawn().map_err(|error| RepositoryError::GitHub {
-            repository: repository.into(),
-            operation,
-            reason: error.to_string(),
-        })?;
+        let mut child = command
+            .spawn()
+            .map_err(|error| git_spawn_error(repository, operation, error))?;
         let status = tokio::time::timeout(Duration::from_secs(90), async {
             loop {
                 tokio::select! {
@@ -531,11 +643,7 @@ async fn git_command(
             operation,
             reason: "Git command timed out".into(),
         })?
-        .map_err(|error| RepositoryError::GitHub {
-            repository: repository.into(),
-            operation,
-            reason: error.to_string(),
-        })?;
+        .map_err(|error| git_spawn_error(repository, operation, error))?;
     if !result.status.success() {
         return Err(RepositoryError::GitHub {
             repository: repository.into(),
@@ -739,6 +847,12 @@ fn extract_archive(
     Ok(())
 }
 
+/// Whether spawning `docker` failed because the CLI is not installed, as on a
+/// hosted control plane. Every other spawn failure is a real build error.
+fn docker_cli_is_missing(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
 pub(crate) fn bun_target() -> Option<&'static str> {
     match (
         std::env::consts::OS,
@@ -757,25 +871,157 @@ pub(crate) fn bun_target() -> Option<&'static str> {
 
 #[cfg(test)]
 pub(crate) async fn build(source: &RepositorySource, output: &Path) -> Result<(), RepositoryError> {
-    build_with_progress(source, output, None).await
+    build_with_progress(source, output, None, None).await
 }
 
+/// Compile a fetched plugin: in a container on this machine when it has Docker,
+/// otherwise on a worker node that does.
 pub(crate) async fn build_with_progress(
     source: &RepositorySource,
     output: &Path,
     progress: Option<&ProgressHandle>,
+    remote: Option<&dyn temps_core::plugin_builder::RemotePluginBuilder>,
 ) -> Result<(), RepositoryError> {
     if let Some(progress) = progress {
         progress.advance(Stage::PreparingBuilder).await;
     }
-    let run = |reason: String| RepositoryError::Build {
+    let failed = |reason: String| RepositoryError::Build {
         repository: source.repository.clone(),
         commit: source.commit.clone(),
         reason,
     };
-    let target = bun_target().ok_or_else(|| run("unsupported Bun compile target".into()))?;
-    let local_image = Command::new("docker")
-        .args(["image", "inspect", BUILDER_IMAGE])
+    let target = bun_target().ok_or_else(|| failed("unsupported Bun compile target".into()))?;
+    match build_in_container(
+        ContainerBuildSource::Directory(&source.source_dir),
+        target,
+        output,
+        progress,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(LocalBuildError::Failed(reason)) => Err(failed(reason)),
+        Err(LocalBuildError::RuntimeMissing) => {
+            build_on_worker(source, target, output, progress, remote).await
+        }
+    }
+}
+
+/// This machine has no Docker. Ask a worker node to compile, if there is a way
+/// to reach one.
+async fn build_on_worker(
+    source: &RepositorySource,
+    target: &str,
+    output: &Path,
+    progress: Option<&ProgressHandle>,
+    remote: Option<&dyn temps_core::plugin_builder::RemotePluginBuilder>,
+) -> Result<(), RepositoryError> {
+    let unavailable = |reason: &str| RepositoryError::BuilderUnavailable {
+        repository: source.repository.clone(),
+        commit: source.commit.clone(),
+        reason: reason.to_string(),
+    };
+    let failed = |reason: String| RepositoryError::Build {
+        repository: source.repository.clone(),
+        commit: source.commit.clone(),
+        reason,
+    };
+    let Some(remote) = remote else {
+        return Err(unavailable(
+            "No container engine (Docker or Podman) is available here and there is no worker node to build on. Install the plugin from a server that has Docker or Podman.",
+        ));
+    };
+    if let Some(progress) = progress {
+        progress.advance(Stage::Compiling).await;
+    }
+    let work = output
+        .parent()
+        .ok_or_else(|| failed("plugin output has no parent directory".into()))?;
+    let archive = work.join("source.tar");
+    let status = Command::new("tar")
+        .args(["-C", &source.source_dir.display().to_string(), "-cf"])
+        .arg(&archive)
+        .arg(".")
+        .env("COPYFILE_DISABLE", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map_err(|error| failed(format!("archive source for the worker build: {error}")))?;
+    if !status.success() {
+        return Err(failed(format!(
+            "archive source for the worker build: tar {status}"
+        )));
+    }
+    let size = tokio::fs::metadata(&archive)
+        .await
+        .map_err(|error| failed(format!("inspect source archive: {error}")))?
+        .len();
+    if size > MAX_ARCHIVE_BYTES as u64 {
+        let _ = tokio::fs::remove_file(&archive).await;
+        return Err(failed(format!(
+            "source archive exceeds {MAX_ARCHIVE_BYTES} bytes"
+        )));
+    }
+    let request = temps_core::plugin_builder::PluginBuildRequest {
+        source_archive: archive.clone(),
+        bun_target: target.to_string(),
+        output: output.to_path_buf(),
+    };
+    let result = remote.build(&request).await;
+    let _ = tokio::fs::remove_file(&archive).await;
+    match result {
+        Ok(()) => {
+            #[cfg(unix)]
+            tokio::fs::set_permissions(output, std::fs::Permissions::from_mode(0o500))
+                .await
+                .map_err(|error| {
+                    failed(format!(
+                        "mark compiled output {} executable: {error}",
+                        output.display()
+                    ))
+                })?;
+            Ok(())
+        }
+        Err(temps_core::plugin_builder::PluginBuildError::NoBuilder(reason)) => {
+            Err(unavailable(&reason))
+        }
+        Err(temps_core::plugin_builder::PluginBuildError::Failed(reason)) => Err(failed(reason)),
+    }
+}
+
+/// Why a build in a local container did not produce a binary.
+#[derive(Debug)]
+pub enum LocalBuildError {
+    /// There is neither `docker` nor `podman` here. Nothing was compiled.
+    RuntimeMissing,
+    /// The container engine ran and the build failed; the text is the reason.
+    Failed(String),
+}
+
+/// Where the source for a container build comes from.
+pub enum ContainerBuildSource<'a> {
+    /// A source tree on this machine.
+    Directory(&'a Path),
+    /// A tar archive. It is streamed into the container and extracted there,
+    /// never on this machine's filesystem.
+    Archive(&'a Path),
+}
+
+/// Compile a plugin in the pinned, resource-bounded Bun container on this
+/// machine's Docker. Used for installs on a machine with Docker, and by a
+/// worker's agent for a build a control plane without Docker asked for.
+pub async fn build_in_container(
+    source: ContainerBuildSource<'_>,
+    target: &str,
+    output: &Path,
+    progress: Option<&ProgressHandle>,
+) -> Result<(), LocalBuildError> {
+    let run = |reason: String| LocalBuildError::Failed(reason);
+    let runtime = resolve_container_runtime().await?;
+    let image = runtime.builder_image();
+    let local_image = Command::new(runtime.program())
+        .args(["image", "inspect", &image])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -783,13 +1029,13 @@ pub(crate) async fn build_with_progress(
         .map_err(|error| run(format!("inspect pinned builder: {error}")))?;
     if !local_image.success() {
         let pull = tokio::time::timeout(
-            Duration::from_secs(120),
-            Command::new("docker")
-                .args(["pull", BUILDER_IMAGE])
+            Duration::from_secs(300),
+            Command::new(runtime.program())
+                .args(["pull", &image])
                 .output(),
         )
         .await
-        .map_err(|_| run("pinned builder image pull timed out".into()))?
+        .map_err(|_| run("pinned builder image pull exceeded 300 seconds".into()))?
         .map_err(|error| run(format!("pull pinned builder: {error}")))?;
         if !pull.status.success() {
             return Err(run(format!(
@@ -798,8 +1044,8 @@ pub(crate) async fn build_with_progress(
             )));
         }
     }
-    let create = Command::new("docker")
-        .args(BUILD_CONTAINER_ARGS)
+    let create = Command::new(runtime.program())
+        .args(build_container_args(runtime))
         .output()
         .await
         .map_err(|error| run(format!("create container: {error}")))?;
@@ -811,10 +1057,12 @@ pub(crate) async fn build_with_progress(
     }
     let id = String::from_utf8_lossy(&create.stdout).trim().to_string();
     if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err(run("Docker returned an invalid container identifier".into()));
+        return Err(run(
+            "the container engine returned an invalid container identifier".into(),
+        ));
     }
     let result = async {
-        let start = Command::new("docker")
+        let start = Command::new(runtime.program())
             .args(["start", &id])
             .output()
             .await
@@ -827,7 +1075,7 @@ pub(crate) async fn build_with_progress(
         }
         // Docker installs tmpfs mounts only when the container starts. Copying
         // before this point would place the source in its writable image layer.
-        let dirs = Command::new("docker")
+        let dirs = Command::new(runtime.program())
             .args(["exec", &id, "mkdir", "-p", "/work/home", "/work/cache/bun"])
             .output()
             .await
@@ -840,15 +1088,28 @@ pub(crate) async fn build_with_progress(
         }
         // docker cp refuses a read-only rootfs even when the destination is
         // tmpfs. Stream a capped archive through docker exec into /work.
-        let mut archive = Command::new("tar")
-            .args(["-C", &source.source_dir.display().to_string(), "-cf", "-", "."])
-            .env("COPYFILE_DISABLE", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| run(format!("archive source for bounded staging: {error}")))?;
-        let mut extract = Command::new("docker")
+        let mut archive_child = None;
+        let mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match &source {
+            ContainerBuildSource::Directory(directory) => {
+                let mut child = Command::new("tar")
+                    .args(["-C", &directory.display().to_string(), "-cf", "-", "."])
+                    .env("COPYFILE_DISABLE", "1")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .map_err(|error| run(format!("archive source for bounded staging: {error}")))?;
+                let stdout = child.stdout.take().ok_or_else(|| run("source archive stdout unavailable".into()))?;
+                archive_child = Some(child);
+                Box::new(stdout)
+            }
+            ContainerBuildSource::Archive(path) => Box::new(
+                tokio::fs::File::open(path)
+                    .await
+                    .map_err(|error| run(format!("open source archive: {error}")))?,
+            ),
+        };
+        let mut extract = Command::new(runtime.program())
             .args(["exec", "-i", &id, "tar", "--no-same-owner", "-xf", "-", "-C", "/work"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -856,9 +1117,8 @@ pub(crate) async fn build_with_progress(
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| run(format!("start bounded source staging: {error}")))?;
-        let archive_stdout = archive.stdout.take().ok_or_else(|| run("source archive stdout unavailable".into()))?;
         let mut extract_stdin = extract.stdin.take().ok_or_else(|| run("source staging stdin unavailable".into()))?;
-        let copied = tokio::time::timeout(BUILD_TIMEOUT, tokio::io::copy(&mut archive_stdout.take(MAX_ARCHIVE_BYTES as u64 + 1), &mut extract_stdin))
+        let copied = tokio::time::timeout(BUILD_TIMEOUT, tokio::io::copy(&mut (&mut reader).take(MAX_ARCHIVE_BYTES as u64 + 1), &mut extract_stdin))
             .await
             .map_err(|_| run("bounded source staging exceeded 300 seconds".into()))?
             .map_err(|error| run(format!("stream source into bounded work tmpfs: {error}")))?;
@@ -867,17 +1127,20 @@ pub(crate) async fn build_with_progress(
         }
         extract_stdin.shutdown().await.map_err(|error| run(format!("finish bounded source staging: {error}")))?;
         drop(extract_stdin);
-        let archive_status = tokio::time::timeout(BUILD_TIMEOUT, archive.wait()).await.map_err(|_| run("source archive exceeded 300 seconds".into()))?.map_err(|error| run(format!("archive source: {error}")))?;
+        let archive_ok = match archive_child {
+            Some(mut child) => tokio::time::timeout(BUILD_TIMEOUT, child.wait()).await.map_err(|_| run("source archive exceeded 300 seconds".into()))?.map_err(|error| run(format!("archive source: {error}")))?.success(),
+            None => true,
+        };
         let extract_status = tokio::time::timeout(BUILD_TIMEOUT, extract.wait()).await.map_err(|_| run("source extraction exceeded 300 seconds".into()))?.map_err(|error| run(format!("extract source in bounded work tmpfs: {error}")))?;
-        if !archive_status.success() || !extract_status.success() {
-            return Err(run(format!("bounded source staging failed (archive {archive_status}, extract {extract_status})")));
+        if !archive_ok || !extract_status.success() {
+            return Err(run(format!("bounded source staging failed (archive ok: {archive_ok}, extract {extract_status})")));
         }
         // Package resolution may use the network, but lifecycle scripts are
         // disabled. Disconnect before compiling attacker-controlled source.
         if let Some(progress) = progress { progress.advance(Stage::InstallingDependencies).await; }
         let install = tokio::time::timeout(
             BUILD_TIMEOUT,
-            Command::new("docker")
+            Command::new(runtime.program())
                 .args([
                     "exec",
                     &id,
@@ -905,7 +1168,7 @@ pub(crate) async fn build_with_progress(
         if let Some(progress) = progress { progress.advance(Stage::PreparingRuntime).await; }
         let warmup = tokio::time::timeout(
             BUILD_TIMEOUT,
-            Command::new("docker")
+            Command::new(runtime.program())
                 .args([
                     "exec", &id, "/bin/sh", "-c",
                     &format!(
@@ -923,8 +1186,8 @@ pub(crate) async fn build_with_progress(
         if !warmup.success() {
             return Err(run(format!("target runtime prefetch failed with exit status {warmup}")));
         }
-        let disconnect = Command::new("docker")
-            .args(["network", "disconnect", "bridge", &id])
+        let disconnect = Command::new(runtime.program())
+            .args(["network", "disconnect", runtime.build_network(), &id])
             .output()
             .await
             .map_err(|error| run(format!("disconnect build network: {error}")))?;
@@ -937,7 +1200,7 @@ pub(crate) async fn build_with_progress(
         if let Some(progress) = progress { progress.advance(Stage::Compiling).await; }
         let compile = tokio::time::timeout(
             BUILD_TIMEOUT,
-            Command::new("docker")
+            Command::new(runtime.program())
                 .args([
                     "exec",
                     &id,
@@ -962,7 +1225,7 @@ pub(crate) async fn build_with_progress(
                 "Bun compile failed with exit status {compile}"
             )));
         }
-        let size = Command::new("docker")
+        let size = Command::new(runtime.program())
             .args(["exec", &id, "stat", "-c", "%s", "/work/plugin"])
             .output()
             .await
@@ -980,7 +1243,7 @@ pub(crate) async fn build_with_progress(
         // docker cp cannot inspect tmpfs paths under a read-only rootfs.
         // Stream the output through exec and enforce the same binary cap.
         if let Some(progress) = progress { progress.advance(Stage::ExtractingBinary).await; }
-        let mut export = Command::new("docker")
+        let mut export = Command::new(runtime.program())
             .args(["exec", &id, "cat", "/work/plugin"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1010,7 +1273,7 @@ pub(crate) async fn build_with_progress(
         Ok(())
     }
     .await;
-    let _ = Command::new("docker")
+    let _ = Command::new(runtime.program())
         .args(["rm", "-f", &id])
         .output()
         .await;
@@ -1019,6 +1282,152 @@ pub(crate) async fn build_with_progress(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn podman_spells_the_pinned_image_with_its_registry() {
+        let docker = build_container_args(ContainerRuntime::Docker);
+        let podman = build_container_args(ContainerRuntime::Podman);
+        assert!(docker.iter().any(|arg| arg == BUILDER_IMAGE));
+        assert!(podman
+            .iter()
+            .any(|arg| arg == &format!("docker.io/{BUILDER_IMAGE}")));
+        assert!(!podman.iter().any(|arg| arg == BUILDER_IMAGE));
+        // Only the image differs: every limit and hardening flag is shared.
+        assert_eq!(docker.len(), podman.len());
+        let strip = |args: &[String]| -> Vec<String> {
+            args.iter()
+                .filter(|arg| !arg.ends_with(BUILDER_IMAGE))
+                .cloned()
+                .collect()
+        };
+        assert_eq!(strip(&docker), strip(&podman));
+    }
+
+    #[test]
+    fn docker_is_preferred_and_each_engine_names_its_build_network() {
+        assert_eq!(ContainerRuntime::PREFERENCE[0], ContainerRuntime::Docker);
+        assert_eq!(ContainerRuntime::Docker.build_network(), "bridge");
+        assert_eq!(ContainerRuntime::Podman.build_network(), "podman");
+    }
+
+    fn worker_fixture(dir: &Path) -> RepositorySource {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/index.ts"), "console.log(1)\n").unwrap();
+        RepositorySource {
+            repository: "https://github.com/example/plugin".into(),
+            name: "fixture-plugin".into(),
+            ref_name: "main".into(),
+            path: None,
+            commit: "a".repeat(40),
+            version: "1.0.0".into(),
+            source_dir: dir.to_path_buf(),
+        }
+    }
+
+    struct FakeWorker(std::sync::Mutex<Option<temps_core::plugin_builder::PluginBuildError>>);
+
+    #[async_trait::async_trait]
+    impl temps_core::plugin_builder::RemotePluginBuilder for FakeWorker {
+        async fn build(
+            &self,
+            request: &temps_core::plugin_builder::PluginBuildRequest,
+        ) -> Result<(), temps_core::plugin_builder::PluginBuildError> {
+            // The archive really holds the source, and the target is passed on.
+            let listing = std::process::Command::new("tar")
+                .arg("-tf")
+                .arg(&request.source_archive)
+                .output()
+                .expect("list archive");
+            assert!(String::from_utf8_lossy(&listing.stdout).contains("src/index.ts"));
+            assert_eq!(request.bun_target, "bun-linux-x64-musl");
+            if let Some(error) = self.0.lock().unwrap().take() {
+                return Err(error);
+            }
+            std::fs::write(&request.output, b"\x7fELF-compiled").unwrap();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_build_writes_an_executable_binary() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = worker_fixture(&temp.path().join("source"));
+        let output = temp.path().join("plugin");
+        let worker = FakeWorker(Default::default());
+        build_on_worker(&source, "bun-linux-x64-musl", &output, None, Some(&worker))
+            .await
+            .expect("worker build");
+        assert_eq!(std::fs::read(&output).unwrap(), b"\x7fELF-compiled");
+        #[cfg(unix)]
+        assert_ne!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o111,
+            0
+        );
+        assert!(
+            !temp.path().join("source.tar").exists(),
+            "the staged source archive is removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_docker_and_no_worker_is_reported_as_an_unavailable_builder() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = worker_fixture(&temp.path().join("source"));
+        let output = temp.path().join("plugin");
+        let none = build_on_worker(&source, "bun-linux-x64-musl", &output, None, None).await;
+        assert!(matches!(
+            none,
+            Err(RepositoryError::BuilderUnavailable { .. })
+        ));
+
+        let worker = FakeWorker(std::sync::Mutex::new(Some(
+            temps_core::plugin_builder::PluginBuildError::NoBuilder(
+                "no worker is connected".into(),
+            ),
+        )));
+        match build_on_worker(&source, "bun-linux-x64-musl", &output, None, Some(&worker)).await {
+            Err(RepositoryError::BuilderUnavailable { reason, .. }) => {
+                assert_eq!(reason, "no worker is connected")
+            }
+            other => panic!("expected an unavailable builder, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_worker_build_is_a_build_failure_not_an_unavailable_builder() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = worker_fixture(&temp.path().join("source"));
+        let output = temp.path().join("plugin");
+        let worker = FakeWorker(std::sync::Mutex::new(Some(
+            temps_core::plugin_builder::PluginBuildError::Failed("bun exited 1".into()),
+        )));
+        match build_on_worker(&source, "bun-linux-x64-musl", &output, None, Some(&worker)).await {
+            Err(RepositoryError::Build { reason, .. }) => assert_eq!(reason, "bun exited 1"),
+            other => panic!("expected a build failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_git_binary_is_not_reported_as_github_being_unreachable() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(matches!(
+            git_spawn_error("https://github.com/example/plugin", "fetch ref", missing),
+            RepositoryError::GitUnavailable { .. }
+        ));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            git_spawn_error("https://github.com/example/plugin", "fetch ref", denied),
+            RepositoryError::GitHub { .. }
+        ));
+    }
+
+    #[test]
+    fn a_missing_docker_cli_is_not_a_build_failure() {
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(docker_cli_is_missing(&missing));
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!docker_cli_is_missing(&denied));
+    }
+
     use super::*;
 
     #[tokio::test]

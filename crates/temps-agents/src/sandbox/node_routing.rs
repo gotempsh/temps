@@ -25,9 +25,9 @@ use tokio::sync::RwLock;
 
 use super::remote::{RemoteSandboxDefaults, RemoteSandboxProvider};
 use super::{
-    KillSignal, OnStreamEventCallback, PtyAttachment, RootfsGcReport, RootfsReport,
-    RuntimeCompatibility, SandboxBackend, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
-    SandboxProvider, SnapshotArtifact,
+    DefaultResourceLimits, KillSignal, OnStreamEventCallback, PtyAttachment, RootfsGcReport,
+    RootfsReport, RuntimeCompatibility, SandboxBackend, SandboxCreateConfig, SandboxExecResult,
+    SandboxHandle, SandboxProvider, SnapshotArtifact,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -391,6 +391,10 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         self.local.supports_backend(backend)
     }
 
+    fn default_resource_limits(&self, backend: Option<SandboxBackend>) -> DefaultResourceLimits {
+        self.local.default_resource_limits(backend)
+    }
+
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
         self.owner_of(handle).await?.attach_pty(handle).await
     }
@@ -549,8 +553,9 @@ impl NodeProviderFactory for MtlsProviderFactory {
         token: String,
         defaults: RemoteSandboxDefaults,
     ) -> Result<Arc<dyn SandboxProvider>, String> {
+        let endpoint = temps_deployments::cluster_ca::node_agent_endpoint(node);
         let client = temps_deployments::cluster_ca::build_node_http_client(
-            &node.address,
+            &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
             None,
@@ -559,8 +564,9 @@ impl NodeProviderFactory for MtlsProviderFactory {
         .map_err(|e| e.to_string())?;
         // Byte channels (terminal, agent runtime, preview ports) present the
         // same identity as `client` on their WebSocket.
-        let ws_connector = if temps_deployments::cluster_ca::is_https_address(&node.address) {
+        let ws_connector = if temps_deployments::cluster_ca::is_https_address(&endpoint.dial_url) {
             let config = temps_deployments::cluster_ca::cp_ws_client_config(
+                &endpoint,
                 self.config_service.as_ref(),
                 self.encryption_service.as_ref(),
             )
@@ -574,7 +580,7 @@ impl NodeProviderFactory for MtlsProviderFactory {
             RemoteSandboxProvider::new(
                 node.id,
                 node.name.clone(),
-                node.address.clone(),
+                endpoint.dial_url,
                 token,
                 client,
             )
@@ -1140,6 +1146,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: now,
             updated_at: now,
         }

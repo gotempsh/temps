@@ -59,8 +59,7 @@ pub fn render_html_template(digest: &WeeklyDigestData) -> Result<String> {
                 Tone::Negative
             },
         ),
-        Metric::new("Uptime", &format!("{:.1}%", summary.uptime_percent))
-            .with_note("of the week", uptime_tone(summary.uptime_percent)),
+        uptime_metric(summary.uptime_percent, 1, "of the week"),
     ]));
     body.push_str(&section_close());
 
@@ -154,8 +153,7 @@ pub fn render_html_template(digest: &WeeklyDigestData) -> Result<String> {
                 },
             ),
             Metric::new("New Error Types", &errors.new_error_types.to_string()),
-            Metric::new("Uptime", &format!("{:.2}%", errors.uptime_percentage))
-                .with_note("", uptime_tone(errors.uptime_percentage)),
+            uptime_metric(errors.uptime_percentage, 2, ""),
             Metric::new(
                 "Failed Health Checks",
                 &errors.failed_health_checks.to_string(),
@@ -587,13 +585,16 @@ pub fn render_text_template(digest: &WeeklyDigestData) -> Result<String> {
 
     let s = &digest.executive_summary;
     text.push_str(&format!(
-        "• {} total visitors ({:+.1}% from last week)\n• {} deployments ({} failed)\n• {} new errors detected\n• {:.1}% uptime\n\n",
+        "• {} total visitors ({:+.1}% from last week)\n• {} deployments ({} failed)\n• {} new errors detected\n• {}\n\n",
         format_number(s.total_visitors),
         s.visitor_change_percent,
         s.total_deployments,
         s.failed_deployments,
         format_number(s.new_errors),
-        s.uptime_percent,
+        match s.uptime_percent {
+            Some(pct) => format!("{:.1}% uptime", pct),
+            None => "No health checks ran".to_string(),
+        },
     ));
 
     if let Some(perf) = &digest.performance {
@@ -646,10 +647,10 @@ pub fn render_text_template(digest: &WeeklyDigestData) -> Result<String> {
 
     if let Some(errors) = &digest.errors {
         text.push_str(&format!(
-            "{rule}\n⚠️  ERRORS & RELIABILITY\n{rule}\n\nTotal Errors:        {}\nNew Error Types:     {}\nUptime:              {:.2}%\nFailed Health Checks: {}\n\n",
+            "{rule}\n⚠️  ERRORS & RELIABILITY\n{rule}\n\nTotal Errors:        {}\nNew Error Types:     {}\nUptime:              {}\nFailed Health Checks: {}\n\n",
             format_number(errors.total_errors),
             errors.new_error_types,
-            errors.uptime_percentage,
+            format_uptime(errors.uptime_percentage, 2),
             errors.failed_health_checks,
             rule = rule,
         ));
@@ -773,6 +774,19 @@ fn escape_html(s: &str) -> String {
     out
 }
 
+/// Uptime as a percentage, or "No checks" when nothing was monitored.
+fn format_uptime(pct: Option<f64>, decimals: usize) -> String {
+    match pct {
+        Some(pct) => format!("{:.*}%", decimals, pct),
+        None => "No checks".to_string(),
+    }
+}
+
+fn uptime_metric(pct: Option<f64>, decimals: usize, note: &str) -> Metric {
+    let tone = pct.map(uptime_tone).unwrap_or(Tone::Neutral);
+    Metric::new("Uptime", &format_uptime(pct, decimals)).with_note(note, tone)
+}
+
 fn uptime_tone(pct: f64) -> Tone {
     if pct >= 99.9 {
         Tone::Positive
@@ -854,6 +868,25 @@ mod tests {
 
         assert!(text.contains("WEEKLY DIGEST"));
         assert!(text.contains("EXECUTIVE SUMMARY"));
+    }
+
+    #[test]
+    fn test_unmonitored_week_is_not_reported_as_full_uptime() {
+        let now = Utc::now();
+        let week_start = now - chrono::Duration::days(7);
+        let mut digest = WeeklyDigestData::new(week_start, now);
+        assert_eq!(digest.executive_summary.uptime_percent, None);
+
+        let text = render_text_template(&digest).expect("render text");
+        assert!(text.contains("No health checks ran"));
+        assert!(!text.contains("100.0% uptime"));
+        let html = render_html_template(&digest).expect("render html");
+        assert!(html.contains("No checks"));
+        assert!(!html.contains("100.0%"));
+
+        digest.executive_summary.uptime_percent = Some(87.5);
+        let text = render_text_template(&digest).expect("render text");
+        assert!(text.contains("87.5% uptime"));
     }
 
     #[test]

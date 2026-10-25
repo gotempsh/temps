@@ -56,15 +56,27 @@ interface ContainerSeries {
 interface MergedPoint {
   time: string
   timestamp: number
-  [seriesKey: string]: number | string
+  [seriesKey: string]: number | string | null
+}
+
+type HistoryPoint = { time: string; value?: number | null }
+
+/** Scale a bucket's value, keeping a bucket without a sample as `null`. */
+function scaled(points: HistoryPoint[], divisor: number): HistoryPoint[] {
+  return points.map((p) => ({
+    time: p.time,
+    value: p.value == null ? null : p.value / divisor,
+  }))
 }
 
 /** Merge independently-fetched per-container history series onto one time
  *  axis, keyed by the bucket timestamp the backend already returns —
  *  TimescaleDB/ClickHouse bucket on absolute clock time, so buckets from
- *  concurrent requests line up without needing to resample here. */
+ *  concurrent requests line up without needing to resample here. The
+ *  backend returns every bucket of the window, with `null` where a container
+ *  reported nothing; those stay `null` so the lines break there. */
 function mergeHistory(
-  series: { key: string; points: { time: string; value: number }[] }[]
+  series: { key: string; points: HistoryPoint[] }[]
 ): MergedPoint[] {
   const rows = new Map<string, MergedPoint>()
   for (const { key, points } of series) {
@@ -74,7 +86,7 @@ function mergeHistory(
         row = { time: p.time, timestamp: new Date(p.time).getTime() }
         rows.set(p.time, row)
       }
-      row[key] = p.value
+      row[key] = p.value ?? null
     }
   }
   return Array.from(rows.values()).sort((a, b) => a.timestamp - b.timestamp)
@@ -312,10 +324,7 @@ export function EnvironmentMetricsCharts({
       mergeHistory(
         visibleEntries.map((c, i) => ({
           key: `mem_${containerSeries.get(c.container_id)!.key}`,
-          points: (memQueries[i]?.data ?? []).map((p) => ({
-            time: p.time,
-            value: p.value / (1024 * 1024),
-          })),
+          points: scaled(memQueries[i]?.data ?? [], 1024 * 1024),
         }))
       ),
     [visibleEntries, memQueries, containerSeries]
@@ -326,17 +335,11 @@ export function EnvironmentMetricsCharts({
       mergeHistory([
         ...visibleEntries.map((c, i) => ({
           key: `rx_${containerSeries.get(c.container_id)!.key}`,
-          points: (netRxQueries[i]?.data ?? []).map((p) => ({
-            time: p.time,
-            value: p.value / 1024,
-          })),
+          points: scaled(netRxQueries[i]?.data ?? [], 1024),
         })),
         ...visibleEntries.map((c, i) => ({
           key: `tx_${containerSeries.get(c.container_id)!.key}`,
-          points: (netTxQueries[i]?.data ?? []).map((p) => ({
-            time: p.time,
-            value: p.value / 1024,
-          })),
+          points: scaled(netTxQueries[i]?.data ?? [], 1024),
         })),
       ]),
     [visibleEntries, netRxQueries, netTxQueries, containerSeries]
@@ -546,7 +549,7 @@ export function EnvironmentMetricsCharts({
                         : false
                     }
                     activeDot={{ r: 4 }}
-                    connectNulls
+                    connectNulls={false}
                   />
                 ))}
               </LineChart>
@@ -628,7 +631,7 @@ export function EnvironmentMetricsCharts({
                         : false
                     }
                     activeDot={{ r: 4 }}
-                    connectNulls
+                    connectNulls={false}
                   />
                 ))}
               </LineChart>
@@ -710,7 +713,7 @@ export function EnvironmentMetricsCharts({
                         : false
                     }
                     activeDot={{ r: 4 }}
-                    connectNulls
+                    connectNulls={false}
                   />,
                   <Line
                     key={`tx-${series.key}`}
@@ -728,7 +731,7 @@ export function EnvironmentMetricsCharts({
                         : false
                     }
                     activeDot={{ r: 4 }}
-                    connectNulls
+                    connectNulls={false}
                   />,
                 ])}
               </LineChart>

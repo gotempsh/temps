@@ -39,6 +39,13 @@ import { useMemo, useState, useRef } from 'react'
 import { Link, useParams } from 'react-router'
 import { format, subDays } from 'date-fns'
 import { DateRange } from 'react-day-picker'
+import {
+  BUCKET_TONE_CLASS,
+  BUCKET_TONE_LABEL,
+  bucketTone,
+  formatUptime,
+  unknownTimeNote,
+} from '@/lib/monitor-uptime'
 
 interface MonitorDetailProps {
   project: ProjectResponse
@@ -51,6 +58,7 @@ interface BucketItemProps {
 }
 
 function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
+  const tone = bucketTone(bucket.status)
   const timeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined)
 
   const handleMouseEnter = () => {
@@ -74,15 +82,7 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
         asChild
       >
         <div
-          className={`flex-1 rounded-sm transition-opacity hover:opacity-80 cursor-pointer ${
-            bucket.status === 'operational'
-              ? 'bg-green-500'
-              : bucket.status === 'major_outage'
-                ? 'bg-red-500'
-                : bucket.status === 'degraded'
-                  ? 'bg-yellow-500'
-                  : 'bg-gray-300'
-          }`}
+          className={`flex-1 rounded-sm transition-opacity hover:opacity-80 cursor-pointer ${BUCKET_TONE_CLASS[tone]}`}
         />
       </PopoverTrigger>
       <PopoverContent
@@ -105,19 +105,24 @@ function BucketItem({ bucket, isOpen, onOpenChange }: BucketItemProps) {
               <span className="text-xs text-muted-foreground">Status</span>
               <Badge
                 variant={
-                  bucket.status === 'operational'
+                  tone === 'operational'
                     ? 'default'
-                    : bucket.status === 'major_outage'
+                    : tone === 'down'
                       ? 'destructive'
                       : 'secondary'
                 }
                 className="text-xs"
               >
-                {bucket.status === 'major_outage'
-                  ? 'Major Outage'
-                  : bucket.status}
+                {BUCKET_TONE_LABEL[tone]}
               </Badge>
             </div>
+            {bucket.total_checks === 0 && (
+              <p className="text-xs text-muted-foreground">
+                No check ran in this interval, so Temps can&apos;t say whether
+                the site was up — e.g. the Temps server was down or the
+                deployment was paused.
+              </p>
+            )}
             <div className="flex items-center justify-between">
               <span className="text-xs text-muted-foreground">
                 Avg Response Time
@@ -290,10 +295,10 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
     refetchInterval: 30000, // Refresh every 30 seconds
   })
   // Calculate uptime stats from status data (filtered by date range)
-  const uptimePercentage = useMemo(
-    () => currentMonitorStatus?.uptime_percentage ?? 0,
-    [currentMonitorStatus]
-  )
+  const uptimePercentage = currentMonitorStatus?.uptime_percentage ?? null
+  const unknownNote = currentMonitorStatus
+    ? unknownTimeNote(currentMonitorStatus)
+    : null
   const avgResponseTime = useMemo(
     () => currentMonitorStatus?.avg_response_time_ms ?? 0,
     [currentMonitorStatus]
@@ -447,13 +452,20 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
             ) : (
               <>
                 <div className="text-2xl font-bold">
-                  {uptimePercentage.toFixed(2)}%
+                  {formatUptime(uptimePercentage)}
                 </div>
                 <p className="text-xs text-muted-foreground mt-1">
                   {startDate && endDate
                     ? `${format(startDate, 'MMM dd')} - ${format(endDate, 'MMM dd')}`
                     : 'Select a date range'}
+                  {unknownNote ? ' · of monitored time' : ''}
                 </p>
+                {unknownNote && (
+                  <p className="mt-1 flex items-center gap-1 text-xs text-amber-700 dark:text-amber-400">
+                    <AlertCircle className="h-3 w-3 shrink-0" />
+                    {unknownNote}
+                  </p>
+                )}
               </>
             )}
           </CardContent>
@@ -542,8 +554,10 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
                   <span>Major Outage</span>
                 </div>
                 <div className="flex items-center gap-2">
-                  <div className="h-3 w-3 rounded-sm bg-gray-300" />
-                  <span>Unknown</span>
+                  <div
+                    className={`h-3 w-3 rounded-sm ${BUCKET_TONE_CLASS.unknown}`}
+                  />
+                  <span>No checks</span>
                 </div>
               </div>
             </div>

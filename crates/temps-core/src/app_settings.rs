@@ -32,6 +32,17 @@ pub struct AppSettings {
     #[serde(default)]
     pub public_ingress_url: Option<String>,
     pub preview_domain: String,
+    /// Label of a new environment's generated hostname under `preview_domain`,
+    /// from `{project}` and `{env}` (ADR 058 D9). `None` means
+    /// [`crate::public_hostname::DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. Applies to
+    /// environments created after it is set; existing ones keep their names.
+    #[serde(default)]
+    pub environment_hostname_template: Option<String>,
+    /// Label for an environment named `production`, when it should differ
+    /// (e.g. `{project}` for `app.example.com`). `None` uses
+    /// `environment_hostname_template`.
+    #[serde(default)]
+    pub production_hostname_template: Option<String>,
     /// Public edge target that generated DNS records point at when a managed
     /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
     /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
@@ -1095,6 +1106,17 @@ pub struct ContainerLogSettings {
     /// mean fewer, bigger chunks; smaller ones bound memory per container.
     #[schema(minimum = 1, maximum = 256, example = 8)]
     pub head_buffer_mb: u32,
+    /// Per-container ingestion budget, in lines per second. A container
+    /// over budget has its excess lines dropped (not stored or indexed),
+    /// a notice written into its log, and is listed as throttled in the log
+    /// explorer. Up to 10 seconds of budget may arrive at once. `0` disables
+    /// the line limit. Applied within a minute of saving.
+    #[schema(minimum = 0, maximum = 1000000, example = 250)]
+    pub ingest_lines_per_sec: u32,
+    /// Per-container ingestion budget, in KiB per second, enforced alongside
+    /// `ingest_lines_per_sec`. `0` disables the byte limit.
+    #[schema(minimum = 0, maximum = 1048576, example = 256)]
+    pub ingest_kib_per_sec: u32,
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -1212,6 +1234,33 @@ pub struct AgentSandboxSettings {
     /// update preserves the stored value.
     #[serde(default)]
     pub allowed_node_ids: Option<Vec<i32>>,
+    /// Highest `cpu_limit` (cores) a `POST /sandboxes` request may ask for.
+    /// `cpu_limit` above only sets the default for requests that omit the
+    /// field; this is the ceiling. `None` = the built-in ceiling (16 cores).
+    /// A value above the built-in ceiling has no effect.
+    #[serde(default)]
+    #[schema(example = 4.0, minimum = 0.01)]
+    pub max_cpu_limit: Option<f64>,
+    /// Highest `memory_limit_mb` a `POST /sandboxes` request may ask for.
+    /// `None` = the built-in ceiling (32768 MB). On the control plane the
+    /// host's physical memory is an additional ceiling.
+    #[serde(default)]
+    #[schema(example = 8192, minimum = 6)]
+    pub max_memory_limit_mb: Option<u64>,
+    /// Highest `pids_limit` a `POST /sandboxes` request may ask for.
+    /// `None` = the built-in ceiling (4096).
+    #[serde(default)]
+    #[schema(example = 1024, minimum = 1)]
+    pub max_pids_limit: Option<i64>,
+    /// Most sandboxes (not destroyed) one user may have created through
+    /// `POST /sandboxes` at a time; a create over the cap is refused.
+    /// `None` = unlimited. AI application workspaces, agent runs and the
+    /// sandboxes the platform creates for AI chat or autofix do not count
+    /// and are not refused. Sandboxes created before this setting existed
+    /// are not counted either.
+    #[serde(default)]
+    #[schema(example = 10, minimum = 1)]
+    pub max_sandboxes_per_user: Option<u32>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -1261,6 +1310,10 @@ impl Default for AgentSandboxSettings {
             network_mode: "full".to_string(),
             sandbox_backend: None,
             allowed_node_ids: None,
+            max_cpu_limit: None,
+            max_memory_limit_mb: None,
+            max_pids_limit: None,
+            max_sandboxes_per_user: None,
         }
     }
 }
@@ -1388,6 +1441,17 @@ pub struct MultiNodeSettings {
     /// Used by remote worker nodes to reach services (databases, etc.) running on the control plane.
     /// Set via `--private-address` or `TEMPS_PRIVATE_ADDRESS`.
     pub private_address: Option<String>,
+    /// `ip:port` workers dial for the control plane's end of the WireGuard
+    /// mesh, published instead of `private_address` on the mesh port. For a
+    /// control plane reachable only through NAT or a forwarded port.
+    ///
+    /// Owned by `temps serve --wg-endpoint` / `TEMPS_WG_ENDPOINT`: every start
+    /// records the flag's value (clearing it when the flag is absent), and a
+    /// settings write never changes it. Stored here only so the processes
+    /// that set the mesh up (the deployer plugin, `temps network
+    /// setup-multi-node`) read the same value.
+    #[serde(default)]
+    pub wg_endpoint: Option<String>,
     /// Whether the legacy single shared join token is still accepted for node
     /// registration (ADR-020 WS-1.1). Defaults to `true` so existing clusters
     /// keep working on upgrade; fresh installs should set it `false` and rely on
@@ -1457,6 +1521,7 @@ impl Default for MultiNodeSettings {
         Self {
             join_token_hash: None,
             private_address: None,
+            wg_endpoint: None,
             legacy_shared_token_enabled: true,
             cluster_ca_cert_pem: None,
             cluster_ca_key_encrypted: None,
@@ -2324,6 +2389,8 @@ impl Default for AppSettings {
             internal_url: None,
             public_ingress_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            environment_hostname_template: None,
+            production_hostname_template: None,
             edge_target: None,
             cloudflare_new_projects: false,
             bunny_new_projects: false,
@@ -2437,6 +2504,11 @@ impl Default for ContainerLogSettings {
             service_max_file: 3,
             cache_mb: 2048,
             head_buffer_mb: 8,
+            // ~21M lines and ~21 GiB per container per day: far above what a
+            // healthy service logs, low enough that one runaway container
+            // cannot become the node's whole log volume.
+            ingest_lines_per_sec: 250,
+            ingest_kib_per_sec: 256,
         }
     }
 }

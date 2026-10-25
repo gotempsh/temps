@@ -56,8 +56,12 @@ pub enum PendingActionError {
     )]
     StepBlocked { step_index: i32, pending: usize },
 
-    #[error("permission '{permission}' is required to confirm this action")]
-    PermissionDenied { permission: String },
+    #[error("permission '{permission}' is required to {decision} pending action '{public_id}'")]
+    PermissionDenied {
+        public_id: String,
+        permission: String,
+        decision: &'static str,
+    },
 
     #[error("write action feature is not available (write caller not yet wired)")]
     Unavailable,
@@ -104,6 +108,43 @@ fn ensure_expected_status(
     Err(PendingActionError::InvalidState {
         public_id: public_id.to_string(),
         status: action.status.clone(),
+    })
+}
+
+/// Whether a reject must re-check the caller's authority over the action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RejectAuthority {
+    Check,
+    AlreadyChecked,
+}
+
+/// Rejecting a proposal decides its fate just as confirming does, so it takes
+/// the same authority: the permission the operation itself requires. Without
+/// this, a credential that could never approve an action, such as a read-only
+/// API key, could still discard one its owner meant to approve.
+///
+/// Unlike confirm, a reject executes nothing, so there is no router guard
+/// behind it to fall back on. An unknown permission therefore fails closed, as
+/// the inline approval prompt does, and an action that declares no permission
+/// requires `projects:write`, the gate the project-scoped reject route applies.
+fn ensure_reject_authority(
+    action: &ai_pending_actions::Model,
+    auth: &AuthContext,
+) -> Result<(), PendingActionError> {
+    let (required, name) = match action.required_permission.as_deref() {
+        Some(name) => (Permission::from_str(name), name.to_string()),
+        None => (
+            Some(Permission::ProjectsWrite),
+            Permission::ProjectsWrite.to_string(),
+        ),
+    };
+    if required.is_some_and(|permission| auth.has_permission(&permission)) {
+        return Ok(());
+    }
+    Err(PendingActionError::PermissionDenied {
+        public_id: action.public_id.clone(),
+        permission: name,
+        decision: "reject",
     })
 }
 
@@ -502,7 +543,9 @@ impl PendingActionService {
             if let Some(perm) = Permission::from_str(perm_str) {
                 if !auth.has_permission(&perm) {
                     return Err(PendingActionError::PermissionDenied {
+                        public_id: public_id.to_string(),
                         permission: perm_str.clone(),
+                        decision: "confirm",
                     });
                 }
             }
@@ -626,8 +669,15 @@ impl PendingActionService {
         auth: &AuthContext,
         rejected_by: Option<i32>,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
-        self.reject_with_status(project_id, public_id, auth, rejected_by, "proposed")
-            .await
+        self.reject_with_status(
+            project_id,
+            public_id,
+            auth,
+            rejected_by,
+            "proposed",
+            RejectAuthority::Check,
+        )
+        .await
     }
 
     pub async fn reject_inline(
@@ -643,6 +693,9 @@ impl PendingActionService {
             auth,
             rejected_by,
             "awaiting_inline_approval",
+            // The inline approval prompt already re-checked the operation's
+            // permission against this auth before handing over the decision.
+            RejectAuthority::AlreadyChecked,
         )
         .await
     }
@@ -654,6 +707,7 @@ impl PendingActionService {
         auth: &AuthContext,
         rejected_by: Option<i32>,
         expected_status: &str,
+        authority: RejectAuthority,
     ) -> Result<ai_pending_actions::Model, PendingActionError> {
         // Load first so we have the id and can return the updated row.
         let user_id = auth.user_id();
@@ -662,6 +716,10 @@ impl PendingActionService {
         // Name the real reason before attempting the claim: an inline approval
         // or an already-resolved action is not a "concurrent confirm/reject".
         ensure_expected_status(&action, public_id, expected_status)?;
+
+        if authority == RejectAuthority::Check {
+            ensure_reject_authority(&action, auth)?;
+        }
 
         let now = Utc::now();
 
@@ -913,6 +971,8 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
@@ -921,7 +981,15 @@ mod tests {
     }
 
     fn make_auth() -> AuthContext {
-        let user = temps_entities::users::Model {
+        AuthContext::new_session(test_user(), temps_auth::permissions::Role::Admin)
+    }
+
+    fn api_key_with_role(role: temps_auth::permissions::Role) -> AuthContext {
+        AuthContext::new_api_key(test_user(), Some(role), None, "test-key".to_string(), 1)
+    }
+
+    fn test_user() -> temps_entities::users::Model {
+        temps_entities::users::Model {
             id: 1,
             name: "t".to_string(),
             email: "t@t.com".to_string(),
@@ -940,8 +1008,7 @@ mod tests {
             oidc_provider_id: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
-        };
-        AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+        }
     }
 
     fn noop_write_handle() -> Arc<WriteApiToolsHandle> {
@@ -1341,6 +1408,108 @@ mod tests {
         assert!(result.is_ok(), "reject should succeed: {:?}", result.err());
         let m = result.unwrap();
         assert_eq!(m.status, "rejected");
+    }
+
+    /// A proposal recording `permission` the way the write tools prepare it.
+    fn proposed_requiring(public_id: &str, permission: Option<&str>) -> ai_pending_actions::Model {
+        let mut action = make_proposed(1, public_id, 7);
+        action.required_permission = permission.map(str::to_string);
+        action
+    }
+
+    // A read-only key can't confirm a proposal, so it must not be able to
+    // discard one either. The check runs before the claim: nothing is written.
+    #[tokio::test]
+    async fn read_only_api_keys_cannot_reject_a_proposal() {
+        for role in [
+            temps_auth::permissions::Role::Reader,
+            temps_auth::permissions::Role::ApiReader,
+        ] {
+            for permission in [Some("deployments:create"), None] {
+                let db = MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![proposed_requiring("abc", permission)]])
+                    .into_connection();
+                let svc = make_svc(db);
+                let auth = api_key_with_role(role.clone());
+
+                let error = svc
+                    .reject(Some(7), "abc", &auth, Some(auth.user_id()))
+                    .await
+                    .expect_err("a read-only key must not reject a proposal");
+
+                let expected = permission.unwrap_or("projects:write");
+                assert!(
+                    matches!(
+                        &error,
+                        PendingActionError::PermissionDenied { public_id, permission, decision }
+                            if public_id == "abc" && permission == expected && *decision == "reject"
+                    ),
+                    "{role:?} / {permission:?}: {error:?}"
+                );
+            }
+        }
+    }
+
+    // Rejecting takes the operation's own permission, not a blanket project
+    // write: a role holding it may reject, a role without it may not.
+    #[tokio::test]
+    async fn reject_requires_the_permission_the_action_declares() {
+        let mut rejected = proposed_requiring("abc", Some("deployments:create"));
+        rejected.status = "rejected".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring(
+                "abc",
+                Some("deployments:create"),
+            )]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results(vec![vec![rejected]])
+            .into_connection();
+        let svc = make_svc(db);
+        let user = api_key_with_role(temps_auth::permissions::Role::User);
+        let result = svc
+            .reject(Some(7), "abc", &user, Some(user.user_id()))
+            .await
+            .expect("a user who could confirm the action may reject it");
+        assert_eq!(result.status, "rejected");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring("abc", Some("users:create"))]])
+            .into_connection();
+        let svc = make_svc(db);
+        let error = svc
+            .reject(Some(7), "abc", &user, Some(user.user_id()))
+            .await
+            .expect_err("a user who could not confirm the action may not reject it");
+        assert!(
+            matches!(&error, PendingActionError::PermissionDenied { permission, .. } if permission == "users:create"),
+            "{error:?}"
+        );
+    }
+
+    // There is no router guard behind a reject, so an unrecognised permission
+    // fails closed instead of passing like it does on confirm.
+    #[tokio::test]
+    async fn reject_fails_closed_on_an_unknown_permission() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![proposed_requiring(
+                "abc",
+                Some("not_a:permission"),
+            )]])
+            .into_connection();
+        let svc = make_svc(db);
+        let auth = make_auth();
+        let error = svc
+            .reject(Some(7), "abc", &auth, Some(auth.user_id()))
+            .await
+            .expect_err("an unknown permission cannot be satisfied");
+        assert!(
+            matches!(&error, PendingActionError::PermissionDenied { permission, .. } if permission == "not_a:permission"),
+            "{error:?}"
+        );
+        assert!(error.to_string().contains("reject pending action 'abc'"));
     }
 
     // reject on non-proposed → atomic update returns 0 rows → InvalidState.

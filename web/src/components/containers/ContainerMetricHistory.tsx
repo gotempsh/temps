@@ -5,7 +5,10 @@ import { containerMetricsGetHistoryOptions } from '@/api/client/@tanstack/react-
 import { MetricSparkline } from '@/components/charts/metric-sparkline'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { buildMetricHistorySeries } from './container-metric-history'
+import {
+  buildMetricHistorySeries,
+  hasMetricHistory,
+} from './container-metric-history'
 
 interface ContainerMetricHistoryProps {
   projectId: number
@@ -50,7 +53,7 @@ export function ContainerMetricHistory({
   })
 
   if (!enabled) return null
-  if (hideWithoutHistory && !data?.length) return null
+  if (hideWithoutHistory && !hasMetricHistory(data)) return null
 
   const values = buildMetricHistorySeries(data, currentValue)
   const latest = values[values.length - 1]

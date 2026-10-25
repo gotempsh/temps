@@ -394,6 +394,22 @@ pub enum SandboxError {
         #[source]
         source: temps_config::ConfigServiceError,
     },
+
+    /// The platform settings holding the sandbox limits could not be read, so
+    /// a create request cannot be checked against them. Fails closed rather
+    /// than creating a sandbox no limit was applied to. Mapped to 500.
+    #[error("Could not load the sandbox limit settings to check a create request from user {user_id}: {source}")]
+    LimitSettings {
+        user_id: i32,
+        #[source]
+        source: temps_config::ConfigServiceError,
+    },
+
+    /// The user already has as many sandboxes as the operator allows
+    /// (`agent_sandbox.max_sandboxes_per_user`). Destroying one frees a slot.
+    /// Mapped to 422.
+    #[error("User {user_id} already has {live} sandbox(es) and the limit is {limit}; destroy one to create another")]
+    UserSandboxLimitReached { user_id: i32, limit: u32, live: u64 },
 }
 
 /// How to get a sandbox whose VM is not running back, which depends on what

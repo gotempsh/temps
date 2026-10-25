@@ -163,7 +163,11 @@ async fn pool_can_change_before_first_allocation() {
         .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
         .await
         .unwrap();
-    assert_eq!(configured.compute_pool_cidr.to_string(), "10.240.0.0/16");
+    assert_eq!(
+        configured.config.compute_pool_cidr.to_string(),
+        "10.240.0.0/16"
+    );
+    assert!(configured.reassigned.is_empty());
 
     let node_id = insert_node(&fx.db, "node-custom", Some("10.0.0.1")).await;
     let allocation = allocator.allocate_for_node(node_id).await.unwrap();
@@ -171,7 +175,9 @@ async fn pool_can_change_before_first_allocation() {
 }
 
 #[tokio::test]
-async fn pool_change_is_rejected_after_worker_allocation() {
+async fn pool_change_is_refused_while_a_node_has_not_reported_its_overlay() {
+    // An agent older than ADR 056 never reports overlay status: nothing
+    // proves it has not applied its allocation, so the pool stays locked.
     let Some(fx) = fixture().await else { return };
     let allocator = PostgresAllocator::new(fx.db.clone());
     let node_id = insert_node(&fx.db, "node-fixed", Some("10.0.0.1")).await;
@@ -181,13 +187,14 @@ async fn pool_change_is_rejected_after_worker_allocation() {
         .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        AllocatorError::PoolChangeAfterAllocation {
-            allocation_count: 1,
-            ..
+    match &error {
+        AllocatorError::PoolInUse { users, .. } => {
+            assert_eq!(users.len(), 1, "{users:?}");
+            assert!(users[0].contains("node-fixed"), "{users:?}");
+            assert!(users[0].contains("has not reported"), "{users:?}");
         }
-    ));
+        other => panic!("expected PoolInUse, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -198,9 +205,9 @@ async fn allocate_assigns_lowest_free_cidr() {
     let id = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
     let result = alloc.allocate_for_node(id).await.unwrap();
 
-    // Default pool 172.20.0.0/16 with /24 subnets → first free is .0.0/24.
-    assert_eq!(result.compute_cidr.to_string(), "172.20.0.0/24");
-    assert_eq!(result.bridge_address.to_string(), "172.20.0.1");
+    // Default pool 10.202.0.0/16 (ADR 056) with /24 subnets → first free is .0.0/24.
+    assert_eq!(result.compute_cidr.to_string(), "10.202.0.0/24");
+    assert_eq!(result.bridge_address.to_string(), "10.202.0.1");
     assert_eq!(result.underlay_address.to_string(), "10.0.0.1");
     assert_eq!(result.node_id, id);
 
@@ -210,7 +217,7 @@ async fn allocate_assigns_lowest_free_cidr() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(row.compute_cidr.as_deref(), Some("172.20.0.0/24"));
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.0.0/24"));
 }
 
 #[tokio::test]
@@ -224,8 +231,8 @@ async fn second_allocation_picks_next_subnet() {
     let r1 = alloc.allocate_for_node(a).await.unwrap();
     let r2 = alloc.allocate_for_node(b).await.unwrap();
 
-    assert_eq!(r1.compute_cidr.to_string(), "172.20.0.0/24");
-    assert_eq!(r2.compute_cidr.to_string(), "172.20.1.0/24");
+    assert_eq!(r1.compute_cidr.to_string(), "10.202.0.0/24");
+    assert_eq!(r2.compute_cidr.to_string(), "10.202.1.0/24");
 }
 
 #[tokio::test]
@@ -270,12 +277,12 @@ async fn control_plane_allocation_is_stable_and_visible_to_workers() {
         .await
         .unwrap();
     let control_plane = reservation.alloc.clone();
-    assert_eq!(control_plane.compute_cidr.to_string(), "172.20.255.0/24");
-    assert_eq!(control_plane.bridge_address.to_string(), "172.20.255.1");
+    assert_eq!(control_plane.compute_cidr.to_string(), "10.202.255.0/24");
+    assert_eq!(control_plane.bridge_address.to_string(), "10.202.255.1");
 
     let worker_id = insert_node(&fx.db, "node-a", Some("10.200.4.2")).await;
     let worker = allocator.allocate_for_node(worker_id).await.unwrap();
-    assert_eq!(worker.compute_cidr.to_string(), "172.20.0.0/24");
+    assert_eq!(worker.compute_cidr.to_string(), "10.202.0.0/24");
 
     let peers = allocator.peer_list(worker_id).await.unwrap();
     assert!(
@@ -307,7 +314,7 @@ async fn control_plane_allocation_is_stable_and_visible_to_workers() {
         .unwrap();
     assert_eq!(
         persisted.control_plane_compute_cidr.as_deref(),
-        Some("172.20.255.0/24")
+        Some("10.202.255.0/24")
     );
     assert_eq!(
         persisted.control_plane_underlay_address.as_deref(),
@@ -376,13 +383,10 @@ async fn pool_change_is_rejected_while_control_plane_setup_is_in_flight() {
         .configure_pool(replacement_pool, 24)
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        AllocatorError::PoolChangeAfterAllocation {
-            allocation_count: 1,
-            ..
-        }
-    ));
+    assert!(
+        matches!(error, AllocatorError::ControlPlaneSetupInFlight { .. }),
+        "{error:?}"
+    );
     allocator
         .set_control_plane_ready_for(&stale, true)
         .await
@@ -394,7 +398,7 @@ async fn pool_change_is_rejected_while_control_plane_setup_is_in_flight() {
         .unwrap()
         .unwrap();
     assert!(persisted.control_plane_overlay_ready);
-    assert_eq!(persisted.compute_pool_cidr, "172.20.0.0/16");
+    assert_eq!(persisted.compute_pool_cidr, "10.202.0.0/16");
     assert_eq!(
         persisted.control_plane_setup_generation,
         stale.setup_generation
@@ -416,7 +420,7 @@ async fn failed_unready_setup_can_release_reservation_and_choose_corrected_pool(
         .unwrap();
     let corrected_pool: Ipv4Net = "10.240.0.0/16".parse().unwrap();
     let corrected = allocator.configure_pool(corrected_pool, 24).await.unwrap();
-    assert_eq!(corrected.compute_pool_cidr, corrected_pool);
+    assert_eq!(corrected.config.compute_pool_cidr, corrected_pool);
 
     let persisted = network_config::Entity::find_by_id(1)
         .one(fx.db.as_ref())
@@ -487,7 +491,7 @@ async fn allocate_twice_returns_already_allocated() {
     let err = alloc.allocate_for_node(id).await.unwrap_err();
     assert!(
         matches!(err, AllocatorError::AlreadyAllocated { node_id, existing }
-            if node_id == id && existing == Ipv4Net::from_str("172.20.0.0/24").unwrap()),
+            if node_id == id && existing == Ipv4Net::from_str("10.202.0.0/24").unwrap()),
         "got {:?}",
         err
     );
@@ -530,7 +534,7 @@ async fn release_clears_compute_cidr() {
 
     // Reallocation after release must succeed and pick the same low slot.
     let r = alloc.allocate_for_node(id).await.unwrap();
-    assert_eq!(r.compute_cidr.to_string(), "172.20.0.0/24");
+    assert_eq!(r.compute_cidr.to_string(), "10.202.0.0/24");
 }
 
 #[tokio::test]
@@ -567,10 +571,10 @@ async fn peer_list_excludes_viewer_and_unallocated() {
         .iter()
         .map(|p| p.compute_cidr.to_string())
         .collect();
-    assert!(cidrs.contains(&"172.20.1.0/24".to_string()));
-    assert!(cidrs.contains(&"172.20.2.0/24".to_string()));
+    assert!(cidrs.contains(&"10.202.1.0/24".to_string()));
+    assert!(cidrs.contains(&"10.202.2.0/24".to_string()));
     assert!(
-        !cidrs.contains(&"172.20.0.0/24".to_string()),
+        !cidrs.contains(&"10.202.0.0/24".to_string()),
         "viewer's own cidr must be excluded"
     );
 }
@@ -585,8 +589,8 @@ async fn get_alloc_returns_none_when_unallocated() {
 
     alloc.allocate_for_node(id).await.unwrap();
     let got = alloc.get_alloc(id).await.unwrap().unwrap();
-    assert_eq!(got.compute_cidr.to_string(), "172.20.0.0/24");
-    assert_eq!(got.bridge_address.to_string(), "172.20.0.1");
+    assert_eq!(got.compute_cidr.to_string(), "10.202.0.0/24");
+    assert_eq!(got.bridge_address.to_string(), "10.202.0.1");
 }
 
 #[tokio::test]
@@ -652,19 +656,19 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     // Nodes that joined with public addresses: no private underlay yet.
     let node_a = insert_node(&db, "node-a", Some("203.0.113.10")).await;
     let node_b = insert_node(&db, "node-b", Some("198.51.100.20")).await;
-    let endpoint_a = "203.0.113.10:51820".parse().unwrap();
-    let endpoint_b = "198.51.100.20:51820".parse().unwrap();
+    let endpoint_a: std::net::SocketAddr = "203.0.113.10:51820".parse().unwrap();
+    let endpoint_b: std::net::SocketAddr = "198.51.100.20:51820".parse().unwrap();
 
     // Off by default: registration is refused and nobody gets mesh peers.
     assert_eq!(mesh::load_settings(&db).await.unwrap(), None);
     assert_eq!(
-        mesh::register_node(&db, node_a, &mesh_key(1), endpoint_a).await,
+        mesh::register_node(&db, node_a, &mesh_key(1), Some(endpoint_a)).await,
         Err(MeshError::Disabled)
     );
 
     // A pool overlapping the compute pool is refused.
     assert!(matches!(
-        mesh::enable(&db, Some("172.20.0.0/24"), None, None).await,
+        mesh::enable(&db, Some("10.202.0.0/24"), None, None).await,
         Err(MeshError::OverlapsComputePool { .. })
     ));
     let settings = mesh::enable(&db, Some("10.201.0.0/24"), Some(51820), None)
@@ -672,10 +676,10 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
         .unwrap();
     assert_eq!(settings.control_plane_address().to_string(), "10.201.0.1");
 
-    let a = mesh::register_node(&db, node_a, &mesh_key(1), endpoint_a)
+    let a = mesh::register_node(&db, node_a, &mesh_key(1), Some(endpoint_a))
         .await
         .unwrap();
-    let b = mesh::register_node(&db, node_b, &mesh_key(2), endpoint_b)
+    let b = mesh::register_node(&db, node_b, &mesh_key(2), Some(endpoint_b))
         .await
         .unwrap();
     assert_eq!(a.address.to_string(), "10.201.0.2");
@@ -683,7 +687,7 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     assert_eq!((a.prefix_len, a.listen_port), (24, 51820));
 
     // Re-registering (agent restart, new endpoint) keeps the address.
-    let moved = "203.0.113.99:51820".parse().unwrap();
+    let moved = Some("203.0.113.99:51820".parse().unwrap());
     let again = mesh::register_node(&db, node_a, &mesh_key(1), moved)
         .await
         .unwrap();
@@ -691,11 +695,11 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
 
     // Another node cannot claim a key already in the mesh.
     assert_eq!(
-        mesh::register_node(&db, node_b, &mesh_key(1), endpoint_b).await,
+        mesh::register_node(&db, node_b, &mesh_key(1), Some(endpoint_b)).await,
         Err(MeshError::PublicKeyInUse)
     );
     assert_eq!(
-        mesh::register_node(&db, node_b, "not-a-key", endpoint_b).await,
+        mesh::register_node(&db, node_b, "not-a-key", Some(endpoint_b)).await,
         Err(MeshError::InvalidPublicKey)
     );
 
@@ -713,7 +717,7 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
     // The pool and port are frozen once nodes hold addresses; re-running
     // with the same settings is fine.
     assert!(matches!(
-        mesh::enable(&db, Some("10.202.0.0/24"), None, None).await,
+        mesh::enable(&db, Some("10.203.0.0/24"), None, None).await,
         Err(MeshError::InUse {
             setting: "pool",
             ..
@@ -760,7 +764,7 @@ async fn mesh_registration_assigns_stable_addresses_and_switches_the_underlay() 
 
     // The control plane's key cannot be registered by a node either.
     assert_eq!(
-        mesh::register_node(&db, node_b, &cp_key, endpoint_b).await,
+        mesh::register_node(&db, node_b, &cp_key, Some(endpoint_b)).await,
         Err(MeshError::PublicKeyInUse)
     );
 
@@ -844,7 +848,7 @@ async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
         &db,
         other,
         &mesh_key(3),
-        "203.0.113.5:51820".parse().unwrap(),
+        Some("203.0.113.5:51820".parse().unwrap()),
     )
     .await
     .unwrap();
@@ -924,7 +928,7 @@ async fn a_pairing_reserves_an_address_and_hands_it_to_the_node_it_enrolls() {
         &db,
         node_a,
         &mesh_key(1),
-        "198.51.100.7:51820".parse().unwrap(),
+        Some("198.51.100.7:51820".parse().unwrap()),
     )
     .await
     .unwrap();
@@ -1108,7 +1112,7 @@ async fn mesh_links_keep_byte_order_under_a_locale_collation() {
             &db,
             node,
             &mesh_key(seed),
-            format!("{ip}:51820").parse().unwrap(),
+            Some(format!("{ip}:51820").parse().unwrap()),
         )
         .await
         .unwrap();
@@ -1145,12 +1149,22 @@ async fn a_hub_carries_pairs_that_never_connected_until_it_is_removed() {
     let a = insert_node(&db, "node-a", Some("203.0.113.10")).await;
     let b = insert_node(&db, "node-b", Some("198.51.100.20")).await;
     let off_mesh = insert_node(&db, "node-off", Some("198.51.100.30")).await;
-    let reg_a = mesh::register_node(&db, a, &mesh_key(1), "203.0.113.10:51820".parse().unwrap())
-        .await
-        .unwrap();
-    let reg_b = mesh::register_node(&db, b, &mesh_key(2), "198.51.100.20:51820".parse().unwrap())
-        .await
-        .unwrap();
+    let reg_a = mesh::register_node(
+        &db,
+        a,
+        &mesh_key(1),
+        Some("203.0.113.10:51820".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    let reg_b = mesh::register_node(
+        &db,
+        b,
+        &mesh_key(2),
+        Some("198.51.100.20:51820".parse().unwrap()),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         mesh_links::set_hub(&db, Some(Hub::Node(9999))).await,
@@ -1389,7 +1403,7 @@ async fn pairings_refuse_taken_keys_and_link_atomically() {
             &db,
             other,
             &mesh_key(5),
-            "203.0.113.5:51820".parse().unwrap()
+            Some("203.0.113.5:51820".parse().unwrap())
         )
         .await,
         Err(MeshError::PublicKeyInUse)
@@ -1513,10 +1527,10 @@ async fn enabling_the_mesh_refuses_a_pool_holding_a_registered_node_address() {
     );
 
     // A pool clear of every node's addresses is fine.
-    let settings = mesh::enable(&db, Some("10.202.0.0/24"), None, None)
+    let settings = mesh::enable(&db, Some("10.203.0.0/24"), None, None)
         .await
         .unwrap();
-    assert_eq!(settings.cidr.to_string(), "10.202.0.0/24");
+    assert_eq!(settings.cidr.to_string(), "10.203.0.0/24");
 }
 
 /// A pending pairing holds an address of the current pool and its code
@@ -1598,7 +1612,7 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
         return;
     };
     certificate_history_ca(&f.db).await;
-    mesh::reserve_certificate_addresses(&f.db, "test-ca", &["10.202.0.1".into()])
+    mesh::reserve_certificate_addresses(&f.db, "test-ca", &["10.203.0.1".into()], None)
         .await
         .unwrap();
     let node_id = insert_node(&f.db, "historical-worker", None).await;
@@ -1606,7 +1620,7 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
         .exec(f.db.as_ref())
         .await
         .unwrap();
-    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+    let error = mesh::enable(&f.db, Some("10.203.0.0/24"), None, None)
         .await
         .unwrap_err();
     assert!(
@@ -1629,7 +1643,7 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
         .await
         .unwrap();
     mesh::enable(&f.db, None, None, None).await.unwrap();
-    let error = mesh::enable(&f.db, Some("10.202.0.0/24"), None, None)
+    let error = mesh::enable(&f.db, Some("10.203.0.0/24"), None, None)
         .await
         .unwrap_err();
     assert!(
@@ -1647,13 +1661,621 @@ async fn certificate_reservation_and_pool_changes_are_serialized() {
         return;
     };
     certificate_history_ca(&f.db).await;
-    let identities = ["10.202.0.1".into()];
+    let identities = ["10.203.0.1".into()];
     let (issued, enabled) = tokio::join!(
-        mesh::reserve_certificate_addresses(&f.db, "test-ca", &identities),
-        mesh::enable(&f.db, Some("10.202.0.0/24"), None, None),
+        mesh::reserve_certificate_addresses(&f.db, "test-ca", &identities, None),
+        mesh::enable(&f.db, Some("10.203.0.0/24"), None, None),
     );
     assert!(
         issued.is_ok() ^ enabled.is_ok(),
         "issued={issued:?}, enabled={enabled:?}"
+    );
+}
+
+/// ADR 055: a worker that joins outbound only hands its key over HTTPS. Its
+/// pairing starts with the key and no endpoint, is never dialed, is peered
+/// with no endpoint, and links a node that has none either; the node's own
+/// mesh address is the one pool address its registration may claim.
+#[tokio::test]
+async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_endpoint() {
+    use std::net::Ipv4Addr;
+    use temps_network::{
+        mesh::{self, MeshError, MeshIdentityHolder, OwnMeshAddress},
+        pairing::{self, NewOutboundPairing},
+    };
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    let token_a = enrollment_token("outbound-a")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let token_b = enrollment_token("outbound-b")
+        .insert(db.as_ref())
+        .await
+        .unwrap()
+        .id;
+    let outbound = |name: &str, token: i32, key: String| NewOutboundPairing {
+        pairing_id: format!("id-{name}"),
+        name: name.to_string(),
+        public_key: key,
+        secret_encrypted: "encrypted".into(),
+        enrollment_token_id: token,
+        expires_at: chrono::Utc::now() + chrono::Duration::minutes(30),
+        created_by_user_id: None,
+    };
+
+    assert!(matches!(
+        pairing::create_outbound(&db, outbound("outbound-a", token_a, mesh_key(1))).await,
+        Err(MeshError::Disabled)
+    ));
+    mesh::enable(&db, Some("10.204.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        Some("203.0.113.1:51820".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        pairing::create_outbound(&db, outbound("outbound-a", token_a, "not-a-key".into())).await,
+        Err(MeshError::InvalidPublicKey)
+    ));
+    assert!(matches!(
+        pairing::create_outbound(&db, outbound("outbound-a", token_a, mesh_key(90))).await,
+        Err(MeshError::PublicKeyInUse)
+    ));
+
+    let a = pairing::create_outbound(&db, outbound("outbound-a", token_a, mesh_key(1)))
+        .await
+        .unwrap();
+    assert_eq!(a.status, pairing::STATUS_KEY_RECEIVED);
+    assert_eq!(a.node_endpoint, None);
+    assert_eq!(a.public_key.as_deref(), Some(mesh_key(1).as_str()));
+    assert_eq!(a.mesh_address, "10.204.0.2");
+    assert!(a.key_received_at.is_some());
+    assert!(
+        pairing::due(&db).await.unwrap().is_empty(),
+        "the initiator never dials an outbound pairing"
+    );
+    // A key a pending pairing holds is in use for the next one.
+    assert!(matches!(
+        pairing::create_outbound(&db, outbound("outbound-b", token_b, mesh_key(1))).await,
+        Err(MeshError::PublicKeyInUse)
+    ));
+
+    // The control plane peers it with no endpoint; WireGuard roams.
+    let for_cp = mesh::peers(&db, None).await.unwrap();
+    let peer = for_cp
+        .iter()
+        .find(|peer| peer.name == "pairing:outbound-a")
+        .expect("the outbound pairing is peered");
+    assert_eq!(peer.peer.endpoint, None);
+    assert_eq!(peer.peer.address, Ipv4Addr::new(10, 204, 0, 2));
+
+    // Its own reserved address is the one pool address it may claim.
+    let own = OwnMeshAddress {
+        pairing_id: a.id,
+        address: Ipv4Addr::new(10, 204, 0, 2),
+    };
+    let claim = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2"]), None).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::Pool { .. })
+    ));
+    assert_eq!(
+        mesh::mesh_identity_claimed(
+            &db,
+            &claim(&["10.204.0.2", "https://10.204.0.2:3100"]),
+            Some(own)
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    // Another pairing's exemption does not cover this pairing's address.
+    let foreign = OwnMeshAddress {
+        pairing_id: a.id + 1000,
+        ..own
+    };
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2"]), Some(foreign)).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::Pairing { .. })
+    ));
+    // Any other pool address, and the control plane's, stay refused.
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2", "10.204.0.9"]), Some(own)).await.unwrap(),
+        Some(claim) if claim.claimed == "10.204.0.9"
+    ));
+    let control_plane = OwnMeshAddress {
+        pairing_id: a.id,
+        address: Ipv4Addr::new(10, 204, 0, 1),
+    };
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.1"]), Some(control_plane)).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::ControlPlane { .. })
+    ));
+
+    // The node registers under its mesh address and is linked with no
+    // endpoint.
+    let node = insert_node(&db, "outbound-a", None).await;
+    db.execute_unprepared(&format!(
+        "UPDATE nodes SET private_address = '10.204.0.2', address = 'https://10.204.0.2:3100' WHERE id = {node}"
+    ))
+    .await
+    .unwrap();
+    pairing::link_node(&db, token_a, node)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        pairing::get(&db, a.id).await.unwrap().unwrap().status,
+        pairing::STATUS_COMPLETED
+    );
+    let row = nodes::Entity::find_by_id(node)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.mesh_wg_endpoint, None);
+    assert_eq!(row.mesh_wg_address.as_deref(), Some("10.204.0.2"));
+    assert_eq!(row.underlay_address.as_deref(), Some("10.204.0.2"));
+    // A node holding the address is never exempt.
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2"]), Some(own)).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::Node { .. })
+    ));
+
+    // The agent re-registering with no endpoint changes nothing.
+    let again = mesh::register_node(&db, node, &mesh_key(1), None)
+        .await
+        .unwrap();
+    assert_eq!(again.address, Ipv4Addr::new(10, 204, 0, 2));
+    // Its private address inside the pool is its own, so reapplying the
+    // mesh settings still works.
+    mesh::enable(&db, None, None, Some(8443)).await.unwrap();
+
+    // An address a leaf of the current CA names is never handed out again.
+    certificate_history_ca(&db).await;
+    assert!(
+        mesh::reserve_certificate_addresses(&db, "test-ca", &claim(&["10.204.0.3"]), None)
+            .await
+            .is_err(),
+        "pool addresses are refused without the exemption"
+    );
+    mesh::reserve_certificate_addresses(
+        &db,
+        "test-ca",
+        &claim(&["10.204.0.3"]),
+        Some(OwnMeshAddress {
+            pairing_id: 0,
+            address: Ipv4Addr::new(10, 204, 0, 3),
+        }),
+    )
+    .await
+    .unwrap();
+    let b = pairing::create_outbound(&db, outbound("outbound-b", token_b, mesh_key(2)))
+        .await
+        .unwrap();
+    assert_eq!(b.mesh_address, "10.204.0.4");
+}
+
+/// ADR 055: a node can register its mesh key with no endpoint, and an
+/// endpoint it had is cleared when it stops publishing one.
+#[tokio::test]
+async fn a_node_registers_on_the_mesh_without_an_endpoint() {
+    use temps_network::mesh;
+
+    let Some(fx) = fixture().await else { return };
+    let db = fx.db.clone();
+    mesh::enable(&db, Some("10.205.0.0/24"), Some(51820), None)
+        .await
+        .unwrap();
+    mesh::publish_control_plane(
+        &db,
+        &mesh_key(90),
+        Some("203.0.113.1:51820".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    let node = insert_node(&db, "endpointless", None).await;
+    let reg = mesh::register_node(&db, node, &mesh_key(1), None)
+        .await
+        .unwrap();
+    assert_eq!(reg.address.to_string(), "10.205.0.2");
+    let endpoint_of = |db: Arc<DatabaseConnection>| async move {
+        nodes::Entity::find_by_id(node)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .mesh_wg_endpoint
+    };
+    assert_eq!(endpoint_of(db.clone()).await, None);
+    mesh::register_node(
+        &db,
+        node,
+        &mesh_key(1),
+        Some("198.51.100.9:51820".parse().unwrap()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        endpoint_of(db.clone()).await.as_deref(),
+        Some("198.51.100.9:51820")
+    );
+    let again = mesh::register_node(&db, node, &mesh_key(1), None)
+        .await
+        .unwrap();
+    assert_eq!(again.address, reg.address);
+    assert_eq!(endpoint_of(db.clone()).await, None);
+    let peers = mesh::peers(&db, None).await.unwrap();
+    let me = peers.iter().find(|p| p.name == "endpointless").unwrap();
+    assert_eq!(me.peer.endpoint, None);
+}
+
+// ---------------------------------------------------------------------------
+// ADR 056: occupied ranges, auto-remediation, changing the pool
+// ---------------------------------------------------------------------------
+
+async fn set_node(db: &DatabaseConnection, id: i32, sql_set: &str) {
+    db.execute_unprepared(&format!("UPDATE nodes SET {sql_set} WHERE id = {id}"))
+        .await
+        .expect("update node");
+}
+
+fn occupied_json(ranges: &[(&str, &str)]) -> String {
+    let ranges: Vec<serde_json::Value> = ranges
+        .iter()
+        .map(|(cidr, name)| serde_json::json!({"cidr": cidr, "source": "docker", "name": name}))
+        .collect();
+    serde_json::Value::Array(ranges).to_string()
+}
+
+#[tokio::test]
+async fn allocation_avoids_every_members_occupied_ranges() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    let b = insert_node(&fx.db, "node-b", Some("10.0.0.2")).await;
+    // Node A runs a Compose project on 10.202.0.0/24; node B's own Docker
+    // pool covers 10.202.1.0/24. A new allocation for either skips both.
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}'",
+            occupied_json(&[("10.202.0.0/24", "shop_default")])
+        ),
+    )
+    .await;
+    set_node(
+        &fx.db,
+        b,
+        &format!(
+            "occupied_ranges = '{}'",
+            occupied_json(&[("10.202.1.0/24", "blog_default")])
+        ),
+    )
+    .await;
+    let first = allocator.allocate_for_node(a).await.unwrap();
+    assert_eq!(first.compute_cidr.to_string(), "10.202.2.0/24");
+    let second = allocator.allocate_for_node(b).await.unwrap();
+    assert_eq!(second.compute_cidr.to_string(), "10.202.3.0/24");
+}
+
+#[tokio::test]
+async fn an_unapplied_colliding_allocation_is_moved_automatically() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    let before = allocator.allocate_for_node(a).await.unwrap();
+    assert_eq!(before.compute_cidr.to_string(), "10.202.0.0/24");
+
+    // The agent then reports a Docker network over its allocation.
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}', overlay_status = 'unavailable'",
+            occupied_json(&[("10.202.0.0/16", "br-f6051ccc7abf")])
+        ),
+    )
+    .await;
+    // Nothing in the pool is clear of a /16 covering it: left alone.
+    assert_eq!(
+        allocator.remediate_unapplied_collision(a).await.unwrap(),
+        None
+    );
+
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}'",
+            occupied_json(&[("10.202.0.0/23", "shop_default")])
+        ),
+    )
+    .await;
+    let moved = allocator
+        .remediate_unapplied_collision(a)
+        .await
+        .unwrap()
+        .expect("collision is remediated");
+    assert_eq!(moved.from, "10.202.0.0/24");
+    assert_eq!(moved.to.to_string(), "10.202.2.0/24");
+    let row = nodes::Entity::find_by_id(a)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.2.0/24"));
+    let note = row.overlay_remediation.expect("remediation is recorded");
+    assert!(
+        note.contains("10.202.0.0/24") && note.contains("shop_default"),
+        "{note}"
+    );
+    // Idempotent: nothing collides any more.
+    assert_eq!(
+        allocator.remediate_unapplied_collision(a).await.unwrap(),
+        None
+    );
+}
+
+/// A service member on `node_id` that holds an overlay address.
+async fn insert_overlay_member(db: &DatabaseConnection, node_id: i32, compute_ip: &str) {
+    db.execute_unprepared(&format!(
+        "WITH svc AS ( \
+           INSERT INTO external_services (name, service_type, status, topology, created_at, updated_at) \
+           VALUES ('svc-{node_id}', 'postgres', 'running', 'standalone', now(), now()) RETURNING id) \
+         INSERT INTO service_members \
+           (service_id, node_id, role, container_name, status, ordinal, compute_ip, created_at, updated_at) \
+         SELECT id, {node_id}, 'primary', 'svc-{node_id}-0', 'running', 0, '{compute_ip}', now(), now() FROM svc"
+    ))
+    .await
+    .expect("insert service member");
+}
+
+#[tokio::test]
+async fn an_allocation_services_hold_addresses_in_is_not_moved_automatically() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    // Never reported ready, but a service already got an address in it.
+    insert_overlay_member(&fx.db, a, "10.202.0.5").await;
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}', overlay_status = 'unavailable'",
+            occupied_json(&[("10.202.0.0/23", "shop_default")])
+        ),
+    )
+    .await;
+    assert_eq!(
+        allocator.remediate_unapplied_collision(a).await.unwrap(),
+        None
+    );
+    let row = nodes::Entity::find_by_id(a)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.0.0/24"));
+}
+
+#[tokio::test]
+async fn a_pool_change_is_refused_while_services_hold_addresses() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    set_node(&fx.db, a, "overlay_status = 'unavailable'").await;
+    insert_overlay_member(&fx.db, a, "10.202.0.5").await;
+    let error = allocator
+        .configure_pool("10.210.0.0/16".parse().unwrap(), 24)
+        .await
+        .expect_err("services hold addresses in the allocation");
+    match error {
+        AllocatorError::PoolInUse { users, .. } => assert!(
+            users.iter().any(|user| user.contains("runs services")),
+            "{users:?}"
+        ),
+        other => panic!("expected PoolInUse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_applied_allocation_is_never_moved_automatically() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}', overlay_status = 'unavailable', \
+             overlay_ready_cidr = '10.202.0.0/24'",
+            occupied_json(&[("10.202.0.0/24", "shop_default")])
+        ),
+    )
+    .await;
+    assert_eq!(
+        allocator.remediate_unapplied_collision(a).await.unwrap(),
+        None
+    );
+    let row = nodes::Entity::find_by_id(a)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.0.0/24"));
+}
+
+#[tokio::test]
+async fn pool_change_reassigns_allocations_that_were_never_applied() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    let b = insert_node(&fx.db, "node-b", Some("10.0.0.2")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    allocator.allocate_for_node(b).await.unwrap();
+    // A reports a collision; B has applied a previous allocation, not this one.
+    set_node(&fx.db, a, "overlay_status = 'unavailable'").await;
+    set_node(
+        &fx.db,
+        b,
+        "overlay_status = 'ready', overlay_ready_cidr = '10.202.9.0/24'",
+    )
+    .await;
+
+    let change = allocator
+        .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap();
+    assert_eq!(change.config.compute_pool_cidr.to_string(), "10.240.0.0/16");
+    let moved: Vec<(i32, String)> = change
+        .reassigned
+        .iter()
+        .map(|r| (r.node_id, r.to.to_string()))
+        .collect();
+    assert_eq!(
+        moved,
+        [
+            (a, "10.240.0.0/24".to_owned()),
+            (b, "10.240.1.0/24".to_owned())
+        ]
+    );
+    let row = nodes::Entity::find_by_id(a)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.240.0.0/24"));
+    let cfg = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cfg.compute_pool_cidr, "10.240.0.0/16");
+}
+
+#[tokio::test]
+async fn pool_change_is_refused_while_a_node_runs_the_overlay_and_names_it() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    let b = insert_node(&fx.db, "node-b", Some("10.0.0.2")).await;
+    allocator.allocate_for_node(a).await.unwrap();
+    allocator.allocate_for_node(b).await.unwrap();
+    set_node(
+        &fx.db,
+        a,
+        "overlay_status = 'ready', overlay_ready_cidr = '10.202.0.0/24'",
+    )
+    .await;
+    set_node(&fx.db, b, "overlay_status = 'unavailable'").await;
+
+    let error = allocator
+        .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    match &error {
+        AllocatorError::PoolInUse { users, .. } => {
+            assert_eq!(users.len(), 1, "{users:?}");
+            assert!(users[0].contains("node-a") && users[0].contains("overlay up"));
+        }
+        other => panic!("expected PoolInUse, got {other:?}"),
+    }
+    assert!(error.to_string().contains("remove those nodes"), "{error}");
+    // Nothing moved.
+    let row = nodes::Entity::find_by_id(b)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.compute_cidr.as_deref(), Some("10.202.1.0/24"));
+}
+
+#[tokio::test]
+async fn pool_change_is_refused_when_the_control_plane_overlay_is_up() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let reservation = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    allocator
+        .set_control_plane_ready_for(&reservation, true)
+        .await
+        .unwrap();
+    let error = allocator
+        .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    match &error {
+        AllocatorError::PoolInUse { users, .. } => {
+            assert!(users[0].contains("control plane"), "{users:?}")
+        }
+        other => panic!("expected PoolInUse, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn pool_change_is_refused_over_the_mesh_pool_an_address_or_an_occupied_range() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
+    set_node(
+        &fx.db,
+        a,
+        &format!(
+            "occupied_ranges = '{}'",
+            occupied_json(&[("192.168.32.0/20", "br-compose")])
+        ),
+    )
+    .await;
+
+    let mesh = allocator
+        .configure_pool("10.201.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(mesh, AllocatorError::PoolOverlapsMesh { .. }),
+        "{mesh:?}"
+    );
+
+    let underlay = allocator
+        .configure_pool("10.0.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&underlay, AllocatorError::PoolOverlapsUnderlay { member, .. } if member.contains("node-a")),
+        "{underlay:?}"
+    );
+
+    let occupied = allocator
+        .configure_pool("192.168.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&occupied, AllocatorError::PoolOverlapsOccupied { member, range, .. }
+            if member.contains("node-a") && range.contains("br-compose")),
+        "{occupied:?}"
+    );
+    let cfg = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cfg.compute_pool_cidr,
+        temps_entities::network_config::DEFAULT_COMPUTE_POOL_CIDR
     );
 }

@@ -3,11 +3,11 @@
 
 use super::AuthState;
 use crate::audit::{
-    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
-    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaSetupStartedAudit,
-    MfaVerificationFailedAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit,
-    RoleRemovedAudit, StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit,
-    UserRestoredAudit, UserUpdatedAudit,
+    AdminMfaResetAudit, AdminPasswordResetAudit, ConcurrentSessionDetectedAudit,
+    EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit, MfaDisabledAudit,
+    MfaEnabledAudit, MfaSetupStartedAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
+    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
+    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -40,9 +40,9 @@ use utoipa::{OpenApi, ToSchema};
 use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
-    MfaSetupResponse, MfaVerificationRequest, ResetUserPasswordResponse, RouteRole, RouteUser,
-    RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest,
-    UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
+    MfaSetupResponse, MfaVerificationRequest, ResetUserMfaResponse, ResetUserPasswordResponse,
+    RouteRole, RouteUser, RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest,
+    UpdateSelfRequest, UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -886,6 +886,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}", patch(update_user))
         .route("/users/{user_id}/restore", post(restore_user))
         .route("/users/{user_id}/password", post(reset_user_password))
+        .route("/users/{user_id}/mfa", delete(reset_user_mfa))
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
@@ -1953,6 +1954,20 @@ impl From<UserServiceError> for Problem {
                         user_id
                     ))
             }
+            UserServiceError::MfaResetOnDeletedUser { user_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("User Deleted")
+                    .with_detail(format!(
+                        "User {} is deleted. Restore the user before resetting their MFA.",
+                        user_id
+                    ))
+            }
+            UserServiceError::MfaNotEnrolled { user_id } => problem_new(StatusCode::CONFLICT)
+                .with_title("MFA Not Enrolled")
+                .with_detail(format!(
+                    "User {} has no multi-factor authentication enrolled, so there is nothing to reset.",
+                    user_id
+                )),
         }
     }
 }
@@ -1968,13 +1983,14 @@ impl From<UserServiceError> for Problem {
         update_user,
         restore_user,
         reset_user_password,
+        reset_user_mfa,
         update_self,
         setup_mfa,
         verify_and_enable_mfa,
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, ResetUserMfaResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -2739,6 +2755,116 @@ async fn reset_user_password(
         }),
     )
         .into_response())
+}
+
+/// Remove another user's second factor (admin only).
+///
+/// The recovery path for a user who lost both their authenticator and their
+/// recovery codes: their TOTP secret, recovery codes and second-factor
+/// lockout state are deleted and every session they have is revoked, so they
+/// can sign in with their password alone and enroll again. Their password,
+/// roles and API keys are left alone.
+///
+/// Gated exactly like `POST /users/{user_id}/password`: `users:manage`, not
+/// on yourself (use `DELETE /users/me/mfa`, which takes a code), and a recent
+/// step-up for an MFA-enrolled administrator. When the instance has no other
+/// admin to ask, `temps reset-admin-password --clear-mfa` does the same
+/// offline.
+#[utoipa::path(
+    tag = "Users",
+    delete,
+    path = "/users/{user_id}/mfa",
+    responses(
+        (status = 200, description = "MFA removed and the user's sessions revoked", body = ResetUserMfaResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is deleted, or has no MFA enrolled"),
+        (status = 428, description = "Recent identity verification (step-up) required"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("user_id" = i32, Path, description = "User ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn reset_user_mfa(
+    State(app_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(user_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // `users:manage` gate (+ no self-target) lives in authorize_admin_target.
+    // Removing your own factor goes through DELETE /users/me/mfa, which
+    // requires a current code; without that, a stolen admin session could
+    // strip its own account's MFA.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied MFA reset by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ResetUserMfa { user_id },
+    )
+    .await?;
+
+    let cleared = app_state.user_service.admin_reset_mfa(user_id).await?;
+
+    info!(
+        "Admin {} removed the MFA of user {} ({} session(s) revoked)",
+        auth.user_id(),
+        user_id,
+        cleared.sessions_revoked
+    );
+
+    // Tell the caller when instance policy will refuse this user's password
+    // sign-in until they re-enroll, rather than letting them find out from a
+    // failed login. The reset itself has already committed, so a failed
+    // lookup is logged and reported as "not blocked" instead of failing it.
+    let password_sign_in_blocked = match app_state
+        .auth_service
+        .requires_mfa_enrollment(user_id)
+        .await
+    {
+        Ok(blocked) => blocked,
+        Err(error) => {
+            error!(
+                "Failed to evaluate require_mfa_for_admins for user {} after an MFA reset: {}",
+                user_id, error
+            );
+            false
+        }
+    };
+
+    let audit = AdminMfaResetAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        target_user_id: user_id,
+        username: cleared.user.name.clone(),
+        sessions_revoked: cleared.sessions_revoked,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(ResetUserMfaResponse {
+        mfa_enabled: cleared.user.mfa_enabled,
+        sessions_revoked: cleared.sessions_revoked,
+        password_sign_in_blocked,
+    })
+    .into_response())
 }
 
 /// Authorize a self-service MFA request (`/users/me/mfa/*`) and return the
@@ -4478,6 +4604,301 @@ mod tests {
                 .map(|n| format!("{n:06}"))
                 .find(|candidate| !valid.contains(candidate))
                 .unwrap()
+        }
+
+        /// Give `user_id` the admin role (seeding the role table if needed).
+        async fn make_admin(
+            state: &crate::state::AuthState,
+            db: &DatabaseConnection,
+            user_id: i32,
+        ) {
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            state.user_service.initialize_roles().await.unwrap();
+            let admin_role = temps_entities::roles::Entity::find()
+                .filter(
+                    temps_entities::roles::Column::Name
+                        .eq(temps_entities::types::RoleType::Admin.as_str()),
+                )
+                .one(db)
+                .await
+                .unwrap()
+                .expect("admin role seeded");
+            state
+                .user_service
+                .assign_role_to_user(user_id, admin_role.id)
+                .await
+                .unwrap();
+        }
+
+        async fn set_password(
+            db: &DatabaseConnection,
+            user: users::Model,
+            password: &str,
+        ) -> users::Model {
+            let hash = argon2::Argon2::default()
+                .hash_password(password.as_bytes())
+                .unwrap()
+                .to_string();
+            let mut update: users::ActiveModel = user.into();
+            update.password_hash = Set(Some(hash));
+            update.update(db).await.unwrap()
+        }
+
+        /// Turn MFA on for a user whose sessions were opened beforehand
+        /// (`session_cookie` refuses to mint one for an enrolled account).
+        async fn enable_mfa(db: &DatabaseConnection, user: users::Model) -> users::Model {
+            let mut update: users::ActiveModel = user.into();
+            update.mfa_enabled = Set(true);
+            update.update(db).await.unwrap()
+        }
+
+        async fn login(
+            app: &axum::Router,
+            email: &str,
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            send(
+                app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(serde_json::json!({ "email": email, "password": password })),
+            )
+            .await
+        }
+
+        /// Issue #1590: a user who lost both their authenticator and their
+        /// recovery codes had no way back in, because nothing let an admin
+        /// remove another account's second factor.
+        #[tokio::test]
+        async fn admin_mfa_reset_lets_a_user_who_lost_every_factor_sign_in_again() {
+            use sea_orm::EntityTrait;
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let admin =
+                insert_user(&db, &format!("admin-{}@example.com", uuid::Uuid::new_v4())).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+
+            let (target, _secret) = mfa_user(&db, false, &["482915", "730264"]).await;
+            let target = set_password(&db, target, "Recover-Me-2026!").await;
+            let target_session = session_cookie(&state, target.id).await;
+            let target = enable_mfa(&db, target).await;
+            // A lockout left over from guessing at the lost factor.
+            temps_entities::user_mfa_guards::ActiveModel {
+                user_id: Set(target.id),
+                last_totp_step: Set(Some(1)),
+                failed_attempts: Set(10),
+                locked_until: Set(Some(Utc::now() + chrono::Duration::hours(1))),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+            // Before: the password only leads to a code prompt the user
+            // cannot answer.
+            let (status, body) = login(&app, &target.email, "Recover-Me-2026!").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["mfa_required"], true, "{body}");
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", target.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "admin MFA reset: {body}");
+            assert_eq!(body["mfa_enabled"], false, "{body}");
+            assert_eq!(body["password_sign_in_blocked"], false, "{body}");
+            assert!(
+                body["sessions_revoked"].as_u64().unwrap() >= 2,
+                "the signed-in session and the pending sign-in challenge end: {body}"
+            );
+
+            let (status, _) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("cookie", &target_session)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a session from before the reset must be signed out"
+            );
+
+            let stored = users::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!stored.mfa_enabled);
+            assert!(stored.mfa_secret.is_none(), "the TOTP secret is removed");
+            assert!(
+                stored.mfa_recovery_codes.is_none(),
+                "recovery codes are removed"
+            );
+            assert!(
+                stored.password_hash.is_some() && !stored.must_change_password,
+                "the password is left alone"
+            );
+            let guard = temps_entities::user_mfa_guards::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap();
+            assert!(guard.is_none(), "the old factor's lockout state is dropped");
+
+            // After: the password alone signs the user in.
+            let (status, body) = login(&app, &target.email, "Recover-Me-2026!").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["success"], true, "{body}");
+            assert_eq!(body["mfa_required"], false, "{body}");
+
+            // The admin's own session is untouched.
+            let (status, body) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        #[tokio::test]
+        async fn admin_mfa_reset_refuses_the_wrong_caller_or_target() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let (plain_user, _) = mfa_user(&db, false, &[]).await;
+            state.user_service.initialize_roles().await.unwrap();
+            let user_cookie = session_cookie(&state, plain_user.id).await;
+            let (target, _) = mfa_user(&db, true, &[]).await;
+
+            let reset = |cookie: String, id: i32| {
+                let app = app.clone();
+                async move {
+                    send(
+                        &app,
+                        "DELETE",
+                        &format!("/users/{id}/mfa"),
+                        Some(("cookie", &cookie)),
+                        None,
+                    )
+                    .await
+                }
+            };
+
+            let (status, body) = reset(user_cookie.clone(), target.id).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a non-admin cannot: {body}");
+
+            let (status, body) = reset(admin_cookie.clone(), admin.id).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an admin cannot strip their own factor without a code: {body}"
+            );
+
+            let (status, body) = reset(admin_cookie.clone(), plain_user.id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "nothing enrolled: {body}");
+
+            let (status, body) = reset(admin_cookie.clone(), i32::MAX).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+            let mut deleted: users::ActiveModel = target.clone().into();
+            deleted.deleted_at = Set(Some(Utc::now()));
+            deleted.update(db.as_ref()).await.unwrap();
+            let (status, body) = reset(admin_cookie.clone(), target.id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "deleted user: {body}");
+        }
+
+        #[tokio::test]
+        async fn mfa_enrolled_admin_must_step_up_before_resetting_another_users_mfa() {
+            use sea_orm::EntityTrait;
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            enable_mfa(&db, admin).await;
+            let (target, _) = mfa_user(&db, true, &[]).await;
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", target.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "{body}");
+            let stored = users::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.mfa_enabled, "nothing changes without step-up");
+        }
+
+        #[tokio::test]
+        async fn admin_mfa_reset_reports_when_policy_blocks_password_sign_in() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            temps_entities::settings::ActiveModel {
+                id: Set(1),
+                data: Set(serde_json::json!({ "require_mfa_for_admins": true })),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let (other_admin, _) = mfa_user(&db, true, &[]).await;
+            make_admin(&state, &db, other_admin.id).await;
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", other_admin.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["password_sign_in_blocked"], true,
+                "require_mfa_for_admins refuses an unenrolled admin's password sign-in: {body}"
+            );
         }
 
         #[tokio::test]

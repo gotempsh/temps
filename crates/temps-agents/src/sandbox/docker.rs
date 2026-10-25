@@ -1930,6 +1930,9 @@ fn ensure_mutable_rebuild_target(image: &str) -> Result<(), AgentError> {
 
 /// Docker-based sandbox provider. Each agent run gets its own container with
 /// bind-mounted work directory, resource limits, and security hardening.
+/// PID limit applied when a create request does not set one.
+pub const DEFAULT_PIDS_LIMIT: i64 = 512;
+
 pub struct DockerSandboxProvider {
     docker: Arc<Docker>,
     config: DockerSandboxConfig,
@@ -5034,7 +5037,7 @@ impl SandboxProvider for DockerSandboxProvider {
                 "SETGID".to_string(),
             ]),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-            pids_limit: Some(config.pids_limit.unwrap_or(512)),
+            pids_limit: Some(config.pids_limit.unwrap_or(DEFAULT_PIDS_LIMIT)),
             init: Some(true),
             // Survive Docker daemon restarts (reboot, `systemctl restart docker`,
             // Mac sleep/wake). Without this the default is "no" and a daemon
@@ -6354,6 +6357,18 @@ impl SandboxProvider for DockerSandboxProvider {
 
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
         matches!(backend, super::SandboxBackend::Docker)
+    }
+
+    fn default_resource_limits(
+        &self,
+        _backend: Option<super::SandboxBackend>,
+    ) -> super::DefaultResourceLimits {
+        super::DefaultResourceLimits {
+            cpu_limit: Some(self.config.default_cpu_limit),
+            memory_limit_mb: Some(self.config.default_memory_limit_mb),
+            pids_limit: Some(DEFAULT_PIDS_LIMIT),
+            cpu_whole_cores: false,
+        }
     }
 
     fn name(&self) -> &str {

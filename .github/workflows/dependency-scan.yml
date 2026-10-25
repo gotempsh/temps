@@ -219,6 +219,16 @@ jobs:
       #   it serves are 1.0.10's, without the distrusted root. Drop this entry
       #   once sqlx moves to webpki-roots 1, and re-check it if the shim is
       #   ever locked against a 1.x older than 1.0.10.
+      # - RUSTSEC-2026-0387 (crypto-bigint: arithmetic meant to be
+      #   constant-time can branch on secret values; fixed in >= 0.7.6).
+      #   Cargo.lock has 0.7.6 for the copy that russh/rsa pulls in. The 0.5.5
+      #   copy is a direct dependency of aws-sigv4 (checked 2026-10-24, still
+      #   on 0.5 in aws-sigv4 1.6.0), and 0.5 has no patched release, so a
+      #   version bump cannot reach it. aws-sigv4 uses it only to derive the
+      #   ECDSA key for SigV4A (multi-region access points); the S3 requests
+      #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
+      #   which does not touch it. Drop this entry once aws-sigv4 moves to
+      #   crypto-bigint >= 0.7.6.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -234,7 +244,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381,RUSTSEC-2026-0387
 
   web-audit:
     name: Web Dependency Audit (bun audit)

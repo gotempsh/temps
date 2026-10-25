@@ -177,14 +177,18 @@ Requirements:
 
 There are two ways to join a worker, depending on which side can reach the other.
 
-**The worker reaches the control plane** (the control plane has a public URL). Join the worker with its **public** IP:
+**The worker reaches the control plane** (the control plane has a public URL and publishes a mesh endpoint workers can dial). Join the worker with no address at all, as root:
 
 ```bash
-temps join https://temps.example.com <join-token> --private-address <worker-public-ip>
-temps agent
+temps join https://temps.example.com <join-token>
+temps agent service install
 ```
 
-Behind NAT, or reachable on a different public IP? Start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
+Only the control plane's mesh port has to be open; the worker needs no public IP and opens no port, so it can sit behind NAT or a firewall that drops everything inbound. `temps join` sends the worker's WireGuard **public** key to the control plane over HTTPS with the join token, gets back its mesh address, brings the mesh up by dialing the control plane and registers over it, trusting only the cluster CA (pin it with `--ca-fingerprint <sha256>` to check it before anything is set up). The join takes one use of the token and holds a pairing for 30 minutes; a join that fails after that point says so and the pairing can be cancelled from **Settings → Worker Nodes** or with `bunx @temps-sdk/cli nodes pair cancel <id>`. It needs a control plane that supports outbound joins and the mesh turned on; otherwise the command says what is missing.
+
+Other workers reach a worker joined this way through the control plane. To let them connect to it directly, open UDP `51820` on it and start the agent with `temps agent --wg-endpoint <public-ip>:51820`.
+
+Joining with `--private-address <worker-public-ip>` still works as before: the worker registers under that address and must accept UDP `51820`.
 
 **The control plane reaches the worker** (the control plane has no address workers can reach). On **Settings → Worker Nodes → Over the internet → This server reaches the worker**, enter the worker's public IP, or run:
 
@@ -400,6 +404,18 @@ curl https://your-temps-instance/api/internal/nodes/1
 ```
 
 A node is considered **active** if it has sent a heartbeat within the last 90 seconds. Nodes that miss heartbeats are automatically marked **offline** and excluded from scheduling.
+
+### The cluster network {{ anchor: true, id: 'cluster-network' }}
+
+Containers on different nodes reach each other over a private address pool, the cluster's **compute pool**. Each node gets one `/24` of it. New clusters use `10.202.0.0/16`; clusters created by earlier releases keep the pool they have (often `172.20.0.0/16`).
+
+A node can already use part of that pool: a Docker network (Compose projects get networks from `172.17.0.0/12`), a VPN, or a cloud VPC route. The agent checks only the subnets the node actually routes (its own `/24` and its peers'), reports what the node already uses, and Temps hands out subnets around it. When a node's subnet collides anyway:
+
+- The node keeps running its deployments. Only cross-node container traffic (managed-service clusters across hosts, `*.temps.local` names) is unavailable on it, and managed-service members spanning hosts are not placed there.
+- **Settings > Worker Nodes** marks it **Cross-node network unavailable** with the colliding range, what owns it, and the fixes.
+- If the node never brought its overlay up on that subnet, Temps moves it to a free one automatically and says so on the node.
+
+To fix it yourself, either move the network on the node, or change the pool in the **Cluster network** card on the Worker Nodes page (or `temps network setup-multi-node --compute-pool-cidr <cidr>` on the control-plane host). The pool must be private address space, outside the WireGuard mesh pool and anything a node already uses. It can change only while no node runs the cross-node network on it; subnets handed out but never used move to the new pool.
 
 ---
 

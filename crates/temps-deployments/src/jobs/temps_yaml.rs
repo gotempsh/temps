@@ -128,6 +128,8 @@ pub(crate) mod test_support {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,

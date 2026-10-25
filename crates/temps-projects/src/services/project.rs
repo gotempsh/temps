@@ -1930,6 +1930,57 @@ impl ProjectService {
             project_found_db
         };
 
+        // Auto-install a GitHub repository webhook for non-App GitHub
+        // connections (best-effort, non-fatal). Without it a PAT/OAuth
+        // project never hears about a push (#1596).
+        let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
+            let repo_owner = project_found_db.repo_owner.clone();
+            let repo_name = project_found_db.repo_name.clone();
+            if !repo_owner.is_empty() && !repo_name.is_empty() {
+                match self
+                    .install_github_webhook_for_connection(
+                        project_found_db.id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some((hook_id, encrypted_secret))) => {
+                        let mut active = projects::ActiveModel::from(project_found_db.clone());
+                        active.github_webhook_id = Set(Some(hook_id));
+                        active.github_webhook_signing_token = Set(Some(encrypted_secret));
+                        active.updated_at = Set(chrono::Utc::now());
+                        match active.update(self.db.as_ref()).await {
+                            Ok(updated) => updated,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to persist GitHub webhook fields on new project {}: {}",
+                                    project_found_db.id,
+                                    e
+                                );
+                                project_found_db
+                            }
+                        }
+                    }
+                    Ok(None) => project_found_db,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to install GitHub webhook for new project {}: {}",
+                            project_found_db.id,
+                            e
+                        );
+                        project_found_db
+                    }
+                }
+            } else {
+                project_found_db
+            }
+        } else {
+            project_found_db
+        };
+
         // Auto-install Gitea webhook if applicable (best-effort, non-fatal).
         // BLOCKER 1 fix: gitea_webhook_signing_token was never written.
         let project_found_db = if let Some(conn_id) = project_found_db.git_provider_connection_id {
@@ -4007,6 +4058,7 @@ impl ProjectService {
         let old_repo_name = project.repo_name.clone();
         let old_gitlab_webhook_id = project.gitlab_webhook_id;
         let old_bitbucket_hook_id = project.bitbucket_webhook_hook_id.clone();
+        let old_github_webhook_id = project.github_webhook_id;
         // Gitea: no separate hook_id column — we clear gitea_webhook_signing_token
         // on repo change / disconnect. The orphaned remote hook on Gitea is
         // acceptable for v1 (no stored ID to call DELETE with).
@@ -4295,6 +4347,78 @@ impl ProjectService {
             // Explicit disconnect: clear Bitbucket webhook state.
             active_project.bitbucket_webhook_hook_id = Set(None);
             active_project.bitbucket_webhook_token = Set(None);
+        }
+
+        // ── GitHub repository webhook lifecycle ─────────────────────────────
+        //
+        // Mirrors the GitLab block above for non-App GitHub connections:
+        // delete the old repository hook when the repo changes and register
+        // one on the new repo (best-effort, non-fatal).
+        //
+        // Unlike `repo_changed`, this compares against the stored values: the
+        // console sends `git_provider_connection_id` with every Git settings
+        // save (branch, preset, directory), and replacing a working hook on
+        // each of those would rotate its secret and, if the new registration
+        // failed, silently stop push deploys over an unrelated edit.
+        let github_repo_changed = repository_target_changed(
+            (old_connection_id, &old_repo_owner, &old_repo_name),
+            (new_connection_id, &repo_owner, &repo_name),
+        );
+
+        if github_repo_changed {
+            if let (Some(old_hook_id), Some(old_conn_id)) =
+                (old_github_webhook_id, old_connection_id)
+            {
+                if let Err(e) = self
+                    .delete_github_webhook_for_connection(
+                        old_conn_id,
+                        &old_repo_owner,
+                        &old_repo_name,
+                        old_hook_id,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to remove old GitHub webhook {} for project {}: {}",
+                        old_hook_id, project_id, e
+                    );
+                }
+            }
+            // Clear stale hook fields unconditionally — even if delete failed
+            // (it may already be gone on GitHub's side).
+            active_project.github_webhook_id = Set(None);
+            active_project.github_webhook_signing_token = Set(None);
+
+            if let Some(conn_id) = new_connection_id {
+                match self
+                    .install_github_webhook_for_connection(
+                        project_id,
+                        conn_id,
+                        &repo_owner,
+                        &repo_name,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some((hook_id, encrypted_secret))) => {
+                        active_project.github_webhook_id = Set(Some(hook_id));
+                        active_project.github_webhook_signing_token = Set(Some(encrypted_secret));
+                    }
+                    Ok(None) => {
+                        // Not a non-App GitHub connection — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to install GitHub webhook for project {}: {}",
+                            project_id, e
+                        );
+                    }
+                }
+            }
+        } else if git_provider_connection_id == Some(0) {
+            // Explicit disconnect: clear GitHub webhook state.
+            active_project.github_webhook_id = Set(None);
+            active_project.github_webhook_signing_token = Set(None);
         }
 
         // ── Gitea webhook lifecycle ──────────────────────────────────────────
@@ -5091,6 +5215,255 @@ impl ProjectService {
         );
 
         Ok(encrypted_token)
+    }
+
+    // ── GitHub repository webhook install / delete ──────────────────────────────
+    //
+    // A GitHub App delivers every push through the App's own webhook. A GitHub
+    // connection authenticated any other way (personal access token, OAuth)
+    // has no App, so without a repository webhook nothing ever told Temps
+    // about a push and auto-deploy silently did nothing (#1596). For those
+    // connections we register a repository webhook signed with a fresh
+    // per-project secret, stored encrypted together with the hook ID so the
+    // hook can be deleted when the project's repository changes.
+    //
+    // Failures are non-fatal — same policy as GitLab/Gitea/Bitbucket.
+
+    /// Resolve `connection_id` to `(provider_id, access_token)` when it is a
+    /// GitHub connection that needs its own repository webhook, i.e. any
+    /// GitHub connection that is not a GitHub App. `Ok(None)` for App
+    /// connections and other providers (caller skips).
+    async fn resolve_github_repo_webhook_connection(
+        &self,
+        connection_id: i32,
+    ) -> Result<Option<(i32, String)>, String> {
+        use temps_entities::{git_provider_connections, git_providers};
+
+        let connection = git_provider_connections::Entity::find_by_id(connection_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching connection {connection_id}: {e}"))?
+            .ok_or_else(|| format!("Connection {connection_id} not found"))?;
+
+        let provider = git_providers::Entity::find_by_id(connection.provider_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| format!("DB error fetching provider {}: {e}", connection.provider_id))?
+            .ok_or_else(|| format!("Provider {} not found", connection.provider_id))?;
+
+        if !github_connection_needs_repo_webhook(&provider.provider_type, &provider.auth_method) {
+            return Ok(None);
+        }
+
+        let access_token = self
+            .git_provider_manager
+            .get_connection_token(connection_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get access token for GitHub connection {connection_id}: {e}")
+            })?;
+
+        Ok(Some((provider.id, access_token)))
+    }
+
+    /// Register a GitHub repository webhook for `project_id` when
+    /// `connection_id` is a non-App GitHub connection.
+    ///
+    /// With `existing_hook_id`, that hook is given the new secret in place and
+    /// keeps its ID; a new hook is registered only when it no longer exists on
+    /// GitHub. GitHub refuses a second hook with the same URL and events, so
+    /// replacing a hook by creating its successor first would always fail.
+    ///
+    /// Returns `Ok(Some((hook_id, encrypted_secret)))` on success, `Ok(None)`
+    /// when the connection does not need one, `Err` on failure (non-fatal —
+    /// the caller logs and continues).
+    async fn install_github_webhook_for_connection(
+        &self,
+        project_id: i32,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        existing_hook_id: Option<i64>,
+    ) -> Result<Option<(i64, String)>, String> {
+        use temps_git::services::git_provider::WebhookConfig;
+        use temps_git::services::github_provider::generate_github_webhook_secret;
+
+        let Some((provider_id, access_token)) = self
+            .resolve_github_repo_webhook_connection(connection_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        let secret = generate_github_webhook_secret()
+            .map_err(|error| format!("Failed to generate GitHub webhook secret: {error}"))?;
+
+        let config = WebhookConfig {
+            url: github_repo_webhook_url(&self.git_webhook_base_url().await, project_id),
+            secret: Some(secret.clone()),
+            events: vec!["push".to_string()],
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(provider_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get provider service for GitHub connection {connection_id}: {e}")
+            })?;
+
+        let updated_hook_id = match existing_hook_id {
+            Some(hook_id) => {
+                let updated = provider_service
+                    .update_webhook(
+                        &access_token,
+                        owner,
+                        repo,
+                        &hook_id.to_string(),
+                        config.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to update GitHub webhook {hook_id} for project {project_id} ({owner}/{repo}): {e}"
+                        )
+                    })?;
+                if !updated {
+                    info!(
+                        "GitHub webhook {} for project {} no longer exists on {}/{}; registering a new one",
+                        hook_id, project_id, owner, repo
+                    );
+                }
+                updated.then_some(hook_id)
+            }
+            None => None,
+        };
+
+        let hook_id = match updated_hook_id {
+            Some(hook_id) => hook_id,
+            None => {
+                let hook_id = provider_service
+                    .create_webhook(&access_token, owner, repo, config)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Failed to register GitHub webhook for project {project_id} ({owner}/{repo}): {e}"
+                        )
+                    })?;
+                hook_id.parse().map_err(|e| {
+                    format!(
+                        "GitHub returned a non-numeric webhook ID '{hook_id}' for project {project_id} ({owner}/{repo}): {e}"
+                    )
+                })?
+            }
+        };
+
+        let encrypted_secret = self
+            .encryption_service
+            .encrypt_string(&secret)
+            .map_err(|e| format!("Failed to encrypt GitHub webhook secret: {e}"))?;
+
+        info!(
+            "Installed GitHub repository webhook {} for project {} ({}/{})",
+            hook_id, project_id, owner, repo
+        );
+
+        Ok(Some((hook_id, encrypted_secret)))
+    }
+
+    /// Delete a previously registered GitHub repository webhook. Best-effort.
+    async fn delete_github_webhook_for_connection(
+        &self,
+        connection_id: i32,
+        owner: &str,
+        repo: &str,
+        hook_id: i64,
+    ) -> Result<(), String> {
+        let Some((provider_id, access_token)) = self
+            .resolve_github_repo_webhook_connection(connection_id)
+            .await?
+        else {
+            // No longer a non-App GitHub connection — nothing we can delete with.
+            return Ok(());
+        };
+
+        let provider_service = self
+            .git_provider_manager
+            .get_provider_service(provider_id)
+            .await
+            .map_err(|e| {
+                format!("Failed to get provider service for GitHub connection {connection_id}: {e}")
+            })?;
+
+        provider_service
+            .delete_webhook(&access_token, owner, repo, &hook_id.to_string())
+            .await
+            .map_err(|e| format!("GitHub delete webhook {hook_id} error for {owner}/{repo}: {e}"))
+    }
+
+    /// Install (or replace) the GitHub repository webhook for a project on a
+    /// non-App GitHub connection. Called by
+    /// `POST /projects/{id}/github/reinstall-webhook`, for when automatic
+    /// registration failed (e.g. the token lacked webhook permission) or the
+    /// hook was deleted on GitHub.
+    pub async fn reinstall_github_webhook(&self, project_id: i32) -> Result<i64, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ProjectError::NotFound(format!(
+                "Project {} not found",
+                project_id
+            )))?;
+
+        let connection_id = project.git_provider_connection_id.ok_or_else(|| {
+            ProjectError::InvalidInput(format!(
+                "Project {} has no git provider connection, so there is no repository to install a GitHub webhook on",
+                project_id
+            ))
+        })?;
+
+        let owner = project.repo_owner.clone();
+        let repo = project.repo_name.clone();
+        if owner.is_empty() || repo.is_empty() {
+            return Err(ProjectError::InvalidInput(format!(
+                "Project {} has no repository configured, so there is nothing to install a GitHub webhook on",
+                project_id
+            )));
+        }
+
+        // The stored hook is updated in place (GitHub refuses a second hook with
+        // the same URL); a new one is registered only if it was deleted on
+        // GitHub. Nothing is persisted unless GitHub accepted the change, so a
+        // failure leaves the project with the hook and secret it had.
+        let (hook_id, encrypted_secret) = self
+            .install_github_webhook_for_connection(
+                project_id,
+                connection_id,
+                &owner,
+                &repo,
+                project.github_webhook_id,
+            )
+            .await
+            .map_err(ProjectError::GitHubError)?
+            .ok_or_else(|| {
+                ProjectError::InvalidInput(format!(
+                    "Project {} is not connected through a GitHub personal access token or OAuth connection (connection {}). GitHub App connections receive pushes through the App webhook and need no repository webhook",
+                    project_id, connection_id
+                ))
+            })?;
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.github_webhook_id = Set(Some(hook_id));
+        active_project.github_webhook_signing_token = Set(Some(encrypted_secret));
+        active_project.updated_at = Set(chrono::Utc::now());
+        active_project.update(self.db.as_ref()).await?;
+
+        info!(
+            "Reinstalled GitHub repository webhook {} for project {}",
+            hook_id, project_id
+        );
+
+        Ok(hook_id)
     }
 
     // ── Generic webhook token install ────────────────────────────────────────────
@@ -6587,6 +6960,7 @@ impl ProjectService {
             allow_alternate_sources: db_project.allow_alternate_sources,
             hosting: db_project.hosting,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
+            github_webhook_id: db_project.github_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
             image_retention_hours: db_project.image_retention_hours,
         }
@@ -7056,6 +7430,35 @@ fn git_webhook_base_url(settings: Option<&temps_core::AppSettings>) -> String {
         .unwrap_or_else(|| "http://localhost:8080".to_string())
 }
 
+/// URL of the GitHub repository webhook registered for `project_id`.
+///
+/// GitHub refuses a second hook with the same URL and events on a repository,
+/// so each project's hook needs a URL of its own for two projects to deploy
+/// from one repository. The receiver ignores the query: it identifies the
+/// project by the secret that signed the delivery.
+fn github_repo_webhook_url(base_url: &str, project_id: i32) -> String {
+    use temps_git::handlers::github::GITHUB_REPO_WEBHOOK_PATH;
+
+    format!("{base_url}/api{GITHUB_REPO_WEBHOOK_PATH}?project_id={project_id}")
+}
+
+/// Whether a provider needs Temps to register a GitHub repository webhook for
+/// its projects: a GitHub provider authenticated any way other than as a
+/// GitHub App. An App delivers pushes through its own webhook and needs none.
+fn github_connection_needs_repo_webhook(provider_type: &str, auth_method: &str) -> bool {
+    provider_type == "github" && auth_method != "github_app"
+}
+
+/// Whether a project's Git connection or repository differs between `old`
+/// and `new` (`(connection_id, repo_owner, repo_name)`), so a repository
+/// webhook registered for `old` must be replaced.
+fn repository_target_changed(
+    old: (Option<i32>, &str, &str),
+    new: (Option<i32>, &str, &str),
+) -> bool {
+    old != new
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7305,6 +7708,40 @@ mod tests {
         );
         // An unreadable settings row behaves like an unconfigured one.
         assert_eq!(git_webhook_base_url(None), "http://localhost:8080");
+    }
+
+    // #1596: a GitHub PAT/OAuth connection has no App webhook, so its
+    // projects need a repository webhook; an App connection must not get one
+    // (the push would arrive twice), and other providers have their own flow.
+    #[test]
+    fn only_non_app_github_connections_get_a_repository_webhook() {
+        assert!(github_connection_needs_repo_webhook("github", "pat"));
+        assert!(github_connection_needs_repo_webhook("github", "oauth"));
+        assert!(!github_connection_needs_repo_webhook(
+            "github",
+            "github_app"
+        ));
+        assert!(!github_connection_needs_repo_webhook("gitlab", "pat"));
+        assert!(!github_connection_needs_repo_webhook("gitea", "pat"));
+        assert!(!github_connection_needs_repo_webhook("bitbucket", "pat"));
+    }
+
+    #[test]
+    fn repository_webhook_is_replaced_only_when_the_repository_changes() {
+        let current = (Some(7), "acme", "web");
+        // A branch, preset or directory save resends the same connection.
+        assert!(!repository_target_changed(
+            current,
+            (Some(7), "acme", "web")
+        ));
+        assert!(repository_target_changed(current, (Some(8), "acme", "web")));
+        assert!(repository_target_changed(
+            current,
+            (Some(7), "other", "web")
+        ));
+        assert!(repository_target_changed(current, (Some(7), "acme", "api")));
+        // Disconnecting removes the hook.
+        assert!(repository_target_changed(current, (None, "acme", "web")));
     }
     use sea_orm::{ActiveModelTrait, Set};
 
@@ -8051,6 +8488,583 @@ mod tests {
             environment_service,
             encryption_service,
         )
+    }
+
+    async fn insert_reinstall_test_project(
+        db: &temps_database::DbConnection,
+        slug: &str,
+        connection_id: Option<i32>,
+    ) -> projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set(slug.to_string()),
+            slug: Set(slug.to_string()),
+            repo_name: Set("example-repository".to_string()),
+            repo_owner: Set("example-owner".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            git_provider_connection_id: Set(connection_id),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    async fn insert_github_connection(db: &temps_database::DbConnection, auth_method: &str) -> i32 {
+        let now = chrono::Utc::now();
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set(format!("github-{auth_method}")),
+            provider_type: Set("github".to_string()),
+            auth_method: Set(auth_method.to_string()),
+            auth_config: Set(serde_json::json!({})),
+            is_active: Set(true),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            account_name: Set("example-owner".to_string()),
+            account_type: Set("User".to_string()),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            synced_repository_count: Set(0),
+            health_status: Set("unknown".to_string()),
+            consecutive_health_failures: Set(0),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn reinstall_github_webhook_rejects_a_missing_project() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let service = create_test_services(test_db.db.clone(), Arc::new(MockJobQueue::new())).await;
+
+        let result = service.reinstall_github_webhook(999_999).await;
+
+        assert!(
+            matches!(result, Err(ProjectError::NotFound(ref msg)) if msg.contains("999999")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reinstall_github_webhook_requires_a_git_connection() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = insert_reinstall_test_project(db.as_ref(), "no-connection", None).await;
+
+        let result = service.reinstall_github_webhook(project.id).await;
+
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(ref msg)) if msg.contains("no git provider connection")),
+            "{result:?}"
+        );
+    }
+
+    /// A GitHub App delivers pushes through its own webhook; installing a
+    /// repository webhook as well would deploy every push twice, so the
+    /// endpoint refuses (without calling GitHub) and says why.
+    #[tokio::test]
+    async fn reinstall_github_webhook_refuses_github_app_connections() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let connection_id = insert_github_connection(db.as_ref(), "github_app").await;
+        let project =
+            insert_reinstall_test_project(db.as_ref(), "app-connection", Some(connection_id)).await;
+
+        let result = service.reinstall_github_webhook(project.id).await;
+
+        assert!(
+            matches!(result, Err(ProjectError::InvalidInput(ref msg)) if msg.contains("GitHub App")),
+            "{result:?}"
+        );
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, None);
+        assert_eq!(stored.github_webhook_signing_token, None);
+    }
+
+    /// A personal-access-token GitHub connection whose API is `api_url`.
+    async fn insert_mock_github_pat_connection(
+        db: &temps_database::DbConnection,
+        api_url: String,
+    ) -> i32 {
+        let encryption = temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        let provider = temps_entities::git_providers::ActiveModel {
+            name: Set("github-pat-mock".to_string()),
+            provider_type: Set("github".to_string()),
+            base_url: Set(None),
+            api_url: Set(Some(api_url)),
+            auth_method: Set("pat".to_string()),
+            auth_config: Set(serde_json::json!({
+                "PersonalAccessToken": { "token": "synthetic-token" }
+            })),
+            webhook_secret: Set(None),
+            is_active: Set(true),
+            is_default: Set(false),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        temps_entities::git_provider_connections::ActiveModel {
+            provider_id: Set(provider.id),
+            account_name: Set("example-owner".to_string()),
+            account_type: Set("User".to_string()),
+            access_token: Set(Some(encryption.encrypt_string("synthetic-token").unwrap())),
+            is_active: Set(true),
+            is_expired: Set(false),
+            syncing: Set(false),
+            synced_repository_count: Set(0),
+            health_status: Set("unknown".to_string()),
+            consecutive_health_failures: Set(0),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// Mock GitHub's "create a repository webhook" for `owner/repo`,
+    /// answering with `hook_id` and recording the request body.
+    async fn mock_github_hook_creation(
+        server: &mut mockito::Server,
+        repo: &str,
+        hook_id: i64,
+    ) -> (
+        mockito::Mock,
+        Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) {
+        mock_github_hook_request(
+            server,
+            "POST",
+            &format!("/repos/example-owner/{repo}/hooks"),
+            201,
+            hook_id,
+        )
+        .await
+    }
+
+    /// Mock one GitHub webhook request, answering `status` with a hook whose
+    /// ID is `hook_id` and recording the request body. Expects one call.
+    async fn mock_github_hook_request(
+        server: &mut mockito::Server,
+        method: &str,
+        path: &str,
+        status: usize,
+        hook_id: i64,
+    ) -> (
+        mockito::Mock,
+        Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    ) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let sink = captured.clone();
+        let mock = server
+            .mock(method, path)
+            .with_status(status)
+            .with_header("content-type", "application/json")
+            .with_body_from_request(move |request| {
+                let body = request.body().map(|b| b.to_vec()).unwrap_or_default();
+                *sink.lock().unwrap() = serde_json::from_slice(&body).ok();
+                if (200..300).contains(&status) {
+                    serde_json::json!({ "id": hook_id })
+                } else {
+                    serde_json::json!({ "message": "Not Found" })
+                }
+                .to_string()
+                .into_bytes()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+        (mock, captured)
+    }
+
+    /// Mocks for webhook calls a test expects not to happen.
+    async fn forbid_github_hook_calls(
+        server: &mut mockito::Server,
+        methods: &[&str],
+    ) -> Vec<mockito::Mock> {
+        let mut forbidden = Vec::new();
+        for method in methods {
+            forbidden.push(
+                server
+                    .mock(method, mockito::Matcher::Regex("/hooks".into()))
+                    .expect(0)
+                    .create_async()
+                    .await,
+            );
+        }
+        forbidden
+    }
+
+    async fn insert_project_with_github_hook(
+        db: &temps_database::DbConnection,
+        slug: &str,
+        connection_id: i32,
+        hook_id: i64,
+        encrypted_secret: String,
+    ) -> projects::Model {
+        let project = insert_reinstall_test_project(db, slug, Some(connection_id)).await;
+        let mut active: projects::ActiveModel = project.into();
+        active.directory = Set(".".to_string());
+        active.github_webhook_id = Set(Some(hook_id));
+        active.github_webhook_signing_token = Set(Some(encrypted_secret));
+        active.update(db).await.unwrap()
+    }
+
+    fn decrypt_with_test_key(encrypted: &str) -> String {
+        temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap()
+        .decrypt_string(encrypted)
+        .unwrap()
+    }
+
+    /// Reinstalling gives the project's existing hook a new secret in place:
+    /// GitHub refuses a second hook with the same URL and events, so it must
+    /// not register another one.
+    #[tokio::test]
+    async fn reinstall_github_webhook_updates_the_existing_hook_in_place() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let mut server = mockito::Server::new_async().await;
+        let connection_id = insert_mock_github_pat_connection(db.as_ref(), server.url()).await;
+        let project = insert_project_with_github_hook(
+            db.as_ref(),
+            "reinstall-update",
+            connection_id,
+            11,
+            test_db_encrypt("old-secret"),
+        )
+        .await;
+        let (update, captured) = mock_github_hook_request(
+            &mut server,
+            "PATCH",
+            "/repos/example-owner/example-repository/hooks/11",
+            200,
+            11,
+        )
+        .await;
+        let forbidden = forbid_github_hook_calls(&mut server, &["POST", "DELETE"]).await;
+
+        let hook_id = service.reinstall_github_webhook(project.id).await.unwrap();
+
+        assert_eq!(hook_id, 11);
+        update.assert_async().await;
+        for mock in forbidden {
+            mock.assert_async().await;
+        }
+        let request = captured.lock().unwrap().clone().expect("hook update body");
+        assert_eq!(request["events"], serde_json::json!(["push"]));
+        assert_eq!(request["active"], serde_json::json!(true));
+        assert!(
+            request["config"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!(
+                    "/api/webhook/git/github/repo-events?project_id={}",
+                    project.id
+                )),
+            "{request}"
+        );
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(11));
+        let stored_secret =
+            decrypt_with_test_key(stored.github_webhook_signing_token.as_deref().unwrap());
+        assert_eq!(
+            request["config"]["secret"],
+            serde_json::json!(stored_secret)
+        );
+        assert_eq!(stored_secret.len(), 64);
+        assert_ne!(stored_secret, "old-secret");
+    }
+
+    /// When the stored hook was deleted on GitHub, reinstalling registers a
+    /// new one and stores its ID and secret.
+    #[tokio::test]
+    async fn reinstall_github_webhook_registers_a_new_hook_when_the_old_one_is_gone() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let mut server = mockito::Server::new_async().await;
+        let connection_id = insert_mock_github_pat_connection(db.as_ref(), server.url()).await;
+        let project = insert_project_with_github_hook(
+            db.as_ref(),
+            "reinstall-recreate",
+            connection_id,
+            11,
+            test_db_encrypt("old-secret"),
+        )
+        .await;
+        let (update, _) = mock_github_hook_request(
+            &mut server,
+            "PATCH",
+            "/repos/example-owner/example-repository/hooks/11",
+            404,
+            11,
+        )
+        .await;
+        let (create, captured) =
+            mock_github_hook_creation(&mut server, "example-repository", 22).await;
+        let forbidden = forbid_github_hook_calls(&mut server, &["DELETE"]).await;
+
+        let hook_id = service.reinstall_github_webhook(project.id).await.unwrap();
+
+        assert_eq!(hook_id, 22);
+        update.assert_async().await;
+        create.assert_async().await;
+        for mock in forbidden {
+            mock.assert_async().await;
+        }
+        let request = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("hook creation body");
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(22));
+        assert_eq!(
+            request["config"]["secret"],
+            serde_json::json!(decrypt_with_test_key(
+                stored.github_webhook_signing_token.as_deref().unwrap()
+            ))
+        );
+    }
+
+    /// A reinstall GitHub refuses leaves the project's existing hook in place
+    /// on GitHub and its ID and secret in the database.
+    #[tokio::test]
+    async fn failed_github_webhook_reinstall_keeps_the_existing_hook() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let mut server = mockito::Server::new_async().await;
+        let connection_id = insert_mock_github_pat_connection(db.as_ref(), server.url()).await;
+        let old_secret = test_db_encrypt("old-secret");
+        let project = insert_project_with_github_hook(
+            db.as_ref(),
+            "reinstall-failure",
+            connection_id,
+            11,
+            old_secret.clone(),
+        )
+        .await;
+        server
+            .mock("PATCH", "/repos/example-owner/example-repository/hooks/11")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Must have admin rights to Repository."}"#)
+            .create_async()
+            .await;
+        let forbidden = forbid_github_hook_calls(&mut server, &["POST", "DELETE"]).await;
+
+        let result = service.reinstall_github_webhook(project.id).await;
+
+        assert!(
+            matches!(result, Err(ProjectError::GitHubError(_))),
+            "{result:?}"
+        );
+        for mock in forbidden {
+            mock.assert_async().await;
+        }
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(11));
+        assert_eq!(stored.github_webhook_signing_token, Some(old_secret));
+    }
+
+    /// GitHub refuses a second hook with the same URL and events, so two
+    /// projects on one repository each need a hook URL of their own.
+    #[test]
+    fn each_project_gets_its_own_github_webhook_url() {
+        let first = github_repo_webhook_url("https://temps.example.com", 7);
+        let second = github_repo_webhook_url("https://temps.example.com", 8);
+
+        assert_eq!(
+            first,
+            "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7"
+        );
+        assert_ne!(first, second);
+    }
+
+    /// A Git settings save resends the connection ID with every edit. Only a
+    /// change of repository replaces the hook: a branch change keeps it.
+    #[tokio::test]
+    async fn git_settings_saves_replace_the_github_webhook_only_on_a_repository_change() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let mut server = mockito::Server::new_async().await;
+        let connection_id = insert_mock_github_pat_connection(db.as_ref(), server.url()).await;
+        let old_secret = test_db_encrypt("old-secret");
+        let project = insert_project_with_github_hook(
+            db.as_ref(),
+            "settings-save",
+            connection_id,
+            11,
+            old_secret.clone(),
+        )
+        .await;
+        let save = |branch: &str, repo: &str| {
+            service.update_git_settings(
+                project.id,
+                Some(connection_id),
+                branch.to_string(),
+                "example-owner".to_string(),
+                repo.to_string(),
+                None,
+                ".".to_string(),
+                None,
+                None,
+                None,
+                None,
+                DeployCaller::default(),
+            )
+        };
+
+        // Each save verifies the branch exists.
+        server
+            .mock("GET", mockito::Matcher::Regex("/commits/release$".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "sha": "0123456789abcdef0123456789abcdef01234567",
+                    "commit": {
+                        "message": "release",
+                        "author": {
+                            "name": "Example Author",
+                            "email": "author@example.com",
+                            "date": "2026-01-01T00:00:00Z"
+                        }
+                    }
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let untouched = forbid_github_hook_calls(&mut server, &["POST", "PATCH", "DELETE"]).await;
+        save("release", "example-repository").await.unwrap();
+        for mock in untouched {
+            mock.assert_async().await;
+            mock.remove_async().await;
+        }
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(11));
+        assert_eq!(stored.github_webhook_signing_token, Some(old_secret));
+
+        let delete = server
+            .mock("DELETE", "/repos/example-owner/example-repository/hooks/11")
+            .with_status(204)
+            .expect(1)
+            .create_async()
+            .await;
+        let (create, _) = mock_github_hook_creation(&mut server, "other-repository", 33).await;
+        save("release", "other-repository").await.unwrap();
+        delete.assert_async().await;
+        create.assert_async().await;
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(33));
+        assert!(stored.github_webhook_signing_token.is_some());
+    }
+
+    /// Creating a project on a GitHub PAT connection registers its
+    /// repository webhook and stores the hook ID and secret.
+    #[tokio::test]
+    async fn creating_a_project_on_a_github_pat_connection_installs_its_webhook() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let mut server = mockito::Server::new_async().await;
+        let connection_id = insert_mock_github_pat_connection(db.as_ref(), server.url()).await;
+        let (create, captured) = mock_github_hook_creation(&mut server, "starter", 44).await;
+        let mut request = template_service_request("Webhook Install", "webhook-install");
+        request.repo_owner = Some("example-owner".to_string());
+        request.git_provider_connection_id = Some(connection_id);
+
+        let project = service.create_project(request).await.unwrap();
+
+        create.assert_async().await;
+        let stored = projects::Entity::find_by_id(project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.github_webhook_id, Some(44));
+        let request = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("hook creation body");
+        assert!(
+            request["config"]["url"]
+                .as_str()
+                .unwrap()
+                .ends_with(&format!(
+                    "/api/webhook/git/github/repo-events?project_id={}",
+                    project.id
+                )),
+            "{request}"
+        );
+        assert_eq!(
+            request["config"]["secret"],
+            serde_json::json!(decrypt_with_test_key(
+                stored.github_webhook_signing_token.as_deref().unwrap()
+            ))
+        );
+    }
+
+    fn test_db_encrypt(value: &str) -> String {
+        temps_core::EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap()
+        .encrypt_string(value)
+        .unwrap()
     }
 
     #[tokio::test]

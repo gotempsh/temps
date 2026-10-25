@@ -711,7 +711,10 @@ async function pairListAction(options: { json?: boolean }): Promise<void> {
   printTable(result, [
     { header: 'ID', key: 'id' },
     { header: 'Node', key: 'name' },
-    { header: 'Address', key: 'node_endpoint' },
+    {
+      header: 'Address',
+      accessor: (pairing) => pairing.node_endpoint ?? 'joined outbound',
+    },
     { header: 'Mesh address', key: 'mesh_address' },
     { header: 'Progress', accessor: (pairing) => describePairing(pairing) },
   ])

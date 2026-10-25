@@ -37,6 +37,7 @@ pub mod error;
 pub mod manager;
 pub mod mesh;
 pub mod mesh_doctor;
+pub mod occupied;
 pub mod overlay_routes;
 
 #[cfg(target_os = "linux")]
@@ -72,20 +73,47 @@ pub async fn detect_underlay_device() -> Result<String> {
     linux::detect_underlay_device().await
 }
 
+/// Refuse to bring up the overlay when a host route overlaps a subnet this
+/// node routes on it: its own and its peers' (ADR 056). Routes elsewhere in
+/// the cluster pool do not matter.
 #[cfg(target_os = "linux")]
-pub async fn preflight_compute_pool_routes(
+pub async fn preflight_compute_routes(
     config: &NetworkConfig,
-    pool: ipnet::Ipv4Net,
+    routed: &[ipnet::Ipv4Net],
 ) -> Result<()> {
-    linux::preflight_compute_pool_routes(config, pool).await
+    linux::preflight_compute_routes(config, routed).await
 }
 
 #[cfg(not(target_os = "linux"))]
-pub async fn preflight_compute_pool_routes(
+pub async fn preflight_compute_routes(
     _config: &NetworkConfig,
-    _pool: ipnet::Ipv4Net,
+    _routed: &[ipnet::Ipv4Net],
 ) -> Result<()> {
     Ok(())
+}
+
+/// What to do when a network change was refused with `EPERM`, or `None` when
+/// `message` is not such a refusal. Netlink and WireGuard surface it as
+/// "Operation not permitted" / "os error 1"; the fix is always privileges.
+pub fn permission_hint(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    let denied = lower.contains("operation not permitted")
+        || lower.contains("os error 1)")
+        || lower.contains("eperm");
+    denied.then_some(
+        "this process may not change the host network: run it as root, or grant it \
+         CAP_NET_ADMIN (e.g. `setcap cap_net_admin+ep` on the binary, or \
+         `AmbientCapabilities=CAP_NET_ADMIN` in its systemd unit); inside a container, the host \
+         must grant it (`--cap-add NET_ADMIN`, plus `--device /dev/net/tun` for WireGuard)",
+    )
+}
+
+/// `message` with the [`permission_hint`] appended when it applies.
+pub fn with_permission_hint(message: String) -> String {
+    match permission_hint(&message) {
+        Some(hint) => format!("{message}. {hint}"),
+        None => message,
+    }
 }
 
 /// Detect the MTU of the selected underlay interface. This must be resolved
@@ -123,4 +151,24 @@ pub async fn detect_underlay_device() -> Result<String> {
     Err(NetworkError::UnsupportedPlatform {
         target: std::env::consts::OS,
     })
+}
+
+#[cfg(test)]
+mod permission_hint_tests {
+    use super::*;
+
+    #[test]
+    fn eperm_from_netlink_gets_the_privilege_fix() {
+        let message = "netlink link add 'temps-wg0' failed: Operation not permitted (os error 1)";
+        let hinted = with_permission_hint(message.to_owned());
+        assert!(hinted.starts_with(message));
+        assert!(hinted.contains("CAP_NET_ADMIN"), "{hinted}");
+        assert!(hinted.contains("container"), "{hinted}");
+    }
+
+    #[test]
+    fn other_errors_are_left_alone() {
+        let message = "connection refused (os error 111)".to_owned();
+        assert_eq!(with_permission_hint(message.clone()), message);
+    }
 }

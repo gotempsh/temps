@@ -773,9 +773,8 @@ impl NodeWorkloadPlacement {
                     .map_err(|e| format!("the agent token of node {} is not utf-8: {e}", node.id))
             })?;
         let remote = crate::cluster_ca::build_node_deployer(
-            &node.address,
+            node,
             token,
-            node.name.clone(),
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
         )

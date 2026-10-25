@@ -118,6 +118,9 @@ pub struct Project {
     pub hosting: temps_entities::types::Hosting,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
+    /// GitHub repository webhook ID Temps registered for a non-App GitHub
+    /// connection (PAT/OAuth), if any.
+    pub github_webhook_id: Option<i64>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project
     /// discovery results. Default true (consistent with OSS global-observability
     /// model). Operators can set false to suppress cross-project links to this

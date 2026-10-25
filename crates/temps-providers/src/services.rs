@@ -3288,7 +3288,18 @@ impl ExternalServiceManager {
                 ),
             })?;
             let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
-            RemoteServiceClient::new_mtls(node.address, token, node.name, &identity_pem, &ca_cert)
+            // Over the WireGuard mesh for a node that joined with a public
+            // address, verified for its registered host either way.
+            let endpoint = node.agent_endpoint();
+            if endpoint.via_mesh() {
+                tracing::debug!(
+                    node_id,
+                    node = %node.name,
+                    dial = %endpoint.dial_url,
+                    "reaching the node agent over the WireGuard mesh"
+                );
+            }
+            RemoteServiceClient::new_mtls_at(&endpoint, token, node.name, &identity_pem, &ca_cert)
         } else {
             RemoteServiceClient::new(node.address, token, node.name)
         }
@@ -8996,13 +9007,11 @@ echo "[restore] Pre-seed complete"
             return Ok(normalized);
         }
 
-        let found: Vec<i32> = nodes::Entity::find()
+        let found_nodes = nodes::Entity::find()
             .filter(nodes::Column::Id.is_in(wanted.clone()))
             .all(db)
-            .await?
-            .into_iter()
-            .map(|n| n.id)
-            .collect();
+            .await?;
+        let found: Vec<i32> = found_nodes.iter().map(|n| n.id).collect();
 
         let missing: Vec<String> = wanted
             .iter()
@@ -9023,7 +9032,54 @@ echo "[restore] Pre-seed complete"
             });
         }
 
+        let placements: Vec<Option<i32>> = normalized.iter().map(|m| m.node_id).collect();
+        Self::refuse_nodes_without_overlay(service_id, &placements, &found_nodes)?;
+
         Ok(normalized)
+    }
+
+    /// ADR 056: members of a cluster that spans hosts find each other by
+    /// their `*.temps.local` names, which resolve to overlay IPs and are
+    /// served by each node's resolver on its overlay bridge. A node whose
+    /// agent reports the cross-node overlay unavailable cannot take part, so
+    /// refuse the placement up front with the node's cause. A node that never
+    /// reported (`overlay_status` NULL, an older agent) is not refused.
+    fn refuse_nodes_without_overlay(
+        service_id: i32,
+        placements: &[Option<i32>],
+        candidates: &[nodes::Model],
+    ) -> Result<(), ExternalServiceError> {
+        let hosts: std::collections::HashSet<Option<i32>> = placements.iter().copied().collect();
+        if hosts.len() <= 1 {
+            return Ok(());
+        }
+        let blocked: Vec<String> = candidates
+            .iter()
+            .filter(|node| hosts.contains(&Some(node.id)))
+            .filter(|node| node.overlay_status.as_deref() == Some("unavailable"))
+            .map(|node| {
+                format!(
+                    "'{}' ({})",
+                    node.name,
+                    node.overlay_last_error
+                        .as_deref()
+                        .unwrap_or("no cause reported")
+                )
+            })
+            .collect();
+        if blocked.is_empty() {
+            return Ok(());
+        }
+        Err(ExternalServiceError::ParameterValidationFailed {
+            service_id,
+            reason: format!(
+                "This cluster spans hosts, and members on different hosts reach each other over \
+                 the cross-node network, which is unavailable on node(s) {}. Fix that node's \
+                 network (the cause above names the fix; see Worker Nodes -> Cluster network), or \
+                 place these members on hosts where it is up.",
+                blocked.join("; ")
+            ),
+        })
     }
 
     /// Initialize a cluster service: create member containers across nodes,
@@ -10369,6 +10425,22 @@ echo "[restore] Pre-seed complete"
                 id: service_id,
                 reason: "Cannot add member: cluster has no monitor".to_string(),
             })?;
+
+        // ADR 056: refuse a node without the cross-node overlay when the
+        // cluster spans hosts once this member is added.
+        let placements: Vec<Option<i32>> = existing_members
+            .iter()
+            .map(|m| m.node_id)
+            .chain(std::iter::once(
+                node_id.filter(|id| *id != Self::CONTROL_PLANE_NODE_ID),
+            ))
+            .collect();
+        let placement_nodes: Vec<i32> = placements.iter().flatten().copied().collect();
+        let candidates = nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(placement_nodes))
+            .all(self.db.as_ref())
+            .await?;
+        Self::refuse_nodes_without_overlay(service_id, &placements, &candidates)?;
 
         // What address should the member being added dial to reach the
         // monitor? NOT simply "whatever's in `monitor.hostname`": that
@@ -18563,6 +18635,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -18860,9 +18937,77 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    fn node_with_overlay(id: i32, status: Option<&str>, error: Option<&str>) -> nodes::Model {
+        nodes::Model {
+            overlay_status: status.map(str::to_owned),
+            overlay_last_error: error.map(str::to_owned),
+            ..nodes_test_model(id)
+        }
+    }
+
+    /// ADR 056: a cluster that spans hosts is refused on a node whose
+    /// cross-node overlay is unavailable, naming it and its cause; a
+    /// single-host cluster and a node that never reported are not.
+    #[tokio::test]
+    async fn a_multi_host_cluster_is_refused_on_a_node_without_the_overlay() {
+        let cause = "overlay subnet 10.202.0.0/24 overlaps Docker network 'shop_default'";
+        let down = node_with_overlay(3, Some("unavailable"), Some(cause));
+
+        let db = db_with_nodes(vec![down.clone()]);
+        let err = ExternalServiceManager::resolve_member_placement(
+            &db,
+            1,
+            &[member("monitor", None), member("replica", Some(3))],
+        )
+        .await
+        .expect_err("a member across hosts needs the overlay");
+        let message = err.to_string();
+        assert!(message.contains("'worker-3'"), "{message}");
+        assert!(message.contains("shop_default"), "{message}");
+
+        // Every member on that one node: no cross-host traffic, allowed.
+        let db = db_with_nodes(vec![down.clone()]);
+        ExternalServiceManager::resolve_member_placement(
+            &db,
+            1,
+            &[member("monitor", Some(3)), member("replica", Some(3))],
+        )
+        .await
+        .expect("a single-host cluster does not need the overlay");
+
+        // An older agent that never reported is not refused.
+        let db = db_with_nodes(vec![node_with_overlay(4, None, None)]);
+        ExternalServiceManager::resolve_member_placement(
+            &db,
+            1,
+            &[member("monitor", None), member("replica", Some(4))],
+        )
+        .await
+        .expect("an unreported overlay is not a refusal");
+
+        // The add-member path applies the same rule.
+        assert!(ExternalServiceManager::refuse_nodes_without_overlay(
+            1,
+            &[None, Some(3)],
+            std::slice::from_ref(&down),
+        )
+        .is_err());
+        assert!(ExternalServiceManager::refuse_nodes_without_overlay(
+            1,
+            &[None, Some(3)],
+            &[node_with_overlay(3, Some("ready"), None)],
+        )
+        .is_ok());
     }
 
     fn db_with_nodes(rows: Vec<nodes::Model>) -> DatabaseConnection {
@@ -22338,6 +22483,8 @@ mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
@@ -24996,6 +25143,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
             updated_at: Utc::now(),
         }
     }

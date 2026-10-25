@@ -62,6 +62,8 @@ struct SnapshotPublicIngress {
     unsupported_reasons: Vec<String>,
     #[serde(default)]
     certificates: Option<SnapshotCertificates>,
+    #[serde(default)]
+    listen: Option<crate::route_store::PublicListen>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -283,6 +285,7 @@ impl RouteSyncClient {
             if refused {
                 self.store
                     .apply_public_snapshot(PublicIngressSnapshot::default());
+                crate::public_ingress_manager::apply_listen(None);
             }
             return Err(TickError {
                 message: format!("CP returned {} for {url}", resp.status()),
@@ -320,8 +323,11 @@ impl RouteSyncClient {
                         .collect(),
                 }
             }),
+            listen: body.public_ingress.listen,
         };
+        let listen = public_ingress.listen.clone();
         self.store.apply_public_snapshot(public_ingress);
+        crate::public_ingress_manager::apply_listen(listen);
         crate::public_ingress::update_snapshot_health(&self.store);
 
         // Apply unconditionally — even when generation is unchanged
@@ -511,6 +517,7 @@ mod tests {
             }),
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
+            listen: None,
         }
     }
 
@@ -631,6 +638,7 @@ mod tests {
             }),
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
+            listen: None,
         });
 
         crate::public_ingress::update_snapshot_health(&store);

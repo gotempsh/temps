@@ -63,8 +63,9 @@ pub struct CreateNodePairingRequest {
 pub struct NodePairingResponse {
     pub id: i32,
     pub name: String,
-    /// `ip:port` the control plane dials.
-    pub node_endpoint: String,
+    /// `ip:port` the control plane dials; `null` for a worker that joined
+    /// outbound only (ADR 055): it dials the control plane instead.
+    pub node_endpoint: Option<String>,
     /// Mesh address reserved for the node.
     pub mesh_address: String,
     /// `waiting` (dialing the node), `key_received` (the node answered; it is
@@ -161,6 +162,14 @@ pub(crate) fn problem(error: MeshError) -> Problem {
     }
 }
 
+/// Why a worker cannot join outbound only (ADR 055) when the control plane
+/// publishes no WireGuard endpoint, and what to do.
+pub(crate) const CONTROL_PLANE_NOT_DIALABLE: &str =
+    "This control plane publishes no WireGuard endpoint, so a worker cannot dial it. Restart \
+     `temps serve` with `--wg-endpoint <public-ip>:<mesh-port>` and open that UDP port to the \
+     internet, or join this worker with `temps join --pair` (the control plane dials the \
+     worker) or `temps join <url> <token> --private-address <worker-ip>`.";
+
 fn internal(what: &str, error: &NodePairingAdminError) -> Problem {
     error!("node pairing: {error}");
     problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -178,9 +187,20 @@ pub(crate) fn pairing_problem(error: NodePairingAdminError) -> Problem {
                 "The control plane has not brought up its end of the mesh yet. Wait for the \
                  mesh to show Ready, then pair the node.",
             ),
+        NodePairingAdminError::ControlPlaneNotDialable => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Control Plane Not Dialable")
+            .with_detail(CONTROL_PLANE_NOT_DIALABLE),
         NodePairingAdminError::InvalidName { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Node Name")
             .with_detail("Use 1–63 lowercase letters, digits and dashes."),
+        NodePairingAdminError::InvalidRegistrationName { ref name } => {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Node Name")
+                .with_detail(format!(
+                    "Node name '{name}' is invalid: use at most 63 letters, digits, '-', '.' or \
+                     '_'. Re-run `temps join` with `--name <name>`."
+                ))
+        }
         NodePairingAdminError::NotFound { pairing_id } => {
             problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Pairing Not Found")
@@ -335,7 +355,7 @@ pub(crate) async fn start_pairing_audited(
         context,
         pairing_id: started.pairing.id,
         name: started.pairing.name.clone(),
-        node_endpoint: started.pairing.node_endpoint.clone(),
+        node_endpoint: Some(node_endpoint.to_string()),
     };
     if let Err(error) = audit_service.create_audit_log(&audit).await {
         error!(%error, "node pairing created but audit record failed");
@@ -509,7 +529,7 @@ mod tests {
             id,
             pairing_id: "cGFpcmluZy1pZC0xNmJ5dGU".to_string(),
             name: "worker-7".to_string(),
-            node_endpoint: "198.51.100.7:51820".to_string(),
+            node_endpoint: Some("198.51.100.7:51820".to_string()),
             mesh_address: "10.201.0.2".to_string(),
             secret_encrypted: "encrypted".to_string(),
             enrollment_token_id: 11,
@@ -709,11 +729,13 @@ mod tests {
             .append_query_results(vec![vec![network_config(true, true)]])
             .append_query_results(vec![vec![network_config(true, true)]])
             // create: the locked config row, pending pairings, taken
-            // addresses (nodes, then pairings), the insert
+            // addresses (nodes, pairings, then the settings naming the
+            // cluster CA whose leaves' addresses are taken too), the insert
             .append_query_results(vec![vec![network_config(true, true)]])
             .append_query_results(vec![vec![count(0)]])
             .append_query_results(vec![Vec::<temps_entities::nodes::Model>::new()])
             .append_query_results(vec![Vec::<node_pairings::Model>::new()])
+            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
             .append_query_results(vec![vec![pairing(5, "waiting")]])
             .into_connection();
         let tokens_db = mock_db()

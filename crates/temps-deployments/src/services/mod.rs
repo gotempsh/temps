@@ -12,6 +12,7 @@ pub use container_operations::*;
 pub mod types;
 pub use types::*;
 
+pub mod cluster_network;
 pub mod node_pairing;
 pub mod node_pairing_admin;
 pub mod node_ssh;
@@ -73,6 +74,8 @@ pub use remote_deployment_service::*;
 pub mod node_service;
 pub use node_service::*;
 
+pub mod node_plugin_builder;
+pub mod node_public_ingress;
 pub mod node_scheduler;
 pub use node_scheduler::*;
 

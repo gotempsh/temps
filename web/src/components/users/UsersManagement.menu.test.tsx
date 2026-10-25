@@ -31,7 +31,7 @@ const listedUser = {
 
 const client = new QueryClient()
 
-function page(role: string) {
+function page(role: string, listed: typeof listedUser = listedUser) {
   const user: UserResponse = {
     id: 3,
     name: 'Example User',
@@ -53,7 +53,7 @@ function page(role: string) {
           }}
         >
           <UsersManagement
-            users={[listedUser] as never}
+            users={[listed] as never}
             isLoading={false}
             error={undefined}
             reloadUsers={() => {}}
@@ -97,4 +97,34 @@ test('a row menu left open when access is revoked stays closed when it is restor
   })
   expect(view.getByRole('button', { name: 'Open menu' })).toBeTruthy()
   expect(view.queryByText('Manage Roles')).toBeNull()
+})
+
+async function openMenu(view: ReturnType<typeof render>) {
+  await act(async () => {
+    fireEvent.pointerDown(view.getByRole('button', { name: 'Open menu' }), {
+      button: 0,
+      ctrlKey: false,
+    })
+  })
+}
+
+test('an administrator can reset the MFA of a user who has it enrolled', async () => {
+  const view = render(
+    page('admin', {
+      ...listedUser,
+      user: { ...listedUser.user, mfa_enabled: true },
+    })
+  )
+  await openMenu(view)
+  const item = await view.findByRole('menuitem', { name: 'Reset MFA' })
+  expect(item.getAttribute('aria-disabled')).toBeNull()
+})
+
+test('the MFA reset stays visible but disabled when nothing is enrolled', async () => {
+  const view = render(page('admin'))
+  await openMenu(view)
+  const item = await view.findByRole('menuitem', {
+    name: 'Reset MFA (not enrolled)',
+  })
+  expect(item.getAttribute('aria-disabled')).toBe('true')
 })

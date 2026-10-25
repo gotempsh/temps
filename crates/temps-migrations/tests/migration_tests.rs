@@ -2992,7 +2992,8 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
     let port: i32 = row.try_get("", "vxlan_port")?;
     let mtu: i32 = row.try_get("", "underlay_mtu")?;
     assert_eq!(id, 1);
-    assert_eq!(pool, "172.20.0.0/16");
+    // ADR 056: a new cluster starts outside Docker's default address pools.
+    assert_eq!(pool, "10.202.0.0/16");
     assert_eq!(prefix, 24);
     assert_eq!(transport, "vxlan");
     assert_eq!(vni, 42);
@@ -6859,5 +6860,113 @@ async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
     for table in tables {
         assert!(exists(table).await?, "{table} after re-up");
     }
+    Ok(())
+}
+
+/// ADR 056: the compute-pool migration changes only the column default. An
+/// existing cluster keeps the pool it stored (here the old default), and the
+/// new per-node overlay columns start NULL ("never reported").
+#[tokio::test]
+async fn test_compute_pool_default_change_keeps_existing_pool() -> anyhow::Result<()> {
+    if std::env::var("TEMPS_TEST_DATABASE_URL").is_ok() {
+        println!(
+            "⏭️  Skipping test_compute_pool_default_change_keeps_existing_pool: external database \
+             in use"
+        );
+        return Ok(());
+    }
+
+    let container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+        .expect("Failed to start TimescaleDB container");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+
+    let target = "m20261020_000002_compute_pool_collisions";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    // An install created before this change: old default, old stored pool.
+    db.execute_unprepared(
+        "ALTER TABLE network_config ALTER COLUMN compute_pool_cidr SET DEFAULT '172.20.0.0/16'; \
+         UPDATE network_config SET compute_pool_cidr = '172.20.0.0/16' WHERE id = 1",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+         labels, capacity, compute_cidr) VALUES \
+         ('w1', 'h1', '127.0.0.1', '10.0.0.1', 'worker', 'active', '{}', '{}', '172.20.0.0/24')",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT compute_pool_cidr, \
+                    (SELECT column_default FROM information_schema.columns \
+                     WHERE table_name = 'network_config' AND column_name = 'compute_pool_cidr') \
+                    AS column_default \
+             FROM network_config WHERE id = 1"
+                .to_string(),
+        ))
+        .await?
+        .expect("network_config singleton row");
+    let pool: String = row.try_get("", "compute_pool_cidr")?;
+    let column_default: String = row.try_get("", "column_default")?;
+    assert_eq!(pool, "172.20.0.0/16", "an existing pool is never rewritten");
+    assert!(
+        column_default.contains("10.202.0.0/16"),
+        "new clusters default to 10.202.0.0/16, got {column_default}"
+    );
+
+    let node = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT compute_cidr, occupied_ranges IS NULL AS no_ranges, \
+                    overlay_status IS NULL AS no_status, \
+                    overlay_ready_cidr IS NULL AS no_ready \
+             FROM nodes WHERE name = 'w1'"
+                .to_string(),
+        ))
+        .await?
+        .expect("node row");
+    assert_eq!(node.try_get::<String>("", "compute_cidr")?, "172.20.0.0/24");
+    assert!(node.try_get::<bool>("", "no_ranges")?);
+    assert!(node.try_get::<bool>("", "no_status")?);
+    assert!(node.try_get::<bool>("", "no_ready")?);
+
+    // And back: the old default returns, the pool is still untouched.
+    Migrator::down(&db, Some(1)).await?;
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT compute_pool_cidr FROM network_config WHERE id = 1".to_string(),
+        ))
+        .await?
+        .expect("network_config singleton row");
+    assert_eq!(
+        row.try_get::<String>("", "compute_pool_cidr")?,
+        "172.20.0.0/16"
+    );
     Ok(())
 }

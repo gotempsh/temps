@@ -71,6 +71,18 @@ pub struct PublicIngressSnapshot {
     pub unsupported_route_count: usize,
     #[serde(default)]
     pub unsupported_reasons: Vec<String>,
+    /// Where to bind the public listeners (ADR 058 D7); `None` when this
+    /// node takes no direct traffic or the control plane predates it.
+    #[serde(default)]
+    pub listen: Option<PublicListen>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicListen {
+    /// Local address to bind; `None` means the default-route interface.
+    pub address: Option<String>,
+    pub http_port: u16,
+    pub https_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -651,6 +663,7 @@ mod tests {
             }),
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
+            listen: None,
         });
 
         assert!(store.lookup_public("example.com").is_some());

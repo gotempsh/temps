@@ -4,6 +4,7 @@
 import { ProjectResponse } from '@/api/client'
 import LogViewer from '../runtime-logs/log-viewer'
 import HistoryLogViewer from '../runtime-logs/history-log-viewer'
+import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
 import {
   Card,
   CardContent,
@@ -65,6 +66,11 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
 
   return (
     <Tabs value={activeTab} onValueChange={handleTabChange} className="w-full">
+      <LogIngestBudgetWarning
+        scope={{ projectId: project.id }}
+        label={project.name}
+        className="mb-3"
+      />
       <div className="mb-2">
         <TabsList>
           <TabsTrigger value="live" className="gap-1.5">

@@ -145,6 +145,16 @@ pub struct Model {
     /// Never serialized in API responses (MUST-FIX 5).
     #[serde(skip_serializing)]
     pub gitea_webhook_signing_token: Option<String>,
+    /// Repository webhook ID returned by `POST /repos/{owner}/{repo}/hooks`
+    /// when we auto-register a webhook for a GitHub connection that is not a
+    /// GitHub App (PAT/OAuth). App connections receive pushes through the
+    /// App's own webhook and leave this NULL.
+    pub github_webhook_id: Option<i64>,
+    /// Encrypted HMAC-SHA256 secret sent to GitHub as the repository
+    /// webhook's `secret`. Deliveries carrying `X-Hub-Signature-256` are
+    /// verified against it. Never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub github_webhook_signing_token: Option<String>,
     /// Encrypted secret-in-path token for Bitbucket webhook delivery URL.
     /// Embedded in the webhook callback URL path instead of HMAC (Bitbucket
     /// Cloud does not provide HMAC body signing).

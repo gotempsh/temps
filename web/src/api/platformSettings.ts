@@ -84,6 +84,12 @@ export interface AgentSandboxSettings {
   memory_limit_mb: number
   network_mode: string
   sandbox_backend?: string
+  /// Operator ceilings for `POST /sandboxes`; `null` = the built-in ceiling
+  /// (`max_sandboxes_per_user`: no cap).
+  max_cpu_limit?: number | null
+  max_memory_limit_mb?: number | null
+  max_pids_limit?: number | null
+  max_sandboxes_per_user?: number | null
 }
 
 export interface PreviewGatewaySettings {
@@ -150,6 +156,10 @@ export interface ContainerLogSettings {
   cache_mb: number
   /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
   head_buffer_mb: number
+  /** Per-container ingestion budget in lines/s; 0 = no line limit. */
+  ingest_lines_per_sec: number
+  /** Per-container ingestion budget in KiB/s; 0 = no byte limit. */
+  ingest_kib_per_sec: number
 }
 
 export interface ObservabilityRetentionSettings {

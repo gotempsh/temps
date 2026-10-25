@@ -5,8 +5,10 @@
 //! `temps serve` (automatic migrations on boot) and `temps migrate` (explicit
 //! migrations, also used by the console's "Update now").
 //!
-//! 1. **Schema guard** — refuse a database that a newer release migrated
-//!    ([`temps_database::SchemaGuardError::DatabaseNewerThanBinary`]).
+//! 1. **Schema guard** — classify the database. One that a newer release
+//!    migrated ([`temps_database::SchemaStatus::NewerThanBinary`], e.g. after
+//!    a binary-only rollback) is logged as a warning and startup continues;
+//!    only an unreadable migration ledger stops it.
 //! 2. **Pre-migration backup** — opt-in with `--pre-migration-backup`. When
 //!    an existing database has pending migrations, dump it to
 //!    `<data dir>/backups/pre-migration/` first; if the dump fails, nothing
@@ -67,10 +69,19 @@ enum BackupDecision {
 fn decide(status: &SchemaStatus, policy: BackupPolicy) -> BackupDecision {
     match (status, policy) {
         (SchemaStatus::Fresh | SchemaStatus::UpToDate { .. }, _) => BackupDecision::NotNeeded,
-        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::Enabled) => BackupDecision::Take,
-        (SchemaStatus::PendingUpgrade { .. }, BackupPolicy::Disabled) => {
-            BackupDecision::NotRequested
+        // A newer schema after a binary rollback normally has nothing of this
+        // binary's left to apply; only a divergent build does.
+        (SchemaStatus::NewerThanBinary { pending, .. }, _) if pending.is_empty() => {
+            BackupDecision::NotNeeded
         }
+        (
+            SchemaStatus::PendingUpgrade { .. } | SchemaStatus::NewerThanBinary { .. },
+            BackupPolicy::Enabled,
+        ) => BackupDecision::Take,
+        (
+            SchemaStatus::PendingUpgrade { .. } | SchemaStatus::NewerThanBinary { .. },
+            BackupPolicy::Disabled,
+        ) => BackupDecision::NotRequested,
     }
 }
 
@@ -104,8 +115,9 @@ pub struct PreparedUpgrade {
 /// Run the schema guard and, for an upgrade, the pre-migration backup.
 ///
 /// Must run before any migration is applied. Returns an error — and changes
-/// nothing — when the database is newer than this binary or when a required
-/// backup fails.
+/// nothing — when the migration ledger cannot be read or when a required
+/// backup fails. A database newer than this binary is not an error: the guard
+/// logs a warning and startup continues.
 pub async fn prepare_schema_upgrade(
     db: &sea_orm::DatabaseConnection,
     database_url: &str,
@@ -129,7 +141,8 @@ pub async fn prepare_schema_upgrade(
         }
         BackupDecision::Take => {
             let applied = match &status {
-                SchemaStatus::PendingUpgrade { applied, .. } => *applied,
+                SchemaStatus::PendingUpgrade { applied, .. }
+                | SchemaStatus::NewerThanBinary { applied, .. } => *applied,
                 SchemaStatus::Fresh | SchemaStatus::UpToDate { .. } => 0,
             };
             let binary_version = crate::commands::upgrade::current_version_tag();
@@ -202,6 +215,31 @@ mod tests {
         );
         assert_eq!(
             decide(&pending(), BackupPolicy::Disabled),
+            BackupDecision::NotRequested
+        );
+    }
+
+    #[test]
+    fn newer_schema_backs_up_only_when_this_binary_has_migrations_to_apply() {
+        let rolled_back = SchemaStatus::NewerThanBinary {
+            applied: 11,
+            unknown: vec!["m_from_newer_release".to_string()],
+            pending: Vec::new(),
+        };
+        let divergent = SchemaStatus::NewerThanBinary {
+            applied: 11,
+            unknown: vec!["m_from_newer_release".to_string()],
+            pending: vec!["m_only_in_this_build".to_string()],
+        };
+        for policy in [BackupPolicy::Enabled, BackupPolicy::Disabled] {
+            assert_eq!(decide(&rolled_back, policy), BackupDecision::NotNeeded);
+        }
+        assert_eq!(
+            decide(&divergent, BackupPolicy::Enabled),
+            BackupDecision::Take
+        );
+        assert_eq!(
+            decide(&divergent, BackupPolicy::Disabled),
             BackupDecision::NotRequested
         );
     }

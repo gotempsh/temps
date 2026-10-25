@@ -36,6 +36,7 @@ RUN apk add --no-cache \
     postgresql-dev \
     protobuf-dev \
     git \
+    libgcc \
     curl \
     tar \
     gzip \
@@ -148,9 +149,15 @@ FROM alpine:3.22
 RUN apk update && apk upgrade --no-cache
 
 # Install runtime dependencies
+# git is how plugin installs fetch their source from GitHub. libstdc++ and
+# libgcc are what a Bun-compiled musl plugin binary links against; without
+# them an installed plugin dies at load.
 RUN apk add --no-cache \
     ca-certificates \
+    git \
+    libgcc \
     libssl3 \
+    libstdc++ \
     postgresql-client
 
 # Create app user

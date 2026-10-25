@@ -614,7 +614,8 @@ test the supported WireGuard setup: an operator-run tunnel plus direct mode.
 - **Setup**: Production DB after migrations applied. Take a `pg_dump`. Roll back the binary one minor.
 - **Steps**: Old binary boots against the new schema.
 - **Pass**:
-  - Old binary either boots cleanly (forward-compatible schema) OR refuses to start with a clear "schema_version_ahead" error
+  - Old binary boots and logs a WARN that the database schema is newer than the binary, naming the unknown migrations and linking to the rollback docs
+  - The unknown migrations stay recorded in `seaql_migrations` (nothing is rolled back) and no migration error is raised
   - Never silently corrupts data
 
 ---

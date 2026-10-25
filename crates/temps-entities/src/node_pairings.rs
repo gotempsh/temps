@@ -17,7 +17,10 @@ pub struct Model {
     /// Name the node registers under (the enrollment token is bound to it).
     pub name: String,
     /// `ip:port` the control plane dials: the node's WireGuard endpoint.
-    pub node_endpoint: String,
+    /// `None` for a node that joined outbound only (ADR 055): it sent its
+    /// key over HTTPS and dials the control plane, which learns its address
+    /// from the first handshake. A `waiting` pairing always has one.
+    pub node_endpoint: Option<String>,
     /// Mesh address reserved for the node.
     pub mesh_address: String,
     /// The pairing secret, encrypted with the installation key.

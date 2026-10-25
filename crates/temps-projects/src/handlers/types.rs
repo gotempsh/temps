@@ -468,6 +468,14 @@ pub struct ProjectResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 42)]
     pub gitlab_webhook_id: Option<i32>,
+    /// GitHub repository webhook ID Temps registered on the connected
+    /// repository. Only GitHub connections that are not a GitHub App (personal
+    /// access token, OAuth) get one; App connections receive pushes through the
+    /// App webhook. `null` when none is installed (another provider, a GitHub
+    /// App connection, or registration failed / the hook was never created).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 512345678)]
+    pub github_webhook_id: Option<i64>,
     /// ADR-027 Phase 3 opt-out: when false, this project's traces are suppressed
     /// from cross-project discovery results. Default true (consistent with the
     /// OSS global-observability model where any OtelRead holder can query any
@@ -543,6 +551,7 @@ impl ProjectResponse {
             allow_alternate_sources: project.allow_alternate_sources,
             hosting: project.hosting,
             gitlab_webhook_id: project.gitlab_webhook_id,
+            github_webhook_id: project.github_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,
             // Filled in by the detail handlers via `with_docker_socket`; the
@@ -1545,6 +1554,16 @@ pub struct GenerateDockerfileResponse {
     pub build_args: std::collections::HashMap<String, String>,
     /// The preset slug used for generation
     pub preset: String,
+}
+
+/// Response for `POST /projects/{project_id}/github/reinstall-webhook`
+#[derive(Serialize, ToSchema)]
+pub struct ReinstallGithubWebhookResponse {
+    /// The new GitHub repository hook ID that was installed.
+    #[schema(example = 512345678)]
+    pub hook_id: i64,
+    /// Human-readable status message.
+    pub message: String,
 }
 
 /// Response for `POST /projects/{project_id}/gitlab/reinstall-webhook`

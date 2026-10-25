@@ -4,8 +4,8 @@
 use arc_swap::ArcSwapOption;
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, FromQueryResult, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set,
+    Statement, TransactionTrait,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -667,14 +667,20 @@ impl ErrorIngestionService {
         // Legacy fingerprints not yet indexed are resolved once and cached by
         // process_error_event. The lowest group ID keeps future events stable
         // without merging historical issues or changing their triage state.
-        let result = error_events::Entity::find()
-            .filter(error_events::Column::FingerprintHash.eq(fingerprint))
-            .filter(error_events::Column::ProjectId.eq(project_id))
-            .order_by_asc(error_events::Column::ErrorGroupId)
-            .one(db)
+        // error_events can outlive its group (compressed hypertable chunks), so
+        // only a group that still exists in this project is a valid answer;
+        // otherwise the caller's group lock would fail with GroupNotFound on
+        // every event carrying this fingerprint.
+        let row = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT e.error_group_id FROM error_events e JOIN error_groups g ON g.id=e.error_group_id AND g.project_id=e.project_id WHERE e.project_id=$1 AND e.fingerprint_hash=$2 ORDER BY e.error_group_id LIMIT 1",
+                [project_id.into(), fingerprint.into()],
+            ))
             .await?;
-
-        Ok(result.map(|event| event.error_group_id))
+        row.map(|row| row.try_get("", "error_group_id"))
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Find similar error group using vector cosine similarity
@@ -955,7 +961,7 @@ impl ErrorIngestionService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sea_orm::PaginatorTrait;
+    use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter};
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{error_events, error_groups, projects};
@@ -1308,6 +1314,55 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].exception_type, "TypeError");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn legacy_fingerprint_fallback_ignores_events_of_deleted_group() {
+        let test_db = setup_test_db().await;
+        let db = test_db.connection_arc();
+        let service = ErrorIngestionService::new(db.clone());
+        let project_id = create_test_project(&db).await;
+        let deleted_group = service
+            .process_error_event(create_test_error_data(project_id))
+            .await
+            .expect("Failed to process first error event");
+
+        // Leave the event behind as an orphan of its group, and un-index the
+        // fingerprint so the next ingest takes the legacy error_events path.
+        let tx = db.begin().await.unwrap();
+        tx.execute_unprepared("SET LOCAL session_replication_role = replica")
+            .await
+            .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM error_groups WHERE id=$1",
+            [deleted_group.into()],
+        ))
+        .await
+        .unwrap();
+        tx.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "DELETE FROM error_group_fingerprints WHERE error_group_id=$1",
+            [deleted_group.into()],
+        ))
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let group_id = service
+            .process_error_event(create_test_error_data(project_id))
+            .await
+            .expect("an orphaned legacy event must not block ingest of its fingerprint");
+
+        assert_ne!(group_id, deleted_group);
+        let group = error_groups::Entity::find_by_id(group_id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("new group should exist");
+        assert_eq!(group.project_id, project_id);
+        assert_eq!(group.total_count, 1);
     }
 
     #[tokio::test]

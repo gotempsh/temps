@@ -54,6 +54,8 @@ pub struct ExternalPluginsService {
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
     closing: AtomicBool,
+    /// Compiles plugins on a worker node when this process has no Docker.
+    remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
 }
 
 #[derive(Debug, Error)]
@@ -382,7 +384,13 @@ impl ExternalPluginsService {
         )
         .await?;
         let output = selected._temporary.path().join("plugin");
-        repository::build_with_progress(&selected.source, &output, progress).await?;
+        repository::build_with_progress(
+            &selected.source,
+            &output,
+            progress,
+            self.remote_builder.as_deref(),
+        )
+        .await?;
         if let Some(progress) = progress {
             progress.complete_current().await;
         }
@@ -550,7 +558,17 @@ impl ExternalPluginsService {
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
+            remote_builder: None,
         }
+    }
+
+    /// Let installs compile on a worker node when this process has no Docker.
+    pub fn with_remote_builder(
+        mut self,
+        builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
+    ) -> Self {
+        self.remote_builder = builder;
+        self
     }
 
     /// Spawn a background task that runs initial plugin discovery + start,
@@ -641,6 +659,7 @@ impl ExternalPluginsService {
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
             closing: AtomicBool::new(false),
+            remote_builder: None,
         }
     }
 

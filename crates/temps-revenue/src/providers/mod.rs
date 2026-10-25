@@ -20,6 +20,24 @@ pub mod stripe;
 
 pub use stripe::StripeProvider;
 
+/// Largest amount, in minor units, one revenue row may carry: 10^15, i.e.
+/// ten trillion in a two-decimal currency. It is far beyond any real
+/// subscription or invoice, and small enough that a sum over the rows of an
+/// install stays meaningful instead of pinning at the `i64` limit.
+pub const MAX_MINOR_AMOUNT: i64 = 1_000_000_000_000_000;
+
+/// Round a computed amount to minor units, or `None` when it is not a
+/// finite value within [`MAX_MINOR_AMOUNT`]. A bare `as i64` saturates a
+/// huge or infinite value to `i64::MAX` (and NaN to 0), which then
+/// overflows any total it is added to.
+pub(crate) fn minor_units_from_f64(value: f64) -> Option<i64> {
+    let rounded = value.round();
+    if !rounded.is_finite() || rounded.abs() > MAX_MINOR_AMOUNT as f64 {
+        return None;
+    }
+    Some(rounded as i64)
+}
+
 /// Normalized subscription status used across all providers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -356,5 +374,24 @@ impl ProviderRegistry {
 impl Default for ProviderRegistry {
     fn default() -> Self {
         Self::default_registry()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn minor_units_reject_values_an_i64_total_cannot_hold() {
+        assert_eq!(minor_units_from_f64(1999.5), Some(2000));
+        assert_eq!(minor_units_from_f64(-250.0), Some(-250));
+        assert_eq!(
+            minor_units_from_f64(MAX_MINOR_AMOUNT as f64),
+            Some(MAX_MINOR_AMOUNT)
+        );
+        assert_eq!(minor_units_from_f64(1e16), None);
+        assert_eq!(minor_units_from_f64(-1e16), None);
+        assert_eq!(minor_units_from_f64(f64::INFINITY), None);
+        assert_eq!(minor_units_from_f64(f64::NAN), None);
     }
 }

@@ -74,6 +74,12 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 
 import { RuntimeHealthPanel } from './RuntimeHealthPanel'
 import { visibleExternalMonitors } from './runtime-health-display'
+import {
+  BUCKET_TONE_CLASS,
+  BUCKET_TONE_LABEL,
+  bucketTone,
+  unknownTimeNote,
+} from '@/lib/monitor-uptime'
 
 interface ProjectMonitorsProps {
   project: ProjectResponse
@@ -208,8 +214,23 @@ function MonitorCard({
             ) : (
               <>
                 <div className="flex items-center gap-2">
-                  <div className="text-lg font-semibold">
-                    {uptimePercentage?.toFixed(0) ?? 'N/A'}%
+                  <div
+                    className="text-lg font-semibold"
+                    title={
+                      currentMonitorStatus
+                        ? (unknownTimeNote(currentMonitorStatus) ?? undefined)
+                        : undefined
+                    }
+                  >
+                    {uptimePercentage == null
+                      ? '—'
+                      : `${uptimePercentage.toFixed(0)}%`}
+                    {currentMonitorStatus &&
+                      unknownTimeNote(currentMonitorStatus) && (
+                        <span className="text-amber-700 dark:text-amber-400">
+                          *
+                        </span>
+                      )}
                   </div>
                   <div
                     className={`text-xs flex items-center gap-1 ${
@@ -253,16 +274,8 @@ function MonitorCard({
                         .map((bucket, idx) => (
                           <div
                             key={idx}
-                            className={`flex-1 rounded-sm ${
-                              bucket.status === 'operational'
-                                ? 'bg-green-500'
-                                : bucket.status === 'major_outage'
-                                  ? 'bg-red-500'
-                                  : bucket.status === 'degraded'
-                                    ? 'bg-yellow-500'
-                                    : 'bg-gray-300'
-                            }`}
-                            title={`${new Date(bucket.bucket_start).toLocaleString()}\nStatus: ${bucket.status}\nAvg: ${bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms`}
+                            className={`flex-1 rounded-sm ${BUCKET_TONE_CLASS[bucketTone(bucket.status)]}`}
+                            title={`${new Date(bucket.bucket_start).toLocaleString()}\nStatus: ${BUCKET_TONE_LABEL[bucketTone(bucket.status)]}\nAvg: ${bucket.avg_response_time_ms?.toFixed(0) ?? 'N/A'}ms`}
                           />
                         ))
                     : Array.from({ length: 48 }).map((_, idx) => (

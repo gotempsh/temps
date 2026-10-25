@@ -144,6 +144,21 @@ pub struct ResetUserPasswordResponse {
     pub must_change_password: bool,
 }
 
+/// Returned when an administrator removes another user's second factor.
+#[derive(Serialize, utoipa::ToSchema)]
+pub struct ResetUserMfaResponse {
+    /// Always false: the user's TOTP secret and recovery codes are gone.
+    pub mfa_enabled: bool,
+    /// How many of the user's sessions were signed out by the reset.
+    #[schema(example = 2)]
+    pub sessions_revoked: u64,
+    /// True when this instance requires MFA for admins
+    /// (`require_mfa_for_admins`) and the user is an admin: until they enroll
+    /// again they cannot sign in with a password, so they must sign in
+    /// through SSO, or the setting must be turned off while they re-enroll.
+    pub password_sign_in_blocked: bool,
+}
+
 // In-app password change for the authenticated user. Distinct from the
 // out-of-band password-reset flow because it requires the current
 // password as a re-auth gate and runs while the user is logged in. When

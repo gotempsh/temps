@@ -2920,9 +2920,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "6bb08299a6046833a879ace115697f12fd2bd6c8d3e93c909ffc9e0738e7cae0"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -2962,7 +2962,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "rand_core 0.10.1",
 ]
 
@@ -3044,9 +3044,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
  "subtle",
@@ -3818,7 +3818,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -9307,7 +9307,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -10284,7 +10284,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "hmac 0.13.0",
 ]
 
@@ -10397,7 +10397,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
  "const-oid 0.10.2",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1 0.8.0-rc.4",
@@ -10441,7 +10441,7 @@ dependencies = [
  "bytes",
  "cbc 0.2.1",
  "cipher 0.5.2",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "ctr",
  "curve25519-dalek 5.0.0",
  "data-encoding",
@@ -12342,7 +12342,7 @@ checksum = "7b54d0ed0498daf3f78d82e00e28c8eec9d75a067c4cfbcc7a0f7d0f4077749e"
 dependencies = [
  "base64ct",
  "bytes",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "ctutils",
  "digest 0.11.3",
  "pem-rfc7468 1.0.0",
@@ -12682,7 +12682,9 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "if-addrs",
  "ipnet",
+ "libc",
  "parking_lot",
  "rand 0.10.3",
  "reqwest 0.12.28",
@@ -12701,6 +12703,7 @@ dependencies = [
  "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
+ "temps-external-plugins",
  "temps-network",
  "temps-providers",
  "temps-runtime-health",
@@ -12718,6 +12721,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
+ "x25519-dalek",
  "x509-parser",
 ]
 
@@ -12874,6 +12878,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bollard",
  "chrono",
  "flate2",
  "futures",
@@ -12898,14 +12903,17 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-environments",
  "temps-error-tracking",
  "temps-git",
  "temps-logs",
  "temps-projects",
+ "temps-providers",
  "temps-sandbox",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "unicode-casefold",
  "unicode-normalization",
@@ -13421,6 +13429,7 @@ dependencies = [
  "temps-git",
  "temps-import",
  "temps-infra",
+ "temps-ingress",
  "temps-kv",
  "temps-log-aggregator",
  "temps-logs",
@@ -13715,6 +13724,7 @@ dependencies = [
  "num_cpus",
  "regex",
  "reqwest 0.12.28",
+ "rustls",
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
@@ -13739,6 +13749,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-test",
  "tokio-util",
  "tracing",
@@ -14742,6 +14753,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-ingress"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "hex",
+ "rand 0.10.3",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "temps-auth",
+ "temps-core",
+ "temps-dns",
+ "temps-entities",
+ "temps-routes",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-kv"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -15698,6 +15736,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "sysinfo",
  "tar",
  "tempfile",
  "temps-agents",

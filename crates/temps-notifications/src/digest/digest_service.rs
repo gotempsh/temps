@@ -479,7 +479,9 @@ impl DigestService {
 
         // Health-check based uptime. `external_service_health_checks.status`
         // is "operational" | "degraded" | "down". Uptime = share of checks
-        // that were operational; failed = degraded + down.
+        // that were operational; failed = degraded + down. A week with no
+        // checks has no uptime figure: reporting 100% would claim the
+        // services were verified up when nothing looked at them.
         let (uptime_percentage, failed_health_checks) = {
             let stmt = Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -499,14 +501,12 @@ impl DigestService {
                     let failed: i64 = row.try_get("", "failed").unwrap_or(0);
                     let total: f64 = row.try_get("", "total").unwrap_or(0.0);
                     if total > 0.0 {
-                        ((operational / total) * 100.0, failed)
+                        (Some((operational / total) * 100.0), failed)
                     } else {
-                        // No health checks recorded — report 100% rather than
-                        // a fabricated 99.9, and zero failures.
-                        (100.0, 0)
+                        (None, 0)
                     }
                 }
-                None => (100.0, 0),
+                None => (None, 0),
             }
         };
 
@@ -872,11 +872,7 @@ impl DigestService {
             .map(|e| e.new_error_types)
             .unwrap_or(0);
 
-        let uptime_percent = digest
-            .errors
-            .as_ref()
-            .map(|e| e.uptime_percentage)
-            .unwrap_or(100.0);
+        let uptime_percent = digest.errors.as_ref().and_then(|e| e.uptime_percentage);
 
         Ok(ExecutiveSummary {
             total_visitors,
@@ -1535,12 +1531,13 @@ mod tests {
             .expect("Failed to aggregate error data");
 
         // With no error events and no health checks, the digest must report
-        // zeros and 100% uptime — never the old fabricated 99.9%.
+        // zeros and no uptime figure — neither the old fabricated 99.9% nor a
+        // 100% that claims services were verified up when nothing checked.
         assert_eq!(errors.total_errors, 0);
         assert_eq!(errors.new_error_types, 0);
         assert_eq!(errors.affected_users, 0);
         assert_eq!(errors.failed_health_checks, 0);
-        assert_eq!(errors.uptime_percentage, 100.0);
+        assert_eq!(errors.uptime_percentage, None);
         assert!(errors.most_common_errors.is_empty());
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
@@ -1644,8 +1641,8 @@ mod tests {
         assert_eq!(errors.affected_users, 2);
         assert_eq!(errors.most_common_errors.len(), 1);
         assert_eq!(errors.most_common_errors[0].count, 3);
-        // No health checks recorded → 100% uptime, not a fabricated value.
-        assert_eq!(errors.uptime_percentage, 100.0);
+        // No health checks recorded → no uptime figure, not a fabricated one.
+        assert_eq!(errors.uptime_percentage, None);
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");
     }
@@ -1691,7 +1688,8 @@ mod tests {
             .await
             .expect("Failed to aggregate error data");
 
-        assert!((errors.uptime_percentage - 80.0).abs() < 0.01);
+        let uptime = errors.uptime_percentage.expect("health checks ran");
+        assert!((uptime - 80.0).abs() < 0.01);
         assert_eq!(errors.failed_health_checks, 2);
 
         test_db.cleanup_all_tables().await.expect("Cleanup failed");

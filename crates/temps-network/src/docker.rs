@@ -30,14 +30,15 @@ const NETWORK_OWNER_VALUE: &str = "multi-node-overlay";
 /// an overlapping address range. Docker rejects these late with a generic
 /// `invalid pool request`; this turns it into an actionable, named conflict.
 ///
-/// Preflights the complete cluster pool, not only this node's allocation.
-/// Every node installs routes for peer subnets, so a local Docker network
-/// overlapping any part of the pool can black-hole a future peer.
-pub async fn preflight_network_for_pool(
+/// Checks the subnets this node routes on the overlay (`routed`: its own and
+/// every peer's), not the whole cluster pool (ADR 056). A Docker network
+/// elsewhere in the pool cannot black-hole anything this node sends; a new
+/// peer is allocated around the ranges this node reports as occupied.
+pub async fn preflight_network_for_subnets(
     docker: &Docker,
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    compute_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> crate::Result<()> {
     let desired_subnet = alloc.compute_cidr.to_string();
     let desired_gateway = alloc.bridge_address.to_string();
@@ -68,8 +69,11 @@ pub async fn preflight_network_for_pool(
                 return Err(NetworkError::InterfaceConflict {
                     name,
                     reason: format!(
-                        "existing Temps-owned Docker network does not use authoritative subnet {} and gateway {}",
-                        alloc.compute_cidr, alloc.bridge_address
+                        "existing Temps-owned Docker network does not use authoritative subnet {} \
+                         and gateway {}; the node's allocation changed. Remove it (`docker network \
+                         rm {}` after disconnecting its containers) so it is recreated on the new \
+                         subnet",
+                        alloc.compute_cidr, alloc.bridge_address, config.docker_network_name
                     ),
                 });
             }
@@ -83,9 +87,9 @@ pub async fn preflight_network_for_pool(
             let Ok(existing_cidr) = Ipv4Net::from_str(&raw) else {
                 continue;
             };
-            if cidrs_overlap(&compute_pool, &existing_cidr) {
+            if let Some(subnet) = routed_overlap(routed, &existing_cidr) {
                 return Err(NetworkError::DockerCidrCollision {
-                    cidr: compute_pool,
+                    cidr: subnet,
                     existing_cidr,
                     existing_network: name,
                     desired_network: config.docker_network_name.clone(),
@@ -94,6 +98,50 @@ pub async fn preflight_network_for_pool(
         }
     }
     Ok(())
+}
+
+/// The first routed subnet `existing` overlaps, in either direction.
+fn routed_overlap(routed: &[Ipv4Net], existing: &Ipv4Net) -> Option<Ipv4Net> {
+    routed
+        .iter()
+        .copied()
+        .find(|subnet| cidrs_overlap(subnet, existing))
+}
+
+/// Every Docker network's IPv4 subnets except `owned_network`'s, as occupied
+/// ranges (ADR 056).
+pub async fn occupied_docker_subnets(
+    docker: &Docker,
+    owned_network: &str,
+) -> crate::Result<Vec<crate::occupied::OccupiedRange>> {
+    let networks = docker
+        .list_networks(None::<ListNetworksOptions>)
+        .await
+        .map_err(|error| NetworkError::Docker {
+            op: "list_networks",
+            network: owned_network.to_owned(),
+            reason: error.to_string(),
+        })?;
+    let mut ranges = Vec::new();
+    for network in networks {
+        let Some(name) = network.name else {
+            continue;
+        };
+        if name == owned_network {
+            continue;
+        }
+        let subnets = network
+            .ipam
+            .and_then(|ipam| ipam.config)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.subnet)
+            .filter_map(|raw| Ipv4Net::from_str(&raw).ok());
+        for cidr in subnets {
+            ranges.push(crate::occupied::OccupiedRange::docker(cidr, name.clone()));
+        }
+    }
+    Ok(ranges)
 }
 
 /// Verify that a pre-existing Docker network is the overlay created and
@@ -153,20 +201,20 @@ pub async fn ensure_network(
     config: &NetworkConfig,
     alloc: &NodeAlloc,
 ) -> crate::Result<String> {
-    ensure_network_for_pool(docker, config, alloc, alloc.compute_cidr).await
+    ensure_network_for_subnets(docker, config, alloc, &[alloc.compute_cidr]).await
 }
 
-/// Ensure the local Docker network while fencing against every subnet in the
-/// authoritative cluster pool. Use this in multi-node setup/reconciliation;
-/// the narrower [`ensure_network`] wrapper remains for single-allocation
-/// callers and backwards compatibility.
-pub async fn ensure_network_for_pool(
+/// Ensure the local Docker network while fencing against every subnet this
+/// node routes on the overlay (its own and its peers'). Use this in multi-node
+/// setup/reconciliation; the narrower [`ensure_network`] wrapper remains for
+/// single-allocation callers and backwards compatibility.
+pub async fn ensure_network_for_subnets(
     docker: &Docker,
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    compute_pool: Ipv4Net,
+    routed: &[Ipv4Net],
 ) -> crate::Result<String> {
-    preflight_network_for_pool(docker, config, alloc, compute_pool).await?;
+    preflight_network_for_subnets(docker, config, alloc, routed).await?;
     // 1. Inspect existing networks to detect collisions and short-circuit
     //    when our network already exists in a compatible state.
     let networks = docker
@@ -199,9 +247,9 @@ pub async fn ensure_network_for_pool(
             let Ok(existing_cidr) = Ipv4Net::from_str(cidr) else {
                 continue;
             };
-            if cidrs_overlap(&compute_pool, &existing_cidr) {
+            if let Some(subnet) = routed_overlap(routed, &existing_cidr) {
                 return Err(NetworkError::DockerCidrCollision {
-                    cidr: compute_pool,
+                    cidr: subnet,
                     existing_cidr,
                     existing_network: name,
                     desired_network: config.docker_network_name.clone(),
@@ -343,37 +391,7 @@ async fn recreate_for_new_mtu(
     previous_mtu: Option<String>,
 ) -> crate::Result<String> {
     let name = config.docker_network_name.as_str();
-    let docker_error = |op: &'static str| {
-        move |error: bollard::errors::Error| NetworkError::Docker {
-            op,
-            network: name.to_string(),
-            reason: error.to_string(),
-        }
-    };
-    let members = docker
-        .list_containers(Some(ListContainersOptions {
-            all: true,
-            filters: Some(HashMap::from([(
-                "network".to_string(),
-                vec![name.to_string()],
-            )])),
-            ..Default::default()
-        }))
-        .await
-        .map_err(docker_error("list_containers"))?;
-    let mut attachments: Vec<(String, EndpointSettings)> = Vec::new();
-    for member in members {
-        let Some(id) = member.id else { continue };
-        let endpoint = docker
-            .inspect_container(&id, None::<InspectContainerOptions>)
-            .await
-            .map_err(docker_error("inspect_container"))?
-            .network_settings
-            .and_then(|settings| settings.networks)
-            .and_then(|mut networks| networks.remove(name))
-            .unwrap_or_default();
-        attachments.push((id, endpoint));
-    }
+    let attachments = owned_network_members(docker, name).await?;
     let want_mtu = config.transport.bridge_mtu(config.underlay_mtu);
     warn!(
         network = %name,
@@ -382,22 +400,7 @@ async fn recreate_for_new_mtu(
         containers = attachments.len(),
         "overlay MTU changed; recreating the Docker network and reattaching its containers"
     );
-    for (container, _) in &attachments {
-        docker
-            .disconnect_network(
-                name,
-                NetworkDisconnectRequest {
-                    container: container.clone(),
-                    force: Some(true),
-                },
-            )
-            .await
-            .map_err(docker_error("disconnect_network"))?;
-    }
-    docker
-        .remove_network(name)
-        .await
-        .map_err(docker_error("remove_network"))?;
+    detach_and_remove(docker, name, &attachments).await?;
     let id = create_owned_network(docker, config, alloc).await?;
 
     let mut failed = Vec::new();
@@ -437,6 +440,187 @@ async fn recreate_for_new_mtu(
     }
     info!(network = %name, mtu = want_mtu, "overlay Docker network recreated with the new MTU");
     Ok(id)
+}
+
+/// Every container attached to `name`, running or stopped, with the endpoint
+/// it is attached with.
+async fn owned_network_members(
+    docker: &Docker,
+    name: &str,
+) -> crate::Result<Vec<(String, EndpointSettings)>> {
+    let docker_error = |op: &'static str| {
+        move |error: bollard::errors::Error| NetworkError::Docker {
+            op,
+            network: name.to_string(),
+            reason: error.to_string(),
+        }
+    };
+    let members = docker
+        .list_containers(Some(ListContainersOptions {
+            all: true,
+            filters: Some(HashMap::from([(
+                "network".to_string(),
+                vec![name.to_string()],
+            )])),
+            ..Default::default()
+        }))
+        .await
+        .map_err(docker_error("list_containers"))?;
+    let mut attachments = Vec::new();
+    for member in members {
+        let Some(id) = member.id else { continue };
+        let endpoint = docker
+            .inspect_container(&id, None::<InspectContainerOptions>)
+            .await
+            .map_err(docker_error("inspect_container"))?
+            .network_settings
+            .and_then(|settings| settings.networks)
+            .and_then(|mut networks| networks.remove(name))
+            .unwrap_or_default();
+        attachments.push((id, endpoint));
+    }
+    Ok(attachments)
+}
+
+/// Detach `attachments` from `name`, then remove the network.
+async fn detach_and_remove(
+    docker: &Docker,
+    name: &str,
+    attachments: &[(String, EndpointSettings)],
+) -> crate::Result<()> {
+    let docker_error = |op: &'static str| {
+        move |error: bollard::errors::Error| NetworkError::Docker {
+            op,
+            network: name.to_string(),
+            reason: error.to_string(),
+        }
+    };
+    for (container, _) in attachments {
+        docker
+            .disconnect_network(
+                name,
+                NetworkDisconnectRequest {
+                    container: container.clone(),
+                    force: Some(true),
+                },
+            )
+            .await
+            .map_err(docker_error("disconnect_network"))?;
+    }
+    docker
+        .remove_network(name)
+        .await
+        .map_err(docker_error("remove_network"))
+}
+
+/// A container taken off the overlay network when this node's allocation
+/// moved, with the aliases it rejoins with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetachedMember {
+    pub container: String,
+    pub aliases: Option<Vec<String>>,
+}
+
+/// Retire the overlay network because the control plane moved this node's
+/// allocation (ADR 056). Docker cannot change a network's subnet, and the old
+/// one is no longer this node's, so detach every member and remove the
+/// network; the caller recreates it on the new subnet and passes `queue` to
+/// [`reattach_members`]. Each member is added to `queue` before it is
+/// detached, so one detached before a later failure is still reattached once
+/// a retry succeeds. Refuses a network Temps does not own. A missing network
+/// has no members.
+pub async fn retire_network_for_move(
+    docker: &Docker,
+    config: &NetworkConfig,
+    queue: &mut Vec<DetachedMember>,
+) -> crate::Result<()> {
+    let name = config.docker_network_name.as_str();
+    match docker
+        .inspect_network(name, None::<InspectNetworkOptions>)
+        .await
+    {
+        Ok(_) => {}
+        Err(bollard::errors::Error::DockerResponseServerError {
+            status_code: 404, ..
+        }) => return Ok(()),
+        Err(error) => {
+            return Err(NetworkError::Docker {
+                op: "inspect_network",
+                network: name.to_string(),
+                reason: error.to_string(),
+            })
+        }
+    }
+    validate_owned_network(docker, config).await?;
+    let attachments = owned_network_members(docker, name).await?;
+    for (container, endpoint) in &attachments {
+        if !queue.iter().any(|queued| &queued.container == container) {
+            queue.push(DetachedMember {
+                container: container.clone(),
+                aliases: endpoint.aliases.clone(),
+            });
+        }
+    }
+    warn!(
+        network = %name,
+        containers = attachments.len(),
+        "overlay allocation moved; removing the Docker network so it is recreated on the new subnet"
+    );
+    detach_and_remove(docker, name, &attachments).await
+}
+
+/// Attach containers removed by [`retire_network_for_move`] to the recreated
+/// network with their aliases. Their old addresses belonged to the previous
+/// subnet, so Docker assigns new ones. A container that no longer exists is
+/// dropped. `members` keeps only the containers that could not rejoin, so a
+/// retry does not reconnect the ones that did.
+pub async fn reattach_members(
+    docker: &Docker,
+    config: &NetworkConfig,
+    members: &mut Vec<DetachedMember>,
+) -> crate::Result<()> {
+    let name = config.docker_network_name.as_str();
+    let total = members.len();
+    let mut failed = Vec::new();
+    for member in members.drain(..) {
+        let request = NetworkConnectRequest {
+            container: member.container.clone(),
+            endpoint_config: Some(EndpointSettings {
+                aliases: member.aliases.clone(),
+                ..Default::default()
+            }),
+        };
+        match docker.connect_network(name, request).await {
+            Ok(()) => {}
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                debug!(network = %name, container = %member.container, "detached container is gone; nothing to reattach")
+            }
+            Err(error) => {
+                warn!(network = %name, container = %member.container, error = %error, "could not reattach container to the moved overlay network");
+                failed.push(member);
+            }
+        }
+    }
+    if failed.is_empty() {
+        info!(network = %name, containers = total, "containers rejoined the overlay network on its new subnet");
+        return Ok(());
+    }
+    let names = failed
+        .iter()
+        .map(|member| member.container.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let count = failed.len();
+    *members = failed;
+    Err(NetworkError::Docker {
+        op: "connect_network",
+        network: name.to_string(),
+        reason: format!(
+            "the overlay moved to a new subnet but {count} container(s) could not rejoin it yet: {names}; retrying, or redeploy them"
+        ),
+    })
 }
 
 fn cidrs_overlap(left: &Ipv4Net, right: &Ipv4Net) -> bool {
@@ -504,6 +688,28 @@ mod tests {
         let requested: Ipv4Net = "172.20.255.0/24".parse().expect("valid node subnet");
         assert!(cidrs_overlap(&requested, &existing));
         assert!(cidrs_overlap(&existing, &requested));
+    }
+
+    #[test]
+    fn only_routed_subnets_are_checked_against_docker_networks() {
+        let routed: [Ipv4Net; 2] = [
+            "10.202.0.0/24".parse().unwrap(),
+            "10.202.1.0/24".parse().unwrap(),
+        ];
+        // A Compose network elsewhere in the cluster pool is fine.
+        assert_eq!(
+            routed_overlap(&routed, &"10.202.9.0/24".parse().unwrap()),
+            None
+        );
+        // One over a peer's subnet, or covering all of them, is not.
+        assert_eq!(
+            routed_overlap(&routed, &"10.202.1.0/24".parse().unwrap()),
+            Some(routed[1])
+        );
+        assert_eq!(
+            routed_overlap(&routed, &"10.0.0.0/8".parse().unwrap()),
+            Some(routed[0])
+        );
     }
 
     #[test]

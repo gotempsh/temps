@@ -45,7 +45,7 @@ export function workerIngressStatus(
     return {
       label: 'Waiting for worker',
       description:
-        'This worker has not reported ingress support. Configure its public listener using the steps below; older workers also need an agent upgrade and ingress key enrollment.',
+        'This worker has not reported ingress support yet. Choose where it listens below; a worker on an older Temps needs an upgrade first.',
     }
   }
   if (!node.public_ingress_running) {
@@ -82,3 +82,68 @@ export function workerIngressStatus(
       'The worker reports public listeners and certificates. Verify your domain from outside the cluster before switching production traffic.',
   }
 }
+
+export type AddressScope = 'public' | 'private' | 'cgnat' | 'local'
+
+/** Who can reach an address; mirrors `temps_core::worker_ingress::address_scope`. */
+export function addressScope(address: string): AddressScope | undefined {
+  const v4 = address.trim().match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  if (v4) {
+    const [a, b, c] = v4.slice(1, 4).map(Number)
+    if (v4.slice(1).some((part) => Number(part) > 255)) return undefined
+    if (
+      a === 0 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      a >= 224 ||
+      (a === 192 && b === 0 && c === 2) ||
+      (a === 198 && b === 51 && c === 100) ||
+      (a === 203 && b === 0 && c === 113)
+    )
+      return 'local'
+    if (a === 100 && b >= 64 && b < 128) return 'cgnat'
+    if (
+      a === 10 ||
+      (a === 172 && b >= 16 && b < 32) ||
+      (a === 192 && b === 168)
+    )
+      return 'private'
+    return 'public'
+  }
+  if (!address.includes(':')) return undefined
+  const lower = address.trim().toLowerCase()
+  if (lower === '::1' || lower === '::' || lower.startsWith('ff'))
+    return 'local'
+  if (/^fe[89ab]/.test(lower) || lower.startsWith('2001:db8')) return 'local'
+  if (/^f[cd]/.test(lower)) return 'private'
+  return 'public'
+}
+
+export function scopeLabel(scope: AddressScope): string {
+  switch (scope) {
+    case 'public':
+      return 'public'
+    case 'private':
+      return 'private (behind NAT)'
+    case 'cgnat':
+      return 'carrier-grade NAT'
+    case 'local':
+      return 'local only'
+  }
+}
+
+/**
+ * What a new worker allows, chosen in Add worker and passed to `temps join`.
+ * Only the worker can change it afterwards (`temps agent ingress`).
+ */
+export type JoinIngressChoice = 'off' | 'delegated' | 'fixed'
+
+export function joinIngressFlag(choice: JoinIngressChoice): string {
+  return choice === 'off' ? '' : ` --ingress ${choice}`
+}
+
+/** The commands, run on the worker, that let it take public traffic. */
+export const ALLOW_INGRESS_COMMANDS = {
+  delegated: 'temps agent ingress delegated',
+  fixed: 'temps agent ingress fixed --listen auto',
+} as const

@@ -831,7 +831,7 @@ export function EnvironmentConfigurationCard({
               take a build, it runs on the control plane when local builds are
               enabled, and the build log says why. CI uses the configured GitHub
               Actions runner and never falls back locally.{' '}
-              <Link to="/settings/nodes#ci-builder" className="underline">
+              <Link to="/settings/build-limits#ci-builder" className="underline">
                 Configure CI builder
               </Link>
               .

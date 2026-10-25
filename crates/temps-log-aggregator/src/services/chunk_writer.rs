@@ -1575,10 +1575,15 @@ mod tests {
         context.register_service(storage);
         context.register_service(index);
         context.register_service(Arc::new(ChunkCache::open(None, 1024).await.unwrap()));
+        let ingest_budget = Arc::new(crate::services::IngestBudget::new(
+            crate::services::IngestLimits::UNLIMITED,
+        ));
+        context.register_service(ingest_budget.clone());
         context.register_service(Arc::new(crate::services::CollectorService::new(
             docker,
             writer.clone(),
             metadata.clone(),
+            ingest_budget,
             100,
         )));
         context.register_service(Arc::new(

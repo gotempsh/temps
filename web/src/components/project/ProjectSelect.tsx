@@ -32,6 +32,8 @@ interface ProjectSelectProps {
   onValueChange: (projectId: number | null) => void
   /** Show the "All projects" row. Off for pickers that require a project. */
   allowAll?: boolean
+  /** Text of the `null` row and trigger, when it means more than a filter. */
+  allLabel?: string
   /** Project ids to omit from the list, e.g. ones already assigned elsewhere. */
   excludeIds?: number[]
   placeholder?: string
@@ -54,6 +56,7 @@ export function ProjectSelect({
   value,
   onValueChange,
   allowAll = true,
+  allLabel = 'All services',
   excludeIds,
   placeholder = 'Select service…',
   disabled,
@@ -134,7 +137,7 @@ export function ProjectSelect({
   const triggerLabel =
     value == null
       ? allowAll
-        ? 'All services'
+        ? allLabel
         : placeholder
       : (selected?.name ?? placeholder)
 
@@ -230,7 +233,7 @@ export function ProjectSelect({
                           value == null ? 'opacity-100' : 'opacity-0'
                         )}
                       />
-                      <span className="truncate">All services</span>
+                      <span className="truncate">{allLabel}</span>
                     </CommandItem>
                   </CommandGroup>
                 )}

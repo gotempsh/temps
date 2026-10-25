@@ -387,7 +387,10 @@ pub struct StatusPageOverview {
 pub struct MonitorStatus {
     pub monitor: MonitorResponse,
     pub current_status: String,
-    pub uptime_percentage: f64,
+    /// Share of the last 30 days' *monitored* time the endpoint was
+    /// operational. `None` when no check covered any of that time -- "no
+    /// data" is not "100% up".
+    pub uptime_percentage: Option<f64>,
     pub avg_response_time_ms: Option<i32>,
 }
 
@@ -410,10 +413,23 @@ pub struct UptimeDataPoint {
 pub struct CurrentStatusResponse {
     pub monitor_id: i32,
     pub current_status: String, // "operational", "degraded", "down", or "unknown"
-    pub uptime_percentage: f64, // Uptime for the requested timeframe
+    /// Share of the window's *monitored* time the endpoint was operational,
+    /// weighted by time rather than by check count. Stretches no check covered
+    /// (Temps or its scheduler was down, the deployment was paused, ...) are
+    /// excluded from the denominator and reported in `unknown_seconds`
+    /// instead of silently counting as up. `None` when nothing in the window
+    /// was monitored.
+    pub uptime_percentage: Option<f64>,
     pub avg_response_time_ms: Option<f64>,
     #[schema(value_type = Option<String>, format = "date-time")]
     pub last_check_at: Option<UtcDateTime>,
+    /// Seconds of the window covered by a check result.
+    pub monitored_seconds: i64,
+    /// Seconds of the window covered by a non-operational check result.
+    pub downtime_seconds: i64,
+    /// Seconds of the window (after the monitor was created, up to now) that
+    /// no check covered, so Temps cannot say whether the endpoint was up.
+    pub unknown_seconds: i64,
 }
 
 /// Health summary for a single project based on its production monitors
@@ -438,12 +454,17 @@ pub struct StatusBucketedResponse {
 pub struct StatusBucket {
     #[schema(value_type = String, format = "date-time")]
     pub bucket_start: chrono::DateTime<Utc>,
-    pub status: String, // "operational", "degraded", or "down"
+    /// "operational", "degraded", "down", or "unknown" -- the last for a
+    /// bucket no check landed in. Every bucket of the requested range is
+    /// returned, so a stretch without checks shows up as "unknown" rather than
+    /// disappearing from the timeline.
+    pub status: String,
     pub total_checks: i64,
     pub operational_count: i64,
     pub degraded_count: i64,
     pub down_count: i64,
-    pub uptime_percentage: f64,
+    /// `None` for a bucket without checks.
+    pub uptime_percentage: Option<f64>,
     pub avg_response_time_ms: Option<f64>,
     pub min_response_time_ms: Option<f64>,
     pub max_response_time_ms: Option<f64>,

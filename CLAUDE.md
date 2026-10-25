@@ -3,6 +3,10 @@
 Guidance for Claude Code when working with the Temps codebase.
 **Core philosophy: code that works safely, and when it fails, explains why comprehensively.**
 
+Before opening a PR, read [`REVIEW.md`](./REVIEW.md): the recurring review findings
+(authorization scope, secrets in logs, stale writes, cancellation and cleanup,
+resource limits, migrations) and a pre-PR checklist.
+
 ## Critical Rules
 
 ### NEVER
@@ -46,6 +50,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Run `cargo check --lib` after every modification
 - New functionality must compile without warnings
 - Write tests for all new functionality AND verify they run successfully
+- Ship the test in the same PR as the behavior change; "verified manually" does not count -- see [`REVIEW.md`](./REVIEW.md)
 - Use structured logging with explicit log levels
 - Use Conventional Commits: `type(scope): description`
 - Use services for all business logic
@@ -921,6 +926,8 @@ cargo build --bin temps                      # Debug build (skips web UI)
 cargo build --release --bin temps            # Release build (includes web UI)
 FORCE_WEB_BUILD=1 cargo build               # Debug with web UI
 ```
+
+**Shared build cache**: to reuse compiled dependencies across machines and agent worktrees, see [`docs/testing/build-cache.md`](./docs/testing/build-cache.md) (sccache with local disk or S3; optional, not used by CI).
 
 **Build discipline**: Only run `cargo build`/`cargo check` when at least 99% confident the code will compile. Fix all warnings before considering work complete.
 

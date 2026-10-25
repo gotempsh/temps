@@ -39,6 +39,7 @@ pub async fn bootstrap(
                 &handle,
                 &config.vxlan_dev_name,
                 &config.underlay_dev,
+                alloc.underlay_address,
                 vni,
                 port,
                 config.transport.bridge_mtu(config.underlay_mtu),
@@ -252,16 +253,23 @@ pub async fn detect_device_for_address(address: IpAddr) -> crate::Result<String>
     })
 }
 
-/// Reject an overlay pool that would shadow an existing host/VLAN/VPN route.
-/// Routes owned by the configured Temps bridge/VXLAN are accepted so an
-/// idempotent restart can reconcile an already-running overlay.
-pub async fn preflight_compute_pool_routes(
+/// Reject overlay subnets that would shadow an existing host/VLAN/VPN route.
+///
+/// `routed` is what this host actually routes on the overlay: its own subnet
+/// and every peer's (ADR 056). A route elsewhere in the cluster pool is not a
+/// collision; a route over one of these subnets, or one covering it such as
+/// `10.0.0.0/8`, is. Routes owned by the configured Temps bridge/VXLAN are
+/// accepted so an idempotent restart can reconcile a running overlay.
+pub async fn preflight_compute_routes(
     config: &NetworkConfig,
-    pool: ipnet::Ipv4Net,
+    routed: &[ipnet::Ipv4Net],
 ) -> crate::Result<()> {
-    match route_overlapping(pool, &[&config.bridge_name, &config.vxlan_dev_name]).await? {
-        Some((existing_cidr, device)) => Err(NetworkError::HostRouteCollision {
-            pool,
+    if routed.is_empty() {
+        return Ok(());
+    }
+    match route_overlapping(routed, &[&config.bridge_name, &config.vxlan_dev_name]).await? {
+        Some((subnet, existing_cidr, device)) => Err(NetworkError::HostRouteCollision {
+            subnet,
             existing_cidr,
             device,
         }),
@@ -273,8 +281,8 @@ pub async fn preflight_compute_pool_routes(
 /// The mesh interface's own connected route is accepted, so a restart of an
 /// already-running mesh passes.
 pub async fn preflight_mesh_routes(pool: ipnet::Ipv4Net) -> crate::Result<()> {
-    match route_overlapping(pool, &[crate::mesh::MESH_INTERFACE]).await? {
-        Some((existing_cidr, device)) => Err(NetworkError::MeshRouteCollision {
+    match route_overlapping(&[pool], &[crate::mesh::MESH_INTERFACE]).await? {
+        Some((_, existing_cidr, device)) => Err(NetworkError::MeshRouteCollision {
             pool,
             existing_cidr,
             device,
@@ -283,16 +291,66 @@ pub async fn preflight_mesh_routes(pool: ipnet::Ipv4Net) -> crate::Result<()> {
     }
 }
 
-/// The first IPv4 route (any table) overlapping `pool` that is not on one of
-/// `owned_devices`.
+/// The first IPv4 route (any table) overlapping one of `targets` that is not
+/// on one of `owned_devices`, with the target it overlaps.
 ///
 /// The dump is streamed: each route is judged as it arrives and the walk stops
 /// at the first collision, so memory does not grow with the host's route count
 /// (a router or VPN concentrator can carry hundreds of thousands).
 async fn route_overlapping(
-    pool: ipnet::Ipv4Net,
+    targets: &[ipnet::Ipv4Net],
     owned_devices: &[&str],
-) -> crate::Result<Option<(ipnet::Ipv4Net, String)>> {
+) -> crate::Result<Option<(ipnet::Ipv4Net, ipnet::Ipv4Net, String)>> {
+    let mut found = None;
+    walk_unicast_routes(
+        |existing| {
+            targets.iter().find_map(|target| {
+                overlapping_prefix(*target, Some(existing.network()), existing.prefix_len())
+                    .map(|_| *target)
+            })
+        },
+        |target, existing, device| match unowned_collision(existing, device, owned_devices) {
+            Some((existing, device)) => {
+                found = Some((target, existing, device));
+                false
+            }
+            None => true,
+        },
+    )
+    .await?;
+    Ok(found)
+}
+
+/// Every unicast route on a device not in `owned_devices` that could collide
+/// with a compute pool (RFC 1918, not default, not /32), for the occupied
+/// ranges a node reports (ADR 056). Stops collecting at a bound well above
+/// what is stored, so a full routing table cannot grow memory.
+pub async fn occupied_routes(
+    owned_devices: &[&str],
+) -> crate::Result<Vec<crate::occupied::OccupiedRange>> {
+    const COLLECT_BOUND: usize = crate::occupied::MAX_OCCUPIED_RANGES * 16;
+    let mut ranges = Vec::new();
+    walk_unicast_routes(
+        |existing| crate::occupied::is_reportable(&existing).then_some(existing),
+        |_, existing, device| {
+            if let Some((cidr, device)) = unowned_collision(existing, device, owned_devices) {
+                ranges.push(crate::occupied::OccupiedRange::route(cidr, device));
+            }
+            ranges.len() < COLLECT_BOUND
+        },
+    )
+    .await?;
+    Ok(ranges)
+}
+
+/// Stream every IPv4 unicast route (all tables). `select` judges the prefix
+/// first (default and /32 routes never reach it) and returns a tag for the
+/// routes worth a device lookup; `visit` receives the tag, the prefix and the
+/// device and returns whether to keep walking.
+async fn walk_unicast_routes<T>(
+    mut select: impl FnMut(ipnet::Ipv4Net) -> Option<T>,
+    mut visit: impl FnMut(T, ipnet::Ipv4Net, Option<&str>) -> bool,
+) -> crate::Result<()> {
     use futures::TryStreamExt;
     use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteType};
     use rtnetlink::RouteMessageBuilder;
@@ -311,9 +369,9 @@ async fn route_overlapping(
         .execute();
 
     while let Some(message) = routes.try_next().await.map_err(listing_error)? {
-        // Only connected/static unicast routes can shadow the pool. `local`,
+        // Only connected/static unicast routes can shadow a subnet. `local`,
         // `broadcast`, `multicast`, `unreachable` and friends are not routes
-        // a packet to the pool would take.
+        // a packet to the overlay would take.
         if message.header.kind != RouteType::Unicast {
             continue;
         }
@@ -321,11 +379,13 @@ async fn route_overlapping(
             RouteAttribute::Destination(RouteAddress::Inet(address)) => Some(*address),
             _ => None,
         });
-        // Judge the prefix first: almost every route on a busy host cannot
-        // overlap, and those never cost a device-name lookup.
-        let Some(existing) =
-            overlapping_prefix(pool, destination, message.header.destination_prefix_length)
+        let Some(existing) = route_prefix(destination, message.header.destination_prefix_length)
         else {
+            continue;
+        };
+        // Judge the prefix first: almost every route on a busy host cannot
+        // matter, and those never cost a device-name lookup.
+        let Some(tag) = select(existing) else {
             continue;
         };
         let device = match message.attributes.iter().find_map(|attr| match attr {
@@ -337,12 +397,22 @@ async fn route_overlapping(
                 .unwrap_or(None),
             None => None,
         };
-        if let Some(collision) = unowned_collision(existing, device.as_deref(), owned_devices) {
-            return Ok(Some(collision));
+        if !visit(tag, existing, device.as_deref()) {
+            break;
         }
     }
 
-    Ok(None)
+    Ok(())
+}
+
+/// A route's destination as a network, or `None` for default and host (/32)
+/// routes, which are never reported.
+fn route_prefix(destination: Option<std::net::Ipv4Addr>, prefix_len: u8) -> Option<ipnet::Ipv4Net> {
+    let destination = destination?;
+    if prefix_len == 0 || prefix_len >= 32 {
+        return None;
+    }
+    ipnet::Ipv4Net::new(destination, prefix_len).ok()
 }
 
 /// The route's prefix as a network when it overlaps `pool`, else `None`.
@@ -410,10 +480,77 @@ mod tests {
         owned_devices: &[&str],
         routes: &[TestRoute],
     ) -> Option<(ipnet::Ipv4Net, String)> {
+        first_routed_collision(&[pool], owned_devices, routes)
+            .map(|(_, existing, device)| (existing, device))
+    }
+
+    /// The same check against several routed subnets, as the overlay
+    /// preflight runs it.
+    fn first_routed_collision(
+        targets: &[ipnet::Ipv4Net],
+        owned_devices: &[&str],
+        routes: &[TestRoute],
+    ) -> Option<(ipnet::Ipv4Net, ipnet::Ipv4Net, String)> {
         routes.iter().find_map(|(destination, prefix_len, device)| {
-            let existing = overlapping_prefix(pool, *destination, *prefix_len)?;
-            unowned_collision(existing, device.as_deref(), owned_devices)
+            let existing = route_prefix(*destination, *prefix_len)?;
+            let target = targets.iter().find_map(|target| {
+                overlapping_prefix(*target, Some(existing.network()), existing.prefix_len())
+                    .map(|_| *target)
+            })?;
+            let (existing, device) = unowned_collision(existing, device.as_deref(), owned_devices)?;
+            Some((target, existing, device))
         })
+    }
+
+    #[test]
+    fn a_route_elsewhere_in_the_pool_does_not_collide_with_routed_subnets() {
+        // ADR 056: the pool is 10.202.0.0/16, this node routes its own /24
+        // and one peer's. A Compose network at 10.202.9.0/24 is irrelevant.
+        let routed: [ipnet::Ipv4Net; 2] = [
+            "10.202.0.0/24".parse().unwrap(),
+            "10.202.1.0/24".parse().unwrap(),
+        ];
+        let routes = [route("10.202.9.0/24", "br-f6051ccc7abf")];
+        assert_eq!(
+            first_routed_collision(&routed, &["br-temps0"], &routes),
+            None
+        );
+    }
+
+    #[test]
+    fn a_route_over_the_own_or_a_peer_subnet_collides() {
+        let routed: [ipnet::Ipv4Net; 2] = [
+            "10.202.0.0/24".parse().unwrap(),
+            "10.202.1.0/24".parse().unwrap(),
+        ];
+        let own = [route("10.202.0.0/24", "br-compose")];
+        assert_eq!(
+            first_routed_collision(&routed, &["br-temps0"], &own),
+            Some((routed[0], routed[0], "br-compose".to_owned()))
+        );
+        let peer = [route("10.202.1.128/25", "tun0")];
+        assert_eq!(
+            first_routed_collision(&routed, &["br-temps0"], &peer),
+            Some((
+                routed[1],
+                "10.202.1.128/25".parse().unwrap(),
+                "tun0".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_covering_route_collides_with_routed_subnets() {
+        let routed: [ipnet::Ipv4Net; 1] = ["10.202.0.0/24".parse().unwrap()];
+        let routes = [route("10.0.0.0/8", "wg-corp")];
+        assert_eq!(
+            first_routed_collision(&routed, &["br-temps0"], &routes),
+            Some((
+                routed[0],
+                "10.0.0.0/8".parse().unwrap(),
+                "wg-corp".to_owned()
+            ))
+        );
     }
 
     fn route(cidr: &str, device: &str) -> (Option<Ipv4Addr>, u8, Option<String>) {
@@ -506,6 +643,8 @@ mod tests {
         // A pool no sane host routes: the dump must succeed and find nothing
         // overlapping, which also exercises the rtnetlink path end to end.
         let pool: ipnet::Ipv4Net = "240.77.0.0/24".parse().unwrap();
-        assert_eq!(route_overlapping(pool, &[]).await.unwrap(), None);
+        assert_eq!(route_overlapping(&[pool], &[]).await.unwrap(), None);
+        // The occupied-range walk must also succeed without the ip binary.
+        occupied_routes(&[]).await.unwrap();
     }
 }

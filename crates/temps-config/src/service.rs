@@ -284,9 +284,9 @@ pub struct EffectiveTelemetryPolicies {
 
 /// Effective cluster-wide container-network allocation state.
 ///
-/// The pool is mutable only before the first control-plane or worker subnet is
-/// allocated. Keeping that lock state beside the values lets operator surfaces
-/// explain why an established cluster cannot be edited in place.
+/// `allocation_count` counts handed-out subnets. Since ADR 056 only the ones
+/// in use (overlay reported up) lock the pool; see
+/// `temps_network::allocator::PostgresAllocator::configure_pool`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterNetworkState {
     pub compute_pool_cidr: String,
@@ -4994,6 +4994,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
             updated_at: Utc::now(),
         }
     }

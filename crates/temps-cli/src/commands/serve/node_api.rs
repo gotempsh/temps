@@ -414,6 +414,10 @@ fn is_node_route(path: &str) -> bool {
                 | "routes/snapshot"
                 | "routes/ack"
                 | "acme-challenge"
+                | "ingress/connectors"
+                | "ingress/status"
+                | "public-ingress/key"
+                | "public-ingress/report"
         ) || route.strip_prefix("s3-credentials/").is_some_and(is_id))
 }
 

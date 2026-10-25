@@ -10,10 +10,21 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
-import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
+import { ClusterNetworkCard } from '@/components/settings/ClusterNetworkCard'
+import { useClusterNetwork } from '@/hooks/useClusterNetwork'
+import {
+  nodeOverlayStatus,
+  type ClusterNetworkNode,
+} from '@/lib/cluster-network'
+import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
@@ -37,7 +48,10 @@ import {
 } from '@/hooks/useNodeCapability'
 import {
   canAddWorkerNode,
+  nodeIsUnreachable,
+  servingOnUnreachableNode,
   shouldPromptForFirstWorkerNode,
+  type ServingOnUnreachableNode,
   unremovedNodeContainers,
   type UnremovedNodeContainers,
   WORKER_NODES_URL,
@@ -77,6 +91,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Box,
+  ChevronDown,
   Cpu,
   Globe,
   HardDrive,
@@ -85,6 +100,7 @@ import {
   MemoryStick,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Server,
   Shield,
@@ -116,6 +132,8 @@ import { client } from '@/api/client/client.gen'
 import { describeUpdatedPlacements } from '@/lib/node-placements'
 import { NodeWorkloadSettings } from '@/components/nodes/NodeWorkloadSettings'
 import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
+import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
+import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
 
 // ── Helpers ──
 
@@ -553,14 +571,37 @@ function NodeRoleDescription({ labels }: { labels: unknown }) {
 
 // ── Node Table ──
 
+/** A node's cross-node overlay (ADR 056); the cause is in the title. */
+function OverlayBadge({ node }: { node: ClusterNetworkNode | undefined }) {
+  if (!node) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  const view = nodeOverlayStatus(node)
+  const variant =
+    view.tone === 'ok'
+      ? 'success-subtle'
+      : view.tone === 'warn'
+        ? 'warning-subtle'
+        : 'neutral-subtle'
+  return (
+    <Badge variant={variant} className="text-xs" title={view.description}>
+      {view.tone === 'warn' ? 'Unavailable' : view.label}
+    </Badge>
+  )
+}
+
 function NodeTable({
   nodes,
   mesh,
+  overlay,
 }: {
   nodes: NodeInfoResponse[]
   mesh: WireguardMeshStatusResponse | undefined
+  overlay: ClusterNetworkNode[] | undefined
 }) {
   const navigate = useNavigate()
+  const overlayNodes = new Map(overlay?.map((node) => [node.id, node]))
+  const showOverlay = overlay?.some((node) => node.compute_cidr) ?? false
   const showMesh = mesh !== undefined && mesh.state !== 'disabled'
   const meshNodes = new Map(mesh?.nodes.map((node) => [node.node_id, node]))
   return (
@@ -575,6 +616,7 @@ function NodeTable({
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
+            {showOverlay && <TableHead>Cross-node</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
           </TableRow>
         </TableHeader>
@@ -653,6 +695,11 @@ function NodeTable({
                     ) : (
                       <span className="text-xs text-muted-foreground">—</span>
                     )}
+                  </TableCell>
+                )}
+                {showOverlay && (
+                  <TableCell>
+                    <OverlayBadge node={overlayNodes.get(node.id)} />
                   </TableCell>
                 )}
                 <TableCell>
@@ -945,7 +992,8 @@ export function NodeDetailPage() {
  */
 function removeNodeConsequences(
   pinnedPlacements: NodePlacementReference[] | null,
-  unremovedContainers: UnremovedNodeContainers | null
+  unremovedContainers: UnremovedNodeContainers | null,
+  servingOnGoneNode: ServingOnUnreachableNode | null
 ) {
   if (pinnedPlacements) {
     const targets = pinnedPlacements
@@ -956,6 +1004,28 @@ function removeNodeConsequences(
       )
       .join(', ')
     return `The node was not removed: it is the only target node of ${targets}. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.`
+  }
+  if (servingOnGoneNode) {
+    return (
+      <>
+        This node stopped sending heartbeats, so a drain cannot move the{' '}
+        {servingOnGoneNode.count} container(s) live deployments still have on it
+        {servingOnGoneNode.environments.length > 0 && (
+          <>
+            {' '}
+            (
+            <span className="break-words">
+              {servingOnGoneNode.environments.join(', ')}
+            </span>
+            )
+          </>
+        )}
+        . If the host still exists, start its agent and drain it instead. If it
+        is gone for good, remove it anyway: those containers are recorded as
+        orphaned, and any of these environments with no replicas on another node
+        stops serving until you redeploy it.
+      </>
+    )
   }
   if (unremovedContainers) {
     return (
@@ -999,6 +1069,10 @@ function NodeDetail({
   const [pinnedPlacements, setPinnedPlacements] = useState<
     NodePlacementReference[] | null
   >(null)
+  // Live deployments an unreachable node still serves, from a refused
+  // removal. While set, the dialog names them and offers to remove anyway.
+  const [servingOnGoneNode, setServingOnGoneNode] =
+    useState<ServingOnUnreachableNode | null>(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1111,6 +1185,13 @@ function NodeDetail({
           setShowRemoveDialog(true)
           return
         }
+        const serving = servingOnUnreachableNode(resp.error)
+        if (serving && !force) {
+          setServingOnGoneNode(serving)
+          keepDialogOpen = true
+          setShowRemoveDialog(true)
+          return
+        }
         const unremoved = unremovedNodeContainers(resp.error)
         if (unremoved && !force) {
           setUnremovedContainers(unremoved)
@@ -1146,10 +1227,21 @@ function NodeDetail({
       }
       const removal = resp.data as RemoveNodeResponse | undefined
       const orphaned = removal?.orphaned_containers ?? []
+      const lost = removal?.lost_environments ?? []
       // Environments whose target nodes listed this node no longer do; say
       // which, since a rejoined machine gets a new ID and is not targeted.
       const placements = describeUpdatedPlacements(removal?.placements_updated)
-      if (orphaned.length > 0) {
+      if (lost.length > 0) {
+        toast.warning('Node removed', {
+          description: [
+            `These environments were still serving from it; redeploy any with no replicas on another node: ${lost.join(', ')}.`,
+            'If the host comes back, remove its containers there with docker rm -f.',
+            placements,
+          ]
+            .filter(Boolean)
+            .join(' '),
+        })
+      } else if (orphaned.length > 0) {
         toast.warning('Node removed', {
           description: [
             'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
@@ -1176,6 +1268,7 @@ function NodeDetail({
         setShowRemoveDialog(false)
         setUnremovedContainers(null)
         setPinnedPlacements(null)
+        setServingOnGoneNode(null)
       }
     }
   }
@@ -1247,10 +1340,13 @@ function NodeDetail({
   const canUndrain = node.status === 'draining' || node.status === 'drained'
   // Draining does not move sandboxes; they have to be destroyed first.
   const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
+  // A node the control plane stopped hearing from can be removed whatever
+  // its status: a drain cannot finish without its agent (ADR 057).
   const removableState =
     (node.status === 'drained' &&
       (drainStatus?.remaining_containers ?? containers.length) === 0) ||
-    node.status === 'offline'
+    node.status === 'offline' ||
+    nodeIsUnreachable(node)
   const canRemove = removableState && remainingSandboxes === 0
   const blockedBySandboxes = removableState && remainingSandboxes > 0
 
@@ -1355,18 +1451,28 @@ function NodeDetail({
           if (!open) {
             setUnremovedContainers(null)
             setPinnedPlacements(null)
+            setServingOnGoneNode(null)
           }
         }}
         resourceType="node"
         resourceName={node.name}
         verb="Remove"
-        confirmLabel={unremovedContainers ? 'Remove anyway' : 'Remove node'}
+        confirmLabel={
+          unremovedContainers || servingOnGoneNode
+            ? 'Remove anyway'
+            : 'Remove node'
+        }
         consequences={removeNodeConsequences(
           pinnedPlacements,
-          unremovedContainers
+          unremovedContainers,
+          servingOnGoneNode
         )}
         isPending={removePending}
-        onConfirm={() => void handleRemove(unremovedContainers !== null)}
+        onConfirm={() =>
+          void handleRemove(
+            unremovedContainers !== null || servingOnGoneNode !== null
+          )
+        }
       />
 
       {/* Undrain confirmation dialog */}
@@ -1514,6 +1620,15 @@ function NodeDetail({
             )}
         </div>
       )}
+
+      {/* History and alerts. Always rendered: with no samples yet, or no
+          metrics store, ServerMonitoring explains what is missing. */}
+      <ServerMonitoring
+        nodeId={nodeId}
+        embedded
+        rangeParamName="metrics_range"
+      />
+      <NodeAlertRules nodeId={nodeId} />
 
       {/* Edge Analytics (only for edge nodes) */}
       {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
@@ -1832,14 +1947,24 @@ export function NodesPage() {
     isFetching: meshFetching,
   } = useWireguardMesh()
   const stranded = strandedPublicNodes(mesh)
+  const { data: clusterNetwork } = useClusterNetwork()
+  const overlayDown = (clusterNetwork?.nodes ?? []).filter(
+    (node) => nodeOverlayStatus(node).tone === 'warn'
+  )
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
   const nodeCount = nodes.length
+  // The list always includes this server itself; only workers count here.
+  const workerCount = nodes.filter((node) => node.role !== 'control-plane')
+    .length
   // "No nodes" means two very different things. With local workloads the
   // control plane runs everything itself and worker nodes are optional
   // scale-out; without them nothing can run at all and this page is the
   // onboarding step the operator must complete.
-  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, nodeCount)
+  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, workerCount)
+  // A cluster with no worker yet opens on adding one; otherwise it is a click.
+  const [addingChosen, setAdding] = useState<boolean | null>(null)
+  const adding = addingChosen ?? workerCount === 0
 
   // This list polls, so it is the first thing in the console to learn that a
   // worker finished `temps join` (or dropped out). Re-read the capability
@@ -1900,7 +2025,14 @@ export function NodesPage() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
-          <JoinTokenSection />
+          {adding ? (
+            <AddWorkerNode otherWays={<JoinTokenSection />} />
+          ) : (
+            <Button onClick={() => setAdding(true)}>
+              <Plus className="mr-1 h-4 w-4" />
+              Add a worker node
+            </Button>
+          )}
 
           <NodeStateStreamStatus />
 
@@ -1914,7 +2046,32 @@ export function NodesPage() {
               <AlertDescription className="text-amber-700 dark:text-amber-300">
                 {mesh?.state === 'starting'
                   ? 'They move onto the WireGuard mesh as soon as it is up.'
-                  : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}
+                  : 'Without the private network they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Turn it on under “Add a worker node” above.'}
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {overlayDown.length > 0 && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                Cross-node network unavailable on{' '}
+                {overlayDown.map((node) => node.name).join(', ')}
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  Their deployments keep working; containers on them cannot
+                  reach containers on other nodes, and managed-service members
+                  spanning hosts are not placed there.
+                </p>
+                <ul className="list-disc space-y-1 pl-4">
+                  {overlayDown.map((node) => (
+                    <li key={node.id} className="break-words">
+                      <span className="font-medium">{node.name}:</span>{' '}
+                      {nodeOverlayStatus(node).description}
+                    </li>
+                  ))}
+                </ul>
               </AlertDescription>
             </Alert>
           )}
@@ -1937,21 +2094,33 @@ export function NodesPage() {
               </p>
             </div>
           ) : (
-            <NodeTable nodes={nodes} mesh={mesh} />
+            <NodeTable
+              nodes={nodes}
+              mesh={mesh}
+              overlay={clusterNetwork?.nodes}
+            />
           )}
         </CardContent>
       </Card>
 
-      <MeshHubCard
-        mesh={mesh}
-        isLoading={meshLoading}
-        error={meshError}
-        onRetry={() => void refetchMesh()}
-        retrying={meshFetching}
-      />
-      <CiBuilderPanel />
-      <ClusterDnsCard />
-      <ClusterTrustCard />
+      <Collapsible>
+        <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+          <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+          Advanced: mesh hub, cluster network, DNS and trust
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-6 space-y-6">
+          <MeshHubCard
+            mesh={mesh}
+            isLoading={meshLoading}
+            error={meshError}
+            onRetry={() => void refetchMesh()}
+            retrying={meshFetching}
+          />
+          <ClusterNetworkCard />
+          <ClusterDnsCard />
+          <ClusterTrustCard />
+        </CollapsibleContent>
+      </Collapsible>
     </div>
   )
 }

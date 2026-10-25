@@ -15,7 +15,6 @@ Browse the data inside a service (tables, collections, keys, objects) — read-o
 - `tables` (`entities`) - List tables, collections, keys or objects in a container
 - `schema` (`columns`) - Show an entity's columns, types and row count
 - `rows` (`select`) - Read rows from an entity
-- `ai-access` - Show or set whether the built-in AI assistant may read this service's rows
 
 ### `data info`
 
@@ -75,16 +74,4 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `data ai-access`
-
-Show or set whether the built-in AI assistant may read this service's rows
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--enable` | Allow the built-in assistant to read row data | - | No |
-| `--disable` | Stop the built-in assistant reading row data | - | No |
 | `--json` | Output in JSON format | - | No |

@@ -133,7 +133,7 @@ Every mesh failure is reported as a state plus the action that fixes it, on both
 - **Control-plane side: the mesh status API** (`GET /nodes/wireguard`) carries per-node `checks` from what the control plane can observe (agent heartbeat, mesh key, handshake, and which end must open its port), plus hub routing once hubs exist; pairings carry their last error and, separately, their last refusal, which later "no answer" attempts do not overwrite. The Worker Nodes page shows each failing check with its fix ("What to fix"). CLI: `bunx @temps-sdk/cli nodes mesh doctor` (exits 1 when a check fails).
 - The existing `temps doctor` runs the node-side mesh checks when the mesh is enabled.
 
-### D10. Retire what this replaces
+### D9. Retire what this replaces
 
 - Remove the `--relay-url` join mode and `temps_wireguard::WireGuardManager`'s `wg0`/`10.100.0.x` path.
 - `temps-edge`: exclude `role = "edge"` from scheduling now; fold its cache into the ingress engine later and document it as experimental until then.

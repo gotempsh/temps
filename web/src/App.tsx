@@ -223,6 +223,11 @@ const AddDomain = lazy(() =>
 const DomainDetail = lazy(() =>
   import('./pages/DomainDetail').then((m) => ({ default: m.DomainDetail }))
 )
+const TunnelDomainDetail = lazy(() =>
+  import('./pages/TunnelDomainDetail').then((m) => ({
+    default: m.TunnelDomainDetail,
+  }))
+)
 const Certificates = lazy(() =>
   import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
 )
@@ -957,6 +962,10 @@ const FullAppRoutes = () => {
                         {/* Top-level resources surfaced in the main sidebar */}
                         <Route path="/domains" element={<Domains />} />
                         <Route path="/domains/add" element={<AddDomain />} />
+                        <Route
+                          path="/domains/tunnel/:hostname"
+                          element={<TunnelDomainDetail />}
+                        />
                         <Route path="/domains/:id" element={<DomainDetail />} />
                         <Route
                           path="/certificates"

@@ -806,6 +806,8 @@ mod tests {
             hosting: Default::default(),
             template_slug: None,
             service_template: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

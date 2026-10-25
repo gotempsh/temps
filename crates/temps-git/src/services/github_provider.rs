@@ -1678,6 +1678,7 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
+        validate_github_repository_path(owner, repo)?;
         let client = self.get_client();
         let headers = self.get_headers(access_token);
 
@@ -1737,6 +1738,8 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError> {
+        validate_github_repository_path(owner, repo)?;
+        validate_github_webhook_id(owner, repo, webhook_id)?;
         let client = self.get_client();
         let headers = self.get_headers(access_token);
 
@@ -1759,6 +1762,67 @@ impl GitProviderService for GitHubProvider {
         }
 
         Ok(())
+    }
+
+    async fn update_webhook(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        webhook_id: &str,
+        config: WebhookConfig,
+    ) -> Result<bool, GitProviderError> {
+        validate_github_repository_path(owner, repo)?;
+        validate_github_webhook_id(owner, repo, webhook_id)?;
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+
+        let url = format!(
+            "{}/repos/{}/{}/hooks/{}",
+            self.api_url, owner, repo, webhook_id
+        );
+
+        #[derive(Serialize)]
+        struct UpdateHookRequest {
+            config: HookConfig,
+            events: Vec<String>,
+            active: bool,
+        }
+
+        #[derive(Serialize)]
+        struct HookConfig {
+            url: String,
+            content_type: String,
+            secret: Option<String>,
+        }
+
+        let request = UpdateHookRequest {
+            config: HookConfig {
+                url: config.url,
+                content_type: "json".to_string(),
+                secret: config.secret,
+            },
+            events: config.events,
+            active: true,
+        };
+
+        let response = self
+            .send_with_retry(|| client.patch(&url).headers(headers.clone()).json(&request))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(github_response_error(
+                response,
+                format!("update webhook {webhook_id} on {owner}/{repo}"),
+                "Webhooks: write (or classic PAT repo scope) and access to the target repository",
+            )
+            .await);
+        }
+
+        Ok(true)
     }
 
     async fn verify_webhook_signature(
@@ -3347,6 +3411,126 @@ mod tag_pagination_tests {
         first_page.assert_async().await;
         failing_page.assert_async().await;
     }
+
+    fn push_webhook_config(secret: &str) -> WebhookConfig {
+        WebhookConfig {
+            url: "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7"
+                .to_string(),
+            secret: Some(secret.to_string()),
+            events: vec!["push".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_replaces_its_config_in_place() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let patch = server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "config": {
+                    "url": "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7",
+                    "content_type": "json",
+                    "secret": "new-secret"
+                },
+                "events": ["push"],
+                "active": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":42}"#)
+            .create_async()
+            .await;
+
+        let updated = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect("a 200 must update the webhook");
+
+        assert!(updated);
+        patch.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn updating_a_deleted_webhook_reports_it_missing() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let patch = server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+
+        let updated = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect("a 404 means the hook is gone, not a failure");
+
+        assert!(!updated);
+        patch.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_surfaces_other_github_failures() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Must have admin rights to Repository."}"#)
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect_err("a 403 must fail");
+
+        assert!(
+            matches!(error, GitProviderError::PermissionDenied { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_rejects_a_non_numeric_id_before_calling_github() {
+        let error = provider("http://127.0.0.1:9".to_string())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42/../../keys",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect_err("a non-numeric hook ID must be rejected");
+
+        assert!(
+            matches!(error, GitProviderError::InvalidConfiguration(_)),
+            "unexpected error: {error:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3435,13 +3619,48 @@ mod list_directory_tests {
     }
 }
 
+/// Reject an owner/repository pair that is not a plain GitHub account and
+/// repository name before it is interpolated into a credentialed API path.
+///
+/// A project's `repo_owner`/`repo_name` are user input. URL parsing resolves
+/// `..` segments (also percent-encoded), so a name like `x/../../../user/repos?`
+/// would turn `POST /repos/{owner}/{repo}/hooks` into a request against
+/// another endpoint, made with the connection's token.
+fn validate_github_repository_path(owner: &str, repo: &str) -> Result<(), GitProviderError> {
+    use super::git_provider_manager::{is_safe_name_segment, MAX_REPOSITORY_NAME_LEN};
+
+    let valid = |name: &str| name.len() <= MAX_REPOSITORY_NAME_LEN && is_safe_name_segment(name);
+    if valid(owner) && valid(repo) {
+        Ok(())
+    } else {
+        Err(GitProviderError::InvalidConfiguration(format!(
+            "GitHub repository '{owner}/{repo}' must be an owner and a name of letters, digits, '-', '_' or '.'"
+        )))
+    }
+}
+
+/// Reject a webhook ID that is not a GitHub hook ID (a positive integer)
+/// before it is interpolated into a credentialed API path.
+fn validate_github_webhook_id(
+    owner: &str,
+    repo: &str,
+    webhook_id: &str,
+) -> Result<(), GitProviderError> {
+    if webhook_id.is_empty() || !webhook_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GitProviderError::InvalidConfiguration(format!(
+            "GitHub webhook ID '{webhook_id}' for {owner}/{repo} must be numeric"
+        )));
+    }
+    Ok(())
+}
+
 /// Verify a GitHub `X-Hub-Signature-256` HMAC-SHA256 webhook signature.
 ///
 /// The comparison is **constant-time** (`subtle::ConstantTimeEq`) to avoid a
 /// timing side-channel that could leak the expected signature byte-by-byte
 /// (security review finding #14). Factored out as a free function so the
 /// verification logic can be unit-tested with a known vector.
-fn github_webhook_signature_matches(
+pub(crate) fn github_webhook_signature_matches(
     payload: &[u8],
     signature: &str,
     secret: &str,
@@ -3457,9 +3676,50 @@ fn github_webhook_signature_matches(
     Ok(signature.as_bytes().ct_eq(expected.as_bytes()).into())
 }
 
+/// Generate a fresh 32-byte (64 hex chars) secret for a GitHub repository
+/// webhook. Temps registers one per project on non-App GitHub connections and
+/// verifies `X-Hub-Signature-256` against it.
+pub fn generate_github_webhook_secret() -> Result<String, rand::rngs::SysError> {
+    let mut bytes = [0u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod signature_tests {
-    use super::github_webhook_signature_matches;
+    use super::{
+        generate_github_webhook_secret, github_webhook_signature_matches,
+        validate_github_repository_path,
+    };
+
+    #[test]
+    fn webhook_paths_reject_names_that_escape_the_repository() {
+        assert!(validate_github_repository_path("example-owner", "example.repo_1").is_ok());
+        for (owner, repo) in [
+            ("example-owner", "../../orgs/other-org"),
+            ("example-owner", "x/../../../user/repos?"),
+            ("example-owner", "%2e%2e"),
+            ("example-owner", ".."),
+            ("..", "example-repository"),
+            ("example-owner/sub", "example-repository"),
+            ("example-owner", "repo#fragment"),
+            ("example-owner", ""),
+        ] {
+            assert!(
+                validate_github_repository_path(owner, repo).is_err(),
+                "{owner}/{repo} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_webhook_secrets_are_unique_64_char_hex() {
+        let first = generate_github_webhook_secret().unwrap();
+        let second = generate_github_webhook_secret().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
 
     // Known HMAC-SHA256 vector (GitHub's documented example):
     // secret "It's a Secret to Everybody", payload "Hello, World!".

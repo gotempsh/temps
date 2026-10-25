@@ -650,6 +650,17 @@ impl NodeScheduler {
         Ok(builder_nodes_for(active_nodes, Some(platform)))
     }
 
+    /// The workers a plugin build may run on, best first: build-only nodes,
+    /// then ordinary workers. A dedicated node is passed over (it only runs
+    /// what names it) and so is the control plane itself.
+    pub async fn plugin_build_nodes(&self) -> Result<Vec<nodes::Model>, NodeError> {
+        let active_nodes = self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?;
+        Ok(plugin_build_candidates(active_nodes))
+    }
+
     pub async fn select_any_builder_node(&self) -> Result<Option<nodes::Model>, NodeError> {
         let active_nodes = self
             .node_service
@@ -1790,6 +1801,19 @@ fn pick_builder_node(nodes: Vec<nodes::Model>, platform: &str) -> Option<nodes::
 
 /// The lowest-id active build-only node whose architecture is buildable and,
 /// when `platform` is given, matches it.
+/// Order the nodes a plugin build may use: build-only nodes first, then
+/// ordinary workers, each by id. The binary is compiled for the control
+/// plane's platform whatever the worker's own architecture, so architecture
+/// plays no part.
+fn plugin_build_candidates(nodes: Vec<nodes::Model>) -> Vec<nodes::Model> {
+    let mut candidates: Vec<nodes::Model> = nodes
+        .into_iter()
+        .filter(|node| node.id != CONTROL_PLANE_NODE_ID && !is_dedicated_node(node))
+        .collect();
+    candidates.sort_by_key(|node| (!is_build_only_node(node), node.id));
+    candidates
+}
+
 fn pick_builder_node_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Option<nodes::Model> {
     builder_nodes_for(nodes, platform).into_iter().next()
 }
@@ -1914,6 +1938,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1929,6 +1958,27 @@ mod tests {
         let mut node = make_node(id, name);
         node.labels = labels;
         node
+    }
+
+    #[test]
+    fn plugin_builds_prefer_build_only_nodes_and_pass_over_dedicated_ones() {
+        let labelled = |id: i32, role: &str| {
+            make_node_with_labels(
+                id,
+                &format!("n{id}"),
+                serde_json::json!({ NODE_ROLE_LABEL: role }),
+            )
+        };
+        let ordered: Vec<i32> = plugin_build_candidates(vec![
+            make_node(3, "worker-3"),
+            labelled(4, DEDICATED_NODE_ROLE),
+            make_node(2, "worker-2"),
+            labelled(7, BUILDER_NODE_ROLE),
+        ])
+        .iter()
+        .map(|node| node.id)
+        .collect();
+        assert_eq!(ordered, vec![7, 2, 3]);
     }
 
     fn make_node_with_arch(id: i32, name: &str, architecture: &str) -> nodes::Model {

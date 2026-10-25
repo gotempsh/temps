@@ -1970,7 +1970,7 @@ WHERE project.id = $2
             .map_err(|e| format!("DB error looking up node {}: {}", node_id, e))?
             .ok_or_else(|| format!("Node {} not found in database", node_id))?;
 
-        let encrypted_token = node.token_encrypted.ok_or_else(|| {
+        let encrypted_token = node.token_encrypted.clone().ok_or_else(|| {
             format!(
                 "Node '{}' (id={}) has no encrypted token",
                 node.name, node_id
@@ -1995,9 +1995,8 @@ WHERE project.id = $2
             if let Some(ref cs) = self.config_service {
                 Arc::new(
                     crate::cluster_ca::build_node_deployer(
-                        &node.address,
+                        &node,
                         token,
-                        node.name.clone(),
                         cs.as_ref(),
                         self.encryption_service.as_ref(),
                     )

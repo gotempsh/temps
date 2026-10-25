@@ -226,6 +226,64 @@ fn namespaced_service_label(first: &str, second: &str) -> String {
     }
 }
 
+/// How a new environment's hostname label is built when no template is set.
+pub const DEFAULT_ENVIRONMENT_LABEL_TEMPLATE: &str = "{project}-{env}";
+
+/// A new environment's hostname label from the operator's templates
+/// (ADR 058 D9): `production_template` for the environment named
+/// `production` when set, `template` otherwise, falling back to
+/// [`DEFAULT_ENVIRONMENT_LABEL_TEMPLATE`]. The result is one DNS label.
+pub fn environment_label(
+    template: Option<&str>,
+    production_template: Option<&str>,
+    project: &str,
+    env: &str,
+) -> String {
+    let chosen = production_template
+        .filter(|_| env.eq_ignore_ascii_case("production"))
+        .or(template)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(DEFAULT_ENVIRONMENT_LABEL_TEMPLATE);
+    let raw = chosen.replace("{project}", project).replace("{env}", env);
+    let label = sanitize_label(&raw);
+    if label.len() <= DNS_LABEL_MAX_LEN {
+        return label;
+    }
+    let hash = short_hash(&label);
+    let keep = DNS_LABEL_MAX_LEN - SHORT_HASH_LEN - 1;
+    format!("{}-{hash}", label[..keep].trim_end_matches('-'))
+}
+
+/// Check a hostname label template. `require_env`: every environment of a
+/// project gets a distinct name only if `{env}` is in it, so the general
+/// template needs it; the production one does not.
+pub fn validate_label_template(template: &str, require_env: bool) -> Result<(), String> {
+    let template = template.trim();
+    if !template.contains("{project}") {
+        return Err(format!(
+            "'{template}' must contain {{project}}, or projects would share one hostname."
+        ));
+    }
+    if require_env && !template.contains("{env}") {
+        return Err(format!(
+            "'{template}' must contain {{env}}, or a project's environments would share one hostname."
+        ));
+    }
+    let rest = template.replace("{project}", "").replace("{env}", "");
+    if rest.contains('{') || rest.contains('}') {
+        return Err(format!(
+            "'{template}' may only use {{project}} and {{env}}."
+        ));
+    }
+    if !rest.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        return Err(format!(
+            "'{template}' must be a single hostname label: letters, digits and hyphens, no dots."
+        ));
+    }
+    Ok(())
+}
+
 fn sanitize_label(label: &str) -> String {
     let mut output = String::new();
     let mut previous_hyphen = false;

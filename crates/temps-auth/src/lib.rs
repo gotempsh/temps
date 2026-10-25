@@ -70,7 +70,7 @@ pub use auth_service::{validate_password_complexity, AuthService, VerifiedSessio
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
 };
-pub use user_service::UserService;
+pub use user_service::{clear_mfa_enrollment, ClearedMfaEnrollment, UserService};
 
 // Export TempsMiddleware implementation
 pub use temps_middleware::AuthMiddleware;

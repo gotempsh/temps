@@ -14,6 +14,22 @@ import type { ProxyRangePreset } from '@/lib/proxy-metrics-window'
 /** The control-plane node always has id 0 (`CONTROL_PLANE_NODE_ID`). */
 export const CONTROL_PLANE_NODE_ID = 0
 
+/**
+ * Which metric families a node can have. The control plane samples itself, so
+ * it also records network and block I/O counters and has a Docker daemon the
+ * console can query. A worker only reports CPU, memory and disk, once per
+ * heartbeat, so panels for anything else would sit empty forever.
+ */
+export function nodeMetricCapabilities(nodeId: number): {
+  /** Network and block I/O counters are recorded. */
+  ioCounters: boolean
+  /** `GET /nodes/{id}/docker-disk-usage` answers for this node. */
+  dockerUsage: boolean
+} {
+  const isControlPlane = nodeId === CONTROL_PLANE_NODE_ID
+  return { ioCounters: isControlPlane, dockerUsage: isControlPlane }
+}
+
 /** Bucket width the store uses for each preset (`duration_to_step`). */
 export const STEP_SECONDS: Record<ProxyRangePreset, number> = {
   '1h': 60,
@@ -40,6 +56,31 @@ export function usageTone(
   return 'good'
 }
 
+/** A bucket the store actually sampled (its value is not `null`). */
+export type MetricSample = { time: string; value: number }
+
+/**
+ * The buckets that hold a sample. The range endpoint returns every bucket of
+ * the window and marks the ones nothing was sampled in (the agent or the
+ * server was down) with `value: null`; statistics must skip those, while
+ * charts keep them so the line breaks.
+ */
+export function samplesOf(
+  points: readonly MetricDataPoint[] | undefined
+): MetricSample[] {
+  return (points ?? []).filter(
+    (p): p is MetricSample => p.value != null && Number.isFinite(p.value)
+  )
+}
+
+/** Value of the most recent bucket that holds a sample. */
+export function lastSampleOf(
+  points: readonly MetricDataPoint[] | undefined
+): MetricSample | null {
+  const samples = samplesOf(points)
+  return samples.length > 0 ? samples[samples.length - 1] : null
+}
+
 /** One row of a merged multi-series chart: ISO time, axis label, one value per key. */
 export type ChartRow = { time: string; label: string } & Record<
   string,
@@ -48,8 +89,9 @@ export type ChartRow = { time: string; label: string } & Record<
 
 /**
  * Merge several metric series (each `[{time, value}]`) into rows keyed by
- * timestamp so recharts can draw them on one axis. Missing values are left
- * out so a series with a gap breaks instead of dropping to zero.
+ * timestamp so recharts can draw them on one axis. Buckets without a
+ * sample stay `null` (and the chart must not `connectNulls`), so a series
+ * with a gap breaks instead of dropping to zero or bridging the outage.
  */
 export function mergeSeries(
   series: { key: string; points: MetricDataPoint[] | undefined }[],
@@ -63,7 +105,7 @@ export function mergeSeries(
         time: p.time,
         label: label(p.time),
       }
-      row[key] = p.value
+      row[key] = p.value ?? null
       rows.set(p.time, row)
     }
   }
@@ -72,10 +114,14 @@ export function mergeSeries(
 
 /**
  * Convert the per-bucket *increases* the range endpoint returns for a
- * `*_total` counter into a per-second rate. The bucket width is the gap to
- * the previous bucket (the first bucket uses the gap to the next one; all
- * buckets in a range share one step), and a lone point falls back to
- * `fallbackStepSeconds`.
+ * `*_total` counter into a per-second rate.
+ *
+ * The store differences each sampled bucket against the previous *sampled*
+ * one, so the increase of the first bucket after a gap spans the whole gap.
+ * It is therefore divided by the time since the previous sample, not by one
+ * bucket width — otherwise an outage turns into a spike. The first sample
+ * uses the gap to the next bucket, and a lone sample falls back to
+ * `fallbackStepSeconds`. Buckets without a sample stay `null`.
  */
 export function toRatePerSecond(
   points: MetricDataPoint[] | undefined,
@@ -83,25 +129,33 @@ export function toRatePerSecond(
 ): MetricDataPoint[] {
   if (!points || points.length === 0) return []
   const times = points.map((p) => Date.parse(p.time))
-  const stepFor = (i: number): number => {
-    if (points.length === 1) return fallbackStepSeconds
-    const gap = i > 0 ? times[i] - times[i - 1] : times[i + 1] - times[i]
-    const secs = gap / 1000
-    return Number.isFinite(secs) && secs > 0 ? secs : fallbackStepSeconds
+  const secondsBetween = (a: number, b: number): number | null => {
+    const secs = (times[b] - times[a]) / 1000
+    return Number.isFinite(secs) && secs > 0 ? secs : null
   }
-  return points.map((p, i) => ({
-    time: p.time,
-    value: Math.max(0, p.value) / stepFor(i),
-  }))
+  let previousSample: number | null = null
+  return points.map((p, i) => {
+    if (p.value == null) return { time: p.time, value: null }
+    const span =
+      previousSample != null
+        ? secondsBetween(previousSample, i)
+        : i + 1 < points.length
+          ? secondsBetween(i, i + 1)
+          : null
+    previousSample = i
+    return {
+      time: p.time,
+      value: Math.max(0, p.value) / (span ?? fallbackStepSeconds),
+    }
+  })
 }
 
 /** Highest point of a series and when it happened. */
 export function peakOf(
   points: MetricDataPoint[] | undefined
 ): { time: string; value: number } | null {
-  let best: { time: string; value: number } | null = null
-  for (const p of points ?? []) {
-    if (!Number.isFinite(p.value)) continue
+  let best: MetricSample | null = null
+  for (const p of samplesOf(points)) {
     if (!best || p.value > best.value) best = { time: p.time, value: p.value }
   }
   return best
@@ -163,8 +217,8 @@ export function projectDisk(
   criticalPercent = DISK_THRESHOLDS.poor
 ): DiskProjection | null {
   if (!totalBytes || !(totalBytes > 0)) return null
-  const samples = (points ?? []).filter(
-    (p) => Number.isFinite(p.value) && !Number.isNaN(Date.parse(p.time))
+  const samples = samplesOf(points).filter(
+    (p) => !Number.isNaN(Date.parse(p.time))
   )
   const xs = samples.map((p) => Date.parse(p.time))
   const ys = samples.map((p) => p.value)
@@ -347,21 +401,22 @@ export function currentDiskPercent(
 
 /**
  * Whether the metrics store answered but has not received a single node
- * sample yet: every usage series is empty and the latest snapshot carries no
- * figure. This is the first minutes after metric collection is switched on,
+ * sample yet: no usage series holds a sample (the endpoint returns every
+ * bucket of the window, so "empty" means all-`null`) and the latest snapshot
+ * carries no figure. This is the first minutes after metric collection is switched on,
  * which the charts alone render as five unrelated "no samples" captions.
  * A request that is still pending or failed is not "no samples".
  */
 export function hasNoNodeSamples(state: {
   /** Each series' points once it has answered; `undefined` while pending or failed. */
-  series: (readonly unknown[] | undefined)[]
+  series: (readonly MetricDataPoint[] | undefined)[]
   /** Latest snapshot's usage figures; `null` when none is present. */
   current: (number | null)[]
 }): boolean {
   return (
     state.series.length > 0 &&
     state.series.every(
-      (points) => points !== undefined && points.length === 0
+      (points) => points !== undefined && samplesOf(points).length === 0
     ) &&
     state.current.every((value) => value === null)
   )

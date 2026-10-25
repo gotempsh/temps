@@ -90,7 +90,6 @@ pub struct ControlPlaneOverlay {
     pub config: NetworkConfig,
     manager: NetworkManager,
     docker: Docker,
-    compute_pool: Ipv4Net,
     /// The control plane's end of the managed WireGuard mesh, when that is
     /// the underlay; the reconciler keeps its peers in step with the cluster.
     mesh: Option<MeshEnd>,
@@ -117,6 +116,7 @@ impl MeshEnd {
             vxlan_port: self.vxlan_port,
             mesh: self.settings.cidr,
             node_api_port: Some(self.settings.node_api_port),
+            agent_api: None,
             relay,
         }
     }
@@ -163,7 +163,6 @@ impl ControlPlaneOverlay {
         let docker = self.docker.clone();
         let config = self.config.clone();
         let alloc = self.alloc.clone();
-        let compute_pool = self.compute_pool;
         let mesh = self.mesh.clone();
         tokio::spawn(async move {
             let allocator = PostgresAllocator::new(db.clone());
@@ -220,15 +219,7 @@ impl ControlPlaneOverlay {
                                     true
                                 })
                         } else {
-                            reconcile_peer_snapshot(
-                                &manager,
-                                &docker,
-                                &config,
-                                &alloc,
-                                compute_pool,
-                                peers,
-                            )
-                            .await
+                            reconcile_peer_snapshot(&manager, &docker, &config, &alloc, peers).await
                         };
                         match result {
                             Ok(_) => rebootstrap = false,
@@ -366,16 +357,25 @@ impl ControlPlaneMesh {
 /// runs no workloads). `None` while the mesh is off.
 ///
 /// `configured_address` is the operator's `--private-address`, where nodes
-/// dial WireGuard; without one the control plane publishes no endpoint.
+/// dial WireGuard, and `advertised_endpoint` its `--wg-endpoint`, which takes
+/// precedence; with neither the control plane publishes no endpoint.
 pub async fn setup_mesh_only(
     db: &DatabaseConnection,
     configured_address: Option<&str>,
+    advertised_endpoint: Option<&str>,
     mesh_key_dir: &Path,
 ) -> Result<Option<ControlPlaneMesh>, ControlPlaneSetupError> {
     let Some(settings) = crate::mesh::load_settings(db).await? else {
         return Ok(None);
     };
-    let end = setup_mesh(db, &settings, configured_address, mesh_key_dir).await?;
+    let end = setup_mesh(
+        db,
+        &settings,
+        configured_address,
+        advertised_endpoint,
+        mesh_key_dir,
+    )
+    .await?;
     crate::mesh::publish_control_plane(db, end.key.public_key(), end.endpoint).await?;
     Ok(Some(ControlPlaneMesh { end }))
 }
@@ -389,12 +389,20 @@ pub async fn reconcile_peer_snapshot(
     docker: &Docker,
     config: &NetworkConfig,
     alloc: &NodeAlloc,
-    compute_pool: Ipv4Net,
     peers: Vec<Peer>,
 ) -> Result<bool, NetworkError> {
-    crate::preflight_compute_pool_routes(config, compute_pool).await?;
-    crate::docker::ensure_network_for_pool(docker, config, alloc, compute_pool).await?;
+    let routed = routed_subnets(alloc, &peers);
+    crate::preflight_compute_routes(config, &routed).await?;
+    crate::docker::ensure_network_for_subnets(docker, config, alloc, &routed).await?;
     manager.reconcile_peers(peers).await
+}
+
+/// The overlay subnets a host routes: its own and every peer's (ADR 056).
+/// Collision checks look at these, not at the whole cluster pool.
+pub fn routed_subnets(alloc: &NodeAlloc, peers: &[Peer]) -> Vec<Ipv4Net> {
+    std::iter::once(alloc.compute_cidr)
+        .chain(peers.iter().map(|peer| peer.compute_cidr))
+        .collect()
 }
 
 /// Re-decide which pairs go through the hub, with the control plane's own
@@ -446,16 +454,22 @@ async fn reconcile_mesh_peers(db: &DatabaseConnection) -> Result<(), ControlPlan
 /// overlay underlay. Workers are only told about it (the key is published)
 /// once the whole overlay setup has succeeded, see [`setup`].
 ///
-/// `configured_address` is the operator's `--private-address`: with the mesh
-/// on it is where workers dial WireGuard, and may be public. On a restart
-/// without it, the caller passes the persisted underlay (already the mesh
-/// address) or nothing, and the previously published endpoint, if any, is
-/// reused. With no endpoint at all the control plane is still on the mesh:
-/// it dials every node that publishes one.
+/// `advertised_endpoint` is the operator's `--wg-endpoint`: when set it is
+/// published exactly as given, for a control plane whose reachable `ip:port`
+/// is not its own address and listen port (NAT, port forwarding).
+///
+/// Otherwise `configured_address` is the operator's `--private-address`: with
+/// the mesh on it is where workers dial WireGuard, and may be public. On a
+/// restart without it, the caller passes the persisted underlay (already the
+/// mesh address) or nothing, and the previously published endpoint, if any,
+/// is reused. With no endpoint at all the control plane is still on the mesh:
+/// it dials every node that publishes one. See
+/// [`crate::mesh::resolve_control_plane_endpoint`].
 async fn setup_mesh(
     db: &DatabaseConnection,
     settings: &crate::mesh::MeshSettings,
     configured_address: Option<&str>,
+    advertised_endpoint: Option<&str>,
     key_dir: &Path,
 ) -> Result<MeshEnd, ControlPlaneSetupError> {
     let cfg = network_config::Entity::find_by_id(1)
@@ -463,16 +477,20 @@ async fn setup_mesh(
         .await?
         .ok_or(ControlPlaneSetupError::MissingNetworkConfig)?;
     let mesh_address = settings.control_plane_address();
-    let endpoint = match configured_address
-        .map(str::trim)
-        .filter(|address| !address.is_empty() && *address != mesh_address.to_string())
-    {
-        Some(address) => Some(crate::mesh::default_endpoint(address, settings.port)?),
-        None => cfg
-            .control_plane_wg_endpoint
-            .as_deref()
-            .and_then(|endpoint| endpoint.parse().ok()),
-    };
+    let endpoint = crate::mesh::resolve_control_plane_endpoint(
+        advertised_endpoint,
+        configured_address,
+        cfg.control_plane_wg_endpoint.as_deref(),
+        settings.cidr,
+        settings.port,
+    )?;
+    if let Some(advertised) = advertised_endpoint.filter(|value| !value.trim().is_empty()) {
+        info!(
+            advertised = %advertised.trim(),
+            listen_port = settings.port,
+            "publishing the operator's --wg-endpoint as the control plane's WireGuard endpoint"
+        );
+    }
     let vxlan_port =
         u16::try_from(cfg.vxlan_port).map_err(|_| ControlPlaneSetupError::InvalidVxlanConfig {
             reason: format!("vxlan_port {} is outside 0..=65535", cfg.vxlan_port),
@@ -532,11 +550,13 @@ async fn setup_mesh(
 /// read when `network_config.wireguard_enabled` is set.
 /// `underlay_address` is the operator's `--private-address` (or the persisted
 /// underlay); it may only be absent while the mesh is on, whose address is
-/// then the underlay.
+/// then the underlay. `advertised_endpoint` is its `--wg-endpoint`, the
+/// WireGuard endpoint published for workers when set (see [`setup_mesh`]).
 pub async fn setup(
     db: Arc<DatabaseConnection>,
     docker: &Docker,
     underlay_address: Option<&str>,
+    advertised_endpoint: Option<&str>,
     underlay_device: Option<&str>,
     mesh_key_dir: Option<&Path>,
 ) -> Result<ControlPlaneOverlay, ControlPlaneSetupError> {
@@ -545,7 +565,14 @@ pub async fn setup(
     let (underlay_address, underlay_device) = match &mesh_settings {
         Some(settings) => {
             let key_dir = mesh_key_dir.ok_or(ControlPlaneSetupError::MeshKeyDirMissing)?;
-            let end = setup_mesh(db.as_ref(), settings, underlay_address, key_dir).await?;
+            let end = setup_mesh(
+                db.as_ref(),
+                settings,
+                underlay_address,
+                advertised_endpoint,
+                key_dir,
+            )
+            .await?;
             let address = IpAddr::V4(end.interface.address);
             mesh_end = Some(end);
             (address, Some(crate::mesh::MESH_INTERFACE))
@@ -591,7 +618,6 @@ pub async fn setup(
     // privileged I/O begins. The generation counter in the reservation now
     // acts as the serialization backstop.
     setup_lock.commit().await?;
-    let cluster_network = reservation.cluster_config;
     let mut privileged_setup_started = false;
     let attempt = async {
         let alloc: NodeAlloc = reservation.alloc.clone().into();
@@ -657,27 +683,16 @@ pub async fn setup(
             underlay_dev,
             ..NetworkConfig::default()
         };
-        crate::preflight_compute_pool_routes(&config, cluster_network.compute_pool_cidr).await?;
-        crate::docker::preflight_network_for_pool(
-            docker,
-            &config,
-            &alloc,
-            cluster_network.compute_pool_cidr,
-        )
-        .await?;
+        let routed = routed_subnets(&alloc, &peers);
+        crate::preflight_compute_routes(&config, &routed).await?;
+        crate::docker::preflight_network_for_subnets(docker, &config, &alloc, &routed).await?;
         let manager = NetworkManager::new(config.clone())?;
         // All operations from here are idempotent for this topology, but they
         // mutate shared host state. A failed attempt must not tear that state
         // down because a newer generation may already be using it.
         privileged_setup_started = true;
         manager.bootstrap(alloc.clone(), peers.clone()).await?;
-        crate::docker::ensure_network_for_pool(
-            docker,
-            &config,
-            &alloc,
-            cluster_network.compute_pool_cidr,
-        )
-        .await?;
+        crate::docker::ensure_network_for_subnets(docker, &config, &alloc, &routed).await?;
         Ok::<_, ControlPlaneSetupError>((alloc, peers, config, manager))
     }
     .await;
@@ -727,7 +742,6 @@ pub async fn setup(
         config,
         manager,
         docker: docker.clone(),
-        compute_pool: cluster_network.compute_pool_cidr,
         mesh: mesh_end,
     })
 }
@@ -783,6 +797,7 @@ pub async fn mesh_doctor_expectations(
             vxlan_port,
             mesh: settings.cidr,
             node_api_port: Some(settings.node_api_port),
+            agent_api: None,
             relay: cfg.mesh_hub_control_plane,
         },
     }))

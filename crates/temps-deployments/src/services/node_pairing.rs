@@ -150,9 +150,16 @@ async fn attempt(
         warn!(pairing = pairing.id, %error, "node pairing record is unusable");
         "This pairing's stored secret is unreadable; cancel it and create a new one.".to_string()
     })?;
-    let endpoint: SocketAddr = pairing.node_endpoint.parse().map_err(|_| {
-        "This pairing's node address is invalid; cancel it and create a new one.".to_string()
-    })?;
+    // Only pairings with an endpoint are dialed (`pairing::due`); one a
+    // worker created by dialing in (ADR 055) never gets here.
+    let endpoint: SocketAddr = pairing
+        .node_endpoint
+        .as_deref()
+        .and_then(|endpoint| endpoint.parse().ok())
+        .ok_or_else(|| {
+            "This pairing's node address is missing or invalid; cancel it and create a new one."
+                .to_string()
+        })?;
     let deadline = tokio::time::Instant::now() + ATTEMPT;
     let id = pairing.id;
     let accept = |public_key: String| async move {

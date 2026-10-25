@@ -514,7 +514,7 @@ export function DeployDefaultsCard({
                         CI builds use the configured GitHub Actions runner and
                         stop if verification fails.{' '}
                         <a
-                          href="/settings/nodes#ci-builder"
+                          href="/settings/build-limits#ci-builder"
                           className="underline"
                         >
                           Configure CI builder

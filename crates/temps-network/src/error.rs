@@ -102,8 +102,12 @@ pub enum NetworkError {
     /// The CIDR we were asked to use for our Docker network is already in use
     /// by a different Docker network on this host.
     #[error(
-        "requested cidr {cidr} overlaps {existing_cidr} used by docker network '{existing_network}'; \
-         refusing to create '{desired_network}' to avoid corruption"
+        "overlay subnet {cidr}, which this node routes, overlaps {existing_cidr} used by Docker \
+         network '{existing_network}', so '{desired_network}' cannot be set up here. Fix: change \
+         the cluster compute pool to a range this host does not use, while no node runs the \
+         overlay on it (console: Worker Nodes -> Cluster network, or `temps network \
+         setup-multi-node --compute-pool-cidr <cidr>` on the control plane), or recreate '{existing_network}' on another subnet. Until then this node runs without \
+         cross-node networking; its deployments keep working"
     )]
     DockerCidrCollision {
         cidr: Ipv4Net,
@@ -113,10 +117,15 @@ pub enum NetworkError {
     },
 
     #[error(
-        "compute pool {pool} overlaps host route {existing_cidr} on device '{device}'; choose a different cluster pool before enabling the overlay"
+        "overlay subnet {subnet}, which this node routes, overlaps host route {existing_cidr} on \
+         device '{device}'. Fix: change the cluster compute pool to a range this host does not use, \
+         while no node runs the overlay on it (console: Worker Nodes -> Cluster network, or `temps \
+         network setup-multi-node --compute-pool-cidr <cidr>` on the control plane), or move the network on '{device}' to another range. Until \
+         then this node runs without cross-node networking; its deployments keep working"
     )]
     HostRouteCollision {
-        pool: Ipv4Net,
+        /// The overlay subnet (own or a peer's) the route overlaps.
+        subnet: Ipv4Net,
         existing_cidr: Ipv4Net,
         device: String,
     },

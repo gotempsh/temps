@@ -31,6 +31,7 @@ fn lockdown(node_api_port: Option<u16>, relay: bool) -> MeshLockdown {
         vxlan_port: 4789,
         mesh: "10.201.0.0/16".parse::<Ipv4Net>().unwrap(),
         node_api_port,
+        agent_api: None,
         relay,
     }
 }

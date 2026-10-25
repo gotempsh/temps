@@ -3,7 +3,10 @@
 Conventions for AI coding agents working on this repo (Claude Code,
 Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
-conventions that go *around* the code. Read both.
+conventions that go *around* the code. Read both, and read
+[`REVIEW.md`](./REVIEW.md) before opening a PR: it lists the failure modes that
+have blocked merges (authorization scope, secrets in logs, stale writes,
+cancellation and cleanup, resource limits).
 
 ## Add attribution to every new source file
 
@@ -31,6 +34,13 @@ python3 scripts/source_attribution.py check
 Generated files must receive the same header from their generator or generation
 command so regeneration cannot remove it. Do not replace, remove, or
 misattribute copyright and license notices in third-party files.
+
+## Every behavior change ships a test in the same PR
+
+A new or changed behavior needs an automated test that fails without the change.
+"Verified manually" does not count, even for a one-line fix. When you change a
+default, message or response shape, search the existing tests for the old behavior
+and update them in the same PR. [`REVIEW.md`](./REVIEW.md) has the full checklist.
 
 ## Do not hand-edit `CHANGELOG.md`
 

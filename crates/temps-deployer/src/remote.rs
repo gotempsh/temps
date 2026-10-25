@@ -635,6 +635,63 @@ impl RemoteNodeDeployer {
         })
     }
 
+    /// [`Self::new_mtls`] for an agent reached as `endpoint` says. When the
+    /// endpoint dials an address other than the one the agent's certificate
+    /// names (its WireGuard mesh address), the certificate is verified for
+    /// `endpoint.server_name` instead of the dialed host; the cluster CA as
+    /// the only root, the client identity, chain and expiry checks are the
+    /// same as for a direct call.
+    pub fn new_mtls_at(
+        endpoint: &temps_core::node_address::NodeAgentEndpoint,
+        token: String,
+        node_name: String,
+        client_identity_pem: &str,
+        ca_cert_pem: &str,
+    ) -> Result<Self, DeployerError> {
+        let Some(server_name) = endpoint.server_name.as_deref() else {
+            return Self::new_mtls(
+                endpoint.dial_url.clone(),
+                token,
+                node_name,
+                client_identity_pem,
+                ca_cert_pem,
+            );
+        };
+        let tls = temps_core::node_pki::node_agent_client_config(
+            client_identity_pem,
+            ca_cert_pem,
+            server_name,
+        )
+        .map_err(|e| {
+            DeployerError::NetworkError(format!(
+                "Failed to build the mesh mTLS configuration for node {} at {}: {}",
+                node_name, endpoint.dial_url, e
+            ))
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::none())
+            .use_preconfigured_tls(tls)
+            .build()
+            .map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Failed to create mesh mTLS client for node {} at {}: {}",
+                    node_name, endpoint.dial_url, e
+                ))
+            })?;
+
+        Ok(Self {
+            agent_url: endpoint.dial_url.clone(),
+            token,
+            node_name,
+            client,
+            platform: std::sync::Arc::new(std::sync::OnceLock::new()),
+            build_limits: Default::default(),
+            build_limits_version: 0,
+            runtime_health_mtls: true,
+        })
+    }
+
     /// Runtime probes require the pinned-CA mTLS constructor. Never inherit
     /// the legacy agent client's installation-wide insecure TLS opt-in.
     pub async fn runtime_health_request<T: serde::de::DeserializeOwned>(
@@ -1976,6 +2033,108 @@ impl ImageBuilder for RemoteNodeDeployer {
             .get()
             .cloned()
             .unwrap_or_else(crate::platform::native_platform)
+    }
+}
+
+/// Why a worker did not compile a plugin.
+#[derive(Debug)]
+pub enum PluginBuildAttemptError {
+    /// This worker cannot take the build (no Docker, busy, an agent that
+    /// predates plugin builds, or unreachable). Nothing was compiled; another
+    /// worker can be tried.
+    NotAvailable(String),
+    /// The worker took the build and it failed.
+    Failed(String),
+}
+
+impl RemoteNodeDeployer {
+    /// Compile a plugin on this worker. `archive` is a tar of the source tree;
+    /// the compiled binary is written to `output`, at most `max_binary_bytes`.
+    pub async fn build_plugin(
+        &self,
+        archive: &std::path::Path,
+        bun_target: &str,
+        output: &std::path::Path,
+        max_binary_bytes: u64,
+    ) -> Result<(), PluginBuildAttemptError> {
+        use PluginBuildAttemptError::{Failed, NotAvailable};
+        let node = &self.node_name;
+        let size = tokio::fs::metadata(archive)
+            .await
+            .map_err(|error| Failed(format!("read the source archive: {error}")))?
+            .len();
+        let file = tokio::fs::File::open(archive)
+            .await
+            .map_err(|error| Failed(format!("open the source archive: {error}")))?;
+        let stream = tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new());
+        let body = reqwest::Body::wrap_stream(stream.map_ok(|bytes| bytes.freeze()));
+        let url = format!("{}/agent/plugins/build", self.agent_url);
+        let response = self
+            .client
+            .post(&url)
+            .query(&[("target", bun_target)])
+            .bearer_auth(&self.token)
+            .header(reqwest::header::CONTENT_LENGTH, size)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-tar")
+            .timeout(Duration::from_secs(1800))
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| NotAvailable(format!("worker '{node}' did not answer: {error}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let detail = agent_error_detail(response).await;
+            return Err(match status {
+                reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::METHOD_NOT_ALLOWED
+                | reqwest::StatusCode::NOT_IMPLEMENTED
+                | reqwest::StatusCode::SERVICE_UNAVAILABLE => NotAvailable(format!(
+                    "worker '{node}' cannot build plugins (HTTP {status}): {detail}"
+                )),
+                _ => Failed(format!(
+                    "worker '{node}' failed the build (HTTP {status}): {detail}"
+                )),
+            });
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > max_binary_bytes)
+        {
+            return Err(Failed(format!(
+                "worker '{node}' returned a binary larger than {max_binary_bytes} bytes"
+            )));
+        }
+        let expected = response.content_length();
+        let mut destination = tokio::fs::File::create(output)
+            .await
+            .map_err(|error| Failed(format!("create {}: {error}", output.display())))?;
+        let mut received: u64 = 0;
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|error| {
+                Failed(format!(
+                    "lost the binary stream from worker '{node}': {error}"
+                ))
+            })?;
+            received += chunk.len() as u64;
+            if received > max_binary_bytes {
+                return Err(Failed(format!(
+                    "worker '{node}' returned a binary larger than {max_binary_bytes} bytes"
+                )));
+            }
+            tokio::io::AsyncWriteExt::write_all(&mut destination, &chunk)
+                .await
+                .map_err(|error| Failed(format!("write {}: {error}", output.display())))?;
+        }
+        tokio::io::AsyncWriteExt::flush(&mut destination)
+            .await
+            .map_err(|error| Failed(format!("flush {}: {error}", output.display())))?;
+        if received == 0 || expected.is_some_and(|expected| expected != received) {
+            return Err(Failed(format!(
+                "worker '{node}' sent an incomplete binary ({received} bytes)"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -3515,6 +3674,123 @@ mod tests {
         });
 
         format!("http://{}", addr)
+    }
+
+    /// A fake agent like [`spawn_fake_agent`] that serves mutual TLS with a
+    /// leaf the cluster CA issued for `sans`, requiring a client certificate
+    /// from the same CA, as the real agent does. Listens on loopback, which
+    /// the leaf does not name -- the stand-in for a node's mesh address.
+    async fn spawn_fake_mtls_agent(
+        ca: &temps_core::node_pki::ClusterCa,
+        sans: &[String],
+        body: &'static str,
+    ) -> std::net::SocketAddr {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use std::sync::Arc;
+
+        let csr = temps_core::node_pki::generate_node_keypair_csr("worker", sans).unwrap();
+        let leaf =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, sans)
+                .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let chain = CertificateDer::pem_slice_iter(leaf.cert_pem.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_slice(csr.key_pem.as_bytes()).unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        for root in CertificateDer::pem_slice_iter(ca.cert_pem.as_bytes()) {
+            roots.add(root.unwrap()).unwrap();
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider.clone(),
+        )
+        .build()
+        .unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(chain, key)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let Ok(mut stream) = acceptor.accept(socket).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        addr
+    }
+
+    const FAKE_HEALTH: &str = r#"{"success":true,"data":{"cpu_percent":1.0,"memory_used_bytes":1,"memory_total_bytes":2,"disk_used_bytes":1,"disk_total_bytes":2,"running_containers":0,"platform":"linux/amd64"},"error":null}"#;
+
+    /// The control plane's client identity, as `cluster_ca::cp_client_identity`
+    /// builds it.
+    fn control_plane_identity(ca: &temps_core::node_pki::ClusterCa) -> String {
+        let csr =
+            temps_core::node_pki::generate_node_keypair_csr("temps-control-plane", &[]).unwrap();
+        let signed =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, &[])
+                .unwrap();
+        format!("{}\n{}", signed.cert_pem, csr.key_pem)
+    }
+
+    #[tokio::test]
+    async fn an_agent_dialed_on_another_address_is_verified_for_its_registered_host() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let identity = control_plane_identity(&ca);
+        let registered = "203.0.113.10".to_string();
+        let addr = spawn_fake_mtls_agent(&ca, std::slice::from_ref(&registered), FAKE_HEALTH).await;
+        let endpoint = |server_name: Option<&str>| temps_core::node_address::NodeAgentEndpoint {
+            dial_url: format!("https://{addr}"),
+            server_name: server_name.map(str::to_owned),
+        };
+        let deployer = |endpoint| {
+            RemoteNodeDeployer::new_mtls_at(
+                &endpoint,
+                "token".into(),
+                "worker".into(),
+                &identity,
+                &ca.cert_pem,
+            )
+            .unwrap()
+        };
+
+        let via_mesh = deployer(endpoint(Some(&registered)));
+        assert_eq!(via_mesh.agent_url(), format!("https://{addr}"));
+        assert_eq!(
+            via_mesh.refresh_platform().await.as_deref(),
+            Some("linux/amd64"),
+            "the dialed address differs from the leaf's, the registered host verifies"
+        );
+
+        // Another node's address does not verify, and neither does the dialed
+        // address itself (a direct call, verified for 127.0.0.1).
+        assert_eq!(
+            deployer(endpoint(Some("198.51.100.20")))
+                .refresh_platform()
+                .await,
+            None
+        );
+        assert_eq!(deployer(endpoint(None)).refresh_platform().await, None);
     }
 
     #[tokio::test]

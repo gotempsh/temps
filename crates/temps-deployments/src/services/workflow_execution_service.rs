@@ -224,25 +224,19 @@ async fn connect_build_node(
         .and_then(|value| value.get("_version"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    crate::cluster_ca::build_node_deployer(
-        &node.address,
-        token,
-        node.name.clone(),
-        config,
-        encryption,
-    )
-    .await
-    .map(|remote| {
-        remote
-            .with_build_limits(limits)
-            .with_build_limits_version(version)
-    })
-    .map_err(|error| {
-        format!(
-            "Cannot connect to build node '{}' (id={}): {error}",
-            node.name, node.id
-        )
-    })
+    crate::cluster_ca::build_node_deployer(node, token, config, encryption)
+        .await
+        .map(|remote| {
+            remote
+                .with_build_limits(limits)
+                .with_build_limits_version(version)
+        })
+        .map_err(|error| {
+            format!(
+                "Cannot connect to build node '{}' (id={}): {error}",
+                node.name, node.id
+            )
+        })
 }
 
 /// How long a per-architecture build candidate has to answer its health probe.
@@ -4032,9 +4026,8 @@ impl WorkflowExecutionService {
             ))
         })?;
         let deployer = crate::cluster_ca::build_node_deployer(
-            &node.address,
+            &node,
             token,
-            node.name,
             self.config_service.as_ref(),
             encryption_service.as_ref(),
         )
@@ -6966,6 +6959,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };

@@ -4,6 +4,7 @@
 import {
   addManagedDomain,
   applyHostnameMode,
+  createIngressConnector,
   deleteDnsProvider as deleteProvider,
   getDnsProvider as getProvider,
   listManagedDomains,
@@ -56,6 +57,14 @@ import {
   requireDeliveryData,
 } from '@/components/domains/delivery-errors'
 import { HostnameConflictList } from '@/components/domains/HostnameConflictList'
+import {
+  NO_ZONE_TUNNEL,
+  ZoneTunnelChoice,
+  tunnelKindFor,
+  tunnelNameFor,
+  type ZoneTunnel,
+} from '@/components/domains/ZoneTunnelChoice'
+import { problemDetail } from '@/lib/api-problem'
 import {
   conflictDecisionsRequest,
   conflictKey,
@@ -243,6 +252,7 @@ export default function DnsProviderDetail() {
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isAddDomainDialogOpen, setIsAddDomainDialogOpen] = useState(false)
+  const [zoneTunnel, setZoneTunnel] = useState<ZoneTunnel>(NO_ZONE_TUNNEL)
   const [domainToRemove, setDomainToRemove] =
     useState<ManagedDomainResponse | null>(null)
 
@@ -377,12 +387,40 @@ export default function DnsProviderDetail() {
           sync_generated_records: data.proxied_by_default,
         },
       })
-      return requireDeliveryData(response)
+      requireDeliveryData(response)
+      // ADR 058 D10: the tunnel for the zone, created right after it. The
+      // zone stays added if this fails; the message says where to retry.
+      const kind = provider ? tunnelKindFor(provider.provider_type) : undefined
+      if (zoneTunnel.mode !== 'tunnel' || !kind) return { tunnelError: null }
+      const tunnel = await createIngressConnector({
+        body: {
+          name: tunnelNameFor(data.domain),
+          provider: kind,
+          values: { dns_provider_id: providerId, domain: data.domain },
+          node_ids: zoneTunnel.nodeIds,
+        },
+      })
+      return {
+        tunnelError: tunnel.error
+          ? problemDetail(tunnel.error, 'The provider refused the tunnel.')
+          : null,
+      }
     },
-    onSuccess: () => {
-      toast.success('Zone added successfully')
+    onSuccess: ({ tunnelError }) => {
+      if (tunnelError) {
+        toast.warning('Zone added, but its tunnel was not created', {
+          description: `${tunnelError} Set it up from a worker's page.`,
+        })
+      } else {
+        toast.success(
+          zoneTunnel.mode === 'tunnel'
+            ? 'Zone and tunnel added. Apps under it go live through the tunnel.'
+            : 'Zone added successfully'
+        )
+      }
       refetchDomains()
       setIsAddDomainDialogOpen(false)
+      setZoneTunnel(NO_ZONE_TUNNEL)
       addDomainForm.reset()
     },
     onError: (err: Error) => {
@@ -1358,6 +1396,12 @@ export default function DnsProviderDetail() {
                 )}
               />
 
+              <ZoneTunnelChoice
+                providerType={provider.provider_type}
+                value={zoneTunnel}
+                onChange={setZoneTunnel}
+              />
+
               <DialogFooter>
                 <Button
                   type="button"
@@ -1371,11 +1415,13 @@ export default function DnsProviderDetail() {
                   busy={addDomainMut.isPending}
                   busyLabel="Adding…"
                   disabled={
-                    providerSupportsZoneSelection &&
-                    (zonesPending ||
-                      zonesError ||
-                      selectableZones.length === 0 ||
-                      !addDomainForm.watch('domain'))
+                    (zoneTunnel.mode === 'tunnel' &&
+                      zoneTunnel.nodeIds.length === 0) ||
+                    (providerSupportsZoneSelection &&
+                      (zonesPending ||
+                        zonesError ||
+                        selectableZones.length === 0 ||
+                        !addDomainForm.watch('domain')))
                   }
                 >
                   Add zone

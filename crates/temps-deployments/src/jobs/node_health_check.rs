@@ -25,7 +25,9 @@ use crate::services::node_service::{FailedOverReplica, NodeService, RetireReason
 use crate::DeploymentService;
 
 /// Threshold in seconds — nodes with older heartbeats are marked offline.
-const HEARTBEAT_STALE_THRESHOLD_SECS: i64 = 90;
+/// The same threshold decides when a node may be removed as gone (ADR 057).
+const HEARTBEAT_STALE_THRESHOLD_SECS: i64 =
+    crate::services::node_service::NODE_HEARTBEAT_STALE_SECS;
 
 /// Longest gap between two health ticks that still counts as watching
 /// heartbeats continuously. The loop ticks every 60s; a longer gap means the
@@ -1033,6 +1035,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

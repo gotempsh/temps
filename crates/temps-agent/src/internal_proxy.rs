@@ -178,6 +178,10 @@ struct ProxyState {
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
     public_mode: bool,
     forwarded_proto: &'static str,
+    /// HTTPS listeners check the TLS server name against Host. A tunnel
+    /// origin is told `https` by the provider, which terminated TLS, so it
+    /// has no server name to check.
+    require_sni: bool,
     acme: Option<PublicAcmeConfig>,
     acme_relay: Arc<AcmeRelayState>,
 }
@@ -272,6 +276,7 @@ pub async fn spawn(
         inspection_concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_GLOBAL_CONCURRENCY)),
         caller_identities: Arc::clone(&caller_identities),
         public_mode: false,
+        require_sni: false,
         forwarded_proto: "http",
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
@@ -361,6 +366,28 @@ pub async fn spawn(
 }
 
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+    // Reachability check from the control plane (ADR 058 D7): answered on the
+    // public HTTP listener before any host routing, since the check dials the
+    // bare address.
+    if state.public_mode && state.forwarded_proto == "http" {
+        if let (Some(nonce), Some(acme)) = (
+            req.uri()
+                .path()
+                .strip_prefix(temps_core::worker_ingress::PROBE_PATH_PREFIX),
+            state.acme.as_ref(),
+        ) {
+            if !temps_core::worker_ingress::is_probe_nonce(nonce) {
+                return error_body(StatusCode::BAD_REQUEST, "malformed probe");
+            }
+            use sha2::Digest;
+            let token_hash = hex::encode(sha2::Sha256::digest(acme.node_token.as_bytes()));
+            return (
+                StatusCode::OK,
+                temps_core::worker_ingress::probe_answer(&token_hash, nonce),
+            )
+                .into_response();
+        }
+    }
     let host = match extract_host(req.headers()) {
         Some(h) => h,
         None => {
@@ -370,6 +397,7 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
 
     if state.public_mode {
         if state.forwarded_proto == "https"
+            && state.require_sni
             && req
                 .extensions()
                 .get::<PublicTlsSni>()
@@ -478,6 +506,75 @@ pub(crate) fn public_router(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
 ) -> std::io::Result<axum::Router> {
+    public_router_with(store, forwarded_proto, acme, true)
+}
+
+/// The loopback origin an ingress connector forwards to (ADR 058): serves
+/// the public snapshot like the public HTTPS listener, without a server name
+/// to check, and takes the visitor's address from `client_address_header`
+/// when, and only when, the connection comes from loopback.
+pub async fn spawn_tunnel_origin(
+    address: SocketAddr,
+    store: SharedRouteStore,
+    shutdown: Arc<Notify>,
+    client_address_header: Option<String>,
+) -> std::io::Result<SocketAddr> {
+    if !address.ip().is_loopback() {
+        return Err(std::io::Error::other(
+            "the tunnel origin listener binds loopback only",
+        ));
+    }
+    let listener = TcpListener::bind(address).await?;
+    let bound = listener.local_addr()?;
+    let header = client_address_header
+        .map(|name| HeaderName::from_bytes(name.as_bytes()))
+        .transpose()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
+        move |mut req: Request, next: axum::middleware::Next| {
+            let header = header.clone();
+            async move {
+                if let Some(name) = &header {
+                    let from_loopback = req
+                        .extensions()
+                        .get::<ConnectInfo<SocketAddr>>()
+                        .is_some_and(|peer| peer.0.ip().is_loopback());
+                    let visitor = req
+                        .headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.trim().parse::<IpAddr>().ok());
+                    req.headers_mut().remove(name);
+                    if let (true, Some(ip)) = (from_loopback, visitor) {
+                        req.extensions_mut()
+                            .insert(PublicPeer(SocketAddr::new(ip, 0)));
+                    }
+                }
+                next.run(req).await
+            }
+        },
+    ));
+    tokio::spawn(async move {
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            shutdown.notified().await;
+        });
+        if let Err(error) = server.await {
+            error!(%error, "tunnel origin listener exited");
+        }
+    });
+    Ok(bound)
+}
+
+fn public_router_with(
+    store: SharedRouteStore,
+    forwarded_proto: &'static str,
+    acme: Option<PublicAcmeConfig>,
+    require_sni: bool,
+) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_TIMEOUT)
         // Reqwest applies this between successful reads, rather than to the
@@ -496,6 +593,7 @@ pub(crate) fn public_router(
         caller_identities: Arc::new(RwLock::new(CallerIdentitySnapshot::new(HashMap::new()))),
         public_mode: true,
         forwarded_proto,
+        require_sni,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
     });

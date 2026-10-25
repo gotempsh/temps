@@ -17,20 +17,35 @@ export function NoNodeSamplesState({
   range,
   scrapeInterval,
   settingsPath,
+  nodeKind = 'control-plane',
 }: {
   /** The selected window ("1h", "24h", ...). */
   range: string
   /** Seconds between samples, from the monitoring settings. */
   scrapeInterval: number
   settingsPath: string
+  /**
+   * Whose samples are missing. A worker has no sampler of its own: its agent
+   * reports capacity with every heartbeat and the control plane stores it.
+   */
+  nodeKind?: 'control-plane' | 'worker'
 }) {
+  const worker = nodeKind === 'worker'
   return (
     <div className="rounded-lg border bg-card text-card-foreground">
       <EmptyState
         size="compact"
         icon={Activity}
-        title="No server samples in this window"
-        description={`No CPU, memory, disk or network sample was recorded for this host in the last ${range}. The sampler runs inside temps serve and writes one every ${formatAge(scrapeInterval)}, so a fresh install fills in shortly after it starts. If none arrive, check that temps serve is running and review the collection settings.`}
+        title={
+          worker
+            ? 'No worker samples in this window'
+            : 'No server samples in this window'
+        }
+        description={
+          worker
+            ? `No CPU, memory or disk sample was recorded for this worker in the last ${range}. Its agent reports them with every heartbeat (about every 30 s), so a newly joined worker fills in within a minute. If none arrive, check that temps agent is running on the worker and can reach the control plane, and review the collection settings.`
+            : `No CPU, memory, disk or network sample was recorded for this host in the last ${range}. The sampler runs inside temps serve and writes one every ${formatAge(scrapeInterval)}, so a fresh install fills in shortly after it starts. If none arrive, check that temps serve is running and review the collection settings.`
+        }
         action={
           <Button asChild variant="outline" size="sm">
             <Link to={settingsPath}>

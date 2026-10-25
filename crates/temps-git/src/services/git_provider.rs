@@ -712,6 +712,23 @@ pub trait GitProviderService: Send + Sync {
         webhook_id: &str,
     ) -> Result<(), GitProviderError>;
 
+    /// Replace the configuration (URL, secret, events) of an existing webhook,
+    /// keeping its ID. Returns `Ok(false)` when the webhook no longer exists,
+    /// so the caller can register a new one instead.
+    ///
+    /// # Default
+    /// Returns [`GitProviderError::NotImplemented`].
+    async fn update_webhook(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+        _webhook_id: &str,
+        _config: WebhookConfig,
+    ) -> Result<bool, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
+
     /// Verify webhook signature
     async fn verify_webhook_signature(
         &self,

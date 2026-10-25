@@ -131,7 +131,7 @@ impl StatusPageService {
                     monitor_statuses.push(MonitorStatus {
                         monitor,
                         current_status: "unknown".to_string(),
-                        uptime_percentage: 0.0,
+                        uptime_percentage: None,
                         avg_response_time_ms: None,
                     });
                 }

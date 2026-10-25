@@ -2209,46 +2209,20 @@ async fn find_environments_for_branch(
             return Ok(vec![existing_preview]);
         }
 
-        // Check if a soft-deleted preview environment exists for this branch — restore it
-        if let Some(deleted_preview) = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project.id))
-            .filter(environments::Column::Branch.eq(branch_name))
-            .filter(environments::Column::DeletedAt.is_not_null())
-            .one(db.as_ref())
-            .await
-            .map_err(|e| format!("Database error finding deleted preview environment: {}", e))?
-        {
-            info!(
-                "Restoring soft-deleted preview environment {} for branch '{}'",
-                deleted_preview.id, branch_name
-            );
-            let deleted_preview_id = deleted_preview.id;
-            let subdomain = deleted_preview.subdomain.clone();
-            let txn = db
-                .begin()
-                .await
-                .map_err(|error| format!("Failed to begin preview restore: {error}"))?;
-            if environments::claim_subdomain(&txn, &subdomain, &[deleted_preview_id])
-                .await
-                .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
-                .is_some()
-            {
-                return Err(format!("Preview subdomain '{subdomain}' is already in use"));
-            }
-            let mut active_env: environments::ActiveModel = deleted_preview.into();
-            active_env.deleted_at = Set(None);
-            active_env.updated_at = Set(chrono::Utc::now());
-            active_env.current_deployment_id = Set(None);
-            let restored = active_env
-                .update(&txn)
-                .await
-                .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
-            txn.commit()
-                .await
-                .map_err(|error| format!("Failed to commit preview restore: {error}"))?;
-            return Ok(vec![restored]);
-        }
-
+        // A soft-deleted environment for this branch is deliberately NOT
+        // revived here. Reviving reused the old row id, and with it every
+        // `env_var_environments` / `secret_environments` link of the deleted
+        // incarnation -- links that soft delete keeps on purpose, because a
+        // variable left with no links at all would apply to every
+        // environment. The lookup also matched any deleted environment on
+        // the branch, so a push could bring back a deleted staging or
+        // protected environment and hand its scoped secrets to the pushed
+        // code. A push is unattended, so it gets a fresh preview whose
+        // links come from the project's current `include_in_preview`
+        // policy. The deleted row and its links stay as they are, out of
+        // reach of any deployment. An operator who wants the old
+        // environment back can still re-create it explicitly
+        // (`EnvironmentService::create_environment`).
         // Create new preview environment for this branch
         return create_preview_environment(db, project, branch_name, &slugified_branch)
             .await
@@ -5800,6 +5774,111 @@ mod tests {
             .await?
             .expect("row still exists");
         assert!(still_deleted.deleted_at.is_some());
+
+        Ok(())
+    }
+
+    /// A push to a branch whose preview was deleted gets a fresh preview:
+    /// the deleted row's variable links stay with the deleted row instead of
+    /// being handed to the pushed code, and no link is dropped (which would
+    /// widen a variable to every environment).
+    #[tokio::test]
+    async fn test_push_creates_fresh_preview_instead_of_reviving_deleted_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars, environments};
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Preview Revival Test".to_string()),
+            slug: Set("preview-revival".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            enable_preview_environments: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deleted_preview = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("feature-x".to_string()),
+            slug: Set("feature-x".to_string()),
+            host: Set(String::new()),
+            branch: Set(Some("feature-x".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("preview-revival-feature-x".to_string()),
+            is_preview: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(Some(Utc::now())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let new_var = |key: &str, include_in_preview: bool| env_vars::ActiveModel {
+            project_id: Set(project.id),
+            key: Set(key.to_string()),
+            value: Set("value".to_string()),
+            include_in_preview: Set(include_in_preview),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        // Scoped only to the deleted incarnation.
+        let stale = new_var("OLD_PREVIEW_TOKEN", false)
+            .insert(db.as_ref())
+            .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(stale.id),
+            environment_id: Set(deleted_preview.id),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        // What the project currently says every preview receives.
+        let policy = new_var("PREVIEW_API_URL", true).insert(db.as_ref()).await?;
+
+        let found = find_environments_for_branch(db.clone(), &project, Some("feature-x")).await?;
+        assert_eq!(found.len(), 1);
+        let preview = &found[0];
+        assert_ne!(
+            preview.id, deleted_preview.id,
+            "the deleted row must not be revived"
+        );
+        assert!(preview.is_preview);
+
+        let linked: Vec<i32> = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvironmentId.eq(preview.id))
+            .all(db.as_ref())
+            .await?
+            .into_iter()
+            .map(|link| link.env_var_id)
+            .collect();
+        assert_eq!(linked, vec![policy.id], "only the preview policy is linked");
+
+        let old = environments::Entity::find_by_id(deleted_preview.id)
+            .one(db.as_ref())
+            .await?
+            .expect("deleted row still exists");
+        assert!(old.deleted_at.is_some());
+        let stale_links = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(stale.id))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(
+            stale_links.len(),
+            1,
+            "the stale variable keeps its link, so it never becomes global"
+        );
 
         Ok(())
     }

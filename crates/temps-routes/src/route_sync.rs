@@ -110,6 +110,19 @@ pub struct PublicIngressSnapshot {
     pub unsupported_reasons: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificates: Option<PublicIngressCertificates>,
+    /// Where the agent binds its public listeners (ADR 058 D7). Absent when
+    /// the node takes no direct traffic (off, or a connector only); agents
+    /// that predate it keep using `--public-ingress-address`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<PublicListenDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicListenDto {
+    /// Local address to bind; `None` means the default-route interface.
+    pub address: Option<String>,
+    pub http_port: u16,
+    pub https_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +320,11 @@ pub async fn get_routes_snapshot(
     })
     .await;
     current = app_state.peer_table.current_generation();
+    // Reload the node: the wake-up is usually a change to it (public
+    // ingress turned on or off, a new ingress key), and the row read before
+    // the wait would answer it with the old state for a whole poll. This
+    // also drops a token revoked while the request was parked.
+    let node = authenticate_node(&app_state.db, &headers, node_id).await?;
     Ok(Json(
         build_snapshot(&app_state, &node, current)
             .await
@@ -450,11 +468,120 @@ pub fn configure_routes() -> axum::Router<Arc<RouteSyncAppState>> {
             "/internal/nodes/{node_id}/acme-challenge",
             get(get_acme_challenge),
         )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress/key",
+            post(crate::public_ingress_sync::post_ingress_key),
+        )
+        .route(
+            "/internal/nodes/{node_id}/public-ingress/report",
+            post(crate::public_ingress_sync::post_listener_report),
+        )
 }
 
 // ---------------------------------------------------------------------------
 // Snapshot builder
 // ---------------------------------------------------------------------------
+
+/// The public routes workers serve themselves, and why the others stay on
+/// the control plane. The route snapshot and the ingress connectors (ADR 058)
+/// share it, so a tunnel never publishes a hostname its workers would not
+/// serve.
+#[derive(Debug, Clone, Default)]
+pub struct WorkerPublicRoutes {
+    pub routes: Vec<RouteEntryDto>,
+    /// Routes offered to workers that a policy or a control-plane backend
+    /// keeps on the control plane.
+    pub unsupported_route_count: usize,
+    pub unsupported_reasons: Vec<String>,
+    /// Cluster-wide policies that keep every route on the control plane;
+    /// empty when only some routes are held back.
+    pub blocking_policies: Vec<String>,
+}
+
+pub async fn worker_public_routes(
+    db: &DatabaseConnection,
+    peer_table: &CachedPeerTable,
+    custom_request_policy: bool,
+) -> Result<WorkerPublicRoutes, (&'static str, sea_orm::DbErr)> {
+    use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
+    use temps_entities::{ip_access_control, project_ip_access_rules, settings};
+    let app_settings = settings::Entity::find()
+        .one(db)
+        .await
+        .map_err(|source| ("load public-ingress request policy", source))?
+        .map(|row| temps_core::AppSettings::from_json(row.data))
+        .unwrap_or_default();
+    let ip_policy_count = ip_access_control::Entity::find()
+        .count(db)
+        .await
+        .map_err(|source| ("inspect public-ingress IP policy", source))?;
+    // Per-project / per-environment allow and deny lists are enforced by
+    // the control-plane proxy only; a worker ingress node has no copy of
+    // them, so serving those hosts there would bypass the list.
+    let project_ip_rule_count = project_ip_access_rules::Entity::find()
+        .filter(project_ip_access_rules::Column::Mode.ne("disabled"))
+        .count(db)
+        .await
+        .map_err(|source| ("inspect public-ingress project IP access rules", source))?;
+    let project_rate_limit_count = count_project_rate_limit_policies(db)
+        .await
+        .map_err(|source| ("inspect project rate-limit policies", source))?;
+    let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
+        nodes::Entity::find()
+            .filter(nodes::Column::Role.eq("worker"))
+            .filter(nodes::Column::Status.eq("active"))
+            .all(db)
+            .await
+            .map_err(|source| ("load registered worker backend addresses", source))?
+            .into_iter()
+            .filter_map(|worker| worker.data_address().parse().ok())
+            .collect();
+    let mut blocking_policies = Vec::new();
+    if app_settings.rate_limiting.enabled {
+        blocking_policies.push("global rate limiting is enabled".to_string());
+    }
+    if app_settings.security_headers.enabled {
+        blocking_policies.push("global security headers are enabled".to_string());
+    }
+    if project_rate_limit_count > 0 {
+        blocking_policies.push("project rate limits are configured".to_string());
+    }
+    if ip_policy_count > 0 {
+        blocking_policies.push("IP access-control rules are configured".to_string());
+    }
+    if project_ip_rule_count > 0 {
+        blocking_policies.push("project IP access rules are configured".to_string());
+    }
+    if custom_request_policy {
+        blocking_policies
+            .push("a custom request-policy provider requires control-plane ingress".to_string());
+    }
+    let public_route_count = peer_table.worker_public_route_count();
+    let raw_public_routes = if blocking_policies.is_empty() {
+        peer_table.snapshot_worker_public_routes()
+    } else {
+        Vec::new()
+    };
+    let routes: Vec<RouteEntryDto> = raw_public_routes
+        .into_iter()
+        .filter_map(|(host, route)| entry_from_route(host, &route))
+        .filter(|route| {
+            route.backends.iter().all(|backend| {
+                public_backend_is_registered_worker(&backend.address, &registered_worker_addresses)
+            })
+        })
+        .collect();
+    let mut unsupported_reasons = blocking_policies.clone();
+    if public_route_count > routes.len() && unsupported_reasons.is_empty() {
+        unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, or a remotely reachable backend".to_string());
+    }
+    Ok(WorkerPublicRoutes {
+        unsupported_route_count: public_route_count.saturating_sub(routes.len()),
+        routes,
+        unsupported_reasons,
+        blocking_policies,
+    })
+}
 
 async fn build_snapshot(
     state: &RouteSyncAppState,
@@ -468,121 +595,60 @@ async fn build_snapshot(
             routes.push(entry);
         }
     }
-    let public_ingress = if node.public_ingress_enabled {
-        use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
-        use temps_entities::{ip_access_control, project_ip_access_rules, settings};
-        let app_settings = settings::Entity::find()
+    // A node running an ingress connector (ADR 058) serves public routes on
+    // its loopback tunnel origin even without a public listener.
+    let runs_connector = {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        temps_entities::ingress_connector_nodes::Entity::find()
+            .filter(temps_entities::ingress_connector_nodes::Column::NodeId.eq(node.id))
             .one(state.db.as_ref())
             .await
             .map_err(|source| SnapshotBuildError::Database {
                 node_id: node.id,
-                operation: "load public-ingress request policy",
+                operation: "check ingress connector assignment",
                 source,
             })?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
-            .unwrap_or_default();
-        let ip_policy_count = ip_access_control::Entity::find()
-            .count(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
-                node_id: node.id,
-                operation: "inspect public-ingress IP policy",
-                source,
-            })?;
-        // Per-project / per-environment allow and deny lists are enforced by
-        // the control-plane proxy only; a worker ingress node has no copy of
-        // them, so serving those hosts there would bypass the list.
-        let project_ip_rule_count = project_ip_access_rules::Entity::find()
-            .filter(project_ip_access_rules::Column::Mode.ne("disabled"))
-            .count(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
-                node_id: node.id,
-                operation: "inspect public-ingress project IP access rules",
-                source,
-            })?;
-        let project_rate_limit_count = count_project_rate_limit_policies(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
+            .is_some()
+    };
+    let public_ingress = if node.public_ingress_enabled || runs_connector {
+        let WorkerPublicRoutes {
+            routes: public_routes,
+            unsupported_route_count,
+            unsupported_reasons,
+            ..
+        } = worker_public_routes(
+            state.db.as_ref(),
+            &state.peer_table,
+            !state.request_policy_gate.supports_worker_ingress(),
+        )
+        .await
+        .map_err(|(operation, source)| SnapshotBuildError::Database {
             node_id: node.id,
-            operation: "inspect project rate-limit policies",
+            operation,
             source,
         })?;
-        let custom_request_policy = !state.request_policy_gate.supports_worker_ingress();
-        let registered_worker_addresses: std::collections::HashSet<std::net::IpAddr> =
-            nodes::Entity::find()
-                .filter(nodes::Column::Role.eq("worker"))
-                .filter(nodes::Column::Status.eq("active"))
-                .all(state.db.as_ref())
-                .await
-                .map_err(|source| SnapshotBuildError::Database {
-                    node_id: node.id,
-                    operation: "load registered worker backend addresses",
-                    source,
-                })?
-                .into_iter()
-                .filter_map(|worker| worker.data_address().parse().ok())
-                .collect();
-        let policy_requires_control_plane = app_settings.rate_limiting.enabled
-            || app_settings.security_headers.enabled
-            || ip_policy_count > 0
-            || project_ip_rule_count > 0
-            || project_rate_limit_count > 0
-            || custom_request_policy;
-        let public_route_count = state.peer_table.worker_public_route_count();
-        let raw_public_routes = if policy_requires_control_plane {
-            Vec::new()
-        } else {
-            state.peer_table.snapshot_worker_public_routes()
-        };
-        let public_routes: Vec<RouteEntryDto> = raw_public_routes
-            .into_iter()
-            .filter_map(|(host, route)| entry_from_route(host, &route))
-            .filter(|route| {
-                route.backends.iter().all(|backend| {
-                    public_backend_is_registered_worker(
-                        &backend.address,
-                        &registered_worker_addresses,
-                    )
-                })
-            })
-            .collect();
-        let supported_count = public_routes.len();
         let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
             .iter()
             .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
             .collect();
-        let mut unsupported_reasons = Vec::new();
-        if app_settings.rate_limiting.enabled {
-            unsupported_reasons.push("global rate limiting is enabled".to_string());
-        }
-        if app_settings.security_headers.enabled {
-            unsupported_reasons.push("global security headers are enabled".to_string());
-        }
-        if project_rate_limit_count > 0 {
-            unsupported_reasons.push("project rate limits are configured".to_string());
-        }
-        if ip_policy_count > 0 {
-            unsupported_reasons.push("IP access-control rules are configured".to_string());
-        }
-        if project_ip_rule_count > 0 {
-            unsupported_reasons.push("project IP access rules are configured".to_string());
-        }
-        if custom_request_policy {
-            unsupported_reasons.push(
-                "a custom request-policy provider requires control-plane ingress".to_string(),
-            );
-        }
-        if public_route_count > supported_count && unsupported_reasons.is_empty() {
-            unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, or a remotely reachable backend".to_string());
-        }
         PublicIngressSnapshot {
             enabled: true,
             routes: public_routes,
-            unsupported_route_count: public_route_count.saturating_sub(supported_count),
+            unsupported_route_count,
             unsupported_reasons,
-            certificates: encrypt_public_certificates(state, node, &allowed_certificate_hosts)
-                .await?,
+            // Only a node that terminates TLS itself gets private keys. A
+            // connector serves plain HTTP on loopback and the provider holds
+            // the certificate, so running one is no reason to ship keys.
+            certificates: if node.public_ingress_enabled {
+                encrypt_public_certificates(state, node, &allowed_certificate_hosts).await?
+            } else {
+                None
+            },
+            listen: if node.public_ingress_enabled {
+                Some(public_listen(state, node).await?)
+            } else {
+                None
+            },
         }
     } else {
         PublicIngressSnapshot::default()
@@ -591,6 +657,38 @@ async fn build_snapshot(
         generation,
         routes,
         public_ingress,
+    })
+}
+
+async fn public_listen(
+    state: &RouteSyncAppState,
+    node: &nodes::Model,
+) -> Result<PublicListenDto, SnapshotBuildError> {
+    let row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "load public ingress listen settings",
+            source,
+        })?;
+    let port = |value: i32, default: u16| {
+        u16::try_from(value)
+            .ok()
+            .filter(|p| *p != 0)
+            .unwrap_or(default)
+    };
+    Ok(match row {
+        Some(row) => PublicListenDto {
+            address: row.listen_address,
+            http_port: port(row.http_port, 80),
+            https_port: port(row.https_port, 443),
+        },
+        None => PublicListenDto {
+            address: None,
+            http_port: 80,
+            https_port: 443,
+        },
     })
 }
 
@@ -739,7 +837,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
 // Auth helper (same shape as temps-dns dns_sync)
 // ---------------------------------------------------------------------------
 
-async fn authenticate_node(
+pub async fn authenticate_node(
     db: &DatabaseConnection,
     headers: &HeaderMap,
     node_id: i32,
@@ -814,7 +912,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
@@ -826,7 +924,7 @@ mod tests {
     use crate::route_table::BackendEntry;
     use crate::test_utils::TestDBMockOperations;
 
-    fn test_node(public_ingress_enabled: bool) -> nodes::Model {
+    pub(crate) fn test_node(public_ingress_enabled: bool) -> nodes::Model {
         let now = chrono::Utc::now();
         nodes::Model {
             id: 7,
@@ -864,6 +962,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: now,
             updated_at: now,
         }

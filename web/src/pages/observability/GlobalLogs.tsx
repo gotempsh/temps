@@ -6,6 +6,7 @@ import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
 import { LogCollectionNotice } from '@/components/observability/LogCollectionNotice'
+import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
 import {
   AttrPredicateChips,
   LogAttributeSidebar,
@@ -227,6 +228,7 @@ export default function GlobalLogs() {
         statusUpdatedAt={capabilities.dataUpdatedAt || undefined}
         onRetry={() => void capabilities.refetch()}
       />
+      <LogIngestBudgetWarning projectLabels={projectLabels} />
       <LogExplorer
         lines={lines}
         environmentLabels={environmentLabels}

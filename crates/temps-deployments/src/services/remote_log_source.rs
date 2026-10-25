@@ -215,9 +215,10 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
 
         // follow + timestamps so we get a live, RFC3339-prefixed line stream.
         // `start_date` maps to Docker's `since` (seconds) for resume.
+        let endpoint = crate::cluster_ca::node_agent_endpoint(&node);
         let mut url = format!(
             "{}/agent/containers/{}/logs/stream",
-            node.address.trim_end_matches('/'),
+            endpoint.dial_url.trim_end_matches('/'),
             container_id,
         );
         let mut query: Vec<(&str, String)> = vec![
@@ -238,7 +239,7 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
         // mTLS for https:// nodes (ADR-020), plain HTTP otherwise. No top-level
         // timeout — log follow streams are long-lived by design.
         let client = crate::cluster_ca::build_node_http_client(
-            &node.address,
+            &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
             None,

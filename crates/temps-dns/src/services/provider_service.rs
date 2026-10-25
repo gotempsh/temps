@@ -24,9 +24,9 @@ use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    AzureProvider, BunnyProvider, CloudflareProvider, DigitalOceanProvider, DnsProvider,
-    DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider, PebbleDnsProvider,
-    ProviderCredentials, Route53Provider,
+    AzureProvider, BunnyProvider, CloudflareCredentials, CloudflareProvider, DigitalOceanProvider,
+    DnsProvider, DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider,
+    PebbleDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
@@ -519,6 +519,36 @@ impl DnsProviderService {
         self.create_provider_instance(provider)
             .map(|instance| instance.capabilities().flat_hostnames)
             .unwrap_or(false)
+    }
+
+    /// The decrypted credentials of a Cloudflare provider, for callers that
+    /// drive Cloudflare APIs beyond DNS with the same token (ADR 058 tunnels).
+    pub fn cloudflare_credentials(
+        &self,
+        provider: &dns_providers::Model,
+    ) -> Result<CloudflareCredentials, DnsError> {
+        if !provider.is_active {
+            return Err(DnsError::ProviderInactive {
+                provider_id: provider.id,
+                provider_name: provider.name.clone(),
+            });
+        }
+        if DnsProviderType::from_str(&provider.provider_type)? != DnsProviderType::Cloudflare {
+            return Err(DnsError::InvalidCredentials(format!(
+                "DNS provider '{}' is {}, not Cloudflare",
+                provider.name, provider.provider_type
+            )));
+        }
+        let credentials_json = self
+            .encryption_service
+            .decrypt_string(&provider.credentials)
+            .map_err(|e| DnsError::Decryption(e.to_string()))?;
+        match serde_json::from_str::<ProviderCredentials>(&credentials_json)? {
+            ProviderCredentials::Cloudflare(credentials) => Ok(credentials),
+            _ => Err(DnsError::InvalidCredentials(
+                "Expected Cloudflare credentials".into(),
+            )),
+        }
     }
 
     pub fn create_provider_instance(
@@ -1500,6 +1530,98 @@ impl DnsProviderService {
             .await
     }
 
+    /// [`Self::find_provider_for_domain`] for many domains in one query,
+    /// keyed by the domain as given. Each entry follows the same rules: the
+    /// most specific verified, auto-managed zone of an active provider wins,
+    /// and two rows for that zone are ambiguous.
+    #[allow(clippy::type_complexity)]
+    pub async fn find_providers_for_domains(
+        &self,
+        domains: &[String],
+    ) -> Result<
+        std::collections::HashMap<
+            String,
+            Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError>,
+        >,
+        DnsError,
+    > {
+        let candidates: std::collections::BTreeSet<String> = domains
+            .iter()
+            .flat_map(|domain| Self::authoritative_suffix_candidates(domain))
+            .collect();
+        let rows = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            let placeholders = (1..=candidates.len())
+                .map(|position| format!("${position}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            dns_managed_domains::Entity::find()
+                .find_also_related(dns_providers::Entity)
+                .filter(sea_orm::sea_query::Expr::cust_with_values(
+                    format!(
+                        "{} IN ({placeholders})",
+                        Self::NORMALIZED_MANAGED_DOMAIN_SQL
+                    ),
+                    candidates,
+                ))
+                .filter(dns_managed_domains::Column::Verified.eq(true))
+                .filter(dns_providers::Column::IsActive.eq(true))
+                .filter(dns_managed_domains::Column::AutoManage.eq(true))
+                .all(self.db.as_ref())
+                .await
+                .map_err(DnsError::from)?
+                .into_iter()
+                .filter_map(|(managed, provider)| provider.map(|provider| (provider, managed)))
+                .collect::<Vec<_>>()
+        };
+        Ok(domains
+            .iter()
+            .map(|domain| (domain.clone(), Self::pick_covering_zone(domain, &rows)))
+            .collect())
+    }
+
+    /// The zone among `rows` that covers `domain`, ranked the way
+    /// [`Self::find_active_managed_domain_candidate`] ranks in SQL: the
+    /// longest zone first, the lowest id on a tie.
+    fn pick_covering_zone(
+        domain: &str,
+        rows: &[(dns_providers::Model, dns_managed_domains::Model)],
+    ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
+        let candidates: std::collections::HashSet<String> =
+            Self::authoritative_suffix_candidates(domain)
+                .into_iter()
+                .collect();
+        let mut covering: Vec<_> = rows
+            .iter()
+            .map(|(provider, managed)| (Self::normalize_domain(&managed.domain), provider, managed))
+            .filter(|(zone, _, _)| candidates.contains(zone))
+            .collect();
+        covering.sort_by(|a, b| {
+            b.0.chars()
+                .count()
+                .cmp(&a.0.chars().count())
+                .then(a.2.id.cmp(&b.2.id))
+        });
+        let Some((canonical_zone, provider, managed)) = covering.first() else {
+            return Ok(None);
+        };
+        if covering
+            .get(1)
+            .is_some_and(|(zone, _, _)| zone == canonical_zone)
+        {
+            return Err(DnsError::AmbiguousManagedDomain {
+                requested_domain: domain.to_string(),
+                canonical_zone: canonical_zone.clone(),
+                managed_domain_ids: covering.iter().take(2).map(|(_, _, m)| m.id).collect(),
+                provider_ids: covering.iter().take(2).map(|(_, p, _)| p.id).collect(),
+            });
+        }
+        let mut selected = (*managed).clone();
+        selected.domain = canonical_zone.clone();
+        Ok(Some(((*provider).clone(), selected)))
+    }
+
     /// Find the verified zone belonging to `provider_id` that authoritatively
     /// covers `domain`. Human-triggered writes do not require `auto_manage`, but
     /// they must never be allowed to use arbitrary provider credentials.
@@ -1734,6 +1856,48 @@ mod upstream_tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn batch_lookup_ranks_zones_like_the_single_lookup() {
+        let rows = vec![
+            (
+                dns_provider(1, "a", true),
+                managed_domain(10, 1, "Example.com."),
+            ),
+            (
+                dns_provider(1, "a", true),
+                managed_domain(11, 1, "apps.example.com"),
+            ),
+            (
+                dns_provider(2, "b", true),
+                managed_domain(12, 2, "other.org"),
+            ),
+            (
+                dns_provider(3, "c", true),
+                managed_domain(13, 3, "other.org"),
+            ),
+        ];
+        let zone = |domain: &str| {
+            DnsProviderService::pick_covering_zone(domain, &rows)
+                .map(|found| found.map(|(provider, managed)| (provider.id, managed.domain)))
+        };
+
+        // The most specific covering zone wins, and comes back canonical.
+        assert_eq!(
+            zone("x.apps.example.com").unwrap(),
+            Some((1, "apps.example.com".into()))
+        );
+        assert_eq!(
+            zone("www.example.com").unwrap(),
+            Some((1, "example.com".into()))
+        );
+        assert_eq!(zone("example.net").unwrap(), None);
+        // Two rows for the most specific zone are ambiguous, as in SQL.
+        assert!(matches!(
+            zone("app.other.org"),
+            Err(DnsError::AmbiguousManagedDomain { .. })
+        ));
     }
 
     #[test]

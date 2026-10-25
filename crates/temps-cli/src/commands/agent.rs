@@ -116,12 +116,17 @@ pub enum AgentSubcommand {
     /// Run the agent as a systemd service (install, uninstall, status)
     #[command(subcommand)]
     Service(super::agent_service::AgentServiceCommand),
+    /// Choose whether this worker takes public traffic (ADR 058 D7)
+    #[command(subcommand)]
+    Ingress(super::agent_ingress::AgentIngressCommand),
 }
 
 impl AgentCommand {
     pub fn execute(self) -> anyhow::Result<()> {
-        if let Some(AgentSubcommand::Service(command)) = &self.service {
-            return command.execute();
+        match &self.service {
+            Some(AgentSubcommand::Service(command)) => return command.execute(),
+            Some(AgentSubcommand::Ingress(command)) => return command.execute(),
+            None => {}
         }
         let available_parallelism = std::thread::available_parallelism()
             .map(usize::from)
@@ -313,45 +318,50 @@ impl AgentCommand {
                 }
             }
 
-            if let (Some(public_ip), Some(private_key_b64)) = (
-                config.public_ingress_address,
-                config.public_ingress_private_key.clone(),
-            ) {
-                let ingress_config = temps_agent::public_ingress::PublicIngressConfig {
-                    http_address: std::net::SocketAddr::new(
-                        public_ip,
-                        config.public_ingress_http_port,
-                    ),
-                    https_address: std::net::SocketAddr::new(
-                        public_ip,
-                        config.public_ingress_https_port,
-                    ),
-                    private_key_b64,
+            // Direct worker ingress (ADR 058 D7): the worker's own mode
+            // (`temps agent ingress`) decides whether and where it listens.
+            temps_agent::public_ingress_manager::start(
+                temps_agent::public_ingress_manager::ManagerConfig {
+                    private_key_b64: config.public_ingress_private_key.clone(),
+                    data_dir: agent_data_dir(),
                     control_plane_url: config.control_plane_url.clone(),
                     control_plane_ca: temps_agent::control_plane_ca(&config),
                     node_id: config.node_id,
                     node_token: config.token.clone(),
-                };
-                match temps_agent::public_ingress::spawn(
-                    ingress_config,
+                    ingress: config.local_ingress(),
+                    pinned: self.public_ingress_address.is_some(),
+                    config_path: agent_data_dir().join("agent.json"),
+                },
+                route_store.clone(),
+                route_sync_shutdown.clone(),
+                route_store.public_ingress_snapshot().listen,
+            );
+
+            // Ingress connectors (ADR 058): tunnels such as Cloudflare Tunnel
+            // the control plane assigns to this node. Saved specs start even
+            // while the control plane is unreachable.
+            {
+                let supervisor = temps_agent::connectors::ConnectorSupervisor::new(
+                    agent_data_dir(),
                     route_store.clone(),
                     route_sync_shutdown.clone(),
-                )
-                .await
-                {
-                    Ok(handle) => tracing::info!(
-                        http = %handle.http_address(),
-                        https = %handle.https_address(),
-                        "public worker ingress started"
-                    ),
-                    Err(error) => tracing::error!(%error, "public worker ingress failed to start"),
+                );
+                match temps_agent::connectors::sync::ConnectorSync::new(
+                    config.control_plane_url.clone(),
+                    config.node_id,
+                    config.token.clone(),
+                    temps_agent::control_plane_ca(&config),
+                    supervisor,
+                    agent_data_dir(),
+                    route_sync_shutdown.clone(),
+                ) {
+                    Ok(sync) => {
+                        tokio::spawn(sync.run());
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "ingress connector sync could not start")
+                    }
                 }
-            } else if config.public_ingress_address.is_some() {
-                let message = "public ingress is configured but this worker has no ingress encryption key; rerun the original `temps join` command with the same node name and control-plane target to re-enroll, then restart the agent";
-                temps_agent::public_ingress::record_failure(message);
-                tracing::error!("{message}");
-            } else {
-                tracing::info!("public worker ingress listener not configured on this node");
             }
 
             // Internal edge proxy bound to the overlay bridge gateway.
@@ -604,6 +614,13 @@ impl AgentCommand {
             public_ingress_private_key: saved
                 .as_ref()
                 .and_then(|config| config.public_ingress_private_key.clone()),
+            // `--public-ingress-address` on the command line pins this run to
+            // `fixed` on that address, over whatever agent.json says.
+            ingress: if self.public_ingress_address.is_some() {
+                None
+            } else {
+                saved.as_ref().and_then(|config| config.ingress.clone())
+            },
             mesh_key_dir: agent_data_dir().join("wireguard"),
             wg_endpoint: self
                 .wg_endpoint

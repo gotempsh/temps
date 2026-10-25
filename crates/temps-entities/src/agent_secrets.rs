@@ -12,6 +12,10 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
+    /// Project whose agent runs receive this secret. `None` is the explicit
+    /// instance-wide scope: the secret is injected into every project's runs.
+    pub project_id: Option<i32>,
+    /// Unique per scope (`project_id`, `name`).
     pub name: String,
     /// "env" (environment variable) or "file" (written to mount_path)
     pub secret_type: String,
@@ -26,7 +30,21 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(
+        belongs_to = "super::projects::Entity",
+        from = "Column::ProjectId",
+        to = "super::projects::Column::Id",
+        on_delete = "Cascade"
+    )]
+    Project,
+}
+
+impl Related<super::projects::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::Project.def()
+    }
+}
 
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {

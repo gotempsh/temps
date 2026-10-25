@@ -7,8 +7,10 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteDomainMutation,
+  listIngressHostnamesOptions,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { DomainResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -23,19 +25,27 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
-import { useMutation } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
 import {
   AlertTriangle,
   ArrowUp,
   ArrowDown,
   ArrowUpDown,
+  ChevronRight,
+  Cloud,
   EllipsisVertical,
   Globe,
   Info,
   Plus,
   RefreshCw,
   Search,
+  ShieldCheck,
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
@@ -46,6 +56,13 @@ import {
   isServingCert,
 } from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
+import { StateBadge } from './TunnelHostnames'
+import {
+  domainRowHref,
+  mergeDomainRows,
+  tunnelRows,
+  type DomainRow,
+} from './domain-rows'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Link, useNavigate } from 'react-router'
@@ -161,6 +178,29 @@ export function DomainsManagement({
     )
   }
 
+  // Names tunnels carry, listed with the certificates (ADR 058 D10).
+  // Without settings access these 403 and the list is certificates only.
+  const connectorsQuery = useQuery({
+    ...allTunnelsOptions(),
+    retry: false,
+  })
+  const hostnamesQuery = useQuery({
+    ...listIngressHostnamesOptions(),
+    refetchInterval: 15_000,
+    retry: false,
+  })
+  const tunnels = tunnelRows(
+    connectorsQuery.data ?? [],
+    hostnamesQuery.data ?? [],
+    searchQuery
+  )
+  const rows = mergeDomainRows(domains ?? [], tunnels, page, sort, direction)
+  const failingTunnels = tunnels.filter(
+    (r) => r.kind === 'tunnel' && r.view.state === 'error'
+  ).length
+  // Open by default only while there is nothing to list; then it is noise.
+  const [dnsTipsOpen, setDnsTipsOpen] = useState<boolean>()
+
   const pendingProvisioningCount =
     domains?.filter(
       (domain) =>
@@ -197,48 +237,67 @@ export function DomainsManagement({
       </Button>
     ),
   })
-  const columns: DataTableColumn<DomainResponse>[] = [
+  const columns: DataTableColumn<DomainRow>[] = [
     {
       ...sortable('domain', 'Domain'),
-      render: (domain) => (
+      render: (row) => (
         <Link
-          to={`/domains/${domain.id}`}
+          to={domainRowHref(row)}
           className="font-medium hover:underline focus-visible:underline"
         >
-          {domain.domain}
+          {row.name}
         </Link>
       ),
     },
     {
       ...sortable('status', 'Status'),
-      render: (domain) => <DomainStatusBadge status={domain.status} />,
+      render: (row) =>
+        row.kind === 'certificate' ? (
+          <DomainStatusBadge status={row.domain.status} />
+        ) : row.kind === 'tunnel' ? (
+          <StateBadge view={row.view} />
+        ) : (
+          <TunnelZoneStatus row={row} />
+        ),
     },
     {
-      key: 'type',
-      header: 'Type',
-      render: (domain) => (
-        <span className="text-muted-foreground">
-          {domain.is_wildcard ? 'Wildcard' : 'Single domain'}
-        </span>
-      ),
+      key: 'https',
+      header: 'HTTPS',
+      render: (row) => <HttpsSource row={row} />,
     },
     {
       ...sortable('expiration', 'Certificate expires'),
-      render: (domain) => <DomainExpiration domain={domain} />,
+      render: (row) =>
+        row.kind === 'certificate' ? (
+          <DomainExpiration domain={row.domain} />
+        ) : (
+          <span className="text-muted-foreground">Renewed by Cloudflare</span>
+        ),
     },
     {
       key: 'actions',
       header: <span className="sr-only">Actions</span>,
       className: 'w-12',
-      render: (domain) => (
-        <DomainRowMenu
-          domain={domain}
-          onOpen={(id) => navigate(`/domains/${id}`)}
-          onRenew={handleRenewDomain}
-          onDelete={setDomainToDelete}
-          canManageCertificates={canManageCertificates}
-        />
-      ),
+      render: (row) =>
+        row.kind === 'certificate' ? (
+          <DomainRowMenu
+            domain={row.domain}
+            onOpen={(id) => navigate(`/domains/${id}`)}
+            onRenew={handleRenewDomain}
+            onDelete={setDomainToDelete}
+            canManageCertificates={canManageCertificates}
+          />
+        ) : (
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            aria-label={`Details for ${row.name}`}
+            onClick={() => navigate(domainRowHref(row))}
+          >
+            <ChevronRight className="h-4 w-4" />
+          </Button>
+        ),
     },
   ]
 
@@ -246,7 +305,7 @@ export function DomainsManagement({
     <div className="space-y-6">
       <PageHeader
         title="Domains"
-        description="Manage your custom domains and TLS certificates"
+        description="Every domain this install serves, and how each gets HTTPS: its own certificate or a tunnel"
         actions={
           <>
             {' '}
@@ -265,7 +324,23 @@ export function DomainsManagement({
           </>
         }
       />
-      <DNSConfigurationHelper />
+      {/* How to point DNS at this server: only certificate domains need it,
+          so it waits behind a disclosure instead of leading the page. */}
+      <Collapsible
+        open={
+          dnsTipsOpen ??
+          (!isLoading && !connectorsQuery.isLoading && rows.length === 0)
+        }
+        onOpenChange={setDnsTipsOpen}
+      >
+        <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+          <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
+          Pointing DNS at this server
+        </CollapsibleTrigger>
+        <CollapsibleContent className="mt-3">
+          <DNSConfigurationHelper />
+        </CollapsibleContent>
+      </Collapsible>
 
       {isUsingCloudflare() && (
         <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
@@ -275,6 +350,17 @@ export function DomainsManagement({
             Cloudflare Tunnel. Add or remove domains through your Cloudflare
             dashboard.
           </AlertDescription>
+        </Alert>
+      )}
+
+      {failingTunnels > 0 && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>
+            {failingTunnels} domain{failingTunnels > 1 ? 's' : ''} could not be
+            published through a tunnel
+          </AlertTitle>
+          <AlertDescription>Open one to see why.</AlertDescription>
         </Alert>
       )}
 
@@ -337,7 +423,7 @@ export function DomainsManagement({
             </Button>
           }
         />
-      ) : !isLoading && !domains?.length ? (
+      ) : !isLoading && rows.length === 0 ? (
         searchQuery ? (
           <EmptyState
             icon={Search}
@@ -366,12 +452,18 @@ export function DomainsManagement({
         <DataTable
           aria-label="Domains"
           columns={columns}
-          rows={domains ?? []}
-          rowKey={(domain) => domain.id}
+          rows={rows}
+          rowKey={(row) => row.key}
           isLoading={isLoading}
           pagination={
             !isLoading
-              ? { page, pageSize, total, totalPages, onPageChange }
+              ? {
+                  page,
+                  pageSize,
+                  total: total + tunnels.length,
+                  totalPages,
+                  onPageChange,
+                }
               : undefined
           }
         />
@@ -499,5 +591,58 @@ function DomainExpiration({ domain }: { domain: DomainResponse }) {
         </Badge>
       )}
     </div>
+  )
+}
+
+/** How a domain gets HTTPS: its own certificate, or the tunnel's provider. */
+function HttpsSource({ row }: { row: DomainRow }) {
+  if (row.kind === 'certificate') {
+    const method = row.domain.verification_method
+    const how =
+      method === 'manual'
+        ? 'Uploaded certificate'
+        : method === 'dns-01'
+          ? "Let's Encrypt · DNS"
+          : "Let's Encrypt · HTTP"
+    return (
+      <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+        <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+        {how}
+      </span>
+    )
+  }
+  const name =
+    row.kind === 'tunnel' ? row.view.connector_name : row.connector.name
+  return (
+    <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+      <Cloud className="h-3.5 w-3.5 shrink-0" />
+      {name ? `Tunnel ${name}` : 'No tunnel'}
+      {row.kind === 'tunnel_zone' && ' · covers every name'}
+    </span>
+  )
+}
+
+function TunnelZoneStatus({
+  row,
+}: {
+  row: Extract<DomainRow, { kind: 'tunnel_zone' }>
+}) {
+  const { connector } = row
+  const connected = connector.nodes.filter((n) => n.state === 'ready').length
+  if (connector.status === 'error') {
+    return (
+      <Badge variant="destructive" className="text-xs">
+        tunnel failed
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant={connected > 0 ? 'default' : 'warning'} className="text-xs">
+      {connected > 0
+        ? connector.auto_publish
+          ? 'publishing all'
+          : 'publishing picked'
+        : 'tunnel down'}
+    </Badge>
   )
 }

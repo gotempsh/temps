@@ -37,6 +37,7 @@ syntax may have changed.
 - [`containers`](containers.md)
 - [`cluster`](cluster.md)
 - [`nodes`](nodes.md)
+- [`tunnels`](tunnels.md)
 - [`tokens`](tokens.md)
 - [`errors`](errors.md)
 - [`metrics`](metrics.md)

@@ -72,7 +72,9 @@ pub enum EnvVarError {
     )]
     AmbiguousValue { project_id: i32, key: String },
 
-    #[error("Environment variable '{key}' already exists in one of the selected environments")]
+    #[error(
+        "Environment variable '{key}' already exists in the same scope (project-wide, or one of the selected environments)"
+    )]
     AlreadyExists { key: String },
 
     #[error("Other error: {0}")]
@@ -98,6 +100,19 @@ impl From<sea_orm::TransactionError<EnvVarError>> for EnvVarError {
                 EnvVarError::DatabaseConnectionError(e.to_string())
             }
         }
+    }
+}
+
+/// Whether two env vars with the same key would compete for one deployment
+/// scope. An empty set is project-wide. A project-wide default plus an
+/// environment-scoped override is the supported precedence
+/// (`select_effective_environment_variables`), so only two project-wide
+/// rows, or two rows sharing an environment, collide.
+fn env_var_scopes_collide(requested: &[i32], existing: &[i32]) -> bool {
+    match (requested.is_empty(), existing.is_empty()) {
+        (true, true) => true,
+        (false, false) => existing.iter().any(|id| requested.contains(id)),
+        _ => false,
     }
 }
 
@@ -303,6 +318,53 @@ impl EnvVarService {
         Ok(result)
     }
 
+    /// Serialize writes to one key of a project and refuse a scope another
+    /// row of that key already holds. The advisory lock makes the check and
+    /// the following insert/update atomic against concurrent writers; a
+    /// unique index cannot express this because project-wide scope is the
+    /// absence of junction rows.
+    async fn claim_key_scope(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        key: &str,
+        requested_environment_ids: &[i32],
+        excluded_var_id: Option<i32>,
+    ) -> Result<(), EnvVarError> {
+        // Namespaced so env vars and secrets of the same key do not contend.
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            [project_id.into(), format!("env_var:{key}").into()],
+        ))
+        .await?;
+
+        let mut query = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .filter(env_vars::Column::Key.eq(key));
+        if let Some(var_id) = excluded_var_id {
+            query = query.filter(env_vars::Column::Id.ne(var_id));
+        }
+        let existing = query
+            .find_with_related(env_var_environments::Entity)
+            .all(txn)
+            .await?;
+        let collides = existing.iter().any(|(var, links)| {
+            // The legacy direct column scopes a row like a junction link.
+            let existing_environment_ids = links
+                .iter()
+                .map(|link| link.environment_id)
+                .chain(var.environment_id)
+                .collect::<Vec<_>>();
+            env_var_scopes_collide(requested_environment_ids, &existing_environment_ids)
+        });
+        if collides {
+            return Err(EnvVarError::AlreadyExists {
+                key: key.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     pub async fn create_environment_variable(
         &self,
         project_id: i32,
@@ -314,28 +376,6 @@ impl EnvVarService {
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
         if is_secret && value.is_empty() {
             return Err(EnvVarError::SecretValueRequired { key });
-        }
-
-        let existing_env_vars = env_vars::Entity::find()
-            .filter(env_vars::Column::ProjectId.eq(project_id))
-            .filter(env_vars::Column::Key.eq(&key))
-            .find_with_related(env_var_environments::Entity)
-            .all(self.db.as_ref())
-            .await?;
-
-        let existing_env_ids: Vec<i32> = existing_env_vars
-            .into_iter()
-            .flat_map(|(_, env_var_envs)| {
-                env_var_envs
-                    .into_iter()
-                    .map(|env_var_env| env_var_env.environment_id)
-            })
-            .collect();
-
-        for env_id in &environment_ids {
-            if existing_env_ids.contains(env_id) {
-                return Err(EnvVarError::AlreadyExists { key: key.clone() });
-            }
         }
 
         let encrypted_value = self.encrypt_value(&key, &value)?;
@@ -350,6 +390,7 @@ impl EnvVarService {
                 Box::pin(async move {
                     let scoped_environments =
                         Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    Self::claim_key_scope(txn, project_id, &key, &environment_ids, None).await?;
 
                     let new_var = env_vars::ActiveModel {
                         project_id: Set(project_id),
@@ -543,6 +584,28 @@ impl EnvVarService {
                             .map(|link| link.environment_id)
                             .collect();
                     previous_environment_ids.sort_unstable();
+
+                    // Only a change of key or scope can create a collision.
+                    // Re-checking an unchanged row would lock the operator
+                    // out of editing a duplicate that predates this check,
+                    // when the fix is to edit or delete one of the pair.
+                    let mut final_environment_ids = environment_ids
+                        .iter()
+                        .chain(preserved_ids.iter())
+                        .copied()
+                        .collect::<Vec<_>>();
+                    final_environment_ids.sort_unstable();
+                    final_environment_ids.dedup();
+                    if previous_key != key || previous_environment_ids != final_environment_ids {
+                        Self::claim_key_scope(
+                            txn,
+                            project_id,
+                            &key,
+                            &final_environment_ids,
+                            Some(var_id),
+                        )
+                        .await?;
+                    }
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
@@ -957,8 +1020,12 @@ mod tests {
             environment_id: 5,
             created_at: chrono::Utc::now(),
         };
+        let mut live_environment = make_deleted_environment(5, 10, "staging");
+        live_environment.deleted_at = None;
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![live_environment]])
+                .append_exec_results([key_locked()])
                 .append_query_results(vec![vec![(existing_var, Some(existing_link))]])
                 .into_connection(),
         );
@@ -983,11 +1050,101 @@ mod tests {
         }
     }
 
+    /// The per-key advisory lock `claim_key_scope` takes before its check.
+    fn key_locked() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    #[test]
+    fn env_var_scopes_collide_only_within_one_scope() {
+        // Two project-wide rows compete for every deployment.
+        assert!(env_var_scopes_collide(&[], &[]));
+        // Two rows sharing an environment compete there.
+        assert!(env_var_scopes_collide(&[1, 2], &[2, 3]));
+        // Disjoint environments never meet.
+        assert!(!env_var_scopes_collide(&[1], &[2]));
+        // A project-wide default with an environment override is the
+        // documented precedence, in either order of creation.
+        assert!(!env_var_scopes_collide(&[], &[4]));
+        assert!(!env_var_scopes_collide(&[4], &[]));
+    }
+
+    #[tokio::test]
+    async fn test_create_second_project_wide_var_with_same_key_is_rejected() {
+        let existing_var = make_env_var_model(1, 10, "LOG_LEVEL", "v", false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // No environments requested: no environment lookup.
+                .append_exec_results([key_locked()])
+                .append_query_results(vec![vec![(
+                    existing_var,
+                    None::<env_var_environments::Model>,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), make_encryption_service());
+
+        let result = service
+            .create_environment_variable(
+                10,
+                vec![],
+                "LOG_LEVEL".to_string(),
+                "debug".to_string(),
+                false,
+                false,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(EnvVarError::AlreadyExists { key }) if key == "LOG_LEVEL"),
+            "got {result:?}"
+        );
+        // The check ran under the per-key lock, inside the transaction.
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped, so the test holds the only handle")
+            .into_transaction_log();
+        let statements = format!("{log:?}");
+        assert!(statements.contains("pg_advisory_xact_lock"), "{statements}");
+    }
+
+    #[tokio::test]
+    async fn test_update_renaming_onto_a_taken_key_is_rejected() {
+        // Renaming LOG_LEVEL_OLD to LOG_LEVEL, which another project-wide
+        // row already holds, would leave two rows competing for the key.
+        let encryption_service = make_encryption_service();
+        let before = make_env_var_model(3, 10, "LOG_LEVEL_OLD", "encrypted", true);
+        let other = make_env_var_model(4, 10, "LOG_LEVEL", "encrypted", true);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![before]])
+                .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
+                // Previous links: none, the row is project-wide.
+                .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
+                .append_exec_results([key_locked()])
+                .append_query_results(vec![vec![(other, None::<env_var_environments::Model>)]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let result = service
+            .update_environment_variable(10, 3, "LOG_LEVEL".to_string(), None, vec![], false, None)
+            .await;
+
+        assert!(
+            matches!(&result, Err(EnvVarError::AlreadyExists { key }) if key == "LOG_LEVEL"),
+            "got {result:?}"
+        );
+    }
+
     async fn assert_create_rejects_unavailable_environment(environment_id: i32) {
         let svc = make_encryption_service();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([Vec::<env_vars::Model>::new()])
                 .append_query_results([Vec::<environments::Model>::new()])
                 .into_connection(),
         );

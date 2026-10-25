@@ -74,6 +74,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`containers`](#containers) - Manage project containers in environments
 - [`cluster`](#cluster) - Cluster-wide multi-node operations
 - [`nodes`](#nodes) - Worker nodes and workload placement
+- [`tunnels`](#tunnels) - Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
 - [`tokens`](#tokens) - Manage deployment tokens for project API access (KV, Blob, etc.)
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
@@ -2203,6 +2204,8 @@ Create a new external service
 | `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | No |
 | `-n, --name <name>` | Service name | - | No |
 | `-s, --set <key=value>` | Set a parameter (repeatable) | `` | No |
+| `--backend <backend>` | S3 storage engine: rustfs (default) or garage (s3/blob only) | - | No |
+| `--bucket <name>` | Bucket to create (repeatable, s3/blob only; the first is S3_BUCKET) | `` | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
@@ -4040,6 +4043,128 @@ Show one enrollment: its progress and the log with the server output
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+## `tunnels`
+
+Ingress tunnels: publish apps on workers with no open ports or certificates. Apps under a tunnel's domain go live by adding the hostname to an environment
+
+**Subcommands:**
+
+- `list` - List tunnels, what each publishes and the workers it runs on
+- `workers` - List worker nodes, for choosing where a tunnel runs (create --node)
+- `create` - Create a tunnel for a managed zone and run it on workers. The zone must already be managed by the DNS provider (dns-providers domains add); workers must allow ingress
+- `hostnames` - List hostnames tunnels publish or could publish, with their state and why
+- `explain` - Explain how a hostname reaches visitors: which tunnel carries it, or why none does
+- `route` - Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whichever tunnel covers it (--automatic), or no tunnel (--off)
+- `publish` - Set what a tunnel publishes: every app under its domain (--all) or only chosen hostnames (--chosen)
+- `nodes` - Set the workers a tunnel runs on (an empty list stops it everywhere)
+- `links` - Show a tunnel's live connections to the provider: data centre, age, worker
+- `sync` - Re-check a tunnel with its provider and recreate it if it was deleted there
+
+### `tunnels list`
+
+List tunnels, what each publishes and the workers it runs on
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--page <page>` | Page number (1-indexed) | `1` | No |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels workers`
+
+List worker nodes, for choosing where a tunnel runs (create --node)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels create`
+
+Create a tunnel for a managed zone and run it on workers. The zone must already be managed by the DNS provider (dns-providers domains add); workers must allow ingress
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Lowercase letters, digits and hyphens | - | Yes |
+| `--dns-provider <id>` | Cloudflare DNS provider id | - | Yes |
+| `--domain <domain>` | Zone (or subdomain of one) whose apps it publishes | - | Yes |
+| `--node <ids...>` | Worker node ids to run it on | - | Yes |
+| `--provider <kind>` | Tunnel provider kind | `cloudflare_tunnel` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels hostnames`
+
+List hostnames tunnels publish or could publish, with their state and why
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels explain`
+
+Explain how a hostname reaches visitors: which tunnel carries it, or why none does
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels route`
+
+Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whichever tunnel covers it (--automatic), or no tunnel (--off)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--tunnel <id>` | Pin it to this tunnel | - | No |
+| `--automatic` | Let the most specific covering tunnel publish it | - | No |
+| `--off` | Keep every tunnel away from it (DNS managed elsewhere) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels publish`
+
+Set what a tunnel publishes: every app under its domain (--all) or only chosen hostnames (--chosen)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Publish every app under its domain | - | No |
+| `--chosen` | Publish only hostnames routed to it | - | No |
+
+### `tunnels nodes`
+
+Set the workers a tunnel runs on (an empty list stops it everywhere)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <ids...>` | Worker node ids | - | Yes |
+
+### `tunnels links`
+
+Show a tunnel's live connections to the provider: data centre, age, worker
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `tunnels sync`
+
+Re-check a tunnel with its provider and recreate it if it was deleted there
+
 ## `tokens` (alias: `token`)
 
 Manage deployment tokens for project API access (KV, Blob, etc.)
@@ -4952,7 +5077,6 @@ Browse the data inside a service (tables, collections, keys, objects) — read-o
 - `tables` (`entities`) - List tables, collections, keys or objects in a container
 - `schema` (`columns`) - Show an entity's columns, types and row count
 - `rows` (`select`) - Read rows from an entity
-- `ai-access` - Show or set whether the built-in AI assistant may read this service's rows
 
 ### `data info`
 
@@ -5012,18 +5136,6 @@ Read rows from an entity
 | `--offset <n>` | Rows to skip (default: 0) | - | No |
 | `--sort-by <field>` | Field to sort by | - | No |
 | `--sort-order <order>` | asc or desc (default: asc) | - | No |
-| `--json` | Output in JSON format | - | No |
-
-### `data ai-access`
-
-Show or set whether the built-in AI assistant may read this service's rows
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--enable` | Allow the built-in assistant to read row data | - | No |
-| `--disable` | Stop the built-in assistant reading row data | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `dsn`

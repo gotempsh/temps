@@ -27,12 +27,12 @@ use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
-    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
-    ServiceTemplateChangeKind, ServiceTemplateInstanceResponse, ServiceTemplateUpgradeChange,
-    SetAlternateSourcesRequest, SetProjectHostingRequest, TriggerPipelinePayload,
-    TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
-    UpdateGitSettingsRequest, UpdateProjectSettingsRequest, UpdateServiceTemplateRuntimeRequest,
-    UpgradeServiceTemplateRequest,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallGithubWebhookResponse,
+    ReinstallWebhookResponse, ServiceTemplateChangeKind, ServiceTemplateInstanceResponse,
+    ServiceTemplateUpgradeChange, SetAlternateSourcesRequest, SetProjectHostingRequest,
+    TriggerPipelinePayload, TriggerPipelineResponse, UpdateAutomaticDeployRequest,
+    UpdateDeploymentConfigRequest, UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    UpdateServiceTemplateRuntimeRequest, UpgradeServiceTemplateRequest,
 };
 use crate::services::project::GroupFilter;
 use crate::template_creation::{
@@ -154,6 +154,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/projects/{project_id}/gitlab/reinstall-webhook",
             post(reinstall_gitlab_webhook),
+        )
+        .route(
+            "/projects/{project_id}/github/reinstall-webhook",
+            post(reinstall_github_webhook),
         )
         // Merge custom domain routes
         .merge(custom_domain_routes)
@@ -484,6 +488,7 @@ async fn canonical_template_app_url(
         get_project_service_template,
         upgrade_project_service_template,
         reinstall_gitlab_webhook,
+        reinstall_github_webhook,
         trigger_project_pipeline,
         get_project_statistics,
         list_presets,
@@ -517,6 +522,7 @@ async fn canonical_template_app_url(
             UpdateAutomaticDeployRequest,
             UpdateDeploymentConfigRequest,
             ReinstallWebhookResponse,
+            ReinstallGithubWebhookResponse,
             TriggerPipelinePayload,
             TriggerPipelineResponse,
             ProjectStatisticsResponse,
@@ -2276,6 +2282,91 @@ pub async fn reinstall_gitlab_webhook(
     Ok(Json(ReinstallWebhookResponse {
         hook_id,
         message: "GitLab webhook reinstalled successfully".to_string(),
+    }))
+}
+
+/// Install or reinstall the GitHub repository webhook for a project
+///
+/// For projects on a GitHub connection that is not a GitHub App (personal
+/// access token or OAuth). Removes the existing repository webhook (if any)
+/// and registers a fresh one with a new signing secret. Use this when the
+/// webhook could not be registered automatically (the token lacks webhook
+/// permission) or was deleted on GitHub, and pushes have stopped deploying.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/github/reinstall-webhook",
+    tag = "Projects",
+    responses(
+        (status = 200, description = "Webhook installed", body = ReinstallGithubWebhookResponse),
+        (status = 400, description = "Project is not on a GitHub PAT/OAuth connection, or GitHub refused to create the webhook"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("project_id" = i32, Path, description = "Project ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn reinstall_github_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    info!("Reinstalling GitHub webhook for project: {}", project_id);
+
+    let hook_id = state
+        .project_service
+        .reinstall_github_webhook(project_id)
+        .await
+        .map_err(|e| {
+            error!(
+                "Error reinstalling GitHub webhook for project {}: {:?}",
+                project_id, e
+            );
+            Problem::from(e)
+        })?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id,
+        project_name: format!("project-{}", project_id),
+        project_slug: String::new(),
+        updated_fields: ProjectUpdatedFields {
+            name: None,
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+            compose_configuration_updated: None,
+            hosting: None,
+        },
+    };
+
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!(
+            "Failed to create audit log for GitHub webhook reinstall on project {}: {:?}",
+            project_id, e
+        );
+    }
+
+    Ok(Json(ReinstallGithubWebhookResponse {
+        hook_id,
+        message: "GitHub webhook installed successfully".to_string(),
     }))
 }
 

@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { createDomainMutation } from '@/api/client/@tanstack/react-query.gen'
+import {
+  createCustomDomainMutation,
+  createDomainMutation,
+  getEnvironmentsOptions,
+  getProjectsOptions,
+  setIngressHostnameChoiceMutation,
+  updateIngressConnectorMutation,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -16,17 +23,40 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation } from '@tanstack/react-query'
-import { CheckCircle, Globe, Info, Shield, ArrowLeft } from 'lucide-react'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import {
+  AlertTriangle,
+  CheckCircle,
+  Cloud,
+  Globe,
+  Info,
+  Shield,
+  ArrowLeft,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  chosenTunnel,
+  levelsBelow,
+  tunnelChoice,
+  tunnelsCovering,
+  allTunnelsOptions,
+} from '@/lib/tunnel-domains'
 
 const domainWizardSchema = z.object({
   domain: z
@@ -36,7 +66,10 @@ const domainWizardSchema = z.object({
       /^(\*\.)?[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$/,
       'Invalid domain format (e.g., example.com or *.example.com)'
     ),
-  challengeType: z.enum(['http-01', 'dns-01']),
+  // `http-01`, `dns-01`, or `tunnel:<id>` (ADR 058 D10).
+  challengeType: z
+    .string()
+    .regex(/^(http-01|dns-01|tunnel:\d+)$/, 'Choose how it gets HTTPS'),
 })
 
 type DomainWizardFormData = z.infer<typeof domainWizardSchema>
@@ -63,6 +96,26 @@ export function AddDomain() {
     },
   })
 
+  const connectorsQuery = useQuery({
+    ...allTunnelsOptions(),
+    retry: false,
+  })
+  const [attachProject, setAttachProject] = useState<string>('')
+  const [attachEnvironment, setAttachEnvironment] = useState<string>('')
+  const projectsQuery = useQuery({
+    ...getProjectsOptions({ query: { page: 1, per_page: 100 } }),
+    staleTime: 60_000,
+  })
+  const environmentsQuery = useQuery({
+    ...getEnvironmentsOptions({
+      path: { project_id: Number(attachProject) },
+    }),
+    enabled: !!attachProject,
+  })
+  const chooseTunnel = useMutation(setIngressHostnameChoiceMutation())
+  const publishAll = useMutation(updateIngressConnectorMutation())
+  const attach = useMutation(createCustomDomainMutation())
+
   const createDomain = useMutation({
     ...createDomainMutation(),
     meta: {
@@ -81,10 +134,16 @@ export function AddDomain() {
     if (step === 'domain') {
       form.trigger('domain').then((valid) => {
         if (valid) {
-          // Auto-select DNS-01 for wildcard domains
           const domain = form.getValues('domain')
-          if (domain.startsWith('*.')) {
+          const covering = tunnelsCovering(domain, connectorsQuery.data ?? [])
+          if (covering.length > 0) {
+            // A tunnel carries it: no certificate to issue.
+            form.setValue('challengeType', tunnelChoice(covering[0].id))
+          } else if (domain.startsWith('*.')) {
+            // Auto-select DNS-01 for wildcard domains
             form.setValue('challengeType', 'dns-01')
+          } else if (chosenTunnel(form.getValues('challengeType')) != null) {
+            form.setValue('challengeType', 'http-01')
           }
           setStep('challenge')
         }
@@ -101,7 +160,53 @@ export function AddDomain() {
     else if (step === 'confirm') setStep('challenge')
   }
 
+  const addThroughTunnel = async (
+    data: DomainWizardFormData,
+    connectorId: number
+  ) => {
+    const domain = data.domain.trim().toLowerCase()
+    const connector = connectorsQuery.data?.find((c) => c.id === connectorId)
+    try {
+      if (domain.startsWith('*.')) {
+        // Every name under it is what "publish everything" already means.
+        if (connector && !connector.auto_publish) {
+          await publishAll.mutateAsync({
+            path: { id: connectorId },
+            body: { auto_publish: true },
+          })
+        }
+      } else {
+        await chooseTunnel.mutateAsync({
+          path: { hostname: domain },
+          body: { mode: 'tunnel', connector_id: connectorId },
+        })
+        if (attachProject && attachEnvironment) {
+          await attach.mutateAsync({
+            path: { project_id: Number(attachProject) },
+            body: { domain, environment_id: Number(attachEnvironment) },
+          })
+        }
+      }
+    } catch (error) {
+      toast.error(`Could not add ${domain}`, {
+        description: problemDetail(error, 'Try again in a moment.'),
+      })
+      return
+    }
+    toast.success(
+      domain.startsWith('*.') || (attachProject && attachEnvironment)
+        ? `${domain} goes through ${connector?.name ?? 'the tunnel'}. Its DNS record appears within a minute.`
+        : `${domain} will go through ${connector?.name ?? 'the tunnel'} once you add it to an environment.`
+    )
+    navigate('/domains')
+  }
+
   const handleSubmit = async (data: DomainWizardFormData) => {
+    const connectorId = chosenTunnel(data.challengeType)
+    if (connectorId != null) {
+      await addThroughTunnel(data, connectorId)
+      return
+    }
     await createDomain.mutateAsync({
       body: {
         domain: data.domain,
@@ -111,6 +216,22 @@ export function AddDomain() {
   }
 
   const watchedValues = useWatch({ control: form.control })
+  const covering = tunnelsCovering(
+    watchedValues.domain ?? '',
+    connectorsQuery.data ?? []
+  )
+  const tunnel = connectorsQuery.data?.find(
+    (c) => c.id === chosenTunnel(watchedValues.challengeType)
+  )
+  const wildcardInput = !!watchedValues.domain?.trim().startsWith('*.')
+  const tooDeep = tunnel
+    ? levelsBelow(watchedValues.domain ?? '', tunnel) > 1
+    : false
+  const submitting =
+    createDomain.isPending ||
+    chooseTunnel.isPending ||
+    publishAll.isPending ||
+    attach.isPending
 
   const handleEnterSubmit = useEnterSubmit(() => {
     if (step === 'confirm') {
@@ -137,11 +258,10 @@ export function AddDomain() {
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
-            <h1 className="text-2xl font-bold">
-              Add New Domain & SSL Certificate
-            </h1>
+            <h1 className="text-2xl font-bold">Add Domain</h1>
             <p className="text-sm text-muted-foreground mt-1">
-              Configure a custom domain and provision an SSL certificate
+              Add a custom domain and choose how it gets HTTPS: a certificate
+              from Let&apos;s Encrypt, or a tunnel that brings its own
             </p>
           </div>
         </div>
@@ -173,7 +293,7 @@ export function AddDomain() {
                       <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
                         2
                       </div>
-                      <span>Challenge</span>
+                      <span>HTTPS</span>
                     </div>
                     <div className="h-px flex-1 bg-border" />
                     <div className="flex items-center gap-2">
@@ -209,9 +329,9 @@ export function AddDomain() {
                   <Alert>
                     <Info className="h-4 w-4" />
                     <AlertDescription>
-                      You&apos;ll need to point your domain&apos;s DNS records
-                      to your server after creation. We&apos;ll provide detailed
-                      instructions in the next steps.
+                      {covering.length > 0
+                        ? `It's under ${covering[0].domain}, which tunnel ${covering[0].name} carries: it can go through the tunnel with no DNS records or certificate to set up.`
+                        : "You'll need to point your domain's DNS records to your server after creation. We'll provide detailed instructions in the next steps."}
                     </AlertDescription>
                   </Alert>
 
@@ -245,7 +365,7 @@ export function AddDomain() {
                       <div className="flex h-6 w-6 items-center justify-center rounded-full bg-primary text-xs font-medium text-primary-foreground">
                         2
                       </div>
-                      <span className="font-medium">Challenge</span>
+                      <span className="font-medium">HTTPS</span>
                     </div>
                     <div className="h-px flex-1 bg-border" />
                     <div className="flex items-center gap-2">
@@ -263,11 +383,13 @@ export function AddDomain() {
                       const isWildcard = watchedValues.domain?.startsWith('*.')
                       return (
                         <FormItem className="space-y-4">
-                          <FormLabel>SSL Certificate Challenge Type</FormLabel>
+                          <FormLabel>How it gets HTTPS</FormLabel>
                           <FormDescription>
-                            {isWildcard
-                              ? 'Wildcard domains require DNS-01 challenge'
-                              : "Choose how you want to verify domain ownership for Let's Encrypt"}
+                            {covering.length > 0
+                              ? "A tunnel covers this domain, so its provider can serve HTTPS with no certificate here. Or issue one from Let's Encrypt."
+                              : isWildcard
+                                ? 'Wildcard domains require DNS-01 challenge'
+                                : "Choose how you want to verify domain ownership for Let's Encrypt"}
                           </FormDescription>
                           <FormControl>
                             <RadioGroup
@@ -275,6 +397,60 @@ export function AddDomain() {
                               value={field.value}
                               className="grid gap-4"
                             >
+                              {covering.map((connector, index) => {
+                                const value = tunnelChoice(connector.id)
+                                return (
+                                  <Card
+                                    key={connector.id}
+                                    className={`relative cursor-pointer border-2 transition-colors ${field.value === value ? 'border-primary' : 'border-border hover:border-primary/50'}`}
+                                  >
+                                    <label className="flex cursor-pointer items-start gap-4 p-4">
+                                      <RadioGroupItem
+                                        value={value}
+                                        id={value}
+                                        className="mt-1"
+                                      />
+                                      <div className="flex-1 space-y-2">
+                                        <div className="flex items-center gap-2">
+                                          <Cloud className="h-5 w-5 text-primary" />
+                                          <div className="font-semibold">
+                                            Through tunnel {connector.name}
+                                            {index === 0 && ' (Recommended)'}
+                                          </div>
+                                        </div>
+                                        <p className="text-sm text-muted-foreground">
+                                          The tunnel carries every name under{' '}
+                                          {connector.domain}. Temps creates the
+                                          DNS record and the provider serves
+                                          HTTPS, so there is no certificate to
+                                          issue and no port to open.
+                                        </p>
+                                        <div className="space-y-1 text-sm">
+                                          <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                            <CheckCircle className="h-4 w-4" />
+                                            <span>
+                                              DNS record created for you
+                                            </span>
+                                          </div>
+                                          <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                            <CheckCircle className="h-4 w-4" />
+                                            <span>
+                                              HTTPS from the tunnel&apos;s
+                                              provider
+                                            </span>
+                                          </div>
+                                          <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+                                            <CheckCircle className="h-4 w-4" />
+                                            <span>
+                                              Works behind NAT, no open ports
+                                            </span>
+                                          </div>
+                                        </div>
+                                      </div>
+                                    </label>
+                                  </Card>
+                                )
+                              })}
                               {!isWildcard && (
                                 <Card
                                   className={`relative cursor-pointer border-2 transition-colors ${field.value === 'http-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
@@ -289,7 +465,9 @@ export function AddDomain() {
                                       <div className="flex items-center gap-2">
                                         <Globe className="h-5 w-5 text-primary" />
                                         <div className="font-semibold">
-                                          HTTP-01 Challenge (Recommended)
+                                          HTTP-01 Challenge
+                                          {covering.length === 0 &&
+                                            ' (Recommended)'}
                                         </div>
                                       </div>
                                       <p className="text-sm text-muted-foreground">
@@ -403,7 +581,7 @@ export function AddDomain() {
                       <div className="flex h-6 w-6 items-center justify-center rounded-full bg-muted text-xs font-medium text-muted-foreground">
                         <CheckCircle className="h-4 w-4 text-green-600" />
                       </div>
-                      <span>Challenge</span>
+                      <span>HTTPS</span>
                     </div>
                     <div className="h-px flex-1 bg-border" />
                     <div className="flex items-center gap-2">
@@ -414,74 +592,106 @@ export function AddDomain() {
                     </div>
                   </div>
 
-                  <div className="rounded-lg bg-muted p-4 space-y-3">
-                    <h3 className="font-semibold">Review Your Configuration</h3>
-                    <div className="space-y-2">
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">
-                          Domain:
-                        </span>
-                        <span className="font-medium">
-                          {watchedValues.domain}
-                        </span>
-                      </div>
-                      <div className="flex items-center justify-between">
-                        <span className="text-sm text-muted-foreground">
-                          Challenge Type:
-                        </span>
-                        <span className="font-medium">
-                          {watchedValues.challengeType === 'http-01'
-                            ? 'HTTP-01 (Automatic)'
-                            : 'DNS-01 (Manual)'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {watchedValues.challengeType === 'http-01' ? (
-                    <Alert>
-                      <Globe className="h-4 w-4" />
-                      <AlertDescription>
-                        <div className="space-y-2">
-                          <p className="font-medium">Next Steps (HTTP-01):</p>
-                          <ol className="list-decimal list-inside space-y-1 text-sm">
-                            <li>
-                              Point your domain&apos;s DNS A record to your
-                              server IP
-                            </li>
-                            <li>Ensure port 80 is accessible on your server</li>
-                            <li>
-                              The system will automatically validate and
-                              provision the certificate
-                            </li>
-                          </ol>
-                        </div>
-                      </AlertDescription>
-                    </Alert>
+                  {tunnel ? (
+                    <TunnelConfirm
+                      domain={watchedValues.domain ?? ''}
+                      tunnelName={tunnel.name}
+                      tunnelDomain={tunnel.domain}
+                      publishesAll={tunnel.auto_publish}
+                      wildcard={wildcardInput}
+                      tooDeep={tooDeep}
+                      projects={projectsQuery.data?.projects ?? []}
+                      environments={environmentsQuery.data ?? []}
+                      project={attachProject}
+                      environment={attachEnvironment}
+                      onProjectChange={(value) => {
+                        setAttachProject(value)
+                        setAttachEnvironment('')
+                      }}
+                      onEnvironmentChange={setAttachEnvironment}
+                    />
                   ) : (
-                    <Alert>
-                      <Shield className="h-4 w-4" />
-                      <AlertDescription>
+                    <>
+                      <div className="rounded-lg bg-muted p-4 space-y-3">
+                        <h3 className="font-semibold">
+                          Review Your Configuration
+                        </h3>
                         <div className="space-y-2">
-                          <p className="font-medium">Next Steps (DNS-01):</p>
-                          <ol className="list-decimal list-inside space-y-1 text-sm">
-                            <li>
-                              After creation, you&apos;ll receive a DNS TXT
-                              record to add
-                            </li>
-                            <li>
-                              Add the TXT record to your domain&apos;s DNS
-                              settings
-                            </li>
-                            <li>Wait for DNS propagation (up to 24 hours)</li>
-                            <li>
-                              Complete the DNS challenge to provision the
-                              certificate
-                            </li>
-                          </ol>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-muted-foreground">
+                              Domain:
+                            </span>
+                            <span className="font-medium">
+                              {watchedValues.domain}
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm text-muted-foreground">
+                              Challenge Type:
+                            </span>
+                            <span className="font-medium">
+                              {watchedValues.challengeType === 'http-01'
+                                ? 'HTTP-01 (Automatic)'
+                                : 'DNS-01 (Manual)'}
+                            </span>
+                          </div>
                         </div>
-                      </AlertDescription>
-                    </Alert>
+                      </div>
+
+                      {watchedValues.challengeType === 'http-01' ? (
+                        <Alert>
+                          <Globe className="h-4 w-4" />
+                          <AlertDescription>
+                            <div className="space-y-2">
+                              <p className="font-medium">
+                                Next Steps (HTTP-01):
+                              </p>
+                              <ol className="list-decimal list-inside space-y-1 text-sm">
+                                <li>
+                                  Point your domain&apos;s DNS A record to your
+                                  server IP
+                                </li>
+                                <li>
+                                  Ensure port 80 is accessible on your server
+                                </li>
+                                <li>
+                                  The system will automatically validate and
+                                  provision the certificate
+                                </li>
+                              </ol>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      ) : (
+                        <Alert>
+                          <Shield className="h-4 w-4" />
+                          <AlertDescription>
+                            <div className="space-y-2">
+                              <p className="font-medium">
+                                Next Steps (DNS-01):
+                              </p>
+                              <ol className="list-decimal list-inside space-y-1 text-sm">
+                                <li>
+                                  After creation, you&apos;ll receive a DNS TXT
+                                  record to add
+                                </li>
+                                <li>
+                                  Add the TXT record to your domain&apos;s DNS
+                                  settings
+                                </li>
+                                <li>
+                                  Wait for DNS propagation (up to 24 hours)
+                                </li>
+                                <li>
+                                  Complete the DNS challenge to provision the
+                                  certificate
+                                </li>
+                              </ol>
+                            </div>
+                          </AlertDescription>
+                        </Alert>
+                      )}
+                    </>
                   )}
 
                   <div className="flex justify-between gap-2">
@@ -492,10 +702,14 @@ export function AddDomain() {
                     >
                       Back
                     </Button>
-                    <Button type="submit" disabled={createDomain.isPending}>
-                      {createDomain.isPending
-                        ? 'Creating Domain...'
-                        : 'Create Domain & Start Provisioning'}
+                    <Button type="submit" disabled={submitting}>
+                      {tunnel
+                        ? submitting
+                          ? 'Adding…'
+                          : 'Add domain'
+                        : createDomain.isPending
+                          ? 'Creating Domain...'
+                          : 'Create Domain & Start Provisioning'}
                     </Button>
                   </div>
                 </div>
@@ -504,6 +718,115 @@ export function AddDomain() {
           </Form>
         </div>
       </div>
+    </div>
+  )
+}
+
+function TunnelConfirm({
+  domain,
+  tunnelName,
+  tunnelDomain,
+  publishesAll,
+  wildcard,
+  tooDeep,
+  projects,
+  environments,
+  project,
+  environment,
+  onProjectChange,
+  onEnvironmentChange,
+}: {
+  domain: string
+  tunnelName: string
+  tunnelDomain: string
+  publishesAll: boolean
+  wildcard: boolean
+  tooDeep: boolean
+  projects: { id: number; name: string }[]
+  environments: { id: number; name: string }[]
+  project: string
+  environment: string
+  onProjectChange: (value: string) => void
+  onEnvironmentChange: (value: string) => void
+}) {
+  return (
+    <div className="space-y-4">
+      <div className="rounded-lg bg-muted p-4 space-y-2">
+        <h3 className="font-semibold">Review</h3>
+        <div className="flex items-center justify-between gap-4 text-sm">
+          <span className="text-muted-foreground">Domain</span>
+          <span className="font-medium">{domain}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4 text-sm">
+          <span className="text-muted-foreground">Served through</span>
+          <span className="font-medium">Tunnel {tunnelName}</span>
+        </div>
+        <div className="flex items-center justify-between gap-4 text-sm">
+          <span className="text-muted-foreground">HTTPS</span>
+          <span className="font-medium">From the tunnel&apos;s provider</span>
+        </div>
+      </div>
+
+      {tooDeep && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertDescription>
+            Cloudflare&apos;s free certificate covers {tunnelDomain} and names
+            one level below it, such as app.{tunnelDomain}. Visitors to {domain}{' '}
+            would get a certificate error unless the zone has an advanced
+            certificate that covers it.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {wildcard ? (
+        <Alert>
+          <Cloud className="h-4 w-4" />
+          <AlertDescription>
+            {publishesAll
+              ? `Tunnel ${tunnelName} already publishes every app under ${tunnelDomain}. Add names under it to environments and each goes live on its own.`
+              : `Tunnel ${tunnelName} will publish every app under ${tunnelDomain}, instead of only the names picked for it.`}
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <div className="space-y-2">
+          <p className="text-sm font-medium">Serve it from (optional)</p>
+          <p className="text-sm text-muted-foreground">
+            The tunnel publishes it once an environment serves it. Pick one now,
+            or add it later from the project&apos;s domain settings.
+          </p>
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Select value={project} onValueChange={onProjectChange}>
+              <SelectTrigger aria-label="Project">
+                <SelectValue placeholder="Project" />
+              </SelectTrigger>
+              <SelectContent>
+                {projects.map((p) => (
+                  <SelectItem key={p.id} value={String(p.id)}>
+                    {p.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select
+              value={environment}
+              onValueChange={onEnvironmentChange}
+              disabled={!project}
+            >
+              <SelectTrigger aria-label="Environment">
+                <SelectValue placeholder="Environment" />
+              </SelectTrigger>
+              <SelectContent>
+                {environments.map((e) => (
+                  <SelectItem key={e.id} value={String(e.id)}>
+                    {e.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

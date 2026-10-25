@@ -177,7 +177,36 @@ fn legacy_startup_eof_error(binary_name: &str) -> String {
 
 fn scrub_plugin_environment(command: &mut Command) {
     command.env_clear();
+    drop_ambient_capabilities(command);
 }
+
+/// A plugin is third-party code, so it must not inherit capabilities the host
+/// process was granted ambiently. A hosted control plane runs as a non-root
+/// user with `CAP_NET_ADMIN` ambient so it can set up its own WireGuard mesh;
+/// without this every plugin it executes would carry the same capability.
+#[cfg(target_os = "linux")]
+fn drop_ambient_capabilities(command: &mut Command) {
+    // SAFETY: the closure runs in the forked child before exec and makes one
+    // `prctl` call with integer arguments: async-signal-safe, no allocation.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL as libc::c_ulong,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn drop_ambient_capabilities(_command: &mut Command) {}
 
 fn plugin_stderr_context(observed_bytes: usize) -> String {
     if observed_bytes == 0 {
@@ -1272,6 +1301,84 @@ impl ExternalPluginManager {
 
 #[cfg(test)]
 mod tests {
+
+    /// Raises `CAP_NET_ADMIN` as an ambient capability on the calling thread, or
+    /// returns false when the test process may not (not root, no capability).
+    #[cfg(target_os = "linux")]
+    fn raise_ambient_net_admin() -> bool {
+        #[repr(C)]
+        struct Header {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Data {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const NET_ADMIN: u32 = 12;
+        let header = Header {
+            version: 0x2008_0522,
+            pid: 0,
+        };
+        let mut data = [Data {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        }; 2];
+        // SAFETY: valid, correctly sized buffers for capability version 3.
+        unsafe {
+            if libc::syscall(
+                libc::SYS_capget,
+                &header as *const Header,
+                data.as_mut_ptr(),
+            ) != 0
+            {
+                return false;
+            }
+            data[0].inheritable |= 1 << NET_ADMIN;
+            if libc::syscall(libc::SYS_capset, &header as *const Header, data.as_ptr()) != 0 {
+                return false;
+            }
+            libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_RAISE as libc::c_ulong,
+                NET_ADMIN as libc::c_ulong,
+                0,
+                0,
+            ) == 0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_plugin_does_not_inherit_ambient_capabilities() {
+        if !raise_ambient_net_admin() {
+            eprintln!("skipped: this process cannot raise an ambient capability");
+            return;
+        }
+        // Builtins only, so it works with the scrubbed (empty) environment.
+        const SCRIPT: &str =
+            "while read key value; do case $key in CapAmb:) echo $value;; esac; done < /proc/self/status";
+        let ambient = |mut command: Command| async move {
+            let output = command
+                .arg("-c")
+                .arg(SCRIPT)
+                .output()
+                .await
+                .expect("spawn sh");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        // The control: an ordinary child does inherit it, so the assertion below
+        // is not vacuously true.
+        assert_eq!(ambient(Command::new("/bin/sh")).await, "0000000000001000");
+
+        let mut plugin = Command::new("/bin/sh");
+        scrub_plugin_environment(&mut plugin);
+        assert_eq!(ambient(plugin).await, "0000000000000000");
+    }
     use super::*;
     use base64::Engine as _;
     use ed25519_dalek::SigningKey;

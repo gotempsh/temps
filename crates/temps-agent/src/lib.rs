@@ -10,14 +10,18 @@
 pub mod auth;
 mod build_admission;
 pub mod build_handler;
+pub mod connectors;
 mod exec_timeout;
 pub mod handlers;
 pub mod internal_proxy;
+pub mod mesh_listener;
 pub mod network_sync;
 pub mod node_runtime;
 mod output_buffer;
 mod overlay_driver;
+mod plugin_build_handler;
 pub mod public_ingress;
+pub mod public_ingress_manager;
 pub mod route_store;
 pub mod route_sync_client;
 mod runtime_health;
@@ -338,6 +342,31 @@ pub struct AgentConfig {
     /// X25519 private key used only to decrypt this node's certificate bundles.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
+    /// What this worker lets its control plane do with public ingress (ADR
+    /// 058 D7). `None` in configs saved before modes: see
+    /// [`AgentConfig::local_ingress`].
+    #[serde(default)]
+    pub ingress: Option<temps_core::worker_ingress::LocalIngress>,
+}
+
+impl AgentConfig {
+    /// The ingress setting in force: the saved one, else `fixed` on the
+    /// legacy `public_ingress_address`, else `off`.
+    pub fn local_ingress(&self) -> temps_core::worker_ingress::LocalIngress {
+        use temps_core::worker_ingress::{IngressMode, LocalIngress};
+        if let Some(ingress) = &self.ingress {
+            return ingress.clone();
+        }
+        match self.public_ingress_address {
+            Some(address) => LocalIngress {
+                mode: IngressMode::Fixed,
+                listen: Some(address),
+                http_port: self.public_ingress_http_port,
+                https_port: self.public_ingress_https_port,
+            },
+            None => LocalIngress::default(),
+        }
+    }
 }
 
 fn default_public_http_port() -> u16 {
@@ -826,6 +855,7 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            ingress: None,
             mesh_key_dir: default_mesh_key_dir(),
             wg_endpoint: None,
             control_plane_trust: Some(ControlPlaneTrust::PublicRoots),

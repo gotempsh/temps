@@ -52,6 +52,9 @@ pub enum SensitiveAction {
     /// Make a mesh member the hub (ADR 048 D4): it relays, and can read,
     /// traffic between members that cannot reach each other.
     SetWireguardMeshHub,
+    /// Change the cluster compute pool (ADR 056): every never-applied
+    /// overlay allocation is re-assigned from the new pool.
+    ChangeClusterComputePool,
     /// Destroy every sandbox on a worker node, from all owners, including
     /// their files (ADR-048). `node` is the name or id the caller gave.
     EvictNodeSandboxes {
@@ -73,6 +76,11 @@ pub enum SensitiveAction {
     /// Reset another user's password to a generated temporary one, revoking
     /// all of their sessions.
     ResetUserPassword {
+        user_id: i32,
+    },
+    /// Remove another user's second factor (TOTP secret and recovery codes),
+    /// revoking all of their sessions. Recovery for a user who lost both.
+    ResetUserMfa {
         user_id: i32,
     },
     UpdateAccountEmail,
@@ -155,6 +163,7 @@ impl SensitiveAction {
             Self::CreateNodePairing => "create_node_pairing",
             Self::AddNodeOverSsh => "add_node_over_ssh",
             Self::SetWireguardMeshHub => "set_wireguard_mesh_hub",
+            Self::ChangeClusterComputePool => "change_cluster_compute_pool",
             Self::EvictNodeSandboxes { .. } => "evict_node_sandboxes",
             Self::CreateOidcProvider => "create_oidc_provider",
             Self::UpdateOidcProvider { .. } => "update_oidc_provider",
@@ -162,6 +171,7 @@ impl SensitiveAction {
             Self::DeleteOidcRoleMapping { .. } => "delete_oidc_role_mapping",
             Self::AssignRole { .. } => "assign_role",
             Self::ResetUserPassword { .. } => "reset_user_password",
+            Self::ResetUserMfa { .. } => "reset_user_mfa",
             Self::UpdateAccountEmail => "update_account_email",
             Self::RotateClusterCa => "rotate_cluster_ca",
             Self::RestoreExternalService { .. } => "restore_external_service",
@@ -305,6 +315,10 @@ mod tests {
         assert_eq!(
             SensitiveAction::ResetUserPassword { user_id: 1 }.as_str(),
             "reset_user_password"
+        );
+        assert_eq!(
+            SensitiveAction::ResetUserMfa { user_id: 1 }.as_str(),
+            "reset_user_mfa"
         );
         assert_eq!(
             SensitiveAction::UpdateAccountEmail.as_str(),

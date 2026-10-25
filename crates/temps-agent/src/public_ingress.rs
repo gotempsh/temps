@@ -45,6 +45,7 @@ pub struct PublicIngressHandle {
     http_address: SocketAddr,
     https_address: SocketAddr,
     running: Arc<AtomicBool>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +148,16 @@ impl PublicIngressHandle {
     pub fn last_error(&self) -> Option<String> {
         health().and_then(|health| health.last_error)
     }
+
+    /// Stop accepting and release both ports. Connections already accepted
+    /// finish on their own.
+    pub fn stop(self) {
+        for task in self.tasks {
+            task.abort();
+        }
+        self.running.store(false, Ordering::Release);
+        LISTENER_RUNNING.store(false, Ordering::Release);
+    }
 }
 
 /// Bind both listeners. Port zero is supported and the actual bound addresses
@@ -215,25 +226,26 @@ pub async fn spawn(
     let running = Arc::new(AtomicBool::new(true));
     LISTENER_RUNNING.store(true, Ordering::Release);
     let http_shutdown = Arc::clone(&shutdown);
-    tokio::spawn(serve_http(
+    let mut tasks = Vec::with_capacity(3);
+    tasks.push(tokio::spawn(serve_http(
         http,
         http_router,
         http_shutdown,
         Arc::clone(&running),
-    ));
+    )));
 
     let resolver = Arc::new(SnapshotCertResolver::new(Arc::clone(&store)));
     let tls = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     let tls_shutdown = Arc::clone(&shutdown);
-    tokio::spawn(serve_tls(
+    tasks.push(tokio::spawn(serve_tls(
         https,
         https_router,
         Arc::new(tls),
         tls_shutdown,
         Arc::clone(&running),
-    ));
+    )));
     info!(%http_address, %https_address, "public worker ingress listening");
     let snapshot = store.public_ingress_snapshot();
     let (_, _, prepared_certificate_count) = store.public_ingress_runtime_status();
@@ -260,7 +272,7 @@ pub async fn spawn(
     update_snapshot_health(&store);
     let health_store = Arc::clone(&store);
     let health_shutdown = Arc::clone(&shutdown);
-    tokio::spawn(async move {
+    tasks.push(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
         loop {
             tokio::select! {
@@ -268,11 +280,12 @@ pub async fn spawn(
                 _ = health_shutdown.notified() => break,
             }
         }
-    });
+    }));
     Ok(PublicIngressHandle {
         http_address,
         https_address,
         running,
+        tasks,
     })
 }
 

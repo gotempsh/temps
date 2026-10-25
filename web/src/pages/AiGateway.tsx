@@ -4829,7 +4829,12 @@ console.log(response.choices[0].message.content);`,
           }
         }}
       >
+        {/* Scrolls rather than grows: with the base-URL hint, a save error
+            or the self-hosted fields shown, the form is taller than a short
+            viewport, and a centred dialog would push its title and Close
+            button off the top of the screen. */}
         <DialogContent
+          className="max-h-[90dvh] overflow-y-auto"
           onInteractOutside={(event) => {
             if (createMutation.isPending) event.preventDefault()
           }}

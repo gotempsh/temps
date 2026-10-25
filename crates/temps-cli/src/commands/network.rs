@@ -65,7 +65,7 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
 
-    /// Interface carrying the private address (for example enp6s0.4000 or
+    /// Interface carrying the private address (for example eth1.100 or
     /// wg0). Normally detected from the address.
     #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
     pub underlay_dev: Option<String>,
@@ -292,28 +292,38 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     let requested_prefix = cmd
         .node_prefix_len
         .unwrap_or(current_network.subnet_prefix_len);
-    let cluster_network = allocator
+    let pool_change = allocator
         .configure_pool(requested_pool, requested_prefix)
         .await
         .map_err(|error| anyhow::anyhow!("cluster network configuration refused: {error}"))?;
+    // ADR 056: allocations that were handed out but never applied move to
+    // the new pool; their nodes pick them up on their next network poll.
+    for moved in &pool_change.reassigned {
+        println!(
+            "Moved node '{}' from {} to {}; it applies the new subnet on its next network poll",
+            moved.node_name, moved.from, moved.to
+        );
+    }
+    let cluster_network = pool_change.config;
 
+    let settings = temps_entities::settings::Entity::find_by_id(1)
+        .one(db.as_ref())
+        .await
+        .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
+        .map(|model| temps_core::AppSettings::from_json(model.data))
+        .unwrap_or_default();
+    // What `temps serve --wg-endpoint` recorded, so this command publishes
+    // the same WireGuard endpoint the running server does.
+    let advertised_wg_endpoint = settings.multi_node.wg_endpoint.clone();
     let private_address = match cmd.private_address {
         Some(value) if !value.trim().is_empty() => value,
-        _ => {
-            let settings = temps_entities::settings::Entity::find_by_id(1)
-                .one(db.as_ref())
-                .await
-                .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
-                .map(|model| temps_core::AppSettings::from_json(model.data))
-                .unwrap_or_default();
-            settings.multi_node.private_address.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the control-plane private address is not configured; pass \
+        _ => settings.multi_node.private_address.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the control-plane private address is not configured; pass \
                      --private-address <IP> or start once with \
                      `temps serve --private-address <IP>`"
-                )
-            })?
-        }
+            )
+        })?,
     };
 
     if cmd.wireguard {
@@ -353,6 +363,7 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         db.clone(),
         docker.as_ref(),
         Some(private_address.trim()),
+        advertised_wg_endpoint.as_deref(),
         cmd.underlay_dev.as_deref(),
         Some(&mesh_key_dir),
     )

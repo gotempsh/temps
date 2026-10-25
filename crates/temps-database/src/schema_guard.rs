@@ -11,33 +11,44 @@
 //! - every recorded migration is known and some are pending: an upgrade of an
 //!   existing installation, which is when a pre-migration backup is taken;
 //! - a recorded migration this binary does not define: the database was
-//!   migrated by a NEWER release. Starting an older binary against it would
-//!   let code that does not understand the schema write to it, which is how a
-//!   binary-only rollback corrupts data. The guard refuses with
-//!   [`SchemaGuardError::DatabaseNewerThanBinary`], naming the unknown
-//!   migrations and the two ways out.
+//!   migrated by a NEWER release, typically because only the binary was rolled
+//!   back after an upgrade misbehaved. That is a supported recovery path, so
+//!   the guard does not refuse it: it reports
+//!   [`SchemaStatus::NewerThanBinary`] and logs a WARN naming the unknown
+//!   migrations and the two ways back to a matching schema. The unknown
+//!   migrations are left applied — an older binary has no `down()` for them —
+//!   and only migrations this binary defines and the database lacks are
+//!   applied (see `run_migrations`, which bypasses Sea-ORM's `Migrator::up`
+//!   in this state because it refuses ledgers with unknown entries).
 //!
 //! The check is read-only: unlike `Migrator::get_pending_migrations`, it never
-//! creates the `seaql_migrations` table, so a refused start leaves the
-//! database exactly as it found it. It costs two small catalog/ledger queries,
-//! so it runs on every start.
+//! creates the `seaql_migrations` table, so a fresh database is left exactly as
+//! it was found. It costs two small catalog/ledger queries, so it runs on every
+//! start.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sea_orm::{ConnectionTrait, DbErr, Statement};
 use sea_orm_migration::MigratorTrait;
 use temps_migrations::Migrator;
+use tracing::warn;
 
 use crate::DbConnection;
 
-/// Version of this binary, as reported in guard errors.
+/// Version of this binary, as reported in guard warnings.
 const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// How many unknown migration names an error lists before summarising.
+/// How many unknown migration names a warning lists before summarising.
 const MAX_LISTED_UNKNOWN: usize = 10;
 
-/// Upgrade guide anchor referenced by guard errors.
+/// Upgrade guide anchor referenced by guard warnings.
 pub const UPGRADE_ROLLBACK_DOCS_URL: &str = "https://temps.sh/docs/upgrade#roll-back-an-upgrade";
+
+/// Set once the newer-schema warning has been logged. Startup consults the
+/// guard several times (backup preparation, the pending-migration probe, the
+/// migration run itself); one warning per process is enough.
+static NEWER_SCHEMA_WARNED: AtomicBool = AtomicBool::new(false);
 
 /// Where the database schema stands relative to this binary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,44 +67,49 @@ pub enum SchemaStatus {
         /// Pending migration names, in apply order.
         pending: Vec<String>,
     },
+    /// The database has applied migrations this binary does not define: a
+    /// newer release migrated it. Startup continues with a warning.
+    NewerThanBinary {
+        /// Number of migrations already applied (known and unknown).
+        applied: usize,
+        /// Applied migrations this binary does not define, sorted.
+        unknown: Vec<String>,
+        /// Migrations this binary defines that are not applied, in apply
+        /// order. Empty for a plain binary rollback; non-empty only when the
+        /// newer release lacked a migration this binary has (a divergent
+        /// build).
+        pending: Vec<String>,
+    },
 }
 
 impl SchemaStatus {
-    /// Pending migration names (empty unless [`SchemaStatus::PendingUpgrade`]).
+    /// Migrations this binary will apply (empty for [`SchemaStatus::Fresh`],
+    /// whose plan comes from the migrator, and [`SchemaStatus::UpToDate`]).
     pub fn pending(&self) -> &[String] {
         match self {
-            SchemaStatus::PendingUpgrade { pending, .. } => pending,
+            SchemaStatus::PendingUpgrade { pending, .. }
+            | SchemaStatus::NewerThanBinary { pending, .. } => pending,
             SchemaStatus::Fresh | SchemaStatus::UpToDate { .. } => &[],
+        }
+    }
+
+    /// The operator-facing warning for a database migrated by a newer release,
+    /// or `None` when the schema is not newer than this binary.
+    pub fn newer_schema_warning(&self) -> Option<String> {
+        match self {
+            SchemaStatus::NewerThanBinary { unknown, .. } => {
+                Some(newer_schema_message(BINARY_VERSION, unknown))
+            }
+            SchemaStatus::Fresh
+            | SchemaStatus::UpToDate { .. }
+            | SchemaStatus::PendingUpgrade { .. } => None,
         }
     }
 }
 
-/// Why the schema guard refused to let migrations (and the server) proceed.
+/// Why the schema guard could not classify the database.
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaGuardError {
-    /// The database has applied migrations that this binary does not define.
-    #[error(
-        "The database schema is newer than this Temps binary (v{binary_version}): \
-         {count} applied migration(s) are unknown to it: {listed}. \
-         A newer Temps release migrated this database, and an older binary was \
-         started against it afterwards (for example after rolling back only the \
-         binary). Refusing to start so this binary cannot write to a schema it does \
-         not understand; nothing was changed. To fix it, either run the Temps \
-         release that applied these migrations (or a newer one), or restore the \
-         database from the backup taken before that upgrade (automatic \
-         pre-migration backups are kept in <data dir>/backups/pre-migration) and \
-         then start this binary. See {docs}",
-        count = unknown.len(),
-        listed = list_names(unknown),
-        docs = UPGRADE_ROLLBACK_DOCS_URL
-    )]
-    DatabaseNewerThanBinary {
-        /// Version of the binary that refused to start.
-        binary_version: &'static str,
-        /// Applied migrations this binary does not define, sorted.
-        unknown: Vec<String>,
-    },
-
     /// The migration ledger could not be read.
     #[error("Startup schema check failed while {operation}: {source}")]
     ReadLedger {
@@ -102,6 +118,25 @@ pub enum SchemaGuardError {
         #[source]
         source: DbErr,
     },
+}
+
+fn newer_schema_message(binary_version: &str, unknown: &[String]) -> String {
+    format!(
+        "The database schema is newer than this Temps binary (v{binary_version}): \
+         {count} applied migration(s) are unknown to it: {listed}. \
+         A newer Temps release migrated this database, and this older binary was \
+         started against it afterwards (for example after rolling back only the \
+         binary). Starting anyway: the unknown migrations are left in place and \
+         only migrations this binary defines are applied, but features that rely \
+         on the newer schema may misbehave until the schema and binary match again. \
+         To get back to a matching pair, either run the Temps release that applied \
+         these migrations (or a newer one), or restore the database from the backup \
+         taken before that upgrade (automatic pre-migration backups are kept in \
+         <data dir>/backups/pre-migration) and then start this binary. See {docs}",
+        count = unknown.len(),
+        listed = list_names(unknown),
+        docs = UPGRADE_ROLLBACK_DOCS_URL
+    )
 }
 
 fn list_names(names: &[String]) -> String {
@@ -118,27 +153,16 @@ fn list_names(names: &[String]) -> String {
 /// Classify the applied migrations against the ones this binary knows.
 ///
 /// `known` must be in apply order; the pending list preserves it.
-pub fn classify_schema(
-    applied: &[String],
-    known: &[String],
-) -> Result<SchemaStatus, SchemaGuardError> {
+pub fn classify_schema(applied: &[String], known: &[String]) -> SchemaStatus {
     let known_set: HashSet<&str> = known.iter().map(String::as_str).collect();
     let mut unknown: Vec<String> = applied
         .iter()
         .filter(|name| !known_set.contains(name.as_str()))
         .cloned()
         .collect();
-    if !unknown.is_empty() {
-        unknown.sort();
-        unknown.dedup();
-        return Err(SchemaGuardError::DatabaseNewerThanBinary {
-            binary_version: BINARY_VERSION,
-            unknown,
-        });
-    }
 
     if applied.is_empty() {
-        return Ok(SchemaStatus::Fresh);
+        return SchemaStatus::Fresh;
     }
 
     let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
@@ -148,10 +172,20 @@ pub fn classify_schema(
         .cloned()
         .collect();
     let applied = applied_set.len();
+
+    if !unknown.is_empty() {
+        unknown.sort();
+        unknown.dedup();
+        return SchemaStatus::NewerThanBinary {
+            applied,
+            unknown,
+            pending,
+        };
+    }
     if pending.is_empty() {
-        Ok(SchemaStatus::UpToDate { applied })
+        SchemaStatus::UpToDate { applied }
     } else {
-        Ok(SchemaStatus::PendingUpgrade { applied, pending })
+        SchemaStatus::PendingUpgrade { applied, pending }
     }
 }
 
@@ -165,14 +199,31 @@ pub fn known_migration_names() -> Vec<String> {
 
 /// Read the migration ledger WITHOUT creating it and classify the database.
 ///
-/// Returns [`SchemaGuardError::DatabaseNewerThanBinary`] when the database was
-/// migrated by a newer release. Callers must run this before applying any
-/// migration or taking any other startup write.
+/// A database migrated by a newer release is reported as
+/// [`SchemaStatus::NewerThanBinary`] and logged once per process at WARN; it
+/// is not an error. Only a ledger that cannot be read fails. Callers must run
+/// this before applying any migration or taking any other startup write.
 pub async fn check_schema_compatibility(
     db: &DbConnection,
 ) -> Result<SchemaStatus, SchemaGuardError> {
     let applied = read_applied_migrations(db).await?;
-    classify_schema(&applied, &known_migration_names())
+    let status = classify_schema(&applied, &known_migration_names());
+    if let SchemaStatus::NewerThanBinary {
+        unknown, pending, ..
+    } = &status
+    {
+        if !NEWER_SCHEMA_WARNED.swap(true, Ordering::Relaxed) {
+            warn!(
+                binary_version = BINARY_VERSION,
+                unknown_migrations = ?unknown,
+                pending_known_migrations = pending.len(),
+                docs = UPGRADE_ROLLBACK_DOCS_URL,
+                "{}",
+                newer_schema_message(BINARY_VERSION, unknown)
+            );
+        }
+    }
+    Ok(status)
 }
 
 async fn read_applied_migrations(db: &DbConnection) -> Result<Vec<String>, SchemaGuardError> {
@@ -228,22 +279,20 @@ mod tests {
 
     #[test]
     fn empty_ledger_is_a_fresh_install() {
-        let status = classify_schema(&[], &names(&["m1", "m2"])).expect("fresh");
+        let status = classify_schema(&[], &names(&["m1", "m2"]));
         assert_eq!(status, SchemaStatus::Fresh);
         assert!(status.pending().is_empty());
     }
 
     #[test]
     fn fully_applied_ledger_is_up_to_date() {
-        let status =
-            classify_schema(&names(&["m2", "m1"]), &names(&["m1", "m2"])).expect("up to date");
+        let status = classify_schema(&names(&["m2", "m1"]), &names(&["m1", "m2"]));
         assert_eq!(status, SchemaStatus::UpToDate { applied: 2 });
     }
 
     #[test]
     fn partially_applied_ledger_is_a_pending_upgrade_in_apply_order() {
-        let status =
-            classify_schema(&names(&["m1"]), &names(&["m1", "m3", "m2"])).expect("pending upgrade");
+        let status = classify_schema(&names(&["m1"]), &names(&["m1", "m3", "m2"]));
         assert_eq!(
             status,
             SchemaStatus::PendingUpgrade {
@@ -252,31 +301,36 @@ mod tests {
             }
         );
         assert_eq!(status.pending(), names(&["m3", "m2"]).as_slice());
+        assert!(status.newer_schema_warning().is_none());
     }
 
     #[test]
-    fn unknown_applied_migration_is_refused_with_its_name_and_remediation() {
-        let error = classify_schema(
-            &names(&["m1", "m9_future_b", "m9_future_a"]),
+    fn unknown_applied_migration_is_a_warning_with_its_name_and_remediation() {
+        let status = classify_schema(
+            &names(&["m1", "m2", "m9_future_b", "m9_future_a"]),
             &names(&["m1", "m2"]),
-        )
-        .expect_err("a newer database must be refused");
-        match &error {
-            SchemaGuardError::DatabaseNewerThanBinary {
-                unknown,
-                binary_version,
-            } => {
-                assert_eq!(unknown, &names(&["m9_future_a", "m9_future_b"]));
-                assert_eq!(*binary_version, BINARY_VERSION);
+        );
+        assert_eq!(
+            status,
+            SchemaStatus::NewerThanBinary {
+                applied: 4,
+                unknown: names(&["m9_future_a", "m9_future_b"]),
+                pending: Vec::new(),
             }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        let message = error.to_string();
+        );
+        // A plain binary rollback has nothing of its own to apply.
+        assert!(status.pending().is_empty());
+        let message = status
+            .newer_schema_warning()
+            .expect("a newer database must produce a warning");
         assert!(message.contains("m9_future_a, m9_future_b"), "{message}");
         assert!(
             message.contains("newer than this Temps binary"),
             "{message}"
         );
+        assert!(message.contains(BINARY_VERSION), "{message}");
+        assert!(message.contains("Starting anyway"), "{message}");
+        assert!(!message.contains("Refusing"), "{message}");
         assert!(message.contains("backups/pre-migration"), "{message}");
         assert!(message.contains(UPGRADE_ROLLBACK_DOCS_URL), "{message}");
     }
@@ -319,25 +373,29 @@ mod tests {
     }
 
     #[test]
-    fn unknown_migrations_win_even_when_others_are_pending() {
+    fn newer_schema_still_reports_this_binarys_own_pending_migrations() {
         // A database migrated by a divergent build: it has one migration this
-        // binary lacks and lacks one this binary has. Applying ours on top
-        // would still mix two schemas, so it must be refused.
-        let error = classify_schema(&names(&["m1", "other_branch"]), &names(&["m1", "m2"]))
-            .expect_err("unknown applied migration must be refused");
-        assert!(matches!(
-            error,
-            SchemaGuardError::DatabaseNewerThanBinary { ref unknown, .. }
-                if unknown == &names(&["other_branch"])
-        ));
+        // binary lacks and lacks one this binary has. The unknown one is
+        // reported, and the binary's own missing migration stays pending so
+        // startup can still apply it.
+        let status = classify_schema(&names(&["m1", "other_branch"]), &names(&["m1", "m2"]));
+        assert_eq!(
+            status,
+            SchemaStatus::NewerThanBinary {
+                applied: 2,
+                unknown: names(&["other_branch"]),
+                pending: names(&["m2"]),
+            }
+        );
+        assert_eq!(status.pending(), names(&["m2"]).as_slice());
     }
 
     #[test]
     fn long_unknown_lists_are_summarised() {
         let applied: Vec<String> = (0..15).map(|i| format!("m_future_{i:02}")).collect();
         let message = classify_schema(&applied, &[])
-            .expect_err("all unknown")
-            .to_string();
+            .newer_schema_warning()
+            .expect("all unknown");
         assert!(message.contains("15 applied migration(s)"), "{message}");
         assert!(message.contains("... and 5 more"), "{message}");
         assert!(!message.contains("m_future_14"), "{message}");
@@ -352,7 +410,8 @@ mod tests {
     }
 
     /// Against a real PostgreSQL: the guard must not create the ledger table,
-    /// must classify each ledger shape, and must refuse a newer database.
+    /// must classify each ledger shape, and must report a newer database as a
+    /// status (not an error).
     /// Skips when no container runtime or test database is available.
     #[tokio::test]
     async fn guard_reads_the_real_ledger_without_creating_it() -> anyhow::Result<()> {
@@ -401,14 +460,15 @@ mod tests {
             "INSERT INTO seaql_migrations VALUES ('m29991231_000001_from_the_future', 0);",
         )
         .await?;
-        let error = check_schema_compatibility(db)
-            .await
-            .expect_err("a newer database must be refused");
-        assert!(matches!(
-            error,
-            SchemaGuardError::DatabaseNewerThanBinary { ref unknown, .. }
-                if unknown == &vec!["m29991231_000001_from_the_future".to_string()]
-        ));
+        let status = check_schema_compatibility(db).await?;
+        assert_eq!(
+            status,
+            SchemaStatus::NewerThanBinary {
+                applied: 2,
+                unknown: vec!["m29991231_000001_from_the_future".to_string()],
+                pending: known[1..].to_vec(),
+            }
+        );
         Ok(())
     }
 }

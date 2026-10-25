@@ -937,6 +937,18 @@ pub struct AgentSandboxSettingsMasked {
     pub memory_limit_mb: u64,
     pub network_mode: String,
     pub sandbox_backend: String,
+    /// Operator ceiling for a sandbox create request's `cpu_limit`; `null` = built-in.
+    #[schema(minimum = 0.01)]
+    pub max_cpu_limit: Option<f64>,
+    /// Operator ceiling for `memory_limit_mb`; `null` = built-in.
+    #[schema(minimum = 6)]
+    pub max_memory_limit_mb: Option<u64>,
+    /// Operator ceiling for `pids_limit`; `null` = built-in.
+    #[schema(minimum = 1)]
+    pub max_pids_limit: Option<i64>,
+    /// Most live sandboxes per user; `null` = unlimited.
+    #[schema(minimum = 1)]
+    pub max_sandboxes_per_user: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -982,9 +994,12 @@ pub struct MultiNodeSettingsMasked {
     pub node_failover_after_secs: Option<u64>,
 }
 
-/// Read-only cluster network state. Pool changes are performed on the control
-/// plane through `temps network setup-multi-node`, which enforces that no
-/// existing node allocation can be stranded by an in-place edit.
+/// Read-only cluster network state. The pool is changed through
+/// `PUT /settings/cluster-network` or `temps network setup-multi-node`, which
+/// refuse while any allocation is in use (ADR 056). `locked` means only that
+/// allocations exist: allocations never applied are re-assigned by a change,
+/// so whether it is allowed now is `GET /settings/cluster-network`'s
+/// `can_change`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
 pub struct ClusterNetworkSettings {
     pub compute_pool_cidr: String,
@@ -1098,6 +1113,10 @@ impl From<AppSettings> for AppSettingsResponse {
                     .agent_sandbox
                     .sandbox_backend
                     .unwrap_or_else(|| "docker".to_string()),
+                max_cpu_limit: settings.agent_sandbox.max_cpu_limit,
+                max_memory_limit_mb: settings.agent_sandbox.max_memory_limit_mb,
+                max_pids_limit: settings.agent_sandbox.max_pids_limit,
+                max_sandboxes_per_user: settings.agent_sandbox.max_sandboxes_per_user,
             },
             ai_config: settings.ai_config,
             preview_gateway: PreviewGatewaySettingsMasked {
@@ -2407,6 +2426,8 @@ fn preserve_masked_secrets(
     incoming.multi_node.cluster_ca_cert_pem = current.multi_node.cluster_ca_cert_pem.clone();
     incoming.multi_node.cluster_ca_key_encrypted =
         current.multi_node.cluster_ca_key_encrypted.clone();
+    // Owned by `temps serve --wg-endpoint`, not by the settings API.
+    incoming.multi_node.wg_endpoint = current.multi_node.wg_endpoint.clone();
     if incoming.multi_node.join_token_hash.is_none() {
         incoming.multi_node.join_token_hash = current.multi_node.join_token_hash.clone();
     }
@@ -2962,6 +2983,48 @@ fn validate_request_timeouts(timeouts: &RequestTimeoutSettings) -> Result<(), Pr
     Ok(())
 }
 
+/// Operator ceilings for sandbox create requests. A ceiling below what the
+/// runtime can enforce (a CPU quota that truncates to none, memory under
+/// Docker's 6 MB floor) or a per-user cap of zero would make every create
+/// fail, so the save is refused instead of storing a setting that only
+/// breaks the next request.
+fn validate_sandbox_limits(sandbox: &temps_core::AgentSandboxSettings) -> Result<(), Problem> {
+    let reject = |detail: String| {
+        Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Sandbox Limit")
+            .detail(detail)
+            .build())
+    };
+    if let Some(cpu) = sandbox.max_cpu_limit {
+        if !cpu.is_finite() || cpu < 0.01 {
+            return reject(format!(
+                "agent_sandbox.max_cpu_limit must be at least 0.01 cores, or null for the built-in ceiling (got {cpu})"
+            ));
+        }
+    }
+    if let Some(memory) = sandbox.max_memory_limit_mb {
+        if memory < 6 {
+            return reject(format!(
+                "agent_sandbox.max_memory_limit_mb must be at least 6 MB, or null for the built-in ceiling (got {memory})"
+            ));
+        }
+    }
+    if let Some(pids) = sandbox.max_pids_limit {
+        if pids < 1 {
+            return reject(format!(
+                "agent_sandbox.max_pids_limit must be at least 1, or null for the built-in ceiling (got {pids})"
+            ));
+        }
+    }
+    if sandbox.max_sandboxes_per_user == Some(0) {
+        return reject(
+            "agent_sandbox.max_sandboxes_per_user must be at least 1, or null for no cap"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Host-default sandbox backend accepted in platform settings. Selecting a
 /// backend this host can't run is allowed (the settings page shows its
 /// onboarding state); the agents plugin only routes to registered backends.
@@ -3172,6 +3235,24 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
     if !(1..=256).contains(&logs.head_buffer_mb) {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail("container_logs.head_buffer_mb must be between 1 and 256")
+            .build());
+    }
+    if logs.ingest_lines_per_sec > 1_000_000 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "container_logs.ingest_lines_per_sec must be between 0 (no limit) and 1000000, \
+                 got {}",
+                logs.ingest_lines_per_sec
+            ))
+            .build());
+    }
+    if logs.ingest_kib_per_sec > 1_048_576 {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!(
+                "container_logs.ingest_kib_per_sec must be between 0 (no limit) and 1048576 \
+                 (1 GiB/s), got {}",
+                logs.ingest_kib_per_sec
+            ))
             .build());
     }
     Ok(())
@@ -3519,6 +3600,7 @@ async fn update_settings(
     }
 
     validate_sandbox_backend(settings.agent_sandbox.sandbox_backend.as_deref())?;
+    validate_sandbox_limits(&settings.agent_sandbox)?;
 
     validate_monitoring_settings(&settings.monitoring)?;
     validate_ai_chat_limits(&settings.ai_chat_limits)?;
@@ -4649,6 +4731,71 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_limit_settings_reject_values_that_would_break_every_create() {
+        let ok = AgentSandboxSettings::default();
+        assert!(validate_sandbox_limits(&ok).is_ok());
+        let ok = AgentSandboxSettings {
+            max_cpu_limit: Some(2.0),
+            max_memory_limit_mb: Some(4096),
+            max_pids_limit: Some(256),
+            max_sandboxes_per_user: Some(5),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_limits(&ok).is_ok());
+
+        let bad = [
+            (
+                "max_cpu_limit",
+                AgentSandboxSettings {
+                    max_cpu_limit: Some(0.0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_cpu_limit",
+                AgentSandboxSettings {
+                    max_cpu_limit: Some(f64::NAN),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_memory_limit_mb",
+                AgentSandboxSettings {
+                    max_memory_limit_mb: Some(5),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_pids_limit",
+                AgentSandboxSettings {
+                    max_pids_limit: Some(0),
+                    ..Default::default()
+                },
+            ),
+            (
+                "max_sandboxes_per_user",
+                AgentSandboxSettings {
+                    max_sandboxes_per_user: Some(0),
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (field, settings) in bad {
+            let problem = validate_sandbox_limits(&settings).expect_err(field);
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{field}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            assert!(
+                detail.contains(field),
+                "{field}: detail must name the setting, got {detail:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sandbox_backend_setting_accepts_the_three_public_backends() {
         assert!(validate_sandbox_backend(None).is_ok());
         for backend in ["docker", "firecracker", "microsandbox", " microsandbox "] {
@@ -4739,6 +4886,7 @@ mod tests {
         s.multi_node.join_token_hash = Some("stored-join-token-hash".into());
         s.multi_node.cluster_ca_cert_pem = Some("stored-ca-cert".into());
         s.multi_node.cluster_ca_key_encrypted = Some("stored-ca-key".into());
+        s.multi_node.wg_endpoint = Some("203.0.113.1:20517".into());
         s.multi_node.node_failover_after_secs = None;
         s.monitoring.clickhouse_url = Some("http://user:pass@clickhouse:8123".into());
         s.geo.maxmind_license_key_encrypted = Some("stored-maxmind-ciphertext".into());
@@ -4824,6 +4972,7 @@ mod tests {
         incoming.docker_registry.password = Some("******".into());
         incoming.monitoring.clickhouse_url = Some("   ".into());
         incoming.multi_node.cluster_ca_key_encrypted = Some("forged-ca-key".into());
+        incoming.multi_node.wg_endpoint = Some("198.51.100.66:51820".into());
         preserve_masked_secrets(&mut incoming, &stored, false);
         assert_eq!(
             incoming.dns_provider.cloudflare_api_key.as_deref(),
@@ -4840,6 +4989,11 @@ mod tests {
         assert_eq!(
             incoming.multi_node.cluster_ca_key_encrypted,
             stored.multi_node.cluster_ca_key_encrypted
+        );
+        // `--wg-endpoint` is the flag's, never the settings API's.
+        assert_eq!(
+            incoming.multi_node.wg_endpoint,
+            stored.multi_node.wg_endpoint
         );
     }
 
@@ -5952,6 +6106,25 @@ mod tests {
             ..ContainerLogSettings::default()
         };
         assert!(validate_container_log_budgets(&zero_head).is_err());
+        let no_ingest_limit = ContainerLogSettings {
+            ingest_lines_per_sec: 0,
+            ingest_kib_per_sec: 0,
+            ..ContainerLogSettings::default()
+        };
+        assert!(
+            validate_container_log_budgets(&no_ingest_limit).is_ok(),
+            "0 disables the ingestion budget"
+        );
+        let absurd_lines = ContainerLogSettings {
+            ingest_lines_per_sec: 1_000_001,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&absurd_lines).is_err());
+        let absurd_bytes = ContainerLogSettings {
+            ingest_kib_per_sec: 1_048_577,
+            ..ContainerLogSettings::default()
+        };
+        assert!(validate_container_log_budgets(&absurd_bytes).is_err());
     }
 
     // The ClickHouse metrics store is built from TEMPS_CLICKHOUSE_* env
@@ -6098,6 +6271,10 @@ mod tests {
                 network_mode: "restricted".into(),
                 sandbox_backend: None,
                 allowed_node_ids: None,
+                max_cpu_limit: None,
+                max_memory_limit_mb: None,
+                max_pids_limit: None,
+                max_sandboxes_per_user: None,
             },
             ..Default::default()
         };

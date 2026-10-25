@@ -69,3 +69,10 @@ tokio = { workspace = true, features = ["test-util"] }
 # Migrated PostgreSQL for the workspace and blueprint storage tests; they skip
 # when no container runtime is available.
 temps-database = { path = "../temps-database" }
+# The handler authorization tests build a real `ProjectService` (an `AppState`
+# field) over a mock database; these are its collaborators. Never exercised.
+temps-providers = { path = "../temps-providers" }
+temps-environments = { path = "../temps-environments" }
+bollard = { workspace = true }
+# Sends requests through the assembled router in the same tests.
+tower = { workspace = true }

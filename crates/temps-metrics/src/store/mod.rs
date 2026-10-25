@@ -125,6 +125,82 @@ pub fn range_to_step(range: &str) -> (Duration, Duration) {
     (window, duration_to_step(window))
 }
 
+/// What a range-series bucket without any samples reads as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapFill {
+    /// "No data": the chart breaks the line instead of drawing a value
+    /// nobody measured. Right for gauges (0% CPU while the sampler was down
+    /// would be a lie) and for cumulative counters, whose increase over a gap
+    /// is unknown until the next sample.
+    Null,
+    /// The bucket is a real zero. Right for per-interval delta counters
+    /// ([`is_delta_counter`]): the proxy that served requests is the process
+    /// that samples them, so no sample means no request went through it.
+    Zero,
+}
+
+/// [`GapFill`] policy for one range query.
+pub fn gap_fill_for(metric_name: &str, monotonic: bool) -> GapFill {
+    if !monotonic && is_delta_counter(metric_name) {
+        GapFill::Zero
+    } else {
+        GapFill::Null
+    }
+}
+
+/// Bucket width both stores use for `filter`, when it is safe to gap-fill.
+///
+/// Up to 7 days both backends bucket the raw table at
+/// [`clamp_step`]`(window, step)`, aligned to the Unix epoch for every width
+/// that divides a day (TimescaleDB's default `time_bucket` origin is a UTC
+/// midnight; ClickHouse's `toStartOfInterval` is epoch-based). Wider windows
+/// read continuous aggregates whose width the two backends choose
+/// differently, so they are returned as stored rather than filled on a grid
+/// that might not match.
+pub fn gap_fill_step(filter: &RangeQuery) -> Option<Duration> {
+    let window = filter.to - filter.from;
+    if window <= Duration::zero() || window > Duration::days(7) {
+        return None;
+    }
+    let step = clamp_step(window, filter.step);
+    let secs = step.num_seconds();
+    (secs > 0 && 86_400 % secs == 0).then_some(step)
+}
+
+/// Return one point per `step` bucket of `[from, to]`: the stored value where
+/// the store produced one, `fill` where it did not.
+///
+/// The stores only emit buckets that hold samples, so a stretch where the
+/// sampler (or the whole server) was down simply vanished from the series and
+/// charts drew a straight line across it. Points the store returns off the
+/// expected grid are kept, never dropped.
+pub fn fill_range_gaps(
+    points: Vec<(DateTime<Utc>, f64)>,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    step: Duration,
+    fill: GapFill,
+) -> Vec<(DateTime<Utc>, Option<f64>)> {
+    let step_ms = step.num_milliseconds().max(1);
+    let filler = match fill {
+        GapFill::Null => None,
+        GapFill::Zero => Some(0.0),
+    };
+    let mut by_time: std::collections::BTreeMap<i64, (DateTime<Utc>, Option<f64>)> = points
+        .into_iter()
+        .map(|(time, value)| (time.timestamp_millis(), (time, Some(value))))
+        .collect();
+    let last_ms = to.timestamp_millis();
+    let mut slot = from.timestamp_millis().div_euclid(step_ms) * step_ms;
+    while slot <= last_ms {
+        if let Some(time) = DateTime::<Utc>::from_timestamp_millis(slot) {
+            by_time.entry(slot).or_insert((time, filler));
+        }
+        slot += step_ms;
+    }
+    by_time.into_values().collect()
+}
+
 /// The kind of metric value being stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricKind {
@@ -291,6 +367,24 @@ pub trait MetricsStore: Send + Sync {
         filter: RangeQuery,
     ) -> Result<Vec<(DateTime<Utc>, f64)>, MetricsError>;
 
+    /// [`Self::query_range`] with every bucket of the window present, so a
+    /// chart can tell "no samples" from a value. Empty buckets are `None` or
+    /// `Some(0.0)` per [`gap_fill_for`]. Windows [`gap_fill_step`] cannot fill
+    /// safely (over 7 days) come back as stored, every value `Some`.
+    async fn query_range_filled(
+        &self,
+        filter: RangeQuery,
+    ) -> Result<Vec<(DateTime<Utc>, Option<f64>)>, MetricsError> {
+        let fill = gap_fill_for(&filter.name, filter.monotonic);
+        let step = gap_fill_step(&filter);
+        let (from, to) = (filter.from, filter.to);
+        let points = self.query_range(filter).await?;
+        Ok(match step {
+            Some(step) => fill_range_gaps(points, from, to, step, fill),
+            None => points.into_iter().map(|(t, v)| (t, Some(v))).collect(),
+        })
+    }
+
     /// Return the most-recent value for each requested metric name.
     async fn query_latest(&self, filter: LatestQuery)
         -> Result<HashMap<String, f64>, MetricsError>;
@@ -322,6 +416,116 @@ pub trait MetricsStore: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn range(from: i64, to: i64, step_secs: i64) -> RangeQuery {
+        RangeQuery {
+            source_kind: SourceKind::Node,
+            source_id: 0,
+            name: "node.cpu_percent".into(),
+            from: at(from),
+            to: at(to),
+            step: Duration::seconds(step_secs),
+            monotonic: false,
+        }
+    }
+
+    #[test]
+    fn fill_range_gaps_breaks_a_gauge_across_a_three_hour_gap() {
+        // 24h of 15-minute buckets, the agent silent for hours 10..13.
+        let from = 1_760_000_400; // aligned to 900s
+        let gap = (from + 10 * 3_600)..(from + 13 * 3_600);
+        let points: Vec<_> = (0..96)
+            .map(|i| from + i * 900)
+            .filter(|t| !gap.contains(t))
+            .map(|t| (at(t), 42.0))
+            .collect();
+        assert_eq!(points.len(), 96 - 12);
+
+        let filled = fill_range_gaps(
+            points,
+            at(from),
+            at(from + 86_400 - 1),
+            Duration::seconds(900),
+            GapFill::Null,
+        );
+        assert_eq!(filled.len(), 96);
+        for (time, value) in &filled {
+            if gap.contains(&time.timestamp()) {
+                assert_eq!(
+                    *value, None,
+                    "gap bucket {time} must be null, not interpolated"
+                );
+            } else {
+                assert_eq!(*value, Some(42.0));
+            }
+        }
+    }
+
+    #[test]
+    fn fill_range_gaps_zero_fills_delta_counters_and_aligns_unaligned_windows() {
+        // 10:07 -> 10:41 at 15m covers the 10:00, 10:15 and 10:30 buckets.
+        let hour = 1_760_000_400;
+        let filled = fill_range_gaps(
+            vec![(at(hour + 900), 7.0)],
+            at(hour + 7 * 60),
+            at(hour + 41 * 60),
+            Duration::seconds(900),
+            GapFill::Zero,
+        );
+        assert_eq!(
+            filled,
+            vec![
+                (at(hour), Some(0.0)),
+                (at(hour + 900), Some(7.0)),
+                (at(hour + 1_800), Some(0.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_range_gaps_keeps_off_grid_points() {
+        let filled = fill_range_gaps(
+            vec![(at(1_000_030), 1.0)],
+            at(1_000_020),
+            at(1_000_080),
+            Duration::seconds(60),
+            GapFill::Null,
+        );
+        assert!(filled.contains(&(at(1_000_030), Some(1.0))));
+    }
+
+    #[test]
+    fn gap_fill_policy_is_zero_only_for_delta_counters() {
+        assert_eq!(gap_fill_for("proxy.requests", false), GapFill::Zero);
+        assert_eq!(gap_fill_for("node.cpu_percent", false), GapFill::Null);
+        assert_eq!(
+            gap_fill_for("proxy.request_duration_p95_ms", false),
+            GapFill::Null
+        );
+        assert_eq!(
+            gap_fill_for("node.network_rx_bytes_total", true),
+            GapFill::Null
+        );
+    }
+
+    #[test]
+    fn gap_fill_step_only_fills_raw_table_windows() {
+        assert_eq!(
+            gap_fill_step(&range(0, 86_400, 900)),
+            Some(Duration::seconds(900))
+        );
+        assert_eq!(
+            gap_fill_step(&range(0, 7 * 86_400, 3_600)),
+            Some(Duration::seconds(3_600))
+        );
+        // Continuous aggregates: the two backends disagree on the width.
+        assert_eq!(gap_fill_step(&range(0, 30 * 86_400, 3_600)), None);
+        assert_eq!(gap_fill_step(&range(10, 10, 60)), None);
+    }
 
     #[test]
     fn test_range_to_step_1h() {

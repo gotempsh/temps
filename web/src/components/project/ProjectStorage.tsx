@@ -82,9 +82,11 @@ function ResourceSparkline({
     retry: false,
   })
 
-  if (!data?.length) return null
-
-  const values = data.map((p) => p.value)
+  // Trend glyph only: buckets nothing was sampled in (`null`) are dropped.
+  const values = (data ?? [])
+    .map((p) => p.value)
+    .filter((v): v is number => v != null && Number.isFinite(v))
+  if (values.length === 0) return null
   const last = values[values.length - 1]
 
   return (

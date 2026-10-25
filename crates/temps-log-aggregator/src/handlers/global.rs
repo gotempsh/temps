@@ -28,7 +28,7 @@ use crate::{
         GlobalLogSearchResponse, GlobalLogSource,
     },
     services::search::to_search_line,
-    services::{CollectionStatus, RecoveryState},
+    services::{CollectionStatus, RecoveryState, ThrottledLogSource, BURST_SECONDS},
     store::{
         encode_cursor, resolve_log_access_scope, FacetField, FacetValue, LogAccessScope, LogQuery,
     },
@@ -227,6 +227,49 @@ pub struct GlobalLogCapabilities {
     pub collection: LogCollectionCapability,
 }
 
+/// Settings page and section that configure the ingestion budget.
+pub const INGEST_BUDGET_SETUP_PATH: &str =
+    "/settings/metrics-monitoring#container-log-ingest-budget";
+
+/// The per-container log ingestion budget and the containers over it now.
+/// A throttled container has lines dropped (not stored, not indexed), so it
+/// is reported here for the console to name it rather than leave a gap in
+/// its history unexplained.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct LogIngestBudgetStatus {
+    /// Lines per second each container may store; `0` = no line limit.
+    pub lines_per_sec: u32,
+    /// Bytes per second each container may store; `0` = no byte limit.
+    pub bytes_per_sec: u64,
+    /// Seconds of budget a container may send at once before it is held to
+    /// the rate.
+    pub burst_seconds: u64,
+    /// Console path where an administrator changes the budget.
+    pub setup_path: String,
+    /// Containers that dropped lines in the last minute, noisiest first,
+    /// limited to the projects and services the caller can read.
+    pub throttled: Vec<ThrottledLogSource>,
+}
+
+/// The throttled containers `scope` may read about. An external-service
+/// container carries the `project_id = 0` sentinel and is decided by its
+/// service, never by that sentinel.
+fn visible_throttled(
+    throttled: Vec<ThrottledLogSource>,
+    scope: &LogAccessScope,
+) -> Vec<ThrottledLogSource> {
+    throttled
+        .into_iter()
+        .filter(
+            |source| match (source.external_service_id, source.project_id) {
+                (Some(service_id), _) => scope.allows_external_service(service_id),
+                (None, Some(project_id)) => scope.allows_project(project_id),
+                (None, None) => false,
+            },
+        )
+        .collect()
+}
+
 /// How many deferred generations the response itemizes. The counts cover
 /// all of them; the list is for the operator to recognise what they are.
 const DEFERRED_GENERATIONS_LISTED: usize = 20;
@@ -410,6 +453,39 @@ pub struct AnalyticsCapability {
     /// still holds rows for chunks that no longer exist — over-counted in
     /// facets/histograms/aggregates until the sweeper catches up.
     pub forget_backlog: u64,
+}
+
+/// The ingestion budget and the containers dropping lines over it, for the
+/// warnings on the log views. Reads only in-memory state, so the console can
+/// poll it from every log view; the caller's access scope is resolved only
+/// when some container is throttled.
+#[utoipa::path(get, path="/logs/ingest-budget", tag="Logs",
+    responses(
+        (status=200, description="Budget and throttled containers the caller can read", body=LogIngestBudgetStatus),
+        (status=401, description="Unauthorized", body=ProblemDetails),
+        (status=403, description="Insufficient permissions", body=ProblemDetails),
+        (status=500, description="The caller's log access could not be resolved", body=ProblemDetails)
+    ),
+    security(("bearer_auth"=[])))]
+pub async fn log_ingest_budget(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<LogAggregatorAppState>>,
+) -> Result<Json<LogIngestBudgetStatus>, Problem> {
+    permission_guard!(auth, LogsRead);
+    let limits = state.ingest_budget.limits();
+    let throttled = state.ingest_budget.throttled_sources();
+    let throttled = if throttled.is_empty() || auth.is_instance_admin() {
+        throttled
+    } else {
+        visible_throttled(throttled, &scope_for(&auth, &state).await?)
+    };
+    Ok(Json(LogIngestBudgetStatus {
+        lines_per_sec: limits.lines_per_sec,
+        bytes_per_sec: limits.bytes_per_sec,
+        burst_seconds: BURST_SECONDS,
+        setup_path: INGEST_BUDGET_SETUP_PATH.to_string(),
+        throttled,
+    }))
 }
 
 #[utoipa::path(get, path="/logs/global/capabilities", tag="Logs",
@@ -1139,5 +1215,74 @@ mod collection_tests {
         assert!(capability.collecting);
         assert_eq!(capability.deferred_count, 0);
         assert!(capability.deferred_dir.is_none());
+    }
+}
+
+#[cfg(test)]
+mod ingest_budget_tests {
+    use super::*;
+    use crate::services::IngestDropReason;
+
+    fn throttled(
+        container_id: &str,
+        project_id: Option<i32>,
+        external_service_id: Option<i32>,
+    ) -> ThrottledLogSource {
+        ThrottledLogSource {
+            container_id: container_id.into(),
+            service: "svc".into(),
+            project_id,
+            external_service_id,
+            env: "1".into(),
+            deploy_id: None,
+            node_id: None,
+            node_name: None,
+            offered_lines_per_sec: 1_000,
+            offered_bytes_per_sec: 80_000,
+            dropped_lines: 10,
+            dropped_bytes: 800,
+            reason: IngestDropReason::LinesPerSec,
+            throttled_since: Utc::now(),
+            last_dropped_at: Utc::now(),
+        }
+    }
+
+    fn ids(sources: &[ThrottledLogSource]) -> Vec<&str> {
+        sources.iter().map(|s| s.container_id.as_str()).collect()
+    }
+
+    // A member sees only throttled containers of the projects and services
+    // they can read; another tenant's noisy container is not disclosed.
+    #[test]
+    fn members_see_only_throttled_containers_they_can_read() {
+        let all = vec![
+            throttled("mine", Some(1), None),
+            throttled("theirs", Some(2), None),
+            throttled("my-db", None, Some(7)),
+            throttled("their-db", None, Some(8)),
+        ];
+        let scope = LogAccessScope::Allowed {
+            project_ids: vec![1],
+            external_service_ids: vec![7],
+        };
+        assert_eq!(ids(&visible_throttled(all, &scope)), ["mine", "my-db"]);
+    }
+
+    // An external-service container must not become visible through the
+    // `project_id = 0` sentinel, even to a scope that somehow lists project 0.
+    #[test]
+    fn external_service_is_not_matched_by_the_project_sentinel() {
+        let all = vec![throttled("their-db", None, Some(8))];
+        let scope = LogAccessScope::Allowed {
+            project_ids: vec![0],
+            external_service_ids: vec![],
+        };
+        assert!(visible_throttled(all, &scope).is_empty());
+    }
+
+    #[test]
+    fn administrators_see_every_throttled_container() {
+        let all = vec![throttled("a", Some(1), None), throttled("b", None, Some(7))];
+        assert_eq!(visible_throttled(all, &LogAccessScope::All).len(), 2);
     }
 }

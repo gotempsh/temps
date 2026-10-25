@@ -8,8 +8,12 @@
 //! address and returns the pairing code, which holds the secret and is
 //! handed only to the node. The dialing itself is
 //! [`crate::services::node_pairing`].
+//!
+//! A worker that joins outbound only (ADR 055) starts its own pairing with a
+//! join token ([`NodePairingAdminService::start_outbound`]): no code, no
+//! dialing; it gets the same facts over HTTPS and dials the control plane.
 
-use std::net::{AddrParseError, SocketAddr};
+use std::net::{AddrParseError, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
@@ -20,7 +24,7 @@ use temps_core::EncryptionService;
 use temps_entities::node_pairings;
 use temps_network::mesh::MeshError;
 use temps_wireguard::pairing::{PairingCode, PairingError, PairingId, PairingSecret};
-use tracing::error;
+use tracing::{error, info};
 use zeroize::Zeroizing;
 
 /// How long a pairing code stays usable.
@@ -38,8 +42,14 @@ pub enum NodePairingAdminError {
     },
     #[error("the control plane has not brought up its end of the mesh yet")]
     MeshNotReady,
+    /// A worker that joins outbound only dials the control plane, which
+    /// publishes no WireGuard endpoint (ADR 055).
+    #[error("the control plane publishes no WireGuard endpoint workers can dial")]
+    ControlPlaneNotDialable,
     #[error("node name {name:?} is invalid: use 1-63 lowercase letters, digits and dashes")]
     InvalidName { name: String },
+    #[error("node name {name:?} is invalid: use at most 63 letters, digits, '-', '.' or '_'")]
+    InvalidRegistrationName { name: String },
     #[error("could not generate the pairing {what}: {source}")]
     Randomness {
         what: &'static str,
@@ -80,6 +90,32 @@ fn mesh(action: &'static str) -> impl FnOnce(MeshError) -> NodePairingAdminError
 pub struct StartedPairing {
     pub pairing: node_pairings::Model,
     pub code: Zeroizing<String>,
+}
+
+/// What a worker that joins outbound only (ADR 055) needs to bring its end
+/// of the mesh up and register over it: a pairing code without the secret
+/// and without the node's endpoint. The join token is single-use and bound
+/// to the node's name; hand it only to that worker.
+pub struct OutboundEnrollment {
+    pub pairing: node_pairings::Model,
+    pub control_plane_public_key: String,
+    pub control_plane_endpoint: String,
+    pub control_plane_address: Ipv4Addr,
+    pub node_address: Ipv4Addr,
+    pub prefix_len: u8,
+    pub listen_port: u16,
+    pub node_api_port: u16,
+    pub ca_fingerprint: String,
+    pub join_token: Zeroizing<String>,
+}
+
+/// The enrollment token and encrypted secret a new pairing is created with.
+struct PairingCredentials {
+    ca_fingerprint: String,
+    join_token: String,
+    token_id: i32,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    secret_encrypted: String,
 }
 
 /// A node name: lowercase letters, digits and dashes, 1–63 characters.
@@ -174,43 +210,15 @@ impl NodePairingAdminService {
             None => default_node_name(&pairing_id.to_base64url()),
         };
 
-        let ca = crate::cluster_ca::ensure_cluster_ca(
-            self.config_service.as_ref(),
-            self.encryption_service.as_ref(),
-        )
-        .await
-        .map_err(NodePairingAdminError::ClusterCa)?;
-        let ca_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&ca.cert_pem)
-            .map_err(NodePairingAdminError::CaFingerprint)?;
-
-        let (join_token, token) = self
-            .enrollment_tokens
-            .mint(temps_config::MintParams {
-                max_uses: 1,
-                ttl_secs: PAIRING_TTL_SECS,
-                bound_node_name: Some(name.clone()),
-                bound_labels: None,
-                created_by_user_id: Some(user_id),
-                ca_fingerprint: Some(ca_fingerprint.clone()),
-            })
-            .await
-            .map_err(|source| NodePairingAdminError::MintToken {
-                name: name.clone(),
-                source,
-            })?;
-        let secret_encrypted = match self
-            .encryption_service
-            .encrypt(secret.to_base64url().as_bytes())
-        {
-            Ok(encrypted) => encrypted,
-            Err(error) => {
-                self.revoke_unused_token(token.id).await;
-                return Err(NodePairingAdminError::EncryptSecret {
-                    name,
-                    reason: error.to_string(),
-                });
-            }
-        };
+        let PairingCredentials {
+            ca_fingerprint,
+            join_token,
+            token_id,
+            expires_at,
+            secret_encrypted,
+        } = self
+            .credentials(&name, &secret, Some(user_id), None)
+            .await?;
 
         let created = temps_network::pairing::create(
             db,
@@ -219,8 +227,8 @@ impl NodePairingAdminService {
                 name: name.clone(),
                 node_endpoint,
                 secret_encrypted,
-                enrollment_token_id: token.id,
-                expires_at: token.expires_at,
+                enrollment_token_id: token_id,
+                expires_at,
                 created_by_user_id: Some(user_id),
             },
         )
@@ -228,7 +236,7 @@ impl NodePairingAdminService {
         let pairing = match created {
             Ok(pairing) => pairing,
             Err(source) => {
-                self.revoke_unused_token(token.id).await;
+                self.revoke_unused_token(token_id).await;
                 return Err(NodePairingAdminError::Mesh {
                     action: "create the pairing",
                     source,
@@ -268,6 +276,184 @@ impl NodePairingAdminService {
         Ok(StartedPairing {
             pairing,
             code: Zeroizing::new(code),
+        })
+    }
+
+    /// Create the pairing of a worker that joins outbound only (ADR 055) and
+    /// sent its WireGuard key: it starts with the key, has no endpoint and is
+    /// never dialed. Needs the mesh on and a control plane endpoint workers
+    /// can dial. The pairing's token is bound to `name` and, like the token
+    /// the worker authorized with, to `bound_labels`. The caller validated
+    /// that token and claimed one use of it.
+    pub async fn start_outbound(
+        &self,
+        name: &str,
+        public_key: &str,
+        created_by_user_id: Option<i32>,
+        bound_labels: Option<serde_json::Value>,
+    ) -> Result<OutboundEnrollment, NodePairingAdminError> {
+        let db = self.db.as_ref();
+        if !crate::services::node_service::is_valid_node_name(name) {
+            return Err(NodePairingAdminError::InvalidRegistrationName {
+                name: name.to_string(),
+            });
+        }
+        let settings = temps_network::mesh::load_settings(db)
+            .await
+            .map_err(mesh("read the mesh settings"))?
+            .ok_or_else(|| mesh("enroll a node on the mesh")(MeshError::Disabled))?;
+        let control_plane = temps_network::mesh::published_control_plane(db)
+            .await
+            .map_err(mesh("read the control plane's mesh key"))?
+            .ok_or(NodePairingAdminError::MeshNotReady)?;
+        let control_plane_endpoint = control_plane
+            .endpoint
+            .ok_or(NodePairingAdminError::ControlPlaneNotDialable)?;
+
+        let pairing_id = PairingId::generate()
+            .map_err(|source| NodePairingAdminError::Randomness { what: "id", source })?;
+        // Never handed out: nothing dials this pairing. The column is shared
+        // with dialed pairings, so it still holds a random, encrypted value.
+        let secret =
+            PairingSecret::generate().map_err(|source| NodePairingAdminError::Randomness {
+                what: "secret",
+                source,
+            })?;
+        let PairingCredentials {
+            ca_fingerprint,
+            join_token,
+            token_id,
+            expires_at,
+            secret_encrypted,
+        } = self
+            .credentials(name, &secret, created_by_user_id, bound_labels)
+            .await?;
+        let join_token = Zeroizing::new(join_token);
+
+        // The same machine re-running `temps join` resumes its pending
+        // enrollment (ADR 056); anything else creates a pairing, which
+        // refuses a key in use.
+        let resumed = temps_network::pairing::resume_outbound(
+            db,
+            temps_network::pairing::ResumedOutboundPairing {
+                name: name.to_string(),
+                public_key: public_key.to_string(),
+                secret_encrypted: secret_encrypted.clone(),
+                enrollment_token_id: token_id,
+                expires_at,
+                created_by_user_id,
+            },
+        )
+        .await;
+        let created = match resumed {
+            Ok(Some(pairing)) => {
+                info!(
+                    pairing = pairing.id,
+                    name, "resuming the pending outbound enrollment of the same machine"
+                );
+                Ok(pairing)
+            }
+            Ok(None) => {
+                temps_network::pairing::create_outbound(
+                    db,
+                    temps_network::pairing::NewOutboundPairing {
+                        pairing_id: pairing_id.to_base64url(),
+                        name: name.to_string(),
+                        public_key: public_key.to_string(),
+                        secret_encrypted,
+                        enrollment_token_id: token_id,
+                        expires_at,
+                        created_by_user_id,
+                    },
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        };
+        let pairing = match created {
+            Ok(pairing) => pairing,
+            Err(source) => {
+                self.revoke_unused_token(token_id).await;
+                return Err(NodePairingAdminError::Mesh {
+                    action: "create the pairing",
+                    source,
+                });
+            }
+        };
+        let node_address = pairing.mesh_address.parse().map_err(|source| {
+            NodePairingAdminError::InvalidMeshAddress {
+                pairing_id: pairing.id,
+                address: pairing.mesh_address.clone(),
+                source,
+            }
+        })?;
+        Ok(OutboundEnrollment {
+            pairing,
+            control_plane_public_key: control_plane.public_key,
+            control_plane_endpoint,
+            control_plane_address: settings.control_plane_address(),
+            node_address,
+            prefix_len: settings.cidr.prefix_len(),
+            listen_port: settings.port,
+            node_api_port: settings.node_api_port,
+            ca_fingerprint,
+            join_token,
+        })
+    }
+
+    /// Mint a pairing's single-use enrollment token, bound to `name`, and
+    /// encrypt its secret. A token whose secret could not be encrypted is
+    /// revoked before returning.
+    async fn credentials(
+        &self,
+        name: &str,
+        secret: &PairingSecret,
+        created_by_user_id: Option<i32>,
+        bound_labels: Option<serde_json::Value>,
+    ) -> Result<PairingCredentials, NodePairingAdminError> {
+        let ca = crate::cluster_ca::ensure_cluster_ca(
+            self.config_service.as_ref(),
+            self.encryption_service.as_ref(),
+        )
+        .await
+        .map_err(NodePairingAdminError::ClusterCa)?;
+        let ca_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&ca.cert_pem)
+            .map_err(NodePairingAdminError::CaFingerprint)?;
+
+        let (join_token, token) = self
+            .enrollment_tokens
+            .mint(temps_config::MintParams {
+                max_uses: 1,
+                ttl_secs: PAIRING_TTL_SECS,
+                bound_node_name: Some(name.to_string()),
+                bound_labels,
+                created_by_user_id,
+                ca_fingerprint: Some(ca_fingerprint.clone()),
+            })
+            .await
+            .map_err(|source| NodePairingAdminError::MintToken {
+                name: name.to_string(),
+                source,
+            })?;
+        let secret_encrypted = match self
+            .encryption_service
+            .encrypt(secret.to_base64url().as_bytes())
+        {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                self.revoke_unused_token(token.id).await;
+                return Err(NodePairingAdminError::EncryptSecret {
+                    name: name.to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+        Ok(PairingCredentials {
+            ca_fingerprint,
+            join_token,
+            token_id: token.id,
+            expires_at: token.expires_at,
+            secret_encrypted,
         })
     }
 

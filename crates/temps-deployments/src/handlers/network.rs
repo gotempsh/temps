@@ -115,7 +115,9 @@ pub struct WireguardMeshPeerEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct WireguardMeshSelfEntry {
     pub public_key: String,
-    pub endpoint: String,
+    /// `null` for a node nobody dials (ADR 055): it dials its peers, which
+    /// learn its address from its handshakes.
+    pub endpoint: Option<String>,
     pub address: String,
 }
 
@@ -160,7 +162,10 @@ pub struct RegisterWireguardMeshRequest {
     /// Base64 WireGuard public key. The private key never leaves the node.
     pub public_key: String,
     /// `ip:port` other nodes dial to reach this node's WireGuard socket.
-    pub endpoint: String,
+    /// Absent or `null` for a node nobody can dial (ADR 055): it dials the
+    /// control plane, which learns its address from the handshake.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// Response of `PUT /internal/nodes/{node_id}/network/wireguard`.
@@ -323,14 +328,10 @@ async fn mesh_entry(
         .await
         .map_err(mesh_error)?
         == Some(temps_network::mesh_links::Hub::Node(node.id));
-    let self_entry = match (
-        &node.mesh_wg_public_key,
-        &node.mesh_wg_endpoint,
-        &node.mesh_wg_address,
-    ) {
-        (Some(public_key), Some(endpoint), Some(address)) => Some(WireguardMeshSelfEntry {
+    let self_entry = match (&node.mesh_wg_public_key, &node.mesh_wg_address) {
+        (Some(public_key), Some(address)) => Some(WireguardMeshSelfEntry {
             public_key: public_key.clone(),
-            endpoint: endpoint.clone(),
+            endpoint: node.mesh_wg_endpoint.clone(),
             address: address.clone(),
         }),
         _ => None,
@@ -431,11 +432,16 @@ pub async fn register_mesh(
     // The node as it was before this call: its current mesh key, to tell a
     // re-key from the agent's routine re-registration.
     let node = authenticate_node(&app_state, &headers, node_id).await?;
-    let endpoint = temps_network::mesh::parse_endpoint(&request.endpoint).map_err(|error| {
-        problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid WireGuard Endpoint")
-            .with_detail(error.to_string())
-    })?;
+    let endpoint = request
+        .endpoint
+        .as_deref()
+        .map(temps_network::mesh::parse_endpoint)
+        .transpose()
+        .map_err(|error| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid WireGuard Endpoint")
+                .with_detail(error.to_string())
+        })?;
     let public_key = request.public_key.trim();
     let registration =
         temps_network::mesh::register_node(&app_state.db, node_id, public_key, endpoint)
@@ -466,7 +472,7 @@ struct MeshKeyChange {
     old_public_key: String,
     new_public_key: String,
     old_endpoint: Option<String>,
-    new_endpoint: String,
+    new_endpoint: Option<String>,
 }
 
 /// The re-key `node` (as it was before the registration) undergoes by
@@ -476,7 +482,7 @@ struct MeshKeyChange {
 fn mesh_key_change(
     node: &temps_entities::nodes::Model,
     public_key: &str,
-    endpoint: std::net::SocketAddr,
+    endpoint: Option<std::net::SocketAddr>,
 ) -> Option<MeshKeyChange> {
     let old_public_key = node.mesh_wg_public_key.as_deref()?;
     (old_public_key != public_key).then(|| MeshKeyChange {
@@ -485,7 +491,7 @@ fn mesh_key_change(
         old_public_key: old_public_key.to_string(),
         new_public_key: public_key.to_string(),
         old_endpoint: node.mesh_wg_endpoint.clone(),
-        new_endpoint: endpoint.to_string(),
+        new_endpoint: endpoint.map(|endpoint| endpoint.to_string()),
     })
 }
 
@@ -503,7 +509,7 @@ async fn record_mesh_key_change(
         old_public_key = %change.old_public_key,
         new_public_key = %change.new_public_key,
         old_endpoint = change.old_endpoint.as_deref().unwrap_or("none"),
-        new_endpoint = %change.new_endpoint,
+        new_endpoint = change.new_endpoint.as_deref().unwrap_or("none"),
         %peer,
         "node {} ({}) replaced its WireGuard mesh key",
         change.node_id,
@@ -823,6 +829,7 @@ mod tests {
                 crate::handlers::wireguard_mesh::admin_test_support::RecordingAuditLogger::default(
                 ),
             ),
+            metrics_store: None,
         });
         Router::new()
             .route("/internal/nodes/{node_id}/network/peers", get(list_peers))
@@ -1002,7 +1009,7 @@ mod tests {
 
     #[test]
     fn only_replacing_a_registered_key_is_a_key_change() {
-        let endpoint: std::net::SocketAddr = "203.0.113.40:51820".parse().unwrap();
+        let endpoint: Option<std::net::SocketAddr> = Some("203.0.113.40:51820".parse().unwrap());
         // First registration: nothing to replace.
         assert_eq!(mesh_key_change(&on_mesh(None), NEW_KEY, endpoint), None);
         // The agent's routine re-registration, even from a new endpoint.
@@ -1018,7 +1025,7 @@ mod tests {
                 old_public_key: OLD_KEY.into(),
                 new_public_key: NEW_KEY.into(),
                 old_endpoint: Some("203.0.113.4:51820".into()),
-                new_endpoint: "203.0.113.40:51820".into(),
+                new_endpoint: Some("203.0.113.40:51820".into()),
             })
         );
     }
@@ -1030,7 +1037,7 @@ mod tests {
         let change = mesh_key_change(
             &on_mesh(Some(OLD_KEY)),
             NEW_KEY,
-            "203.0.113.40:51820".parse().unwrap(),
+            Some("203.0.113.40:51820".parse().unwrap()),
         )
         .unwrap();
         record_mesh_key_change(&audit, change, "198.51.100.9:40000".parse().unwrap()).await;

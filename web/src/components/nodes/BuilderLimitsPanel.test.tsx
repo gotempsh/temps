@@ -34,6 +34,7 @@ test('saves per-node limits and retains edits when the server rejects them', asy
       <BuilderLimitsPanel node={node} />
     </QueryClientProvider>
   )
+  fireEvent.click(view.getByRole('button', { name: 'Change' }))
   const concurrency = view.getByLabelText(
     'Concurrent builds'
   ) as HTMLInputElement

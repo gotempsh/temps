@@ -54,14 +54,20 @@ pub struct UpgradeProbe {
 
 impl UpgradeProbe {
     /// `Some` when this start upgrades an existing installation. `None` for a
-    /// fresh install, a restart of the same version, or when neither the
-    /// previous version nor the pending migrations can be read.
+    /// fresh install, a restart of the same version, a start against a
+    /// database a newer release migrated (a rollback, not an upgrade), or when
+    /// neither the previous version nor the pending migrations can be read.
     pub async fn detect(db: &DatabaseConnection, data_dir: &Path) -> Option<Self> {
+        let schema_ahead = matches!(
+            temps_database::check_schema_compatibility(db).await,
+            Ok(temps_database::SchemaStatus::NewerThanBinary { .. })
+        );
         let pending = temps_database::get_pending_migration_names(db)
             .await
             .map(|names| names.len())
             .ok();
         Self::from_state(
+            schema_ahead,
             read_last_started_version(data_dir),
             current_version(),
             pending,
@@ -70,11 +76,15 @@ impl UpgradeProbe {
     }
 
     fn from_state(
+        schema_ahead: bool,
         previous_version: Option<String>,
         current: &str,
         pending: Option<usize>,
         defined: usize,
     ) -> Option<Self> {
+        if schema_ahead {
+            return None;
+        }
         let pending_migrations = pending.unwrap_or(0);
         let version_changed = previous_version
             .as_deref()
@@ -229,12 +239,28 @@ mod tests {
     fn fresh_install_and_same_version_restart_are_not_upgrades() {
         // Fresh install: nothing recorded, every migration pending.
         assert_eq!(
-            UpgradeProbe::from_state(None, "0.2.0", Some(120), 120),
+            UpgradeProbe::from_state(false, None, "0.2.0", Some(120), 120),
             None
         );
         // Restart of the same version with nothing pending.
         assert_eq!(
-            UpgradeProbe::from_state(previous("0.2.0"), "0.2.0", Some(0), 120),
+            UpgradeProbe::from_state(false, previous("0.2.0"), "0.2.0", Some(0), 120),
+            None
+        );
+    }
+
+    #[test]
+    fn starting_on_a_newer_schema_is_a_rollback_not_an_upgrade() {
+        // An older binary started after a newer release ran: the recorded
+        // version differs, but reporting it as a completed upgrade would
+        // count a downgrade (v2 -> v1) as upgrade success.
+        assert_eq!(
+            UpgradeProbe::from_state(true, previous("0.2.0"), "0.1.9", Some(0), 120),
+            None
+        );
+        // Even when the divergent build has its own migrations to apply.
+        assert_eq!(
+            UpgradeProbe::from_state(true, previous("0.2.0"), "0.1.9", Some(1), 120),
             None
         );
     }
@@ -243,15 +269,15 @@ mod tests {
     fn version_change_is_an_upgrade_even_without_pending_migrations() {
         // Migrations already applied by `temps migrate` or the self-updater,
         // or a release that adds none.
-        let probe =
-            UpgradeProbe::from_state(previous("0.1.9"), "0.2.0", Some(0), 120).expect("upgrade");
+        let probe = UpgradeProbe::from_state(false, previous("0.1.9"), "0.2.0", Some(0), 120)
+            .expect("upgrade");
         assert_eq!(probe.previous_version.as_deref(), Some("0.1.9"));
         assert_eq!(probe.pending_migrations, 0);
     }
 
     #[test]
     fn pending_migrations_on_existing_database_are_an_upgrade() {
-        let probe = UpgradeProbe::from_state(None, "0.2.0", Some(3), 120).expect("upgrade");
+        let probe = UpgradeProbe::from_state(false, None, "0.2.0", Some(3), 120).expect("upgrade");
         let completed = probe.completed_event();
         assert_eq!(completed.event_type, "upgrade_completed");
         assert_eq!(completed.properties["migrations_applied"], 3);
@@ -261,8 +287,8 @@ mod tests {
 
     #[test]
     fn failed_upgrade_sends_code_not_message() {
-        let probe =
-            UpgradeProbe::from_state(previous("0.1.9"), "0.2.0", Some(2), 120).expect("upgrade");
+        let probe = UpgradeProbe::from_state(false, previous("0.1.9"), "0.2.0", Some(2), 120)
+            .expect("upgrade");
         let event = probe.failed_event(
             "Migration m20260901_add_index failed: canceling statement due to lock timeout on relation \"customer_orders\"",
         );
@@ -320,6 +346,7 @@ mod tests {
         std::fs::write(dir.join(LAST_STARTED_VERSION_FILE), "0.0.1").unwrap();
 
         let probe = UpgradeProbe::from_state(
+            false,
             read_last_started_version(&dir),
             current_version(),
             Some(0),

@@ -144,6 +144,17 @@ pub struct AdminPasswordResetAudit {
     pub username: String,
 }
 
+// An administrator removed another user's second factor (the user lost both
+// their authenticator and recovery codes). `sessions_revoked` records how many
+// of the target's sessions ended with it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminMfaResetAudit {
+    pub context: AuditContext,
+    pub target_user_id: i32,
+    pub username: String,
+    pub sessions_revoked: u64,
+}
+
 // In-app password change for an authenticated user. `other_sessions_revoked`
 // reflects whether the operator opted to invalidate every other session on
 // submit; useful for auditors trying to reconstruct "did this user lose
@@ -624,6 +635,29 @@ impl AuditOperation for PasswordResetAudit {
 impl AuditOperation for AdminPasswordResetAudit {
     fn operation_type(&self) -> String {
         "ADMIN_PASSWORD_RESET".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for AdminMfaResetAudit {
+    fn operation_type(&self) -> String {
+        "ADMIN_MFA_RESET".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

@@ -83,18 +83,18 @@ start_dockerd() {
   #
   # Pin BOTH the default bridge and the pool user-defined bridges are
   # carved from, so nothing Docker auto-allocates can ever land on the
-  # cluster compute pool (172.20.0.0/16, the `network_config` default).
+  # cluster compute pool (10.202.0.0/16, the `network_config` default
+  # since ADR 056; clusters created before it keep 172.20.0.0/16).
   #
   # It is not enough to note that docker0 defaults to 172.17.0.0/16.
   # Docker's *default* address pool is 172.17.0.0/12 with size 16, so
   # every user-defined bridge walks up 172.18, 172.19, 172.20, … — and
   # this node creates several at boot (the preview-gateway control and
   # ingress networks, then `temps-app-network`). Whichever one lands
-  # fourth gets 172.20.0.0/16 and collides head-on with the compute
-  # pool, which makes `temps network setup-multi-node` refuse to enable
-  # the overlay:
-  #   "compute pool 172.20.0.0/16 overlaps host route 172.20.0.0/16
-  #    on device 'br-<hash>'"
+  # fourth gets 172.20.0.0/16 and collided head-on with the old default
+  # compute pool, which left the node without the overlay:
+  #   "overlay subnet 172.20.0.0/24, which this node routes, overlaps
+  #    host route 172.20.0.0/16 on device 'br-<hash>'"
   # Because those boot-time reconcilers race, which network gets which
   # /16 varies run to run — so the multinode e2e scenario failed only
   # intermittently until this was pinned.
@@ -106,7 +106,7 @@ start_dockerd() {
   # 172.17.0.0/16 makes every `docker network create` fail outright with
   # "all predefined address pools have been fully subnetted".
   #
-  # 10.98/10.99 is clear of the compute pool (172.20.0.0/16), of both
+  # 10.98/10.99 is clear of the compute pool (either default), of both
   # cluster underlays (dev-cluster 10.42.0.0/24, e2e-multinode
   # 10.52.0.0/24), and of the outer daemon's 172.16.0.0/12 defaults.
   # 256 /24s is far more networks than any scenario creates. Overlay

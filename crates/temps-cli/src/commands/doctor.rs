@@ -730,55 +730,14 @@ impl DoctorCommand {
         // Migration status — report applied count AND, crucially, whether this
         // binary has migrations the DB hasn't applied yet. Pending migrations
         // are the key pre-upgrade signal: run `temps migrate` before restarting
-        // the server so a slow migration can't crash-loop the API.
-        {
-            use temps_migrations::{Migrator, MigratorTrait};
-
-            let applied: Option<i64> = db
-                .query_one(Statement::from_string(
-                    DatabaseBackend::Postgres,
-                    "SELECT COUNT(*) as count FROM seaql_migrations".to_string(),
-                ))
-                .await
-                .ok()
-                .flatten()
-                .and_then(|row| {
-                    use sea_orm::TryGetable;
-                    i64::try_get_by(&row, "count").ok()
-                });
-
-            match Migrator::get_pending_migrations(&db).await {
-                Ok(pending) => {
-                    let pending_n = pending.len();
-                    let applied_str = applied
-                        .map(|c| format!("{c} applied"))
-                        .unwrap_or_else(|| "applied count unknown".to_string());
-                    if pending_n == 0 {
-                        report.add(
-                            "Migrations",
-                            CheckResult::Pass(format!("{applied_str}, up to date")),
-                        );
-                    } else {
-                        report.add(
-                            "Migrations",
-                            CheckResult::Warn(format!(
-                                "{applied_str}, {pending_n} PENDING — run `temps migrate` \
-                                 before restarting the server"
-                            )),
-                        );
-                    }
-                }
-                Err(_) => {
-                    report.add(
-                        "Migrations",
-                        CheckResult::Warn(
-                            "Migration table not found. Run `temps migrate` to initialize the schema."
-                                .to_string(),
-                        ),
-                    );
-                }
-            }
-        }
+        // the server so a slow migration can't crash-loop the API. Uses the
+        // read-only schema guard: unlike Sea-ORM's migrator it never creates
+        // the ledger table, and it understands a database migrated by a newer
+        // release (e.g. after a binary-only rollback).
+        let schema_status = temps_database::check_schema_compatibility(&db)
+            .await
+            .map_err(|error| error.to_string());
+        report.add("Migrations", migration_check_result(schema_status.as_ref()));
 
         Some(db)
     }
@@ -1486,6 +1445,40 @@ fn mask_database_url(url: &str) -> String {
 /// newer release is reported as an update, and the suggested command names
 /// the channel so it installs what was suggested (plain `temps upgrade`
 /// tracks stable).
+/// Doctor's "Migrations" line for a classified schema.
+fn migration_check_result(status: Result<&temps_database::SchemaStatus, &String>) -> CheckResult {
+    use temps_database::SchemaStatus;
+    let pending_hint = |count: usize| {
+        format!("{count} PENDING — run `temps migrate` before restarting the server")
+    };
+    match status {
+        Err(error) => CheckResult::Warn(format!("Could not read the migration ledger: {error}")),
+        Ok(SchemaStatus::Fresh) => CheckResult::Warn(
+            "No migrations applied yet. Run `temps migrate` to initialize the schema.".to_string(),
+        ),
+        Ok(SchemaStatus::UpToDate { applied }) => {
+            CheckResult::Pass(format!("{applied} applied, up to date"))
+        }
+        Ok(SchemaStatus::PendingUpgrade { applied, pending }) => CheckResult::Warn(format!(
+            "{applied} applied, {}",
+            pending_hint(pending.len())
+        )),
+        Ok(status @ SchemaStatus::NewerThanBinary { pending, .. }) => {
+            let warning = status.newer_schema_warning().unwrap_or_default();
+            if pending.is_empty() {
+                CheckResult::Warn(warning)
+            } else {
+                CheckResult::Warn(format!(
+                    "{warning} This binary also defines {} migration(s) the database lacks, \
+                     which its next start applies: {}",
+                    pending.len(),
+                    pending.join(", ")
+                ))
+            }
+        }
+    }
+}
+
 fn update_check_result(
     current: &str,
     channel: upgrade::UpgradeChannel,
@@ -1558,6 +1551,59 @@ mod tests {
         };
         assert!(message.contains("n1.temps.local") && !message.contains("n2.temps.local"));
         assert!(message.contains("and more"), "{message}");
+    }
+
+    #[test]
+    fn migration_check_reports_every_schema_state() {
+        use temps_database::SchemaStatus;
+        let names = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+
+        assert!(matches!(
+            migration_check_result(Ok(&SchemaStatus::UpToDate { applied: 12 })),
+            CheckResult::Pass(ref msg) if msg == "12 applied, up to date"
+        ));
+        assert!(matches!(
+            migration_check_result(Ok(&SchemaStatus::PendingUpgrade {
+                applied: 12,
+                pending: names(&["m_next"]),
+            })),
+            CheckResult::Warn(ref msg) if msg.contains("1 PENDING")
+        ));
+        assert!(matches!(
+            migration_check_result(Ok(&SchemaStatus::Fresh)),
+            CheckResult::Warn(ref msg) if msg.contains("No migrations applied yet")
+        ));
+        let error = "permission denied for table seaql_migrations".to_string();
+        assert!(matches!(
+            migration_check_result(Err(&error)),
+            CheckResult::Warn(ref msg) if msg.contains("permission denied")
+        ));
+
+        let rolled_back = SchemaStatus::NewerThanBinary {
+            applied: 13,
+            unknown: names(&["m_from_newer_release"]),
+            pending: Vec::new(),
+        };
+        match migration_check_result(Ok(&rolled_back)) {
+            CheckResult::Warn(msg) => {
+                assert!(msg.contains("newer than this Temps binary"), "{msg}");
+                assert!(msg.contains("m_from_newer_release"), "{msg}");
+                assert!(!msg.contains("lacks"), "{msg}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
+        let divergent = SchemaStatus::NewerThanBinary {
+            applied: 13,
+            unknown: names(&["m_from_newer_release"]),
+            pending: names(&["m_only_in_this_build"]),
+        };
+        match migration_check_result(Ok(&divergent)) {
+            CheckResult::Warn(msg) => {
+                assert!(msg.contains("1 migration(s) the database lacks"), "{msg}");
+                assert!(msg.contains("m_only_in_this_build"), "{msg}");
+            }
+            other => panic!("expected Warn, got {other:?}"),
+        }
     }
 
     #[test]

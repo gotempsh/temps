@@ -798,6 +798,15 @@ fn service_problem(error: &ExternalPluginsError) -> Problem {
             crate::repository::RepositoryError::GitHub { .. }
             | crate::repository::RepositoryError::Archive { .. },
         ) => (StatusCode::BAD_GATEWAY, "Plugin Repository Unavailable"),
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::BuilderUnavailable { .. },
+        ) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Plugin Builder Unavailable",
+        ),
+        ExternalPluginsError::Repository(crate::repository::RepositoryError::GitUnavailable {
+            ..
+        }) => (StatusCode::SERVICE_UNAVAILABLE, "Git Unavailable"),
         ExternalPluginsError::Repository(crate::repository::RepositoryError::Build { .. }) => {
             (StatusCode::BAD_GATEWAY, "Plugin Repository Build Failed")
         }
@@ -887,6 +896,12 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Repository(crate::repository::RepositoryError::Archive {
             ..
         }) => "Repository source archive did not pass safety checks".to_string(),
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::BuilderUnavailable { reason, .. },
+        ) => format!("Plugins are compiled in an isolated container (Docker or Podman). {reason}"),
+        ExternalPluginsError::Repository(
+            crate::repository::RepositoryError::GitUnavailable { .. },
+        ) => "This server has no `git` executable, so it cannot fetch plugin source. Install git on the server (the official Temps image includes it), then retry.".to_string(),
         ExternalPluginsError::Repository(crate::repository::RepositoryError::Build { .. }) => {
             "The isolated Bun build failed or exceeded its resource limits".to_string()
         }

@@ -779,6 +779,10 @@ mod command_tree_tests {
 
     fn expected_leaf_paths() -> BTreeSet<String> {
         [
+            "agent ingress delegated",
+            "agent ingress fixed",
+            "agent ingress off",
+            "agent ingress status",
             "agent service install",
             "agent service status",
             "agent service uninstall",

@@ -203,6 +203,21 @@ pub enum DeploymentError {
     #[error("Invalid deployment state: {0}")]
     InvalidDeploymentState(String),
 
+    /// A lifecycle action (pause, resume) was asked of a deployment whose
+    /// current state does not allow it, e.g. resuming a stopped or failed
+    /// deployment. Mapped to 409: the request is well formed, the
+    /// deployment is just not in a state it applies to.
+    #[error(
+        "Cannot {operation} deployment {deployment_id}: it is '{state}', and only a deployment \
+         that is {expected} can be {operation}d"
+    )]
+    DeploymentStateConflict {
+        deployment_id: i32,
+        operation: &'static str,
+        state: String,
+        expected: &'static str,
+    },
+
     #[error("Pipeline error: {0}")]
     PipelineError(String),
 
@@ -298,6 +313,58 @@ impl From<sea_orm::DbErr> for DeploymentError {
     }
 }
 
+/// Run a failed mark-complete job's cleanup and describe both outcomes.
+///
+/// Promotion and rollback drive their jobs by hand instead of through the
+/// workflow executor, so they must also do what the executor does when a
+/// job fails: call its `cleanup`. For `MarkDeploymentCompleteJob` that tears
+/// down the containers the deploy step started, unless the deployment
+/// already reached completed/deployed.
+async fn clean_up_failed_completion(
+    job: &dyn WorkflowTask,
+    context: &temps_core::WorkflowContext,
+    error: &temps_core::WorkflowError,
+    operation: &str,
+) -> String {
+    match job.cleanup(context).await {
+        Ok(()) => format!("Mark complete failed: {error}"),
+        Err(cleanup_error) => {
+            error!(
+                "{operation}: cleanup after failed mark-complete for deployment {} also failed: {}",
+                context.deployment_id, cleanup_error
+            );
+            format!(
+                "Mark complete failed: {error}; {operation} container cleanup also failed: {cleanup_error}"
+            )
+        }
+    }
+}
+
+/// Deployment states a pause applies to: the deployment is live and serving.
+const PAUSABLE_DEPLOYMENT_STATES: &[&str] = &["deployed", "completed"];
+/// Deployment states a resume applies to: only one paused by `pause_deployment`.
+const RESUMABLE_DEPLOYMENT_STATES: &[&str] = &["paused"];
+
+/// Refuse a pause/resume whose current state is not one it applies to.
+/// Without this, resume restarted the containers of a stopped, failed or
+/// cancelled deployment and marked it "deployed" again.
+fn check_lifecycle_transition(
+    deployment: &deployments::Model,
+    operation: &'static str,
+    allowed: &[&str],
+    expected: &'static str,
+) -> Result<(), DeploymentError> {
+    if allowed.contains(&deployment.state.as_str()) {
+        return Ok(());
+    }
+    Err(DeploymentError::DeploymentStateConflict {
+        deployment_id: deployment.id,
+        operation,
+        state: deployment.state.clone(),
+        expected,
+    })
+}
+
 /// Whether a project's hosting allows Temps to deploy it.
 fn hosting_deploy_check(project: &projects::Model) -> Result<(), DeploymentError> {
     match project.hosting.deploy_refusal(&project.name) {
@@ -361,6 +428,138 @@ fn unreachable_container_reason(
     } else {
         error.to_string()
     }
+}
+
+/// Label keys that have named a container's project over time.
+const PROJECT_LABEL_KEYS: &[&str] = &["sh.temps.project_id"];
+/// Label keys that have named a container's environment over time:
+/// Compose stacks used `sh.temps.environment_id` until they adopted the image
+/// deployer's `sh.temps.environment`.
+const ENVIRONMENT_LABEL_KEYS: &[&str] = &["sh.temps.environment", "sh.temps.environment_id"];
+
+/// Why owner cleanup may remove a recorded container it found running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RecordedContainerOwnership {
+    /// The current label scheme names exactly this project and environment.
+    Labelled,
+    /// The container predates the current label scheme (no labels, no
+    /// `sh.temps.managed`, or a project ID written as a UUID), no label
+    /// contradicts ownership, and Docker resolved the recorded reference to
+    /// that very container -- so the database row is the ownership record.
+    Recorded { missing_labels: Vec<&'static str> },
+}
+
+/// How the values under `keys` compare with `expected`.
+enum LabelVerdict {
+    /// At least one key carries `expected`, and none carries another ID.
+    Matches,
+    /// No key carries a comparable numeric ID (absent, or a legacy format).
+    Unknown,
+}
+
+/// Compare every label in `keys` against `expected`, failing on the first one
+/// that names a *different* numeric ID. A non-numeric value is a legacy
+/// format (the first label scheme wrote project IDs as UUIDs) that can
+/// neither prove nor disprove ownership, so it is reported as `Unknown`.
+fn compare_id_labels(
+    labels: &HashMap<String, String>,
+    keys: &[&'static str],
+    expected: i32,
+) -> Result<LabelVerdict, String> {
+    let mut verdict = LabelVerdict::Unknown;
+    for key in keys {
+        let Some(value) = labels.get(*key) else {
+            continue;
+        };
+        match value.trim().parse::<i32>() {
+            Ok(id) if id == expected => verdict = LabelVerdict::Matches,
+            Ok(_) => return Err(format!("label {key}={value} (expected {expected})")),
+            Err(_) => {}
+        }
+    }
+    Ok(verdict)
+}
+
+/// Decide whether owner cleanup may remove `info`, the runtime container that
+/// Docker returned for the recorded reference `recorded_container_id`, when
+/// deleting `project_id`/`environment_id`.
+///
+/// The database row is the authority -- labels carry numeric IDs that are
+/// local to one database, so they can never prove ownership on their own.
+/// What labels *can* do is contradict it: a container labelled with another
+/// project or environment, or explicitly marked unmanaged, is refused. A
+/// container whose labels are absent or in a legacy format is accepted only
+/// when Docker resolved the recorded reference to that exact container ID, so
+/// a reference that now names someone else's container is still refused.
+///
+/// The error is the reason the container was refused, for the cleanup error.
+fn recorded_container_ownership(
+    recorded_container_id: &str,
+    info: &temps_deployer::ContainerInfo,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<RecordedContainerOwnership, String> {
+    let labels = &info.labels;
+    let mut conflicts = Vec::new();
+    let managed = labels.get("sh.temps.managed").map(String::as_str);
+    if let Some(value) = managed.filter(|value| *value != "true") {
+        conflicts.push(format!("label sh.temps.managed={value}"));
+    }
+    let mut compare = |keys, expected| match compare_id_labels(labels, keys, expected) {
+        Ok(verdict) => Some(verdict),
+        Err(conflict) => {
+            conflicts.push(conflict);
+            None
+        }
+    };
+    let project = compare(PROJECT_LABEL_KEYS, project_id);
+    let environment = compare(ENVIRONMENT_LABEL_KEYS, environment_id);
+    if !conflicts.is_empty() {
+        return Err(format!(
+            "runtime container labels name a different owner than project {project_id}, \
+             environment {environment_id}: {}",
+            conflicts.join(", ")
+        ));
+    }
+
+    let mut missing_labels = Vec::new();
+    if managed.is_none() {
+        missing_labels.push("sh.temps.managed");
+    }
+    if !matches!(project, Some(LabelVerdict::Matches)) {
+        missing_labels.push("sh.temps.project_id");
+    }
+    if !matches!(environment, Some(LabelVerdict::Matches)) {
+        missing_labels.push("sh.temps.environment");
+    }
+    if missing_labels.is_empty() {
+        return Ok(RecordedContainerOwnership::Labelled);
+    }
+
+    // Docker resolves names and ID prefixes too, and some rows (importers)
+    // record a source app name rather than an ID, so a short reference can
+    // land on an unrelated container. Without labels to vouch for it, only a
+    // row that recorded the container's full, exact ID proves ownership.
+    if is_full_container_id(recorded_container_id) && info.container_id == recorded_container_id {
+        return Ok(RecordedContainerOwnership::Recorded { missing_labels });
+    }
+    Err(format!(
+        "runtime container '{}' is missing ownership labels ({}) and the recorded reference \
+         '{recorded_container_id}' is not its full container ID, so it cannot be confirmed as \
+         belonging to project {project_id}, environment {environment_id}",
+        info.container_id,
+        missing_labels.join(", "),
+    ))
+}
+
+/// Whether `value` is a full Docker container ID: 64 lowercase hex digits,
+/// the form Docker returns from create and inspect. Prefixes and names are
+/// ambiguous references, never identities.
+fn is_full_container_id(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn confined_archive_path(
@@ -1172,29 +1371,49 @@ impl DeploymentService {
                 .mark_container_removing(&original, project_id, container_environment_id)
                 .await?;
 
-            let runtime_container_absent = match deployer.get_container_info(&container_id).await {
+            // The exact container that was inspected and judged ours. Removal
+            // targets this ID, never the recorded reference: Docker resolves
+            // names and ID prefixes again on every call, so the reference
+            // could name a different container by the time it is removed.
+            let verified_runtime_id = match deployer.get_container_info(&container_id).await {
                 Ok(info) => {
-                    let expected_project = project_id.to_string();
-                    let expected_environment = container_environment_id.to_string();
-                    if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
-                        || info.labels.get("sh.temps.project_id") != Some(&expected_project)
-                        || info.labels.get("sh.temps.environment") != Some(&expected_environment)
-                    {
-                        let reason = "runtime container labels do not match the project and environment being deleted".to_string();
-                        let _ = self
-                            .restore_cleanup_marker(&original, already_prepared)
-                            .await;
-                        return Err(temps_core::ContainerCleanupError::Removal {
-                            project_id,
-                            environment_id: container_environment_id,
-                            container_id,
-                            node_id,
-                            reason,
-                        });
+                    match recorded_container_ownership(
+                        &container_id,
+                        &info,
+                        project_id,
+                        container_environment_id,
+                    ) {
+                        Ok(RecordedContainerOwnership::Labelled) => {}
+                        Ok(RecordedContainerOwnership::Recorded { missing_labels }) => {
+                            warn!(
+                                project_id,
+                                environment_id = container_environment_id,
+                                container_id,
+                                ?node_id,
+                                ?missing_labels,
+                                "Removing recorded container that predates Temps ownership labels; the database record is its ownership proof"
+                            );
+                        }
+                        Err(reason) => {
+                            let _ = self
+                                .restore_cleanup_marker(&original, already_prepared)
+                                .await;
+                            return Err(temps_core::ContainerCleanupError::Removal {
+                                project_id,
+                                environment_id: container_environment_id,
+                                container_id,
+                                node_id,
+                                reason,
+                            });
+                        }
                     }
-                    false
+                    Some(if info.container_id.is_empty() {
+                        container_id.clone()
+                    } else {
+                        info.container_id
+                    })
                 }
-                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => true,
+                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => None,
                 Err(error) => {
                     let _ = self
                         .restore_cleanup_marker(&original, already_prepared)
@@ -1222,12 +1441,10 @@ impl DeploymentService {
                 }
             };
 
-            let removal_error = if runtime_container_absent {
-                None
-            } else {
+            let removal_error = if let Some(runtime_id) = verified_runtime_id {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    deployer.remove_container(&container_id),
+                    deployer.remove_container(&runtime_id),
                 )
                 .await
                 {
@@ -1237,6 +1454,8 @@ impl DeploymentService {
                     Ok(Err(error)) => Some(error.to_string()),
                     Err(_) => Some("container removal timed out after 30 seconds".to_string()),
                 }
+            } else {
+                None
             };
             if let Some(reason) = removal_error {
                 // Once a request may have reached Docker/the agent, its result is
@@ -1651,10 +1870,10 @@ impl DeploymentService {
             ))
         })?;
 
+        let endpoint = crate::cluster_ca::node_agent_endpoint(&node);
         let remote = crate::cluster_ca::build_node_deployer(
-            &node.address,
+            &node,
             token,
-            node.name.clone(),
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
         )
@@ -1666,7 +1885,7 @@ impl DeploymentService {
             ))
         })?;
         let client = crate::cluster_ca::build_node_http_client(
-            &node.address,
+            &endpoint,
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
             None,
@@ -1680,6 +1899,7 @@ impl DeploymentService {
         })?;
         let terminal_connector = if node.address.starts_with("https://") {
             let config = crate::cluster_ca::cp_ws_client_config(
+                &endpoint,
                 self.config_service.as_ref(),
                 self.encryption_service.as_ref(),
             )
@@ -4071,6 +4291,9 @@ impl DeploymentService {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
                 })?;
 
+            // `execute` consumes the context; keep a copy for the failure
+            // path's cleanup below.
+            let cleanup_context = rollback_context.clone();
             match mark_complete_job.execute(rollback_context).await {
                 Ok(_) => {
                     info!("Rollback: Mark complete job executed successfully");
@@ -4084,16 +4307,31 @@ impl DeploymentService {
                 Err(e) => {
                     error!("Rollback: Mark complete job failed: {}", e);
 
-                    // Update complete job record to Failure
+                    // The deploy step already started this deployment's
+                    // containers. The workflow executor runs the job's
+                    // cleanup on failure; this hand-rolled path must do the
+                    // same, or a readiness or route failure leaves them
+                    // running with no owner: failed deployments are excluded
+                    // from the previous-deployment sweep. `cleanup` leaves a
+                    // deployment that already reached completed/deployed
+                    // alone, so a late failure never tears down a serving
+                    // deployment.
+                    let failure_message = clean_up_failed_completion(
+                        &mark_complete_job,
+                        &cleanup_context,
+                        &e,
+                        "rollback",
+                    )
+                    .await;
+
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
                     active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to mark deployment complete during rollback: {}",
-                        e
+                        "Failed to mark deployment complete during rollback: {failure_message}"
                     )));
                 }
             }
@@ -4693,6 +4931,9 @@ impl DeploymentService {
                     DeploymentError::Other(format!("Failed to create mark complete job: {}", e))
                 })?;
 
+            // `execute` consumes the context; keep a copy for the failure
+            // path's cleanup below.
+            let cleanup_context = promote_context.clone();
             match mark_complete_job.execute(promote_context).await {
                 Ok(_) => {
                     info!("Promotion: Mark complete job executed successfully");
@@ -4705,15 +4946,31 @@ impl DeploymentService {
                 Err(e) => {
                     error!("Promotion: Mark complete job failed: {}", e);
 
+                    // The deploy step already started this deployment's
+                    // containers. The workflow executor runs the job's
+                    // cleanup on failure; this hand-rolled path must do the
+                    // same, or a readiness or route failure leaves them
+                    // running with no owner: failed deployments are excluded
+                    // from the previous-deployment sweep. `cleanup` leaves a
+                    // deployment that already reached completed/deployed
+                    // alone, so a late failure never tears down a serving
+                    // deployment.
+                    let failure_message = clean_up_failed_completion(
+                        &mark_complete_job,
+                        &cleanup_context,
+                        &e,
+                        "promotion",
+                    )
+                    .await;
+
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
                     active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to mark deployment complete during promotion: {}",
-                        e
+                        "Failed to mark deployment complete during promotion: {failure_message}"
                     )));
                 }
             }
@@ -4864,6 +5121,7 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+        check_lifecycle_transition(&deployment, "pause", PAUSABLE_DEPLOYMENT_STATES, "deployed")?;
 
         let environment_id = deployment.environment_id;
 
@@ -5047,6 +5305,7 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+        check_lifecycle_transition(&deployment, "resume", RESUMABLE_DEPLOYMENT_STATES, "paused")?;
 
         // Resume all containers for this deployment
         let containers = deployment_containers::Entity::find()
@@ -6686,6 +6945,214 @@ impl temps_core::DeploymentContainerCleaner for DeploymentService {
 }
 
 #[cfg(test)]
+mod failed_completion_cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temps_core::{JobResult, WorkflowContext, WorkflowError};
+
+    struct NoopLogWriter;
+
+    #[async_trait::async_trait]
+    impl temps_core::LogWriter for NoopLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    /// A job whose cleanup counts its calls and optionally fails.
+    #[derive(Debug)]
+    struct CleanupProbe {
+        cleanups: AtomicUsize,
+        cleanup_error: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for CleanupProbe {
+        fn job_id(&self) -> &str {
+            "mark_deployment_complete"
+        }
+
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn description(&self) -> &str {
+            "records cleanup calls"
+        }
+
+        async fn execute(&self, _context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Err(WorkflowError::JobExecutionFailed("not used".to_string()))
+        }
+
+        async fn cleanup(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            match self.cleanup_error {
+                Some(reason) => Err(WorkflowError::JobExecutionFailed(reason.to_string())),
+                None => Ok(()),
+            }
+        }
+    }
+
+    fn context() -> WorkflowContext {
+        WorkflowContext::new("run-1".to_string(), 31, 1, 2, Arc::new(NoopLogWriter))
+    }
+
+    #[tokio::test]
+    async fn failed_completion_runs_the_jobs_cleanup() {
+        let probe = CleanupProbe {
+            cleanups: AtomicUsize::new(0),
+            cleanup_error: None,
+        };
+        let error = WorkflowError::JobExecutionFailed("route never became ready".to_string());
+
+        let message = clean_up_failed_completion(&probe, &context(), &error, "promotion").await;
+
+        assert_eq!(probe.cleanups.load(Ordering::SeqCst), 1);
+        assert!(message.contains("route never became ready"), "{message}");
+        assert!(!message.contains("cleanup also failed"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_is_reported_alongside_the_original_error() {
+        let probe = CleanupProbe {
+            cleanups: AtomicUsize::new(0),
+            cleanup_error: Some("worker node 4 unreachable"),
+        };
+        let error = WorkflowError::JobExecutionFailed("HTTP 503".to_string());
+
+        let message = clean_up_failed_completion(&probe, &context(), &error, "rollback").await;
+
+        assert_eq!(probe.cleanups.load(Ordering::SeqCst), 1);
+        assert!(message.contains("HTTP 503"), "{message}");
+        assert!(
+            message.contains("rollback container cleanup also failed"),
+            "{message}"
+        );
+        assert!(message.contains("worker node 4 unreachable"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_transition_tests {
+    use super::*;
+
+    fn deployment_in(state: &str) -> deployments::Model {
+        deployments::Model {
+            id: 17,
+            project_id: 1,
+            environment_id: 1,
+            slug: "deploy-17".to_string(),
+            state: state.to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: Some("main".to_string()),
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            upload_request_id: None,
+            docker_socket_mounted: false,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn only_a_paused_deployment_can_be_resumed() {
+        let resume = |state| {
+            check_lifecycle_transition(
+                &deployment_in(state),
+                "resume",
+                RESUMABLE_DEPLOYMENT_STATES,
+                "paused",
+            )
+        };
+        assert!(resume("paused").is_ok());
+        for state in [
+            "stopped",
+            "failed",
+            "cancelled",
+            "pending",
+            "running",
+            "deployed",
+        ] {
+            match resume(state) {
+                Err(DeploymentError::DeploymentStateConflict {
+                    deployment_id: 17,
+                    operation: "resume",
+                    state: rejected,
+                    ..
+                }) => assert_eq!(rejected, state),
+                other => panic!("resuming a '{state}' deployment must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_live_deployment_can_be_paused() {
+        let pause = |state| {
+            check_lifecycle_transition(
+                &deployment_in(state),
+                "pause",
+                PAUSABLE_DEPLOYMENT_STATES,
+                "deployed",
+            )
+        };
+        assert!(pause("deployed").is_ok());
+        assert!(pause("completed").is_ok());
+        for state in [
+            "paused",
+            "stopped",
+            "failed",
+            "cancelled",
+            "pending",
+            "running",
+        ] {
+            assert!(
+                matches!(
+                    pause(state),
+                    Err(DeploymentError::DeploymentStateConflict {
+                        operation: "pause",
+                        ..
+                    })
+                ),
+                "pausing a '{state}' deployment must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_message_names_the_deployment_and_its_state() {
+        let message = check_lifecycle_transition(
+            &deployment_in("stopped"),
+            "resume",
+            RESUMABLE_DEPLOYMENT_STATES,
+            "paused",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("deployment 17"), "{message}");
+        assert!(message.contains("'stopped'"), "{message}");
+        assert!(message.contains("paused"), "{message}");
+    }
+}
+
+#[cfg(test)]
 mod environment_link_tests {
     use super::*;
 
@@ -8260,6 +8727,348 @@ mod tests {
             "a container we refused to touch must not be marked deleted"
         );
 
+        Ok(())
+    }
+
+    fn runtime_container(id: &str, labels: &[(&str, &str)]) -> temps_deployer::ContainerInfo {
+        temps_deployer::ContainerInfo {
+            container_id: id.to_string(),
+            labels: labels
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// Docker returns the full 64-character ID; rows may record it in full or
+    /// as a prefix.
+    const RUNTIME_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn ownership_accepts_a_container_with_matching_labels() {
+        let info = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &info, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+        // Labels are authoritative enough when they fully match, even if the
+        // row recorded a reference Docker resolved by name.
+        assert_eq!(
+            recorded_container_ownership("app-production", &info, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+    }
+
+    #[test]
+    fn ownership_falls_back_to_the_recorded_id_for_unlabelled_containers() {
+        let unlabelled = runtime_container(RUNTIME_ID, &[]);
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &unlabelled, 11, 22),
+            Ok(RecordedContainerOwnership::Recorded {
+                missing_labels: vec![
+                    "sh.temps.managed",
+                    "sh.temps.project_id",
+                    "sh.temps.environment"
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn ownership_accepts_legacy_label_schemes_on_the_recorded_container() {
+        // Before `sh.temps.managed` existed.
+        let pre_managed = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &pre_managed, 11, 22),
+            Ok(RecordedContainerOwnership::Recorded {
+                missing_labels: vec!["sh.temps.managed"],
+            })
+        );
+        // The first label scheme wrote the project as a UUID.
+        let uuid_project = runtime_container(
+            RUNTIME_ID,
+            &[
+                (
+                    "sh.temps.project_id",
+                    "00000000-0000-5000-8000-000000000000",
+                ),
+                ("sh.temps.environment", "22"),
+            ],
+        );
+        assert!(recorded_container_ownership(RUNTIME_ID, &uuid_project, 11, 22).is_ok());
+        // Early Compose stacks used `sh.temps.environment_id`.
+        let compose_environment_id = runtime_container(
+            RUNTIME_ID,
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment_id", "22"),
+            ],
+        );
+        assert_eq!(
+            recorded_container_ownership(RUNTIME_ID, &compose_environment_id, 11, 22),
+            Ok(RecordedContainerOwnership::Labelled)
+        );
+    }
+
+    #[test]
+    fn ownership_refuses_containers_labelled_for_another_owner() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "12"),
+                ("sh.temps.environment", "22"),
+            ],
+            &[
+                ("sh.temps.managed", "true"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "23"),
+            ],
+            // Legacy key, different environment.
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment_id", "23"),
+            ],
+            // The current key matches but the legacy one contradicts it.
+            &[
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+                ("sh.temps.environment_id", "23"),
+            ],
+            // Explicitly not managed by Temps.
+            &[
+                ("sh.temps.managed", "false"),
+                ("sh.temps.project_id", "11"),
+                ("sh.temps.environment", "22"),
+            ],
+        ];
+        for labels in cases {
+            // Refused even though Docker resolved the recorded ID exactly: a
+            // label naming someone else outweighs our own record.
+            let info = runtime_container(RUNTIME_ID, labels);
+            let reason = recorded_container_ownership(RUNTIME_ID, &info, 11, 22)
+                .expect_err(&format!("labels {labels:?} must be refused"));
+            assert!(
+                reason.contains("different owner") && reason.contains("project 11"),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn ownership_refuses_an_unlabelled_container_docker_resolved_elsewhere() {
+        // The recorded reference is a name that now resolves to a container
+        // carrying no labels: nothing ties it to this project.
+        let info = runtime_container(RUNTIME_ID, &[]);
+        let reason = recorded_container_ownership("app-production", &info, 11, 22)
+            .expect_err("a renamed-onto container must be refused");
+        assert!(reason.contains(RUNTIME_ID), "{reason}");
+        assert!(recorded_container_ownership("", &info, 11, 22).is_err());
+        // Docker resolves unique ID prefixes, so a short value -- a short ID,
+        // or an importer's source app name that happens to be hex -- can
+        // land on any container. Only the full, exact ID is an identity.
+        for reference in [&RUNTIME_ID[..2], &RUNTIME_ID[..12], &RUNTIME_ID[..63]] {
+            assert!(
+                recorded_container_ownership(reference, &info, 11, 22).is_err(),
+                "prefix {reference} must not prove ownership"
+            );
+        }
+        let uppercase = RUNTIME_ID.to_uppercase();
+        let uppercase_info = runtime_container(&uppercase, &[]);
+        assert!(recorded_container_ownership(&uppercase, &uppercase_info, 11, 22).is_err());
+    }
+
+    /// The bug this guards: a project whose container predates Temps'
+    /// ownership labels (and was stopped by scaling to zero) could never be
+    /// deleted, because cleanup refused its own recorded container.
+    #[tokio::test]
+    async fn cleanup_removes_a_recorded_container_that_predates_ownership_labels(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping legacy-label cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let mut stopped: deployment_containers::ActiveModel = container.clone().into();
+        stopped.status = Set(Some("stopped".to_string()));
+        stopped.container_id = Set(RUNTIME_ID.to_string());
+        stopped.update(db.as_ref()).await?;
+
+        let expected_container_id = RUNTIME_ID.to_string();
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_get_container_info().returning(|id| {
+            Ok(temps_deployer::ContainerInfo {
+                container_id: id.to_string(),
+                status: temps_deployer::ContainerStatus::Stopped,
+                ..Default::default()
+            })
+        });
+        deployer
+            .expect_remove_container()
+            .withf(move |container_id| container_id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+
+        let cleaned = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container cleanup record remains until project cascade");
+        assert_eq!(cleaned.status.as_deref(), Some("removed"));
+        Ok(())
+    }
+
+    /// A row may record a reference Docker resolves (a name). Once that
+    /// resolved container is verified as ours, removal must target its exact
+    /// ID -- re-resolving the reference could reach a different container.
+    #[tokio::test]
+    async fn cleanup_removes_the_inspected_container_id_not_the_recorded_reference(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping resolved-id cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project_id, environment_id) = (project.id, environment.id);
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer.expect_get_container_info().returning(move |_| {
+            Ok(runtime_container(
+                RUNTIME_ID,
+                &[
+                    ("sh.temps.managed", "true"),
+                    ("sh.temps.project_id", &project_id.to_string()),
+                    ("sh.temps.environment", &environment_id.to_string()),
+                ],
+            ))
+        });
+        deployer
+            .expect_remove_container()
+            .withf(|container_id| container_id == RUNTIME_ID)
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        assert_ne!(container.container_id, RUNTIME_ID);
+        Ok(())
+    }
+
+    /// A stopped container's environment label still has to match: a
+    /// recorded ID that carries another environment of the same project is
+    /// refused, and its row is left untouched.
+    #[tokio::test]
+    async fn cleanup_refuses_a_container_labelled_for_another_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup environment integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id + 1);
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            matches!(
+                &result,
+                Err(temps_core::ContainerCleanupError::Removal { reason, .. })
+                    if reason.contains("sh.temps.environment")
+            ),
+            "cleanup must refuse a container labelled for another environment, got {result:?}"
+        );
+        let preserved = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("a refused cleanup must preserve the container record");
+        assert!(preserved.deleted_at.is_none());
+        assert_eq!(preserved.status, container.status);
+        Ok(())
+    }
+
+    /// A scaled-to-zero environment's container may already be gone from
+    /// Docker. That is the state cleanup wants, not an error.
+    #[tokio::test]
+    async fn cleanup_treats_an_already_gone_container_as_removed(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping gone-container cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let mut stopped: deployment_containers::ActiveModel = container.clone().into();
+        stopped.status = Set(Some("stopped".to_string()));
+        stopped.update(db.as_ref()).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        deployer
+            .expect_get_container_info()
+            .times(1)
+            .returning(|id| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(format!(
+                    "Container {id} not found"
+                )))
+            });
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+        let finalized = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("cleanup record remains until project cascade");
+        assert_eq!(finalized.status.as_deref(), Some("removed"));
+        assert!(finalized.deleted_at.is_some());
         Ok(())
     }
 

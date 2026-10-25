@@ -2079,9 +2079,8 @@ impl DeployImageJob {
         ) {
             (Some(config), Some(encryption)) => {
                 crate::cluster_ca::build_node_deployer(
-                    &node.address,
+                    &node,
                     token,
-                    node.name.clone(),
                     config.as_ref(),
                     encryption.as_ref(),
                 )
@@ -3390,8 +3389,8 @@ impl DeployImageJob {
                         self.log(context, format!("ERROR: {message}")).await?;
                         return Err(WorkflowError::JobExecutionFailed(message));
                     }
-                    // Look up the node's token from the node service
-                    let token = self.get_node_token(assignment).await?;
+                    // Look up the node and its token from the node service
+                    let (node, token) = self.get_remote_node(assignment).await?;
                     // Build the deployer via the shared factory so https:// nodes
                     // get mutual TLS (ADR-020 WS-2.1); falls back to plain HTTP
                     // when the cluster CA deps aren't wired in.
@@ -3401,9 +3400,8 @@ impl DeployImageJob {
                     ) {
                         (Some(cs), Some(es)) => {
                             crate::cluster_ca::build_node_deployer(
-                                address,
+                                &node,
                                 token,
-                                node_name.clone(),
                                 cs.as_ref(),
                                 es.as_ref(),
                             )
@@ -3557,6 +3555,17 @@ impl DeployImageJob {
         &self,
         assignment: &crate::services::NodeAssignment,
     ) -> Result<String, WorkflowError> {
+        self.get_remote_node(assignment)
+            .await
+            .map(|(_node, token)| token)
+    }
+
+    /// Load a remote assignment's node row and decrypt its agent token. The
+    /// row decides where its agent is dialed (`cluster_ca::node_agent_endpoint`).
+    async fn get_remote_node(
+        &self,
+        assignment: &crate::services::NodeAssignment,
+    ) -> Result<(temps_entities::nodes::Model, String), WorkflowError> {
         match assignment {
             crate::services::NodeAssignment::Local => Err(WorkflowError::JobExecutionFailed(
                 "Cannot get token for local node assignment".to_string(),
@@ -3581,7 +3590,7 @@ impl DeployImageJob {
                         ))
                     })?;
 
-                let encrypted_token = node.token_encrypted.ok_or_else(|| {
+                let encrypted_token = node.token_encrypted.clone().ok_or_else(|| {
                     WorkflowError::JobExecutionFailed(format!(
                         "Node '{}' (id={}) has no encrypted token — re-register the node",
                         node_name, node_id
@@ -3602,12 +3611,13 @@ impl DeployImageJob {
                         ))
                     })?;
 
-                String::from_utf8(decrypted_bytes).map_err(|e| {
+                let token = String::from_utf8(decrypted_bytes).map_err(|e| {
                     WorkflowError::JobExecutionFailed(format!(
                         "Decrypted token for node '{}' (id={}) is not valid UTF-8: {}",
                         node_name, node_id, e
                     ))
-                })
+                })?;
+                Ok((node, token))
             }
         }
     }
@@ -7738,6 +7748,11 @@ mod tests {
                 public_ingress_route_count: None,
                 public_ingress_unsupported_route_count: None,
                 public_ingress_unsupported_reasons: serde_json::json!([]),
+                occupied_ranges: None,
+                overlay_status: None,
+                overlay_last_error: None,
+                overlay_ready_cidr: None,
+                overlay_remediation: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -7820,6 +7835,11 @@ mod tests {
                 public_ingress_route_count: None,
                 public_ingress_unsupported_route_count: None,
                 public_ingress_unsupported_reasons: serde_json::json!([]),
+                occupied_ranges: None,
+                overlay_status: None,
+                overlay_last_error: None,
+                overlay_ready_cidr: None,
+                overlay_remediation: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -7903,6 +7923,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8096,6 +8121,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8177,6 +8207,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

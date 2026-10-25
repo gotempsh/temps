@@ -90,6 +90,7 @@ members = [
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",
+    "crates/temps-ingress",
     "crates/temps-blob",
     "crates/temps-log-aggregator",
     "crates/temps-clickhouse",

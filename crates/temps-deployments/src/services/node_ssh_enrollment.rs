@@ -1212,6 +1212,7 @@ mod tests {
             node_api_port: None,
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
+            compute_pool_confirmed_at: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1577,7 +1578,7 @@ mod tests {
                 let pairing = node_pairings::ActiveModel {
                     pairing_id: Set(format!("pairing-{index}")),
                     name: Set(format!("worker-{index}")),
-                    node_endpoint: Set(format!("198.51.100.{index}:51820")),
+                    node_endpoint: Set(Some(format!("198.51.100.{index}:51820"))),
                     mesh_address: Set(format!("10.201.0.{}", index + 1)),
                     secret_encrypted: Set("encrypted".into()),
                     enrollment_token_id: Set(token.id),

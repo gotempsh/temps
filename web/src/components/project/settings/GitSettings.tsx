@@ -18,6 +18,7 @@ import {
   getProjectComposeValidationOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
+  reinstallGithubWebhookMutation,
   reinstallGitlabWebhookMutation,
   updateAutomaticDeployMutation,
   updateGitSettingsMutation,
@@ -623,6 +624,33 @@ function GitSettingsInline({
       await reinstallWebhook.mutateAsync({ path: { project_id: project.id! } })
       await refetch()
       toast.success('Webhook reinstalled')
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
+    }
+  }
+
+  // GitHub repository webhook. A GitHub App delivers pushes through the App's
+  // own webhook; any other GitHub connection (personal access token, OAuth)
+  // needs a webhook on the repository itself, or pushes never deploy.
+  const reinstallGithubWebhook = useMutation({
+    ...reinstallGithubWebhookMutation(),
+    meta: {
+      errorTitle:
+        'Failed to install webhook — check your GitHub token can manage webhooks on the repo',
+    },
+  })
+  const needsGithubRepoWebhook =
+    currentProvider?.provider_type === 'github' &&
+    currentProvider.auth_method !== 'github_app'
+  const hasGithubWebhook = !!project.github_webhook_id
+
+  const handleReinstallGithubWebhook = async () => {
+    try {
+      await reinstallGithubWebhook.mutateAsync({
+        path: { project_id: project.id! },
+      })
+      await refetch()
+      toast.success('GitHub webhook installed')
     } catch {
       // The app-wide mutation handler already toasts this failure.
     }
@@ -1761,62 +1789,95 @@ function GitSettingsInline({
             </div>
 
             {isGitlab && (
-              <div className="flex items-center gap-4 p-6">
-                <div
-                  className={cn(
-                    'flex size-9 shrink-0 items-center justify-center rounded-full',
-                    hasWebhook ? 'bg-green-500/10' : 'bg-amber-500/10'
-                  )}
-                >
-                  {hasWebhook ? (
-                    <Check className="size-4 text-green-600 dark:text-green-400" />
-                  ) : (
-                    <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
-                  )}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium">
-                    {hasWebhook
-                      ? 'GitLab webhook installed'
-                      : 'GitLab webhook not installed'}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    {hasWebhook ? (
-                      <>
-                        Push events from{' '}
-                        <span className="font-mono text-foreground">
-                          {project.repo_owner}/{project.repo_name}
-                        </span>{' '}
-                        reach Temps automatically.
-                      </>
-                    ) : (
-                      <>
-                        We couldn’t install the webhook automatically. Your
-                        GitLab user needs the Maintainer role on{' '}
-                        <span className="font-mono text-foreground">
-                          {project.repo_owner}/{project.repo_name}
-                        </span>
-                        .
-                      </>
-                    )}
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleReinstallWebhook}
-                  disabled={reinstallWebhook.isPending}
-                >
-                  {reinstallWebhook.isPending && (
-                    <Loader2 className="size-3 mr-1 animate-spin" />
-                  )}
-                  {hasWebhook ? 'Reinstall' : 'Install webhook'}
-                </Button>
-              </div>
+              <RepositoryWebhookRow
+                providerName="GitLab"
+                repository={`${project.repo_owner}/${project.repo_name}`}
+                installed={hasWebhook}
+                missingHint="Installing it needs your GitLab user to have the Maintainer role on"
+                isPending={reinstallWebhook.isPending}
+                onInstall={handleReinstallWebhook}
+              />
+            )}
+
+            {needsGithubRepoWebhook && (
+              <RepositoryWebhookRow
+                providerName="GitHub"
+                repository={`${project.repo_owner}/${project.repo_name}`}
+                installed={hasGithubWebhook}
+                missingHint="Installing it needs a token with the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
+                isPending={reinstallGithubWebhook.isPending}
+                onInstall={handleReinstallGithubWebhook}
+              />
             )}
           </CardContent>
         </Card>
       )}
+    </div>
+  )
+}
+
+// Status of the webhook that tells Temps about pushes to the repository, with
+// a button to install it (or replace it) when automatic registration failed
+// or the hook was deleted on the provider's side.
+function RepositoryWebhookRow({
+  providerName,
+  repository,
+  installed,
+  missingHint,
+  isPending,
+  onInstall,
+}: {
+  providerName: string
+  repository: string
+  installed: boolean
+  missingHint: string
+  isPending: boolean
+  onInstall: () => void
+}) {
+  return (
+    <div className="flex items-center gap-4 p-6">
+      <div
+        className={cn(
+          'flex size-9 shrink-0 items-center justify-center rounded-full',
+          installed ? 'bg-green-500/10' : 'bg-amber-500/10'
+        )}
+      >
+        {installed ? (
+          <Check className="size-4 text-green-600 dark:text-green-400" />
+        ) : (
+          <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium">
+          {installed
+            ? `${providerName} webhook installed`
+            : `${providerName} webhook not installed`}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {installed ? (
+            <>
+              Push events from{' '}
+              <span className="font-mono text-foreground">{repository}</span>{' '}
+              reach Temps automatically.
+            </>
+          ) : (
+            <>
+              Pushes won’t deploy until it is. {missingHint}{' '}
+              <span className="font-mono text-foreground">{repository}</span>.
+            </>
+          )}
+        </p>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onInstall}
+        disabled={isPending}
+      >
+        {isPending && <Loader2 className="size-3 mr-1 animate-spin" />}
+        {installed ? 'Reinstall' : 'Install webhook'}
+      </Button>
     </div>
   )
 }

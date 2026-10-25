@@ -54,12 +54,17 @@ export function composeErrorClassHint(
 /**
  * Operator-facing warning when the host's Docker Compose CLI cannot run the
  * checks Compose deployments need. `null` while the startup probe has not
- * finished, or when the CLI is supported.
+ * finished, when the CLI is supported, or when this instance runs no Compose
+ * workloads (a hosted control plane has no Docker to upgrade).
  */
 export function composeHostWarning(
   status: ComposeHostStatusResponse | null | undefined
 ): string | null {
-  if (!status?.probed || (status.available && status.supported)) {
+  if (
+    !status?.applicable ||
+    !status.probed ||
+    (status.available && status.supported)
+  ) {
     return null
   }
   if (status.problem) {

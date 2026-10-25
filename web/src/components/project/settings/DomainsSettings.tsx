@@ -23,6 +23,7 @@ import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindi
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
 import { ProjectDeliverySettings } from '@/components/domains/ProjectDeliverySettings'
 import { deliveryError } from '@/components/domains/delivery-errors'
+import { HostnameTunnelStatus } from '@/components/domains/TunnelHostnames'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -171,6 +172,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
                     Redirects to: {domain.redirect_to} ({domain.status_code})
                   </p>
                 )}
+                <HostnameTunnelStatus hostname={domain.domain} />
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>

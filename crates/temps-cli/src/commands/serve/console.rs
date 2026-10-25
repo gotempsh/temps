@@ -1209,8 +1209,12 @@ fn bootstrap_cloud_enrollment_from_env(
                 // access explicitly from Settings > Temps Cloud or the CLI.
             },
             move || async move {
+                // First-boot input supplied by whoever runs the host: the
+                // instance acting on its own behalf.
                 provision_service
-                    .provision_managed_backups_after_enrollment()
+                    .provision_managed_backups_after_enrollment(
+                        temps_core::BackupScheduleAuthority::InstanceAdmin,
+                    )
                     .await
             },
             move |backup_outcome| async move {
@@ -2813,6 +2817,16 @@ fn ai_read_allowlist() -> Vec<String> {
         "lookup_dns_a_records",
         // Flat vs. wildcard subdomain preview mode for DNS providers.
         "preview_hostname_mode",
+        // ── Ingress tunnels (ADR 058) ──
+        // Tunnels, where they run, which hostnames each publishes and why
+        // one is not published. Connector secrets never leave the service;
+        // the views carry ids, names, states and provider error text only.
+        "list_ingress_providers",
+        "list_ingress_connectors",
+        "get_ingress_connector",
+        "get_ingress_connector_links",
+        "list_ingress_hostnames",
+        "get_ingress_hostname",
         // ── User preferences + cluster metadata ──
         // Notification preferences for the current user — no credentials.
         "get_preferences",
@@ -2988,6 +3002,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "global_log_capabilities",
         "global_log_facets_attrs",
         "global_log_histogram",
+        "log_ingest_budget",
         "list_facets",
         "NodeMetricsGetAlertRules",
         "get_cloud_backfill_status",
@@ -3019,6 +3034,8 @@ fn ai_read_allowlist() -> Vec<String> {
         "admin_get_node",
         "admin_list_node_containers",
         "admin_drain_status",
+        "admin_get_node_public_ingress_settings",
+        "ClusterNetworkGet",
         "NodePairingList",
         "WireguardMeshStatusGet",
         "get_private_ip",
@@ -3093,6 +3110,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "update_automatic_deploy",
         "update_git_settings",
         "reinstall_gitlab_webhook",
+        "reinstall_github_webhook",
         // ── Environment variables (set / change) ──
         "create_environment_variable",
         "update_environment_variable",
@@ -3101,6 +3119,17 @@ fn ai_write_allowlist() -> Vec<String> {
         //    account-global domain create/delete excluded) ──
         "add_environment_domain",
         "delete_environment_domain",
+        // ── Ingress tunnels (ADR 058 D9, D10) ──
+        // Put one hostname through a tunnel (or none), re-sync a tunnel, or
+        // create one for an already managed zone; the human approves each
+        // like every write. Left out on purpose, because one call withdraws
+        // the DNS of every hostname a tunnel carries: deleting it
+        // (`delete_ingress_connector`), emptying its workers
+        // (`set_ingress_connector_nodes`) and switching it to chosen names
+        // only (`update_ingress_connector`). Those stay in the console.
+        "set_ingress_hostname_choice",
+        "sync_ingress_connector",
+        "create_ingress_connector",
         // ── Managed external services (databases, caches, etc.) —
         //    provisioning a new container and linking an existing
         //    one to a project. Both reversible (a service can be
@@ -3272,7 +3301,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "create_notification_route",
         "update_notification_route",
         "delete_notification_route",
-        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; DELETE calls always wait ──
+        // ── Coverage audit: reversible configuration and lifecycle, proposed for approval; deletions always wait ──
         // Project source and deployment settings
         "set_alternate_sources",
         "change_project_source",
@@ -3296,6 +3325,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "DeploymentMetricsToggle",
         "ExternalServiceMetricsCreateAlertRule",
         "ExternalServiceMetricsUpdateAlertRule",
+        "NodeMetricsCreateAlertRule",
         "NodeMetricsUpdateAlertRule",
         "kv_enable",
         "kv_update",
@@ -3874,6 +3904,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering FlagsPlugin");
     let flags_plugin = Box::new(FlagsPlugin::new());
     plugin_manager.register_plugin(flags_plugin);
+
+    // 5.4. IngressPlugin - ingress connectors such as Cloudflare Tunnel
+    // (ADR 058; depends on the DNS plugin and the shared route table)
+    debug!("Registering IngressPlugin");
+    plugin_manager.register_plugin(Box::new(temps_ingress::IngressPlugin::new()));
 
     // 5.5. EnvironmentsPlugin - provides environment management (depends on config)
     debug!("Registering EnvironmentsPlugin");
@@ -4892,6 +4927,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
+        metrics_store: service_context.get_service::<dyn temps_metrics::MetricsStore>(),
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
@@ -5052,6 +5088,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);
+    // Node-token endpoints for ingress connectors (ADR 058): the agent pulls
+    // what to run and reports how it is doing.
+    let ingress_node_routes =
+        temps_ingress::node_routes(Arc::new(temps_ingress::IngressNodeState {
+            db: db.clone(),
+            service: plugin_manager
+                .service_context()
+                .require_service::<temps_ingress::IngressConnectorService>(),
+        }));
 
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
@@ -5186,7 +5231,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     // Agent-facing node + route-sync routes are public (workers anywhere on
     // the internet POST to them with bearer tokens).
-    let public_router = split.public.merge(node_routes).merge(route_sync_routes);
+    let public_router = split
+        .public
+        .merge(node_routes)
+        .merge(route_sync_routes)
+        .merge(ingress_node_routes);
 
     // Use the caller-supplied admin-gate when present (so the proxy and the
     // console share one source of truth) and otherwise build a fresh one.
@@ -6748,6 +6797,7 @@ mod ai_tool_allowlist_tests {
             "update_environment_settings",
             "update_git_settings",
             "reinstall_gitlab_webhook",
+            "reinstall_github_webhook",
         ] {
             assert!(
                 writes.contains(operation),

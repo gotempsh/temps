@@ -3,8 +3,15 @@
 
 //! Database connection management
 
-use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
+use crate::schema_guard::SchemaStatus;
+use sea_orm::sea_query::Query;
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbErr, Statement,
+    TransactionTrait,
+};
+use sea_orm_migration::{seaql_migrations, MigrationTrait, SchemaManager};
 use sqlx::Acquire;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::{ServiceError, ServiceResult};
@@ -619,38 +626,91 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
     Ok(())
 }
 
-/// Run the schema guard and surface a refusal as a [`ServiceError`] whose
-/// message carries the guard's full explanation and remediation.
-async fn ensure_schema_compatible(db: &DbConnection) -> ServiceResult<()> {
+/// Run the schema guard, surfacing an unreadable ledger as a [`ServiceError`].
+///
+/// A database migrated by a newer release is NOT an error: the guard logs a
+/// warning and returns [`SchemaStatus::NewerThanBinary`] so callers can keep
+/// Sea-ORM's migrator (which rejects unknown ledger entries) out of the way.
+async fn ensure_schema_compatible(db: &DbConnection) -> ServiceResult<SchemaStatus> {
     crate::schema_guard::check_schema_compatibility(db)
         .await
-        .map(|_| ())
         .map_err(|error| match error {
-            crate::schema_guard::SchemaGuardError::DatabaseNewerThanBinary { .. } => {
-                ServiceError::Configuration {
-                    message: error.to_string(),
-                }
-            }
             crate::schema_guard::SchemaGuardError::ReadLedger { .. } => {
                 ServiceError::Database(error.to_string())
             }
         })
 }
 
+/// This binary's migrations named in `pending`, in apply order.
+fn migrations_named(pending: &[String]) -> Vec<Box<dyn MigrationTrait>> {
+    let wanted: HashSet<&str> = pending.iter().map(String::as_str).collect();
+    Migrator::migrations()
+        .into_iter()
+        .filter(|migration| wanted.contains(migration.name()))
+        .collect()
+}
+
+/// Apply one migration and record it in `seaql_migrations`, in a single
+/// transaction — the same steps Sea-ORM's `Migrator::up` performs per
+/// migration on PostgreSQL.
+///
+/// Used only when the ledger holds migrations this binary does not define
+/// ([`SchemaStatus::NewerThanBinary`]): `Migrator::up` and
+/// `Migrator::get_pending_migrations` fail outright on such a ledger
+/// ("Migration file of version '…' is missing"), which would turn the guard's
+/// warning back into a refused start. The unknown migrations are never rolled
+/// back — this binary has no `down()` for them.
+async fn apply_migration_on_newer_schema(
+    db: &DbConnection,
+    migration: &dyn MigrationTrait,
+) -> Result<(), DbErr> {
+    let applied_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| {
+            DbErr::Custom(format!(
+                "Cannot record migration {}: system clock is before the UNIX epoch: {error}",
+                migration.name()
+            ))
+        })?
+        .as_secs() as i64;
+    let record = Query::insert()
+        .into_table(Migrator::migration_table_name())
+        .columns([
+            seaql_migrations::Column::Version,
+            seaql_migrations::Column::AppliedAt,
+        ])
+        .values([migration.name().into(), applied_at.into()])
+        .map_err(|error| {
+            DbErr::Custom(format!(
+                "Cannot build the ledger row for migration {}: {error}",
+                migration.name()
+            ))
+        })?
+        .to_owned();
+
+    let txn = db.begin().await?;
+    migration.up(&SchemaManager::new(&txn)).await?;
+    txn.execute(txn.get_database_backend().build(&record))
+        .await?;
+    txn.commit().await
+}
+
 /// Apply all pending migrations.
 ///
 /// Uses Sea-ORM's `Migrator::up`, which applies only migrations present in this
 /// binary that are NOT yet recorded in `seaql_migrations`. Before that, the
-/// schema guard ([`crate::schema_guard::check_schema_compatibility`]) refuses a
-/// database that has applied migrations this binary does not define — i.e. one
-/// migrated by a newer release — with an error naming them and the
-/// remediation, instead of letting an older binary run against a newer schema.
+/// schema guard ([`crate::schema_guard::check_schema_compatibility`]) checks
+/// for applied migrations this binary does not define — i.e. a database
+/// migrated by a newer release, typically after a binary-only rollback. That
+/// is logged as a warning and startup continues: the unknown migrations are
+/// left applied and only this binary's own missing migrations (normally none)
+/// are applied, without `Migrator::up`, which would reject the ledger.
 ///
 /// A short session `lock_timeout` is set first so a migration blocked on a
 /// contended lock fails fast (and the operator retries) rather than burning the
 /// entire `MIGRATION_TIMEOUT` budget waiting behind live traffic.
 pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
-    ensure_schema_compatible(db).await?;
+    let status = ensure_schema_compatible(db).await?;
 
     // Fail fast on contended locks rather than hanging the whole budget.
     // Best-effort — non-fatal on setups that reject it.
@@ -665,6 +725,25 @@ pub async fn run_migrations(db: &DbConnection) -> ServiceResult<()> {
             "Could not set lock_timeout for migrations (non-fatal): {}",
             e
         );
+    }
+
+    if matches!(status, SchemaStatus::NewerThanBinary { .. }) {
+        // Sea-ORM's `Migrator::up` rejects a ledger with unknown entries; the
+        // streaming runner applies this binary's own missing migrations (if
+        // any) without it.
+        let report = run_migrations_streaming(db, |_| {}).await?;
+        return match report.failed() {
+            None => Ok(()),
+            Some(failed) => Err(ServiceError::Database(format!(
+                "Failed to apply migration {} on a database migrated by a newer Temps \
+                 release: {}",
+                failed.name,
+                failed
+                    .error
+                    .as_deref()
+                    .unwrap_or("no error detail reported")
+            ))),
+        };
     }
 
     match timeout(MIGRATION_TIMEOUT, Migrator::up(db, None)).await {
@@ -764,8 +843,9 @@ pub async fn run_migrations_streaming<F>(
 where
     F: FnMut(MigrationProgress<'_>),
 {
-    // Refuse a database migrated by a newer release before touching anything.
-    ensure_schema_compatible(db).await?;
+    // Classify the ledger before touching anything. A database migrated by a
+    // newer release is warned about and handled without `Migrator::up`.
+    let status = ensure_schema_compatible(db).await?;
 
     // Fail fast on contended locks rather than hanging (mirrors run_migrations).
     if let Err(e) = db
@@ -782,21 +862,37 @@ where
     }
 
     // 1. Read the plan: which migrations are pending, in apply order.
-    let pending = Migrator::get_pending_migrations(db)
-        .await
-        .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
+    let newer_schema = matches!(status, SchemaStatus::NewerThanBinary { .. });
+    let pending_names = if newer_schema {
+        status.pending().to_vec()
+    } else {
+        Migrator::get_pending_migrations(db)
+            .await
+            .map_err(|e| {
+                ServiceError::Database(format!("Failed to read pending migrations: {}", e))
+            })?
+            .iter()
+            .map(|migration| migration.name().to_string())
+            .collect()
+    };
+    // Only the newer-schema path applies migrations itself, so only it needs
+    // the migration objects; `Migrator::up(db, Some(1))` finds its own.
+    let newer_schema_migrations = if newer_schema {
+        migrations_named(&pending_names)
+    } else {
+        Vec::new()
+    };
 
-    let total = pending.len();
+    let total = pending_names.len();
     let mut report = MigrationRunReport {
-        planned: pending.iter().map(|m| m.name().to_string()).collect(),
+        planned: pending_names.clone(),
         results: Vec::with_capacity(total),
     };
 
     // 2. Apply each pending migration individually so we can time and report it.
     //    `Migrator::up(db, Some(1))` applies exactly the next pending migration.
-    for (i, migration) in pending.iter().enumerate() {
+    for (i, name) in pending_names.into_iter().enumerate() {
         let index = i + 1;
-        let name = migration.name().to_string();
 
         // Announce the migration BEFORE running it: this is the one that might
         // sit for a while on a large table, so the operator needs to see it now.
@@ -807,7 +903,21 @@ where
         });
 
         let started = std::time::Instant::now();
-        let outcome = match timeout(MIGRATION_TIMEOUT, Migrator::up(db, Some(1))).await {
+        let apply = async {
+            if !newer_schema {
+                return Migrator::up(db, Some(1)).await;
+            }
+            match newer_schema_migrations
+                .iter()
+                .find(|migration| migration.name() == name)
+            {
+                Some(migration) => apply_migration_on_newer_schema(db, migration.as_ref()).await,
+                None => Err(DbErr::Custom(format!(
+                    "Migration {name} is not defined in this binary"
+                ))),
+            }
+        };
+        let outcome = match timeout(MIGRATION_TIMEOUT, apply).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("{}", e)),
             Err(_) => Err(format!("timed out after {}s", MIGRATION_TIMEOUT.as_secs())),
@@ -861,7 +971,10 @@ pub async fn run_migrations_reported(db: &DbConnection) -> ServiceResult<Migrati
 /// would run before the operator commits. This is read-only: it never mutates
 /// the schema or the migration ledger.
 pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec<String>> {
-    ensure_schema_compatible(db).await?;
+    let status = ensure_schema_compatible(db).await?;
+    if let SchemaStatus::NewerThanBinary { pending, .. } = status {
+        return Ok(pending);
+    }
     let pending = Migrator::get_pending_migrations(db)
         .await
         .map_err(|e| ServiceError::Database(format!("Failed to read pending migrations: {}", e)))?;
@@ -983,6 +1096,132 @@ impl ReferenceIndex {
     }
 }
 
+/// Attempts at building one index before its failure is reported.
+const INDEX_BUILD_ATTEMPTS: u32 = 4;
+
+/// Pause before the first retry of an index build; each later retry waits
+/// twice as long as the one before.
+const INDEX_BUILD_RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// Whether PostgreSQL reported a failure that a rebuild can get past.
+///
+/// A concurrent build waits for every transaction that could still see the
+/// table without the new index, and PostgreSQL ends that wait with
+/// `deadlock_detected` (40P01) when two sessions would otherwise wait on each
+/// other forever, or `lock_not_available` (55P03) when the maintenance
+/// connection's lock timeout runs out. Neither says anything about the index
+/// or the data: the other session simply finished a moment later, so the same
+/// statement succeeds on the next attempt. Anything else (a missing column, a
+/// full disk, a cancelled statement) will fail again and is reported at once.
+fn is_transient_index_build_sqlstate(code: &str) -> bool {
+    matches!(code, "40P01" | "55P03")
+}
+
+fn is_transient_index_build_error(error: &sqlx::Error) -> bool {
+    error
+        .as_database_error()
+        .and_then(|database_error| database_error.code())
+        .is_some_and(|code| is_transient_index_build_sqlstate(&code))
+}
+
+/// How long to wait before the next attempt after `failed_attempts` failures
+/// (1-based), or `None` when the failure must be reported: it is not
+/// transient, or the attempts are used up.
+fn index_build_retry_delay(failed_attempts: u32, transient: bool) -> Option<Duration> {
+    if !transient || failed_attempts >= INDEX_BUILD_ATTEMPTS {
+        return None;
+    }
+    Some(INDEX_BUILD_RETRY_DELAY * 2u32.pow(failed_attempts.saturating_sub(1)))
+}
+
+/// Why one attempt at building an index failed.
+struct IndexAttemptError {
+    /// What failed, naming the index, ready to appear in a report.
+    message: String,
+    transient: bool,
+}
+
+/// One attempt at building `name`: clear the invalid leftover of an earlier
+/// failed build, then create it.
+///
+/// The cleanup is part of the attempt, not a one-off beforehand. A concurrent
+/// build that fails midway leaves an invalid index behind, and `IF NOT
+/// EXISTS` would treat that leftover as the finished index and succeed
+/// without building anything.
+async fn build_index_once(
+    connection: &mut sqlx::PgConnection,
+    name: &str,
+    target: &str,
+    create_sql: &str,
+    drop_invalid_sql: &str,
+) -> Result<(), IndexAttemptError> {
+    let failed = |step: String, error: sqlx::Error| IndexAttemptError {
+        message: format!("{name} {step}: {error}"),
+        transient: is_transient_index_build_error(&error),
+    };
+
+    let is_valid = sqlx::query_scalar::<_, bool>(
+        "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
+    )
+    .bind(name)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|error| failed("(inspecting it)".to_string(), error))?;
+    if is_valid == Some(false) {
+        sqlx::query(drop_invalid_sql)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| failed("(removing an invalid earlier build)".to_string(), error))?;
+    }
+
+    sqlx::query(create_sql)
+        .execute(&mut *connection)
+        .await
+        .map_err(|error| failed(format!("on {target}"), error))?;
+    Ok(())
+}
+
+/// Build `name`, retrying the failures [`is_transient_index_build_sqlstate`]
+/// recognises up to [`INDEX_BUILD_ATTEMPTS`] times in total.
+///
+/// The error is the text to report: the last attempt's failure, with the
+/// attempt count when more than one was made.
+async fn build_index_with_retry(
+    connection: &mut sqlx::PgConnection,
+    name: &str,
+    target: &str,
+    create_sql: &str,
+    drop_invalid_sql: &str,
+) -> Result<(), String> {
+    let mut failed_attempts: u32 = 0;
+    loop {
+        let failure =
+            match build_index_once(&mut *connection, name, target, create_sql, drop_invalid_sql)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(failure) => failure,
+            };
+        failed_attempts += 1;
+        let Some(delay) = index_build_retry_delay(failed_attempts, failure.transient) else {
+            return Err(if failed_attempts > 1 {
+                format!("{} (after {failed_attempts} attempts)", failure.message)
+            } else {
+                failure.message
+            });
+        };
+        tracing::warn!(
+            index = name,
+            attempt = failed_attempts,
+            max_attempts = INDEX_BUILD_ATTEMPTS,
+            retry_in_ms = delay.as_millis() as u64,
+            "Concurrent build of index {name} hit a transient failure and will be retried: {}",
+            failure.message
+        );
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Build every [`REFERENCE_INDEXES`] entry whose column exists, on the
 /// maintenance connection. Each index is attempted even if an earlier one
 /// failed; the failures are reported together so the caller retries the set
@@ -1018,46 +1257,23 @@ where
             }
         }
 
-        let invalid = sqlx::query_scalar::<_, bool>(
-            "SELECT indisvalid FROM pg_index WHERE indexrelid = to_regclass($1)",
-        )
-        .bind(index.name)
-        .fetch_optional(&mut *connection)
-        .await;
-        match invalid {
-            Ok(Some(false)) => {
-                if let Err(error) = sqlx::query(&index.drop_invalid_sql())
-                    .execute(&mut *connection)
-                    .await
-                {
-                    failures.push(format!(
-                        "{} (removing an invalid earlier build): {error}",
-                        index.name
-                    ));
-                    continue;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                failures.push(format!("{} (inspecting it): {error}", index.name));
-                continue;
-            }
-        }
-
         on_progress(MaintenanceProgress::IndexStarted { name: index.name });
         let started = std::time::Instant::now();
-        match sqlx::query(&index.create_sql())
-            .execute(&mut *connection)
-            .await
+        let target = format!("{}({})", index.table, index.column);
+        match build_index_with_retry(
+            &mut *connection,
+            index.name,
+            &target,
+            &index.create_sql(),
+            &index.drop_invalid_sql(),
+        )
+        .await
         {
-            Ok(_) => on_progress(MaintenanceProgress::IndexFinished {
+            Ok(()) => on_progress(MaintenanceProgress::IndexFinished {
                 name: index.name,
                 elapsed: started.elapsed(),
             }),
-            Err(error) => failures.push(format!(
-                "{} on {}({}): {error}",
-                index.name, index.table, index.column
-            )),
+            Err(message) => failures.push(message),
         }
     }
     if failures.is_empty() {
@@ -1182,52 +1398,26 @@ where
     }
 
     let maintenance_result: ServiceResult<()> = async {
-        let index_is_valid = sqlx::query_scalar::<_, bool>(
-            "SELECT index.indisvalid \
-             FROM pg_index AS index \
-             WHERE index.indexrelid = \
-                 to_regclass('idx_audit_logs_permission_denied_retention')",
-        )
-        .fetch_optional(&mut *connection)
-        .await
-        .map_err(|error| {
-            ServiceError::Database(format!(
-                "Failed to inspect permission-denied retention index: {error}"
-            ))
-        })?;
-
-        // A cancelled/failed concurrent build leaves an invalid index behind.
-        // `IF NOT EXISTS` would otherwise accept it forever and prevent retries.
-        if index_is_valid == Some(false) {
-            sqlx::query(
-                "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
-            )
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| {
-                ServiceError::Database(format!(
-                    "Failed to remove invalid permission-denied retention index: {error}"
-                ))
-            })?;
-        }
-
         on_progress(MaintenanceProgress::IndexStarted {
             name: PERMISSION_DENIED_RETENTION_INDEX,
         });
         let started = std::time::Instant::now();
 
-        sqlx::query(
+        build_index_with_retry(
+            &mut connection,
+            PERMISSION_DENIED_RETENTION_INDEX,
+            "audit_logs (audit_date, id)",
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
                  idx_audit_logs_permission_denied_retention \
              ON audit_logs (audit_date ASC, id ASC) \
              WHERE operation_type = 'PERMISSION_DENIED'",
+            "DROP INDEX CONCURRENTLY IF EXISTS idx_audit_logs_permission_denied_retention",
         )
-        .execute(&mut *connection)
         .await
-        .map_err(|error| {
+        .map_err(|reason| {
             ServiceError::Database(format!(
                 "Failed to build concurrent permission-denied retention index \
-                 '{PERMISSION_DENIED_RETENTION_INDEX}': {error}"
+                 '{PERMISSION_DENIED_RETENTION_INDEX}': {reason}"
             ))
         })?;
 
@@ -1974,6 +2164,26 @@ mod tests {
         }
     }
 
+    /// Keep a second tracing dispatcher registered for the life of the test
+    /// process, so a scoped subscriber is never the only one.
+    ///
+    /// While exactly one dispatcher is registered, `tracing-core` computes the
+    /// "interest" of a callsite that registers for the first time from the
+    /// *calling thread's* default subscriber, and caches the answer for every
+    /// thread. The tests in this crate run in parallel: when another test's
+    /// first query registers sqlx's `sqlx::query` callsites on a thread with
+    /// no subscriber, the cached answer is "never", and the capture below
+    /// then records nothing at all, not even the slow-statement warning. With a
+    /// second dispatcher registered, `tracing-core` combines every registered
+    /// dispatcher instead, and each event is checked against the subscriber of
+    /// the thread that emits it.
+    fn keep_dispatchers_from_being_alone() {
+        static SECOND_DISPATCHER: std::sync::OnceLock<tracing::Dispatch> =
+            std::sync::OnceLock::new();
+        SECOND_DISPATCHER
+            .get_or_init(|| tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default()));
+    }
+
     /// Runs `queries` over a `connect_options` connection with a subscriber
     /// using `filter`, returning everything it logged.
     async fn capture_sql_logs(
@@ -1981,6 +2191,7 @@ mod tests {
         filter: &str,
         queries: &[&str],
     ) -> anyhow::Result<String> {
+        keep_dispatchers_from_being_alone();
         let buffer = LogBuffer::default();
         let writer = buffer.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2235,5 +2446,66 @@ mod tests {
             })?;
 
         Ok(())
+    }
+
+    #[test]
+    fn only_deadlocks_and_lock_timeouts_are_transient_index_build_failures() {
+        assert!(
+            is_transient_index_build_sqlstate("40P01"),
+            "deadlock_detected"
+        );
+        assert!(
+            is_transient_index_build_sqlstate("55P03"),
+            "lock_not_available"
+        );
+
+        for permanent in [
+            "57014", // query_canceled: an operator or statement timeout stopped it
+            "42703", // undefined_column
+            "42P07", // duplicate_table
+            "53100", // disk_full
+            "23505", // unique_violation
+            "",
+        ] {
+            assert!(
+                !is_transient_index_build_sqlstate(permanent),
+                "SQLSTATE '{permanent}' will fail again and must not be retried"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_without_a_database_code_are_not_transient() {
+        assert!(!is_transient_index_build_error(&sqlx::Error::PoolTimedOut));
+        assert!(!is_transient_index_build_error(&sqlx::Error::RowNotFound));
+    }
+
+    #[test]
+    fn index_build_retries_back_off_and_stop_after_the_attempt_budget() {
+        assert_eq!(
+            index_build_retry_delay(1, true),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            index_build_retry_delay(2, true),
+            Some(Duration::from_millis(1000))
+        );
+        assert_eq!(
+            index_build_retry_delay(3, true),
+            Some(Duration::from_millis(2000))
+        );
+        assert_eq!(
+            index_build_retry_delay(INDEX_BUILD_ATTEMPTS, true),
+            None,
+            "the last attempt's failure is reported, not retried"
+        );
+        assert_eq!(index_build_retry_delay(u32::MAX, true), None);
+    }
+
+    #[test]
+    fn a_permanent_index_build_failure_is_never_retried() {
+        for failed_attempts in 1..=INDEX_BUILD_ATTEMPTS {
+            assert_eq!(index_build_retry_delay(failed_attempts, false), None);
+        }
     }
 }

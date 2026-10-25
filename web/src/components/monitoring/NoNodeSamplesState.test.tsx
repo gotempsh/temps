@@ -36,3 +36,20 @@ test('uses the compact empty state on a single bordered surface', () => {
   expect(html).toContain('min-h-60')
   expect(html).not.toContain('min-h-[400px]')
 })
+
+test('worker wording names the agent heartbeat and leaves out the network the agent does not report', () => {
+  const html = renderToStaticMarkup(
+    <MemoryRouter>
+      <NoNodeSamplesState
+        range="1h"
+        scrapeInterval={30}
+        settingsPath="/settings/metrics-monitoring"
+        nodeKind="worker"
+      />
+    </MemoryRouter>
+  )
+  expect(html).toContain('No worker samples in this window')
+  expect(html).toContain('every heartbeat')
+  expect(html).toContain('temps agent')
+  expect(html).not.toContain('network')
+})

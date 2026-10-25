@@ -153,6 +153,18 @@ TEMPS_DATABASE_URL=postgresql://... temps reset-admin-password
 
 This resets the password of the first user with the admin role, then prints a new generated password and asks you to confirm you saved it. Pass `--password` (or `TEMPS_ADMIN_PASSWORD`) to set a specific password non-interactively.
 
+### An admin lost their authenticator and recovery codes
+
+If another admin can still sign in, they reset the account's MFA from **Settings → Users** with **Reset MFA**. The account then signs in with its password and enrolls again.
+
+If no other admin can sign in, run this on the server:
+
+```bash
+TEMPS_DATABASE_URL=postgresql://... temps reset-admin-password --clear-mfa
+```
+
+On top of the password reset, this removes the admin's TOTP secret and recovery codes and signs out all of their sessions. If `require_mfa_for_admins` is on, it is turned off, because an admin without MFA could not sign in with a password otherwise. Enroll MFA again from the **Account** page, then turn the setting back on.
+
 ### The GeoLite2 database is missing
 
 ```

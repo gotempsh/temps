@@ -140,6 +140,20 @@ impl std::fmt::Display for SandboxBackend {
     }
 }
 
+/// Resource limits a provider applies when a create request leaves them out.
+/// `None` means the provider does not say, so a caller that needs to bound
+/// the effective value cannot assume one.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DefaultResourceLimits {
+    pub cpu_limit: Option<f64>,
+    pub memory_limit_mb: Option<u64>,
+    pub pids_limit: Option<i64>,
+    /// The backend gives a sandbox whole vCPUs (at least one), rounding a
+    /// fractional `cpu_limit` up, so a fractional request runs on more cores
+    /// than it names.
+    pub cpu_whole_cores: bool,
+}
+
 /// A handle to an active sandbox. Opaque to callers — the internal fields
 /// are provider-specific (Docker container ID, Vercel sandbox ID, etc.).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
@@ -1463,6 +1477,14 @@ done
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
         let _ = backend;
         true
+    }
+
+    /// The limits `create` applies to a request that omits them, for the
+    /// given backend (`None` = the host default). Providers that cannot say
+    /// keep the all-`None` default.
+    fn default_resource_limits(&self, backend: Option<SandboxBackend>) -> DefaultResourceLimits {
+        let _ = backend;
+        DefaultResourceLimits::default()
     }
 
     /// Open a bidirectional channel to the sandbox's PTY agent (ADR-008).

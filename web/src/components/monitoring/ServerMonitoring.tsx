@@ -2,16 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * ServerMonitoring — resource usage of the machine running the control plane.
+ * ServerMonitoring — resource usage of one machine: the control plane by
+ * default, or a worker node when `nodeId` is given.
  *
- * Route: /monitoring/server (standalone Server page).
+ * Route: /monitoring/server (standalone Server page, control plane), and
+ * embedded in the worker node detail page (`embedded`, `nodeId`).
  *
  * Six panels, in the shape of the Proxy page: CPU, memory and disk usage
  * (current value + progress bar + history), Docker disk usage (docker system
  * df by images / containers / volumes / build cache), block I/O and network
- * I/O. Everything comes from `GET /nodes/0/metrics*` (the node sampler in
- * the proxy process) and `GET /nodes/0/docker-disk-usage`, through the
- * generated SDK bindings.
+ * I/O. Everything comes from `GET /nodes/{id}/metrics*` (the node sampler in
+ * the proxy process for the control plane, the worker's heartbeats for a
+ * worker) and, for the control plane only, `GET /nodes/0/docker-disk-usage`,
+ * through the generated SDK bindings. A worker records only CPU, memory and
+ * disk, so the panels with no data source are not rendered for it.
  */
 
 import { HelpPopover } from '@temps-sdk/ds'
@@ -61,8 +65,10 @@ import {
   currentDiskPercent,
   formatRateTick,
   hasNoNodeSamples,
+  lastSampleOf,
   isMetricsUnavailable,
   mergeSeries,
+  nodeMetricCapabilities,
   peakOf,
   projectDisk,
   toRatePerSecond,
@@ -103,6 +109,7 @@ function pollInterval(interval: number | false) {
 }
 
 function useNodeSeries(
+  nodeId: number,
   metric: string,
   range: ProxyRangePreset,
   refetchInterval: number | false,
@@ -110,7 +117,7 @@ function useNodeSeries(
 ) {
   return useQuery({
     ...nodeMetricsGetRangeOptions({
-      path: { id: CONTROL_PLANE_NODE_ID },
+      path: { id: nodeId },
       query: { metric, range },
     }),
     staleTime: 15_000,
@@ -121,7 +128,7 @@ function useNodeSeries(
 }
 
 const lastValue = (points: MetricDataPoint[] | undefined) =>
-  points && points.length > 0 ? points[points.length - 1].value : null
+  lastSampleOf(points)?.value ?? null
 
 // ---------------------------------------------------------------------------
 // Presentational pieces
@@ -213,6 +220,16 @@ function UsageCard({
 
 type SeriesDef = ThresholdLineSeries
 
+/** Whether any row holds a value for any of the chart's series. */
+function hasAnySample(
+  data: Record<string, string | number | null>[],
+  series: SeriesDef[]
+): boolean {
+  return data.some((row) =>
+    series.some((s) => typeof row[s.dataKey] === 'number')
+  )
+}
+
 type ChartPanelProps = {
   title: string
   description: string
@@ -259,7 +276,7 @@ function ChartPanel({
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {errorText}
           </div>
-        ) : data.length === 0 ? (
+        ) : !hasAnySample(data, series) ? (
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {emptyText}
           </div>
@@ -271,6 +288,9 @@ function ChartPanel({
             thresholds={thresholds}
             height={220}
             syncId={CHART_SYNC_ID}
+            // Buckets nothing was sampled in are null: break the line there
+            // instead of drawing a straight segment across the downtime.
+            connectNulls={false}
             yTickFormatter={tickFormatter ?? valueFormatter}
             tooltipValueFormatter={valueFormatter}
           />
@@ -445,6 +465,46 @@ function DockerDiskUsageCard() {
 // Section
 // ---------------------------------------------------------------------------
 
+type SubjectCopy = {
+  /** "the control-plane host" / "this worker". */
+  host: string
+  /** Clause completing "This server has no metrics store, so …". */
+  noStoreCause: string
+  /** Panels the section would show, for the unconfigured state. */
+  panelList: string
+  /** Why samples stop, for the silent-sampler alert. */
+  silentCause: string
+  process: string
+  silentCheck: string
+  diskDescription: string
+}
+
+function describeSubject(nodeId: number): SubjectCopy {
+  if (nodeId === CONTROL_PLANE_NODE_ID) {
+    return {
+      host: 'the control-plane host',
+      noStoreCause: 'the proxy process is not sampling this host',
+      panelList:
+        'CPU, memory, disk, Docker disk usage, block I/O and network I/O of the control-plane host',
+      silentCause:
+        'The node sampler runs inside the proxy process and writes one sample on a fixed interval.',
+      process: 'temps serve',
+      silentCheck: '',
+      diskDescription: 'Volume under the Temps data directory',
+    }
+  }
+  return {
+    host: 'this worker',
+    noStoreCause: 'nothing records the CPU, memory and disk its agent reports',
+    panelList: "this worker's CPU, memory and disk",
+    silentCause:
+      'A worker reports CPU, memory and disk with every agent heartbeat, and the control plane stores each one as a sample.',
+    process: 'temps agent',
+    silentCheck: ' on the worker and can reach the control plane',
+    diskDescription: 'Root filesystem (/) of the worker',
+  }
+}
+
 // The shared chart prints a threshold label in the 24px gutter right of the
 // plot, which fits a percentage but not a word; the words go in the card
 // description instead.
@@ -456,18 +516,36 @@ const cpuBands = bandsOf(CPU_THRESHOLDS)
 const memoryBands = bandsOf(MEMORY_THRESHOLDS)
 const diskBands = bandsOf(DISK_THRESHOLDS)
 
-export function ServerMonitoring() {
+export type ServerMonitoringProps = {
+  /** Node to show; the control plane (`0`) when omitted. */
+  nodeId?: number
+  /**
+   * Render inside another page: a section toolbar instead of the page
+   * header, so the host page keeps the only `<h1>`.
+   */
+  embedded?: boolean
+  /** URL search param that carries the window; distinct from the host page's own params. */
+  rangeParamName?: string
+}
+
+export function ServerMonitoring({
+  nodeId = CONTROL_PLANE_NODE_ID,
+  embedded = false,
+  rangeParamName = 'range',
+}: ServerMonitoringProps = {}) {
+  const { ioCounters, dockerUsage } = nodeMetricCapabilities(nodeId)
+  const subject = describeSubject(nodeId)
   // The window lives in the URL (`?range=6h`) so a link opens on the same
   // view and the browser's back button walks the ranges.
   const [searchParams, setSearchParams] = useSearchParams()
-  const rangeParam = searchParams.get('range')
+  const rangeParam = searchParams.get(rangeParamName)
   const range: ProxyRangePreset = isRangePreset(rangeParam) ? rangeParam : '1h'
   const setRange = (next: ProxyRangePreset) =>
     setSearchParams(
       (prev) => {
         const p = new URLSearchParams(prev)
-        if (next === '1h') p.delete('range')
-        else p.set('range', next)
+        if (next === '1h') p.delete(rangeParamName)
+        else p.set(rangeParamName, next)
         return p
       },
       { replace: true }
@@ -488,25 +566,28 @@ export function ServerMonitoring() {
   const canReadNodeMetrics = useIsInstanceAdmin()
 
   const latest = useQuery({
-    ...nodeMetricsGetLatestOptions({ path: { id: CONTROL_PLANE_NODE_ID } }),
+    ...nodeMetricsGetLatestOptions({ path: { id: nodeId } }),
     staleTime: 15_000,
     refetchInterval: pollInterval(refetchInterval),
     retry: false,
     enabled: canReadNodeMetrics,
   })
   const cpu = useNodeSeries(
+    nodeId,
     'node.cpu_percent',
     range,
     refetchInterval,
     canReadNodeMetrics
   )
   const memory = useNodeSeries(
+    nodeId,
     'node.memory_percent',
     range,
     refetchInterval,
     canReadNodeMetrics
   )
   const disk = useNodeSeries(
+    nodeId,
     'node.disk_used_bytes',
     range,
     refetchInterval,
@@ -515,34 +596,39 @@ export function ServerMonitoring() {
   // The projection always reads the longest window: extrapolating a fill
   // date from the last hour turns one image pull into "full in 3 days".
   const diskHistory = useNodeSeries(
+    nodeId,
     'node.disk_used_bytes',
     '7d',
     refetchInterval,
     canReadNodeMetrics
   )
   const rx = useNodeSeries(
+    nodeId,
     'node.network_rx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    canReadNodeMetrics && ioCounters
   )
   const tx = useNodeSeries(
+    nodeId,
     'node.network_tx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    canReadNodeMetrics && ioCounters
   )
   const read = useNodeSeries(
+    nodeId,
     'node.disk_read_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    canReadNodeMetrics && ioCounters
   )
   const write = useNodeSeries(
+    nodeId,
     'node.disk_write_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    canReadNodeMetrics && ioCounters
   )
 
   const snapshot = (latest.data ?? {}) as Record<string, number>
@@ -578,7 +664,9 @@ export function ServerMonitoring() {
         points: diskTotal
           ? disk.data?.map((p) => ({
               time: p.time,
-              value: usagePercent(p.value, diskTotal),
+              // A bucket without a sample stays a gap; usagePercent would
+              // turn the missing reading into 0 %.
+              value: p.value == null ? null : usagePercent(p.value, diskTotal),
             }))
           : undefined,
       },
@@ -600,7 +688,9 @@ export function ServerMonitoring() {
     label
   )
 
-  const lastSampleIso = cpu.data?.[cpu.data.length - 1]?.time
+  // The series carries every bucket of the window, including the trailing
+  // ones nothing was sampled in, so "last sample" is the last non-null one.
+  const lastSampleIso = lastSampleOf(cpu.data)?.time
   // Age at the time the series was fetched (refreshed every 30 s), so render
   // stays pure and the number never drifts between two renders of one fetch.
   const ageSeconds =
@@ -612,7 +702,9 @@ export function ServerMonitoring() {
 
   // Any failed request surfaces at page level with one Retry that refetches
   // everything; the chart it belongs to also says so in place.
-  const queries = [latest, cpu, memory, disk, rx, tx, read, write]
+  const queries = ioCounters
+    ? [latest, cpu, memory, disk, rx, tx, read, write]
+    : [latest, cpu, memory, disk]
   const firstError = queries.find((q) => q.isError)?.error
   const refreshAll = () => {
     for (const q of queries) void q.refetch()
@@ -623,7 +715,9 @@ export function ServerMonitoring() {
   const noSamples =
     !firstError &&
     hasNoNodeSamples({
-      series: [cpu.data, memory.data, disk.data, rx.data, tx.data],
+      series: ioCounters
+        ? [cpu.data, memory.data, disk.data, rx.data, tx.data]
+        : [cpu.data, memory.data, disk.data],
       current: [cpuNow, memPct, diskPct],
     })
 
@@ -634,7 +728,7 @@ export function ServerMonitoring() {
   if (!canReadNodeMetrics) {
     return (
       <div className="space-y-6">
-        <PageHeader title="Server" />
+        {embedded ? null : <PageHeader title="Server" />}
         <NodeMetricsAccessDenied />
       </div>
     )
@@ -650,6 +744,8 @@ export function ServerMonitoring() {
           ageSeconds={null}
           paused={paused}
           onTogglePause={() => setPaused((p) => !p)}
+          embedded={embedded}
+          subject={subject}
         />
         <Card className="shadow-none">
           <CardHeader>
@@ -658,10 +754,9 @@ export function ServerMonitoring() {
               Metric collection is not set up
             </CardTitle>
             <CardDescription>
-              This server has no metrics store, so the proxy process is not
-              sampling this host. With one configured, this page shows CPU,
-              memory, disk, Docker disk usage, block I/O and network I/O of the
-              control-plane host every {formatAge(scrapeInterval)}, keeps{' '}
+              This server has no metrics store, so {subject.noStoreCause}. With
+              one configured, this {embedded ? 'section' : 'page'} shows{' '}
+              {subject.panelList} every {formatAge(scrapeInterval)}, keeps{' '}
               {retentionDays} days of history, and says when the disk will fill.
             </CardDescription>
           </CardHeader>
@@ -687,6 +782,8 @@ export function ServerMonitoring() {
         ageSeconds={ageSeconds}
         paused={paused}
         onTogglePause={() => setPaused((p) => !p)}
+        embedded={embedded}
+        subject={subject}
       />
 
       {firstError && (
@@ -710,10 +807,9 @@ export function ServerMonitoring() {
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>No sample for {formatAge(ageSeconds)}</AlertTitle>
           <AlertDescription>
-            The node sampler runs inside the proxy process and writes one sample
-            every {formatAge(scrapeInterval)}. Check that{' '}
-            <code>temps serve</code> is running and that the metrics store
-            accepts writes. The values below are the last ones that arrived.
+            {subject.silentCause} Check that <code>{subject.process}</code> is
+            running{subject.silentCheck} and that the metrics store accepts
+            writes. The values below are the last ones that arrived.
           </AlertDescription>
         </Alert>
       )}
@@ -723,6 +819,9 @@ export function ServerMonitoring() {
           range={range}
           scrapeInterval={scrapeInterval}
           settingsPath={METRICS_SETTINGS_PATH}
+          nodeKind={
+            nodeId === CONTROL_PLANE_NODE_ID ? 'control-plane' : 'worker'
+          }
         />
       )}
 
@@ -731,7 +830,7 @@ export function ServerMonitoring() {
           <>
             <UsageCard
               title="CPU usage"
-              description="All cores of the control-plane host"
+              description={`All cores of ${subject.host}`}
               percent={cpuNow}
               absolute={null}
               thresholds={CPU_THRESHOLDS}
@@ -761,7 +860,7 @@ export function ServerMonitoring() {
             />
             <UsageCard
               title="Disk space"
-              description="Volume under the Temps data directory"
+              description={subject.diskDescription}
               percent={diskPct}
               absolute={
                 diskUsed != null && diskTotal != null
@@ -779,7 +878,7 @@ export function ServerMonitoring() {
           </>
         )}
         {/* Docker's own `system df` answers without any recorded sample. */}
-        <DockerDiskUsageCard />
+        {dockerUsage && <DockerDiskUsageCard />}
       </div>
 
       {!noSamples && (
@@ -828,36 +927,40 @@ export function ServerMonitoring() {
             emptyText="No disk samples in this window yet"
             footer={bucketCaption}
           />
-          <ChartPanel
-            title="Network I/O"
-            description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
-            series={[
-              { dataKey: 'in', label: 'In', tone: 'primary' },
-              { dataKey: 'out', label: 'Out', tone: 'good' },
-            ]}
-            data={networkData}
-            valueFormatter={formatBytesPerSecond}
-            tickFormatter={formatRateTick}
-            isPending={rx.isPending || tx.isPending}
-            errorText={seriesError(rx) ?? seriesError(tx)}
-            emptyText="No network samples in this window yet"
-            footer={bucketCaption}
-          />
-          <ChartPanel
-            title="Block I/O"
-            description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
-            series={[
-              { dataKey: 'read', label: 'Read', tone: 'primary' },
-              { dataKey: 'write', label: 'Write', tone: 'good' },
-            ]}
-            data={blockIoData}
-            valueFormatter={formatBytesPerSecond}
-            tickFormatter={formatRateTick}
-            isPending={read.isPending || write.isPending}
-            errorText={seriesError(read) ?? seriesError(write)}
-            emptyText="No block I/O samples in this window yet"
-            footer={bucketCaption}
-          />
+          {ioCounters && (
+            <>
+              <ChartPanel
+                title="Network I/O"
+                description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
+                series={[
+                  { dataKey: 'in', label: 'In', tone: 'primary' },
+                  { dataKey: 'out', label: 'Out', tone: 'good' },
+                ]}
+                data={networkData}
+                valueFormatter={formatBytesPerSecond}
+                tickFormatter={formatRateTick}
+                isPending={rx.isPending || tx.isPending}
+                errorText={seriesError(rx) ?? seriesError(tx)}
+                emptyText="No network samples in this window yet"
+                footer={bucketCaption}
+              />
+              <ChartPanel
+                title="Block I/O"
+                description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
+                series={[
+                  { dataKey: 'read', label: 'Read', tone: 'primary' },
+                  { dataKey: 'write', label: 'Write', tone: 'good' },
+                ]}
+                data={blockIoData}
+                valueFormatter={formatBytesPerSecond}
+                tickFormatter={formatRateTick}
+                isPending={read.isPending || write.isPending}
+                errorText={seriesError(read) ?? seriesError(write)}
+                emptyText="No block I/O samples in this window yet"
+                footer={bucketCaption}
+              />
+            </>
+          )}
         </div>
       )}
     </div>
@@ -871,6 +974,8 @@ function SectionIntro({
   ageSeconds,
   paused,
   onTogglePause,
+  embedded,
+  subject,
 }: {
   range: ProxyRangePreset
   onRange: (r: ProxyRangePreset) => void
@@ -878,56 +983,61 @@ function SectionIntro({
   ageSeconds: number | null
   paused: boolean
   onTogglePause: () => void
+  embedded: boolean
+  subject: SubjectCopy
 }) {
-  return (
-    <PageHeader
-      title="Server"
-      actions={
-        <div className="flex min-w-0 flex-wrap items-center gap-1">
-          <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
-            {paused
-              ? 'Updates paused'
-              : ageSeconds != null
-                ? `Updated ${formatAge(ageSeconds)} ago`
-                : 'Waiting for a sample'}
-            <HelpPopover label="About server metrics">
-              <p>
-                Resource usage of the control-plane host. Samples are collected
-                every {formatAge(scrapeInterval)} and refreshed every 30
-                seconds.
-              </p>
-              <p>
-                Hover or focus a chart and use the arrow keys to compare every
-                panel at the same instant.
-              </p>
-            </HelpPopover>
-          </div>
-          <Button
-            variant="outline"
-            size="sm"
-            aria-pressed={paused}
-            onClick={onTogglePause}
-            className="mr-2"
-          >
-            {paused ? (
-              <Play className="mr-1.5 h-3.5 w-3.5" />
-            ) : (
-              <Pause className="mr-1.5 h-3.5 w-3.5" />
-            )}
-            {paused ? 'Resume' : 'Pause'}
-          </Button>
-          {PROXY_RANGE_PRESETS.map((opt) => (
-            <Button
-              key={opt.value}
-              variant={range === opt.value ? 'default' : 'outline'}
-              size="sm"
-              onClick={() => onRange(opt.value)}
-            >
-              {opt.label}
-            </Button>
-          ))}
-        </div>
-      }
-    />
+  const toolbar = (
+    <div className="flex min-w-0 flex-wrap items-center gap-1">
+      <div className="mr-3 flex items-center gap-1 whitespace-nowrap text-xs text-muted-foreground">
+        {paused
+          ? 'Updates paused'
+          : ageSeconds != null
+            ? `Updated ${formatAge(ageSeconds)} ago`
+            : 'Waiting for a sample'}
+        <HelpPopover label="About server metrics">
+          <p>
+            Resource usage of {subject.host}. Samples are collected every{' '}
+            {formatAge(scrapeInterval)} and refreshed every 30 seconds.
+          </p>
+          <p>
+            Hover or focus a chart and use the arrow keys to compare every panel
+            at the same instant.
+          </p>
+        </HelpPopover>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        aria-pressed={paused}
+        onClick={onTogglePause}
+        className="mr-2"
+      >
+        {paused ? (
+          <Play className="mr-1.5 h-3.5 w-3.5" />
+        ) : (
+          <Pause className="mr-1.5 h-3.5 w-3.5" />
+        )}
+        {paused ? 'Resume' : 'Pause'}
+      </Button>
+      {PROXY_RANGE_PRESETS.map((opt) => (
+        <Button
+          key={opt.value}
+          variant={range === opt.value ? 'default' : 'outline'}
+          size="sm"
+          onClick={() => onRange(opt.value)}
+        >
+          {opt.label}
+        </Button>
+      ))}
+    </div>
   )
+  if (embedded) {
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="text-base font-semibold">Resource usage</h2>
+        {toolbar}
+      </div>
+    )
+  }
+  return <PageHeader title="Server" actions={toolbar} />
 }

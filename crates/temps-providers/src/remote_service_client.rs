@@ -255,6 +255,57 @@ impl RemoteServiceClient {
         })
     }
 
+    /// [`Self::new_mtls`] for an agent reached as `endpoint` says: when it
+    /// dials the node's WireGuard mesh address, the agent's certificate is
+    /// verified for `endpoint.server_name` (the node's registered host, which
+    /// is what the leaf names) instead of the dialed address. Roots, client
+    /// identity, chain and expiry checks are unchanged.
+    pub fn new_mtls_at(
+        endpoint: &temps_core::node_address::NodeAgentEndpoint,
+        token: String,
+        node_name: String,
+        identity_pem: &str,
+        cluster_ca_pem: &str,
+    ) -> Result<Self, ExternalServiceError> {
+        let Some(server_name) = endpoint.server_name.as_deref() else {
+            return Self::new_mtls(
+                endpoint.dial_url.clone(),
+                token,
+                node_name,
+                identity_pem,
+                cluster_ca_pem,
+            );
+        };
+        let tls = temps_core::node_pki::node_agent_client_config(
+            identity_pem,
+            cluster_ca_pem,
+            server_name,
+        )
+        .map_err(|e| ExternalServiceError::InternalError {
+            reason: format!(
+                "Failed to build the mesh mTLS configuration for node {} at {}: {}",
+                node_name, endpoint.dial_url, e
+            ),
+        })?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .use_preconfigured_tls(tls)
+            .build()
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Failed to create mesh mTLS client for node {} at {}: {}",
+                    node_name, endpoint.dial_url, e
+                ),
+            })?;
+
+        Ok(Self {
+            agent_url: endpoint.dial_url.clone(),
+            token,
+            node_name,
+            client,
+        })
+    }
+
     /// Create and start a service container on the remote node.
     pub async fn create_service(
         &self,
@@ -841,6 +892,44 @@ mod tests {
         assert!(error
             .to_string()
             .contains("Failed to parse cluster CA certificate for node worker-1"));
+    }
+
+    #[test]
+    fn a_mesh_endpoint_builds_a_client_for_the_mesh_address() {
+        let ca = temps_core::node_pki::generate_cluster_ca().expect("generate test CA");
+        let csr = temps_core::node_pki::generate_node_keypair_csr("temps-control-plane", &[])
+            .expect("generate control-plane identity");
+        let signed =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, &csr.csr_pem, &[])
+                .expect("sign control-plane identity");
+        let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
+        let endpoint = temps_core::node_address::NodeAgentEndpoint {
+            dial_url: "https://10.201.0.5:3100".to_string(),
+            server_name: Some("203.0.113.10".to_string()),
+        };
+
+        let client = RemoteServiceClient::new_mtls_at(
+            &endpoint,
+            "node-token".to_string(),
+            "worker-1".to_string(),
+            &identity_pem,
+            &ca.cert_pem,
+        )
+        .expect("the preconfigured TLS client builds");
+        assert_eq!(client.agent_url, "https://10.201.0.5:3100");
+
+        let error = RemoteServiceClient::new_mtls_at(
+            &endpoint,
+            "node-token".to_string(),
+            "worker-1".to_string(),
+            &identity_pem,
+            "not-a-pem-certificate",
+        )
+        .err()
+        .expect("invalid cluster CA must be rejected");
+        assert!(error
+            .to_string()
+            .contains("worker-1 at https://10.201.0.5:3100"));
     }
 
     #[test]

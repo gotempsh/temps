@@ -40,6 +40,9 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
+    /// A worker's direct-ingress settings and last reachability check.
+    pub node_public_ingress_service:
+        Arc<crate::services::node_public_ingress::NodePublicIngressService>,
     /// Placement policy for this process, used by the node capability
     /// endpoint to answer "can anything run here?" with the same rules the
     /// deploy path applies.
@@ -1010,8 +1013,10 @@ pub struct ContainerMetricHistoryPoint {
     /// Bucket timestamp (ISO 8601 with `Z` suffix).
     #[schema(example = "2025-10-12T12:15:00+00:00")]
     pub time: String,
-    /// Averaged metric value for the bucket.
-    pub value: f64,
+    /// Averaged metric value for the bucket; `null` when the container
+    /// reported no sample in it (it was stopped, or the server was down), so
+    /// charts show a gap instead of interpolating across it.
+    pub value: Option<f64>,
 }
 
 /// One container that has ever run for an environment — current or replaced

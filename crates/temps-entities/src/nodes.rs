@@ -115,6 +115,22 @@ pub struct Model {
     pub public_ingress_route_count: Option<i32>,
     pub public_ingress_unsupported_route_count: Option<i32>,
     pub public_ingress_unsupported_reasons: Json,
+    /// IPv4 ranges this node already uses outside Temps (ADR 056): unicast
+    /// host routes on non-Temps devices and other Docker networks' subnets,
+    /// as `[{"cidr": "...", "owner": "..."}]`. The allocator steers compute
+    /// allocations around them. `None` means never reported (older agent).
+    #[serde(default)]
+    pub occupied_ranges: Option<Json>,
+    /// Cross-node overlay state from the last heartbeat that reported it:
+    /// `ready` or `unavailable`. `None` means never reported.
+    pub overlay_status: Option<String>,
+    /// Why the overlay is unavailable, as reported by the agent (truncated).
+    pub overlay_last_error: Option<String>,
+    /// The allocation this node last reported the overlay ready on. Equal to
+    /// `compute_cidr` means the allocation is in use and locks the pool.
+    pub overlay_ready_cidr: Option<String>,
+    /// The last automatic re-allocation of `compute_cidr` and why.
+    pub overlay_remediation: Option<String>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -158,6 +174,22 @@ impl Model {
             }
             _ => self.private_address.as_str(),
         }
+    }
+
+    /// Where the control plane opens connections to this node's agent API, and
+    /// the name the agent's certificate is verified for. A node whose
+    /// workloads are reached on its mesh address ([`Self::data_address`]) has
+    /// its agent reached there too, once the agent reports it listens on it;
+    /// see `temps_core::node_address::node_agent_endpoint`.
+    pub fn agent_endpoint(&self) -> temps_core::node_address::NodeAgentEndpoint {
+        temps_core::node_address::node_agent_endpoint(
+            &self.address,
+            &self.private_address,
+            self.mesh_wg_address.as_deref(),
+            self.capacity
+                .get(temps_core::node_address::AGENT_MESH_LISTENER_KEY)
+                .and_then(serde_json::Value::as_str),
+        )
     }
 }
 
@@ -226,6 +258,11 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
             created_at: now,
             updated_at: now,
         }
@@ -249,5 +286,27 @@ mod tests {
         );
         // Until it registers on the mesh there is nothing else to use.
         assert_eq!(node("203.0.113.10", None).data_address(), "203.0.113.10");
+    }
+
+    #[test]
+    fn the_agent_follows_the_data_address_once_it_listens_on_the_mesh() {
+        let mut public = node("203.0.113.10", Some("10.201.0.2"));
+        // An agent that has not reported a mesh listener is dialed directly.
+        assert_eq!(
+            public.agent_endpoint().dial_url,
+            "https://203.0.113.10:3100"
+        );
+        public.capacity = serde_json::json!({
+            "cpu_percent": 3.0,
+            temps_core::node_address::AGENT_MESH_LISTENER_KEY: "10.201.0.2:3100",
+        });
+        let endpoint = public.agent_endpoint();
+        assert_eq!(endpoint.dial_url, "https://10.201.0.2:3100");
+        assert_eq!(endpoint.server_name.as_deref(), Some("203.0.113.10"));
+
+        let mut private = node("10.0.0.5", Some("10.201.0.2"));
+        private.address = "https://10.0.0.5:3100".into();
+        private.capacity = public.capacity.clone();
+        assert!(!private.agent_endpoint().via_mesh());
     }
 }

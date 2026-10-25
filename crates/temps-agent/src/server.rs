@@ -154,6 +154,11 @@ pub fn build_router(
                 .layer(axum::extract::DefaultBodyLimit::disable()),
         )
         .route(
+            "/agent/plugins/build",
+            post(crate::plugin_build_handler::build_plugin)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
+        .route(
             "/agent/images/export",
             get(crate::build_handler::export_image),
         )
@@ -421,10 +426,14 @@ fn spawn_heartbeat_loop(
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     platform: SharedPlatform,
     docker: Option<bollard::Docker>,
-    dns_health: crate::network_sync::SharedDnsHealth,
+    health: crate::network_sync::HealthSlots,
     docker_socket_grant: DockerSocketGrant,
-    node_runtime: Option<Arc<temps_workload_node::NodeRuntime>>,
+    wakers: HeartbeatWakers,
 ) {
+    let HeartbeatWakers {
+        mesh_listener,
+        node_runtime,
+    } = wakers;
     let control_plane_url = config.control_plane_url.clone();
     let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
@@ -459,34 +468,54 @@ fn spawn_heartbeat_loop(
         let mut consecutive_failures: u32 = 0;
         let mut inventory_sent = false;
         let mut beats_since_platform_check: u32 = 0;
+        // Occupied ranges the control plane acknowledged last (ADR 056):
+        // they are sent only when they differ.
+        let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
+        let mut capacity_sampler = CapacitySampler::new();
 
         let mut last_beat: Option<tokio::time::Instant> = None;
 
         loop {
-            match &node_runtime {
-                // ADR-055 §7: a changed instance report is sent early
-                // rather than up to 30 s late, but never more often than
-                // once per `EARLY_BEAT_MIN_GAP`.
-                Some(runtime) => {
-                    tokio::select! {
-                        _ = interval.tick() => {}
-                        _ = runtime.reports_changed.notified() => {
-                            if let Some(last) = last_beat {
-                                let gap = last.elapsed();
-                                if gap < EARLY_BEAT_MIN_GAP {
-                                    tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
-                                }
-                            }
+            tokio::select! {
+                _ = interval.tick() => {}
+                // Report a new mesh listener at once: a control plane that
+                // reaches this node only through the mesh dials the
+                // registered address until it hears of it.
+                _ = mesh_listener.changed() => {
+                    tracing::info!(
+                        node_id,
+                        mesh_listener = ?mesh_listener.get(),
+                        "the agent API's mesh listener changed; sending a heartbeat now"
+                    );
+                }
+                // ADR-055 §7: a changed instance report is sent early rather
+                // than up to 30 s late, but never more often than once per
+                // `EARLY_BEAT_MIN_GAP`.
+                _ = instance_reports_changed(node_runtime.as_deref()) => {
+                    if let Some(last) = last_beat {
+                        let gap = last.elapsed();
+                        if gap < EARLY_BEAT_MIN_GAP {
+                            tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
                         }
                     }
-                }
-                None => {
-                    interval.tick().await;
                 }
             }
             last_beat = Some(tokio::time::Instant::now());
 
-            let mut capacity = collect_capacity_metrics();
+            let mut capacity = capacity_sampler.sample().await;
+            // Where the agent API is served on the WireGuard mesh: what lets
+            // the control plane call this node through the mesh (an agent
+            // that never reports it keeps being called at its registered
+            // address).
+            if let (Some(value), Some(fields)) = (
+                mesh_listener.get().heartbeat_value(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(
+                    temps_core::node_address::AGENT_MESH_LISTENER_KEY.to_string(),
+                    value,
+                );
+            }
             // The node runtime's reports: only those that changed since the
             // last accepted beat.
             let instance_reports = match &node_runtime {
@@ -584,7 +613,7 @@ fn spawn_heartbeat_loop(
             // that never gets a compute_cidr allocation and so never
             // touches cluster DNS at all) — omitted from the body in that
             // case, same treatment as `architecture` above.
-            let dns_snapshot = dns_health.read().ok().and_then(|guard| guard.clone());
+            let dns_snapshot = health.dns.read().ok().and_then(|guard| guard.clone());
             if let Some(health) = dns_snapshot {
                 match serde_json::to_value(&health) {
                     Ok(v) => body["dns_resolver"] = v,
@@ -594,6 +623,24 @@ fn spawn_heartbeat_loop(
                         "Failed to serialize DNS resolver health for heartbeat"
                     ),
                 }
+            }
+
+            // Cross-node overlay state and this host's occupied ranges
+            // (ADR 056), published by the network-sync loop. Both omitted
+            // until it ran; the ranges also when unchanged since last sent.
+            let overlay_snapshot = health
+                .overlay
+                .read()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            if let Some(overlay) = &overlay_snapshot.overlay {
+                body["overlay"] = serde_json::json!(overlay);
+            }
+            let occupied_to_send = overlay_snapshot
+                .occupied_ranges
+                .filter(|ranges| occupied_sent.as_ref() != Some(ranges));
+            if let Some(ranges) = &occupied_to_send {
+                body["occupied_ranges"] = serde_json::json!(ranges);
             }
 
             // On the first heartbeat (agent startup/reconnect), include a full
@@ -684,6 +731,9 @@ fn spawn_heartbeat_loop(
                                     "Control plane did not acknowledge the instance reports; resending them next heartbeat"
                                 );
                             }
+                        }
+                        if let Some(ranges) = occupied_to_send.clone() {
+                            occupied_sent = Some(ranges);
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
@@ -803,34 +853,85 @@ pub async fn detect_agent_platform(docker: Option<&bollard::Docker>) -> Option<S
     }
 }
 
-/// Collect system resource metrics for heartbeat capacity data.
-fn collect_capacity_metrics() -> serde_json::Value {
-    use sysinfo::{Disks, System};
+/// Shortest gap between two CPU refreshes that sysinfo reports meaningfully.
+/// Refreshing sooner returns the previous reading (or ~0).
+const CPU_MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
-    let mut sys = System::new();
-    sys.refresh_cpu_all();
-    sys.refresh_memory();
-    let disks = Disks::new_with_refreshed_list();
+/// Samples this host's CPU/memory/disk for the heartbeat `capacity` payload.
+///
+/// What can send a heartbeat ahead of the 30-second interval.
+struct HeartbeatWakers {
+    /// The agent API's mesh listener; a change is reported at once.
+    mesh_listener: crate::mesh_listener::SharedMeshListener,
+    /// The node runtime (ADR-055 §7), when the state stream is enabled; a
+    /// changed instance report is sent early.
+    node_runtime: Option<Arc<temps_workload_node::NodeRuntime>>,
+}
 
-    // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = disks
-        .list()
-        .iter()
-        .find(|d| d.mount_point() == std::path::Path::new("/"))
-        .map(|d| (d.total_space() - d.available_space(), d.total_space()))
-        .unwrap_or((0, 0));
+/// Resolves when the node runtime has a changed instance report to send;
+/// never, when this node has no runtime.
+async fn instance_reports_changed(runtime: Option<&temps_workload_node::NodeRuntime>) {
+    match runtime {
+        Some(runtime) => runtime.reports_changed.notified().await,
+        None => std::future::pending().await,
+    }
+}
 
-    serde_json::json!({
-        "cpu_percent": sys.global_cpu_usage(),
-        "memory_used_bytes": sys.used_memory(),
-        "memory_total_bytes": sys.total_memory(),
-        "disk_used_bytes": disk_used,
-        "disk_total_bytes": disk_total,
-        // ADR-055 §5: the scheduler deducts `system_reserved` (millicores)
-        // from the node's CPU capacity, and an enforcing node counts
-        // reservations against it. Only the core count makes that possible.
-        "cpu_cores": sys.cpus().len(),
-    })
+/// CPU usage is a delta between two refreshes, so the `System` must outlive a
+/// single reading: the previous implementation built a fresh `System` per beat
+/// and refreshed once, which always reported ~0% and made any CPU alert
+/// useless. Holding it across beats makes `cpu_percent` the average load over
+/// the heartbeat interval, which is also the right signal to alert on (a
+/// 30-second mean rather than an instantaneous spike).
+struct CapacitySampler {
+    sys: sysinfo::System,
+    last_cpu_refresh: std::time::Instant,
+}
+
+impl CapacitySampler {
+    fn new() -> Self {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_cpu_all();
+        Self {
+            sys,
+            last_cpu_refresh: std::time::Instant::now(),
+        }
+    }
+
+    /// Collect one reading. Waits out the remainder of
+    /// [`CPU_MIN_REFRESH_INTERVAL`] first, which only ever matters for the
+    /// very first beat (the heartbeat interval is far longer).
+    async fn sample(&mut self) -> serde_json::Value {
+        let since_last = self.last_cpu_refresh.elapsed();
+        if since_last < CPU_MIN_REFRESH_INTERVAL {
+            tokio::time::sleep(CPU_MIN_REFRESH_INTERVAL - since_last).await;
+        }
+        self.sys.refresh_cpu_usage();
+        self.last_cpu_refresh = std::time::Instant::now();
+        self.sys.refresh_memory();
+
+        let disks = sysinfo::Disks::new_with_refreshed_list();
+        // Use only the root mount point to avoid double-counting overlapping mounts
+        let (disk_used, disk_total) = disks
+            .list()
+            .iter()
+            .find(|d| d.mount_point() == std::path::Path::new("/"))
+            .map(|d| (d.total_space() - d.available_space(), d.total_space()))
+            .unwrap_or((0, 0));
+
+        serde_json::json!({
+            "cpu_percent": self.sys.global_cpu_usage(),
+            "memory_used_bytes": self.sys.used_memory(),
+            "memory_total_bytes": self.sys.total_memory(),
+            "disk_used_bytes": disk_used,
+            "disk_total_bytes": disk_total,
+            // ADR-055 §5: the scheduler deducts `system_reserved`
+            // (millicores) from the node's CPU capacity, and an enforcing
+            // node counts reservations against it. Only the core count makes
+            // that possible.
+            "cpu_cores": self.sys.cpus().len(),
+        })
+    }
 }
 
 fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentError> {
@@ -939,11 +1040,19 @@ pub async fn start_agent_server_with(
         platform.clone(),
     );
 
-    // Shared DNS resolver health slot (ADR-024). Written by the network-sync
-    // loop below on every tick, read by the heartbeat loop so the control
-    // plane learns resolver health without an operator SSHing in to read
-    // logs. Lives for the agent's process lifetime, same as `platform`.
-    let dns_health: crate::network_sync::SharedDnsHealth = Arc::new(std::sync::RwLock::new(None));
+    // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
+    // slots. Written by the network-sync loop below on every tick, read by
+    // the heartbeat loop so the control plane learns resolver and overlay
+    // health without an operator SSHing in to read logs. Live for the
+    // agent's process lifetime, same as `platform`.
+    let health = crate::network_sync::HealthSlots::default();
+
+    // This node's mesh address (published by the network-sync loop) and the
+    // address the agent API is served on over the mesh (reported by the
+    // heartbeat). Only an mTLS agent ever serves there; see `mesh_listener`.
+    let (mesh_address_tx, mesh_address_rx) =
+        tokio::sync::watch::channel(crate::mesh_listener::MeshAddress::Unknown);
+    let mesh_listener: crate::mesh_listener::SharedMeshListener = Arc::default();
 
     // The node runtime (ADR-055 §7). Without it, or when it cannot start,
     // the capability is not advertised and the control plane keeps using
@@ -988,9 +1097,12 @@ pub async fn start_agent_server_with(
         container_deployer.clone(),
         platform,
         docker,
-        dns_health.clone(),
+        health.clone(),
         docker_socket_grant,
-        node_runtime,
+        HeartbeatWakers {
+            mesh_listener: mesh_listener.clone(),
+            node_runtime,
+        },
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -1002,9 +1114,10 @@ pub async fn start_agent_server_with(
         &config,
         network.overlay_bridge_address,
         network.overlay_peers,
-        dns_health,
+        health,
         network.host_bind_address,
         container_deployer,
+        mesh_address_tx,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -1043,8 +1156,18 @@ pub async fn start_agent_server_with(
                 cert = %cert.display(),
                 "Agent serving with mutual TLS (control-plane client cert verified against cluster CA)"
             );
-            let server_config = build_tls_server_config(cert, key, ca)?;
-            serve_mtls(listener, router, std::sync::Arc::new(server_config)).await?;
+            let server_config = std::sync::Arc::new(build_tls_server_config(cert, key, ca)?);
+            // The same router, TLS configuration and auth on the mesh
+            // address, for a control plane that reaches this node only
+            // through the mesh. Never for the plaintext branch below.
+            crate::mesh_listener::spawn(
+                router.clone(),
+                server_config.clone(),
+                config.listen_address.clone(),
+                mesh_address_rx,
+                mesh_listener,
+            );
+            serve_mtls(listener, router, server_config).await?;
         }
         (None, None, None) if !config.require_mtls => {
             tracing::warn!(
@@ -1068,7 +1191,7 @@ pub async fn start_agent_server_with(
 /// Build a rustls `ServerConfig` that serves the node's leaf cert and requires
 /// the client (the control plane) to present a certificate chaining to the
 /// cluster CA (ADR-020 WS-2.1).
-fn build_tls_server_config(
+pub(crate) fn build_tls_server_config(
     cert_path: &std::path::Path,
     key_path: &std::path::Path,
     ca_path: &std::path::Path,
@@ -1124,7 +1247,7 @@ fn build_tls_server_config(
 /// axum router over hyper with WebSocket-upgrade support (the agent exposes a
 /// terminal WS route, so `serve_connection_with_upgrades` is required). Mirrors
 /// the pattern in `temps-plugin-sdk/src/runtime.rs`.
-async fn serve_mtls(
+pub(crate) async fn serve_mtls(
     listener: tokio::net::TcpListener,
     router: Router,
     server_config: std::sync::Arc<rustls::ServerConfig>,
@@ -1173,7 +1296,7 @@ async fn serve_mtls(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1194,7 +1317,7 @@ mod tests {
         assert!(!instance_reports_acknowledged(b""));
     }
 
-    fn test_agent_config(require_mtls: bool) -> AgentConfig {
+    pub(crate) fn test_agent_config(require_mtls: bool) -> AgentConfig {
         AgentConfig {
             listen_address: "127.0.0.1:3100".to_string(),
             token: "secret".to_string(),
@@ -1214,6 +1337,7 @@ mod tests {
             public_ingress_http_port: 80,
             public_ingress_https_port: 443,
             public_ingress_private_key: None,
+            ingress: None,
             mesh_key_dir: std::path::PathBuf::from("/tmp/temps-wireguard"),
             wg_endpoint: None,
             control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
@@ -1251,6 +1375,36 @@ mod tests {
         let mut config = test_agent_config(false);
         config.control_plane_url = "http://10.0.0.1:3000".to_string();
         assert!(validate_agent_transport(&config).is_ok());
+    }
+
+    /// The heartbeat feeds CPU alerts, so every field must be present and
+    /// numeric, and CPU must be a valid percentage on every beat -- including
+    /// the first, which previously read a cold sample.
+    #[tokio::test]
+    async fn capacity_sampler_reports_numeric_fields_with_a_valid_cpu_percent() {
+        let mut sampler = CapacitySampler::new();
+
+        for _ in 0..2 {
+            let capacity = sampler.sample().await;
+            for key in [
+                "cpu_percent",
+                "memory_used_bytes",
+                "memory_total_bytes",
+                "disk_used_bytes",
+                "disk_total_bytes",
+            ] {
+                assert!(
+                    capacity.get(key).is_some_and(serde_json::Value::is_number),
+                    "capacity is missing numeric field '{key}': {capacity}"
+                );
+            }
+            let cpu = capacity["cpu_percent"].as_f64().unwrap_or(-1.0);
+            assert!(
+                (0.0..=100.0).contains(&cpu),
+                "cpu_percent out of range: {cpu}"
+            );
+            assert!(capacity["memory_total_bytes"].as_u64().unwrap_or(0) > 0);
+        }
     }
 
     /// With no Docker client we cannot know the daemon's architecture, and

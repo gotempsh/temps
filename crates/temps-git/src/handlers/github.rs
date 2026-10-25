@@ -55,7 +55,18 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/webhook/git/github/events", events())
         .route("/webhook/source/github/events", events())
+        .route(
+            GITHUB_REPO_WEBHOOK_PATH,
+            post(github_repo_webhook_events)
+                .layer(DefaultBodyLimit::max(super::PROVIDER_EVENT_BODY_LIMIT)),
+        )
 }
+
+/// Where a per-project GitHub *repository* webhook delivers (as opposed to a
+/// GitHub App's webhook, which uses `/webhook/git/github/events`). Temps
+/// registers one for each project on a non-App GitHub connection (PAT or
+/// OAuth), signed with that project's own secret.
+pub const GITHUB_REPO_WEBHOOK_PATH: &str = "/webhook/git/github/repo-events";
 
 // ===== Webhook Handlers =====
 
@@ -340,22 +351,11 @@ async fn handle_push_event(
         return;
     }
 
-    let git_ref = push_event.r#ref;
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else {
-        push_event
-            .base_ref
-            .map(|base_ref| base_ref.replace("refs/heads/", ""))
-    };
+    let (branch, tag) = push_target(&push_event.r#ref, push_event.base_ref.as_deref());
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
-
-    // Use git provider manager to handle the push event
+    // A project that also has its own repository webhook (a non-App
+    // connection on a repository where the App is installed) receives this
+    // push twice; deployment creation coalesces deliveries of the same commit.
     if let Err(e) = state
         .git_provider_manager
         .handle_push_event(repo_owner, repo_name, branch, tag, push_event.after.clone())
@@ -366,6 +366,196 @@ async fn handle_push_event(
             e
         );
     }
+}
+
+/// Branch and tag a push targets, from its `ref` and (for a tag pushed from
+/// a branch) its `base_ref`.
+fn push_target(git_ref: &str, base_ref: Option<&str>) -> (Option<String>, Option<String>) {
+    let branch = match git_ref.strip_prefix("refs/heads/") {
+        Some(branch) => Some(branch.to_string()),
+        None => base_ref.map(|base_ref| base_ref.replace("refs/heads/", "")),
+    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_string);
+    (branch, tag)
+}
+
+/// The parts of a GitHub repository webhook delivery Temps acts on. Every
+/// repository webhook event (`ping` included) carries `repository`; only
+/// `push` carries `ref` and `after`.
+#[derive(Deserialize)]
+struct RepoWebhookPayload {
+    repository: Option<RepoWebhookRepository>,
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
+    base_ref: Option<String>,
+    after: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RepoWebhookRepository {
+    name: String,
+    owner: RepoWebhookOwner,
+}
+
+#[derive(Deserialize)]
+struct RepoWebhookOwner {
+    login: String,
+}
+
+/// Receive deliveries from a per-project GitHub repository webhook.
+///
+/// GitHub connections authenticated with a personal access token or OAuth
+/// have no GitHub App, so the App webhook never reports their pushes. Temps
+/// registers a repository webhook for each such project instead, signed with
+/// a secret stored encrypted on the project. A delivery is accepted only for
+/// the projects whose own secret verifies `X-Hub-Signature-256` over the raw
+/// body, and a push deploys only those projects.
+async fn github_repo_webhook_events(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    body: Bytes,
+) -> Result<Json<EventResponse>, Problem> {
+    let event_type = headers
+        .get("X-GitHub-Event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+    let delivery_id = headers
+        .get("X-GitHub-Delivery")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown");
+
+    let invalid_signature = || {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Invalid Webhook Signature")
+            .with_detail(format!(
+                "GitHub repository webhook delivery {delivery_id} is not signed by any Temps project connected to this repository"
+            ))
+    };
+
+    // Reject unsigned deliveries before parsing or touching the database.
+    let Some(signature) = headers
+        .get("X-Hub-Signature-256")
+        .and_then(|v| v.to_str().ok())
+        .filter(|signature| signature.starts_with("sha256="))
+    else {
+        warn!(
+            delivery_id = delivery_id,
+            event_type = event_type,
+            "GitHub repository webhook delivery without a sha256 signature, rejecting"
+        );
+        return Err(invalid_signature());
+    };
+
+    let payload: RepoWebhookPayload = serde_json::from_slice(&body).map_err(|e| {
+        error!(
+            delivery_id = delivery_id,
+            event_type = event_type,
+            "Failed to parse GitHub repository webhook payload: {}",
+            e
+        );
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Webhook Parse Failed")
+            .with_detail(format!(
+                "GitHub repository webhook delivery {delivery_id} ({event_type}) is not a valid payload: {e}"
+            ))
+    })?;
+
+    let Some(repository) = payload.repository else {
+        warn!(
+            delivery_id = delivery_id,
+            event_type = event_type,
+            "GitHub repository webhook delivery names no repository, rejecting"
+        );
+        return Err(invalid_signature());
+    };
+    let owner = repository.owner.login;
+    let repo = repository.name;
+
+    let projects = state
+        .git_provider_manager
+        .github_repo_webhook_projects(&owner, &repo, &body, signature)
+        .await
+        .map_err(|e| {
+            error!(
+                delivery_id = delivery_id,
+                "Failed to look up projects for GitHub repository webhook on {}/{}: {}",
+                owner,
+                repo,
+                e
+            );
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Webhook Processing Failed")
+                .with_detail(format!(
+                    "Failed to look up projects for GitHub repository webhook delivery {delivery_id} on {owner}/{repo}"
+                ))
+        })?;
+
+    if projects.is_empty() {
+        warn!(
+            delivery_id = delivery_id,
+            event_type = event_type,
+            "No project connected to {}/{} signed this GitHub repository webhook delivery",
+            owner,
+            repo
+        );
+        return Err(invalid_signature());
+    }
+
+    let project_ids: Vec<i32> = projects.iter().map(|p| p.id).collect();
+
+    if event_type != "push" {
+        info!(
+            delivery_id = delivery_id,
+            event_type = event_type,
+            "Verified GitHub repository webhook {} event for {}/{} (projects {:?}); nothing to deploy",
+            event_type,
+            owner,
+            repo,
+            project_ids
+        );
+        return Ok(Json(EventResponse {
+            message: format!("{event_type} event received"),
+        }));
+    }
+
+    let (branch, tag) = push_target(
+        payload.git_ref.as_deref().unwrap_or_default(),
+        payload.base_ref.as_deref(),
+    );
+    let commit = payload.after.unwrap_or_default();
+
+    let triggered = state
+        .git_provider_manager
+        .handle_push_event_for_projects(branch, tag, commit, projects)
+        .await
+        .map_err(|e| {
+            error!(
+                delivery_id = delivery_id,
+                "Failed to queue GitHub repository webhook push for {}/{} (projects {:?}): {}",
+                owner,
+                repo,
+                project_ids,
+                e
+            );
+            problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Webhook Processing Failed")
+                .with_detail(format!(
+                    "Failed to queue deployments for GitHub push delivery {delivery_id} on {owner}/{repo}"
+                ))
+        })?;
+
+    info!(
+        delivery_id = delivery_id,
+        "GitHub repository webhook push for {}/{} queued for {} project(s) {:?}",
+        owner,
+        repo,
+        triggered,
+        project_ids
+    );
+
+    Ok(Json(EventResponse {
+        message: format!("Processed {triggered} project(s)"),
+    }))
 }
 
 async fn handle_installation_repositories(
@@ -900,5 +1090,26 @@ mod tests {
             )),
             OperationFailureCode::Timeout
         );
+    }
+
+    #[test]
+    fn push_target_reads_branch_and_tag_refs() {
+        assert_eq!(
+            push_target("refs/heads/main", None),
+            (Some("main".to_string()), None)
+        );
+        assert_eq!(
+            push_target("refs/heads/feature/a-b", None),
+            (Some("feature/a-b".to_string()), None)
+        );
+        assert_eq!(
+            push_target("refs/tags/v1.2.0", Some("refs/heads/main")),
+            (Some("main".to_string()), Some("v1.2.0".to_string()))
+        );
+        assert_eq!(
+            push_target("refs/tags/v1.2.0", None),
+            (None, Some("v1.2.0".to_string()))
+        );
+        assert_eq!(push_target("", None), (None, None));
     }
 }

@@ -495,7 +495,9 @@ function ChartPanel({
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {errorText}
           </div>
-        ) : data.length === 0 ? (
+        ) : !data.some((row) =>
+            series.some((s) => typeof row[s.dataKey] === 'number')
+          ) ? (
           <div className="flex h-[220px] items-center justify-center px-6 text-center text-sm text-muted-foreground">
             {emptyText}
           </div>
@@ -542,7 +544,10 @@ function ChartPanel({
                     dot={false}
                     strokeWidth={2}
                     stroke={s.color}
-                    connectNulls
+                    // Null buckets are "nothing measured" (the proxy was
+                    // down, or the bucket had no timed requests): break the
+                    // line instead of interpolating across them.
+                    connectNulls={false}
                     isAnimationActive={false}
                   />
                 ))}
@@ -607,7 +612,9 @@ function NodeMetricPanel({
         time: p.time,
         label: formatProxyTimeLabel(p.time, window.showDate),
       }
-      row[key] = p.value
+      // Every bucket of the window is returned; one nothing was sampled in
+      // is null and stays a gap (request counters already read 0 there).
+      row[key] = p.value ?? null
       rows.set(p.time, row)
     }
   })
@@ -637,17 +644,22 @@ function bucketChartRows(
   stats: TimeBucketStats[],
   window: ResolvedProxyWindow
 ) {
+  // The endpoint gap-fills idle buckets with 0 for every column. That is
+  // right for the counts, but a latency or error rate of 0 in a bucket with
+  // no requests is invented: leave those null so the lines break instead.
+  const timed = (b: TimeBucketStats, v: number) =>
+    b.latency_count > 0 ? v : null
   return stats.map((b) => ({
     time: b.bucket,
     label: formatProxyTimeLabel(b.bucket, window.showDate),
     request_count: b.request_count,
     error_count: b.error_count,
     error_rate:
-      b.request_count > 0 ? (b.error_count / b.request_count) * 100 : 0,
-    avg_response_time_ms: b.avg_response_time_ms,
-    p50_response_time_ms: b.p50_response_time_ms,
-    p95_response_time_ms: b.p95_response_time_ms,
-    p99_response_time_ms: b.p99_response_time_ms,
+      b.request_count > 0 ? (b.error_count / b.request_count) * 100 : null,
+    avg_response_time_ms: timed(b, b.avg_response_time_ms),
+    p50_response_time_ms: timed(b, b.p50_response_time_ms),
+    p95_response_time_ms: timed(b, b.p95_response_time_ms),
+    p99_response_time_ms: timed(b, b.p99_response_time_ms),
     total_request_bytes: b.total_request_bytes,
     total_response_bytes: b.total_response_bytes,
   }))

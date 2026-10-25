@@ -352,6 +352,14 @@ pub struct ServeCommand {
     #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
 
+    /// `ip:port` workers dial for this control plane's end of the WireGuard
+    /// mesh. Only used when the cluster runs the managed mesh. Defaults to
+    /// `--private-address` on the mesh port; set it when workers reach this
+    /// server through a different IP or a forwarded port (NAT). The mesh
+    /// still listens on its own port. Must be an IP literal, not a hostname.
+    #[arg(long, env = "TEMPS_WG_ENDPOINT", value_parser = parse_wg_endpoint)]
+    pub wg_endpoint: Option<std::net::SocketAddr>,
+
     /// Which halves of the control plane to run in this process.
     ///
     /// `all` (default) runs the proxy (:80/:443) and the console together —
@@ -404,6 +412,13 @@ fn ingress_listener_clash(
     } else {
         None
     }
+}
+
+/// `--wg-endpoint` / `TEMPS_WG_ENDPOINT`: a literal `ip:port` other machines
+/// can dial, held to the rules a node's endpoint is (no hostnames, no
+/// loopback, link-local, multicast or metadata addresses, no port 0).
+fn parse_wg_endpoint(value: &str) -> Result<std::net::SocketAddr, String> {
+    temps_network::mesh::parse_endpoint(value).map_err(|error| error.to_string())
 }
 
 impl ServeCommand {
@@ -678,6 +693,45 @@ impl ServeCommand {
                     .await
                 {
                     tracing::error!("Failed to update private address setting: {}", e);
+                }
+            });
+        }
+
+        // `--wg-endpoint` belongs to the flag: record it, or clear a value an
+        // earlier start recorded, so the mesh setup (deployer plugin and
+        // `temps network setup-multi-node`) publishes exactly what this
+        // process was started with. Written only when it changes.
+        {
+            let wg_endpoint = self.wg_endpoint.map(|endpoint| endpoint.to_string());
+            if let Some(ref endpoint) = wg_endpoint {
+                info!(
+                    wg_endpoint = %endpoint,
+                    "Advertising this WireGuard endpoint to workers"
+                );
+            }
+            let config_service = temps_config::ConfigService::new(serve_config.clone(), db.clone());
+            rt.block_on(async move {
+                match config_service.get_settings().await {
+                    Ok(settings) if settings.multi_node.wg_endpoint == wg_endpoint => {}
+                    Ok(_) => {
+                        if let Err(e) = config_service
+                            .update_setting_field(|settings| {
+                                settings.multi_node.wg_endpoint = wg_endpoint;
+                            })
+                            .await
+                        {
+                            tracing::error!(
+                                "Failed to record the --wg-endpoint setting: {}; workers keep \
+                                 the previously published WireGuard endpoint",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "Failed to read settings to record --wg-endpoint: {}; workers keep the \
+                         previously published WireGuard endpoint",
+                        e
+                    ),
                 }
             });
         }
@@ -1544,6 +1598,64 @@ mod serve_profile_tests {
         );
         // The retired no-op flag stays CLI-only.
         assert_eq!(env_of("skip_pre_migration_backup"), None);
+    }
+
+    #[test]
+    fn wg_endpoint_reads_the_flag_or_its_env_var() {
+        assert_eq!(
+            parse_with_env("wge_unset", &[], &[])
+                .expect("parses")
+                .wg_endpoint,
+            None
+        );
+        assert_eq!(
+            parse_with_env("wge_flag", &[], &["--wg-endpoint", "157.180.96.48:20517"])
+                .expect("parses")
+                .wg_endpoint,
+            Some("157.180.96.48:20517".parse().unwrap())
+        );
+        assert_eq!(
+            parse_with_env("wge_env", &[("wg_endpoint", "203.0.113.7:4000")], &[])
+                .expect("parses")
+                .wg_endpoint,
+            Some("203.0.113.7:4000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn wg_endpoint_rejects_hostnames_and_undialable_addresses() {
+        let error = match parse_with_env(
+            "wge_host",
+            &[],
+            &["--wg-endpoint", "plane.example.com:20517"],
+        ) {
+            Ok(_) => panic!("a hostname must be refused"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("a hostname is not accepted"), "{error}");
+        for bad in [
+            "157.180.96.48",
+            "127.0.0.1:20517",
+            "0.0.0.0:51820",
+            "157.180.96.48:0",
+        ] {
+            assert!(
+                parse_with_env("wge_bad", &[], &["--wg-endpoint", bad]).is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn wg_endpoint_env_var_mirrors_the_agent() {
+        use clap::CommandFactory;
+        let command = TestCli::command();
+        let env = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "wg_endpoint")
+            .and_then(|arg| arg.get_env())
+            .map(|name| name.to_string_lossy().into_owned());
+        assert_eq!(env.as_deref(), Some("TEMPS_WG_ENDPOINT"));
     }
 
     #[test]

@@ -1639,6 +1639,18 @@ impl SandboxProvider for MicrosandboxSandboxProvider {
         backend == SandboxBackend::Microsandbox
     }
 
+    fn default_resource_limits(
+        &self,
+        _backend: Option<SandboxBackend>,
+    ) -> crate::sandbox::DefaultResourceLimits {
+        crate::sandbox::DefaultResourceLimits {
+            cpu_limit: Some(f64::from(self.config.default_vcpus)),
+            memory_limit_mb: Some(u64::from(self.config.default_memory_mib)),
+            pids_limit: None,
+            cpu_whole_cores: true,
+        }
+    }
+
     fn name(&self) -> &str {
         PROVIDER_NAME
     }

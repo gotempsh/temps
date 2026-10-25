@@ -935,7 +935,9 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
               Loading…
             </div>
-          ) : chartData.length === 0 ? (
+          ) : !chartData.some((p) => p.value != null) ? (
+            // Every bucket is returned; `null` ones are gaps the line breaks
+            // at, so "no data" means no bucket holds a sample.
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
               No data for this range
             </div>

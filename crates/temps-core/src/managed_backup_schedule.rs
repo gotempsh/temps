@@ -71,8 +71,52 @@ pub struct ReleasedManagedBackupSchedules {
     pub disabled: Vec<i32>,
 }
 
+/// Who is asking for a backup schedule whose reach is the whole instance.
+///
+/// A schedule that targets every external service or includes the control
+/// plane dumps Temps's own database -- every project's configuration and
+/// every encrypted secret -- so creating, retargeting or deleting one is an
+/// instance-administrator decision, whatever permissions the caller's role or
+/// API key otherwise holds. Handlers derive this from
+/// `AuthContext::is_instance_admin()`; the service layers that own such
+/// schedules take it as a parameter and refuse `Scoped`, so a future caller
+/// that skips the handler check still cannot provision one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupScheduleAuthority {
+    /// An Admin or PlatformAdmin principal, or the instance acting on its own
+    /// behalf with no request principal (unattended first-boot enrollment,
+    /// credential rotation, releasing schedules before a credential is
+    /// revoked).
+    InstanceAdmin,
+    /// Any other principal, including a `Role::Custom` user or API key that
+    /// holds `settings:write` and `backups:write`, and every deployment token.
+    /// May manage project-scoped schedules only.
+    Scoped,
+}
+
+impl BackupScheduleAuthority {
+    /// The authority of a request principal, from whether it runs the
+    /// instance (`AuthContext::is_instance_admin()`).
+    pub fn from_instance_admin(is_instance_admin: bool) -> Self {
+        if is_instance_admin {
+            Self::InstanceAdmin
+        } else {
+            Self::Scoped
+        }
+    }
+
+    pub fn is_instance_admin(self) -> bool {
+        matches!(self, Self::InstanceAdmin)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ManagedBackupScheduleError {
+    #[error(
+        "Only an instance administrator may create the managed backup schedule for S3 source \
+         {s3_source_id}: it backs up every database and the control plane"
+    )]
+    NotAuthorized { s3_source_id: i32 },
     #[error("Could not read the backup schedules targeting S3 source {s3_source_id}: {reason}")]
     Lookup { s3_source_id: i32, reason: String },
     #[error("Could not create the default backup schedule for S3 source {s3_source_id}: {reason}")]
@@ -99,10 +143,15 @@ pub trait ManagedBackupScheduleProvisioner: Send + Sync {
     /// nightly one (every database plus the control plane, `retention_days`
     /// of retention) when none does. Idempotent: an existing schedule is
     /// returned untouched, whatever the operator has changed on it.
+    ///
+    /// The default schedule is instance-wide, so a `Scoped` caller is refused
+    /// with [`ManagedBackupScheduleError::NotAuthorized`] before anything is
+    /// looked up or created.
     async fn ensure_schedule_for_source(
         &self,
         s3_source_id: i32,
         retention_days: u16,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSchedule, ManagedBackupScheduleError>;
 
     /// Services whose continuous archive is pinned to a source other than

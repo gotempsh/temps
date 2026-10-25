@@ -3542,6 +3542,18 @@ impl CachedPeerTable {
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
     }
+
+    /// Every public hostname in the route table, whoever serves it.
+    pub fn public_hostnames(&self) -> Vec<String> {
+        self.route_snapshot
+            .load()
+            .legacy
+            .exact
+            .keys()
+            .filter(|host| !host.ends_with(".temps.local"))
+            .cloned()
+            .collect()
+    }
 }
 
 #[temps_core::async_trait::async_trait]
@@ -4486,6 +4498,8 @@ mod tests {
                 gitlab_webhook_id: None,
                 gitlab_webhook_signing_token: None,
                 gitea_webhook_signing_token: None,
+                github_webhook_id: None,
+                github_webhook_signing_token: None,
                 bitbucket_webhook_token: None,
                 bitbucket_webhook_hook_id: None,
                 generic_webhook_token: None,

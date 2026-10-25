@@ -153,6 +153,69 @@ export function unremovedNodeContainers(
   }
 }
 
+/**
+ * Seconds without a heartbeat after which the control plane treats a node as
+ * unreachable; matches `NODE_HEARTBEAT_STALE_SECS` on the server.
+ */
+export const NODE_HEARTBEAT_STALE_SECS = 90
+
+/**
+ * Whether the control plane has stopped hearing from a node: never heard
+ * from, or silent past the threshold. Decided on the heartbeat alone, like
+ * the server: a node that was draining when its agent stopped keeps its
+ * status (ADR 057).
+ */
+export function nodeIsUnreachable(
+  node: { last_heartbeat?: string | null },
+  now: number = Date.now()
+): boolean {
+  if (!node.last_heartbeat) return true
+  const heartbeat = Date.parse(node.last_heartbeat)
+  if (Number.isNaN(heartbeat)) return false
+  return now - heartbeat > NODE_HEARTBEAT_STALE_SECS * 1000
+}
+
+/** What a removal of an unreachable node would take down. */
+export interface ServingOnUnreachableNode {
+  /** Containers of live deployments recorded on the node. */
+  count: number
+  /** The environments they serve, as the API describes them. */
+  environments: string[]
+}
+
+/**
+ * The live deployments an unreachable node still serves, when the API
+ * refused its removal for that reason (409 "Unreachable Node Still Serves
+ * Deployments"). Only then does retrying with `force=true` remove it anyway,
+ * and those environments stop until they are redeployed.
+ */
+export function servingOnUnreachableNode(
+  error: unknown
+): ServingOnUnreachableNode | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  type Fields = {
+    force_removes_serving?: unknown
+    serving_containers?: unknown
+    serving_environments?: unknown
+  }
+  const problem = error as Fields & { extensions?: Fields | null }
+  const field = <K extends keyof Fields>(key: K) =>
+    problem[key] ?? problem.extensions?.[key]
+  if (field('force_removes_serving') !== true) return undefined
+  const list = field('serving_environments')
+  const environments = Array.isArray(list)
+    ? list.filter((item): item is string => typeof item === 'string')
+    : []
+  const count = field('serving_containers')
+  return {
+    count:
+      typeof count === 'number' && Number.isInteger(count) && count > 0
+        ? count
+        : environments.length,
+    environments,
+  }
+}
+
 /** True when a failed request failed because no worker node can run it. */
 export function isWorkerNodeRequiredProblem(error: unknown): boolean {
   return problemErrorCode(error) === WORKER_NODE_REQUIRED_ERROR_CODE

@@ -37,9 +37,22 @@ pub struct MeshLockdown {
     /// On the control plane only: the node API port (ADR 048 D3), which
     /// mesh members reach on the control plane's mesh address.
     pub node_api_port: Option<u16>,
+    /// On a worker whose agent serves mutual TLS: the agent API port, which
+    /// only the control plane's mesh address may reach, so a control plane
+    /// that can reach the worker only through the mesh still can.
+    pub agent_api: Option<MeshAgentApi>,
     /// This host is the mesh hub (ADR 048 D4): it forwards traffic between
     /// mesh members, from the tunnel back into the tunnel, and nothing else.
     pub relay: bool,
+}
+
+/// The one TCP port a worker accepts over the mesh for its agent API, and the
+/// only source allowed to use it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshAgentApi {
+    /// The control plane's mesh address.
+    pub from: Ipv4Addr,
+    pub port: u16,
 }
 
 /// Install the nftables lockdown for [`MESH_INTERFACE`] unless it is already
@@ -347,6 +360,31 @@ pub struct MeshIdentityClaim {
     pub holder: MeshIdentityHolder,
 }
 
+/// The one mesh-pool address a registration may claim (ADR 055): the
+/// address `pairing_id` reserved, for a registration that came through that
+/// pairing, over the node API, from that address. A worker that joined
+/// outbound only registers under its own mesh address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnMeshAddress {
+    pub pairing_id: i32,
+    pub address: Ipv4Addr,
+}
+
+/// `addresses` without the registration's own mesh address (ADR 055). The
+/// control plane's mesh address is never exempt, whatever a pairing says.
+pub fn without_own_address(
+    addresses: &[(String, Ipv4Addr)],
+    own: Option<OwnMeshAddress>,
+    pool: Ipv4Net,
+) -> Vec<(String, Ipv4Addr)> {
+    let control_plane = control_plane_mesh_address(pool);
+    addresses
+        .iter()
+        .filter(|(_, ip)| own.is_none_or(|own| *ip != own.address || *ip == control_plane))
+        .cloned()
+        .collect()
+}
+
 /// The first of `addresses` (claimed value, its IPv4 address) that is the
 /// control plane's mesh address in `pool`, or any other address of `pool`.
 pub fn pool_claim(addresses: &[(String, Ipv4Addr)], pool: Ipv4Net) -> Option<MeshIdentityClaim> {
@@ -401,10 +439,16 @@ pub fn parse_endpoint(value: &str) -> Result<SocketAddr, MeshError> {
         value: value.to_string(),
         reason: reason.to_string(),
     };
-    let endpoint: SocketAddr = value
-        .trim()
-        .parse()
-        .map_err(|_| invalid("expected ip:port, e.g. 203.0.113.10:51820"))?;
+    let endpoint: SocketAddr = value.trim().parse().map_err(|_| {
+        if names_a_host(value) {
+            invalid(
+                "a hostname is not accepted, the endpoint must be an IP literal: resolve it and \
+                 pass ip:port, e.g. 203.0.113.10:51820",
+            )
+        } else {
+            invalid("expected ip:port, e.g. 203.0.113.10:51820")
+        }
+    })?;
     if endpoint.port() == 0 {
         return Err(invalid("port must not be 0"));
     }
@@ -446,6 +490,55 @@ pub fn check_endpoint_outside_pools(
         });
     }
     Ok(())
+}
+
+/// Whether `value` is `host:port` with a DNS name rather than an IP literal,
+/// so the error can say so instead of only "expected ip:port".
+fn names_a_host(value: &str) -> bool {
+    let Some((host, port)) = value.trim().rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && port.parse::<u16>().is_ok()
+        && host.parse::<IpAddr>().is_err()
+        && !host.starts_with('[')
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+        && host.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// The endpoint the control plane publishes for workers to dial its end of
+/// the mesh.
+///
+/// In order of precedence:
+/// 1. `advertised` -- the operator's `temps serve --wg-endpoint`, published
+///    exactly as given. For a control plane behind NAT or port forwarding,
+///    whose reachable `ip:port` differs from its address and listen port; the
+///    listen port stays the mesh port either way.
+/// 2. `configured_address` -- `--private-address`, on the mesh port, unless it
+///    is the mesh address itself.
+/// 3. `persisted` -- the endpoint published before, on a restart with neither.
+pub fn resolve_control_plane_endpoint(
+    advertised: Option<&str>,
+    configured_address: Option<&str>,
+    persisted: Option<&str>,
+    mesh: Ipv4Net,
+    port: u16,
+) -> Result<Option<SocketAddr>, MeshError> {
+    if let Some(advertised) = advertised.map(str::trim).filter(|value| !value.is_empty()) {
+        let endpoint = parse_endpoint(advertised)?;
+        check_endpoint_outside_pools(endpoint, mesh, None)?;
+        return Ok(Some(endpoint));
+    }
+    let mesh_address = control_plane_mesh_address(mesh).to_string();
+    match configured_address
+        .map(str::trim)
+        .filter(|address| !address.is_empty() && *address != mesh_address)
+    {
+        Some(address) => default_endpoint(address, port).map(Some),
+        None => Ok(persisted.and_then(|endpoint| endpoint.parse().ok())),
+    }
 }
 
 /// A node's default endpoint: the address it registered with, on the mesh
@@ -574,10 +667,15 @@ mod db {
 
     /// Reserve all certificate IP SANs before releasing a leaf, under the same lock as
     /// pool changes. Entries survive node removal and failed registrations.
+    ///
+    /// `own` exempts the registration's own mesh address (ADR 055); it is
+    /// recorded like every other address, so it is never handed to another
+    /// member while the CA lasts.
     pub async fn reserve_certificate_addresses(
         db: &DatabaseConnection,
         ca_cert_pem: &str,
         identities: &[String],
+        own: Option<OwnMeshAddress>,
     ) -> Result<(), MeshError> {
         use sea_orm::{ConnectionTrait, Statement};
         let txn = db.begin().await?;
@@ -586,7 +684,8 @@ mod db {
             .iter()
             .filter_map(|value| identity_ipv4(value).map(|ip| (value.clone(), ip)))
             .collect();
-        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+        let pool = reserved_mesh_pool(&cfg.wireguard_cidr);
+        if let Some(claim) = pool_claim(&without_own_address(&addresses, own, pool), pool) {
             return Err(MeshError::InvalidCidr {
                 value: cfg.wireguard_cidr,
                 reason: format!(
@@ -607,6 +706,41 @@ mod db {
         }
         txn.commit().await?;
         Ok(())
+    }
+
+    /// Every address a leaf of the current cluster CA names. A worker that
+    /// joined outbound only (ADR 055) holds a leaf for its mesh address, and
+    /// leaves are not revoked, so new pairings and nodes skip these.
+    pub(crate) async fn certificate_addresses<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<std::collections::HashSet<Ipv4Addr>, MeshError> {
+        use sea_orm::{FromQueryResult, Statement};
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await?;
+        let Some(ca) = settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(Default::default());
+        };
+        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
+        #[derive(FromQueryResult)]
+        struct Address {
+            address: String,
+        }
+        Ok(Address::find_by_statement(Statement::from_sql_and_values(
+            db.get_database_backend(),
+            "SELECT address FROM cluster_certificate_addresses WHERE ca_key = $1",
+            [ca_key.into()],
+        ))
+        .all(db)
+        .await?
+        .into_iter()
+        .filter_map(|row| row.address.parse().ok())
+        .collect())
     }
 
     /// A pre-history CA may have issued certificates for deleted or renamed
@@ -762,6 +896,12 @@ mod db {
             .all(txn)
             .await?
         {
+            // A node that joined outbound only registered under its own mesh
+            // address (ADR 055); that is its identity, not a claim on another.
+            let own = node
+                .mesh_wg_address
+                .as_deref()
+                .and_then(|address| address.parse::<Ipv4Addr>().ok());
             for (field, value) in [
                 ("name", node.name.as_str()),
                 ("address", node.address.as_str()),
@@ -770,7 +910,7 @@ mod db {
                 let Some(ip) = identity_ipv4(value) else {
                     continue;
                 };
-                if !pool.contains(&ip) {
+                if !pool.contains(&ip) || (field != "name" && Some(ip) == own) {
                     continue;
                 }
                 let role = if ip == control_plane {
@@ -812,9 +952,14 @@ mod db {
     /// is assigned or reserved), so the pool check alone covers them; the
     /// node and pairing lookups keep that true for rows written before the
     /// pool was frozen for pending pairings, and name the holder.
+    ///
+    /// `own` is the registration's own mesh address (ADR 055): exempt from
+    /// the pool check and from its own pairing's reservation, but never from
+    /// a node holding it or from being the control plane's address.
     pub async fn mesh_identity_claimed(
         db: &DatabaseConnection,
         claimed: &[String],
+        own: Option<OwnMeshAddress>,
     ) -> Result<Option<MeshIdentityClaim>, MeshError> {
         let addresses: Vec<(String, Ipv4Addr)> = claimed
             .iter()
@@ -824,7 +969,8 @@ mod db {
             return Ok(None);
         }
         let cfg = load_config(db).await?;
-        if let Some(claim) = pool_claim(&addresses, reserved_mesh_pool(&cfg.wireguard_cidr)) {
+        let pool = reserved_mesh_pool(&cfg.wireguard_cidr);
+        if let Some(claim) = pool_claim(&without_own_address(&addresses, own, pool), pool) {
             return Ok(Some(claim));
         }
         let texts: Vec<String> = addresses.iter().map(|(_, ip)| ip.to_string()).collect();
@@ -849,9 +995,14 @@ mod db {
                 },
             }));
         }
-        if let Some(pairing) = temps_entities::node_pairings::Entity::find()
+        let mut pairings = temps_entities::node_pairings::Entity::find()
             .filter(temps_entities::node_pairings::Column::MeshAddress.is_in(texts))
-            .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING))
+            .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING));
+        if let Some(own) = own {
+            pairings =
+                pairings.filter(temps_entities::node_pairings::Column::Id.ne(own.pairing_id));
+        }
+        if let Some(pairing) = pairings
             .order_by_asc(temps_entities::node_pairings::Column::Id)
             .one(db)
             .await?
@@ -928,6 +1079,9 @@ mod db {
     /// Store a node's mesh public key and endpoint, assign its mesh address
     /// on first registration, and make that address its underlay.
     ///
+    /// `endpoint` is `None` for a node nobody can dial (ADR 055): it dials
+    /// the control plane, which learns its address from the handshake.
+    ///
     /// Serialized on the `network_config` row lock so two nodes registering
     /// at once never receive the same address (the unique index is the
     /// backstop).
@@ -935,7 +1089,7 @@ mod db {
         db: &Arc<DatabaseConnection>,
         node_id: i32,
         public_key: &str,
-        endpoint: SocketAddr,
+        endpoint: Option<SocketAddr>,
     ) -> Result<NodeMeshRegistration, MeshError> {
         let txn = db.begin().await?;
         let registration = register_node_in(&txn, node_id, public_key, endpoint).await?;
@@ -949,18 +1103,20 @@ mod db {
         txn: &C,
         node_id: i32,
         public_key: &str,
-        endpoint: SocketAddr,
+        endpoint: Option<SocketAddr>,
     ) -> Result<NodeMeshRegistration, MeshError> {
         if !temps_wireguard::mesh::is_valid_public_key(public_key) {
             return Err(MeshError::InvalidPublicKey);
         }
         let cfg = lock_config(txn).await?;
         let settings = settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
-        check_endpoint_outside_pools(
-            endpoint,
-            settings.cidr,
-            cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
-        )?;
+        if let Some(endpoint) = endpoint {
+            check_endpoint_outside_pools(
+                endpoint,
+                settings.cidr,
+                cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
+            )?;
+        }
         let node = nodes::Entity::find_by_id(node_id)
             .one(txn)
             .await?
@@ -997,7 +1153,13 @@ mod db {
         // A node that registered with a pairing's token takes the address
         // the pairing reserved for this key (ADR 048 D2b).
         let paired = crate::pairing::adopt_for_node(txn, node_id, public_key).await?;
+        // A node that joined outbound only registered under the paired
+        // address (ADR 055) and its interface already carries it, so that
+        // address wins over one the node held before re-joining.
+        let registered_under_paired =
+            paired.is_some_and(|paired| identity_ipv4(&node.private_address) == Some(paired));
         let address = match (current, paired) {
+            (Some(_), Some(address)) if registered_under_paired => address,
             (Some(address), _) => address,
             (None, Some(address)) => address,
             (None, None) => {
@@ -1006,15 +1168,15 @@ mod db {
         };
 
         let address_text = address.to_string();
-        let endpoint_text = endpoint.to_string();
+        let endpoint_text = endpoint.map(|endpoint| endpoint.to_string());
         let unchanged = node.mesh_wg_public_key.as_deref() == Some(public_key)
-            && node.mesh_wg_endpoint.as_deref() == Some(endpoint_text.as_str())
+            && node.mesh_wg_endpoint == endpoint_text
             && node.mesh_wg_address.as_deref() == Some(address_text.as_str())
             && node.underlay_address.as_deref() == Some(address_text.as_str());
         if !unchanged {
             let mut active: nodes::ActiveModel = node.into();
             active.mesh_wg_public_key = Set(Some(public_key.to_string()));
-            active.mesh_wg_endpoint = Set(Some(endpoint_text));
+            active.mesh_wg_endpoint = Set(endpoint_text);
             active.mesh_wg_address = Set(Some(address_text.clone()));
             active.underlay_address = Set(Some(address_text));
             active.update(txn).await?;
@@ -1071,6 +1233,8 @@ mod db {
         if excluding_node.is_none() {
             // Nodes being paired: the control plane dials them so they can
             // register over the mesh (ADR 048 D2b). Workers never see them.
+            // One that joined outbound only (ADR 055) has no endpoint: it
+            // dials the control plane, which roams to its address.
             for pairing in crate::pairing::peering(db).await? {
                 let (Some(public_key), Ok(address)) =
                     (pairing.public_key, pairing.mesh_address.parse())
@@ -1081,7 +1245,10 @@ mod db {
                     name: format!("pairing:{}", pairing.name),
                     peer: MeshPeer {
                         public_key,
-                        endpoint: pairing.node_endpoint.parse().ok(),
+                        endpoint: pairing
+                            .node_endpoint
+                            .as_deref()
+                            .and_then(|endpoint| endpoint.parse().ok()),
                         address,
                         relayed: Vec::new(),
                     },
@@ -1322,6 +1489,99 @@ mod tests {
             "[::ffff:169.254.169.254]:51820",
         ] {
             assert!(parse_endpoint(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn a_hostname_endpoint_is_refused_with_a_specific_reason() {
+        for host in ["node-a.example.com:51820", "localhost:51820"] {
+            let error = parse_endpoint(host).unwrap_err().to_string();
+            assert!(
+                error.contains("a hostname is not accepted"),
+                "{host}: {error}"
+            );
+        }
+        for not_a_host in ["203.0.113.10", "203.0.113.10:99999", "garbage", "[::1"] {
+            let error = parse_endpoint(not_a_host).unwrap_err().to_string();
+            assert!(!error.contains("hostname"), "{not_a_host}: {error}");
+        }
+    }
+
+    const MESH: Ipv4Net = Ipv4Net::new_assert(Ipv4Addr::new(10, 201, 0, 0), 16);
+
+    #[test]
+    fn the_advertised_endpoint_is_published_exactly_and_wins() {
+        let published = resolve_control_plane_endpoint(
+            Some("157.180.96.48:20517"),
+            Some("157.180.96.48"),
+            Some("198.51.100.1:51820"),
+            MESH,
+            51820,
+        )
+        .unwrap();
+        assert_eq!(published, Some("157.180.96.48:20517".parse().unwrap()));
+        // Even without a private address.
+        assert_eq!(
+            resolve_control_plane_endpoint(Some(" 203.0.113.7:4000 "), None, None, MESH, 51820)
+                .unwrap(),
+            Some("203.0.113.7:4000".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn without_an_advertised_endpoint_the_existing_rules_apply() {
+        // The private address, forced onto the listen port.
+        assert_eq!(
+            resolve_control_plane_endpoint(
+                None,
+                Some("157.180.96.48"),
+                Some("198.51.100.1:51820"),
+                MESH,
+                51820
+            )
+            .unwrap(),
+            Some("157.180.96.48:51820".parse().unwrap())
+        );
+        // A blank flag counts as unset.
+        assert_eq!(
+            resolve_control_plane_endpoint(Some("  "), Some("203.0.113.9"), None, MESH, 51820)
+                .unwrap(),
+            Some("203.0.113.9:51820".parse().unwrap())
+        );
+        // The mesh address itself, or nothing: the published endpoint is kept.
+        for configured in [Some("10.201.0.1"), None] {
+            assert_eq!(
+                resolve_control_plane_endpoint(
+                    None,
+                    configured,
+                    Some("198.51.100.1:51820"),
+                    MESH,
+                    51820
+                )
+                .unwrap(),
+                Some("198.51.100.1:51820".parse().unwrap())
+            );
+        }
+        assert_eq!(
+            resolve_control_plane_endpoint(None, None, None, MESH, 51820).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn an_unusable_advertised_endpoint_is_an_error_not_a_fallback() {
+        for bad in [
+            "plane.example.com:20517",
+            "157.180.96.48",
+            "127.0.0.1:20517",
+            "10.201.0.1:51820",
+            "157.180.96.48:0",
+        ] {
+            assert!(
+                resolve_control_plane_endpoint(Some(bad), Some("157.180.96.48"), None, MESH, 51820)
+                    .is_err(),
+                "{bad} must be refused"
+            );
         }
     }
 

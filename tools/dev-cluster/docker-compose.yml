@@ -21,7 +21,7 @@
 #   └──────────────────────────────────────────────────────────────────────────────────┘
 #
 # Each worker is a privileged container running its own dockerd + the
-# Temps agent. The compute_cidr allocator carves out 172.20.x.0/24 from
+# Temps agent. The compute_cidr allocator carves out 10.202.x.0/24 from
 # the configured pool, one slice per worker. Cross-node traffic flows
 # over a VXLAN tunnel pinned to the underlay IPs above.
 #

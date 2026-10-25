@@ -18,6 +18,12 @@ mod m20261017_000001_deployment_health_probes;
 pub mod m20261017_000001_retain_ci_cancellation;
 pub mod m20261017_000002_runtime_health;
 mod m20261019_000001_mfa_verification_guards;
+mod m20261020_000001_node_pairings_outbound;
+mod m20261020_000002_compute_pool_collisions;
+mod m20261020_000003_compute_pool_confirmed;
+mod m20261020_000004_ingress_connectors;
+mod m20261020_000005_node_public_ingress;
+mod m20261021_000001_ingress_hostname_choices;
 
 mod m20261019_000001_cron_monitors;
 pub mod m20261019_000002_reconcile_error_group_counts;
@@ -29,6 +35,7 @@ mod m20261020_000003_debug_id_artifacts;
 mod m20261020_000004_client_outcomes;
 mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
+mod m20261022_000001_add_github_repo_webhook;
 pub(crate) mod m20261022_000001_dns_name_claims;
 pub(crate) mod m20261022_000002_workloads;
 pub(crate) mod m20261022_000003_node_state_changes;
@@ -382,6 +389,8 @@ mod m20261019_000002_create_ai_chat_operations;
 mod m20261019_000003_drop_ai_data_access_from_external_services;
 mod m20261020_000001_create_ai_blueprints;
 mod m20261020_000002_create_autofix_incidents;
+mod m20261022_000001_scope_agent_secrets_to_projects;
+mod m20261022_000002_fence_revenue_subscription_events;
 
 pub struct Migrator;
 
@@ -827,6 +836,22 @@ impl MigratorTrait for Migrator {
             Box::new(m20261019_000003_drop_ai_data_access_from_external_services::Migration),
             Box::new(m20261020_000001_create_ai_blueprints::Migration),
             Box::new(m20261020_000002_create_autofix_incidents::Migration),
+            // ADR 055: outbound-only worker joins have no pairing endpoint.
+            Box::new(m20261020_000001_node_pairings_outbound::Migration),
+            // ADR 056: new default compute pool, per-node overlay status.
+            Box::new(m20261020_000002_compute_pool_collisions::Migration),
+            // ADR 056: the console asks for the pool once before the first node.
+            Box::new(m20261020_000003_compute_pool_confirmed::Migration),
+            // ADR 058: ingress connectors (tunnels) and what they publish.
+            Box::new(m20261020_000004_ingress_connectors::Migration),
+            // ADR 058 D7: direct worker ingress configured from the console.
+            Box::new(m20261020_000005_node_public_ingress::Migration),
+            // ADR 058 D9: the operator decides what each tunnel publishes.
+            Box::new(m20261021_000001_ingress_hostname_choices::Migration),
+            // #1596: per-project GitHub repository webhooks for non-App connections.
+            Box::new(m20261022_000001_add_github_repo_webhook::Migration),
+            Box::new(m20261022_000001_scope_agent_secrets_to_projects::Migration),
+            Box::new(m20261022_000002_fence_revenue_subscription_events::Migration),
             Box::new(m20261022_000001_dns_name_claims::Migration),
             Box::new(m20261022_000002_workloads::Migration),
             Box::new(m20261022_000003_node_state_changes::Migration),

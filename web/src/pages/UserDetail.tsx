@@ -7,6 +7,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
 import {
+  ResetMfaDialog,
+  ResetMfaTarget,
+} from '@/components/users/ResetMfaDialog'
+import {
   ResetPasswordDialog,
   ResetPasswordTarget,
 } from '@/components/users/ResetPasswordDialog'
@@ -44,6 +48,7 @@ import {
   MailWarning,
   ScrollText,
   Shield,
+  ShieldOff,
 } from 'lucide-react'
 import { ReactNode, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -61,6 +66,9 @@ export function UserDetail() {
   const canViewAuditLogs = useCanViewAuditLogs()
   const { user: currentUser } = useAuth()
   const [resetTarget, setResetTarget] = useState<ResetPasswordTarget | null>(
+    null
+  )
+  const [resetMfaTarget, setResetMfaTarget] = useState<ResetMfaTarget | null>(
     null
   )
 
@@ -208,6 +216,10 @@ export function UserDetail() {
         user={resetTarget}
         onClose={() => setResetTarget(null)}
       />
+      <ResetMfaDialog
+        user={resetMfaTarget}
+        onClose={() => setResetMfaTarget(null)}
+      />
       <div className="flex items-center gap-2">
         <Button
           variant="ghost"
@@ -324,7 +336,7 @@ export function UserDetail() {
                     </div>
                   )}
               </div>
-              <div className="ml-auto shrink-0">
+              <div className="ml-auto flex shrink-0 flex-col gap-2 sm:flex-row">
                 {currentUser?.id === target.user.id ? (
                   <Button variant="outline" size="sm" asChild>
                     <Link to="/account">
@@ -352,6 +364,32 @@ export function UserDetail() {
                   >
                     <KeyRound className="mr-2 h-4 w-4" />
                     Reset password
+                  </Button>
+                )}
+                {currentUser?.id !== target.user.id && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={
+                      !target.user.mfa_enabled || !!target.user.deleted_at
+                    }
+                    title={
+                      target.user.deleted_at
+                        ? 'Restore this user before resetting their MFA'
+                        : !target.user.mfa_enabled
+                          ? 'This user has no MFA enrolled'
+                          : 'Remove MFA for a user who lost their authenticator and recovery codes'
+                    }
+                    onClick={() =>
+                      setResetMfaTarget({
+                        id: target.user.id,
+                        name: target.user.name || target.user.username || '',
+                        email: target.user.email || '',
+                      })
+                    }
+                  >
+                    <ShieldOff className="mr-2 h-4 w-4" />
+                    Reset MFA
                   </Button>
                 )}
               </div>

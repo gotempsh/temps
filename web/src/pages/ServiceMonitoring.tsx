@@ -687,7 +687,9 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
     )
   }
 
-  if (chartData.length === 0) {
+  // Every bucket of the range is returned; `null` ones are gaps the line
+  // breaks at, so "no data" means no bucket holds a sample.
+  if (!chartData.some((p) => p.value != null)) {
     return (
       <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
         No data for this range

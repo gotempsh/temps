@@ -9,7 +9,7 @@ export const metadata = {
 
 # Upgrading Temps
 
-An upgrade replaces the `temps` binary and then applies the new release's database migrations. Migrations run automatically the next time `temps serve` starts (or explicitly with `temps migrate`). Before they run, Temps backs up the database so the upgrade can be rolled back, and it refuses to run an older binary against a database that a newer release has already migrated. {{ className: 'lead' }}
+An upgrade replaces the `temps` binary and then applies the new release's database migrations. Migrations run automatically the next time `temps serve` starts (or explicitly with `temps migrate`). Before they run, Temps can back up the database so the upgrade can be rolled back, and it warns when an older binary is started against a database that a newer release has already migrated. {{ className: 'lead' }}
 
 ---
 
@@ -268,7 +268,7 @@ Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.te
 
 Each startup, in order:
 
-1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps refuses to start and changes nothing. See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
+1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps logs a warning naming them and keeps starting. It never rolls those migrations back; it only applies migrations of its own that the database is missing (normally none). See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
 2. **Pre-migration backup**, only with `--pre-migration-backup` and only if there are pending migrations on an existing database. See below. Either way, a `pg_dump` container left running by an interrupted earlier backup of the same data directory is removed first: it holds a lock on every table and would make the first migration time out.
 3. **Migrations.** Each runs in its own transaction; a statement waiting more than 15 seconds for a lock fails fast, and the whole step is bounded at 10 minutes. If a migration fails, the server does not start and the database stays at the last migration that succeeded.
 4. **Maintenance** that does not block startup (large concurrent index builds, analytics backfills) runs in the background once the server is up.
@@ -353,7 +353,11 @@ Open the console and check that your projects, environments and services are lis
 
 ## Roll back an upgrade {{ anchor: true, id: 'roll-back-an-upgrade' }}
 
-Migrations only go forward. To return to the previous release you need **both** the previous binary **and** the database as it was before the upgrade. Starting only the old binary on the upgraded database does not work: the schema guard (and, in older releases, the migrator) refuses it, so that an older binary cannot write to a schema it does not understand.
+Migrations only go forward. A full rollback to the previous release needs **both** the previous binary **and** the database as it was before the upgrade.
+
+If the new release stops working and you need Temps back up quickly, you can roll back only the binary (`temps upgrade --version vX.Y.Z --yes`) and start it against the upgraded database. It starts with a [warning](#database-schema-is-newer-than-this-binary) that the schema is newer than the binary, and it leaves the newer migrations in place. That is a stopgap, not a rollback: the older binary does not know about the newer schema, so features that depend on it can misbehave, and anything it writes is written to that newer schema. Plan to either move forward to a fixed release or complete the rollback below. (Earlier releases refused to start in that state.)
+
+To roll back fully, restore the database as well.
 
 The example below is for a `deploy.sh` install (database container `temps-timescaledb`, user and database `temps`, data in `~/.temps/data`). Adjust names to your setup.
 
@@ -444,11 +448,13 @@ launchctl kickstart -k gui/$(id -u)/dev.temps.localup-tunnel   # macOS
 
 ### Database schema is newer than this binary {{ anchor: true, id: 'database-schema-is-newer-than-this-binary' }}
 
+Logged as a warning at startup (and reported by `temps doctor`):
+
 ```text
-The database schema is newer than this Temps binary (v…): N applied migration(s) are unknown to it: m2026…
+The database schema is newer than this Temps binary (v…): N applied migration(s) are unknown to it: m2026…. … Starting anyway: the unknown migrations are left in place and only migrations this binary defines are applied, …
 ```
 
-A newer release migrated this database, then an older binary was started on it — usually after rolling back only the binary. Nothing was changed. Either start the newer release again (`temps upgrade --version <that release>`), or [roll back](#roll-back-an-upgrade) properly by restoring the pre-migration backup.
+A newer release migrated this database, then an older binary was started on it — usually after rolling back only the binary. Temps keeps running: it does not roll back the unknown migrations and does not touch them, but it is running against a schema it does not fully understand, so features that rely on the newer schema can misbehave. To get back to a matching pair, either start the newer release again (`temps upgrade --version <that release>`), or [roll back](#roll-back-an-upgrade) fully by restoring the pre-migration backup from `<data dir>/backups/pre-migration`.
 
 ### Pre-migration backup failed
 

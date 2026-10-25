@@ -11,13 +11,23 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+/// Compute pool a new cluster starts with (ADR 056). Outside Docker's default
+/// address pools (`172.17.0.0/12`, `192.168.0.0/16`), the common Kubernetes,
+/// cloud-VPC and VPN ranges, and next to the mesh's `10.201.0.0/16`. Existing
+/// clusters keep the pool they stored; only the column default uses this.
+pub const DEFAULT_COMPUTE_POOL_CIDR: &str = "10.202.0.0/16";
+
+/// The pool every cluster created before ADR 056 was seeded with. Kept only so
+/// the migration that moves the column default can restore it on `down`.
+pub const LEGACY_COMPUTE_POOL_CIDR: &str = "172.20.0.0/16";
+
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "network_config")]
 pub struct Model {
     /// Always 1; CHECK (id = 1) makes the row unique by construction.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: i32,
-    /// CIDR pool we slice into per-node CIDRs (e.g. "172.20.0.0/16").
+    /// CIDR pool we slice into per-node CIDRs (new clusters: [`DEFAULT_COMPUTE_POOL_CIDR`]).
     pub compute_pool_cidr: String,
     /// Prefix length per allocated subnet — `24` means each node gets a /24
     /// (256 hosts) carved out of `compute_pool_cidr`.
@@ -64,6 +74,9 @@ pub struct Model {
     /// The control plane is the mesh hub. Never set together with
     /// `mesh_hub_node_id`.
     pub mesh_hub_control_plane: bool,
+    /// When an operator confirmed the compute pool. The console asks once
+    /// before adding the first node; nothing on the join path reads it.
+    pub compute_pool_confirmed_at: Option<DBDateTime>,
     pub updated_at: DBDateTime,
 }
 
