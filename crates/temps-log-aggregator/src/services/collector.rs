@@ -33,7 +33,7 @@ use tracing::{debug, error, info, warn};
 use crate::error::{LogAggregatorError, RetryClass};
 use crate::parser::{parse_docker_timestamp, parse_log_line};
 use crate::services::{
-    Admission, ChunkWriterService, IngestBudget, IngestSource, LogMetadataService,
+    Admission, ChunkWriterService, IngestBudget, IngestSource, LogMetadataService, STATS_WINDOW,
 };
 use crate::types::{ContainerContext, LogLine, LogStream};
 
@@ -773,7 +773,18 @@ impl CollectorService {
         let mut stream = docker.logs(&container_id, Some(options));
 
         loop {
-            match stream.next().await {
+            // Quiet for a whole stats window: explain what the last one
+            // dropped now rather than with a next line that may never come.
+            let next = match tokio::time::timeout(STATS_WINDOW, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    if let Some(notice) = limiter.flush() {
+                        write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+                    }
+                    continue;
+                }
+            };
+            match next {
                 Some(Ok(output)) => {
                     // Reset error state on success
                     consecutive_errors = 0;
@@ -796,16 +807,11 @@ impl CollectorService {
                     // not the line is kept: a dropped line is not re-fetched.
                     last_seen_ts = ts.timestamp();
 
-                    let admission = limiter.admit(msg.len());
-                    if let Some(notice) = limiter.take_drop_notice(ts) {
-                        let _ = tail_tx.send(notice.clone());
-                        if let Err(e) = chunk_writer.write_line(notice).await {
-                            error!(
-                                container_id = container_id,
-                                error = %e,
-                                "Failed to write log drop notice to chunk buffer"
-                            );
-                        }
+                    // Judged by when Docker stamped the line, so a replayed
+                    // backlog is held to the rate it was produced at.
+                    let admission = limiter.admit(msg.len(), ts);
+                    if let Some(notice) = limiter.take_drop_notice() {
+                        write_drop_notice(&chunk_writer, &tail_tx, notice).await;
                     }
                     // An over-budget line still reaches anyone tailing live,
                     // but is not parsed at all when nobody is.
@@ -884,6 +890,27 @@ impl CollectorService {
                 }
             }
         }
+        if let Some(notice) = limiter.flush() {
+            write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+        }
+    }
+}
+
+/// Write an ingestion-budget drop notice where the container's own lines
+/// go: to anyone tailing live, and to storage.
+pub(crate) async fn write_drop_notice(
+    chunk_writer: &Arc<ChunkWriterService>,
+    tail_tx: &broadcast::Sender<LogLine>,
+    notice: LogLine,
+) {
+    let _ = tail_tx.send(notice.clone());
+    let container_id = notice.container_id.clone();
+    if let Err(e) = chunk_writer.write_line(notice).await {
+        error!(
+            container_id = %container_id,
+            error = %e,
+            "Failed to write log drop notice to chunk buffer"
+        );
     }
 }
 

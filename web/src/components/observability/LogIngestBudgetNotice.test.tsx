@@ -5,12 +5,12 @@ import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import type {
-  LogIngestBudgetCapability,
+  LogIngestBudgetStatus,
   ThrottledLogSource,
 } from '@/api/client/types.gen'
 import { LogIngestBudgetNotice } from './LogIngestBudgetNotice'
 
-const budget: LogIngestBudgetCapability = {
+const budget: LogIngestBudgetStatus = {
   lines_per_sec: 250,
   bytes_per_sec: 256 * 1024,
   burst_seconds: 10,
@@ -33,7 +33,7 @@ const noisy: ThrottledLogSource = {
 }
 
 const render = (
-  value: LogIngestBudgetCapability | undefined,
+  value: LogIngestBudgetStatus | undefined,
   projectLabels?: Record<string, string>
 ) =>
   renderToStaticMarkup(

@@ -264,8 +264,9 @@ impl TempsPlugin for LogAggregatorPlugin {
             let collector_metadata = Arc::new(LogMetadataService::new(db.clone()));
 
             // Per-container ingestion budget, shared by the local and remote
-            // collectors. Starts at the defaults; the budget sync below
-            // applies the saved settings.
+            // collectors. Starts at the defaults; initialization applies the
+            // saved settings before any stream starts, and the budget sync
+            // keeps them current.
             let ingest_budget = Arc::new(IngestBudget::new(IngestLimits::from_settings(
                 &temps_core::ContainerLogSettings::default(),
             )));
@@ -374,6 +375,15 @@ impl TempsPlugin for LogAggregatorPlugin {
             let compactor_storage = context.require_service::<dyn LogStorage>();
             let compactor_cache = (*context.require_service::<ChunkCache>()).clone();
             let retention_metadata = context.require_service::<LogMetadataService>();
+
+            // The saved ingestion budget must be in force before the first
+            // stream opens: startup replays every container's backlog, and
+            // judging it by the defaults would drop lines a raised budget
+            // allows (or keep ones a lowered budget does not).
+            if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
+                let ingest_budget = context.require_service::<IngestBudget>();
+                apply_saved_ingest_limits(&config_service, &ingest_budget).await;
+            }
 
             // ── Flush ticker ────────────────────────────────────────────
             // Seals every head buffer whose flush policy (ADR-046 §1) says
@@ -723,6 +733,35 @@ impl TempsPlugin for LogAggregatorPlugin {
 
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<handlers::LogAggregatorApiDoc as OpenApiTrait>::openapi())
+    }
+}
+
+/// How long initialization waits for the saved ingestion budget before
+/// starting the collectors with the current one.
+const INGEST_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn apply_saved_ingest_limits(
+    config_service: &temps_config::ConfigService,
+    ingest_budget: &IngestBudget,
+) {
+    match tokio::time::timeout(INGEST_SETTINGS_TIMEOUT, config_service.get_settings()).await {
+        Ok(Ok(settings)) => {
+            let logs = &settings.container_logs;
+            ingest_budget.set_limits(IngestLimits::from_settings(logs));
+            tracing::info!(
+                ingest_lines_per_sec = logs.ingest_lines_per_sec,
+                ingest_kib_per_sec = logs.ingest_kib_per_sec,
+                "per-container log ingestion budget loaded"
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "could not read the saved log ingestion budget at startup; using the defaults until the next budget sync"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = INGEST_SETTINGS_TIMEOUT.as_secs(),
+            "reading the saved log ingestion budget at startup timed out; using the defaults until the next budget sync"
+        ),
     }
 }
 

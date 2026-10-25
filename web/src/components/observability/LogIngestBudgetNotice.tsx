@@ -4,10 +4,10 @@
 import { Callout } from '@temps-sdk/ds'
 import { Link } from 'react-router'
 import type {
-  LogIngestBudgetCapability,
+  LogIngestBudgetStatus,
   ThrottledLogSource,
 } from '@/api/client/types.gen'
-import { useGlobalLogCapabilities } from '@/hooks/useGlobalLogs'
+import { useLogIngestBudget } from '@/hooks/useGlobalLogs'
 
 /** How many throttled containers are itemized; the title counts them all. */
 const LISTED = 5
@@ -25,7 +25,7 @@ function formatRate(bytesPerSec: number): string {
   return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`
 }
 
-function describeBudget(budget: LogIngestBudgetCapability): string {
+function describeBudget(budget: LogIngestBudgetStatus): string {
   const parts = [
     budget.lines_per_sec > 0
       ? `${number.format(budget.lines_per_sec)} lines/s`
@@ -77,7 +77,7 @@ export function LogIngestBudgetNotice({
   scope,
   className,
 }: {
-  budget: LogIngestBudgetCapability | undefined
+  budget: LogIngestBudgetStatus | undefined
   /** Project names by id, as the log explorer resolves them. */
   projectLabels?: Record<string, string>
   /** Only containers of this project or external service. */
@@ -140,29 +140,32 @@ export function LogIngestBudgetNotice({
 }
 
 /**
- * The same notice for one project's or one external service's log view,
- * reading the budget status the Logs page polls.
+ * The notice with its data: polls the ingestion budget status for a log
+ * view, optionally narrowed to one project or external service.
  */
-export function ScopedLogIngestBudgetNotice({
+export function LogIngestBudgetWarning({
   scope,
   label,
+  projectLabels,
   className,
 }: {
-  scope: LogIngestScope
-  /** How to name the project or service in each line. */
+  scope?: LogIngestScope
+  /** How to name the scoped project in each line. */
   label?: string
+  /** Project names by id, for an unscoped view. */
+  projectLabels?: Record<string, string>
   className?: string
 }) {
-  const capabilities = useGlobalLogCapabilities()
+  const status = useLogIngestBudget()
   return (
     <LogIngestBudgetNotice
-      budget={capabilities.data?.ingest_budget}
+      budget={status.data}
       scope={scope}
       className={className}
       projectLabels={
-        label && scope.projectId != null
+        label && scope?.projectId != null
           ? { [String(scope.projectId)]: label }
-          : undefined
+          : projectLabels
       }
     />
   )

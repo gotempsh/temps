@@ -225,7 +225,6 @@ pub const ANALYTICS_SETUP_PATH: &str = "/settings/metrics-monitoring";
 pub struct GlobalLogCapabilities {
     pub analytics: AnalyticsCapability,
     pub collection: LogCollectionCapability,
-    pub ingest_budget: LogIngestBudgetCapability,
 }
 
 /// Settings page and section that configure the ingestion budget.
@@ -234,10 +233,10 @@ pub const INGEST_BUDGET_SETUP_PATH: &str =
 
 /// The per-container log ingestion budget and the containers over it now.
 /// A throttled container has lines dropped (not stored, not indexed), so it
-/// is reported here for the explorer to name it rather than leave a gap in
+/// is reported here for the console to name it rather than leave a gap in
 /// its history unexplained.
 #[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
-pub struct LogIngestBudgetCapability {
+pub struct LogIngestBudgetStatus {
     /// Lines per second each container may store; `0` = no line limit.
     pub lines_per_sec: u32,
     /// Bytes per second each container may store; `0` = no byte limit.
@@ -456,6 +455,39 @@ pub struct AnalyticsCapability {
     pub forget_backlog: u64,
 }
 
+/// The ingestion budget and the containers dropping lines over it, for the
+/// warnings on the log views. Reads only in-memory state, so the console can
+/// poll it from every log view; the caller's access scope is resolved only
+/// when some container is throttled.
+#[utoipa::path(get, path="/logs/ingest-budget", tag="Logs",
+    responses(
+        (status=200, description="Budget and throttled containers the caller can read", body=LogIngestBudgetStatus),
+        (status=401, description="Unauthorized", body=ProblemDetails),
+        (status=403, description="Insufficient permissions", body=ProblemDetails),
+        (status=500, description="The caller's log access could not be resolved", body=ProblemDetails)
+    ),
+    security(("bearer_auth"=[])))]
+pub async fn log_ingest_budget(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<LogAggregatorAppState>>,
+) -> Result<Json<LogIngestBudgetStatus>, Problem> {
+    permission_guard!(auth, LogsRead);
+    let limits = state.ingest_budget.limits();
+    let throttled = state.ingest_budget.throttled_sources();
+    let throttled = if throttled.is_empty() || auth.is_instance_admin() {
+        throttled
+    } else {
+        visible_throttled(throttled, &scope_for(&auth, &state).await?)
+    };
+    Ok(Json(LogIngestBudgetStatus {
+        lines_per_sec: limits.lines_per_sec,
+        bytes_per_sec: limits.bytes_per_sec,
+        burst_seconds: BURST_SECONDS,
+        setup_path: INGEST_BUDGET_SETUP_PATH.to_string(),
+        throttled,
+    }))
+}
+
 #[utoipa::path(get, path="/logs/global/capabilities", tag="Logs",
     responses((status=200,body=GlobalLogCapabilities),(status=403,body=ProblemDetails)),
     security(("bearer_auth"=[])))]
@@ -481,15 +513,6 @@ pub async fn global_log_capabilities(
         .chunk_writer
         .collection_status(DEFERRED_GENERATIONS_LISTED)
         .await;
-    let limits = state.ingest_budget.limits();
-    let throttled = state.ingest_budget.throttled_sources();
-    // Resolving the caller's scope costs a query; only pay it when there is
-    // something to filter.
-    let throttled = if throttled.is_empty() || auth.is_instance_admin() {
-        throttled
-    } else {
-        visible_throttled(throttled, &scope_for(&auth, &state).await?)
-    };
     Ok(Json(GlobalLogCapabilities {
         analytics: AnalyticsCapability {
             configured: reason.is_none(),
@@ -508,13 +531,6 @@ pub async fn global_log_capabilities(
             collection.into()
         } else {
             LogCollectionCapability::from(collection).without_server_details()
-        },
-        ingest_budget: LogIngestBudgetCapability {
-            lines_per_sec: limits.lines_per_sec,
-            bytes_per_sec: limits.bytes_per_sec,
-            burst_seconds: BURST_SECONDS,
-            setup_path: INGEST_BUDGET_SETUP_PATH.to_string(),
-            throttled,
         },
     }))
 }

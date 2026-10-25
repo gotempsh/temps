@@ -3811,6 +3811,8 @@
             "default": {
               "cache_mb": 2048,
               "head_buffer_mb": 8,
+              "ingest_kib_per_sec": 256,
+              "ingest_lines_per_sec": 250,
               "max_file": 3,
               "max_size": "50m",
               "service_max_file": 3,
@@ -12876,6 +12878,24 @@
             "format": "int32",
             "maximum": 256,
             "minimum": 1,
+            "type": "integer"
+          },
+          "ingest_kib_per_sec": {
+            "default": 256,
+            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit.",
+            "example": 256,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ingest_lines_per_sec": {
+            "default": 250,
+            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving.",
+            "example": 250,
+            "format": "int32",
+            "maximum": 1000000,
+            "minimum": 0,
             "type": "integer"
           },
           "max_file": {
@@ -34009,6 +34029,14 @@
         ],
         "type": "object"
       },
+      "IngestDropReason": {
+        "description": "Which budget a dropped line exceeded.",
+        "enum": [
+          "lines_per_sec",
+          "bytes_per_sec"
+        ],
+        "type": "string"
+      },
       "IngestErrorSummary": {
         "description": "One aggregated ingest-failure group: \"this signal failed this way N times\".\n\nThe pipeline-stats counters say *how many* records were dropped;\nthis says *why*. Rows are grouped by `(signal_type, error_class)` rather\nthan stored per-event, so a sustained outage collapses into one row with a\nrising `count` instead of flooding the table.\n\n`sample_message` is one representative backend error string, kept for the\ndetail a class name cannot carry (the failing column, the refused address).\nIt is a sample, not a guarantee: which occurrence it came from is\nunspecified.",
         "properties": {
@@ -36759,6 +36787,48 @@
           "stopped"
         ],
         "type": "string"
+      },
+      "LogIngestBudgetStatus": {
+        "description": "The per-container log ingestion budget and the containers over it now.\nA throttled container has lines dropped (not stored, not indexed), so it\nis reported here for the console to name it rather than leave a gap in\nits history unexplained.",
+        "properties": {
+          "burst_seconds": {
+            "description": "Seconds of budget a container may send at once before it is held to\nthe rate.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_per_sec": {
+            "description": "Bytes per second each container may store; `0` = no byte limit.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines_per_sec": {
+            "description": "Lines per second each container may store; `0` = no line limit.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "setup_path": {
+            "description": "Console path where an administrator changes the budget.",
+            "type": "string"
+          },
+          "throttled": {
+            "description": "Containers that dropped lines in the last minute, noisiest first,\nlimited to the projects and services the caller can read.",
+            "items": {
+              "$ref": "#/components/schemas/ThrottledLogSource"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "lines_per_sec",
+          "bytes_per_sec",
+          "burst_seconds",
+          "setup_path",
+          "throttled"
+        ],
+        "type": "object"
       },
       "LogLevel": {
         "description": "Normalized log level",
@@ -63071,6 +63141,104 @@
           "status",
           "created_at",
           "updated_at"
+        ],
+        "type": "object"
+      },
+      "ThrottledLogSource": {
+        "description": "A container that is dropping lines because it exceeds its budget.",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "deploy_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "dropped_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "dropped_lines": {
+            "description": "Totals since temps started collecting the container.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "env": {
+            "type": "string"
+          },
+          "external_service_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_dropped_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "node_id": {
+            "description": "Worker node, for containers collected from a remote node.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "offered_bytes_per_sec": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "offered_lines_per_sec": {
+            "description": "What the container is producing, measured over the last few seconds;\n`0` once it has gone quiet.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "project_id": {
+            "description": "`None` for external-service containers.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "$ref": "#/components/schemas/IngestDropReason",
+            "description": "Budget the most recent dropped line exceeded."
+          },
+          "service": {
+            "description": "Service label, or the external service's name.",
+            "type": "string"
+          },
+          "throttled_since": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_id",
+          "service",
+          "env",
+          "offered_lines_per_sec",
+          "offered_bytes_per_sec",
+          "dropped_lines",
+          "dropped_bytes",
+          "reason",
+          "throttled_since",
+          "last_dropped_at"
         ],
         "type": "object"
       },
@@ -107657,6 +107825,62 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Logs"
+        ]
+      }
+    },
+    "/logs/ingest-budget": {
+      "get": {
+        "operationId": "log_ingest_budget",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LogIngestBudgetStatus"
+                }
+              }
+            },
+            "description": "Budget and throttled containers the caller can read"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The caller's log access could not be resolved"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The ingestion budget and the containers dropping lines over it, for the\nwarnings on the log views. Reads only in-memory state, so the console can\npoll it from every log view; the caller's access scope is resolved only\nwhen some container is throttled.",
         "tags": [
           "Logs"
         ]

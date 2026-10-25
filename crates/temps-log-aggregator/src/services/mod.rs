@@ -29,7 +29,7 @@ pub use forget_sweeper::{
 };
 pub use ingest_budget::{
     Admission, IngestBudget, IngestDropReason, IngestLimiter, IngestLimits, IngestSource,
-    ThrottledLogSource, BURST_SECONDS,
+    ThrottledLogSource, BURST_SECONDS, STATS_WINDOW, THROTTLED_VISIBLE_FOR,
 };
 pub use metadata::{LogEventsQuery, LogMetadataService};
 pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};

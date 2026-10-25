@@ -6164,6 +6164,19 @@ export type ContainerLogSettings = {
      */
     head_buffer_mb?: number;
     /**
+     * Per-container ingestion budget, in KiB per second, enforced alongside
+     * `ingest_lines_per_sec`. `0` disables the byte limit.
+     */
+    ingest_kib_per_sec?: number;
+    /**
+     * Per-container ingestion budget, in lines per second. A container
+     * over budget has its excess lines dropped (not stored or indexed),
+     * a notice written into its log, and is listed as throttled in the log
+     * explorer. Up to 10 seconds of budget may arrive at once. `0` disables
+     * the line limit. Applied within a minute of saving.
+     */
+    ingest_lines_per_sec?: number;
+    /**
      * Maximum number of rotated log files to keep (e.g., 3 means up to 3 x max_size total)
      */
     max_file?: number;
@@ -15911,6 +15924,11 @@ export type IncrResponse = {
 };
 
 /**
+ * Which budget a dropped line exceeded.
+ */
+export type IngestDropReason = 'lines_per_sec' | 'bytes_per_sec';
+
+/**
  * One aggregated ingest-failure group: "this signal failed this way N times".
  *
  * The pipeline-stats counters say *how many* records were dropped;
@@ -17106,6 +17124,37 @@ export type LogCollectionCapability = {
 };
 
 export type LogCollectionState = 'running' | 'recovering' | 'retrying' | 'stopped';
+
+/**
+ * The per-container log ingestion budget and the containers over it now.
+ * A throttled container has lines dropped (not stored, not indexed), so it
+ * is reported here for the console to name it rather than leave a gap in
+ * its history unexplained.
+ */
+export type LogIngestBudgetStatus = {
+    /**
+     * Seconds of budget a container may send at once before it is held to
+     * the rate.
+     */
+    burst_seconds: number;
+    /**
+     * Bytes per second each container may store; `0` = no byte limit.
+     */
+    bytes_per_sec: number;
+    /**
+     * Lines per second each container may store; `0` = no line limit.
+     */
+    lines_per_sec: number;
+    /**
+     * Console path where an administrator changes the budget.
+     */
+    setup_path: string;
+    /**
+     * Containers that dropped lines in the last minute, noisiest first,
+     * limited to the projects and services the caller can read.
+     */
+    throttled: Array<ThrottledLogSource>;
+};
 
 /**
  * Normalized log level
@@ -29532,6 +29581,46 @@ export type ThreadArtifactResponse = {
     status: string;
     title?: string | null;
     updated_at: string;
+};
+
+/**
+ * A container that is dropping lines because it exceeds its budget.
+ */
+export type ThrottledLogSource = {
+    container_id: string;
+    deploy_id?: number | null;
+    dropped_bytes: number;
+    /**
+     * Totals since temps started collecting the container.
+     */
+    dropped_lines: number;
+    env: string;
+    external_service_id?: number | null;
+    last_dropped_at: string;
+    /**
+     * Worker node, for containers collected from a remote node.
+     */
+    node_id?: number | null;
+    node_name?: string | null;
+    offered_bytes_per_sec: number;
+    /**
+     * What the container is producing, measured over the last few seconds;
+     * `0` once it has gone quiet.
+     */
+    offered_lines_per_sec: number;
+    /**
+     * `None` for external-service containers.
+     */
+    project_id?: number | null;
+    /**
+     * Budget the most recent dropped line exceeded.
+     */
+    reason: IngestDropReason;
+    /**
+     * Service label, or the external service's name.
+     */
+    service: string;
+    throttled_since: string;
 };
 
 /**
@@ -54839,6 +54928,39 @@ export type SearchGlobalLogsResponses = {
 };
 
 export type SearchGlobalLogsResponse = SearchGlobalLogsResponses[keyof SearchGlobalLogsResponses];
+
+export type LogIngestBudgetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/logs/ingest-budget';
+};
+
+export type LogIngestBudgetErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The caller's log access could not be resolved
+     */
+    500: ProblemDetails;
+};
+
+export type LogIngestBudgetError = LogIngestBudgetErrors[keyof LogIngestBudgetErrors];
+
+export type LogIngestBudgetResponses = {
+    /**
+     * Budget and throttled containers the caller can read
+     */
+    200: LogIngestBudgetStatus;
+};
+
+export type LogIngestBudgetResponse = LogIngestBudgetResponses[keyof LogIngestBudgetResponses];
 
 export type SearchLogsData = {
     body: SearchLogsRequest;

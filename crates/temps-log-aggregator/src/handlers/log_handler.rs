@@ -25,8 +25,8 @@ use temps_core::RequestMetadata;
 
 use super::global::{
     facet_global_logs, global_log_aggregate, global_log_attribute_keys, global_log_capabilities,
-    global_log_facets_attrs, global_log_histogram, search_global_logs, AggregateResponse,
-    AttributeKeysResponse, FacetsAttrsResponse, HistogramResponse,
+    global_log_facets_attrs, global_log_histogram, log_ingest_budget, search_global_logs,
+    AggregateResponse, AttributeKeysResponse, FacetsAttrsResponse, HistogramResponse,
 };
 use crate::error::LogAggregatorError;
 use crate::handlers::types::LogAggregatorAppState;
@@ -419,6 +419,7 @@ pub struct PurgeLogsRequest {
         super::global::search_global_logs,
         super::global::facet_global_logs,
         super::global::global_log_capabilities,
+        super::global::log_ingest_budget,
         super::global::global_log_attribute_keys,
         super::global::global_log_facets_attrs,
         super::global::global_log_histogram,
@@ -439,7 +440,7 @@ pub struct PurgeLogsRequest {
             super::global::LogCollectionCapability,
             super::global::LogCollectionState,
             super::global::DeferredWalGeneration,
-            super::global::LogIngestBudgetCapability,
+            super::global::LogIngestBudgetStatus,
             crate::services::ThrottledLogSource,
             crate::services::IngestDropReason,
             AttributeKeysResponse,
@@ -489,6 +490,7 @@ pub fn configure_routes() -> Router<Arc<LogAggregatorAppState>> {
         .route("/logs/global/search", post(search_global_logs))
         .route("/logs/global/facets", post(facet_global_logs))
         .route("/logs/global/capabilities", get(global_log_capabilities))
+        .route("/logs/ingest-budget", get(log_ingest_budget))
         .route("/logs/global/attributes", get(global_log_attribute_keys))
         .route("/logs/global/facets/attrs", get(global_log_facets_attrs))
         .route("/logs/global/histogram", get(global_log_histogram))
@@ -2769,6 +2771,113 @@ mod tests {
         assert_eq!(
             response.status_code(),
             StatusCode::OK,
+            "{}",
+            response.text()
+        );
+    }
+
+    // ── Ingestion budget ────────────────────────────────────────────────
+
+    /// Push a container of `project_id` over a 1 line/s budget. Its limiter
+    /// is dropped; the container stays listed while its bucket is parked.
+    fn throttle(budget: &Arc<crate::services::IngestBudget>, project_id: i32, container_id: &str) {
+        budget.set_limits(crate::services::IngestLimits {
+            lines_per_sec: 1,
+            bytes_per_sec: 0,
+        });
+        let mut limiter = budget.limiter(crate::services::IngestSource {
+            ctx: ContainerContext {
+                project_id,
+                external_service_id: None,
+                env: "1".into(),
+                service: "web".into(),
+                container_id: container_id.into(),
+                deploy_id: None,
+            },
+            node_id: None,
+            node_name: None,
+        });
+        let now = Utc::now();
+        for i in 0..100 {
+            limiter.admit(10, now + Duration::microseconds(i));
+        }
+    }
+
+    fn throttled_ids(body: &serde_json::Value) -> Vec<String> {
+        body["throttled"]
+            .as_array()
+            .map(|sources| {
+                sources
+                    .iter()
+                    .filter_map(|s| s["container_id"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn ingest_budget_names_the_throttled_container_and_how_to_change_the_budget() {
+        let ctx = create_test_context().await;
+        throttle(&ctx.app_state.ingest_budget, 4, "noisy-container");
+        let server = build_test_server(ctx.app_state.clone());
+
+        let response = server.get("/logs/ingest-budget").await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["lines_per_sec"], 1);
+        assert_eq!(body["burst_seconds"], crate::services::BURST_SECONDS);
+        assert_eq!(
+            body["setup_path"],
+            "/settings/metrics-monitoring#container-log-ingest-budget"
+        );
+        assert_eq!(throttled_ids(&body), ["noisy-container"]);
+        assert_eq!(body["throttled"][0]["reason"], "lines_per_sec");
+        assert_eq!(body["throttled"][0]["project_id"], 4);
+    }
+
+    // A member learns about throttled containers of projects they can read,
+    // never about another tenant's.
+    #[tokio::test]
+    async fn ingest_budget_lists_only_containers_the_member_can_read() {
+        let ctx = create_test_context().await;
+        let (_, project_id) = seed_external_service_with_project(ctx.app_state.db.as_ref()).await;
+        throttle(&ctx.app_state.ingest_budget, project_id, "readable");
+        throttle(
+            &ctx.app_state.ingest_budget,
+            project_id + 1_000,
+            "other-tenant",
+        );
+
+        let member = build_test_server_with_role(ctx.app_state.clone(), Role::Reader);
+        let response = member.get("/logs/ingest-budget").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::OK,
+            "{}",
+            response.text()
+        );
+        assert_eq!(throttled_ids(&response.json()), ["readable"]);
+
+        let admin = build_test_server(ctx.app_state.clone());
+        let mut all = throttled_ids(&admin.get("/logs/ingest-budget").await.json());
+        all.sort();
+        assert_eq!(all, ["other-tenant", "readable"]);
+    }
+
+    #[tokio::test]
+    async fn ingest_budget_requires_logs_read() {
+        let ctx = create_test_context().await;
+        let server = build_test_server_with_role(ctx.app_state.clone(), Role::MetricsIngest);
+        let response = server.get("/logs/ingest-budget").await;
+        assert_eq!(
+            response.status_code(),
+            StatusCode::FORBIDDEN,
             "{}",
             response.text()
         );
