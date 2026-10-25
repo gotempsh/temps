@@ -2995,6 +2995,7 @@ fn ai_read_allowlist() -> Vec<String> {
         "global_log_capabilities",
         "global_log_facets_attrs",
         "global_log_histogram",
+        "log_ingest_budget",
         "list_facets",
         "NodeMetricsGetAlertRules",
         "get_cloud_backfill_status",
