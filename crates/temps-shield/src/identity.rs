@@ -41,6 +41,31 @@ impl VisitorIdentity {
     }
 }
 
+/// The network a visitor connects from, for per-network limits: the /24 of
+/// an IPv4 address or the /48 of an IPv6 one. Wider than the identity's /64,
+/// since one IPv6 subscriber usually holds a /48 or a /56, and unlike the
+/// identity it ignores the User-Agent, which a client can change at will.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VisitorNetwork(pub(crate) [u8; 8]);
+
+impl VisitorNetwork {
+    pub fn of(client_ip: Option<IpAddr>) -> Self {
+        let mut network = [0u8; 8];
+        match client_ip.map(|ip| ip.to_canonical()) {
+            Some(IpAddr::V4(v4)) => {
+                network[0] = 4;
+                network[1..4].copy_from_slice(&v4.octets()[..3]);
+            }
+            Some(IpAddr::V6(v6)) => {
+                network[0] = 6;
+                network[1..7].copy_from_slice(&v6.octets()[..6]);
+            }
+            None => {}
+        }
+        Self(network)
+    }
+}
+
 impl std::fmt::Debug for VisitorIdentity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "VisitorIdentity(")?;
@@ -105,6 +130,17 @@ mod tests {
             VisitorIdentity::compute(ip("203.0.113.7"), UA, "tls:b")
         );
         assert_ne!(base, VisitorIdentity::compute(None, UA, "tls:a"));
+    }
+
+    #[test]
+    fn networks_are_the_ipv4_slash_24_and_the_ipv6_slash_48() {
+        let net = |s: &str| VisitorNetwork::of(ip(s));
+        assert_eq!(net("203.0.113.7"), net("203.0.113.200"));
+        assert_eq!(net("::ffff:203.0.113.7"), net("203.0.113.7"));
+        assert_ne!(net("203.0.113.7"), net("203.0.114.7"));
+        assert_eq!(net("2001:db8:1:2::1"), net("2001:db8:1:ffff::9"));
+        assert_ne!(net("2001:db8:1::1"), net("2001:db8:2::1"));
+        assert_ne!(net("203.0.113.7"), VisitorNetwork::of(None));
     }
 
     #[test]

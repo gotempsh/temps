@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::budget::BudgetCounter;
-use crate::identity::VisitorIdentity;
+use crate::identity::{VisitorIdentity, VisitorNetwork};
 use crate::keys::ShieldKeys;
 use crate::redeemed::{NotRecorded, RedeemedSalts};
 use crate::token::{
@@ -52,6 +52,12 @@ pub const DEFAULT_BUDGET_PER_HOUR: u32 = 3_000;
 /// cannot grow memory without limit.
 const MAX_REDEEMED: usize = 200_000;
 
+/// Upper bound on redeemed salts held for one network (an IPv4 /24 or IPv6
+/// /48), so one client cannot take the whole set: filling it then needs
+/// hundreds of networks. Generous for a busy NAT, where every visitor
+/// solves at most once a day per identity.
+const MAX_REDEEMED_PER_NETWORK: u32 = 256;
+
 /// What a request's clearance cookie allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
@@ -83,7 +89,7 @@ impl ChallengeGate {
     pub fn with_budget(keys: ShieldKeys, budget_per_hour: u32) -> Self {
         Self {
             keys,
-            redeemed: RedeemedSalts::new(MAX_REDEEMED),
+            redeemed: RedeemedSalts::new(MAX_REDEEMED, MAX_REDEEMED_PER_NETWORK),
             budgets: BudgetCounter::new(),
             budget_per_hour,
         }
@@ -125,6 +131,7 @@ impl ChallengeGate {
         token: &str,
         nonce: &str,
         identity: &VisitorIdentity,
+        network: VisitorNetwork,
         now: u64,
     ) -> Result<Clearance, ChallengeError> {
         let claims = open_challenge(&self.keys, token)?;
@@ -138,9 +145,10 @@ impl ChallengeGate {
         // A full set refuses rather than forgetting a salt whose token is
         // still valid, which would let that token be redeemed again.
         self.redeemed
-            .record(claims.salt, claims.issued_at, now)
+            .record(claims.salt, claims.issued_at, network, now)
             .map_err(|refusal| match refusal {
                 NotRecorded::Replayed => ChallengeError::Replayed,
+                NotRecorded::NetworkFull => ChallengeError::NetworkBusy,
                 NotRecorded::Full => ChallengeError::Busy,
             })?;
         let value = seal_clearance(
@@ -193,6 +201,7 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     const NOW: u64 = 1_800_000_000;
+    const NET: VisitorNetwork = VisitorNetwork([4, 203, 0, 113, 0, 0, 0, 0]);
     const DIFFICULTY: u8 = 8;
 
     fn gate_with_budget(budget: u32) -> ChallengeGate {
@@ -224,7 +233,7 @@ mod tests {
     fn clearance(gate: &ChallengeGate, env_id: i32, who: &VisitorIdentity) -> String {
         let token = gate.issue(env_id, who, DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
-        let clearance = gate.redeem(&token, &nonce, who, NOW + 1).unwrap();
+        let clearance = gate.redeem(&token, &nonce, who, NET, NOW + 1).unwrap();
         assert_eq!(clearance.env_id, env_id);
         clearance.value
     }
@@ -247,12 +256,12 @@ mod tests {
         let gate = gate();
         let who = visitor(1);
         assert_eq!(
-            gate.redeem("anything", "0", &who, NOW),
+            gate.redeem("anything", "0", &who, NET, NOW),
             Err(ChallengeError::Malformed)
         );
         let forged = "A".repeat(80);
         let nonce = solve(&forged, DIFFICULTY);
-        assert!(gate.redeem(&forged, &nonce, &who, NOW).is_err());
+        assert!(gate.redeem(&forged, &nonce, &who, NET, NOW).is_err());
 
         let token = gate.issue(1, &who, 20, NOW).unwrap();
         let unsolved = (0u64..)
@@ -263,7 +272,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            gate.redeem(&token, &unsolved, &who, NOW),
+            gate.redeem(&token, &unsolved, &who, NET, NOW),
             Err(ChallengeError::InsufficientWork)
         );
     }
@@ -274,10 +283,10 @@ mod tests {
         let token = gate.issue(7, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
         assert_eq!(
-            gate.redeem(&token, &nonce, &visitor(2), NOW),
+            gate.redeem(&token, &nonce, &visitor(2), NET, NOW),
             Err(ChallengeError::WrongVisitor)
         );
-        let clearance = gate.redeem(&token, &nonce, &visitor(1), NOW).unwrap();
+        let clearance = gate.redeem(&token, &nonce, &visitor(1), NET, NOW).unwrap();
         assert_eq!(clearance.env_id, 7);
         assert_eq!(
             gate.admit(&clearance.value, 7, &visitor(1), NOW),
@@ -295,7 +304,7 @@ mod tests {
         let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
         assert_eq!(
-            gate.redeem(&token, &nonce, &visitor(1), NOW + CHALLENGE_TTL_SECS),
+            gate.redeem(&token, &nonce, &visitor(1), NET, NOW + CHALLENGE_TTL_SECS),
             Err(ChallengeError::Expired)
         );
     }
@@ -305,9 +314,9 @@ mod tests {
         let gate = gate();
         let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
         let nonce = solve(&token, DIFFICULTY);
-        assert!(gate.redeem(&token, &nonce, &visitor(1), NOW).is_ok());
+        assert!(gate.redeem(&token, &nonce, &visitor(1), NET, NOW).is_ok());
         assert_eq!(
-            gate.redeem(&token, &nonce, &visitor(1), NOW),
+            gate.redeem(&token, &nonce, &visitor(1), NET, NOW),
             Err(ChallengeError::Replayed)
         );
     }
@@ -326,7 +335,7 @@ mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         barrier.wait();
-                        gate.redeem(&token, &nonce, &visitor(1), NOW).is_ok()
+                        gate.redeem(&token, &nonce, &visitor(1), NET, NOW).is_ok()
                     })
                 })
                 .collect();
@@ -351,26 +360,49 @@ mod tests {
     #[test]
     fn a_full_redeemed_set_refuses_until_its_tokens_expire() {
         let mut gate = gate();
-        gate.redeemed = RedeemedSalts::new(2);
+        gate.redeemed = RedeemedSalts::new(2, 10);
         let (first, first_nonce) = solved(&gate, NOW);
         let (second, second_nonce) = solved(&gate, NOW);
         let (third, third_nonce) = solved(&gate, NOW);
-        assert!(gate.redeem(&first, &first_nonce, &visitor(1), NOW).is_ok());
         assert!(gate
-            .redeem(&second, &second_nonce, &visitor(1), NOW)
+            .redeem(&first, &first_nonce, &visitor(1), NET, NOW)
+            .is_ok());
+        assert!(gate
+            .redeem(&second, &second_nonce, &visitor(1), NET, NOW)
             .is_ok());
         assert_eq!(
-            gate.redeem(&third, &third_nonce, &visitor(1), NOW),
+            gate.redeem(&third, &third_nonce, &visitor(1), NET, NOW),
             Err(ChallengeError::Busy)
         );
         assert_eq!(
-            gate.redeem(&first, &first_nonce, &visitor(1), NOW),
+            gate.redeem(&first, &first_nonce, &visitor(1), NET, NOW),
             Err(ChallengeError::Replayed)
         );
         let later = NOW + 60 + CHALLENGE_TTL_SECS;
         let (fresh, fresh_nonce) = solved(&gate, later);
         assert!(gate
-            .redeem(&fresh, &fresh_nonce, &visitor(1), later)
+            .redeem(&fresh, &fresh_nonce, &visitor(1), NET, later)
+            .is_ok());
+    }
+
+    /// One network solving as fast as it can is refused once it holds its
+    /// share of the redeemed set; other networks still redeem.
+    #[test]
+    fn one_network_cannot_fill_the_redeemed_set() {
+        let mut gate = gate();
+        gate.redeemed = RedeemedSalts::new(10, 1);
+        let other = VisitorNetwork([4, 198, 51, 100, 0, 0, 0, 0]);
+        let (first, first_nonce) = solved(&gate, NOW);
+        let (second, second_nonce) = solved(&gate, NOW);
+        assert!(gate
+            .redeem(&first, &first_nonce, &visitor(1), NET, NOW)
+            .is_ok());
+        assert_eq!(
+            gate.redeem(&second, &second_nonce, &visitor(1), NET, NOW),
+            Err(ChallengeError::NetworkBusy)
+        );
+        assert!(gate
+            .redeem(&second, &second_nonce, &visitor(1), other, NOW)
             .is_ok());
     }
 

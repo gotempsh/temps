@@ -10,7 +10,7 @@
 //! in a body decides who it is or which environment it cleared.
 
 use serde::Deserialize;
-use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity};
+use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity, VisitorNetwork};
 
 /// Where the challenge page posts its solution. Answered by the proxy on
 /// every project host; it never reaches the console or the application.
@@ -51,6 +51,12 @@ pub fn visitor_identity(
     )
 }
 
+/// The network `client_ip` belongs to, for the per-network share of the
+/// redeemed-token set.
+pub fn visitor_network(client_ip: Option<&str>) -> VisitorNetwork {
+    VisitorNetwork::of(client_ip.and_then(|ip| ip.parse().ok()))
+}
+
 #[derive(Debug, Deserialize)]
 struct VerifyBody {
     token: String,
@@ -82,12 +88,13 @@ pub fn verify(
     gate: &ChallengeGate,
     body: &[u8],
     identity: &VisitorIdentity,
+    network: VisitorNetwork,
     now: u64,
 ) -> VerifyOutcome {
     let Ok(body) = serde_json::from_slice::<VerifyBody>(body) else {
         return VerifyOutcome::BadRequest;
     };
-    match gate.redeem(&body.token, &body.nonce, identity, now) {
+    match gate.redeem(&body.token, &body.nonce, identity, network, now) {
         Ok(clearance) => VerifyOutcome::Cleared {
             env_id: clearance.env_id,
             set_cookie: clearance.set_cookie(),
@@ -103,6 +110,7 @@ pub fn rejection_code(error: ChallengeError) -> &'static str {
         ChallengeError::Expired => "expired",
         ChallengeError::Replayed => "replayed",
         ChallengeError::Busy => "busy",
+        ChallengeError::NetworkBusy => "rate_limited",
         ChallengeError::InsufficientWork | ChallengeError::BadNonce => "unsolved",
         _ => "invalid",
     }
@@ -182,13 +190,14 @@ mod tests {
     fn verify_rejects_bodies_that_are_not_solutions() {
         let gate = test_gate();
         let who = visitor_identity(Some("203.0.113.9"), "ua", Some("t13_aa"));
-        assert_eq!(verify(&gate, b"", &who, 0), VerifyOutcome::BadRequest);
+        let net = visitor_network(Some("203.0.113.9"));
+        assert_eq!(verify(&gate, b"", &who, net, 0), VerifyOutcome::BadRequest);
         assert_eq!(
-            verify(&gate, br#"{"challenge":"x","nonce":"1"}"#, &who, 0),
+            verify(&gate, br#"{"challenge":"x","nonce":"1"}"#, &who, net, 0),
             VerifyOutcome::BadRequest
         );
         assert_eq!(
-            verify(&gate, br#"{"token":"x","nonce":"1"}"#, &who, 0),
+            verify(&gate, br#"{"token":"x","nonce":"1"}"#, &who, net, 0),
             VerifyOutcome::Rejected(ChallengeError::Malformed)
         );
     }

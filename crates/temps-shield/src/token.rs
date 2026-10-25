@@ -58,6 +58,8 @@ pub enum ChallengeError {
     Replayed,
     #[error("too many tokens were redeemed recently; try again shortly")]
     Busy,
+    #[error("too many tokens were redeemed from this network recently")]
+    NetworkBusy,
     #[error("the signing key was rejected")]
     Key,
 }

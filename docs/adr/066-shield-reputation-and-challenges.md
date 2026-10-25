@@ -743,7 +743,8 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   `{ "token": "...", "nonce": "...", "solve_ms": 1234 }`, at most 4 KB,
   answered by the proxy itself on every project host. Answers: `200` with
   the cookie; `403` with `{"ok":false,"error":"expired|replayed|unsolved|invalid"}`;
-  `400` for any other body, including the old one; `405`, `413`. A failed
+  `429` `rate_limited` and `503` `busy` (below); `400` for any other body,
+  including the old one; `405`, `413`. A failed
   page offers "Try again", which reloads and brings a new token.
 - The challenge page carries the token and difficulty in escaped `data-`
   attributes, never in inline script literals, and is sent with
@@ -753,8 +754,13 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   token was issued, and a group is dropped once all its tokens have
   expired (at most 6 minutes); salts never leave to make room, since a
   forgotten salt could be redeemed again. Expiry follows the same clock as
-  the token checks. Once 200,000 unexpired salts are held, verify answers
-  503 `busy` until the oldest group expires. Checking and recording a salt
+  the token checks. One network (an IPv4 /24 or IPv6 /48, whatever the
+  User-Agent) may hold at most 256 unexpired salts; past that, verify
+  answers 429 `rate_limited`. Once 200,000 unexpired salts are held, verify
+  answers 503 `busy` until the oldest group expires. At difficulty 20 a
+  token costs about 2^20 hashes, so one GPU could fill the whole set within
+  its 6 minutes; the per-network share means filling it takes some 800
+  networks instead. Checking and recording a salt
   happen under one lock, taken only for tokens that passed the signature,
   visitor and proof-of-work checks.
 - Budget counts are keyed by `budget_id` in a count-min sketch per ingress:

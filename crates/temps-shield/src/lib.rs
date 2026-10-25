@@ -21,7 +21,7 @@ pub use gate::{
     clearance_cookie_name, Admission, ChallengeGate, Clearance, CLEARANCE_COOKIE_PREFIX,
     DEFAULT_BUDGET_PER_HOUR,
 };
-pub use identity::VisitorIdentity;
+pub use identity::{VisitorIdentity, VisitorNetwork};
 pub use keys::ShieldKeys;
 pub use token::{has_leading_zero_bits, ChallengeError, CHALLENGE_TTL_SECS, CLEARANCE_TTL_SECS};
 

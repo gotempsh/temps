@@ -3413,6 +3413,7 @@ impl LoadBalancer {
                 &self.challenge_gate,
                 &body,
                 &identity,
+                crate::shield::visitor_network(ctx.ip_address.as_deref()),
                 temps_shield::unix_now(),
             ) {
                 crate::shield::VerifyOutcome::Cleared {
@@ -3433,12 +3434,13 @@ impl LoadBalancer {
                 }
                 crate::shield::VerifyOutcome::Rejected(error) => {
                     debug!(%error, "Attack mode: challenge rejected");
-                    // A full redeemed set is the ingress's limit, not the
-                    // visitor's fault; the page offers a retry.
-                    let status = if error == temps_shield::ChallengeError::Busy {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        StatusCode::FORBIDDEN
+                    // A full redeemed set is the ingress's limit and a full
+                    // network share is a rate limit, not a bad solution; the
+                    // page offers a retry for both.
+                    let status = match error {
+                        temps_shield::ChallengeError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+                        temps_shield::ChallengeError::NetworkBusy => StatusCode::TOO_MANY_REQUESTS,
+                        _ => StatusCode::FORBIDDEN,
                     };
                     (
                         status,
