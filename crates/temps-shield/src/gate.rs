@@ -76,6 +76,7 @@ pub enum Admission {
 pub struct ChallengeGate {
     keys: ShieldKeys,
     redeemed: Cache<[u8; 16], ()>,
+    redeemed_capacity: u64,
     budgets: Cache<[u8; 8], Arc<AtomicU32>>,
     budget_per_hour: u32,
 }
@@ -88,10 +89,14 @@ impl ChallengeGate {
     pub fn with_budget(keys: ShieldKeys, budget_per_hour: u32) -> Self {
         Self {
             keys,
+            // No `max_capacity`: a size-evicted salt could be redeemed
+            // again before its token expires. Entries leave only by TTL,
+            // which outlives every token, and `redeem` refuses new entries
+            // once the set holds `redeemed_capacity`.
             redeemed: Cache::builder()
-                .max_capacity(MAX_TRACKED)
                 .time_to_live(Duration::from_secs(CHALLENGE_TTL_SECS + 60))
                 .build(),
+            redeemed_capacity: MAX_TRACKED,
             budgets: Cache::builder()
                 .max_capacity(MAX_TRACKED)
                 .time_to_live(BUDGET_WINDOW)
@@ -146,6 +151,12 @@ impl ChallengeGate {
             return Err(ChallengeError::WrongVisitor);
         }
         check_work(token, nonce, claims.difficulty)?;
+        // The count is approximate and concurrent callers can pass together,
+        // so this bounds memory loosely; replay protection does not depend
+        // on it.
+        if self.redeemed.entry_count() >= self.redeemed_capacity {
+            return Err(ChallengeError::Busy);
+        }
         // `or_insert_with` coalesces concurrent callers on one key, so exactly
         // one sees a fresh entry. `or_insert` does not: racing submissions of
         // one solution would each mint a clearance.
@@ -355,6 +366,41 @@ mod tests {
                 .count()
         });
         assert_eq!(successes, 1);
+    }
+
+    /// A full redeemed set refuses new tokens rather than forgetting old
+    /// ones, so a token cannot be replayed after a flood of redemptions.
+    #[test]
+    fn a_full_redeemed_set_refuses_instead_of_forgetting() {
+        let mut gate = gate();
+        gate.redeemed_capacity = 2;
+        let solved: Vec<_> = (0..3)
+            .map(|_| {
+                let token = gate.issue(1, &visitor(1), DIFFICULTY, NOW).unwrap();
+                let nonce = solve(&token, DIFFICULTY);
+                (token, nonce)
+            })
+            .collect();
+        for (token, nonce) in &solved[..2] {
+            assert!(gate.redeem(token, nonce, &visitor(1), NOW).is_ok());
+        }
+        gate.redeemed.run_pending_tasks();
+        let (token, nonce) = &solved[2];
+        assert_eq!(
+            gate.redeem(token, nonce, &visitor(1), NOW),
+            Err(ChallengeError::Busy)
+        );
+        let (first, first_nonce) = &solved[0];
+        assert_eq!(
+            gate.redeem(first, first_nonce, &visitor(1), NOW),
+            Err(ChallengeError::Busy)
+        );
+        gate.redeemed_capacity = 3;
+        assert_eq!(
+            gate.redeem(first, first_nonce, &visitor(1), NOW),
+            Err(ChallengeError::Replayed)
+        );
+        assert!(gate.redeem(token, nonce, &visitor(1), NOW).is_ok());
     }
 
     #[test]

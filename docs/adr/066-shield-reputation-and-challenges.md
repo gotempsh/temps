@@ -747,9 +747,14 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   attributes, never in inline script literals, and is sent with
   `Cache-Control: no-store`, since its token is bound to one visitor.
 - Each ingress keeps a 6-minute set of redeemed token salts, so one solved
-  token mints one clearance per ingress.
+  token mints one clearance per ingress. Salts leave the set only when they
+  expire, never to make room, since a forgotten salt could be redeemed
+  again. Once the set holds 200,000 salts, verify answers 503 `busy` until
+  older salts expire.
 - The budget counter is keyed by `budget_id` and lives in a moka cache
-  bounded at 200,000 entries per ingress.
+  bounded at 200,000 entries per ingress. Evicting a counter restarts that
+  clearance's hour, which weakens the budget but not the challenge: every
+  clearance still costs a solve.
 - Until JA4 (phase 3), the `ja4_or_source` input of the identity is the
   proxy's existing TLS fingerprint (`tls:<fingerprint>`); attack mode keeps
   answering plain HTTP with 426.

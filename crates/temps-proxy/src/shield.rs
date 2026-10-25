@@ -102,6 +102,7 @@ pub fn rejection_code(error: ChallengeError) -> &'static str {
     match error {
         ChallengeError::Expired => "expired",
         ChallengeError::Replayed => "replayed",
+        ChallengeError::Busy => "busy",
         ChallengeError::InsufficientWork | ChallengeError::BadNonce => "unsolved",
         _ => "invalid",
     }

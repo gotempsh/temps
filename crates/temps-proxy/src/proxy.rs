@@ -3433,8 +3433,15 @@ impl LoadBalancer {
                 }
                 crate::shield::VerifyOutcome::Rejected(error) => {
                     debug!(%error, "Attack mode: challenge rejected");
+                    // A full redeemed set is the ingress's limit, not the
+                    // visitor's fault; the page offers a retry.
+                    let status = if error == temps_shield::ChallengeError::Busy {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::FORBIDDEN
+                    };
                     (
-                        StatusCode::FORBIDDEN,
+                        status,
                         None,
                         format!(
                             r#"{{"ok":false,"error":"{}"}}"#,

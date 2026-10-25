@@ -56,6 +56,8 @@ pub enum ChallengeError {
     InsufficientWork,
     #[error("the token was already redeemed")]
     Replayed,
+    #[error("too many tokens were redeemed recently; try again shortly")]
+    Busy,
     #[error("the signing key was rejected")]
     Key,
 }
