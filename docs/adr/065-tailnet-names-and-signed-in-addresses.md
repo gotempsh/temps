@@ -464,8 +464,9 @@ read from the API when planning (absent, or its `comment`, `ports`,
       something the agent did not write, it removes nothing and reports it.
       The step then becomes `conflict` naming what is there, and the row
       stays until the user decides;
-    - **the agent wrote nothing** (it reported `conflict` or `error`):
-      there is nothing of Temps' on the worker. The row is deleted without
+    - **the agent wrote nothing** (it reported `conflict`, which it
+      decides from a read before any write): there is nothing of Temps' on
+      the worker. The row is deleted without
       any instruction to the agent, so pre-existing configuration is never
       touched;
     - **no report arrived:** the agent may have written the entry and lost
@@ -478,7 +479,23 @@ read from the API when planning (absent, or its `comment`, `ports`,
       when no such handler was there, and the row is deleted on either.
       Until a report arrives the step stays pending, like any step the
       reconciler is waiting on;
-    - **the worker is gone from the cluster:** the row is deleted at once.
+    - **the agent reported `error`:** the write may have reached tailscaled
+      before the error (a timeout after the commit, for example), so it is
+      handled exactly as no report, above;
+    - **the worker is gone from the cluster:** no agent can report, and
+      removing a node does not by itself clear its tailscaled. Removing a
+      node whose agent still answers first sends these removals through
+      the `removing` path above. Otherwise the row becomes `removing` with
+      no `applied_etag`, and is deleted only on proof that the machine no
+      longer serves it: for a Service, the API's host list no longer
+      includes the machine (the D2 host read); for any entry, the machine
+      is no longer in the tailnet. Until then the step is `waiting` and
+      names the machine: "`nas` left the cluster while it served `myapp`.
+      Remove it from the tailnet, or run `tailscale serve reset` on it,
+      then confirm." The user may confirm instead, after checking the
+      machine, as for a Service deletion. While the row exists, that host
+      counts as recorded, not unrecorded, so it blocks deleting the Service
+      without reading as someone else's;
 
     The step is pending until one of these ends it. It is never done just
     because the row was deleted.
