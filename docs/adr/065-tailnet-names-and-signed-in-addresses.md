@@ -314,8 +314,7 @@ read from the API when planning (absent, or its `comment`, `ports`,
 |---|---|---|
 | `TailscaleCredential {name}` | its Temps row | immediate |
 | `TailscaleService {name, marker}` | `GET …/services/{name}` and its `comment` | settled (two misses), as Cloudflare DNS |
-| `TailscaleServiceHost {name, node_id}` | its `tailnet_service_hosts` row | immediate |
-| `TailscaleServe {node_id, address_id}` | the desired-entry row, then the agent's report | immediate for the row; the step is done only on the report |
+| `TailscaleServe {node_id, address_id}` | the `tailnet_serve_entries` row and this run's reference to it, then the agent's report | immediate for the row; the step is done only on the report |
 | `ServiceApproval {name, node_id}` | none: a wait, no side effect | n/a |
 
 - **Temps' Service definition is fixed, and Temps never updates a
@@ -338,12 +337,13 @@ read from the API when planning (absent, or its `comment`, `ports`,
     all.
   - A marker with another install's id, or no marker, is not Temps'. It is
     never written to or deleted.
-- **Which hosts are valid: the recorded ones.** Each worker a run configures
-  for a Service gets a `tailnet_service_hosts` row (Service name, node,
-  address, the run that added it). The row is written in the same
-  transaction as that worker's Serve desired-entry row and is journaled, so
-  undo removes it. The valid hosts of a Service are its rows, whichever run
-  of this install added them; a host advertising the name without a row is
+- **Which hosts are valid: the ones with a Serve entry.** What a worker
+  serves for an address is one `tailnet_serve_entries` row per (node,
+  address): way in, Service name if any. That row is the only record of a
+  worker configuration (D2's Serve entry and, for a Service, its
+  `AdvertiseServices` name), and it is shared, not per run (below). The
+  valid hosts of a Service are the nodes of its entries, whichever run of
+  this install made them; a host advertising the name without an entry is
   foreign.
 - **Create only when absent.** The plan reads the name first and records
   what it found in the fingerprint: absent, or the `comment`, `ports`,
@@ -389,7 +389,7 @@ read from the API when planning (absent, or its `comment`, `ports`,
     `ports` and `tags` are the fixed definition, and `addrs` equals the
     `addrs` journaled by the run that created it;
   - **in both cases:** every host advertising the name has a
-    `tailnet_service_hosts` row.
+    `tailnet_serve_entries` row.
 
   Any mismatch makes the step `conflict`, even with this install's marker,
   and names the field: "`svc:myapp` now listens on `tcp:8443` as well,
@@ -402,15 +402,26 @@ read from the API when planning (absent, or its `comment`, `ports`,
   hosts is required: if implementation finds that the D2 scopes cannot read
   them, the Service way in is not offered until a way to read them without
   `devices:core` is found.
-- **The Serve entry is declared, and applied by the agent.** The run writes
-  a desired-entry row (`tailnet_serve_entries`: node, address, way in,
-  Service name) and the route snapshot carries it to that worker only. The
-  agent applies it with `If-Match` (D2) and reports, per entry, `applied`
-  with the config's `Etag`, `conflict` naming what holds the slot ("a
-  `tailscale serve` entry proxying to `http://127.0.0.1:3000`"), or
+- **The Serve entry is declared, shared by reference, and applied by the
+  agent.** One `tailnet_serve_entries` row per (node, address) holds what
+  that worker must configure, and the route snapshot carries it to that
+  worker only. Runs do not own the row; they reference it. Each run that
+  needs it writes a `tailnet_serve_refs` row (entry, run, `created` or
+  `found`) in the same transaction:
+  - **no row yet:** the run creates the row and a `created` reference;
+  - **a matching row** (same way in and Service name), for example a
+    re-run for the address on the same worker: the run adds a `found`
+    reference and changes nothing;
+  - **a row that differs:** the step is `conflict` and names what the
+    worker serves now. Two runs never hold different wishes for one slot.
+
+  The agent applies the row with `If-Match` (D2) and reports, per entry,
+  `applied` with the config's `Etag`, `conflict` naming what holds the slot
+  ("a `tailscale serve` entry proxying to `http://127.0.0.1:3000`"), or
   `error` with the reason. The step is `done` on `applied` and `conflict`
   on `conflict`; it never overwrites. Since tailscaled's write is
-  conditional, there is no lost-update window on the worker.
+  conditional, there is no lost-update window on the worker. The same rule
+  covers the machine-name way in, which has entries but no Service.
 - **Approval is waited for, never done.** The step shows the admin-console
   link and the policy entry to paste:
   `"autoApprovers": {"services": {"svc:myapp": ["tag:temps"]}}`. Whether
@@ -419,13 +430,17 @@ read from the API when planning (absent, or its `comment`, `ports`,
   in `waiting` and resumes when the host reads as approved; it is not a
   failure.
 - **Undo, newest first.**
-  - **Hosts first.** The agent removes the run's Serve entries and its
-    `AdvertiseServices` names. The desired rows and the run's
-    `tailnet_service_hosts` rows are deleted; the step is done on the
-    agent's report, or at once if the worker is gone from the cluster.
-  - **Then the Service, only once it has no hosts left.** It is deleted by
-    the undo that removes its last recorded host, whichever run of this
-    install that is. Deleting it also needs three things:
+  - **References first, worker configuration with the last one.** Undo
+    deletes this run's `tailnet_serve_refs` rows. An entry that still has
+    another run's reference is left exactly as it is, and the worker keeps
+    serving. An entry left with no reference is deleted, so the agent
+    removes its Serve entry and its `AdvertiseServices` name. That step is
+    done on the agent's report, or at once if the worker is gone from the
+    cluster. Undo never removes worker configuration another run still
+    references.
+  - **Then the Service, only once it has no entries left.** It is deleted by
+    the undo that removes its last entry, whichever run of this install
+    that is. Deleting it also needs three things:
     - a journal entry of this install recording `created` for it, with the
       run id in its marker;
     - its definition still matches that entry;
@@ -433,7 +448,7 @@ read from the API when planning (absent, or its `comment`, `ports`,
 
     This way neither the creator's undo nor a later run's undo leaves an
     orphan.
-  - **A Service still in use is kept.** If other runs' hosts remain, undo
+  - **A Service still in use is kept.** If entries other runs reference remain, undo
     reports "kept: `svc:myapp` still serves `myapp` on `nas` (set up on
     3 May)" and is done. That is expected, not a conflict.
   - **Anything else pauses undo as a conflict:** a changed definition, or an
@@ -482,7 +497,7 @@ device can give.
 **Outside (the control plane):** no tunnel publishes or is publishing the
 name; public DNS returns nothing for it or only Tailscale addresses; and
 the agent reports Funnel off for it; and, for a Service, every host
-advertising it has a `tailnet_service_hosts` row (D4), read
+advertising it has a `tailnet_serve_entries` row (D4), read
 from the API with the D2 credential. A foreign host is shown with its name
 and is a failure. A Funnel entry for the name, or a
 `Tailscale-Funnel-Request` seen at the socket, is shown in red ("This
