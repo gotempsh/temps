@@ -735,8 +735,8 @@ fn notice_message(notice: &DropNotice) -> String {
     };
     format!(
         "temps: dropped {} log lines ({} bytes) in the {}s up to this line: this container \
-         exceeded its log ingestion budget of {}. Raise it under Settings > Monitoring > \
-         Container logs, or make the container log less.",
+         exceeded its log ingestion budget of {}. Raise it under Settings > Metrics \
+         Monitoring > Container log ingestion budget, or make the container log less.",
         notice.dropped_lines, notice.dropped_bytes, notice.window_secs, budget
     )
 }
@@ -954,6 +954,13 @@ mod tests {
         assert_eq!(notice.container_id, "noisy");
         assert_eq!(notice.deploy_id, Some(9));
         assert!(notice.msg.contains("100 lines/s"), "{}", notice.msg);
+        assert!(
+            notice
+                .msg
+                .contains("Settings > Metrics Monitoring > Container log ingestion budget"),
+            "the notice must name where the budget is changed: {}",
+            notice.msg
+        );
         assert!(
             notice.msg.contains("in the 5s up to this line"),
             "{}",
