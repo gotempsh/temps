@@ -351,12 +351,16 @@ read from the API when planning (absent, or its `comment`, `ports`,
   option ("`svc:myapp` already exists in your tailnet and Temps did not
   create it; pick another name"). Immediately before the `PUT` the step
   reads the name again:
-  - absent: create it;
-  - this run's own marker (a resumed run whose earlier `PUT` landed): no
-    `PUT`, go to the check below;
-  - anything else, including this install's Service with any field
-    different from the plan's read: `conflict`, nothing written, and the
-    message names the field that changed.
+  - **absent:** create it;
+  - **this run's own marker** (a resumed run whose earlier `PUT` landed):
+    no `PUT`, go to the check below as created;
+  - **this install's marker from an earlier run**, with `comment`, `ports`,
+    `tags` and `addrs` all equal to the plan's read: no `PUT`, journal it
+    `found`, go to the check below as found. This is the re-run path of D1
+    option 1;
+  - **anything else** is `conflict`, nothing written, and the message names
+    what differs: a foreign marker or none, or this install's Service with
+    a field different from the plan's read.
 - **The create can still overwrite, and the ADR accepts that window.** The
   Services API has no conditional create (no `If-Match`, no create-only
   verb), so a Service someone else creates between that re-read and the
