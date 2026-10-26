@@ -750,7 +750,8 @@ extension. Workers serve one request per connection
 connector's JA4 header from loopback exactly as it honours its address
 header: the connector spec gains `client_ja4` (header and source),
 Cloudflare Tunnel's being `cf-ja4` and `cloudflare`, and the origin
-removes the header whatever it holds. Workers remove every header of
+removes the header whatever it holds. A bound origin takes changed
+headers on the next connector sync, without restarting the connector. Workers remove every header of
 `ja4::FORWARDED_JA4_HEADERS` before a request goes upstream, as the
 control plane does. Until workers write events (phase 5) they log the
 JA4 and its source at `debug` per request.

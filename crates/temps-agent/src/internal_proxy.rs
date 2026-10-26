@@ -813,6 +813,35 @@ pub(crate) fn private_router(
     router_with(store, forwarded_proto, None, true, true, tailnet)
 }
 
+/// The headers a tunnel origin trusts from its loopback connector. The
+/// connector supervisor swaps them in place on every sync, so a running
+/// listener never keeps settings the control plane has since changed.
+#[derive(Debug, Default)]
+pub struct TunnelOriginHeaders {
+    pub(crate) client_address: Option<HeaderName>,
+    pub(crate) client_ja4: Option<(HeaderName, temps_shield::ja4::Ja4Source)>,
+}
+
+impl TunnelOriginHeaders {
+    /// `client_ja4` is the header a connector puts the visitor's JA4 in, and
+    /// the source it stands for (ADR 066, D4).
+    pub fn new(
+        client_address_header: Option<&str>,
+        client_ja4: Option<(&str, temps_shield::ja4::Ja4Source)>,
+    ) -> std::io::Result<Self> {
+        let header = |name: &str| {
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        };
+        Ok(Self {
+            client_address: client_address_header.map(header).transpose()?,
+            client_ja4: client_ja4
+                .map(|(name, source)| header(name).map(|name| (name, source)))
+                .transpose()?,
+        })
+    }
+}
+
 /// Remove a tunnel connector's JA4 header and, when the connection came
 /// from loopback, return what it says (ADR 066, D4). The header is removed
 /// either way, and a value not in the exact JA4 format counts as none.
@@ -838,13 +867,13 @@ fn take_forwarded_ja4(
 /// to check, and takes the visitor's address from `client_address_header`
 /// when, and only when, the connection comes from loopback. The visitor's
 /// JA4 comes from `client_ja4`'s header the same way (ADR 066, D4): the
-/// connector ended TLS, so nothing else here can know it.
+/// connector ended TLS, so nothing else here can know it. Both are read
+/// from `headers` on every request.
 pub async fn spawn_tunnel_origin(
     address: SocketAddr,
     store: SharedRouteStore,
     shutdown: Arc<Notify>,
-    client_address_header: Option<String>,
-    client_ja4: Option<(String, temps_shield::ja4::Ja4Source)>,
+    headers: Arc<arc_swap::ArcSwap<TunnelOriginHeaders>>,
 ) -> std::io::Result<SocketAddr> {
     if !address.ip().is_loopback() {
         return Err(std::io::Error::other(
@@ -853,33 +882,22 @@ pub async fn spawn_tunnel_origin(
     }
     let listener = TcpListener::bind(address).await?;
     let bound = listener.local_addr()?;
-    let header = client_address_header
-        .map(|name| HeaderName::from_bytes(name.as_bytes()))
-        .transpose()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let ja4_header = client_ja4
-        .map(|(name, source)| {
-            HeaderName::from_bytes(name.as_bytes()).map(|header| (header, source))
-        })
-        .transpose()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
         move |mut req: Request, next: axum::middleware::Next| {
-            let header = header.clone();
-            let ja4_header = ja4_header.clone();
+            let trusted = headers.load_full();
             async move {
                 let from_loopback = req
                     .extensions()
                     .get::<ConnectInfo<SocketAddr>>()
                     .is_some_and(|peer| peer.0.ip().is_loopback());
-                if let Some((name, source)) = &ja4_header {
+                if let Some((name, source)) = &trusted.client_ja4 {
                     if let Some(fingerprint) =
                         take_forwarded_ja4(req.headers_mut(), from_loopback, name, *source)
                     {
                         req.extensions_mut().insert(fingerprint);
                     }
                 }
-                if let Some(name) = &header {
+                if let Some(name) = &trusted.client_address {
                     let visitor = req
                         .headers()
                         .get(name)
