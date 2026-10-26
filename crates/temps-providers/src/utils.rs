@@ -51,6 +51,40 @@ pub(crate) fn default_service_log_config() -> bollard::models::HostConfigLogConf
     service_log_config("20m", 3)
 }
 
+/// `HostConfig.init` for every managed-service container (Redis, MariaDB,
+/// MongoDB, MinIO/S3, RustFS): always on.
+///
+/// Without it the service's main process runs as PID 1. Most database and
+/// storage servers do not reap children they did not spawn, so every process
+/// orphaned inside the container -- a timed-out healthcheck, a `docker exec`
+/// whose shell died first -- stays behind as a zombie for the container's
+/// lifetime. Docker's init (tini) reaps them and forwards signals unchanged,
+/// so `docker stop` still produces the image's normal shutdown.
+///
+/// PostgreSQL has its own `POSTGRES_CONTAINER_INIT` with the same value.
+pub(crate) const MANAGED_SERVICE_CONTAINER_INIT: Option<bool> = Some(true);
+
+/// Whether an existing container's `HostConfig` predates
+/// [`MANAGED_SERVICE_CONTAINER_INIT`]. `HostConfig.Init` is fixed at creation,
+/// so only a recreate applies it.
+pub(crate) fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
+    host_config.init != MANAGED_SERVICE_CONTAINER_INIT
+}
+
+/// Entries of `desired_env` (`KEY=value`) that are absent from a container's
+/// actual environment. Extra variables the image itself sets are ignored:
+/// only what Temps asks for is compared.
+pub(crate) fn missing_env_entries<'a>(
+    desired_env: &'a [String],
+    actual_env: &[String],
+) -> Vec<&'a str> {
+    desired_env
+        .iter()
+        .filter(|entry| !actual_env.contains(entry))
+        .map(String::as_str)
+        .collect()
+}
+
 /// Build a Docker port-binding map that maps `container_port_key`
 /// (e.g. `"5432/tcp"`) to `host_port` on the loopback interface only.
 ///

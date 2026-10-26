@@ -2194,7 +2194,13 @@ fn build_ch_metrics_store(
         },
     );
 
-    Some(store as Arc<dyn MetricsStore>)
+    // Every producer (scraper, samplers, health monitors, OTLP) writes a few
+    // dozen points per tick; buffering turns those into a few large inserts
+    // instead of one ClickHouse part each.
+    Some(temps_metrics::BufferedMetricsStore::wrap(
+        store as Arc<dyn MetricsStore>,
+        temps_metrics::BufferConfig::default(),
+    ))
 }
 
 /// Build the console health/readiness router.

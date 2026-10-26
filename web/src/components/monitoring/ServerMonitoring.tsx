@@ -17,6 +17,8 @@
  * heartbeats and the rest pulled from its agent), the combined
  * `GET /nodes/metrics/cluster*` for "All nodes", and, for the control plane
  * only, `GET /nodes/0/docker-disk-usage`, through the generated SDK bindings.
+ * RAID / drive SMART health comes from `GET /nodes/{id}/disk-health`, which a
+ * worker feeds from its heartbeat.
  */
 
 import { HelpPopover } from '@temps-sdk/ds'
@@ -96,6 +98,7 @@ import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Pause, Play, RefreshCw, Settings } from 'lucide-react'
 import { useMemo, useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { DiskHealthCard } from './DiskHealthCard'
 
 const METRICS_SETTINGS_PATH = '/settings/metrics-monitoring'
 const REFRESH_MS = 30_000
@@ -932,6 +935,12 @@ export function ServerMonitoring({
         {/* Docker's own `system df` answers without any recorded sample. */}
         {showDockerDiskUsage && <DockerDiskUsageCard />}
       </div>
+
+      {/* RAID and drive SMART health of one node; a worker reports it in its
+          heartbeat. "All nodes" has no single set of drives to show. */}
+      {metricsEnabled && scope.kind === 'node' && (
+        <DiskHealthCard nodeId={scope.id} />
+      )}
 
       {!noSamples && (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2">

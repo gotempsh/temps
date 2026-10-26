@@ -9,6 +9,7 @@
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
 pub mod commands;
+mod database_url_source;
 mod docker_context;
 pub mod otel_export;
 
@@ -559,8 +560,14 @@ unsafe fn scrub_argv_raw(
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
     // Mutates the environment, so it runs before anything can spawn a thread.
     let docker_context = docker_context::adopt_active_docker_context();
+    // Also mutates the environment: exports TEMPS_DATABASE_URL from
+    // TEMPS_DATABASE_URL_FILE or a systemd credential before clap reads it.
+    let database_url_source = database_url_source::adopt_database_url_file()?;
     install_crypto_provider();
     let cli = Cli::parse();
+    // Checked before the scrub below overwrites the value.
+    let database_url_flag_used =
+        database_url_source::database_url_on_command_line(std::env::args_os());
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv(&positional_secrets(&cli));
@@ -574,6 +581,20 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     };
     install_tracing_with_otel(&cli.log_level, &cli.log_format, "", otel.layer.take());
     otel.report();
+    match &database_url_source {
+        database_url_source::DatabaseUrlSource::Unchanged => {}
+        database_url_source::DatabaseUrlSource::File(path) => tracing::info!(
+            "Read the database URL from {} (TEMPS_DATABASE_URL_FILE)",
+            path.display()
+        ),
+        database_url_source::DatabaseUrlSource::SystemdCredential(path) => tracing::info!(
+            "Read the database URL from the systemd credential {}",
+            path.display()
+        ),
+    }
+    if database_url_flag_used {
+        tracing::warn!("{}", database_url_source::command_line_warning());
+    }
     match docker_context {
         Ok(adopted) => tracing::info!(
             "Using Docker context '{}' ({}) because DOCKER_HOST is not set",

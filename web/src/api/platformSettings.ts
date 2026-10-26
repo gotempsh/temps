@@ -49,10 +49,13 @@ export interface DiskSpaceAlertSettings {
 /// `BuildLimitsSettings` struct. `cpu_limit_cores = 0` or `memory_limit_mb
 /// = 0` means "fall back to the legacy 50%-of-host heuristic" so admins
 /// can enable concurrency without committing to specific resource caps.
+/// `build_cache_max_gb = 0` disables the build cache size cap.
 export interface BuildLimitsSettings {
   max_concurrent: number
   cpu_limit_cores: number
   memory_limit_mb: number
+  build_cache_max_gb: number
+  build_cache_max_unused_days: number
 }
 
 /// Per-provider config as returned by GET /api/settings. The `credentials_encrypted`
@@ -156,9 +159,13 @@ export interface ContainerLogSettings {
   cache_mb: number
   /** Per-container cap (MiB) on unsealed lines held before sealing a chunk. */
   head_buffer_mb: number
-  /** Per-container ingestion budget in lines/s; 0 = no line limit. */
+  /**
+   * Per-container ingestion budget in lines per second (10 s burst). Lines
+   * over it are dropped and the gap is noted in the container's logs.
+   * `0` disables the limit.
+   */
   ingest_lines_per_sec: number
-  /** Per-container ingestion budget in KiB/s; 0 = no byte limit. */
+  /** Per-container ingestion budget in KiB per second. `0` disables it. */
   ingest_kib_per_sec: number
 }
 

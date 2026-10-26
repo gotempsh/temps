@@ -40,6 +40,7 @@
 //! | `node.disk_write_bytes_total` | Gauge (cumulative) | Bytes written to physical block devices since boot (`/proc/diskstats`) |
 //! | `node.network_rx_bytes_total` | Gauge (cumulative) | Bytes received on non-virtual interfaces since boot (`/proc/net/dev`) |
 //! | `node.network_tx_bytes_total` | Gauge (cumulative) | Bytes transmitted on non-virtual interfaces since boot (`/proc/net/dev`) |
+//! | `node.raid_*`, `node.disk_wear_percent`, `node.disk_media_errors`, `node.disk_bytes_written_total`, `node.disk_health_drives*` | Gauge | RAID array and drive health — see [`super::disk_health`] |
 //!
 //! ## Cumulative I/O counters
 //!
@@ -70,6 +71,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use tracing::{debug, warn};
 
+use super::disk_health::{DiskHealthReport, DriveHealthCache};
 use super::{Collector, CollectorConfig};
 use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint, SourceKind};
@@ -151,6 +153,10 @@ pub struct NodeMetricsCollector {
     /// must outlive a single scrape — same reason `prev_cpu` exists above.
     #[cfg(not(target_os = "linux"))]
     fallback: Mutex<fallback::FallbackState>,
+    /// SMART readings, refreshed in the background (see
+    /// [`super::disk_health::DriveHealthCache`]). `None` when this collector
+    /// does not report disk health (see [`Self::without_disk_health`]).
+    drive_health: Option<std::sync::Arc<DriveHealthCache>>,
 }
 
 impl NodeMetricsCollector {
@@ -161,10 +167,25 @@ impl NodeMetricsCollector {
     pub fn with_scope(scope: NodeMetricsScope) -> Self {
         Self {
             scope,
+            drive_health: Some(DriveHealthCache::new("/sys/block")),
             prev_cpu: Mutex::new(None),
             #[cfg(not(target_os = "linux"))]
             fallback: Mutex::new(fallback::FallbackState::new()),
         }
+    }
+}
+
+impl NodeMetricsCollector {
+    /// Leave RAID and drive health out of this collector's points.
+    ///
+    /// A worker reports disk health in its heartbeat, from the agent's own
+    /// [`DriveHealthCache`], and its host-scope report (ADR 061) may carry
+    /// only [`HOST_METRIC_NAMES`]. Its host collector therefore skips disk
+    /// health instead of reading SMART a second time for points the control
+    /// plane would refuse.
+    pub fn without_disk_health(mut self) -> Self {
+        self.drive_health = None;
+        self
     }
 }
 
@@ -212,6 +233,15 @@ impl Collector for NodeMetricsCollector {
             // Block + network I/O — cumulative kernel counters.
             points.extend(collect_disk_io(source_id, config, now).await);
             points.extend(collect_network_io(source_id, config, now).await);
+
+            // RAID arrays (fresh every scrape) and drive health (cached SMART).
+            if let Some(drive_health) = &self.drive_health {
+                points.extend(
+                    DiskHealthReport::read(drive_health)
+                        .await
+                        .points(config, now),
+                );
+            }
 
             // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
             #[cfg(not(target_os = "linux"))]
@@ -1509,12 +1539,40 @@ docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
         assert!(names.contains(&"node.cpu_percent"), "{names:?}");
     }
 
+    /// The control plane's host collector reports RAID and drive health; a
+    /// worker's leaves it to the heartbeat.
+    #[tokio::test]
+    async fn disk_health_is_reported_unless_opted_out() {
+        let config = make_config(1, "/tmp");
+        let is_disk_health =
+            |name: &str| name.starts_with("node.raid_") || name.starts_with("node.drive");
+
+        let worker = NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health();
+        let points = worker.collect(&config).await.unwrap();
+        assert!(!points.is_empty());
+        assert!(
+            !points.iter().any(|p| is_disk_health(&p.name)),
+            "a worker's host collector must not emit disk health"
+        );
+
+        // `/proc/mdstat` exists on every Linux host, RAID or not, so the
+        // control plane always records at least `node.raid_arrays`.
+        if std::path::Path::new("/proc/mdstat").exists() {
+            let control_plane = NodeMetricsCollector::with_scope(NodeMetricsScope::Host);
+            let points = control_plane.collect(&config).await.unwrap();
+            assert!(points.iter().any(|p| p.name == "node.raid_arrays"));
+        }
+    }
+
     /// A worker reports its host with this collector in host scope, and the
     /// control plane accepts only `HOST_METRIC_NAMES`. Anything the collector
     /// emits outside that list would be silently refused for every worker.
     #[tokio::test]
     async fn host_scope_emits_only_names_a_worker_may_report() {
-        let collector = NodeMetricsCollector::with_scope(NodeMetricsScope::Host);
+        // Built the way the agent builds it: disk health travels in the
+        // heartbeat instead.
+        let collector =
+            NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health();
         let config = make_config(1, "/tmp");
         // Two passes: the first primes the CPU baseline, the second carries
         // `node.cpu_percent`.

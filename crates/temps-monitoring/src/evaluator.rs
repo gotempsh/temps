@@ -115,6 +115,10 @@ pub struct AlertEvaluator {
     /// unreachable metrics store or a failing alarm write logged the same line
     /// every 30 seconds, forever. See [`temps_core::log_transitions`].
     log_state: EvaluatorLogState,
+    /// Worker node ids whose default disk-health rules have been seeded;
+    /// `None` until the first sync. Lets each cycle seed only nodes that
+    /// joined since the last one, instead of re-inserting for every node.
+    worker_nodes: std::sync::Mutex<Option<std::collections::BTreeSet<i32>>>,
 }
 
 /// Failure latches for [`AlertEvaluator`]'s recurring conditions.
@@ -222,7 +226,94 @@ impl AlertEvaluator {
             breach_start: Arc::new(RwLock::new(HashMap::new())),
             firing_alarms: Arc::new(RwLock::new(HashMap::new())),
             log_state: EvaluatorLogState::default(),
+            worker_nodes: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Give every worker node the default disk-health rules, and drop the
+    /// node-scoped rules of workers that were removed. Cheap when nothing
+    /// changed: one `SELECT id FROM nodes`. A worker that already has any
+    /// disk-health rule is left alone, so rules an operator deleted on the
+    /// node page stay deleted across restarts. Worker nodes report RAID and
+    /// SMART health in their heartbeat, so these rules have data to read;
+    /// the file-descriptor defaults stay control-plane only, since workers
+    /// don't report those metrics.
+    async fn sync_worker_node_rules(&self) -> Result<(), MetricsError> {
+        use sea_orm::{ConnectionTrait, Statement};
+        let rows = self
+            .db
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT id FROM nodes WHERE id <> 0",
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        let current: std::collections::BTreeSet<i32> = rows
+            .iter()
+            .filter_map(|row| row.try_get::<i32>("", "id").ok())
+            .collect();
+        let previous = match self.worker_nodes.lock() {
+            Ok(known) => known.clone(),
+            Err(_) => None,
+        };
+        if previous.as_ref() == Some(&current) {
+            return Ok(());
+        }
+        let previous = previous.unwrap_or_default();
+        let seeds = node_disk_health_default_seeds();
+        let new_nodes: Vec<i32> = current.difference(&previous).copied().collect();
+        let already_seeded: std::collections::BTreeSet<i32> = if new_nodes.is_empty() {
+            Default::default()
+        } else {
+            let placeholders: Vec<String> = (1..=seeds.len()).map(|i| format!("${i}")).collect();
+            let rows = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    format!(
+                        "SELECT DISTINCT node_id FROM monitoring_alert_rules \
+                         WHERE node_id IS NOT NULL AND node_id <> 0 \
+                         AND metric_name IN ({})",
+                        placeholders.join(", ")
+                    ),
+                    seeds.iter().map(|seed| seed.metric_name.into()),
+                ))
+                .await
+                .map_err(MetricsError::DatabaseError)?;
+            rows.iter()
+                .filter_map(|row| row.try_get::<i32>("", "node_id").ok())
+                .collect()
+        };
+        for node_id in new_nodes.iter().filter(|id| !already_seeded.contains(id)) {
+            seed_node_rules(
+                self.db.as_ref(),
+                "seed_worker_disk_health_rules",
+                *node_id,
+                &seeds,
+            )
+            .await?;
+        }
+        // No FK can do this: node 0 has no row, so `node_id` has none.
+        let removed = self
+            .db
+            .execute(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM monitoring_alert_rules r \
+                 WHERE r.node_id IS NOT NULL AND r.node_id <> 0 \
+                 AND NOT EXISTS (SELECT 1 FROM nodes n WHERE n.id = r.node_id)",
+            ))
+            .await
+            .map_err(MetricsError::DatabaseError)?;
+        if removed.rows_affected() > 0 {
+            info!(
+                rules = removed.rows_affected(),
+                "AlertEvaluator: removed alert rules of worker nodes that no longer exist"
+            );
+        }
+        if let Ok(mut known) = self.worker_nodes.lock() {
+            *known = Some(current);
+        }
+        Ok(())
     }
 
     /// Run the evaluation loop forever.  Spawn this on a background task.
@@ -626,6 +717,12 @@ impl AlertEvaluator {
     /// resolved once per rule at load time, eliminating per-breach DB lookups.
     async fn run_cycle(&self) -> Result<(), String> {
         let now_ts = Utc::now();
+
+        // A failure here only delays a new node's default rules; the cycle
+        // still evaluates the rules that exist.
+        if let Err(e) = self.sync_worker_node_rules().await {
+            warn!("AlertEvaluator: failed to sync worker node alert rules: {e}");
+        }
 
         // Load all enabled rules that are not currently silenced.
         let rules = monitoring_alert_rules::Entity::find()
@@ -1516,7 +1613,13 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(node_id, metric_name)` so concurrent calls are safe.
 pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    seed_node_rules(db, "seed_default_proxy_rules", &proxy_default_seeds()).await
+    seed_node_rules(
+        db,
+        "seed_default_proxy_rules",
+        CONTROL_PLANE_NODE_ID,
+        &proxy_default_seeds(),
+    )
+    .await
 }
 
 /// Insert a default alert rule that fires when OTLP ingest requests are being
@@ -1538,6 +1641,7 @@ pub async fn seed_default_otel_rate_limit_rules(
     seed_node_rules(
         db,
         "seed_default_otel_rate_limit_rules",
+        CONTROL_PLANE_NODE_ID,
         &otel_rate_limit_default_seeds(),
     )
     .await
@@ -1551,11 +1655,17 @@ pub async fn seed_default_otel_rate_limit_rules(
 /// node 0 on every install where the proxy runs, so the defaults always have
 /// data to evaluate. Uses the same `(node_id, metric_name)` unique index as
 /// [`seed_default_proxy_rules`], so this is safe to call alongside it.
+///
+/// Also seeds the disk-health defaults ([`node_disk_health_default_seeds`]):
+/// a degraded RAID array, a worn-out drive and drive media errors.
 pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
+    let mut seeds = node_fd_default_seeds();
+    seeds.extend(node_disk_health_default_seeds());
     seed_node_rules(
         db,
         "seed_default_node_resource_rules",
-        &node_fd_default_seeds(),
+        CONTROL_PLANE_NODE_ID,
+        &seeds,
     )
     .await
 }
@@ -1577,6 +1687,7 @@ pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result
 async fn seed_node_rules(
     db: &DatabaseConnection,
     caller: &str,
+    node_id: i32,
     seeds: &[RuleSeed],
 ) -> Result<(), MetricsError> {
     use sea_orm::ConnectionTrait;
@@ -1588,7 +1699,7 @@ async fn seed_node_rules(
              VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, true) \
              ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
             [
-                CONTROL_PLANE_NODE_ID.into(),
+                node_id.into(),
                 seed.name.into(),
                 seed.metric_name.into(),
                 seed.threshold.into(),
@@ -1605,7 +1716,7 @@ async fn seed_node_rules(
 
     info!(
         rule_count = seeds.len(),
-        "{caller}: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
+        node_id, "{caller}: seeded default node alert rules (ON CONFLICT DO NOTHING)"
     );
 
     Ok(())
@@ -1943,6 +2054,44 @@ fn node_fd_default_seeds() -> Vec<RuleSeed> {
             comparator: ">",
             severity: "critical",
             for_duration_secs: 30,
+        },
+    ]
+}
+
+/// Default disk-health alert rules for the control-plane node.
+///
+/// `NodeMetricsCollector` reads `/proc/mdstat` on every sample and SMART data
+/// every two minutes (see `temps_metrics::collector::disk_health`); with the
+/// evaluator's 30-second cycle and no `for_duration_secs`, a degraded array
+/// or a failing drive alarms well within five minutes. The rules read the
+/// unlabelled aggregate series: the number of degraded arrays, the worst
+/// drive's wear, and the summed media errors. The node's monitoring page
+/// shows which array or drive it is.
+fn node_disk_health_default_seeds() -> Vec<RuleSeed> {
+    vec![
+        RuleSeed {
+            name: "RAID array degraded",
+            metric_name: "node.raid_degraded",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 0,
+        },
+        RuleSeed {
+            name: "Drive wear above 80%",
+            metric_name: "node.disk_wear_percent",
+            threshold: 80.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 0,
+        },
+        RuleSeed {
+            name: "Drive reporting media errors",
+            metric_name: "node.disk_media_errors",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 0,
         },
     ]
 }
@@ -2293,6 +2442,35 @@ mod tests {
     }
 
     #[test]
+    fn node_disk_health_seeds_match_the_issue_thresholds() {
+        let seeds = node_disk_health_default_seeds();
+        let find = |metric: &str| {
+            seeds
+                .iter()
+                .find(|s| s.metric_name == metric)
+                .unwrap_or_else(|| panic!("no seed for {metric}"))
+        };
+        let raid = find("node.raid_degraded");
+        assert_eq!((raid.comparator, raid.threshold), (">", 0.0));
+        assert_eq!(raid.severity, "critical");
+        let wear = find("node.disk_wear_percent");
+        assert_eq!((wear.comparator, wear.threshold), (">", 80.0));
+        assert_eq!(wear.severity, "warning");
+        let errors = find("node.disk_media_errors");
+        assert_eq!((errors.comparator, errors.threshold), (">", 0.0));
+        assert_eq!(errors.severity, "warning");
+        // Five-minute acceptance: no sustained-breach delay on top of the
+        // two-minute SMART refresh and the 30 s evaluation cycle.
+        assert!(seeds.iter().all(|s| s.for_duration_secs == 0));
+        // Shares the (node_id, metric_name) unique index with the fd seeds.
+        let fd: Vec<&str> = node_fd_default_seeds()
+            .iter()
+            .map(|s| s.metric_name)
+            .collect();
+        assert!(seeds.iter().all(|s| !fd.contains(&s.metric_name)));
+    }
+
+    #[test]
     fn rustfs_default_seeds_use_beta6_otlp_metric_names() {
         let names: Vec<&str> = rustfs_default_seeds()
             .iter()
@@ -2467,6 +2645,96 @@ mod tests {
             Arc::new(NoopQueue),
         ));
         AlertEvaluator::new(db, Arc::new(NoopStore), alarm_service)
+    }
+
+    fn node_rows(ids: &[i32]) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        ids.iter()
+            .map(|id| std::collections::BTreeMap::from([("id", (*id).into())]))
+            .collect()
+    }
+
+    fn seeded_rows(ids: &[i32]) -> Vec<std::collections::BTreeMap<&'static str, sea_orm::Value>> {
+        ids.iter()
+            .map(|id| std::collections::BTreeMap::from([("node_id", (*id).into())]))
+            .collect()
+    }
+
+    fn exec_ok(rows_affected: u64) -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected,
+        }
+    }
+
+    /// #1618: a new worker gets the disk-health rules once, unless it already
+    /// has some; an unchanged node set costs one SELECT; a removed worker's
+    /// rules are deleted.
+    #[tokio::test]
+    async fn worker_disk_health_rules_follow_the_node_set() {
+        let seeds = node_disk_health_default_seeds().len();
+        let mut mock = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // Cycle 1: workers 5 and 6 appear; 6 already has a disk-health
+            // rule (the operator deleted the others), so only 5 is seeded.
+            .append_query_results([node_rows(&[5, 6])])
+            .append_query_results([seeded_rows(&[6])]);
+        for _ in 0..seeds {
+            mock = mock.append_exec_results([exec_ok(1)]);
+        }
+        let db = Arc::new(
+            mock.append_exec_results([exec_ok(0)])
+                // Cycle 2: unchanged.
+                .append_query_results([node_rows(&[5, 6])])
+                // Cycle 3: both workers removed.
+                .append_query_results([node_rows(&[])])
+                .append_exec_results([exec_ok(seeds as u64)])
+                .into_connection(),
+        );
+        let evaluator = evaluator_with_shared_db(db.clone());
+        for _ in 0..3 {
+            evaluator.sync_worker_node_rules().await.expect("sync");
+        }
+
+        let log: Vec<String> = transaction_log(evaluator, db)
+            .iter()
+            .map(|t| format!("{t:?}"))
+            .collect();
+        let inserts = log
+            .iter()
+            .filter(|s| s.contains("INSERT INTO monitoring_alert_rules"));
+        assert_eq!(
+            inserts.clone().count(),
+            seeds,
+            "seeded once, not on the unchanged cycle"
+        );
+        assert!(
+            inserts.clone().all(|s| s.contains("Int(Some(5))")),
+            "only the worker without disk-health rules is seeded: {log:#?}"
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("SELECT DISTINCT node_id FROM monitoring_alert_rules"))
+                .count(),
+            1,
+            "the seeded-check runs only when new workers appear"
+        );
+        assert!(
+            inserts.clone().any(|s| s.contains("node.raid_degraded")),
+            "disk-health rules, not the fd defaults: {log:#?}"
+        );
+        assert!(!log.iter().any(|s| s.contains("node.fd_")), "{log:#?}");
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("SELECT id FROM nodes"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            log.iter()
+                .filter(|s| s.contains("DELETE FROM monitoring_alert_rules"))
+                .count(),
+            2,
+            "cleanup runs only when the node set changed"
+        );
     }
 
     /// Recover the mock connection's statement log.

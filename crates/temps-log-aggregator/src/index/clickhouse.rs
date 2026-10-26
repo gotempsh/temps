@@ -26,7 +26,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -55,19 +55,69 @@ pub const FACET_SLOTS: usize = 20;
 
 const TRACKING_TABLE: &str = "_temps_ch_log_index_migrations";
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    name: "0001_log_lines_index",
-    sql: include_str!("../../migrations/clickhouse/0001_log_lines_index.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_log_lines_index",
+        sql: include_str!("../../migrations/clickhouse/0001_log_lines_index.sql"),
+    },
+    Migration {
+        name: "0002_forgotten_chunks",
+        sql: include_str!("../../migrations/clickhouse/0002_forgotten_chunks.sql"),
+    },
+    Migration {
+        name: "0003_attr_key_counts",
+        sql: include_str!("../../migrations/clickhouse/0003_attr_key_counts.sql"),
+    },
+];
 
 /// The instance's own line-index table. Its DDL is in this repository
 /// (`migrations/clickhouse/0001_log_lines_index.sql`) and this side applies
 /// it.
 pub(crate) const LOCAL_LINES_TABLE: &str = "log_lines_index";
 
-/// The instance's own per-project/day attribute-key rollup, maintained by a
-/// materialized view on [`LOCAL_LINES_TABLE`]. Cloud has no equivalent.
-pub(crate) const LOCAL_ATTR_KEYS_TABLE: &str = "log_attr_keys";
+/// The instance's own per-project/day attribute-key counts. Written by
+/// [`ClickHouseLineIndex::flush_rollups`] from counts accumulated while
+/// indexing (DDL in `migrations/clickhouse/0003_attr_key_counts.sql`).
+/// Cloud has no equivalent.
+pub(crate) const LOCAL_ATTR_KEYS_TABLE: &str = "log_attr_key_counts";
+
+/// Longest attribute-key counts wait in memory before they are written.
+/// One insert per interval holds one row per (project, day, key) seen.
+pub(crate) const ATTR_KEYS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Distinct pending (project, day, key) entries that trigger an early write.
+const ATTR_KEYS_FLUSH_ENTRIES: usize = 20_000;
+
+/// Pending entries kept across failed writes; beyond this the counts are
+/// dropped (they only rank keys in the facet sidebar) so a ClickHouse outage
+/// cannot grow memory without bound.
+const ATTR_KEYS_PENDING_CAP: usize = 200_000;
+
+/// Local tombstones for chunks this instance has forgotten. Reads exclude
+/// them at once; [`ClickHouseLineIndex::reclaim_forgotten`] deletes the
+/// masked rows in batches and then clears the tombstones. DDL in
+/// `migrations/clickhouse/0002_forgotten_chunks.sql`.
+pub(crate) const LOCAL_FORGOTTEN_CHUNKS_TABLE: &str = "log_forgotten_chunks";
+
+/// Which day partitions of [`LOCAL_LINES_TABLE`] hold each chunk, filled by
+/// a materialized view on the lines insert. Lets a reclaim pass delete with
+/// `IN PARTITION` instead of mutating every partition.
+pub(crate) const LOCAL_CHUNK_DAYS_TABLE: &str = "log_chunk_days";
+
+/// Minimum time between two local reclaim passes. Each pass issues one
+/// lightweight `DELETE` per day partition holding forgotten chunks, and a
+/// lightweight delete still rewrites every part of the partition it runs
+/// on, so the cadence -- not the number of forgotten chunks -- sets the
+/// mutation volume. Compaction works on completed days, so a pass usually
+/// touches one or two partitions: four passes a day keeps mutation writes
+/// to a few partition-sizes a day instead of the whole table per forget.
+/// The masked rows are invisible to every read in the meantime.
+pub(crate) const RECLAIM_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// Seqs per `DELETE ... WHERE chunk_seq IN (...)` statement, so one pass
+/// after a long outage never builds an unbounded query.
+const RECLAIM_SEQS_PER_STATEMENT: usize = 10_000;
 
 /// Cloud-side tombstones for chunks this instance has forgotten.
 ///
@@ -651,6 +701,94 @@ fn allowed_slot_values<'a>(
     out
 }
 
+/// One local tombstone (`log_forgotten_chunks`): no instance column, the
+/// table only ever holds this instance's chunks.
+#[derive(Debug, Row, Serialize)]
+struct LocalForgottenChunkRow {
+    chunk_seq: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    forgotten_at: DateTime<Utc>,
+}
+
+/// One day partition and the forgotten chunks that still have rows in it.
+#[derive(Debug, Row, serde::Deserialize)]
+struct ReclaimDayRow {
+    day: String,
+    seqs: Vec<u64>,
+}
+
+/// One `log_attr_key_counts` row.
+#[derive(Debug, Row, Serialize)]
+struct AttrKeyCountRow<'a> {
+    project_id: i32,
+    #[serde(with = "clickhouse::serde::chrono::date")]
+    day: chrono::NaiveDate,
+    key: &'a str,
+    lines: u64,
+}
+
+/// Attribute-key counts not yet written, keyed by (project, UTC day, key).
+#[derive(Debug, Default)]
+struct PendingAttrKeys {
+    counts: HashMap<(i32, chrono::NaiveDate, String), u64>,
+    last_flush: Option<std::time::Instant>,
+}
+
+impl PendingAttrKeys {
+    fn due(&self, now: std::time::Instant) -> bool {
+        !self.counts.is_empty()
+            && (self.counts.len() >= ATTR_KEYS_FLUSH_ENTRIES
+                || self
+                    .last_flush
+                    .is_none_or(|t| now.duration_since(t) >= ATTR_KEYS_FLUSH_INTERVAL))
+    }
+
+    /// Put back counts whose write failed, unless that would exceed the cap.
+    fn restore(&mut self, failed: HashMap<(i32, chrono::NaiveDate, String), u64>) -> bool {
+        if self.counts.len() + failed.len() > ATTR_KEYS_PENDING_CAP {
+            return false;
+        }
+        for (k, n) in failed {
+            *self.counts.entry(k).or_insert(0) += n;
+        }
+        true
+    }
+}
+
+/// The JSON paths ClickHouse's `JSONAllPaths` reports for `attrs`: nested
+/// objects are descended and joined with `.`; arrays and scalars end a path;
+/// `null` values and empty objects store nothing.
+fn attr_paths(prefix: &str, value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if prefix.is_empty() {
+                    attr_paths(k, v, out);
+                } else {
+                    attr_paths(&format!("{prefix}.{k}"), v, out);
+                }
+            }
+        }
+        serde_json::Value::Null => {}
+        _ => out.push(prefix.to_string()),
+    }
+}
+
+/// The attribute paths of one line's residual `attrs` (canonical keys
+/// excluded, exactly as [`residual_attrs`] stores them).
+fn line_attr_paths(fields: Option<&serde_json::Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(obj) = fields.and_then(|f| f.as_object()) else {
+        return out;
+    };
+    for (k, v) in obj {
+        if !crate::parser::is_canonical_key(k) {
+            attr_paths(k, v, &mut out);
+        }
+    }
+    out
+}
+
 /// One tombstone: the chunk this instance no longer has, and when it said so.
 #[derive(Debug, Row, Serialize)]
 struct ForgottenChunkRow<'a> {
@@ -682,6 +820,14 @@ pub struct ClickHouseLineIndex {
     /// Whether the "retention is Cloud's" note has been logged already;
     /// retention ticks are frequent and the note does not change.
     retention_note_logged: AtomicBool,
+    /// Unix seconds of the last local reclaim pass that ran; `0` = never.
+    /// Gates [`ClickHouseLineIndex::reclaim_forgotten`] to
+    /// [`RECLAIM_INTERVAL`].
+    last_reclaim_unix: AtomicI64,
+    /// Attribute-key counts accumulated by local inserts, written by
+    /// [`ClickHouseLineIndex::flush_rollups`]. Locked only to update or take
+    /// the map, never across an await.
+    pending_attr_keys: std::sync::Mutex<PendingAttrKeys>,
 }
 
 impl ClickHouseLineIndex {
@@ -768,6 +914,8 @@ impl ClickHouseLineIndex {
             slots: arc_swap::ArcSwap::from_pointee(Default::default()),
             ttl_days: AtomicU32::new(0),
             retention_note_logged: AtomicBool::new(false),
+            last_reclaim_unix: AtomicI64::new(0),
+            pending_attr_keys: std::sync::Mutex::new(PendingAttrKeys::default()),
         }))
     }
 
@@ -834,6 +982,78 @@ impl ClickHouseLineIndex {
         }
     }
 
+    /// One local reclaim pass: for every day partition that still holds
+    /// rows of a tombstoned chunk, delete those rows with a partition-scoped
+    /// lightweight `DELETE`, then drop the reclaimed `(chunk, day)` entries
+    /// and finally every tombstone whose chunk has no rows left anywhere.
+    /// Returns the number of `(chunk, day)` pairs reclaimed.
+    ///
+    /// Each step is idempotent, so a pass interrupted anywhere just leaves
+    /// work for the next one; the rows stay masked by their tombstone until
+    /// it is gone, and the tombstone is only dropped after its rows are.
+    async fn reclaim_pass(&self) -> Result<u64, LogAggregatorError> {
+        let client = self.read_client()?;
+        let days: Vec<ReclaimDayRow> = client
+            .query(&format!(
+                "SELECT toString(d.day) AS day, groupUniqArray(d.chunk_seq) AS seqs \
+                 FROM {LOCAL_CHUNK_DAYS_TABLE} AS d \
+                 WHERE d.chunk_seq IN (SELECT chunk_seq FROM {LOCAL_FORGOTTEN_CHUNKS_TABLE}) \
+                 GROUP BY day ORDER BY day"
+            ))
+            .fetch_all()
+            .await
+            .map_err(ch_err)?;
+        let mut reclaimed = 0u64;
+        for row in &days {
+            let day = parse_partition_day(&row.day)?;
+            for seqs in row.seqs.chunks(RECLAIM_SEQS_PER_STATEMENT) {
+                let list = seq_list(seqs);
+                client
+                    .query(&format!(
+                        "DELETE FROM {LOCAL_LINES_TABLE} IN PARTITION '{day}' \
+                         WHERE chunk_seq IN ({list})"
+                    ))
+                    .execute()
+                    .await
+                    .map_err(|e| LogAggregatorError::LineIndex {
+                        reason: format!(
+                            "reclaiming {} forgotten chunk(s) from {LOCAL_LINES_TABLE} \
+                             partition {day}: {e}",
+                            seqs.len()
+                        ),
+                    })?;
+                client
+                    .query(&format!(
+                        "DELETE FROM {LOCAL_CHUNK_DAYS_TABLE} \
+                         WHERE day = toDate('{day}') AND chunk_seq IN ({list})"
+                    ))
+                    .execute()
+                    .await
+                    .map_err(ch_err)?;
+                reclaimed += seqs.len() as u64;
+            }
+        }
+        // A tombstone with no `(chunk, day)` entry left masks nothing: its
+        // rows were reclaimed above or the chunk was never indexed. Tiny
+        // table, so this mutation is cheap.
+        client
+            .query(&format!(
+                "DELETE FROM {LOCAL_FORGOTTEN_CHUNKS_TABLE} \
+                 WHERE chunk_seq NOT IN (SELECT chunk_seq FROM {LOCAL_CHUNK_DAYS_TABLE})"
+            ))
+            .execute()
+            .await
+            .map_err(ch_err)?;
+        if reclaimed > 0 {
+            info!(
+                chunk_days = reclaimed,
+                partitions = days.len(),
+                "reclaimed forgotten chunks from the log line index"
+            );
+        }
+        Ok(reclaimed)
+    }
+
     /// Replace the promoted-facet mapping (called by the facet service when
     /// a key is promoted or removed).
     pub fn set_facet_slots(&self, slots: FacetSlots) {
@@ -859,7 +1079,15 @@ impl ClickHouseLineIndex {
                 let row = index_row(seq, labels, first_index + offset as u32, line, &slots);
                 insert.write(&row).await.map_err(ch_err)?;
             }
-            return insert.end().await.map_err(ch_err);
+            insert.end().await.map_err(ch_err)?;
+            self.count_attr_keys(labels.project_id, lines);
+            if self.attr_keys_due() {
+                // The lines are stored; a failed key write is retried later.
+                if let Err(e) = self.flush_attr_keys().await {
+                    warn!(error = %e, "writing attribute-key counts failed; retried on the next flush");
+                }
+            }
+            return Ok(());
         }
         // Cloud scopes by pseudonym, and the whole chunk shares all three:
         // the labels are constant for it, so each HMAC is computed once.
@@ -893,6 +1121,90 @@ impl ClickHouseLineIndex {
                 &policy,
             );
             insert.write(&row).await.map_err(ch_err)?;
+        }
+        insert.end().await.map_err(ch_err)
+    }
+}
+
+impl ClickHouseLineIndex {
+    /// Add one count per attribute path per line to the pending rollup.
+    fn count_attr_keys(&self, project_id: i32, lines: &[LogLine]) {
+        let mut per_line: Vec<((chrono::NaiveDate, String), u64)> = Vec::new();
+        for line in lines {
+            let day = line.ts.date_naive();
+            for path in line_attr_paths(line.fields.as_ref()) {
+                per_line.push(((day, path), 1));
+            }
+        }
+        if per_line.is_empty() {
+            return;
+        }
+        let Ok(mut pending) = self.pending_attr_keys.lock() else {
+            return;
+        };
+        for ((day, key), n) in per_line {
+            *pending.counts.entry((project_id, day, key)).or_insert(0) += n;
+        }
+    }
+
+    fn attr_keys_due(&self) -> bool {
+        self.pending_attr_keys
+            .lock()
+            .map(|p| p.due(std::time::Instant::now()))
+            .unwrap_or(false)
+    }
+
+    /// Write every pending attribute-key count in one insert. Returns the
+    /// number of rows written.
+    async fn flush_attr_keys(&self) -> Result<u64, LogAggregatorError> {
+        let counts = match self.pending_attr_keys.lock() {
+            Ok(mut pending) => {
+                pending.last_flush = Some(std::time::Instant::now());
+                std::mem::take(&mut pending.counts)
+            }
+            Err(_) => return Ok(0),
+        };
+        if counts.is_empty() {
+            return Ok(0);
+        }
+        match self.write_attr_key_counts(&counts).await {
+            Ok(()) => Ok(counts.len() as u64),
+            Err(e) => {
+                let entries = counts.len();
+                let restored = self
+                    .pending_attr_keys
+                    .lock()
+                    .map(|mut p| p.restore(counts))
+                    .unwrap_or(false);
+                if !restored {
+                    warn!(
+                        entries,
+                        cap = ATTR_KEYS_PENDING_CAP,
+                        "dropping attribute-key counts after a failed write; the pending set is full"
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn write_attr_key_counts(
+        &self,
+        counts: &HashMap<(i32, chrono::NaiveDate, String), u64>,
+    ) -> Result<(), LogAggregatorError> {
+        let client = self.write_client()?;
+        let mut insert: clickhouse::insert::Insert<AttrKeyCountRow<'_>> =
+            client.insert(LOCAL_ATTR_KEYS_TABLE).await.map_err(ch_err)?;
+        for ((project_id, day, key), lines) in counts {
+            insert
+                .write(&AttrKeyCountRow {
+                    project_id: *project_id,
+                    day: *day,
+                    key,
+                    lines: *lines,
+                })
+                .await
+                .map_err(ch_err)?;
         }
         insert.end().await.map_err(ch_err)
     }
@@ -992,6 +1304,27 @@ fn slot_values<'a>(
     out
 }
 
+/// Whether a reclaim pass is due, given the last pass's unix seconds.
+fn reclaim_due(last_unix: i64, now_unix: i64) -> bool {
+    last_unix == 0 || now_unix.saturating_sub(last_unix) >= RECLAIM_INTERVAL.as_secs() as i64
+}
+
+/// A day partition value read back from ClickHouse, re-validated as a date
+/// before it is spliced into `IN PARTITION '...'`.
+fn parse_partition_day(day: &str) -> Result<chrono::NaiveDate, LogAggregatorError> {
+    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").map_err(|e| LogAggregatorError::LineIndex {
+        reason: format!("unexpected partition day '{day}' in {LOCAL_CHUNK_DAYS_TABLE}: {e}"),
+    })
+}
+
+/// `1,2,3` for an `IN (...)` list of numeric seqs.
+fn seq_list(seqs: &[u64]) -> String {
+    seqs.iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn ch_err(e: clickhouse::error::Error) -> LogAggregatorError {
     LogAggregatorError::LineIndex {
         reason: e.to_string(),
@@ -1061,6 +1394,23 @@ impl LineIndexSink for ClickHouseLineIndex {
             .execute()
             .await
             .map_err(ch_err)?;
+        // The forget bookkeeping ages out on the same clock as the lines it
+        // describes, so it can never outlive them.
+        client
+            .query(&format!(
+                "ALTER TABLE {LOCAL_CHUNK_DAYS_TABLE} MODIFY TTL day + INTERVAL {days} DAY"
+            ))
+            .execute()
+            .await
+            .map_err(ch_err)?;
+        client
+            .query(&format!(
+                "ALTER TABLE {LOCAL_FORGOTTEN_CHUNKS_TABLE} \
+                 MODIFY TTL toDateTime(forgotten_at) + INTERVAL {days} DAY"
+            ))
+            .execute()
+            .await
+            .map_err(ch_err)?;
         self.ttl_days.store(days, Ordering::Relaxed);
         info!(days, "line index TTL aligned with container log retention");
         Ok(())
@@ -1070,7 +1420,8 @@ impl LineIndexSink for ClickHouseLineIndex {
         if seqs.is_empty() {
             return Ok(());
         }
-        if let Some(tombstones) = self.dialect.tombstones {
+        if self.dialect.is_cloud() {
+            let tombstones = CLOUD_FORGOTTEN_CHUNKS_TABLE;
             // No `DELETE` through the Cloud proxies, so the rows are masked
             // instead: every read excludes these seqs, and Cloud's TTL ages
             // the lines and their tombstones out together.
@@ -1093,20 +1444,56 @@ impl LineIndexSink for ClickHouseLineIndex {
             }
             return insert.end().await.map_err(ch_err);
         }
-        // Lightweight DELETE (mask + background rewrite), not a full
-        // mutation; cheap enough for compaction/purge cadence.
-        let list = seqs
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        self.read_client()?
-            .query(&format!(
-                "DELETE FROM {LOCAL_LINES_TABLE} WHERE chunk_seq IN ({list})"
-            ))
-            .execute()
+        // Locally too, a forget is a tombstone, not a `DELETE`: the sort key
+        // cannot prune on `chunk_seq` and the call carries no time bound, so
+        // a delete here mutated every day partition on every call. Reads
+        // exclude the tombstone immediately; `reclaim_forgotten` removes the
+        // rows later, one partition-scoped delete per day.
+        let client = self.write_client()?;
+        let now = Utc::now();
+        let mut insert: clickhouse::insert::Insert<LocalForgottenChunkRow> = client
+            .insert(LOCAL_FORGOTTEN_CHUNKS_TABLE)
             .await
-            .map_err(ch_err)
+            .map_err(ch_err)?;
+        for seq in seqs {
+            insert
+                .write(&LocalForgottenChunkRow {
+                    chunk_seq: *seq as u64,
+                    forgotten_at: now,
+                })
+                .await
+                .map_err(ch_err)?;
+        }
+        insert.end().await.map_err(ch_err)
+    }
+
+    async fn reclaim_forgotten(&self) -> Result<u64, LogAggregatorError> {
+        // Cloud's TTL ages its masked rows out; there is no DELETE there.
+        if self.dialect.is_cloud() {
+            return Ok(0);
+        }
+        let now = Utc::now().timestamp();
+        let last = self.last_reclaim_unix.load(Ordering::Relaxed);
+        if !reclaim_due(last, now) {
+            return Ok(0);
+        }
+        // Claimed up front: a failing pass waits a whole interval like a
+        // successful one rather than retrying a mutation every sweep.
+        if self
+            .last_reclaim_unix
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return Ok(0);
+        }
+        self.reclaim_pass().await
+    }
+
+    async fn flush_rollups(&self) -> Result<u64, LogAggregatorError> {
+        if self.dialect.is_cloud() {
+            return Ok(0);
+        }
+        self.flush_attr_keys().await
     }
 
     fn unavailable_reason(&self) -> Option<String> {
@@ -1130,6 +1517,104 @@ impl LineIndexSink for ClickHouseLineIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn day(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn attr_paths_match_what_the_json_column_stores() {
+        let fields = serde_json::json!({
+            "trace_id": "canonical, never counted",
+            "status_code": 200,
+            "worker": "w1",
+            "http": { "status": 200, "route": { "name": "x" }, "empty": {} },
+            "tags": ["a", "b"],
+            "gone": null,
+        });
+        let mut paths = line_attr_paths(Some(&fields));
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["http.route.name", "http.status", "tags", "worker"]
+        );
+        assert!(line_attr_paths(None).is_empty());
+        assert!(line_attr_paths(Some(&serde_json::json!("not an object"))).is_empty());
+    }
+
+    #[test]
+    fn pending_attr_keys_flush_on_first_use_then_by_interval_or_size() {
+        let now = std::time::Instant::now();
+        let mut pending = PendingAttrKeys::default();
+        assert!(!pending.due(now), "nothing pending: never due");
+
+        pending
+            .counts
+            .insert((1, day("2026-10-25"), "worker".into()), 3);
+        assert!(
+            pending.due(now),
+            "never flushed: due as soon as there is data"
+        );
+
+        pending.last_flush = Some(now);
+        assert!(!pending.due(now));
+        assert!(pending.due(now + ATTR_KEYS_FLUSH_INTERVAL));
+
+        for i in 0..ATTR_KEYS_FLUSH_ENTRIES {
+            pending
+                .counts
+                .insert((2, day("2026-10-25"), format!("k{i}")), 1);
+        }
+        assert!(pending.due(now), "a full map flushes before the interval");
+    }
+
+    #[test]
+    fn failed_attr_key_writes_are_merged_back_up_to_the_cap() {
+        let mut pending = PendingAttrKeys::default();
+        let key = (7, day("2026-10-25"), "worker".to_string());
+        pending.counts.insert(key.clone(), 2);
+        let failed = HashMap::from([(key.clone(), 5)]);
+        assert!(pending.restore(failed));
+        assert_eq!(pending.counts[&key], 7, "counts for the same key add up");
+
+        let huge: HashMap<_, _> = (0..ATTR_KEYS_PENDING_CAP)
+            .map(|i| ((8, day("2026-10-25"), format!("k{i}")), 1))
+            .collect();
+        assert!(
+            !pending.restore(huge),
+            "past the cap the counts are dropped"
+        );
+        assert_eq!(pending.counts.len(), 1);
+    }
+
+    #[test]
+    fn reclaim_runs_first_time_then_only_after_the_interval() {
+        let interval = RECLAIM_INTERVAL.as_secs() as i64;
+        assert!(reclaim_due(0, 1_000), "never reclaimed: due now");
+        assert!(!reclaim_due(1_000, 1_000 + interval - 1));
+        assert!(reclaim_due(1_000, 1_000 + interval));
+        // A clock that steps backwards must not make it due early.
+        assert!(!reclaim_due(1_000, 500));
+    }
+
+    #[test]
+    fn partition_day_must_be_a_plain_date() {
+        assert_eq!(
+            parse_partition_day("2026-10-21").unwrap().to_string(),
+            "2026-10-21"
+        );
+        // Spliced into `IN PARTITION '...'`, so anything but a date is refused.
+        for bad in ["2026-10-21' OR 1=1 --", "", "21/10/2026", "2026-13-01"] {
+            let err = parse_partition_day(bad).unwrap_err().to_string();
+            assert!(err.contains("log_chunk_days"), "{err}");
+        }
+    }
+
+    #[test]
+    fn seq_list_is_comma_separated() {
+        assert_eq!(seq_list(&[1, 22, 333]), "1,22,333");
+        assert_eq!(seq_list(&[]), "");
+    }
 
     #[test]
     fn residual_attrs_drop_canonical_keys() {
@@ -1675,7 +2160,7 @@ impl LogAnalytics for ClickHouseLineIndex {
             sql.conditions.push("project_id IN ?".into());
         }
         let stmt = format!(
-            "SELECT key, countMerge(lines) AS lines FROM {LOCAL_ATTR_KEYS_TABLE} WHERE {} \
+            "SELECT key, sum(lines) AS lines FROM {LOCAL_ATTR_KEYS_TABLE} WHERE {} \
              GROUP BY key ORDER BY lines DESC LIMIT {}",
             sql.where_clause(),
             limit.clamp(1, 1000)
@@ -1924,6 +2409,7 @@ mod live_tests {
         eprintln!("facets: {facets:#?}");
         assert!(facets.contains_key("service"));
 
+        idx.flush_rollups().await.expect("flush rollups");
         let keys = idx.attribute_keys(&q, 20).await.expect("keys");
         eprintln!("keys: {keys:?}");
 

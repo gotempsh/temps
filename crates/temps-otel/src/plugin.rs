@@ -3,6 +3,7 @@
 
 //! Plugin registration for the OTel subsystem.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1479,21 +1480,58 @@ impl TempsPlugin for OtelPlugin {
 
             // 1c. ADR-027 Phase 0: cross-project trace hint writer consumer.
             //
-            // Drains `trace_hint_rx` and calls `CrossProjectTraceService::record_hint`
-            // for each message, issuing a single multi-row INSERT ON CONFLICT DO NOTHING.
-            // Errors are warned and the loop continues — hint loss is tolerable.
+            // Drains `trace_hint_rx` and coalesces hints for up to
+            // `TRACE_HINT_FLUSH_INTERVAL` (or `TRACE_HINT_FLUSH_REFS` refs)
+            // before writing them with one `record_hints` call. Each OTLP
+            // batch carries 1-3 trace ids, so writing per message meant one
+            // tiny insert — and on ClickHouse one new part — per ingested
+            // batch. Memory is bounded by the flush threshold. Errors are
+            // warned and the loop continues — hint loss is tolerable, and the
+            // next ingest of the same trace re-records it.
             {
                 let hint_svc = cross_project_service.clone();
                 tokio::spawn(async move {
                     info!("Cross-project trace hint writer consumer started");
-                    while let Some(msg) = trace_hint_rx.recv().await {
-                        if let Err(e) = hint_svc.record_hint(msg.trace_ids, msg.project_id).await {
-                            tracing::warn!(
-                                project_id = msg.project_id,
-                                error = %e,
-                                "Cross-project trace hint write failed (non-fatal); \
-                                 subsequent ingests will re-populate via ON CONFLICT DO NOTHING"
-                            );
+                    let mut pending: HashMap<i32, HashSet<String>> = HashMap::new();
+                    let mut pending_refs = 0usize;
+                    let mut ticker = tokio::time::interval(TRACE_HINT_FLUSH_INTERVAL);
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        let closed = tokio::select! {
+                            msg = trace_hint_rx.recv() => match msg {
+                                Some(msg) => {
+                                    let ids = pending.entry(msg.project_id).or_default();
+                                    for id in msg.trace_ids {
+                                        if ids.insert(id) {
+                                            pending_refs += 1;
+                                        }
+                                    }
+                                    if pending_refs < TRACE_HINT_FLUSH_REFS {
+                                        continue;
+                                    }
+                                    false
+                                }
+                                None => true,
+                            },
+                            _ = ticker.tick() => false,
+                        };
+                        if pending_refs > 0 {
+                            let projects = pending.len();
+                            if let Err(e) =
+                                hint_svc.record_hints(std::mem::take(&mut pending)).await
+                            {
+                                tracing::warn!(
+                                    projects,
+                                    refs = pending_refs,
+                                    error = %e,
+                                    "Cross-project trace hint write failed (non-fatal); \
+                                     subsequent ingests will re-record these traces"
+                                );
+                            }
+                            pending_refs = 0;
+                        }
+                        if closed {
+                            break;
                         }
                     }
                     info!("Cross-project trace hint writer consumer stopped (channel closed)");
@@ -1562,7 +1600,6 @@ impl TempsPlugin for OtelPlugin {
                 let stats_ingest_limit = config.max_concurrent_ingest_requests;
                 tokio::spawn(async move {
                     use chrono::Utc;
-                    use std::collections::HashMap;
                     use temps_metrics::{MetricKind, MetricPoint, SourceKind};
 
                     info!(
@@ -1814,6 +1851,12 @@ impl TempsPlugin for OtelPlugin {
 /// attempt before starting without it. Applying them is metadata-only, so a
 /// reachable server finishes well within this.
 const CLICKHOUSE_MIGRATION_STARTUP_WAIT: Duration = Duration::from_secs(30);
+
+/// Longest a cross-project trace hint waits before it is written.
+const TRACE_HINT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Distinct pending `(project, trace_id)` refs that trigger an early flush.
+const TRACE_HINT_FLUSH_REFS: usize = 5_000;
 
 /// Handler state for both route hooks, with the ADR-028 project access checker
 /// injected (it is registered by a later plugin, so it is only available once

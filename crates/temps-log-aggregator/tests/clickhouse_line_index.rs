@@ -224,6 +224,18 @@ async fn row_count(idx: &ClickHouseLineIndex, where_clause: &str) -> u64 {
         .n
 }
 
+async fn table_count(idx: &ClickHouseLineIndex, table: &str, where_clause: &str) -> u64 {
+    idx.client()
+        .expect("a local target owns its client")
+        .query(&format!(
+            "SELECT count() AS n FROM {table} FINAL WHERE {where_clause}"
+        ))
+        .fetch_one::<CountRow>()
+        .await
+        .expect("table count query")
+        .n
+}
+
 // ── 1. connect: migration + idempotency ─────────────────────────────────
 
 #[tokio::test]
@@ -406,6 +418,13 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
     // ── Analytics ────────────────────────────────────────────────────
     let query = scoped_query(vec![9101, 9102, 9103]);
 
+    // Attribute-key counts are batched in memory; write them out first.
+    let written = idx.flush_rollups().await.expect("flush_rollups");
+    assert!(
+        written > 0,
+        "indexed lines with attributes must produce key counts"
+    );
+
     let keys = idx
         .attribute_keys(&query, 50)
         .await
@@ -579,10 +598,49 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
     let before = row_count(&idx, "chunk_seq = 601").await;
     assert_eq!(before, 2, "chunk must be indexed before forgetting it");
 
+    // The view filled the chunk -> day-partition map in the same insert.
+    let days = table_count(&idx, "log_chunk_days", "chunk_seq = 601").await;
+    assert!(
+        days >= 1,
+        "indexed chunk must have its day partition recorded"
+    );
+
     idx.forget_chunks(&[601]).await.expect("forget_chunks");
 
+    // A forget is a tombstone, not a table-wide mutation: the rows stay
+    // until the reclaim pass, but no read can see them any more.
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 601").await,
+        1,
+        "forget_chunks must write a tombstone"
+    );
+    let visible = idx
+        .matching_chunks(&scoped_query(vec![9201]), &[], 100)
+        .await
+        .expect("matching chunks");
+    assert!(
+        !visible.contains(&601),
+        "a forgotten chunk must be invisible to reads before it is reclaimed: {visible:?}"
+    );
+
+    // Reclaim deletes the rows partition by partition and then clears both
+    // bookkeeping tables.
+    let reclaimed = idx.reclaim_forgotten().await.expect("reclaim_forgotten");
+    assert!(reclaimed >= 1, "the forgotten chunk must be reclaimed");
     let after = row_count(&idx, "chunk_seq = 601").await;
-    assert_eq!(after, 0, "forget_chunks must remove that chunk's rows");
+    assert_eq!(after, 0, "reclaim must remove the forgotten chunk's rows");
+    assert_eq!(
+        table_count(&idx, "log_chunk_days", "chunk_seq = 601").await,
+        0,
+        "reclaimed chunk days must be cleared"
+    );
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 601").await,
+        0,
+        "a tombstone whose rows are gone must be cleared"
+    );
+    // Rate-limited: a second pass right away does nothing.
+    assert_eq!(idx.reclaim_forgotten().await.expect("second reclaim"), 0);
 
     // A forgotten chunk that never existed is a no-op, not an error.
     idx.forget_chunks(&[999_999])

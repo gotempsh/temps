@@ -132,6 +132,13 @@ instead of starting an app that cannot resolve its dependency hostnames.
 | Variable             | CLI Flag         | Default    | Description                  |
 | -------------------- | ---------------- | ---------- | ---------------------------- |
 | `TEMPS_DATABASE_URL` | `--database-url` | (required) | PostgreSQL connection string |
+| `TEMPS_DATABASE_URL_FILE` | -- | -- | Path to a file whose content is the connection string. Used only when `TEMPS_DATABASE_URL` is not set |
+
+When neither variable is set, Temps also reads the systemd credential
+`temps_database_url` (`LoadCredential=temps_database_url:/etc/temps/database-url`)
+from `$CREDENTIALS_DIRECTORY`. Prefer any of these over `--database-url`: the
+flag puts the password in `ps` output and in the service definition, and Temps
+logs a warning when it is used.
 
 ### Database URL Format
 

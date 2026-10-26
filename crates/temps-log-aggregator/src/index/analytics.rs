@@ -250,27 +250,27 @@ pub(crate) enum Scoping {
 }
 
 /// Everything about a target that changes the SQL: where the rows live, how
-/// the attributes are stored, how a project is named, and whether forgotten
-/// chunks are masked by tombstones instead of deleted.
+/// the attributes are stored, how a project is named, and where the
+/// tombstones of forgotten chunks are kept.
 pub(crate) struct Dialect {
     pub lines_table: &'static str,
     pub attrs: AttrStorage,
     pub scoping: Scoping,
-    /// Table of chunk seqs the instance has forgotten. `Some` only where
-    /// `DELETE` is not available (Cloud): every read then excludes them, so
-    /// compaction and purge never double-count.
+    /// Table of chunk seqs the instance has forgotten. Every read excludes
+    /// them, so compaction and purge never double-count. On Cloud they are
+    /// the only mechanism (no `DELETE` through the proxies); locally they
+    /// mask rows until a batched, partition-scoped reclaim removes them.
     pub tombstones: Option<&'static str>,
 }
 
 impl Dialect {
-    /// The instance's own ClickHouse. Must render exactly the SQL this file
-    /// has always rendered.
+    /// The instance's own ClickHouse.
     pub fn local() -> Self {
         Self {
             lines_table: super::clickhouse::LOCAL_LINES_TABLE,
             attrs: AttrStorage::Json,
             scoping: Scoping::Raw,
-            tombstones: None,
+            tombstones: Some(super::clickhouse::LOCAL_FORGOTTEN_CHUNKS_TABLE),
         }
     }
 
@@ -647,11 +647,19 @@ pub(crate) fn build_where(
     // `chunk_seq` is only unique within one manifest, so an uncorrelated
     // subquery would let one instance's tombstone hide a sibling instance's
     // lines in the same tenant.
+    // Locally the table only ever holds this instance's chunks, so no
+    // correlation is needed.
     if let Some(tombstones) = d.tombstones {
-        let p = sql.bind(Param::Str(instance_ref.unwrap_or_default()));
-        sql.conditions.push(format!(
-            "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones} WHERE instance_ref = {p})"
-        ));
+        if d.is_cloud() {
+            let p = sql.bind(Param::Str(instance_ref.unwrap_or_default()));
+            sql.conditions.push(format!(
+                "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones} WHERE instance_ref = {p})"
+            ));
+        } else {
+            sql.conditions.push(format!(
+                "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones})"
+            ));
+        }
     }
     if !query.levels.is_empty() {
         let v = sql.bind(Param::StrList(
@@ -1059,7 +1067,7 @@ mod tests {
     }
 
     #[test]
-    fn every_cloud_read_excludes_forgotten_chunks_and_no_local_read_does() {
+    fn every_cloud_read_excludes_forgotten_chunks_correlated_to_this_instance() {
         let dir = tempfile::tempdir().expect("temp dir");
         let tombstones = "chunk_seq NOT IN (SELECT chunk_seq FROM telemetry_log_forgotten_chunks \
                           WHERE instance_ref = ?)";
@@ -1084,6 +1092,29 @@ mod tests {
         assert!(!sql
             .where_clause()
             .contains("telemetry_log_forgotten_chunks"));
+    }
+
+    #[test]
+    fn every_local_read_excludes_locally_forgotten_chunks_uncorrelated() {
+        // A forget is a tombstone locally too (a bare DELETE mutated every
+        // day partition), so every read must mask it until the reclaim pass
+        // deletes the rows. The local table holds one instance's chunks
+        // only: no `instance_ref` column, no bound parameter.
+        for scope in [
+            LogAccessScope::All,
+            LogAccessScope::Allowed {
+                project_ids: vec![7],
+                external_service_ids: vec![],
+            },
+        ] {
+            let sql = build_where(&q(scope), &[], &local()).unwrap();
+            let clause = sql.where_clause();
+            assert!(
+                clause.contains("chunk_seq NOT IN (SELECT chunk_seq FROM log_forgotten_chunks)"),
+                "{clause}"
+            );
+            assert!(!clause.contains("instance_ref"), "{clause}");
+        }
     }
 
     #[test]

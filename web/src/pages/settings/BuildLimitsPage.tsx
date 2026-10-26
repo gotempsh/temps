@@ -26,6 +26,8 @@ const DEFAULTS: BuildLimitsSettings = {
   max_concurrent: 2,
   cpu_limit_cores: 0,
   memory_limit_mb: 0,
+  build_cache_max_gb: 10,
+  build_cache_max_unused_days: 7,
 }
 
 export function BuildLimitsPage() {
@@ -54,7 +56,7 @@ export function BuildLimitsPage() {
   useEffect(() => {
     if (settings) {
       reset({
-        build_limits: settings.build_limits || DEFAULTS,
+        build_limits: { ...DEFAULTS, ...settings.build_limits },
       })
     }
   }, [settings, reset])
@@ -63,7 +65,9 @@ export function BuildLimitsPage() {
     try {
       await updateSettings.mutateAsync(data)
       reset(data)
-      toast.success('Build limits saved and applied')
+      toast.success(
+        'Build limits saved and applied. Cache limits take effect at the next nightly cleanup'
+      )
     } catch {
       // useUpdateSettings already toasts this failure, with the server's reason.
     }
@@ -164,6 +168,64 @@ export function BuildLimitsPage() {
               {errors.build_limits?.memory_limit_mb && (
                 <p className="text-xs text-destructive">
                   Must be between 0 and 262144
+                </p>
+              )}
+            </div>
+          </SettingsGroup>
+          <SettingsGroup title="Build cache">
+            <p className="text-sm text-muted-foreground">
+              Docker keeps layers from earlier builds to speed up later ones.
+              The nightly cleanup (2:00 UTC) keeps this cache bounded on this
+              host; worker nodes use the defaults.
+            </p>
+            <div className="space-y-2">
+              <Label htmlFor="build_cache_max_gb">
+                Maximum cache size (GB)
+              </Label>
+              <Input
+                id="build_cache_max_gb"
+                type="number"
+                min={0}
+                max={10000}
+                {...register('build_limits.build_cache_max_gb', {
+                  valueAsNumber: true,
+                  min: 0,
+                  max: 10000,
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Least recently used cache that no build is using is removed
+                until the cache fits. 0 turns the size cap off. Default 10.
+              </p>
+              {errors.build_limits?.build_cache_max_gb && (
+                <p className="text-xs text-destructive">
+                  Must be between 0 and 10000
+                </p>
+              )}
+            </div>
+
+            <div className="space-y-2">
+              <Label htmlFor="build_cache_max_unused_days">
+                Remove cache unused for (days)
+              </Label>
+              <Input
+                id="build_cache_max_unused_days"
+                type="number"
+                min={1}
+                max={365}
+                {...register('build_limits.build_cache_max_unused_days', {
+                  valueAsNumber: true,
+                  required: true,
+                  min: 1,
+                  max: 365,
+                })}
+              />
+              <p className="text-xs text-muted-foreground">
+                Applies whatever the cache size. Min 1, max 365. Default 7.
+              </p>
+              {errors.build_limits?.build_cache_max_unused_days && (
+                <p className="text-xs text-destructive">
+                  Must be between 1 and 365
                 </p>
               )}
             </div>

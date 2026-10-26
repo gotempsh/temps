@@ -166,6 +166,19 @@ fn rustfs_container_env(config: &RustfsConfig) -> Vec<String> {
             .as_deref()
             .unwrap_or("http://host.docker.internal:8080")
             .trim_end_matches('/');
+        // RustFS forces its stdout exporter on whenever the *root*
+        // `RUSTFS_OBS_ENDPOINT` is empty -- regardless of
+        // `RUSTFS_OBS_USE_STDOUT` and even when a per-signal endpoint is set.
+        // That exporter prints a multi-line dump of every metric on every
+        // meter interval (>1M lines/hour per idle instance), all of which goes
+        // through log ingestion. Setting the root endpoint lets
+        // `RUSTFS_OBS_USE_STDOUT=false` take effect. The explicit metric
+        // endpoint still wins for metrics, and traces/logs export stay off,
+        // so nothing is ever sent to the root's derived `/v1/traces` or
+        // `/v1/logs` paths. Application logs are unaffected: they are routed
+        // by `RUSTFS_OBS_LOG_STDOUT_ENABLED`, not by this exporter switch.
+        env_vars.push(format!("RUSTFS_OBS_ENDPOINT={}/api/otel", base_url));
+        env_vars.push("RUSTFS_OBS_USE_STDOUT=false".to_string());
         env_vars.push(format!(
             "RUSTFS_OBS_METRIC_ENDPOINT={}/api/otel/v1/metrics",
             base_url
@@ -179,6 +192,76 @@ fn rustfs_container_env(config: &RustfsConfig) -> Vec<String> {
         env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
     }
     env_vars
+}
+
+/// Why an existing RustFS container no longer matches what
+/// `create_container` would build, or `None` when it does. Both checks are
+/// fixed at container creation, so a restart can never apply them:
+///
+/// - `HostConfig.Init` missing (orphaned processes pile up as zombies);
+/// - an environment entry Temps sets is absent or has a different value --
+///   e.g. a container from before the stdout metrics exporter was turned off.
+///
+/// Only variable *names* appear in the reason: values include credentials.
+fn rustfs_drift_reason(
+    host_config: Option<&bollard::models::HostConfig>,
+    actual_env: &[String],
+    desired_env: &[String],
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if host_config.is_some_and(crate::utils::host_config_missing_init) {
+        reasons.push("no init process".to_string());
+    }
+    let missing = crate::utils::missing_env_entries(desired_env, actual_env);
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing
+            .iter()
+            .map(|entry| entry.split_once('=').map_or(*entry, |(name, _)| name))
+            .collect();
+        reasons.push(format!("environment differs for {}", names.join(", ")));
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(reasons.join("; "))
+    }
+}
+
+/// Inspect `container_name` and report [`rustfs_drift_reason`]. Returns
+/// `None` when the container cannot be inspected: an unknown state must not
+/// trigger a recreate.
+async fn rustfs_container_drift(
+    docker: &Docker,
+    container_name: &str,
+    config: &RustfsConfig,
+) -> Option<String> {
+    let info = match docker
+        .inspect_container(
+            container_name,
+            None::<bollard::query_parameters::InspectContainerOptions>,
+        )
+        .await
+    {
+        Ok(info) => info,
+        Err(error) => {
+            tracing::warn!(
+                "Could not inspect RustFS container {} for config drift, keeping it as is: {}",
+                container_name,
+                error
+            );
+            return None;
+        }
+    };
+    let actual_env = info
+        .config
+        .as_ref()
+        .and_then(|c| c.env.clone())
+        .unwrap_or_default();
+    rustfs_drift_reason(
+        info.host_config.as_ref(),
+        &actual_env,
+        &rustfs_container_env(config),
+    )
 }
 
 impl RustfsConfig {
@@ -676,21 +759,35 @@ impl RustfsService {
             let is_running =
                 container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
 
+            // Check if container is running with same image and the creation-time
+            // settings Temps now requires - if so, we're good
             if existing_image == config.docker_image && is_running {
+                let drift = rustfs_container_drift(docker, &container_name, config).await;
+                if drift.is_none() {
+                    info!(
+                        "Container {} already exists and is running with same image",
+                        container_name
+                    );
+                    return Ok(());
+                }
                 info!(
-                    "Container {} already exists and is running with same image",
-                    container_name
+                    "Container {} has config drift ({}); recreating it to apply the current settings. \
+                     Data and logs volumes are kept",
+                    container_name,
+                    drift.as_deref().unwrap_or_default()
                 );
-                return Ok(());
+            } else {
+                // Container exists but is not running or has a different image
+                info!(
+                    "Container {} exists (running: {}, image: {}) but needs to be recreated (requested image: {})",
+                    container_name, is_running, existing_image, config.docker_image
+                );
             }
 
-            // A stopped container is replaced so it picks up the current
-            // specification (credentials, ingest keys), as before; now through
-            // the guard, so the replacement must mount the same data.
-            info!(
-                "Container {} exists (running: {}, image: {}) but needs to be recreated (requested image: {})",
-                container_name, is_running, existing_image, config.docker_image
-            );
+            // A stopped or drifted container is replaced so it picks up the
+            // current specification (credentials, ingest keys, init, env), as
+            // before; now through the guard, so the replacement must mount the
+            // same data.
             let same_image = existing_image == config.docker_image;
             let operation = if same_image {
                 "applying its current configuration"
@@ -708,7 +805,17 @@ impl RustfsService {
                             .is_some_and(|g| g.is_refusal()) =>
                 {
                     // Refreshing the specification is optional; the data is
-                    // not. Start the stopped container as it is.
+                    // not. Keep a running container (one with config drift)
+                    // as it is, and start a stopped one unchanged.
+                    if is_running {
+                        warn!(
+                            service = %self.instance_name(),
+                            container = %container_name,
+                            error = %e,
+                            "Not recreating the RustFS container to apply its config drift; keeping it running unchanged"
+                        );
+                        return Ok(());
+                    }
                     warn!(
                         service = %self.instance_name(),
                         container = %container_name,
@@ -918,6 +1025,7 @@ impl RustfsService {
             // Security hardening for service containers
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(512),
+            init: crate::utils::MANAGED_SERVICE_CONTAINER_INIT,
             ..Default::default()
         };
         resource_limits.apply_to_host_config(&mut host_config);
@@ -3779,6 +3887,100 @@ mod tests {
             &"RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20si_TEST_ONLY".to_string()
         ));
         assert!(env.contains(&"RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string()));
+        // The stdout metrics exporter is only switchable once the root
+        // endpoint is set; without both, every metric is dumped to stdout.
+        assert!(
+            env.contains(&"RUSTFS_OBS_ENDPOINT=http://temps.internal:8080/api/otel".to_string())
+        );
+        assert!(env.contains(&"RUSTFS_OBS_USE_STDOUT=false".to_string()));
+        assert!(env.contains(&"RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string()));
+        assert!(env.contains(&"RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string()));
+    }
+
+    #[test]
+    fn container_without_metrics_key_sets_no_obs_environment() {
+        let config = RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "TEST_ACCESS".to_string(),
+            secret_key: "TEST_SECRET".to_string(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: None,
+            metrics_ingest_url: None,
+        };
+        let env = rustfs_container_env(&config);
+        assert!(
+            env.iter().all(|entry| !entry.starts_with("RUSTFS_OBS_")),
+            "unexpected OBS env without a metrics key: {env:?}"
+        );
+    }
+
+    fn init_host_config(init: Option<bool>) -> bollard::models::HostConfig {
+        bollard::models::HostConfig {
+            init,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn drift_reason_none_when_init_and_env_match() {
+        let desired = vec!["A=1".to_string(), "B=2".to_string()];
+        // Image-provided extras such as PATH never count as drift.
+        let actual = vec![
+            "PATH=/usr/bin".to_string(),
+            "B=2".to_string(),
+            "A=1".to_string(),
+        ];
+        assert_eq!(
+            rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired),
+            None
+        );
+    }
+
+    #[test]
+    fn drift_reason_reports_missing_init() {
+        let env = vec!["A=1".to_string()];
+        let reason = rustfs_drift_reason(Some(&init_host_config(None)), &env, &env)
+            .expect("a container without init must be recreated");
+        assert!(reason.contains("no init process"), "{reason}");
+    }
+
+    #[test]
+    fn drift_reason_names_changed_variables_without_their_values() {
+        let desired = vec![
+            "RUSTFS_SECRET_KEY=TEST_SECRET".to_string(),
+            "RUSTFS_OBS_USE_STDOUT=false".to_string(),
+        ];
+        // A container from before the stdout fix: no USE_STDOUT entry.
+        let actual = vec!["RUSTFS_SECRET_KEY=TEST_SECRET".to_string()];
+        let reason = rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired)
+            .expect("missing env must be reported");
+        assert!(reason.contains("RUSTFS_OBS_USE_STDOUT"), "{reason}");
+        assert!(
+            !reason.contains("false"),
+            "values must not be logged: {reason}"
+        );
+
+        // A changed credential is reported by name only.
+        let actual = vec![
+            "RUSTFS_SECRET_KEY=OLD_SECRET".to_string(),
+            "RUSTFS_OBS_USE_STDOUT=false".to_string(),
+        ];
+        let reason = rustfs_drift_reason(Some(&init_host_config(Some(true))), &actual, &desired)
+            .expect("changed env must be reported");
+        assert!(reason.contains("RUSTFS_SECRET_KEY"), "{reason}");
+        assert!(
+            !reason.contains("SECRET,") && !reason.contains("TEST_SECRET"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn drift_reason_none_without_host_config() {
+        // Uninspectable host config is not evidence of drift.
+        assert_eq!(rustfs_drift_reason(None, &[], &[]), None);
     }
 
     #[test]

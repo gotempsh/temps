@@ -23,14 +23,27 @@ use crate::traits::FirstVisitAttribution;
 /// At ~4 KB per entry, 8192 entries = ~32 MB maximum memory usage.
 const CHANNEL_CAPACITY: usize = 8192;
 
-/// Maximum number of rows per batch INSERT statement.
-const MAX_BATCH_SIZE: usize = 200;
+/// Rows that trigger an early flush. Bounds the batch at ~8 MB (4 KB/row).
+const MAX_BATCH_SIZE: usize = 2_000;
 
-/// Maximum tracking events per batch (visitors + sessions are lighter weight).
+/// Maximum tracking events drained per receive (visitors + sessions are
+/// lighter weight).
 const MAX_TRACKING_BATCH_SIZE: usize = 512;
 
+/// Tracking events that trigger an early flush, so a burst of new visitors
+/// cannot grow the tracking batch without bound between timer ticks.
+const MAX_TRACKING_BUFFERED: usize = 8 * MAX_TRACKING_BATCH_SIZE;
+
 /// How long to wait before flushing a partial batch.
-const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
+///
+/// Each flush is one insert per storage backend. At 500 ms a quiet instance
+/// sent ClickHouse ~3 rows per insert, and every tiny insert is a new part
+/// that has to be merged and removed later — the merge and part-removal
+/// churn dominated the table's I/O. Five seconds turns that into tens of
+/// rows per insert at low traffic, while busy instances still flush on
+/// `MAX_BATCH_SIZE` well before the timer. The cost is that a request shows
+/// up in the request log up to five seconds later.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Emit a shed warning once per this many dropped entries (per handle kind),
 /// so overload produces a handful of log lines instead of one per request.
@@ -308,11 +321,15 @@ impl ProxyLogBatchWriter {
                         Some(event) => {
                             tracking_batch.push(event);
                             // Drain additional events without blocking
-                            while tracking_batch.len() < MAX_TRACKING_BATCH_SIZE {
+                            let drain_limit = tracking_batch.len() + MAX_TRACKING_BATCH_SIZE;
+                            while tracking_batch.len() < drain_limit {
                                 match self.tracking_receiver.try_recv() {
                                     Ok(e) => tracking_batch.push(e),
                                     Err(_) => break,
                                 }
+                            }
+                            if tracking_batch.len() >= MAX_TRACKING_BUFFERED {
+                                self.flush_all(&mut tracking_batch, &mut proxy_log_batch).await;
                             }
                         }
                         None => {

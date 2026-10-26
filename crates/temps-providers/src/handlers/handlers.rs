@@ -32,10 +32,11 @@ use super::audit::{
     ExternalServiceClusterMemberPromotedAudit, ExternalServiceClusterMemberRemovedAudit,
     ExternalServiceCreatedAudit, ExternalServiceDeletedAudit,
     ExternalServiceEnvironmentVariableRevealedAudit,
-    ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
-    ExternalServiceProjectLinkedAudit, ExternalServiceProjectUnlinkedAudit,
-    ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceS3MigratedAudit,
-    ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit, ServiceHealthChecked,
+    ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceLogIngestionUpdatedAudit,
+    ExternalServiceParameterRevealedAudit, ExternalServiceProjectLinkedAudit,
+    ExternalServiceProjectUnlinkedAudit, ExternalServiceRuntimeCredentialsIssuedAudit,
+    ExternalServiceS3MigratedAudit, ExternalServiceStatusChangedAudit, ExternalServiceUpdatedAudit,
+    ServiceHealthChecked,
 };
 use crate::handlers::types::{
     AddClusterMemberRequest, AvailableContainerInfo, ClusterHealthReportResponse,
@@ -662,6 +663,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route(
             "/external-services/{id}/resources",
             patch(update_service_resources),
+        )
+        .route(
+            "/external-services/{id}/log-ingestion",
+            get(get_service_log_ingestion).put(update_service_log_ingestion),
         )
         .merge(super::query_handlers::configure_query_routes())
         .merge(super::metrics_handlers::configure_metrics_routes())
@@ -3834,6 +3839,136 @@ async fn update_service_resources(
     }
 }
 
+/// A managed service's container log ingestion budget.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct ServiceLogIngestionResponse {
+    pub service_id: i32,
+    /// Lines/s per container; absent/null = platform default, 0 = unlimited.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// KiB/s per container; absent/null = platform default, 0 = unlimited.
+    pub log_ingest_kib_per_sec: Option<i32>,
+}
+
+impl ServiceLogIngestionResponse {
+    fn new(service_id: i32, settings: crate::services::ServiceLogIngestion) -> Self {
+        Self {
+            service_id,
+            log_ingest_lines_per_sec: settings.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: settings.log_ingest_kib_per_sec,
+        }
+    }
+}
+
+fn log_ingestion_problem(error: crate::services::ExternalServiceError) -> Problem {
+    match error {
+        crate::services::ExternalServiceError::ServiceNotFound { .. } => not_found()
+            .title("Service Not Found")
+            .detail(error.to_string())
+            .build(),
+        crate::services::ExternalServiceError::ParameterValidationFailed { .. } => bad_request()
+            .title("Invalid Log Ingestion Budget")
+            .detail(error.to_string())
+            .build(),
+        other => external_service_problem(
+            &other,
+            format!("Failed to update log ingestion budget: {}", other),
+        ),
+    }
+}
+
+/// Get this service's own container log ingestion budget.
+///
+/// Both fields null means the service uses the platform budget from
+/// Settings → Monitoring → Container log ingestion.
+#[utoipa::path(
+    get,
+    path = "/external-services/{id}/log-ingestion",
+    tag = "External Services",
+    responses(
+        (status = 200, description = "Current override", body = ServiceLogIngestionResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(("id" = i32, Path, description = "External service ID")),
+    security(("bearer_auth" = []))
+)]
+async fn get_service_log_ingestion(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    let settings = app_state
+        .external_service_manager
+        .get_log_ingestion(id)
+        .await
+        .map_err(log_ingestion_problem)?;
+    Ok(Json(ServiceLogIngestionResponse::new(id, settings)))
+}
+
+/// Replace this service's container log ingestion budget.
+///
+/// Send null for a field to return to the platform default, 0 to lift the
+/// limit. Applied to running containers within a minute; nothing restarts.
+#[utoipa::path(
+    put,
+    path = "/external-services/{id}/log-ingestion",
+    tag = "External Services",
+    request_body = crate::services::ServiceLogIngestion,
+    responses(
+        (status = 200, description = "Override saved", body = ServiceLogIngestionResponse),
+        (status = 400, description = "Value out of range"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Service not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(("id" = i32, Path, description = "External service ID")),
+    security(("bearer_auth" = []))
+)]
+async fn update_service_log_ingestion(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<crate::services::ServiceLogIngestion>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ExternalServicesWrite);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+
+    let update = app_state
+        .external_service_manager
+        .set_log_ingestion(id, request)
+        .await
+        .map_err(log_ingestion_problem)?;
+
+    let audit = ExternalServiceLogIngestionUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        service_id: update.service_id,
+        service_name: update.service_name.clone(),
+        previous_lines_per_sec: update.previous.log_ingest_lines_per_sec,
+        previous_kib_per_sec: update.previous.log_ingest_kib_per_sec,
+        lines_per_sec: update.current.log_ingest_lines_per_sec,
+        kib_per_sec: update.current.log_ingest_kib_per_sec,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for log ingestion update on service {}: {}",
+            id, e
+        );
+    }
+
+    Ok(Json(ServiceLogIngestionResponse::new(id, update.current)))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -3879,6 +4014,8 @@ async fn update_service_resources(
         get_service_runtime,
         get_service_stats,
         update_service_resources,
+        get_service_log_ingestion,
+        update_service_log_ingestion,
         super::query_handlers::check_explorer_support,
         super::query_handlers::list_root_containers,
         super::query_handlers::list_containers_at_path,
@@ -3902,6 +4039,7 @@ async fn update_service_resources(
         super::metrics_handlers::toggle_deployment_metrics,
         super::metrics_handlers::get_node_metrics_range,
         super::metrics_handlers::get_node_metrics_latest,
+        super::metrics_handlers::get_node_disk_health,
         super::metrics_handlers::get_cluster_metrics_range,
         super::metrics_handlers::get_cluster_metrics_latest,
         super::metrics_handlers::get_node_metrics_reporting,
@@ -3959,6 +4097,8 @@ async fn update_service_resources(
         crate::services::ServiceStatsReport,
         crate::services::ResourceLimitApplyResult,
         crate::services::ResourceLimitsUpdateResponse,
+        crate::services::ServiceLogIngestion,
+        ServiceLogIngestionResponse,
         super::query_handlers::ExplorerSupportResponse,
         super::query_handlers::ContainerResponse,
         super::query_handlers::EntityResponse,
@@ -3977,6 +4117,9 @@ async fn update_service_resources(
         super::metrics_handlers::MetricsStatusResponse,
         super::metrics_handlers::DatabaseMetricsRow,
         super::metrics_handlers::DatabaseMetricsResponse,
+        super::metrics_handlers::NodeDiskHealthResponse,
+        super::metrics_handlers::RaidArrayHealth,
+        super::metrics_handlers::DriveHealthRow,
         super::metrics_handlers::AlertRuleResponse,
         super::metrics_handlers::CreateAlertRuleRequest,
         super::metrics_handlers::UpdateAlertRuleRequest,
@@ -4173,6 +4316,8 @@ mod tests {
             created_by_user_id: Some(1),
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         let linked_service = project_services::Model {
             id: 1,
@@ -4850,6 +4995,8 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -5019,6 +5166,8 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         let link = project_services::Model {
             id: 1,

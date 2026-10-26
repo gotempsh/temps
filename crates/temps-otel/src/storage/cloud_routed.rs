@@ -622,6 +622,11 @@ impl OtelStorage for CloudRoutedOtelStorage {
         self.local.record_trace_refs(trace_ids, project_id).await
     }
 
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        // Local for the same reason as `record_trace_refs`.
+        self.local.record_trace_refs_batch(refs).await
+    }
+
     async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>> {
         self.local.get_trace_ref_projects(trace_id).await
     }

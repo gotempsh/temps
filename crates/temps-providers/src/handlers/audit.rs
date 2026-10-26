@@ -115,6 +115,45 @@ pub struct ExternalServiceStatusChangedAudit {
     pub new_status: String,
 }
 
+/// Operator changed a managed service's container log ingestion budget.
+///
+/// Audited because raising or lifting it lets one service fill the log
+/// store; lowering it silently drops that service's lines. Both ends are
+/// recorded (`None` = platform default, `Some(0)` = unlimited).
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalServiceLogIngestionUpdatedAudit {
+    pub context: AuditContext,
+    pub service_id: i32,
+    pub service_name: String,
+    pub previous_lines_per_sec: Option<i32>,
+    pub previous_kib_per_sec: Option<i32>,
+    pub lines_per_sec: Option<i32>,
+    pub kib_per_sec: Option<i32>,
+}
+
+impl AuditOperation for ExternalServiceLogIngestionUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "EXTERNAL_SERVICE_LOG_INGESTION_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
 /// The AI assistant actually read row data from a service.
 ///
 /// The assistant reads data with the user's own permissions, and rows can carry

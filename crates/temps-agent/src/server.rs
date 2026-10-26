@@ -409,6 +409,13 @@ fn spawn_heartbeat_loop(
             control_plane_url, node_id
         );
 
+        // Software RAID + drive SMART health (#1618). The control plane
+        // stores it as this node's `node.raid_*` / `node.drive_*` metrics and
+        // evaluates the same disk-health alert rules it seeds for itself.
+        // `smartctl` runs in the cache's own background task, never inline.
+        let drive_health =
+            temps_metrics::collector::disk_health::DriveHealthCache::new("/sys/block");
+
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         let mut consecutive_failures: u32 = 0;
         let mut inventory_sent = false;
@@ -532,6 +539,21 @@ fn spawn_heartbeat_loop(
                         node_id = node_id,
                         error = %e,
                         "Failed to serialize DNS resolver health for heartbeat"
+                    ),
+                }
+            }
+
+            // Omitted when nothing is readable (not Linux, no /proc/mdstat
+            // and no drive reading yet), like `dns_resolver` above.
+            let disk_health =
+                temps_metrics::collector::disk_health::DiskHealthReport::read(&drive_health).await;
+            if !disk_health.is_empty() {
+                match serde_json::to_value(&disk_health) {
+                    Ok(v) => body["disk_health"] = v,
+                    Err(e) => tracing::warn!(
+                        node_id = node_id,
+                        error = %e,
+                        "Failed to serialize disk health for heartbeat"
                     ),
                 }
             }

@@ -14596,6 +14596,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sysinfo",
+ "tempfile",
  "temps-clickhouse",
  "temps-config",
  "temps-core",

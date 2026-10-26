@@ -85,6 +85,18 @@
         ],
         "type": "object"
       },
+      "ActionKind": {
+        "enum": [
+          "make_reachable",
+          "deploy",
+          "set_dns_record",
+          "open_ingress",
+          "open_worker",
+          "wait",
+          "run_command"
+        ],
+        "type": "string"
+      },
       "ActivateProviderResponse": {
         "properties": {
           "default_provider": {
@@ -1080,6 +1092,104 @@
         ],
         "type": "object"
       },
+      "AddressAudience": {
+        "description": "Who one address is for, with what bounds a private one (ADR 064 D5).",
+        "properties": {
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          },
+          "network_range": {
+            "description": "For `private`: the network range a visitor must come from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_listener": {
+            "description": "For `private`: that listener's address, which DNS points at and the\ninside check dials.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_node_id": {
+            "description": "For `private`: the worker whose private listener serves it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "audience"
+        ],
+        "type": "object"
+      },
+      "AddressReachability": {
+        "description": "One address of an environment and whether its audience can reach it.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "address": {
+            "example": "myapp.example.com",
+            "type": "string"
+          },
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          },
+          "custom_domain_id": {
+            "description": "The custom domain row, for a custom domain.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "network": {
+            "description": "For a private address: the network it is reachable from, `Tailscale`\nor the range (ADR 064 D7).",
+            "example": "Tailscale",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "example": "No DNS record for myapp.example.com exists yet.",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/AddressSource"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReachState"
+          },
+          "way_in": {
+            "description": "How traffic gets in: `tunnel:<name>`, `direct:<node>`,\n`direct:control-plane`, or `private:<node>` for a worker's private\nlistener. `None` while nothing does.",
+            "example": "tunnel:homelab",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "audience",
+          "source",
+          "state",
+          "reason"
+        ],
+        "type": "object"
+      },
       "AddressScope": {
         "description": "Who can reach an address.",
         "enum": [
@@ -1087,6 +1197,15 @@
           "private",
           "cgnat",
           "local"
+        ],
+        "type": "string"
+      },
+      "AddressSource": {
+        "description": "Where an address comes from.",
+        "enum": [
+          "generated",
+          "environment_domain",
+          "custom_domain"
         ],
         "type": "string"
       },
@@ -2799,6 +2918,13 @@
             "description": "Stable v5 UUID derived from the database node id.",
             "type": "string"
           },
+          "overlay_network_name": {
+            "description": "The overlay network name this node uses (ADR 059): its override, else\nthe cluster's. Agents that predate it ignore the field and keep\n`temps0`; an agent reading a control plane without it assumes\n`temps0`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "underlay_address": {
             "type": "string"
           }
@@ -3739,6 +3865,8 @@
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
+              "build_cache_max_gb": 10,
+              "build_cache_max_unused_days": 7,
               "cpu_limit_cores": 0,
               "max_concurrent": 2,
               "memory_limit_mb": 0
@@ -3766,6 +3894,7 @@
               "notifications_enabled": false,
               "telemetry_bulk_anomaly_factor": null,
               "telemetry_bulk_rate_limit_spans_per_sec": null,
+              "telemetry_consent_bootstrapped": false,
               "telemetry_enabled": false,
               "telemetry_outbox_max_bytes": 536870912
             },
@@ -4992,6 +5121,32 @@
         ],
         "type": "object"
       },
+      "ApplyRequest": {
+        "description": "`POST …/reachability/apply`.",
+        "properties": {
+          "answers": {
+            "description": "Answers to the option's fields by key. `address`, when given, must be\nthe plan's; `dns_provider_id` takes a provider id,\n`cloudflare_api_token` the token (held in memory for the run, never\nstored on it).",
+            "type": "object"
+          },
+          "confirmed": {
+            "description": "The user saw and accepted the option's `confirmation`.",
+            "type": "boolean"
+          },
+          "option": {
+            "$ref": "#/components/schemas/PlanOptionKind",
+            "description": "Which option of the plan to carry out."
+          },
+          "plan_id": {
+            "description": "The plan this acts on, from `POST …/reachability/plan`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_id",
+          "option"
+        ],
+        "type": "object"
+      },
       "ArchiveFlagResponse": {
         "properties": {
           "archived_at": {
@@ -5271,6 +5426,16 @@
           "keys"
         ],
         "type": "object"
+      },
+      "Audience": {
+        "description": "Who an address is for.",
+        "enum": [
+          "public",
+          "private",
+          "signed_in",
+          "unsupported"
+        ],
+        "type": "string"
       },
       "AuditLogIpInfo": {
         "description": "IP address information in audit log",
@@ -7254,6 +7419,23 @@
       "BuildLimitsSettings": {
         "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global gate in the deployer crate\nadmits at most `max_concurrent` `DockerRuntime::build_image` calls at a\ntime. When the gate is full, additional builds queue and wait — they do\nnot fail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\nChanges apply live, with no restart. Builds already running finish with the\nlimits they started with; queued and new builds use the new ones. Lowering\n`max_concurrent` never stops a running build: new builds wait until enough\nof them finish to get under the new limit.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
         "properties": {
+          "build_cache_max_gb": {
+            "default": 10,
+            "description": "Upper bound for Docker's build cache, in gigabytes. The nightly\ncleanup removes the least recently used cache records that no build\nis using until the total is at or below this size. 0 disables the\nsize cap (only `build_cache_max_unused_days` applies). Re-read on\nevery nightly run. Applies to this host's Docker daemon; worker nodes\nuse the default.",
+            "example": 10,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "build_cache_max_unused_days": {
+            "default": 7,
+            "description": "Build cache records unused for longer than this many days are removed\nby the nightly cleanup, whatever the total size. Valid range 1..=365.",
+            "example": 7,
+            "format": "int32",
+            "maximum": 365,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cpu_limit_cores": {
             "default": 0,
             "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Applies live to builds that start\nafter the change; a running build keeps the cap it started with.",
@@ -8011,6 +8193,18 @@
         },
         "required": [
           "hostname"
+        ],
+        "type": "object"
+      },
+      "CertificateMethods": {
+        "description": "Whether HTTP-01 can issue a certificate here: a direct ingress answers\non port 80.",
+        "properties": {
+          "http01_available": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "http01_available"
         ],
         "type": "object"
       },
@@ -9954,6 +10148,11 @@
               "null"
             ]
           },
+          "telemetry_consent_bootstrapped": {
+            "default": false,
+            "description": "Set once Temps Cloud's bootstrap file has applied its telemetry-export\nconsent (ADR-045 Amendment 2). Cloud drops that file on every upgrade\nof a hosted plane; this makes the consent apply exactly once, so an\noperator who later turns telemetry off is not overridden by the next\nupgrade. Never set on a self-hosted instance.",
+            "type": "boolean"
+          },
           "telemetry_enabled": {
             "default": false,
             "description": "Explicit consent to mirror locally stored telemetry.",
@@ -10441,6 +10640,55 @@
         ],
         "type": "object"
       },
+      "ClusterMetricsLatestQuery": {
+        "description": "Nodes to combine for the latest values.",
+        "properties": {
+          "node_ids": {
+            "description": "Comma-separated node ids (`0` = control plane), at most 64.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_ids"
+        ],
+        "type": "object"
+      },
+      "ClusterMetricsRangeQuery": {
+        "description": "Query for one metric combined across several nodes.",
+        "properties": {
+          "end_time": {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "metric": {
+            "description": "Metric name, e.g. `\"proxy.requests\"`.",
+            "type": "string"
+          },
+          "node_ids": {
+            "description": "Comma-separated node ids (`0` = control plane), at most 64.",
+            "type": "string"
+          },
+          "range": {
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
+            "type": "string"
+          },
+          "start_time": {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "metric",
+          "node_ids"
+        ],
+        "type": "object"
+      },
       "ClusterNetworkChangeResponse": {
         "description": "`PUT /settings/cluster-network` answer.",
         "properties": {
@@ -10526,6 +10774,10 @@
               "null"
             ]
           },
+          "overlay_network_name": {
+            "description": "The overlay network name it uses: its own when `temps join` found the\ncluster's name taken on its host, else the cluster's (ADR 059).",
+            "type": "string"
+          },
           "overlay_remediation": {
             "description": "The last automatic move of its allocation, and why.",
             "type": [
@@ -10544,6 +10796,7 @@
         "required": [
           "id",
           "name",
+          "overlay_network_name",
           "in_use",
           "occupied_ranges"
         ],
@@ -10639,6 +10892,10 @@
             },
             "type": "array"
           },
+          "overlay_network_name": {
+            "description": "The cluster's overlay network name (ADR 059): the Docker network\n`<name>`, bridge `br-<name>` and VXLAN device `vxlan-<name>` on each\nhost whose node does not override it.",
+            "type": "string"
+          },
           "pool_confirmed": {
             "description": "Whether an operator has confirmed the pool, or a member already uses\nit. The console asks for it once before adding the first node.",
             "type": "boolean"
@@ -10655,6 +10912,7 @@
           "default_compute_pool_cidr",
           "mesh_pool_cidr",
           "mesh_enabled",
+          "overlay_network_name",
           "pool_confirmed",
           "can_change",
           "change_blocked_by",
@@ -12882,7 +13140,7 @@
           },
           "ingest_kib_per_sec": {
             "default": 256,
-            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit.",
+            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit. A project or\nmanaged service can override it (`log_ingest_kib_per_sec`).",
             "example": 256,
             "format": "int32",
             "maximum": 1048576,
@@ -12891,7 +13149,7 @@
           },
           "ingest_lines_per_sec": {
             "default": 250,
-            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving.",
+            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving. A project or\nmanaged service can override it (`log_ingest_lines_per_sec`).",
             "example": 250,
             "format": "int32",
             "maximum": 1000000,
@@ -14739,6 +14997,13 @@
       },
       "CreateConnectorRequest": {
         "properties": {
+          "auto_publish": {
+            "description": "Publish every worker-served hostname under the domain (the default),\nor only the hostnames chosen for this tunnel.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "name": {
             "description": "Lowercase letters, digits and hyphens; names the tunnel `temps-<name>`.",
             "type": "string"
@@ -18377,6 +18642,31 @@
         ],
         "type": "string"
       },
+      "DecideRequest": {
+        "description": "`POST …/reachability/runs/{run_id}/decide`.",
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision"
+          },
+          "key": {
+            "description": "The journal entry in conflict.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "decision"
+        ],
+        "type": "object"
+      },
+      "Decision": {
+        "description": "A user's answer to a conflict (ADR 064 D4), journaled with the entry.",
+        "enum": [
+          "keep",
+          "overwrite"
+        ],
+        "type": "string"
+      },
       "DeferredWalGeneration": {
         "properties": {
           "bytes": {
@@ -21859,6 +22149,57 @@
         ],
         "type": "object"
       },
+      "DnsRecordState": {
+        "description": "A DNS record as the provider had it when Temps read it: what a run\ncompares with before it writes, and what undo puts back (ADR 064 D4).",
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "label": {
+            "description": "The record's name within its zone (`myapp`, `@`).",
+            "type": "string"
+          },
+          "managed": {
+            "description": "This install's signed ownership marker covers it.",
+            "type": "boolean"
+          },
+          "modified_on": {
+            "description": "When the provider says it last changed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "record_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "record_type": {
+            "description": "`A` or `AAAA`.",
+            "type": "string"
+          },
+          "run_id": {
+            "description": "The run whose marker it carries.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider_id",
+          "record_type",
+          "content"
+        ],
+        "type": "object"
+      },
       "DnsRecordStatusResponse": {
         "description": "DNS record verification status",
         "enum": [
@@ -22741,6 +23082,45 @@
           "drain_complete",
           "can_remove",
           "message"
+        ],
+        "type": "object"
+      },
+      "DriveHealthRow": {
+        "description": "SMART health of one drive on a node.",
+        "properties": {
+          "bytes_written": {
+            "description": "Bytes written over the drive's lifetime.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "device": {
+            "description": "Device name, e.g. `nvme0` or `sda`.",
+            "type": "string"
+          },
+          "media_errors": {
+            "description": "Media / reallocated-sector errors the drive has recorded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wear_percent": {
+            "description": "Percentage of rated endurance used (can exceed 100).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device"
         ],
         "type": "object"
       },
@@ -24398,6 +24778,69 @@
           "id",
           "name",
           "main_url"
+        ],
+        "type": "object"
+      },
+      "EnvironmentReachability": {
+        "description": "Everything about one environment's addresses.",
+        "properties": {
+          "addresses": {
+            "items": {
+              "$ref": "#/components/schemas/AddressReachability"
+            },
+            "type": "array"
+          },
+          "deployed": {
+            "description": "Whether anything is deployed to it.",
+            "type": "boolean"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "plan": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityPlan",
+                "description": "What *Make it reachable* would do, while no address is reachable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "running_on": {
+            "description": "The nodes its containers run on (`control plane` for the local one).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "state": {
+            "$ref": "#/components/schemas/ReachState",
+            "description": "`reachable` when any address is."
+          },
+          "summary": {
+            "description": "One line for the header: why nothing reaches it, or where it is.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_id",
+          "environment_name",
+          "deployed",
+          "running_on",
+          "state",
+          "summary",
+          "addresses"
         ],
         "type": "object"
       },
@@ -32114,6 +32557,13 @@
               "null"
             ]
           },
+          "disk_health": {
+            "description": "Software RAID and drive SMART health read by the agent\n(`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw\nJSON here and parsed after the heartbeat is recorded, so a malformed\nreport from a mismatched agent version costs only the disk metrics,\nnever the heartbeat that keeps the node online.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "dns_resolver": {
             "oneOf": [
               {
@@ -34097,7 +34547,8 @@
         "enum": [
           "off",
           "fixed",
-          "delegated"
+          "delegated",
+          "private"
         ],
         "type": "string"
       },
@@ -34773,6 +35224,252 @@
         ],
         "type": "object"
       },
+      "Intent": {
+        "description": "What a run set out to create, with what finds it again (ADR 064 D4):\nwritten to the journal before the call that creates it.",
+        "oneOf": [
+          {
+            "description": "Found by its name, which the run picks before creating it.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_provider"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "managed_domain"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "auto_manage_enabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by its name; Cloudflare's tunnel is `temps-<name>-<install>`.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "connector"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "environment_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "custom_domain"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "domain",
+              "environment_id",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "previous": {
+                "$ref": "#/components/schemas/PreviousChoice"
+              },
+              "type": {
+                "enum": [
+                  "hostname_choice"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "connector_id",
+              "previous",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by its ADR 031 ownership marker: controller `reachability`,\nthis project and environment.",
+            "properties": {
+              "hostname": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "record_type": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_record"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "label",
+              "record_type",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Changes the existing record from `before` (read just before the\nwrite) to `after`, stamped with this run's marker.",
+            "properties": {
+              "after": {
+                "type": "string"
+              },
+              "before": {
+                "$ref": "#/components/schemas/DnsRecordState"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "record_type": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_change"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "label",
+              "record_type",
+              "before",
+              "after",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by the address row's current audience.",
+            "properties": {
+              "after": {
+                "$ref": "#/components/schemas/AddressAudience"
+              },
+              "before": {
+                "$ref": "#/components/schemas/AddressAudience"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "address_audience"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "before",
+              "after",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "certificate"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "IpAccessCidrEntry": {
         "description": "One CIDR in a policy, in canonical form (network address, explicit prefix).",
         "properties": {
@@ -34943,6 +35640,123 @@
           "has_token"
         ],
         "type": "object"
+      },
+      "JournalEntry": {
+        "description": "One entry of a run's journal.",
+        "properties": {
+          "at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "conflict": {
+            "description": "For a `conflict`: what the record holds now, in words.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decision": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Decision",
+                "description": "The user's answer while the run was going forward."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "deleting": {
+            "description": "Undo marked this tunnel `deleting` (ADR 064 D4): from here it is\nonly ever finished, never reverted nor reused.",
+            "type": "boolean"
+          },
+          "failed_lookups": {
+            "description": "Lookups that could not answer, for the backoff.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "first_miss_at": {
+            "description": "The first lookup that missed; a second one a settle delay later\nconfirms the miss.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "intent": {
+            "$ref": "#/components/schemas/Intent"
+          },
+          "key": {
+            "type": "string"
+          },
+          "next_lookup_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_since": {
+            "description": "When the entry was written `pending`, so a lookup knows how long the\ncall has had.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "resource": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RunResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/JournalState"
+          },
+          "tunnel_id": {
+            "description": "The provider tunnel id the connector had when it was marked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "undo_decision": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Decision",
+                "description": "The user's answer while undoing: `keep` skips it, `overwrite`\nrestores what was there before anyway."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "unwritten": {
+            "description": "A conflict found before the write: Temps wrote nothing, so undo has\nnothing to put back for it.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "key",
+          "intent",
+          "state",
+          "at"
+        ],
+        "type": "object"
+      },
+      "JournalState": {
+        "enum": [
+          "pending",
+          "done",
+          "absent",
+          "conflict"
+        ],
+        "type": "string"
       },
       "JourneyEvent": {
         "description": "A single event in the visitor journey timeline",
@@ -37693,6 +38507,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "rejoin_ack": {
+            "description": "With `rejoined_node_id`: `temps_core::node_pki::rejoin_ack` over the\nworker's proof, keyed by the node's agent token hash. The worker\nchecks it before treating this as the control plane it belongs to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "rejoined_node_id": {
             "description": "The node this worker already is on this control plane, when it proved\nit and joins again (ADR 060): it keeps its mesh key and address, and\nregistering with `join_token` updates that node in place.",
             "format": "int32",
@@ -40142,6 +40963,59 @@
         ],
         "type": "object"
       },
+      "NodeDiskHealthResponse": {
+        "description": "Latest disk-array and drive health for a node.",
+        "properties": {
+          "drives": {
+            "items": {
+              "$ref": "#/components/schemas/DriveHealthRow"
+            },
+            "type": "array"
+          },
+          "drives_detected": {
+            "description": "Physical drives found on the node.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "drives_read": {
+            "description": "Drives whose SMART data could be read.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "raid_arrays": {
+            "items": {
+              "$ref": "#/components/schemas/RaidArrayHealth"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why some or all drive health is missing, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported": {
+            "description": "`false` when the node has never reported disk health.",
+            "type": "boolean"
+          },
+          "setup_path": {
+            "description": "Console path that shows this node's disk health.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "reported",
+          "raid_arrays",
+          "drives",
+          "drives_detected",
+          "drives_read",
+          "setup_path"
+        ],
+        "type": "object"
+      },
       "NodeDnsStatusEntry": {
         "description": "Per-node DNS resolver health, as last reported by that node's heartbeat.\nPart of `GET /api/cluster/dns/status`.",
         "properties": {
@@ -40453,6 +41327,43 @@
         "required": [
           "nodes",
           "total"
+        ],
+        "type": "object"
+      },
+      "NodeMetricsReportingStatus": {
+        "description": "Whether a worker is reporting metrics to the control plane.",
+        "properties": {
+          "detail": {
+            "description": "What went wrong, when `state` is not `reporting`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_attempt_at": {
+            "description": "ISO 8601, when the control plane last pulled.",
+            "type": "string"
+          },
+          "last_report_at": {
+            "description": "ISO 8601, when a report from the node was last stored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "state": {
+            "description": "`reporting`, `agent_too_old`, `unreachable`, `rejected` or `invalid`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_id",
+          "state",
+          "last_attempt_at"
         ],
         "type": "object"
       },
@@ -44588,6 +45499,30 @@
         },
         "type": "object"
       },
+      "PermissionCheck": {
+        "properties": {
+          "detail": {
+            "description": "Why, and what to change on the token when it is not present.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/TokenPermission"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PermissionState"
+          }
+        },
+        "required": [
+          "permission",
+          "label",
+          "state",
+          "detail"
+        ],
+        "type": "object"
+      },
       "PermissionDecision": {
         "description": "The user's decision for a pending permission request.  Serialized as a tagged\nJSON object and sent in the resolve endpoint body.  `DenyTool`/`RejectPlan`\ncarry an optional human-readable reason that is forwarded to the CLI's\n`control_response` (never stored).",
         "oneOf": [
@@ -44767,6 +45702,14 @@
           "input"
         ],
         "type": "object"
+      },
+      "PermissionState": {
+        "enum": [
+          "present",
+          "missing",
+          "unverified"
+        ],
+        "type": "string"
       },
       "PgUpgradeLogResponse": {
         "properties": {
@@ -45114,6 +46057,28 @@
         ],
         "type": "object"
       },
+      "PlanBlocked": {
+        "description": "Why no option fits, and what would make one.",
+        "properties": {
+          "action": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachAction"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "type": "object"
+      },
       "PlanComplexity": {
         "description": "Plan complexity indicator",
         "enum": [
@@ -45153,6 +46118,108 @@
           "complexity",
           "warnings"
         ],
+        "type": "object"
+      },
+      "PlanOption": {
+        "properties": {
+          "actions": {
+            "description": "How many things the user does: answer, confirm, create.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "confirmation": {
+            "description": "Set when the option changes what another choice decided (ADR 058\nD9's hostname choice): what it changes, in words. Applying it needs\n`confirmed: true`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "fields": {
+            "description": "What the user still has to answer (ADR 058 D8 descriptor form).\n`address` is answered with [`ReachabilityPlan::address`] by default.",
+            "items": {
+              "$ref": "#/components/schemas/SetupField"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/PlanOptionKind"
+          },
+          "recommended": {
+            "description": "The first option that fits, in the ADR's preference order.",
+            "type": "boolean"
+          },
+          "required_permissions": {
+            "description": "Permissions applying it needs on top of `projects:write`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/PlanStep"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "warnings": {
+            "description": "Things worth knowing before choosing it.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "way_in": {
+            "description": "How traffic will get in, as in [`AddressReachability::way_in`].",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "title",
+          "description",
+          "actions",
+          "recommended",
+          "way_in",
+          "steps",
+          "fields",
+          "warnings",
+          "required_permissions"
+        ],
+        "type": "object"
+      },
+      "PlanOptionKind": {
+        "description": "One way to make the address reachable.",
+        "enum": [
+          "existing_tunnel",
+          "direct_managed_dns",
+          "new_tunnel",
+          "new_tunnel_with_token",
+          "direct_manual_dns",
+          "private_worker"
+        ],
+        "type": "string"
+      },
+      "PlanRequest": {
+        "description": "`POST …/reachability/plan`.",
+        "properties": {
+          "address": {
+            "description": "The hostname to make reachable; Temps suggests one without it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          }
+        },
         "type": "object"
       },
       "PlanSourceBackup": {
@@ -45205,6 +46272,21 @@
         ],
         "type": "object"
       },
+      "PlanStep": {
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/StepKind"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
       "PlanTarget": {
         "properties": {
           "container": {
@@ -45245,6 +46327,59 @@
           }
         },
         "type": "object"
+      },
+      "PlannedRecord": {
+        "description": "What a plan saw at a hostname it would write a record for.",
+        "oneOf": [
+          {
+            "description": "No record of that type.",
+            "properties": {
+              "state": {
+                "enum": [
+                  "absent"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "record": {
+                "$ref": "#/components/schemas/DnsRecordState"
+              },
+              "state": {
+                "enum": [
+                  "present"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "record",
+              "state"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "The provider could not be read when planning.",
+            "properties": {
+              "state": {
+                "enum": [
+                  "unknown"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "state"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "PlatformFeatures": {
         "description": "Which capabilities this server process actually provides.\n\nA client cannot tell \"this build has no sandboxes\" from \"this process was\nstarted in a profile that does not run them\" by probing endpoints — both\nlook like failure. This endpoint answers the question directly so the\nconsole can render an honest, actionable state (what is unavailable, and\nwhy) instead of a dead button or an empty page.\n\n**Honesty contract**: every field that is `true` MUST be backed by a\nregistered, reachable subsystem. A `true` that is not true is worse than\nthe endpoint not existing — it causes the console to render controls that\nsilently fail instead of showing an onboarding state.",
@@ -45298,7 +46433,11 @@
             "type": "string"
           },
           "sandboxes": {
-            "description": "Agent sandboxes / workspace previews run in this process. Requires a\nlocal Docker daemon.",
+            "description": "The standalone sandbox API is served and sandboxes can run on some\nnode (ADR 063). `true` in both profiles: on a control plane they run\non worker nodes only, and a create with no usable worker answers the\nworker-node-required problem pointing at Settings → Nodes.",
+            "type": "boolean"
+          },
+          "sandboxes_local": {
+            "description": "Sandboxes, AI agent runs and application workspaces can run on this\nhost itself. Requires local workloads (and so a local Docker daemon);\n`false` in the `control-plane` profile, where the control plane's own\nnode takes no sandboxes (ADR 063).",
             "type": "boolean"
           },
           "stateless": {
@@ -45852,6 +46991,60 @@
           "expires_at"
         ],
         "type": "object"
+      },
+      "PreviousChoice": {
+        "description": "A hostname's ADR 058 D9 choice before a run changed it, so undo puts it\nback.",
+        "oneOf": [
+          {
+            "description": "No choice: automatic selection.",
+            "properties": {
+              "mode": {
+                "enum": [
+                  "automatic"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Kept off tunnels.",
+            "properties": {
+              "mode": {
+                "enum": [
+                  "off"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "mode": {
+                "enum": [
+                  "tunnel"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "mode"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "PricingResponse": {
         "properties": {
@@ -46724,6 +47917,13 @@
               "string",
               "null"
             ]
+          },
+          "warnings": {
+            "description": "Things the operator should know about the saved policy, such as Temps\nnot being able to tell how visitors arrive (ADR 064 D9).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -47025,6 +48225,22 @@
           },
           "last_deployment": {
             "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_kib_per_sec": {
+            "description": "This project's container log ingestion budget in KiB/s. Absent = the\nplatform default; 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "This project's container log ingestion budget in lines/s. Absent =\nthe platform default (Settings → Monitoring); 0 = unlimited.",
+            "format": "int32",
             "type": [
               "integer",
               "null"
@@ -49387,6 +50603,10 @@
           },
           "scope": {
             "$ref": "#/components/schemas/AddressScope"
+          },
+          "tailscale": {
+            "description": "The worker's Tailscale address (`tailscale0`, in 100.64.0.0/10).",
+            "type": "boolean"
           }
         },
         "required": [
@@ -49506,6 +50726,17 @@
             "format": "int32",
             "type": "integer"
           },
+          "private_listener": {
+            "description": "In `private` mode (ADR 064 D5): the private address the listener is\nbound on, when it is a private one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_on_tailscale": {
+            "description": "That address is the worker's Tailscale one.",
+            "type": "boolean"
+          },
           "public_address": {
             "description": "Configured public address; `None` means the listen address.",
             "type": [
@@ -49527,6 +50758,7 @@
           "https_port",
           "agent_reports",
           "interfaces",
+          "private_on_tailscale",
           "behind_nat"
         ],
         "type": "object"
@@ -50037,6 +51269,31 @@
         ],
         "type": "object"
       },
+      "RaidArrayHealth": {
+        "description": "One software RAID array on a node.",
+        "properties": {
+          "degraded": {
+            "description": "Fewer members are active than the array was configured with.",
+            "type": "boolean"
+          },
+          "devices_failed": {
+            "description": "Members missing or marked failed.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "md device name, e.g. `md0`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "degraded",
+          "devices_failed"
+        ],
+        "type": "object"
+      },
       "RateLimitConfig": {
         "description": "Rate limiting configuration (subset of global RateLimitSettings)",
         "properties": {
@@ -50108,6 +51365,110 @@
             "type": "array"
           }
         },
+        "type": "object"
+      },
+      "ReachAction": {
+        "description": "What fixes it.",
+        "properties": {
+          "command": {
+            "description": "A command to run, when that is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "description": "A console path, when there is a page for it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ActionKind"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ReachState": {
+        "enum": [
+          "reachable",
+          "not_reachable",
+          "checking",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "ReachabilityPlan": {
+        "properties": {
+          "address": {
+            "description": "The address asked for, or the one Temps suggests.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "address_error": {
+            "description": "Why the address cannot be used, when it cannot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          },
+          "blocked": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PlanBlocked",
+                "description": "Set when `options` is empty."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fingerprint": {
+            "description": "A hash of everything the plan depends on: the environment's\naddresses and audiences, DNS providers and zones, tunnels with their\ndomains, `auto_publish` and hostname choices, and workers' ingress\nmodes. `apply` recomputes it and refuses a plan the cluster has\nmoved on from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "options": {
+            "description": "In the order Temps prefers them; the first is recommended.",
+            "items": {
+              "$ref": "#/components/schemas/PlanOption"
+            },
+            "type": "array"
+          },
+          "plan_id": {
+            "description": "What `apply` names to act on this plan. Plans expire after 15\nminutes and are applied once; `None` on the plan attached to\n`GET …/reachability`, which is not stored.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "audience",
+          "options"
+        ],
         "type": "object"
       },
       "ReachabilityStatus": {
@@ -50816,6 +52177,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "overlay_network_name": {
+            "description": "The overlay network name this node uses instead of the cluster's\n(ADR 059). `temps join` sends one when the host already has a network\nof the cluster's name it does not own. Absent keeps the node's current\nname; older CLIs never send it.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -52733,6 +54101,16 @@
         ],
         "type": "object"
       },
+      "ResumeRequest": {
+        "description": "`POST …/reachability/runs/{run_id}/resume`.",
+        "properties": {
+          "answers": {
+            "description": "`cloudflare_api_token`, when the run had not saved the account yet.",
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
       "RetentionCleanupFailure": {
         "properties": {
           "backup_id": {
@@ -53347,6 +54725,430 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "RunResource": {
+        "description": "Something a run made, so undo removes exactly that.",
+        "oneOf": [
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_provider"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "managed_domain"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An existing managed domain whose automatic DNS the run turned on.",
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "auto_manage_enabled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "connector"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "custom_domain"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "previous": {
+                "$ref": "#/components/schemas/PreviousChoice"
+              },
+              "type": {
+                "enum": [
+                  "hostname_choice"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "connector_id",
+              "previous",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A record the run created: undo removes it only while it still holds\n`content` with this run's marker.",
+            "properties": {
+              "content": {
+                "description": "What the run wrote; absent on runs recorded before it was kept.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "record_type": {
+                "description": "`A` or `AAAA`.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_record"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "label",
+              "record_type",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An existing record the run changed: undo puts `before` back while\nit still holds `after` with this run's marker.",
+            "properties": {
+              "after": {
+                "type": "string"
+              },
+              "before": {
+                "$ref": "#/components/schemas/DnsRecordState"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "record_type": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "dns_change"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "label",
+              "record_type",
+              "before",
+              "after",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "An address whose audience the run set: undo puts `before` back.",
+            "properties": {
+              "after": {
+                "$ref": "#/components/schemas/AddressAudience"
+              },
+              "before": {
+                "$ref": "#/components/schemas/AddressAudience"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "address_audience"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "hostname",
+              "before",
+              "after",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "domain": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "certificate"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "domain",
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RunState": {
+        "enum": [
+          "running",
+          "succeeded",
+          "waiting",
+          "failed",
+          "interrupted",
+          "recovering",
+          "conflict",
+          "undoing",
+          "undo_paused",
+          "undone"
+        ],
+        "type": "string"
+      },
+      "RunStep": {
+        "properties": {
+          "detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/StepKind"
+          },
+          "label": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/RunStepStatus"
+          }
+        },
+        "required": [
+          "kind",
+          "label",
+          "status"
+        ],
+        "type": "object"
+      },
+      "RunStepStatus": {
+        "enum": [
+          "pending",
+          "running",
+          "done",
+          "failed",
+          "skipped"
+        ],
+        "type": "string"
+      },
+      "RunView": {
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "audience": {
+            "$ref": "#/components/schemas/Audience"
+          },
+          "created": {
+            "description": "What the run created, oldest first: the journal's `done` entries.",
+            "items": {
+              "$ref": "#/components/schemas/RunResource"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "What went wrong or what is still missing, and what to do.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "finished_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "journal": {
+            "description": "Every step's resource, written before the call that creates it.",
+            "items": {
+              "$ref": "#/components/schemas/JournalEntry"
+            },
+            "type": "array"
+          },
+          "live_url": {
+            "description": "The address, once it is reachable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "option": {
+            "type": "string"
+          },
+          "plan_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "$ref": "#/components/schemas/RunState"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/RunStep"
+            },
+            "type": "array"
+          },
+          "undo": {
+            "items": {
+              "$ref": "#/components/schemas/UndoResult"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "audience",
+          "option",
+          "state",
+          "steps",
+          "created",
+          "journal",
+          "undo",
+          "created_at",
+          "updated_at"
+        ],
         "type": "object"
       },
       "RunnerClaim": {
@@ -56685,6 +58487,63 @@
         "required": [
           "service_id",
           "consecutive_failures"
+        ],
+        "type": "object"
+      },
+      "ServiceLogIngestion": {
+        "description": "A managed service's own container log ingestion budget. `None` inherits\nthe platform budget (Settings → Monitoring → Container log ingestion);\n`Some(0)` lifts that limit for this service's containers.",
+        "properties": {
+          "log_ingest_kib_per_sec": {
+            "description": "KiB of log text per second per container (0–1,048,576). null =\nplatform default.",
+            "example": 4096,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Lines per second per container (0–1,000,000). null = platform default.",
+            "example": 2000,
+            "format": "int32",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ServiceLogIngestionResponse": {
+        "description": "A managed service's container log ingestion budget.",
+        "properties": {
+          "log_ingest_kib_per_sec": {
+            "description": "KiB/s per container; absent/null = platform default, 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Lines/s per container; absent/null = platform default, 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id"
         ],
         "type": "object"
       },
@@ -61287,6 +63146,24 @@
         ],
         "type": "object"
       },
+      "StepKind": {
+        "enum": [
+          "check_token",
+          "save_dns_provider",
+          "manage_domain",
+          "create_tunnel",
+          "wait_for_tunnel",
+          "attach_domain",
+          "route_hostname",
+          "set_dns_record",
+          "show_dns_record",
+          "issue_certificate",
+          "wait_for_publication",
+          "check_reachability",
+          "set_audience"
+        ],
+        "type": "string"
+      },
       "StepResourceType": {
         "description": "What kind of resource a migration step operates on",
         "enum": [
@@ -63211,6 +65088,11 @@
       "ThrottledLogSource": {
         "description": "A container that is dropping lines because it exceeds its budget.",
         "properties": {
+          "bytes_per_sec_limit": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "container_id": {
             "type": "string"
           },
@@ -63245,6 +65127,16 @@
           "last_dropped_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "limit_overridden": {
+            "description": "Whether a project or service override sets those limits instead of\nthe platform-wide budget.",
+            "type": "boolean"
+          },
+          "lines_per_sec_limit": {
+            "description": "Limits this container is held to (`0` = no limit), with any project\nor service override applied.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "node_id": {
             "description": "Worker node, for containers collected from a remote node.",
@@ -63301,6 +65193,9 @@
           "dropped_lines",
           "dropped_bytes",
           "reason",
+          "lines_per_sec_limit",
+          "bytes_per_sec_limit",
+          "limit_overridden",
           "throttled_since",
           "last_dropped_at"
         ],
@@ -63572,6 +65467,95 @@
           "enabled"
         ],
         "type": "object"
+      },
+      "TokenCheckRequest": {
+        "properties": {
+          "token": {
+            "description": "The token, as pasted. Used for this check only; not stored.",
+            "type": "string"
+          },
+          "zone": {
+            "description": "The zone the token is meant for. With it, a token that reaches any\nother zone is not ready.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "token"
+        ],
+        "type": "object"
+      },
+      "TokenCheckResult": {
+        "properties": {
+          "checked_zone": {
+            "description": "The zone the write permissions were probed in.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why it did not, when it did not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/PermissionCheck"
+            },
+            "type": "array"
+          },
+          "ready": {
+            "description": "Every permission is present and, for one zone, the token reaches no\nother.",
+            "type": "boolean"
+          },
+          "scope": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ZoneScope",
+                "description": "Set when the check was for one zone."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "template_url": {
+            "description": "Where to create a token with the permissions filled in.",
+            "type": "string"
+          },
+          "valid": {
+            "description": "Cloudflare accepted the token at all.",
+            "type": "boolean"
+          },
+          "zones": {
+            "description": "Zones the token reaches (the first 50).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "valid",
+          "zones",
+          "permissions",
+          "ready",
+          "template_url"
+        ],
+        "type": "object"
+      },
+      "TokenPermission": {
+        "enum": [
+          "zone_read",
+          "dns_edit",
+          "tunnel_edit"
+        ],
+        "type": "string"
       },
       "TokenRenewalRequest": {
         "properties": {
@@ -64988,6 +66972,32 @@
         ],
         "type": "object"
       },
+      "UndoResult": {
+        "description": "What undoing one resource did.",
+        "properties": {
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "resource": {
+            "$ref": "#/components/schemas/RunResource"
+          }
+        },
+        "required": [
+          "resource",
+          "label",
+          "ok"
+        ],
+        "type": "object"
+      },
       "UndrainNodeResponse": {
         "description": "Response after undraining (reactivating) a node.",
         "properties": {
@@ -65816,6 +67826,13 @@
           "compute_pool_cidr": {
             "description": "New compute pool, an RFC 1918 IPv4 network such as `10.202.0.0/16`.",
             "type": "string"
+          },
+          "overlay_network_name": {
+            "description": "New cluster overlay network name (ADR 059); keeps the current one\nwhen omitted. At most 9 characters: a lowercase letter, then lowercase\nletters, digits, `-` or `_`. Hosts build the renamed network beside\nthe old one, which Temps never removes; containers move onto it as\nthey are redeployed.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "subnet_prefix_len": {
             "description": "Prefix of each node's subnet; keeps the current one when omitted.",
@@ -67342,6 +69359,22 @@
           },
           "image_retention_hours": {
             "description": "How long (hours) to retain built Docker images before nightly cleanup removes them.\nSet to null to use the system default. Valid range: 1–8760.\n\nOmitting the key leaves the current value unchanged; sending an explicit\n`null` clears the per-project override. `skip_serializing_if` keeps the\nround-trip honest — re-serializing a request that omitted the key must\nnot emit `\"image_retention_hours\": null`, which would mean \"reset\".",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_kib_per_sec": {
+            "description": "Same as `log_ingest_lines_per_sec`, in KiB per second (0–1,048,576).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Container log ingestion budget for this project's containers, in\nlines per second (0–1,000,000). `0` lifts the limit; explicit `null`\nreturns to the platform default; omit to leave unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -71744,6 +73777,41 @@
         },
         "required": [
           "zones"
+        ],
+        "type": "object"
+      },
+      "ZoneScope": {
+        "description": "Whether the token reaches only the zone it is meant for.",
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "other_count": {
+            "description": "How many other zones it reaches in all, listed or not.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "other_zones": {
+            "description": "Zones it reaches besides `zone`, as far as Cloudflare listed them.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "zone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "zone",
+          "other_zones",
+          "other_count",
+          "ok",
+          "detail"
         ],
         "type": "object"
       }
@@ -97058,6 +99126,119 @@
         ]
       }
     },
+    "/external-services/{id}/log-ingestion": {
+      "get": {
+        "description": "Both fields null means the service uses the platform budget from\nSettings → Monitoring → Container log ingestion.",
+        "operationId": "get_service_log_ingestion",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogIngestionResponse"
+                }
+              }
+            },
+            "description": "Current override"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get this service's own container log ingestion budget.",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Send null for a field to return to the platform default, 0 to lift the\nlimit. Applied to running containers within a minute; nothing restarts.",
+        "operationId": "update_service_log_ingestion",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceLogIngestion"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogIngestionResponse"
+                }
+              }
+            },
+            "description": "Override saved"
+          },
+          "400": {
+            "description": "Value out of range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace this service's container log ingestion budget.",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{id}/members": {
       "post": {
         "description": "Currently only `replica` members can be added at runtime. The\nresponse is **202 Accepted** as soon as the validation passes and\nthe placeholder `service_members` row is inserted. The actual\ncontainer provisioning + DNS registration runs in the background;\npoll `GET /external-services/{id}/members/{member_id}` to watch\n`provisioning_step` advance through the phases.",
@@ -103604,6 +105785,68 @@
         "x-maturity": "beta"
       }
     },
+    "/ingress/certificate-methods": {
+      "get": {
+        "description": "HTTP-01 needs an ingress that answers on port 80; without one, issue\ncertificates through DNS-01.",
+        "operationId": "get_certificate_methods",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CertificateMethods"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Which certificate methods fit this cluster.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/ingress/cloudflare/token-check": {
+      "post": {
+        "description": "Read-only calls, plus two writes whose bodies Cloudflare is certain to\nreject (an A record with an invalid address, a tunnel with no name):\n\"not authorized\" means the permission is missing, a validation error\nthat it is there, and nothing is created either way. Any other answer is\n`unverified`, and a run refuses the token. A token that reaches zones\nbesides the one asked about is refused too, naming them. The token is\nused for this check only and is not stored.",
+        "operationId": "check_cloudflare_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenCheckResult"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check which permissions a pasted Cloudflare API token has.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
     "/ingress/connectors": {
       "get": {
         "description": "A tunnel publishes apps under its `domain` without certificates or open\nports. Each node entry says whether that worker's connector is connected.",
@@ -108600,6 +110843,187 @@
         "x-maturity": "beta"
       }
     },
+    "/nodes/metrics/cluster": {
+      "get": {
+        "operationId": "NodeMetricsGetClusterRange",
+        "parameters": [
+          {
+            "description": "Metric name, e.g. `\"proxy.requests\"`.",
+            "in": "query",
+            "name": "metric",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated node ids (`0` = control plane), at most 64.",
+            "in": "query",
+            "name": "node_ids",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Time window: `\"1h\"` | `\"6h\"` | `\"24h\"` | `\"7d\"`.\nIgnored when `start_time` and `end_time` are both set.",
+            "in": "query",
+            "name": "range",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Explicit window start (ISO 8601). Must be paired with `end_time`.",
+            "example": "2026-08-13T00:00:00Z",
+            "in": "query",
+            "name": "start_time",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Explicit window end (ISO 8601). Must be paired with `start_time`.",
+            "example": "2026-08-13T12:00:00Z",
+            "in": "query",
+            "name": "end_time",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MetricDataPoint"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Combined metric time series"
+          },
+          "400": {
+            "description": "Invalid query parameters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Fetch one metric combined across several nodes: summed counters, ratios\nof summed parts, the slowest node's latency, otherwise the mean.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/metrics/cluster/latest": {
+      "get": {
+        "operationId": "NodeMetricsGetClusterLatest",
+        "parameters": [
+          {
+            "description": "Comma-separated node ids (`0` = control plane), at most 64.",
+            "in": "query",
+            "name": "node_ids",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "format": "double",
+                    "type": "number"
+                  },
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Map of metric name to combined latest value"
+          },
+          "400": {
+            "description": "Invalid query parameters"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Latest value of every metric, combined across several nodes. Nodes with\nnothing recorded in the last 10 minutes are left out.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/metrics/reporting": {
+      "get": {
+        "operationId": "NodeMetricsGetReporting",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/NodeMetricsReportingStatus"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Reporting status per worker"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether each worker is reporting metrics, and why not. Workers the\ncontrol plane does not pull yet (and the control plane itself) are absent.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/nodes/pairings": {
       "get": {
         "operationId": "NodePairingList",
@@ -109449,6 +111873,58 @@
           }
         ],
         "summary": "Update a node-scoped monitoring alert rule.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/disk-health": {
+      "get": {
+        "description": "Backs the disk-health panel on the server monitoring page. The headline\nvalues are also plain node metrics (`node.raid_degraded`,\n`node.disk_wear_percent`, `node.disk_media_errors`) that alert rules read.",
+        "operationId": "NodeMetricsGetDiskHealth",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeDiskHealthResponse"
+                }
+              }
+            },
+            "description": "Disk health"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Latest software RAID and drive SMART health for a node.",
         "tags": [
           "Metrics"
         ],
@@ -117310,6 +119786,16 @@
               }
             }
           },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This control plane runs no workloads, so it runs no preview gateway"
+          },
           "500": {
             "content": {
               "application/json": {
@@ -117467,6 +119953,16 @@
                 }
               }
             }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This control plane runs no workloads, so it runs no preview gateway"
           },
           "500": {
             "content": {
@@ -131242,6 +133738,525 @@
           "Project IP Access"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability": {
+      "get": {
+        "description": "Per address: who it is for, how traffic gets in, whether it works, why\nnot and what to do. Reachability is judged per address, not per node:\none ingress serves every app (ADR-020). When nothing is reachable the\nresponse carries the plan *Make it reachable* would offer.",
+        "operationId": "get_environment_reachability",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentReachability"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Project or environment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether visitors can reach each address of an environment.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/apply": {
+      "post": {
+        "description": "Recomputes the plan's fingerprint first: when anything it depends on\nchanged (or the plan expired or was used), nothing is created and the\n409 carries the new plan under `plan`. Otherwise starts a run and returns\nit at once; poll `…/reachability/runs/{run_id}` for progress. Every\nresource is journaled before it is created, and a failed step removes\nwhat the run made again, newest first.",
+        "operationId": "apply_environment_reachability",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "An answer is missing or invalid"
+          },
+          "403": {
+            "description": "A permission the option needs is missing"
+          },
+          "404": {
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "description": "The plan changed (the body's `plan` is the new one), or a run is in progress"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Carry out one option of a stored plan.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/plan": {
+      "post": {
+        "description": "Returns the ways in that fit, in the order Temps prefers them, each with\nits steps, the fields still to answer and, when an option changes\nanother choice, what to confirm. Changes nothing in the cluster; the plan\nis kept for 15 minutes under `plan_id` with a fingerprint of what it\ndepends on, for `apply`.",
+        "operationId": "plan_environment_reachability",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReachabilityPlan"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Project or environment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What *Make it reachable* would do for an address.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/runs": {
+      "get": {
+        "operationId": "list_reachability_runs",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/RunView"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The newest runs of an environment.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}": {
+      "get": {
+        "operationId": "get_reachability_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Run not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One run, with the progress of each step and what it created.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/decide": {
+      "post": {
+        "description": "Going forward, `keep` leaves their value and skips the step, and\n`overwrite` lets Temps set it; the run is then `interrupted`, to resume.\nWhile undoing, `keep` leaves their value and `overwrite` restores what\nwas there before the run; undo then carries on, with undo's checks.",
+        "operationId": "decide_reachability_conflict",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecideRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "That entry is not waiting for a decision"
+          },
+          "403": {
+            "description": "A permission or step-up confirmation is missing"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run is not waiting for a decision"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Answer a conflict: a DNS record someone else changed while the run was\nsetting it, or after it did (ADR 064 D4).",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/resume": {
+      "post": {
+        "description": "What earlier attempts made is looked up and reused, never made twice.\nAnswer `cloudflare_api_token` again when the run had not saved the\naccount yet: the token is never stored before that.",
+        "operationId": "resume_reachability_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResumeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The token is needed again, or is not usable"
+          },
+          "403": {
+            "description": "A permission the run needs is missing"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run is going, recovering, or finished"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Carry on a waiting or interrupted run from its first step not done.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/reachability/runs/{run_id}/undo": {
+      "post": {
+        "description": "What the run found already there stays, and a hostname choice it changed\nis put back as it was. Refused while Temps is still recovering an\ninterrupted run. Removing a certificate needs a recent password or\npasskey confirmation.",
+        "operationId": "undo_reachability_run",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Run ID",
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunView"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A permission or step-up confirmation is missing"
+          },
+          "404": {
+            "description": "Run not found"
+          },
+          "409": {
+            "description": "The run is still going, or nothing is left to undo"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove exactly what a run created, newest first.",
+        "tags": [
+          "Reachability"
+        ]
       }
     },
     "/projects/{project_id}/environments/{environment_id}/runtime-health": {
@@ -145105,7 +148120,7 @@
             "description": "Pool changed"
           },
           "400": {
-            "description": "Invalid pool, or it collides with the mesh pool, a node's address or a node's occupied range"
+            "description": "Invalid pool or overlay network name, or the pool collides with the mesh pool, a node's address or a node's occupied range"
           },
           "401": {
             "description": "Unauthorized"
@@ -145730,6 +148745,16 @@
           },
           "403": {
             "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "This control plane runs no workloads, so it builds no sandbox image"
           }
         },
         "security": [
@@ -153079,6 +156104,10 @@
     {
       "description": "Ingress connectors: tunnels into the cluster (ADR 058)",
       "name": "Ingress"
+    },
+    {
+      "description": "Making a project reachable (ADR 064)",
+      "name": "Reachability"
     },
     {
       "description": "Environment management operations",

@@ -1242,6 +1242,9 @@ mod ingest_budget_tests {
             dropped_lines: 10,
             dropped_bytes: 800,
             reason: IngestDropReason::LinesPerSec,
+            lines_per_sec_limit: 250,
+            bytes_per_sec_limit: 256 * 1024,
+            limit_overridden: false,
             throttled_since: Utc::now(),
             last_dropped_at: Utc::now(),
         }

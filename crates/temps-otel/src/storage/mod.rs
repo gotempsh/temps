@@ -286,6 +286,18 @@ pub trait OtelStorage: Send + Sync {
     /// backends dedupe internally).
     async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64>;
 
+    /// [`Self::record_trace_refs`] for several projects at once, as
+    /// `(project_id, trace_ids)` pairs. The default records each project in
+    /// turn; backends where every call is its own insert (ClickHouse, where
+    /// each insert is a new part to merge) override it to write one insert.
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        let mut submitted = 0;
+        for (project_id, trace_ids) in refs {
+            submitted += self.record_trace_refs(trace_ids, *project_id).await?;
+        }
+        Ok(submitted)
+    }
+
     /// Return every `(project_id, first_seen)` pair recorded for
     /// `trace_id`, at most one entry per project (earliest `first_seen`
     /// wins), in no guaranteed order. Project metadata (name, slug,

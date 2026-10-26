@@ -49,6 +49,14 @@
 //! is touched only when a stream starts or ends and when the console asks
 //! for a snapshot. Memory is one small entry per streamed container, plus one
 //! per container whose stream ended within the last [`THROTTLED_VISIBLE_FOR`].
+//!
+//! ## Overrides
+//!
+//! A project or managed service may override either limit
+//! ([`IngestOverrides`], from `projects.log_ingest_*` /
+//! `external_services.log_ingest_*`). The override is copied into each
+//! matching container's own atomics when its limiter is created and whenever
+//! the overrides are reloaded, so admitting a line still reads only atomics.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -56,6 +64,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use sea_orm::{
+    ColumnTrait, Condition, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QuerySelect,
+};
 use tracing::{error, info, warn};
 
 use crate::types::{ContainerContext, LogLevel, LogLine, LogStream};
@@ -77,6 +88,9 @@ const VISIBLE_MS: i64 = THROTTLED_VISIBLE_FOR.as_millis() as i64;
 /// back) re-anchors the bucket instead of waiting for time to catch up.
 /// Smaller steps back (stdout and stderr interleaving) just earn no refill.
 const MAX_REWIND_MS: i64 = BURST_SECONDS as i64 * 1000;
+
+/// Sentinel in a container's override atomics: use the platform limit.
+const INHERIT: i64 = -1;
 
 /// Which budget a dropped line exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
@@ -152,6 +166,99 @@ impl IngestLimits {
     }
 }
 
+/// One project's or managed service's override. `None` inherits the
+/// platform limit; `Some(0)` disables that limit for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct IngestOverride {
+    pub lines_per_sec: Option<u32>,
+    pub bytes_per_sec: Option<u64>,
+}
+
+impl IngestOverride {
+    /// From the `log_ingest_lines_per_sec` / `log_ingest_kib_per_sec` columns.
+    pub fn from_columns(lines_per_sec: Option<i32>, kib_per_sec: Option<i32>) -> Self {
+        Self {
+            lines_per_sec: lines_per_sec.map(|v| v.max(0) as u32),
+            bytes_per_sec: kib_per_sec.map(|v| v.max(0) as u64 * 1024),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines_per_sec.is_none() && self.bytes_per_sec.is_none()
+    }
+}
+
+/// Every project and managed service override currently configured.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct IngestOverrides {
+    pub projects: HashMap<i32, IngestOverride>,
+    pub external_services: HashMap<i32, IngestOverride>,
+}
+
+impl IngestOverrides {
+    /// The override that applies to a container: its managed service's for a
+    /// service container, its project's otherwise.
+    pub fn for_container(&self, ctx: &ContainerContext) -> IngestOverride {
+        let found = match ctx.external_service_id {
+            Some(id) => self.external_services.get(&id),
+            None => self.projects.get(&ctx.project_id),
+        };
+        found.copied().unwrap_or_default()
+    }
+
+    /// Read every non-null `log_ingest_*` override from `projects` and
+    /// `external_services`. Two small scans per budget sync (once a minute);
+    /// rows without an override are filtered out in SQL.
+    pub async fn load<C: ConnectionTrait>(db: &C) -> Result<Self, DbErr> {
+        use temps_entities::{external_services, projects};
+
+        let project_rows: Vec<(i32, Option<i32>, Option<i32>)> = projects::Entity::find()
+            .select_only()
+            .column(projects::Column::Id)
+            .column(projects::Column::LogIngestLinesPerSec)
+            .column(projects::Column::LogIngestKibPerSec)
+            .filter(
+                Condition::any()
+                    .add(projects::Column::LogIngestLinesPerSec.is_not_null())
+                    .add(projects::Column::LogIngestKibPerSec.is_not_null()),
+            )
+            .into_tuple()
+            .all(db)
+            .await?;
+        let service_rows: Vec<(i32, Option<i32>, Option<i32>)> = external_services::Entity::find()
+            .select_only()
+            .column(external_services::Column::Id)
+            .column(external_services::Column::LogIngestLinesPerSec)
+            .column(external_services::Column::LogIngestKibPerSec)
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::LogIngestLinesPerSec.is_not_null())
+                    .add(external_services::Column::LogIngestKibPerSec.is_not_null()),
+            )
+            .into_tuple()
+            .all(db)
+            .await?;
+
+        Ok(Self::from_rows(project_rows, service_rows))
+    }
+
+    fn from_rows(
+        project_rows: Vec<(i32, Option<i32>, Option<i32>)>,
+        service_rows: Vec<(i32, Option<i32>, Option<i32>)>,
+    ) -> Self {
+        let collect = |rows: Vec<(i32, Option<i32>, Option<i32>)>| {
+            rows.into_iter()
+                .map(|(id, lines, kib)| (id, IngestOverride::from_columns(lines, kib)))
+                .filter(|(_, o)| !o.is_empty())
+                .collect()
+        };
+        Self {
+            projects: collect(project_rows),
+            external_services: collect(service_rows),
+        }
+    }
+}
+
 /// Counters for one container, shared between its stream task (writer) and
 /// snapshots (readers). Wall-clock times: they say when we saw it.
 struct SourceStats {
@@ -169,6 +276,9 @@ struct SourceStats {
     last_dropped_at_ms: AtomicI64,
     /// Unix ms the current throttled episode began; `0` = not throttled.
     throttled_since_ms: AtomicI64,
+    /// Project/service override per dimension; [`INHERIT`] = platform limit.
+    lines_override: AtomicI64,
+    bytes_override: AtomicI64,
 }
 
 impl SourceStats {
@@ -183,6 +293,43 @@ impl SourceStats {
             last_reason: AtomicU8::new(0),
             last_dropped_at_ms: AtomicI64::new(0),
             throttled_since_ms: AtomicI64::new(0),
+            lines_override: AtomicI64::new(INHERIT),
+            bytes_override: AtomicI64::new(INHERIT),
+        }
+    }
+
+    fn set_override(&self, o: IngestOverride) {
+        self.lines_override.store(
+            o.lines_per_sec.map_or(INHERIT, i64::from),
+            Ordering::Relaxed,
+        );
+        self.bytes_override.store(
+            o.bytes_per_sec
+                .map_or(INHERIT, |v| i64::try_from(v).unwrap_or(i64::MAX)),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn overridden(&self) -> bool {
+        self.lines_override.load(Ordering::Relaxed) != INHERIT
+            || self.bytes_override.load(Ordering::Relaxed) != INHERIT
+    }
+
+    /// The platform limits with this container's override applied.
+    fn effective(&self, base: IngestLimits) -> IngestLimits {
+        let lines = self.lines_override.load(Ordering::Relaxed);
+        let bytes = self.bytes_override.load(Ordering::Relaxed);
+        IngestLimits {
+            lines_per_sec: if lines == INHERIT {
+                base.lines_per_sec
+            } else {
+                u32::try_from(lines).unwrap_or(u32::MAX)
+            },
+            bytes_per_sec: if bytes == INHERIT {
+                base.bytes_per_sec
+            } else {
+                bytes.max(0) as u64
+            },
         }
     }
 }
@@ -215,6 +362,13 @@ pub struct ThrottledLogSource {
     pub dropped_bytes: u64,
     /// Budget the most recent dropped line exceeded.
     pub reason: IngestDropReason,
+    /// Limits this container is held to (`0` = no limit), with any project
+    /// or service override applied.
+    pub lines_per_sec_limit: u32,
+    pub bytes_per_sec_limit: u64,
+    /// Whether a project or service override sets those limits instead of
+    /// the platform-wide budget.
+    pub limit_overridden: bool,
     #[schema(value_type = String, format = DateTime)]
     pub throttled_since: DateTime<Utc>,
     #[schema(value_type = String, format = DateTime)]
@@ -235,6 +389,9 @@ struct Entry {
 pub struct IngestBudget {
     lines_per_sec: AtomicU32,
     bytes_per_sec: AtomicU64,
+    /// Locked before `sources` whenever both are held, so an override reload
+    /// and a starting stream cannot interleave and leave a stale override.
+    overrides: Mutex<IngestOverrides>,
     sources: Mutex<HashMap<String, Entry>>,
 }
 
@@ -243,6 +400,7 @@ impl IngestBudget {
         Self {
             lines_per_sec: AtomicU32::new(limits.lines_per_sec),
             bytes_per_sec: AtomicU64::new(limits.bytes_per_sec),
+            overrides: Mutex::new(IngestOverrides::default()),
             sources: Mutex::new(HashMap::new()),
         }
     }
@@ -262,6 +420,39 @@ impl IngestBudget {
             .store(limits.bytes_per_sec, Ordering::Relaxed);
     }
 
+    /// Replace the project/service overrides and apply them to every
+    /// streamed container; running streams pick them up on their next line.
+    pub fn set_overrides(&self, overrides: IngestOverrides) {
+        let mut current = match self.overrides.lock() {
+            Ok(current) => current,
+            Err(e) => {
+                error!(error = %e, "log ingestion override registry is poisoned; keeping current overrides");
+                return;
+            }
+        };
+        if *current == overrides {
+            return;
+        }
+        match self.sources.lock() {
+            Ok(sources) => {
+                for entry in sources.values() {
+                    entry
+                        .stats
+                        .set_override(overrides.for_container(&entry.stats.source.ctx));
+                }
+            }
+            Err(e) => {
+                error!(error = %e, "log ingestion budget registry is poisoned; overrides apply to new streams only");
+            }
+        }
+        info!(
+            projects = overrides.projects.len(),
+            external_services = overrides.external_services.len(),
+            "per-project/service log ingestion overrides applied"
+        );
+        *current = overrides;
+    }
+
     /// A limiter for one container's stream. It resumes the bucket of the
     /// container's previous stream if that ended recently, registers the
     /// container for [`Self::throttled_sources`], and parks its bucket for
@@ -269,6 +460,19 @@ impl IngestBudget {
     pub fn limiter(self: &Arc<Self>, source: IngestSource) -> IngestLimiter {
         let container_id = source.ctx.container_id.clone();
         let limits = self.limits();
+        // Held until the entry carries its override; see `overrides`.
+        let overrides = self.overrides.lock();
+        let ingest_override = match &overrides {
+            Ok(overrides) => overrides.for_container(&source.ctx),
+            Err(e) => {
+                error!(
+                    container_id = %container_id,
+                    error = %e,
+                    "log ingestion override registry is poisoned; container gets the platform budget"
+                );
+                IngestOverride::default()
+            }
+        };
         let mut sources = match self.sources.lock() {
             Ok(sources) => sources,
             Err(e) => {
@@ -277,11 +481,14 @@ impl IngestBudget {
                     error = %e,
                     "log ingestion budget registry is poisoned; container will not be listed when throttled"
                 );
+                let stats = Arc::new(SourceStats::new(source));
+                stats.set_override(ingest_override);
+                let bucket = Bucket::full(stats.effective(limits));
                 return IngestLimiter {
                     budget: self.clone(),
-                    stats: Arc::new(SourceStats::new(source)),
+                    stats,
                     generation: 0,
-                    bucket: Bucket::full(limits),
+                    bucket,
                 };
             }
         };
@@ -292,9 +499,10 @@ impl IngestBudget {
             parked: None,
         });
         entry.generation += 1;
+        entry.stats.set_override(ingest_override);
         let bucket = match entry.parked.take() {
             Some((bucket, _)) => bucket,
-            None => Bucket::full(limits),
+            None => Bucket::full(entry.stats.effective(limits)),
         };
         IngestLimiter {
             budget: self.clone(),
@@ -327,6 +535,7 @@ impl IngestBudget {
 
     fn throttled_sources_at(&self, now: DateTime<Utc>) -> Vec<ThrottledLogSource> {
         let now_ms = now.timestamp_millis();
+        let base = self.limits();
         let stats: Vec<Arc<SourceStats>> = match self.sources.lock() {
             Ok(mut sources) => {
                 evict_parked(&mut sources, now_ms);
@@ -363,6 +572,7 @@ impl IngestBudget {
                     since => since,
                 };
                 let ctx = &stats.source.ctx;
+                let limits = stats.effective(base);
                 Some(ThrottledLogSource {
                     container_id: ctx.container_id.clone(),
                     service: ctx.service.clone(),
@@ -377,6 +587,9 @@ impl IngestBudget {
                     dropped_lines: stats.dropped_lines.load(Ordering::Relaxed),
                     dropped_bytes: stats.dropped_bytes.load(Ordering::Relaxed),
                     reason,
+                    lines_per_sec_limit: limits.lines_per_sec,
+                    bytes_per_sec_limit: limits.bytes_per_sec,
+                    limit_overridden: stats.overridden(),
                     throttled_since: from_millis(since_ms),
                     last_dropped_at: from_millis(last_dropped_ms),
                 })
@@ -417,6 +630,8 @@ struct DropNotice {
     window_secs: u64,
     reason: IngestDropReason,
     limits: IngestLimits,
+    /// The limits came from a project or service override.
+    overridden: bool,
     /// Event time of the window's last line; the notice is stamped with it
     /// so it sits right after the gap it explains.
     at: DateTime<Utc>,
@@ -583,7 +798,7 @@ impl IngestLimiter {
     }
 
     fn refill(&mut self, ts_ms: i64) {
-        let limits = self.budget.limits();
+        let limits = self.stats.effective(self.budget.limits());
         let bucket = &mut self.bucket;
         if limits != bucket.limits {
             // A changed budget takes effect at once. A lowered one cannot
@@ -650,6 +865,7 @@ impl IngestLimiter {
                     reason = %reason,
                     lines_per_sec_budget = self.bucket.limits.lines_per_sec,
                     bytes_per_sec_budget = self.bucket.limits.bytes_per_sec,
+                    limit_overridden = stats.overridden(),
                     "Container exceeds its log ingestion budget; dropping lines"
                 );
             }
@@ -688,6 +904,7 @@ impl IngestLimiter {
                     window_secs: STATS_WINDOW.as_secs(),
                     reason,
                     limits: self.bucket.limits,
+                    overridden: stats.overridden(),
                     at,
                 };
                 // A notice not yet written (the caller skipped one) is folded
@@ -733,11 +950,16 @@ fn notice_message(notice: &DropNotice) -> String {
             format!("{} KiB/s", notice.limits.bytes_per_sec / 1024)
         }
     };
+    let where_to_raise = if notice.overridden {
+        "in this project's or service's log ingestion settings, which override the \
+         platform budget"
+    } else {
+        "under Settings > Metrics Monitoring > Container log ingestion budget"
+    };
     format!(
         "temps: dropped {} log lines ({} bytes) in the {}s up to this line: this container \
-         exceeded its log ingestion budget of {}. Raise it under Settings > Metrics \
-         Monitoring > Container log ingestion budget, or make the container log less.",
-        notice.dropped_lines, notice.dropped_bytes, notice.window_secs, budget
+         exceeded its log ingestion budget of {}. Raise it {}, or make the container log less.",
+        notice.dropped_lines, notice.dropped_bytes, notice.window_secs, budget, where_to_raise
     )
 }
 
@@ -1170,5 +1392,197 @@ mod tests {
                 bytes_per_sec: 128 * 1024,
             }
         );
+    }
+
+    fn service_source(container_id: &str, service_id: i32) -> IngestSource {
+        let mut source = source(container_id);
+        source.ctx.project_id = 0;
+        source.ctx.external_service_id = Some(service_id);
+        source
+    }
+
+    #[test]
+    fn a_project_override_changes_only_that_projects_containers() {
+        let budget = budget(10, 0);
+        // Started before the override is loaded: picks it up on reload.
+        let mut overridden = budget.limiter(source("c1"));
+        let mut overrides = IngestOverrides::default();
+        overrides.projects.insert(
+            3,
+            IngestOverride {
+                lines_per_sec: Some(100),
+                bytes_per_sec: None,
+            },
+        );
+        budget.set_overrides(overrides);
+        let mut other_source = source("c2");
+        other_source.ctx.project_id = 8;
+        let mut other = budget.limiter(other_source);
+
+        // The first line anchors the bucket. A raised limit keeps the old
+        // bucket's tokens and refills at the new rate, so let ten seconds of
+        // event time pass to fill the new burst.
+        let start = at(t0(), Duration::from_secs(BURST_SECONDS));
+        burst(&mut overridden, t0(), 1, 10);
+        assert_eq!(burst(&mut overridden, start, 2_000, 10), 1_000);
+        assert_eq!(
+            burst(&mut other, t0(), 2_000, 10),
+            100,
+            "a 10 s burst of the platform 10/s"
+        );
+
+        let throttled = budget.throttled_sources();
+        let c1 = throttled
+            .iter()
+            .find(|t| t.container_id == "c1")
+            .expect("c1");
+        assert!(c1.limit_overridden);
+        assert_eq!(c1.lines_per_sec_limit, 100);
+        let c2 = throttled
+            .iter()
+            .find(|t| t.container_id == "c2")
+            .expect("c2");
+        assert!(!c2.limit_overridden);
+        assert_eq!(c2.lines_per_sec_limit, 10);
+
+        let notice = overridden.flush().expect("c1 dropped lines");
+        assert!(
+            notice
+                .msg
+                .contains("project's or service's log ingestion settings"),
+            "an overridden budget points at the override: {}",
+            notice.msg
+        );
+    }
+
+    #[test]
+    fn a_service_override_of_zero_disables_the_limit_and_clearing_it_restores_it() {
+        let budget = budget(10, 0);
+        let mut overrides = IngestOverrides::default();
+        overrides
+            .external_services
+            .insert(5, IngestOverride::from_columns(Some(0), None));
+        // A project override for project 0 must not leak onto services.
+        overrides
+            .projects
+            .insert(0, IngestOverride::from_columns(Some(1), None));
+        budget.set_overrides(overrides);
+        let mut limiter = budget.limiter(service_source("svc", 5));
+        assert_eq!(burst(&mut limiter, t0(), 5_000, 10), 5_000);
+
+        budget.set_overrides(IngestOverrides::default());
+        let later = at(t0(), Duration::from_secs(1));
+        assert_eq!(
+            burst(&mut limiter, later, 500, 10),
+            100,
+            "back on the platform 10/s, starting from a full bucket"
+        );
+        assert!(!budget.throttled_sources()[0].limit_overridden);
+    }
+
+    #[test]
+    fn a_restarted_stream_keeps_its_override() {
+        let budget = budget(10, 0);
+        let mut overrides = IngestOverrides::default();
+        overrides
+            .projects
+            .insert(3, IngestOverride::from_columns(Some(50), None));
+        budget.set_overrides(overrides);
+        drop(budget.limiter(source("c1")));
+        let mut restarted = budget.limiter(source("c1"));
+        assert_eq!(burst(&mut restarted, t0(), 1_000, 10), 500);
+    }
+
+    #[test]
+    fn override_columns_convert_kib_and_clamp_negatives() {
+        let o = IngestOverride::from_columns(Some(-3), Some(2));
+        assert_eq!(o.lines_per_sec, Some(0));
+        assert_eq!(o.bytes_per_sec, Some(2_048));
+        assert!(IngestOverride::from_columns(None, None).is_empty());
+    }
+
+    #[test]
+    fn overrides_from_rows_key_by_id_and_skip_empty_rows() {
+        let o = IngestOverrides::from_rows(
+            vec![(3, Some(2_000), None), (8, None, None)],
+            vec![(5, None, Some(0))],
+        );
+        assert_eq!(o.projects.len(), 1, "an all-null row is not an override");
+        assert_eq!(o.for_container(&source("c").ctx).lines_per_sec, Some(2_000));
+        assert_eq!(
+            o.for_container(&service_source("s", 5).ctx).bytes_per_sec,
+            Some(0)
+        );
+        // A service container never falls back to its project's override.
+        let mut unknown_service = source("u").ctx;
+        unknown_service.external_service_id = Some(99);
+        assert!(o.for_container(&unknown_service).is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn load_reads_only_rows_with_an_override_from_both_tables() {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::external_services;
+
+        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let conn = db.connection_arc();
+        conn.execute_unprepared(
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+                 preset, slug, created_at, updated_at, log_ingest_lines_per_sec, \
+                 log_ingest_kib_per_sec) \
+             VALUES (9301, 'Loud', 'loud', 'example', '.', 'main', 'nixpacks', 'loud', now(), \
+                 now(), 2000, 64), \
+                (9302, 'Quiet', 'quiet', 'example', '.', 'main', 'nixpacks', 'quiet', now(), \
+                 now(), NULL, NULL);",
+        )
+        .await
+        .expect("seed projects");
+        let now = Utc::now();
+        let service = external_services::ActiveModel {
+            name: Set("cache".to_string()),
+            service_type: Set("redis".to_string()),
+            status: Set("running".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            topology: Set("standalone".to_string()),
+            consecutive_health_failures: Set(0),
+            metrics_enabled: Set(true),
+            default_backup_provisioned: Set(false),
+            log_ingest_kib_per_sec: Set(Some(0)),
+            ..Default::default()
+        }
+        .insert(conn.as_ref())
+        .await
+        .expect("seed external service");
+
+        let o = IngestOverrides::load(conn.as_ref())
+            .await
+            .expect("load overrides");
+        assert_eq!(
+            o.projects.len(),
+            1,
+            "the project without an override is skipped"
+        );
+        let loud = o.projects.get(&9301).copied().unwrap_or_default();
+        assert_eq!(
+            loud.lines_per_sec,
+            Some(2_000),
+            "column order is lines, then KiB"
+        );
+        assert_eq!(loud.bytes_per_sec, Some(64 * 1024));
+        let svc = o
+            .external_services
+            .get(&service.id)
+            .copied()
+            .unwrap_or_default();
+        assert_eq!(svc.lines_per_sec, None);
+        assert_eq!(svc.bytes_per_sec, Some(0), "0 = unlimited for this service");
     }
 }

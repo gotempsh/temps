@@ -38,6 +38,11 @@ use crate::traffic_aggregation::{
 /// path. NOTE: `trace_id` and `error_group_id` are intentionally omitted here to
 /// match the original behaviour (they exist on the entity but were never written
 /// by the batch path).
+/// Rows per multi-row INSERT statement. `INSERT_COLUMNS.len()` parameters
+/// per row must stay under Postgres's 65 535 bind-parameter limit.
+const TIMESCALE_ROWS_PER_INSERT: usize = 1_000;
+const _: () = assert!(TIMESCALE_ROWS_PER_INSERT * INSERT_COLUMNS.len() < 65_535);
+
 const INSERT_COLUMNS: [&str; 35] = [
     "timestamp",
     "method",
@@ -249,7 +254,11 @@ impl ProxyLogStorage for TimescaleDbProxyLogStore {
         &self,
         entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
-        self.batch_insert(entries).await?;
+        // One statement per chunk: a multi-row INSERT binds one parameter per
+        // column per row, and Postgres caps a statement at 65 535 parameters.
+        for chunk in entries.chunks(TIMESCALE_ROWS_PER_INSERT) {
+            self.batch_insert(chunk).await?;
+        }
         Ok(())
     }
 

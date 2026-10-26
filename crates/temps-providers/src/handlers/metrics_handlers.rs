@@ -24,6 +24,7 @@
 //! PATCH /deployments/{id}/metrics/enable
 //!
 //! GET  /nodes/{id}/metrics
+//! GET  /nodes/{id}/metrics/disk-health
 //! ```
 //!
 //! The `range` query param accepts `"1h"` | `"6h"` | `"24h"` | `"7d"`.
@@ -1421,6 +1422,164 @@ async fn get_node_metrics_latest(
     Ok((StatusCode::OK, Json(values)))
 }
 
+/// Console path where a node's disk health is shown: the server monitoring
+/// page for the control plane (node 0), the node's own page for a worker.
+fn disk_health_setup_path(node_id: i32) -> String {
+    if node_id == 0 {
+        "/monitoring/server".to_string()
+    } else {
+        format!("/settings/nodes/{node_id}")
+    }
+}
+
+/// One software RAID array on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RaidArrayHealth {
+    /// md device name, e.g. `md0`.
+    pub name: String,
+    /// Fewer members are active than the array was configured with.
+    pub degraded: bool,
+    /// Members missing or marked failed.
+    pub devices_failed: u32,
+}
+
+/// SMART health of one drive on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DriveHealthRow {
+    /// Device name, e.g. `nvme0` or `sda`.
+    pub device: String,
+    /// Percentage of rated endurance used (can exceed 100).
+    pub wear_percent: Option<f64>,
+    /// Media / reallocated-sector errors the drive has recorded.
+    pub media_errors: Option<u64>,
+    /// Bytes written over the drive's lifetime.
+    pub bytes_written: Option<u64>,
+}
+
+/// Latest disk-array and drive health for a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeDiskHealthResponse {
+    /// `false` when the node has never reported disk health.
+    pub reported: bool,
+    pub raid_arrays: Vec<RaidArrayHealth>,
+    pub drives: Vec<DriveHealthRow>,
+    /// Physical drives found on the node.
+    pub drives_detected: u32,
+    /// Drives whose SMART data could be read.
+    pub drives_read: u32,
+    /// Why some or all drive health is missing, when it is.
+    pub reason: Option<String>,
+    /// Console path that shows this node's disk health.
+    pub setup_path: String,
+}
+
+fn disk_health_reason(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+) -> Option<String> {
+    if !health.reported {
+        return Some(
+            "This node has not reported disk health. It is read on Linux hosts: by the \
+             control plane for itself, and by `temps agent` on a worker node, which sends \
+             it with every heartbeat. A worker running an older agent does not report it \
+             until the agent is upgraded."
+                .into(),
+        );
+    }
+    if health.drives_detected > health.drives_read {
+        let missing = health.drives_detected - health.drives_read;
+        return Some(format!(
+            "SMART data could not be read for {missing} of {} drive(s). NVMe drives need \
+             temps (the server, or the agent on a worker) to run as root; SATA/SAS \
+             drives also need smartmontools (`smartctl`) installed.",
+            health.drives_detected
+        ));
+    }
+    None
+}
+
+impl NodeDiskHealthResponse {
+    fn new(node_id: i32, health: temps_metrics::collector::disk_health::NodeDiskHealth) -> Self {
+        let reason = disk_health_reason(&health);
+        Self {
+            reported: health.reported,
+            raid_arrays: health
+                .raid_arrays
+                .into_iter()
+                .map(|a| RaidArrayHealth {
+                    name: a.name,
+                    degraded: a.degraded,
+                    devices_failed: a.devices_failed,
+                })
+                .collect(),
+            drives: health
+                .drives
+                .into_iter()
+                .map(|d| DriveHealthRow {
+                    device: d.device,
+                    wear_percent: d.wear_percent,
+                    media_errors: d.media_errors,
+                    bytes_written: d.bytes_written,
+                })
+                .collect(),
+            drives_detected: health.drives_detected,
+            drives_read: health.drives_read,
+            reason,
+            setup_path: disk_health_setup_path(node_id),
+        }
+    }
+}
+
+/// Latest software RAID and drive SMART health for a node.
+///
+/// Backs the disk-health panel on the server monitoring page. The headline
+/// values are also plain node metrics (`node.raid_degraded`,
+/// `node.disk_wear_percent`, `node.disk_media_errors`) that alert rules read.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/disk-health",
+    operation_id = "NodeMetricsGetDiskHealth",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "Disk health", body = NodeDiskHealthResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_disk_health(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let health = temps_metrics::collector::disk_health::read_node_disk_health(store.as_ref(), id)
+        .await
+        .map_err(|e| {
+            error!(node_id = id, error = %e, "Failed to query node disk health");
+            internal_server_error()
+                .detail(format!("Failed to query disk health for node {id}: {e}"))
+                .build()
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(NodeDiskHealthResponse::new(id, health)),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Nodes — all nodes at once (ADR 061)
 // ---------------------------------------------------------------------------
@@ -2468,6 +2627,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         .route("/nodes/metrics/reporting", get(get_node_metrics_reporting))
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
         .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
+        .route("/nodes/{id}/metrics/disk-health", get(get_node_disk_health))
         .route(
             "/nodes/{id}/metrics/alert-rules",
             get(list_node_alert_rules).post(create_node_alert_rule),
@@ -2499,6 +2659,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         toggle_deployment_metrics,
         get_node_metrics_range,
         get_node_metrics_latest,
+        get_node_disk_health,
         get_cluster_metrics_range,
         get_cluster_metrics_latest,
         get_node_metrics_reporting,
@@ -2522,6 +2683,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         CreateNodeAlertRuleRequest,
         ToggleServiceMetricsRequest,
         ToggleDeploymentMetricsRequest,
+        NodeDiskHealthResponse,
+        RaidArrayHealth,
+        DriveHealthRow,
     )),
     info(
         title = "Metrics API",
@@ -3118,6 +3282,65 @@ mod tests {
                  declared operations: {served:?}"
             );
         }
+    }
+
+    #[test]
+    fn disk_health_response_explains_unread_drives() {
+        use temps_metrics::collector::disk_health::{DriveHealth, NodeDiskHealth};
+
+        let none = NodeDiskHealthResponse::new(0, NodeDiskHealth::default());
+        assert_eq!(none.setup_path, "/monitoring/server");
+        assert_eq!(
+            NodeDiskHealthResponse::new(4, NodeDiskHealth::default()).setup_path,
+            "/settings/nodes/4"
+        );
+        assert!(!none.reported);
+        assert!(none
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not reported"));
+
+        let partial = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives: vec![DriveHealth {
+                    device: "nvme0".into(),
+                    wear_percent: Some(12.0),
+                    ..Default::default()
+                }],
+                drives_detected: 3,
+                drives_read: 1,
+                ..Default::default()
+            },
+        );
+        let reason = partial.reason.expect("two drives were not read");
+        assert!(reason.contains("2 of 3"), "{reason}");
+        assert!(reason.contains("smartctl"), "{reason}");
+        assert_eq!(partial.drives[0].wear_percent, Some(12.0));
+
+        let complete = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives_detected: 1,
+                drives_read: 1,
+                ..Default::default()
+            },
+        );
+        assert!(complete.reason.is_none());
+    }
+
+    #[test]
+    fn disk_health_endpoint_is_in_the_served_openapi_doc() {
+        use utoipa::OpenApi as _;
+
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+        assert!(
+            served.contains("NodeMetricsGetDiskHealth (/nodes/{id}/metrics/disk-health)"),
+            "disk-health endpoint missing from the served OpenAPI document: {served:?}"
+        );
     }
 
     #[tokio::test]

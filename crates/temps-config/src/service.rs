@@ -5948,6 +5948,7 @@ mod tests {
             max_concurrent: 3,
             cpu_limit_cores: 1.5,
             memory_limit_mb: 1024,
+            ..BuildLimitsSettings::default()
         };
         let changed = BuildLimitsSettings {
             max_concurrent: 1,
@@ -5990,6 +5991,7 @@ mod tests {
             max_concurrent: 6,
             cpu_limit_cores: 4.0,
             memory_limit_mb: 8192,
+            ..BuildLimitsSettings::default()
         };
         let mut malformed = settings_row_with_build_limits(saved.clone());
         malformed.data["build_limits"] = serde_json::json!("not-an-object");
@@ -6019,6 +6021,7 @@ mod tests {
             max_concurrent: 4,
             cpu_limit_cores: 2.0,
             memory_limit_mb: 2048,
+            ..BuildLimitsSettings::default()
         };
         let db = MockDatabase::new(DatabaseBackend::Sqlite)
             .append_query_results(vec![
