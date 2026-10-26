@@ -881,8 +881,199 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_shield::feeds::Format;
-    use temps_shield::{Action, ListVerdict};
+    use temps_shield::{Action, Index, ListVerdict};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 24 * 60 * 60;
+    const TOOL_JA4: &str = "t13d3012h2_1d37bd780c83_882d495ac381";
+    const SCANNER_JA4: &str = "t13d1311h2_f57a46bbacb6_ab7e3b40a677";
+
+    fn rule(
+        project_id: Option<i32>,
+        network: Option<&str>,
+        ja4: Option<&str>,
+        verdict: &str,
+        expires_at: Option<i64>,
+    ) -> OperatorEntry {
+        OperatorEntry {
+            project_id,
+            network: network.map(str::to_string),
+            ja4: ja4.map(str::to_string),
+            verdict: verdict.to_string(),
+            expires_at,
+        }
+    }
+
+    fn observed(kind: &str, subject: &str, verdict: &str, expires_at: i64) -> ObservedEntry {
+        ObservedEntry {
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            verdict: verdict.to_string(),
+            expires_at,
+        }
+    }
+
+    fn rules() -> Vec<OperatorEntry> {
+        vec![
+            rule(None, Some("185.93.89.0/24"), None, "block", None),
+            rule(Some(7), Some("93.184.216.9/32"), None, "allow", None),
+            rule(
+                Some(7),
+                Some("45.33.32.0/24"),
+                None,
+                "challenge",
+                Some(NOW + 3600),
+            ),
+            rule(None, None, Some(TOOL_JA4), "block", None),
+            rule(Some(7), None, Some(SCANNER_JA4), "log", None),
+        ]
+    }
+
+    fn observations() -> Vec<ObservedEntry> {
+        vec![
+            observed("ip", "93.184.216.9", "block", NOW + 7 * DAY),
+            observed("ip", "2a01:4f8::9", "challenge", NOW + DAY),
+            observed("ja4", SCANNER_JA4, "challenge", NOW + DAY),
+        ]
+    }
+
+    fn snapshot_of(entries: Entries) -> ShieldSnapshot {
+        ShieldSnapshot {
+            revision: 1,
+            generated_at: NOW,
+            lists: entries.lists,
+            scoped: entries.scoped,
+            ja4: entries.ja4,
+        }
+    }
+
+    /// Operator rules and observations land in the scope they were written
+    /// for, with their verdict, and an operator allow wins.
+    #[test]
+    fn operator_and_observed_entries_apply_where_they_are_scoped() {
+        let index = Index::new(&snapshot_of(Entries::compile(
+            &rules(),
+            &observations(),
+            NOW,
+        )));
+        let at = |ip: &str, ja4: Option<&str>, project: i32| {
+            index.evaluate_client(None, Some(ip.parse().unwrap()), ja4, project, NOW)
+        };
+
+        let observed = at("93.184.216.9", None, 8);
+        assert_eq!(observed.verdict.action, Action::Block);
+        assert_eq!(
+            observed.verdict.reason_strings(),
+            ["observed (93.184.216.9/32)"]
+        );
+        // Project 7 allows the address it blocks everywhere else.
+        let allowed = at("93.184.216.9", None, 7);
+        assert!(allowed.allowed);
+        assert_eq!(allowed.verdict, temps_shield::Verdict::PASS);
+
+        let platform = at("185.93.89.1", None, 8).verdict;
+        assert_eq!(platform.action, Action::Block);
+        assert_eq!(platform.reason_strings(), ["operator (185.93.89.0/24)"]);
+        assert_eq!(at("45.33.32.9", None, 7).verdict.action, Action::Challenge);
+        assert_eq!(
+            at("45.33.32.9", None, 8).verdict,
+            temps_shield::Verdict::PASS
+        );
+        assert_eq!(
+            at("2a01:4f8::9", None, 8).verdict.reason_strings(),
+            ["observed (2a01:4f8::9/128)"]
+        );
+
+        let tool = at("8.8.4.4", Some(TOOL_JA4), 8).verdict;
+        assert_eq!(tool.action, Action::Block);
+        assert_eq!(
+            tool.reason_strings(),
+            [format!("operator (ja4 {TOOL_JA4})")]
+        );
+        // Observed everywhere; project 7 also logs it.
+        let scanner = at("8.8.4.4", Some(SCANNER_JA4), 7).verdict;
+        assert_eq!(scanner.action, Action::Challenge);
+        assert_eq!(
+            scanner.reason_strings(),
+            [
+                format!("observed (ja4 {SCANNER_JA4})"),
+                format!("operator (ja4 {SCANNER_JA4})")
+            ]
+        );
+        assert_eq!(
+            at("8.8.4.4", Some(SCANNER_JA4), 8).verdict.reason_strings(),
+            [format!("observed (ja4 {SCANNER_JA4})")]
+        );
+    }
+
+    /// An ingress that never hears of a newer revision stops acting on
+    /// expiring entries a day after the last one ends, not never; one that
+    /// does hear gets a revision without them first.
+    #[test]
+    fn expiring_entries_only_log_once_the_snapshot_outlives_them() {
+        let index = Index::new(&snapshot_of(Entries::compile(&[], &observations(), NOW)));
+        let at = |now| {
+            index
+                .evaluate_client(None, Some("93.184.216.9".parse().unwrap()), None, 8, now)
+                .verdict
+                .action
+        };
+        assert_eq!(at(NOW + EXPIRY_GRACE_SECS), Action::Block);
+        assert_eq!(at(NOW + 7 * DAY), Action::Block);
+        assert_eq!(at(NOW + 7 * DAY + 1), Action::Log);
+        let ja4 = index.evaluate_client(None, None, Some(SCANNER_JA4), 8, NOW + EXPIRY_GRACE_SECS);
+        assert_eq!(ja4.verdict, temps_shield::Verdict::PASS);
+    }
+
+    /// Only what the entries do counts as a change, not when they were
+    /// compiled or how far a promotion moved an expiry.
+    #[test]
+    fn the_entries_key_ignores_what_a_recompile_moves() {
+        let key = Entries::compile(&rules(), &observations(), NOW).key();
+        let later = Entries::compile(&rules(), &observations(), NOW + 600);
+        assert_eq!(later.key(), key);
+        let mut extended = observations();
+        extended[0].expires_at += DAY;
+        extended[2].expires_at += DAY;
+        assert_eq!(Entries::compile(&rules(), &extended, NOW).key(), key);
+        // What the stored revision holds compares equal to what made it.
+        let snapshot = snapshot_of(Entries::compile(&rules(), &observations(), NOW));
+        assert_eq!(Entries::of_snapshot(&snapshot).key(), key);
+
+        let mut fewer = observations();
+        fewer.remove(1);
+        assert_ne!(Entries::compile(&rules(), &fewer, NOW).key(), key);
+        let mut upgraded = observations();
+        upgraded[1].verdict = "block".into();
+        assert_ne!(Entries::compile(&rules(), &upgraded, NOW).key(), key);
+        let mut edited = rules();
+        edited[0].verdict = "challenge".into();
+        assert_ne!(Entries::compile(&edited, &observations(), NOW).key(), key);
+        let mut permanent = rules();
+        permanent[2].expires_at = None;
+        assert_ne!(
+            Entries::compile(&permanent, &observations(), NOW).key(),
+            key
+        );
+    }
+
+    #[test]
+    fn entries_that_do_not_parse_are_left_out() {
+        let entries = Entries::compile(
+            &[
+                rule(None, Some("not a network"), None, "block", None),
+                rule(None, Some("10.0.0.0/8"), None, "maybe", None),
+            ],
+            &[
+                observed("ip", "nowhere", "block", NOW + DAY),
+                observed("ip", "198.51.100.7", "allow", NOW + DAY),
+                observed("asn", "64496", "block", NOW + DAY),
+            ],
+            NOW,
+        );
+        assert_eq!(entries, Entries::default());
+    }
 
     /// A one-route HTTP server: answers `body` with `ETag: "v1"`, or 304
     /// when the request carries that tag. Counts the requests it answers.
