@@ -167,10 +167,12 @@ pub fn node_runtime_dir(config: &AgentConfig) -> Result<std::path::PathBuf, Node
     Ok(data_dir.join("node-runtime"))
 }
 
-/// The node runtime's driver: Docker, with secret files under `dir`, and
-/// every new instance joined to the cross-worker overlay with its peer
-/// routes installed, as the legacy worker deployer does
-/// ([`crate::overlay_driver`]). A no-op on a worker without an overlay.
+/// The node runtime's driver: Docker, with secret files under `dir`, the
+/// app network created before the first instance that needs it, and every
+/// new instance joined to the cross-worker overlay with its peer routes
+/// installed, as the legacy worker deployer does
+/// ([`crate::overlay_driver`]). The overlay part is a no-op on a worker
+/// without an overlay.
 fn node_driver(
     docker: bollard::Docker,
     dir: &std::path::Path,
@@ -182,12 +184,15 @@ fn node_driver(
         temps_workload_docker::DockerDriver::new(docker.clone())
             .with_secrets_root(dir.join("secret-files")),
     );
-    Arc::new(crate::overlay_driver::OverlayDriver::new(
-        docker_driver,
-        docker,
-        temps_network::NetworkConfig::default().docker_network_name,
-        overlay_peers,
-    ))
+    Arc::new(
+        crate::overlay_driver::OverlayDriver::new(
+            docker_driver,
+            docker,
+            temps_network::NetworkConfig::default().docker_network_name,
+            overlay_peers,
+        )
+        .with_app_network(temps_core::NETWORK_NAME.as_str()),
+    )
 }
 
 /// Open the node runtime and start its stream and reconcile loops.

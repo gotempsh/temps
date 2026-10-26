@@ -18,6 +18,12 @@
 //!   the Docker driver joins before the instance starts and skips when the
 //!   network does not exist. On a worker without an overlay this costs one
 //!   refused connect and changes nothing.
+//! - `create` first ensures the app network exists when the instance boots
+//!   on it, and re-applies the cloud-metadata egress block to it, as the
+//!   legacy worker handlers do on every create. Docker refuses to start a
+//!   container on a network that does not exist, and nothing else creates
+//!   the app network on a worker whose first workload arrives through the
+//!   node runtime.
 //! - `start` installs the peer routes after the instance is running (the
 //!   route install enters the container's network namespace by PID, which
 //!   only a running container has). Best-effort, like the legacy deployer:
@@ -46,6 +52,9 @@ pub struct OverlayDriver {
     docker: bollard::Docker,
     overlay_network: String,
     peers: SharedPeers,
+    /// The app network (`temps-app-network`) created on demand; `None`
+    /// leaves every network to the caller.
+    app_network: Option<String>,
 }
 
 impl OverlayDriver {
@@ -62,7 +71,55 @@ impl OverlayDriver {
             docker,
             overlay_network: overlay_network.into(),
             peers,
+            app_network: None,
         }
+    }
+
+    /// Creates `network` before the first instance that boots on it.
+    pub fn with_app_network(mut self, network: impl Into<String>) -> Self {
+        self.app_network = Some(network.into());
+        self
+    }
+
+    /// Ensures the app network exists when `attach` boots on it. A failure
+    /// fails the create with the network named, instead of Docker's bare
+    /// "network not found" from the start that follows.
+    async fn ensure_app_network(
+        &self,
+        spec: &InstanceSpec,
+        attach: &Attachments,
+    ) -> Result<(), DriverError> {
+        let Some(network) = self.app_network.as_deref() else {
+            return Ok(());
+        };
+        if attach.network.primary.as_deref() != Some(network) {
+            return Ok(());
+        }
+        let outcome = temps_core::docker_network::ensure_bridge_network(&self.docker, network)
+            .await
+            .map_err(|e| DriverError::Attach {
+                driver: self.inner.capabilities().name.clone(),
+                instance: spec.name.clone(),
+                network: network.to_string(),
+                reason: format!("creating the app network failed: {e}"),
+            })?;
+        if outcome != temps_core::docker_network::NetworkEnsured::Existing {
+            tracing::info!(network, instance = %spec.name, ?outcome, "app network created for the node runtime");
+        }
+        // Re-applied on every create so the block survives a host firewall
+        // flush; best-effort, like the legacy handlers.
+        if let Err(error) =
+            temps_deployer::metadata_egress::apply_metadata_egress_block(&self.docker, network)
+                .await
+        {
+            tracing::warn!(
+                network,
+                error = %error,
+                "Cloud-metadata egress block is incomplete; ensure nftables is installed and \
+                 the agent has CAP_NET_ADMIN"
+            );
+        }
+        Ok(())
     }
 
     /// Installs the peer routes in a running instance. Never fails the
@@ -192,6 +249,7 @@ impl RuntimeDriver for OverlayDriver {
         spec: &InstanceSpec,
         attach: &Attachments,
     ) -> Result<InstanceHandle, DriverError> {
+        self.ensure_app_network(spec, attach).await?;
         let attach = with_overlay(attach, &self.overlay_network);
         self.inner.create(spec, &attach).await
     }
@@ -484,5 +542,113 @@ mod tests {
             inner.started.lock().map(|s| s.clone()).unwrap_or_default(),
             ["app-7-1"]
         );
+    }
+
+    fn recording() -> Arc<RecordingDriver> {
+        Arc::new(RecordingDriver {
+            capabilities: temps_workload_docker::capabilities(),
+            created: Mutex::new(Vec::new()),
+            started: Mutex::new(Vec::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn an_app_network_that_cannot_be_ensured_fails_the_create_naming_it() {
+        let inner = recording();
+        let driver = OverlayDriver::new(
+            inner.clone(),
+            idle_docker(),
+            OVERLAY,
+            Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .with_app_network("temps-app-network");
+
+        let error = driver
+            .create(&spec("app-7-1"), &attach("temps-app-network"))
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("create must fail when the daemon is unreachable"));
+
+        match error {
+            DriverError::Attach {
+                network, instance, ..
+            } => {
+                assert_eq!(network, "temps-app-network");
+                assert_eq!(instance, "app-7-1");
+            }
+            other => panic!("expected an Attach error, got {other}"),
+        }
+        assert!(inner.created.lock().map(|c| c.is_empty()).unwrap_or(false));
+    }
+
+    #[tokio::test]
+    async fn instances_on_another_network_never_dial_the_daemon_for_the_app_network() {
+        let inner = recording();
+        let driver = OverlayDriver::new(
+            inner.clone(),
+            idle_docker(),
+            OVERLAY,
+            Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .with_app_network("temps-app-network");
+
+        driver
+            .create(&spec("job-3-1"), &attach("some-other-network"))
+            .await
+            .unwrap_or_else(|e| panic!("create: {e}"));
+
+        assert_eq!(inner.created.lock().map(|c| c.len()).unwrap_or(0), 1);
+    }
+
+    /// A worker whose first workload arrives through the node runtime has
+    /// no app network yet; the create must make it rather than leave the
+    /// start to fail with "network not found". Skips without Docker.
+    #[tokio::test]
+    async fn a_missing_app_network_is_created_before_the_first_instance() {
+        let Ok(docker) = bollard::Docker::connect_with_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let network = format!("temps-test-app-net-{}", std::process::id());
+        let _ = docker.remove_network(&network).await;
+
+        let inner = recording();
+        let driver = OverlayDriver::new(
+            inner.clone(),
+            docker.clone(),
+            OVERLAY,
+            Arc::new(std::sync::RwLock::new(Vec::new())),
+        )
+        .with_app_network(network.clone());
+        let created = driver.create(&spec("app-7-1"), &attach(&network)).await;
+        let exists = docker
+            .inspect_network(
+                &network,
+                None::<bollard::query_parameters::InspectNetworkOptions>,
+            )
+            .await
+            .map(|_| true);
+        let _ = docker.remove_network(&network).await;
+
+        // A daemon with no free address pool cannot create any network;
+        // that is the host, not the driver.
+        if let Err(e) = &created {
+            if e.to_string()
+                .contains("address pools have been fully subnetted")
+            {
+                println!("Docker has no free address pool, skipping: {e}");
+                return;
+            }
+        }
+        created.unwrap_or_else(|e| panic!("create: {e}"));
+        assert!(
+            matches!(exists, Ok(true)),
+            "network {network} should exist after the create, got {exists:?}"
+        );
+        assert_eq!(inner.created.lock().map(|c| c.len()).unwrap_or(0), 1);
     }
 }
