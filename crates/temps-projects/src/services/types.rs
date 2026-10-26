@@ -92,6 +92,9 @@ pub struct Project {
     pub is_on_demand: bool,
     pub deployment_config: Option<temps_entities::prelude::DeploymentConfig>,
     pub attack_mode: bool,
+    /// The Shield mode the project's environments inherit (ADR 066 D1), as
+    /// stored.
+    pub shield_mode: String,
     pub ai_alert_summaries_enabled: Option<bool>,
     pub ai_api_traffic_summary_enabled: Option<bool>,
     /// Opt-in for native error-tracking source context.
@@ -278,6 +281,9 @@ pub struct UpdateProjectSettingsParams {
     pub preset: Option<String>,
     pub directory: Option<String>,
     pub attack_mode: Option<bool>,
+    /// ADR 066: the Shield mode; wins over `attack_mode`, which is written
+    /// to match.
+    pub shield_mode: Option<temps_shield::ShieldMode>,
     pub enable_preview_environments: Option<bool>,
     pub preview_envs_on_demand: Option<bool>,
     pub preview_envs_idle_timeout_seconds: Option<i32>,

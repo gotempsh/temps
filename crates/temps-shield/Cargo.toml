@@ -29,6 +29,7 @@ zstd = { workspace = true }
 arc-swap = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+utoipa = { workspace = true, optional = true }
 
 [features]
 # `ja4::read_client_hello`, for the ingresses that read a ClientHello off
@@ -47,6 +48,8 @@ netwatch = [
     "dep:reqwest",
     "dep:tracing",
 ]
+# OpenAPI schemas for the types the console API exchanges (`ShieldMode`).
+utoipa = ["dep:utoipa"]
 
 [dev-dependencies]
 # Turns on `tokio` for this crate's own tests.

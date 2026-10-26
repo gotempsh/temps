@@ -19,6 +19,7 @@ describe('environment navigation', () => {
 
   test('only accepts known environment views', () => {
     expect(resolveEnvironmentView('settings')).toBe('settings')
+    expect(resolveEnvironmentView('shield')).toBe('shield')
     expect(resolveEnvironmentView('containers')).toBe('containers')
     expect(resolveEnvironmentView('unknown')).toBe('containers')
   })
@@ -50,5 +51,13 @@ describe('environment navigation', () => {
     const next = updateEnvironmentSearchParams(current, { environmentId: 9 })
 
     expect(next.toString()).toBe('environment=9&view=settings')
+  })
+
+  test('keeps the Shield view in the URL', () => {
+    const next = updateEnvironmentSearchParams(new URLSearchParams(), {
+      view: 'shield',
+    })
+
+    expect(next.toString()).toBe('view=shield')
   })
 })

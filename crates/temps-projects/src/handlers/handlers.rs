@@ -2008,6 +2008,9 @@ pub async fn update_project_settings(
         log_ingest_lines_per_sec: settings.log_ingest_lines_per_sec,
         log_ingest_kib_per_sec: settings.log_ingest_kib_per_sec,
         serves_own_temps_api: settings.serves_own_temps_api,
+        shield_mode: (settings.shield_mode.is_some() || settings.attack_mode.is_some())
+            .then(|| temps_shield::ShieldMode::parse(&update.project.shield_mode))
+            .flatten(),
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {
