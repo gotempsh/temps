@@ -34,6 +34,9 @@ pub struct PublicIngressConfig {
     /// The private listener (ADR 064 D5): serves only private addresses,
     /// each to its own range, with no ACME relay; port 80 only redirects.
     pub private: bool,
+    /// Who tailnet visitors are, for the private listener's
+    /// `tailnet_users` addresses (ADR 065 D6).
+    pub tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 }
 
 #[derive(Debug, Error)]
@@ -91,7 +94,7 @@ pub fn record_failure(error: impl Into<String>) {
 /// Routes this worker's listener serves: the public ones, or on a private
 /// listener (ADR 064 D5) the private ones; each needs a prepared certificate.
 fn served_route_count(snapshot: &crate::route_store::PublicIngressSnapshot) -> usize {
-    snapshot.routes.len() + snapshot.private_routes.len()
+    snapshot.routes.len() + snapshot.private_routes.len() + snapshot.identity_private_routes.len()
 }
 
 fn missing_certificates_error(missing: usize) -> String {
@@ -206,18 +209,24 @@ pub async fn spawn(
 
     let (http_router, https_router) = if config.private {
         (
-            crate::internal_proxy::private_router(Arc::clone(&store), "http").map_err(|error| {
-                PublicIngressError::Bind {
-                    address: http_address,
-                    reason: error.to_string(),
-                }
+            crate::internal_proxy::private_router(
+                Arc::clone(&store),
+                "http",
+                config.tailnet.clone(),
+            )
+            .map_err(|error| PublicIngressError::Bind {
+                address: http_address,
+                reason: error.to_string(),
             })?,
-            crate::internal_proxy::private_router(Arc::clone(&store), "https").map_err(
-                |error| PublicIngressError::Tls {
-                    address: https_address,
-                    reason: error.to_string(),
-                },
-            )?,
+            crate::internal_proxy::private_router(
+                Arc::clone(&store),
+                "https",
+                config.tailnet.clone(),
+            )
+            .map_err(|error| PublicIngressError::Tls {
+                address: https_address,
+                reason: error.to_string(),
+            })?,
         )
     } else {
         let acme_client = crate::with_control_plane_trust(
@@ -526,6 +535,7 @@ mod tests {
                 address_id: "a1".into(),
                 range: "100.64.0.0/10".into(),
                 listener: "100.64.0.7".into(),
+                principals: None,
             }],
             ..Default::default()
         };

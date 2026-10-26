@@ -22,6 +22,7 @@ use sea_orm::{
 use serde_json::Value;
 use temps_config::ConfigService;
 use temps_core::public_hostname::PublicHostnameStrategy;
+use temps_core::tailnet::TailscaleReport;
 use temps_core::ways_in::{
     only_private, private_allow_list_message, AddressWayIn, EnvironmentWaysIn, PrivateAllowList,
     WayInKind, WaysInError,
@@ -38,10 +39,12 @@ use temps_dns::{
     DnsRecordType, ManagedDnsRecordService, OwnershipScope, ProviderCredentials,
 };
 use temps_domains::DomainService;
+use temps_entities::audience::via;
 use temps_entities::{
     deployment_containers, dns_managed_record_states, domains, environment_domains, environments,
     ingress_connectors, node_public_ingress, nodes, project_custom_domains,
     project_ip_access_rules, projects, reachability_plans, reachability_runs,
+    tailnet_serve_entries,
 };
 use temps_projects::CustomDomainService;
 use thiserror::Error;
@@ -50,7 +53,7 @@ use tracing::{info, warn};
 use super::compute::{
     address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
     AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
-    TunnelState, PRIVATE_COMMAND,
+    ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
 use super::model::{
     AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
@@ -59,20 +62,28 @@ use super::model::{
     RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    fingerprint, guess_zone, http01_direct, plan, planned_address, planned_record, private_worker,
-    record_type_of, records_to_read, tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for,
-    NamedId, PlanFacts, PrivateWorkerFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
-    FIELD_TOKEN,
+    address_for_audience, fingerprint, guess_zone, http01_direct, plan, planned_record,
+    private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
+    tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
+    PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
+    ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
 };
 use super::run::{
-    created, decide, execute, reconcile_journal, resume, undo, NewTunnel, RunInput, RunOps,
-    RunRecord, RunSink, Stop, Timing, TunnelStatus, WriteError, ZoneState,
+    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, NewTunnel,
+    RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget,
+    ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus,
+    WriteError, ZoneState,
 };
+use super::serve_entries;
 use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
 use crate::error::IngressError;
 use crate::service::{
     CreateConnectorRequest, CreateError, HostnameMode, IngressConnectorService,
     SetHostnameChoiceRequest, TunnelMoveGuard,
+};
+use crate::tailscale::{
+    self, ScopeCheck, ServiceDefinition, ServiceHost, TailnetApi, TailscaleClient,
+    TailscaleCredential,
 };
 
 /// The DNS controller stamped on records a run sets.
@@ -101,6 +112,8 @@ pub enum ReachabilityError {
     Database(#[from] sea_orm::DbErr),
     #[error("Could not read the settings: {0}")]
     Settings(String),
+    #[error("Could not read this Temps install's id, which marks what it owns: {0}")]
+    InstallId(String),
     /// The plan no longer matches the cluster: nothing was created, and
     /// `plan` is the current one to review.
     #[error("{reason}")]
@@ -135,7 +148,8 @@ impl From<ReachabilityError> for temps_core::problemdetails::Problem {
             ReachabilityError::Ingress(_)
             | ReachabilityError::Stale { .. }
             | ReachabilityError::Database(_)
-            | ReachabilityError::Settings(_) => {
+            | ReachabilityError::Settings(_)
+            | ReachabilityError::InstallId(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "Reachability Error")
             }
         };
@@ -160,9 +174,43 @@ pub struct ReachabilityDeps {
 pub struct ReachabilityService {
     deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
+    /// Tailscale's API, its access tokens in memory only (ADR 065 D2).
+    tailnet: Arc<dyn TailnetApi>,
+    /// The last scope check of the cluster's Tailscale credential, by row
+    /// id: planning proves the scopes without probing on every plan.
+    scopes: Arc<Mutex<Option<(i32, std::time::Instant, ScopeCheck)>>>,
+    /// Recent host reads of each Service, for the outside check.
+    hosts: Arc<Mutex<HashMap<String, CachedHosts>>>,
     /// Environments with a run in progress: one at a time each.
     active: Arc<Mutex<HashSet<i32>>>,
     timing: Timing,
+}
+
+/// One Service's host read, and when it was made.
+type CachedHosts = (std::time::Instant, Result<Vec<ServiceHost>, String>);
+
+/// How long a scope check of the Tailscale credential is reused.
+const SCOPE_CHECK_TTL: Duration = Duration::from_secs(5 * 60);
+/// How long a Service's host read is reused by the outside check.
+const SERVICE_HOSTS_TTL: Duration = Duration::from_secs(30);
+/// At most this many Services' host reads are kept.
+const SERVICE_HOSTS_CACHED: usize = 256;
+
+/// The cluster's Tailscale credential (ADR 065 D2): `(row id, name, the
+/// OAuth client)`, decrypted for the call.
+async fn load_tailscale_credential(
+    connectors: &IngressConnectorService,
+) -> Result<Option<(i32, String, TailscaleCredential)>, String> {
+    let Some((row, settings, secrets)) = connectors
+        .credential(tailscale::KIND)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Ok(None);
+    };
+    let credential = TailscaleCredential::from_answers(&settings, &secrets)
+        .map_err(|e| format!("Tailscale OAuth client {} ('{}'): {e}", row.id, row.name))?;
+    Ok(Some((row.id, row.name, credential)))
 }
 
 /// The environment and project a request is about.
@@ -186,7 +234,10 @@ impl ReachabilityService {
             .unwrap_or_default();
         Self {
             deps: Arc::new(deps),
+            tailnet: Arc::new(TailscaleClient::new()),
             http,
+            scopes: Arc::new(Mutex::new(None)),
+            hosts: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashSet::new())),
             timing: Timing::default(),
         }
@@ -196,9 +247,87 @@ impl ReachabilityService {
         LiveOps {
             deps: self.deps.clone(),
             http: self.http.clone(),
+            tailnet: self.tailnet.clone(),
             project_id,
             environment_id,
         }
+    }
+
+    /// The cluster's Tailscale credential as a plan sees it, its scopes
+    /// proven at most every [`SCOPE_CHECK_TTL`] (ADR 065 D2).
+    async fn tailscale_credential_fact(&self) -> Option<TailscaleCredentialFact> {
+        let (id, name, credential) = match load_tailscale_credential(&self.deps.connectors).await {
+            Ok(Some(found)) => found,
+            Ok(None) => return None,
+            Err(error) => {
+                return Some(TailscaleCredentialFact {
+                    id: 0,
+                    name: String::new(),
+                    refusal: Some(format!(
+                        "Temps could not read the cluster's Tailscale OAuth client: {error}"
+                    )),
+                })
+            }
+        };
+        let cached = self.scopes.lock().ok().and_then(|cache| {
+            cache
+                .as_ref()
+                .filter(|(cached, at, _)| *cached == id && at.elapsed() < SCOPE_CHECK_TTL)
+                .map(|(_, _, check)| check.clone())
+        });
+        let check = match cached {
+            Some(check) => check,
+            None => {
+                let check = self.tailnet.check_scopes(&credential).await;
+                if let Ok(mut cache) = self.scopes.lock() {
+                    *cache = Some((id, std::time::Instant::now(), check.clone()));
+                }
+                check
+            }
+        };
+        Some(TailscaleCredentialFact {
+            id,
+            name,
+            refusal: check.refusal(),
+        })
+    }
+
+    /// The hosts advertising `service`, read at most every
+    /// [`SERVICE_HOSTS_TTL`] for the outside check (ADR 065 D5).
+    async fn cached_service_hosts(&self, service: &str) -> Result<Vec<ServiceHost>, String> {
+        if let Some(hit) = self.hosts.lock().ok().and_then(|cache| {
+            cache
+                .get(service)
+                .filter(|(at, _)| at.elapsed() < SERVICE_HOSTS_TTL)
+                .map(|(_, hosts)| hosts.clone())
+        }) {
+            return hit;
+        }
+        let read = match load_tailscale_credential(&self.deps.connectors).await {
+            Ok(Some((_, _, credential))) => self
+                .tailnet
+                .service_hosts(&credential, service)
+                .await
+                .map_err(|e| e.to_string()),
+            Ok(None) => Err(
+                "This cluster has no Tailscale OAuth client any more, so Temps cannot check which \
+                 machines host it."
+                    .to_string(),
+            ),
+            Err(error) => Err(error),
+        };
+        if let Ok(mut cache) = self.hosts.lock() {
+            if cache.len() >= SERVICE_HOSTS_CACHED {
+                cache.retain(|_, (at, _)| at.elapsed() < SERVICE_HOSTS_TTL);
+            }
+            if cache.len() < SERVICE_HOSTS_CACHED {
+                cache.insert(
+                    service.to_string(),
+                    (std::time::Instant::now(), read.clone()),
+                );
+            }
+        }
+        read
     }
 
     fn owned(&self, environment_id: Option<i32>) -> bool {
@@ -426,11 +555,13 @@ impl ReachabilityService {
                 audience,
                 AddressSource::CustomDomain,
                 Some(custom.id),
-                (audience == Audience::Private).then(|| PrivateBinding {
+                audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(true, custom.id),
                     range: custom.private_range.clone(),
                     node_id: custom.private_node_id,
                     listener: custom.private_listener.clone(),
+                    via: custom.private_via.clone(),
+                    service: custom.private_service.clone(),
                 }),
             );
         }
@@ -446,11 +577,13 @@ impl ReachabilityService {
                 audience,
                 AddressSource::EnvironmentDomain,
                 None,
-                (audience == Audience::Private).then(|| PrivateBinding {
+                audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(false, domain.id),
                     range: domain.private_range.clone(),
                     node_id: domain.private_node_id,
                     listener: domain.private_listener.clone(),
+                    via: domain.private_via.clone(),
+                    service: domain.private_service.clone(),
                 }),
             );
         }
@@ -669,24 +802,191 @@ impl ReachabilityService {
             .into_iter()
             .map(|row| (row.node_id, row))
             .collect();
+        // ADR 065 D4: the Serve entries of the addresses served through
+        // tailscaled.
+        let entries: Vec<tailnet_serve_entries::Model> = if addresses
+            .iter()
+            .any(|a| a.private.as_ref().is_some_and(PrivateBinding::on_tailscale))
+        {
+            tailnet_serve_entries::Entity::find()
+                .filter(tailnet_serve_entries::Column::NodeId.is_in(node_ids.iter().copied()))
+                .all(db)
+                .await
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let now = Utc::now();
-        addresses
+        let mut facts: HashMap<String, PrivateFacts> = addresses
             .iter()
             .filter_map(|input| {
                 let binding = input.private.as_ref()?;
                 let node_id = binding.node_id?;
-                Some((
-                    input.address.clone(),
+                let facts = if binding.on_tailscale() {
+                    tailnet_facts_of(
+                        binding,
+                        node_id,
+                        nodes.get(&node_id),
+                        rows.get(&node_id),
+                        entries
+                            .iter()
+                            .find(|e| e.node_id == node_id && e.address_id == binding.address_id),
+                        now,
+                    )
+                } else {
                     private_facts_of(
                         binding,
                         node_id,
                         nodes.get(&node_id),
                         rows.get(&node_id),
                         now,
-                    ),
-                ))
+                    )
+                };
+                Some((input.address.clone(), facts))
             })
-            .collect()
+            .collect();
+        // ADR 065 D6: who a `tailnet_users` address admits, and whether its
+        // worker is sent it at all. One query for every listed address.
+        let users_ids: Vec<String> = addresses
+            .iter()
+            .filter(|a| a.audience == Audience::TailnetUsers)
+            .filter_map(|a| Some(a.private.as_ref()?.address_id.clone()))
+            .collect();
+        let listed: Result<Vec<temps_entities::address_tailnet_principals::Model>, String> =
+            if users_ids.is_empty() {
+                Ok(Vec::new())
+            } else {
+                temps_entities::address_tailnet_principals::Entity::find()
+                    .filter(
+                        temps_entities::address_tailnet_principals::Column::AddressId
+                            .is_in(users_ids),
+                    )
+                    .all(db)
+                    .await
+                    .map_err(|e| e.to_string())
+            };
+        for input in addresses
+            .iter()
+            .filter(|a| a.audience == Audience::TailnetUsers)
+        {
+            let Some(binding) = input.private.as_ref() else {
+                continue;
+            };
+            let Some(fact) = facts.get_mut(&input.address) else {
+                continue;
+            };
+            let node = binding
+                .node_id
+                .and_then(|id| nodes.get(&id))
+                .map(|n| n.name.clone())
+                .unwrap_or_else(|| "the worker".to_string());
+            let identity = temps_routes::route_sync::reports_capability(
+                binding.node_id.and_then(|id| rows.get(&id)),
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+            );
+            fact.tailnet_users = if !identity {
+                Some(format!(
+                    "{} admits only listed tailnet users, and the agent on `{node}` cannot check \
+                     who they are, so it is not given the address. Update the agent on `{node}`.",
+                    input.address
+                ))
+            } else {
+                match &listed {
+                    Ok(rows) => {
+                        let list = temps_entities::address_tailnet_principals::principals(
+                            rows.iter().filter(|r| r.address_id == binding.address_id),
+                        );
+                        list.is_empty()
+                            .then(|| temps_core::tailnet::messages::NOBODY_LISTED.to_string())
+                    }
+                    Err(error) => Some(format!(
+                        "Temps could not read who {} admits: {error}",
+                        input.address
+                    )),
+                }
+            };
+        }
+        // ADR 065 D5: every host advertising a Service matches one of its
+        // Serve entries, read with the cluster's credential.
+        for input in addresses {
+            let Some(binding) = input.private.as_ref() else {
+                continue;
+            };
+            let (Some(service), Some(node_id)) = (binding.service.as_deref(), binding.node_id)
+            else {
+                continue;
+            };
+            if binding.via.as_deref() != Some(temps_entities::audience::via::TAILSCALE_SERVICE) {
+                continue;
+            }
+            let Some(tailnet) = facts
+                .get_mut(&input.address)
+                .and_then(|f| f.tailnet.as_mut())
+            else {
+                continue;
+            };
+            let state = self
+                .service_hosts_state(service, node_id, &binding.address_id, &tailnet.report)
+                .await;
+            tailnet.service = Some(state);
+        }
+        facts
+    }
+
+    /// What the outside check knows of `service`'s hosts (ADR 065 D5).
+    async fn service_hosts_state(
+        &self,
+        service: &str,
+        node_id: i32,
+        address_id: &str,
+        report: &TailscaleReport,
+    ) -> ServiceHostsState {
+        let tag = report
+            .tags
+            .iter()
+            .find(|t| t.as_str() == crate::tailscale::DEFAULT_TAG)
+            .or_else(|| report.tags.first())
+            .cloned()
+            .unwrap_or_else(|| crate::tailscale::DEFAULT_TAG.to_string());
+        let hosts = match self.cached_service_hosts(service).await {
+            Ok(hosts) => hosts,
+            Err(error) => {
+                return ServiceHostsState {
+                    name: service.to_string(),
+                    tag,
+                    unrecorded: Err(error),
+                    approved: None,
+                }
+            }
+        };
+        let entries = match serve_entries::for_service(self.deps.db.as_ref(), service).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                return ServiceHostsState {
+                    name: service.to_string(),
+                    tag,
+                    unrecorded: Err(format!(
+                        "the Serve entries naming it could not be read: {error}"
+                    )),
+                    approved: None,
+                }
+            }
+        };
+        let approved = entries
+            .iter()
+            .find(|e| e.node_id == node_id && e.address_id == address_id)
+            .and_then(|mine| {
+                hosts
+                    .iter()
+                    .find(|h| h.is(mine.tailscale_node_id.as_deref(), mine.dns_name.as_deref()))
+            })
+            .map(|host| host.approved.unwrap_or(false));
+        ServiceHostsState {
+            name: service.to_string(),
+            tag,
+            unrecorded: Ok(unrecorded_hosts(&hosts, &entries, Some(address_id))),
+            approved,
+        }
     }
 
     async fn judge(
@@ -754,7 +1054,14 @@ impl ReachabilityService {
             None
         } else {
             let facts = self
-                .plan_facts(&scope, &gathered, directs, Audience::Public, None)
+                .plan_facts(
+                    &scope,
+                    &gathered,
+                    directs,
+                    Audience::Public,
+                    None,
+                    Vec::new(),
+                )
                 .await?;
             Some(plan(&facts))
         };
@@ -785,6 +1092,7 @@ impl ReachabilityService {
         directs: Vec<DirectIngress>,
         audience: Audience,
         requested: Option<String>,
+        principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<PlanFacts, ReachabilityError> {
         let db = self.deps.db.as_ref();
         let mut hosts: Vec<String> = gathered
@@ -846,6 +1154,17 @@ impl ReachabilityService {
             .iter()
             .map(|row| (row.node_id, row.mode.clone()))
             .collect();
+        // ADR 065 D6: the agents that check who a tailnet visitor is.
+        let identity_workers: Vec<String> = workers
+            .iter()
+            .filter(|worker| {
+                temps_routes::route_sync::reports_capability(
+                    ingress_rows.iter().find(|r| r.node_id == worker.id),
+                    temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+                )
+            })
+            .map(|worker| worker.name.clone())
+            .collect();
         // ADR 064 D5: workers whose owner put them in private mode.
         let private_workers: Vec<PrivateWorkerFact> = workers
             .iter()
@@ -854,6 +1173,47 @@ impl ReachabilityService {
                 (row.mode.as_deref() == Some("private")).then(|| private_worker_fact(worker, row))
             })
             .collect();
+        // ADR 065 D2: workers that report their tailscaled, and the Serve
+        // entries declared on them.
+        let now = Utc::now();
+        let tailnet_workers: Vec<TailnetWorkerFact> = workers
+            .iter()
+            .filter_map(|worker| {
+                let row = ingress_rows.iter().find(|r| r.node_id == worker.id)?;
+                let (report, minutes_ago) = tailscale_report_of(row, now)?;
+                let private = private_worker_fact(worker, row);
+                Some(TailnetWorkerFact {
+                    id: worker.id,
+                    name: worker.name.clone(),
+                    report,
+                    minutes_ago,
+                    listener_on_tailscale: private
+                        .listener
+                        .filter(|_| private.tailscale && row.mode.as_deref() == Some("private")),
+                })
+            })
+            .collect();
+        let serve_entries: Vec<ServeEntryFact> = if tailnet_workers.is_empty() {
+            Vec::new()
+        } else {
+            tailnet_serve_entries::Entity::find()
+                .filter(
+                    tailnet_serve_entries::Column::NodeId
+                        .is_in(tailnet_workers.iter().map(|w| w.id)),
+                )
+                .order_by_asc(tailnet_serve_entries::Column::Id)
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|e| ServeEntryFact {
+                    node_id: e.node_id,
+                    hostname: e.hostname,
+                    removing: e.state == tailnet_serve_entries::STATE_REMOVING,
+                    via: e.private_via,
+                    service: e.service_name,
+                })
+                .collect()
+        };
         let suggested_private_worker = gathered
             .running_on
             .iter()
@@ -901,6 +1261,22 @@ impl ReachabilityService {
             .map(|a| (a.address.clone(), a.audience))
             .collect();
         let mut intents = tunnel_facts.intents;
+        // ADR 065 D2: the Tailscale credential matters only where a worker
+        // lets Temps use its tailscaled.
+        let tailscale_credential = if tailnet_workers.iter().any(|w| w.report.consent) {
+            self.tailscale_credential_fact().await
+        } else {
+            None
+        };
+        let install_id = if tailnet_workers.iter().any(|w| w.report.consent) {
+            self.deps
+                .records
+                .instance_id()
+                .await
+                .map_err(|e| ReachabilityError::InstallId(e.to_string()))?
+        } else {
+            String::new()
+        };
         let facts = PlanFacts {
             intents: HashMap::new(),
             choices: tunnel_facts.choices,
@@ -926,10 +1302,33 @@ impl ReachabilityService {
             private_workers,
             suggested_private_worker,
             private_ranges,
+            tailnet_workers,
+            serve_entries,
+            tailscale_credential,
+            service_seen: None,
+            install_id,
+            principals: if audience == Audience::TailnetUsers {
+                principals
+            } else {
+                Vec::new()
+            },
+            principals_now: Vec::new(),
+            identity_workers,
         };
         let mut dns_records = Vec::new();
+        let mut service_seen = None;
+        let mut principals_now = Vec::new();
         // The suggested address is known only now; D9 decides it too.
-        if let Ok(Some(address)) = planned_address(&facts) {
+        if let Ok(Some(address)) = address_for_audience(&facts) {
+            // ADR 065 D6: who it admits now, which the plan is held to.
+            if let Some(binding) = gathered
+                .addresses
+                .iter()
+                .find(|a| a.address == address && a.audience == Audience::TailnetUsers)
+                .and_then(|a| a.private.as_ref())
+            {
+                principals_now = super::principals::load(db, &binding.address_id).await?;
+            }
             // What a run would change is shown, and held to (D4).
             let ops = self.ops(None, None);
             for (host, record_type) in records_to_read(&facts, &address) {
@@ -951,12 +1350,88 @@ impl ReachabilityService {
                     .await?;
                 intents.extend(more.intents);
             }
+            // ADR 065 D4: the plan reads the Service name first, and holds
+            // the run to what it found.
+            if let (Some((service, _)), Some(credential)) = (
+                service_of(&facts, &address),
+                facts
+                    .tailscale_credential
+                    .as_ref()
+                    .filter(|c| c.refusal.is_none()),
+            ) {
+                let seen = match load_tailscale_credential(&self.deps.connectors).await {
+                    Ok(Some((id, _, oauth))) if id == credential.id => {
+                        match self.tailnet.get_service(&oauth, &service).await {
+                            Ok(None) => ServiceSeen::Absent,
+                            Ok(Some(definition)) => ServiceSeen::Found(definition),
+                            Err(error) => ServiceSeen::Unreadable(error.to_string()),
+                        }
+                    }
+                    Ok(_) => ServiceSeen::Unreadable(
+                        "the cluster's Tailscale OAuth client changed while planning".into(),
+                    ),
+                    Err(error) => ServiceSeen::Unreadable(error),
+                };
+                service_seen = Some((service, seen));
+            }
         }
         Ok(PlanFacts {
             intents,
             dns_records,
+            service_seen,
+            principals_now,
             ..facts
         })
+    }
+
+    /// ADR 065 3b: the worker that will host `service` must be a device of
+    /// the tailnet the credential creates it in. A credential's tailnet
+    /// `-` is whichever tailnet the OAuth client belongs to, so the worker is
+    /// looked up through it by its stable node id rather than by comparing
+    /// names. Not found, or not answerable, refuses before anything is made.
+    async fn check_worker_in_credentials_tailnet(
+        &self,
+        entered: Option<&TailscaleCredential>,
+        worker: &TailnetWorkerFact,
+        service: &str,
+    ) -> Result<(), ReachabilityError> {
+        let credential = match entered {
+            Some(credential) => credential.clone(),
+            None => match load_tailscale_credential(&self.deps.connectors).await {
+                Ok(Some((_, _, credential))) => credential,
+                Ok(None) => {
+                    return Err(ReachabilityError::Conflict(format!(
+                        "The cluster's Tailscale OAuth client is gone; plan `{service}` again."
+                    )))
+                }
+                Err(error) => return Err(ReachabilityError::Validation(error)),
+            },
+        };
+        let Some(node_id) = worker.report.node_id.as_deref().filter(|id| !id.is_empty()) else {
+            return Err(ReachabilityError::Validation(format!(
+                "{} has not reported its Tailscale node id yet, so Temps cannot check it is in \
+                 the tailnet `{service}` would be created in. Try again once its agent has \
+                 reported.",
+                worker.name
+            )));
+        };
+        match self.tailnet.has_device(&credential, node_id).await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(ReachabilityError::Validation(format!(
+                "{} is not a device of the tailnet this Tailscale OAuth client manages \
+                 (`{}`), so `{service}` would be created where {} cannot host it. Use an OAuth \
+                 client of {}'s own tailnet.",
+                worker.name,
+                credential.tailnet,
+                worker.name,
+                worker.report.tailnet.as_deref().unwrap_or("the worker's"),
+            ))),
+            Err(error) => Err(ReachabilityError::Validation(format!(
+                "Temps could not check that {} is in the tailnet `{service}` would be created \
+                 in: {error}",
+                worker.name
+            ))),
+        }
     }
 
     async fn facts_for(
@@ -964,6 +1439,7 @@ impl ReachabilityService {
         scope: &Scope,
         audience: Audience,
         requested: Option<String>,
+        principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
@@ -971,7 +1447,7 @@ impl ReachabilityService {
             .await?;
         let directs = self.directs(&settings).await;
         let facts = self
-            .plan_facts(scope, &gathered, directs, audience, requested)
+            .plan_facts(scope, &gathered, directs, audience, requested, principals)
             .await?;
         Ok((facts, settings))
     }
@@ -984,7 +1460,7 @@ impl ReachabilityService {
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
         let mut planned = plan(facts);
-        let address = planned_address(facts).ok().flatten();
+        let address = address_for_audience(facts).ok().flatten();
         let print = fingerprint(facts, address.as_deref());
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -1019,8 +1495,16 @@ impl ReachabilityService {
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
         let scope = self.scope(project_id, environment_id).await?;
+        // ADR 065 D6: who a `tailnet_users` address admits, checked and
+        // lower-cased before anything is planned with it.
+        let principals = if request.audience == Audience::TailnetUsers {
+            temps_core::tailnet::normalize_principals(&request.principals)
+                .map_err(ReachabilityError::Validation)?
+        } else {
+            Vec::new()
+        };
         let (facts, _) = self
-            .facts_for(&scope, request.audience, request.address)
+            .facts_for(&scope, request.audience, request.address, principals)
             .await?;
         self.store_plan(&scope, &facts, user_id).await
     }
@@ -1077,8 +1561,16 @@ impl ReachabilityService {
             .as_ref()
             .map(|p| Audience::parse(&p.audience))
             .unwrap_or_default();
-        let (facts, settings) = self.facts_for(&scope, audience, requested).await?;
-        let address = match planned_address(&facts) {
+        // ADR 065 D6: the list the plan was made for, and only that one.
+        let principals = stored
+            .as_ref()
+            .and_then(|p| serde_json::from_value::<ReachabilityPlan>(p.plan.clone()).ok())
+            .map(|p| p.principals)
+            .unwrap_or_default();
+        let (facts, settings) = self
+            .facts_for(&scope, audience, requested, principals)
+            .await?;
+        let address = match address_for_audience(&facts) {
             Ok(Some(address)) => address,
             Ok(None) => {
                 return Err(ReachabilityError::Validation(
@@ -1189,6 +1681,9 @@ impl ReachabilityService {
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
             audience: None,
+            serve: None,
+            tailscale_service: None,
+            tailscale_credential: None,
             acme_email: settings
                 .letsencrypt
                 .email
@@ -1285,10 +1780,120 @@ impl ReachabilityService {
                 input.certificate_challenge = Some("dns-01".to_string());
                 input.audience = Some((
                     AddressAudience {
-                        audience: Audience::Private,
+                        audience: facts.audience,
                         network_range: Some(range.to_string()),
                         private_node_id: Some(worker.id),
                         private_listener: Some(ip.to_string()),
+                        private_via: None,
+                        private_service: None,
+                        principals: facts.principals.clone(),
+                    },
+                    self.current_audience(&address).await?,
+                ));
+            }
+            PlanOptionKind::TailscaleServe => {
+                // ADR 065 D1: the worker whose own name the address is.
+                let worker = facts
+                    .tailnet_workers
+                    .iter()
+                    .find(|w| w.report.dns_name.as_deref() == Some(address.as_str()))
+                    .ok_or_else(|| {
+                        ReachabilityError::Conflict(format!(
+                            "No worker's tailnet name is {address} any more."
+                        ))
+                    })?;
+                input.serve = Some(ServeTarget {
+                    node_id: worker.id,
+                    node_name: worker.name.clone(),
+                    via: via::TAILSCALE_SERVE.to_string(),
+                    service: None,
+                    tailnet: worker.report.tailnet.clone(),
+                });
+                input.audience = Some((
+                    AddressAudience {
+                        audience: facts.audience,
+                        network_range: None,
+                        private_node_id: Some(worker.id),
+                        private_listener: None,
+                        private_via: Some(via::TAILSCALE_SERVE.to_string()),
+                        private_service: None,
+                        principals: facts.principals.clone(),
+                    },
+                    self.current_audience(&address).await?,
+                ));
+            }
+            PlanOptionKind::TailscaleService | PlanOptionKind::TailscaleServiceWithCredential => {
+                // ADR 065 D1, D4: the Service the address names, on a worker
+                // that can host it now.
+                let (service, tailnet) = service_of(&facts, &address).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "{address} is not a Tailscale Service name in your tailnet any more."
+                    ))
+                })?;
+                let worker = service_worker(&facts, &tailnet).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "No worker on {tailnet} can host `{service}` any more."
+                    ))
+                })?;
+                let credential_name = if option.kind
+                    == PlanOptionKind::TailscaleServiceWithCredential
+                {
+                    let mut settings = std::collections::BTreeMap::new();
+                    let mut secrets = std::collections::BTreeMap::new();
+                    for key in [tailscale::FIELD_CLIENT_ID, tailscale::FIELD_TAILNET] {
+                        if let Some(value) = text(key) {
+                            settings.insert(key.to_string(), value);
+                        }
+                    }
+                    if let Some(value) = text(tailscale::FIELD_CLIENT_SECRET) {
+                        secrets.insert(tailscale::FIELD_CLIENT_SECRET.to_string(), value);
+                    }
+                    let credential = TailscaleCredential::from_answers(&settings, &secrets)?;
+                    // D2: nothing starts until every scope is proven.
+                    if let Some(refusal) = self.tailnet.check_scopes(&credential).await.refusal() {
+                        return Err(ReachabilityError::Validation(refusal));
+                    }
+                    input.tailscale_credential = Some(credential);
+                    self.unused_credential_name().await?
+                } else {
+                    String::new()
+                };
+                self.check_worker_in_credentials_tailnet(
+                    input.tailscale_credential.as_ref(),
+                    worker,
+                    &service,
+                )
+                .await?;
+                let seen = match &facts.service_seen {
+                    Some((name, ServiceSeen::Found(definition))) if *name == service => {
+                        Some(definition.clone())
+                    }
+                    _ => None,
+                };
+                input.tailscale_service = Some(ServicePlan {
+                    name: service.clone(),
+                    tailnet: tailnet.clone(),
+                    tag: service_tag(worker),
+                    install_id: facts.install_id.clone(),
+                    seen,
+                    credential_name,
+                });
+                input.serve = Some(ServeTarget {
+                    node_id: worker.id,
+                    node_name: worker.name.clone(),
+                    via: via::TAILSCALE_SERVICE.to_string(),
+                    service: Some(service.clone()),
+                    tailnet: Some(tailnet),
+                });
+                input.audience = Some((
+                    AddressAudience {
+                        audience: facts.audience,
+                        network_range: None,
+                        private_node_id: Some(worker.id),
+                        private_listener: None,
+                        private_via: Some(via::TAILSCALE_SERVICE.to_string()),
+                        private_service: Some(service),
+                        principals: facts.principals.clone(),
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1393,12 +1998,15 @@ impl ReachabilityService {
 
     /// Who `host` is for now, as stored: public when it is not attached.
     async fn current_audience(&self, host: &str) -> Result<AddressAudience, ReachabilityError> {
-        Ok(project_custom_domains::Entity::find()
+        let db = self.deps.db.as_ref();
+        let Some(row) = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::Domain.eq(host))
-            .one(self.deps.db.as_ref())
+            .one(db)
             .await?
-            .map(|row| address_audience_of(&row))
-            .unwrap_or_default())
+        else {
+            return Ok(AddressAudience::default());
+        };
+        Ok(with_principals(db, &row, address_audience_of(&row)).await?)
     }
 
     /// The audience change a stored plan's option makes, for the step-up
@@ -1411,7 +2019,15 @@ impl ReachabilityService {
         plan_id: &str,
         option: PlanOptionKind,
         answered_address: Option<&str>,
-    ) -> Result<Option<(String, AddressAudience, Audience)>, ReachabilityError> {
+    ) -> Result<
+        Option<(
+            String,
+            AddressAudience,
+            Audience,
+            Vec<temps_core::tailnet::TailnetPrincipal>,
+        )>,
+        ReachabilityError,
+    > {
         let Some(stored) = reachability_plans::Entity::find_by_id(plan_id.to_string())
             .filter(reachability_plans::Column::ProjectId.eq(project_id))
             .filter(reachability_plans::Column::EnvironmentId.eq(environment_id))
@@ -1435,7 +2051,12 @@ impl ReachabilityService {
         match (changes, address) {
             (true, Some(address)) => {
                 let before = self.current_audience(&address).await?;
-                Ok(Some((address, before, Audience::parse(&stored.audience))))
+                Ok(Some((
+                    address,
+                    before,
+                    Audience::parse(&stored.audience),
+                    planned.principals,
+                )))
             }
             _ => Ok(None),
         }
@@ -1453,6 +2074,21 @@ impl ReachabilityService {
             .map(|p| p.name.to_ascii_lowercase())
             .collect();
         let base = format!("Cloudflare {zone}");
+        Ok(std::iter::once(base.clone())
+            .chain((2..).map(|n| format!("{base} {n}")))
+            .find(|name| !taken.contains(&name.to_ascii_lowercase()))
+            .unwrap_or(base))
+    }
+
+    /// A name for a pasted Tailscale OAuth client no connector row has.
+    async fn unused_credential_name(&self) -> Result<String, ReachabilityError> {
+        let taken: HashSet<String> = ingress_connectors::Entity::find()
+            .all(self.deps.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect();
+        let base = "Tailscale".to_string();
         Ok(std::iter::once(base.clone())
             .chain((2..).map(|n| format!("{base} {n}")))
             .find(|name| !taken.contains(&name.to_ascii_lowercase()))
@@ -1522,8 +2158,13 @@ impl ReachabilityService {
         let scope = self.scope(project_id, environment_id).await?;
         let row = self.find_run(project_id, environment_id, run_id).await?;
         let state = RunState::parse(&row.state);
+        // ADR 065 D4: a Serve slot held by something else, or Funnel on the
+        // name, stops the run in conflict with nothing for Temps to
+        // decide: the worker's owner fixes it, then resumes.
+        let worker_conflict = state == RunState::Conflict && record_of(&row).conflicts().is_empty();
         match state {
             RunState::Waiting | RunState::Interrupted => {}
+            RunState::Conflict if worker_conflict => {}
             RunState::Recovering => return Err(ReachabilityError::Conflict(RECOVERING.into())),
             RunState::Conflict | RunState::UndoPaused => {
                 return Err(ReachabilityError::Conflict(
@@ -1590,6 +2231,47 @@ impl ReachabilityService {
                 }
             }
             input.token = Some(token);
+        }
+        // ADR 065 D2: a pasted OAuth client is never stored until the run
+        // saves it, so a resume before that needs it again.
+        let credential_still_needed = record.steps.iter().any(|s| {
+            s.kind == StepKind::SaveTailscaleCredential
+                && !matches!(s.status, RunStepStatus::Done | RunStepStatus::Skipped)
+        });
+        if credential_still_needed {
+            let answer = |key: &str| {
+                request
+                    .answers
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+            };
+            let mut settings = std::collections::BTreeMap::new();
+            let mut secrets = std::collections::BTreeMap::new();
+            for key in [tailscale::FIELD_CLIENT_ID, tailscale::FIELD_TAILNET] {
+                if let Some(value) = answer(key) {
+                    settings.insert(key.to_string(), value);
+                }
+            }
+            match answer(tailscale::FIELD_CLIENT_SECRET) {
+                Some(value) => {
+                    secrets.insert(tailscale::FIELD_CLIENT_SECRET.to_string(), value);
+                }
+                None => {
+                    return Err(ReachabilityError::Validation(
+                        "Paste the Tailscale OAuth client again: Temps never stores it until the \
+                         run saves it."
+                            .into(),
+                    ))
+                }
+            }
+            let credential = TailscaleCredential::from_answers(&settings, &secrets)?;
+            if let Some(refusal) = self.tailnet.check_scopes(&credential).await.refusal() {
+                return Err(ReachabilityError::Validation(refusal));
+            }
+            input.tailscale_credential = Some(credential);
         }
         self.claim(environment_id, &scope.environment.name).await?;
         let mut active: reachability_runs::ActiveModel = row.into();
@@ -1760,6 +2442,36 @@ impl ReachabilityService {
     /// Answer a run's conflict (ADR 064 D4), journaled with its entry.
     /// Going forward the run becomes `interrupted`, to resume; while
     /// undoing, undo carries on at once.
+    /// When `request` confirms deleting a Tailscale Service while undoing
+    /// (ADR 065 D4): its tailnet, name and the definition the user was
+    /// shown, for the step-up and the audit record.
+    pub async fn service_to_delete(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        run_id: i32,
+        request: &DecideRequest,
+    ) -> Result<Option<(String, String, ServiceDefinition)>, ReachabilityError> {
+        if request.decision != super::model::Decision::Overwrite {
+            return Ok(None);
+        }
+        let row = self.find_run(project_id, environment_id, run_id).await?;
+        if RunState::parse(&row.state) != RunState::UndoPaused {
+            return Ok(None);
+        }
+        let record = record_of(&row);
+        Ok(record
+            .journal
+            .iter()
+            .find(|e| e.key == request.key)
+            .and_then(|e| match (&e.intent, &e.shown_service) {
+                (Intent::TailscaleService { tailnet, name, .. }, Some(shown)) => {
+                    Some((tailnet.clone(), name.clone(), shown.clone()))
+                }
+                _ => None,
+            }))
+    }
+
     pub async fn decide(
         &self,
         project_id: i32,
@@ -1963,6 +2675,7 @@ impl RunSink for DbSink {
 struct LiveOps {
     deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
+    tailnet: Arc<dyn TailnetApi>,
     /// The ADR 031 ownership scope of the DNS records a run sets.
     project_id: Option<i32>,
     environment_id: Option<i32>,
@@ -1973,6 +2686,18 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 impl LiveOps {
+    /// The cluster's Tailscale OAuth client, for a run's API call.
+    async fn tailscale(&self) -> Result<TailscaleCredential, String> {
+        load_tailscale_credential(&self.deps.connectors)
+            .await?
+            .map(|(_, _, credential)| credential)
+            .ok_or_else(|| {
+                "This cluster has no Tailscale OAuth client any more. Add one by making the \
+                 address reachable again."
+                    .to_string()
+            })
+    }
+
     /// `host` as attached to the run's own environment. An address on any
     /// other environment, or a run without one, is never read or changed
     /// here: a run, or its undo, only ever acts on its own addresses.
@@ -2102,6 +2827,10 @@ impl RunOps for LiveOps {
             Intent::DnsRecord { .. } | Intent::DnsChange { .. } => {
                 return Err("DNS records are looked up at their provider.".to_string())
             }
+            // Looked up by this run's reference to it (run.rs `look`).
+            Intent::TailscaleServe { .. } => {
+                return Err("Serve entries are looked up by the run's reference.".to_string())
+            }
             Intent::AddressAudience {
                 hostname, after, ..
             } => self
@@ -2124,6 +2853,20 @@ impl RunOps for LiveOps {
                 .map(|_| RunResource::Certificate {
                     domain: domain.clone(),
                 }),
+            Intent::TailscaleCredential { name } => ingress_connectors::Entity::find()
+                .filter(ingress_connectors::Column::Name.eq(name.clone()))
+                .filter(ingress_connectors::Column::Provider.eq(tailscale::KIND))
+                .one(db)
+                .await
+                .map_err(text)?
+                .map(|c| RunResource::TailscaleCredential {
+                    id: c.id,
+                    name: c.name,
+                }),
+            // Looked up by its marker (run.rs `look`).
+            Intent::TailscaleService { .. } => {
+                return Err("Tailscale Services are looked up by their marker.".to_string())
+            }
         })
     }
 
@@ -2539,6 +3282,9 @@ impl RunOps for LiveOps {
         let service = ReachabilityService {
             deps: self.deps.clone(),
             http: self.http.clone(),
+            tailnet: self.tailnet.clone(),
+            scopes: Arc::new(Mutex::new(None)),
+            hosts: Arc::new(Mutex::new(HashMap::new())),
             active: Arc::new(Mutex::new(HashSet::new())),
             timing: Timing::default(),
         };
@@ -2563,12 +3309,14 @@ impl RunOps for LiveOps {
             custom_domain_id: row.as_ref().map(|r| r.id),
             private: row
                 .as_ref()
-                .filter(|_| audience == Audience::Private)
+                .filter(|_| audience.is_private())
                 .map(|r| PrivateBinding {
                     address_id: private_address_id(true, r.id),
                     range: r.private_range.clone(),
                     node_id: r.private_node_id,
                     listener: r.private_listener.clone(),
+                    via: r.private_via.clone(),
+                    service: r.private_service.clone(),
                 }),
         };
         service
@@ -2590,10 +3338,13 @@ impl RunOps for LiveOps {
     }
 
     async fn address_audience(&self, host: &str) -> Result<Option<AddressAudience>, String> {
-        Ok(self
-            .own_address(host)
-            .await?
-            .map(|d| address_audience_of(&d)))
+        let Some(row) = self.own_address(host).await? else {
+            return Ok(None);
+        };
+        with_principals(self.deps.db.as_ref(), &row, address_audience_of(&row))
+            .await
+            .map(Some)
+            .map_err(text)
     }
 
     async fn set_address_audience(
@@ -2605,10 +3356,232 @@ impl RunOps for LiveOps {
             .own_address(host)
             .await?
             .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        use sea_orm::TransactionTrait;
+        // ADR 065 D6: the audience and who it admits change together.
+        let address_id = private_address_id(true, row.id);
+        let txn = self.deps.db.begin().await.map_err(text)?;
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, audience);
-        active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        active.update(&txn).await.map_err(text)?;
+        let list = if audience.audience == Audience::TailnetUsers {
+            audience.principals.as_slice()
+        } else {
+            &[]
+        };
+        super::principals::replace(&txn, &address_id, list)
+            .await
+            .map_err(text)?;
+        txn.commit().await.map_err(text)?;
         Ok(())
+    }
+
+    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String> {
+        serve_entries::claim(self.deps.db.as_ref(), run_id, wish)
+            .await
+            .map_err(text)
+    }
+
+    async fn serve_reference(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<(i32, bool)>, String> {
+        serve_entries::reference(self.deps.db.as_ref(), run_id, node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn serve_entry(
+        &self,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<Option<ServeEntryStatus>, String> {
+        serve_entries::status(self.deps.db.as_ref(), node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn release_serve_entry(
+        &self,
+        run_id: i32,
+        node_id: i32,
+        address_id: &str,
+    ) -> Result<ServeRelease, String> {
+        serve_entries::release(self.deps.db.as_ref(), run_id, node_id, address_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String> {
+        serve_entries::forget(self.deps.db.as_ref(), entry_id)
+            .await
+            .map_err(text)
+    }
+
+    async fn save_tailscale_credential(
+        &self,
+        name: &str,
+        credential: &TailscaleCredential,
+    ) -> Result<i32, String> {
+        let values: std::collections::BTreeMap<String, Value> = [
+            (tailscale::FIELD_CLIENT_ID, &credential.client_id),
+            (tailscale::FIELD_CLIENT_SECRET, &credential.client_secret),
+            (tailscale::FIELD_TAILNET, &credential.tailnet),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), Value::String(value.clone())))
+        .collect();
+        self.deps
+            .connectors
+            .save_credential(tailscale::KIND, name, &values)
+            .await
+            .map_err(text)
+    }
+
+    async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String> {
+        // Every Service setup reads the cluster's one credential.
+        let in_use = tailnet_serve_entries::Entity::find()
+            .filter(tailnet_serve_entries::Column::ServiceName.is_not_null())
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?;
+        if let Some(entry) = in_use {
+            return Ok(Some(format!(
+                "{} still serves {} as a Tailscale Service",
+                entry.node_name, entry.hostname
+            )));
+        }
+        self.deps
+            .connectors
+            .delete_credential(id)
+            .await
+            .map_err(text)?;
+        Ok(None)
+    }
+
+    async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String> {
+        let credential = self.tailscale().await?;
+        self.tailnet
+            .get_service(&credential, name)
+            .await
+            .map_err(text)
+    }
+
+    async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError> {
+        let credential = self.tailscale().await.map_err(WriteError::refused)?;
+        self.tailnet
+            .create_service(&credential, definition)
+            .await
+            .map_err(|error| WriteError {
+                maybe_applied: error.maybe_applied(),
+                message: error.to_string(),
+            })
+    }
+
+    async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String> {
+        let credential = self.tailscale().await?;
+        self.tailnet
+            .service_hosts(&credential, name)
+            .await
+            .map_err(text)
+    }
+
+    async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String> {
+        serve_entries::for_service(self.deps.db.as_ref(), name)
+            .await
+            .map_err(text)
+    }
+
+    async fn service_creation(
+        &self,
+        name: &str,
+        creator_run_id: i32,
+    ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String> {
+        let Some(row) = reachability_runs::Entity::find_by_id(creator_run_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+        else {
+            return Ok(None);
+        };
+        Ok(record_of(&row)
+            .journal
+            .into_iter()
+            .find_map(|entry| match entry.resource {
+                Some(RunResource::TailscaleService {
+                    name: created_name,
+                    created: true,
+                    creator_run_id: run,
+                    definition,
+                    ..
+                }) if created_name == name && run == creator_run_id => {
+                    Some((definition, entry.pending_since.unwrap_or(entry.at)))
+                }
+                _ => None,
+            }))
+    }
+
+    async fn delete_service(
+        &self,
+        tailnet: &str,
+        name: &str,
+        creator_run_id: i32,
+        shown: &ServiceDefinition,
+    ) -> Result<ServiceDeletion, String> {
+        use sea_orm::TransactionTrait;
+        let credential = self.tailscale().await?;
+        let txn = self.deps.db.begin().await.map_err(text)?;
+        // ADR 065 D4: no entry or reference can be added for the Service
+        // between these checks and the DELETE.
+        serve_entries::lock_service(&txn, tailnet, name)
+            .await
+            .map_err(text)?;
+        let entries = serve_entries::for_service(&txn, name).await.map_err(text)?;
+        if let Some(user) = entries.first() {
+            return Ok(ServiceDeletion::Kept(format!(
+                "`{name}` is used again, by {} on {}",
+                user.hostname, user.node_name
+            )));
+        }
+        let hosts = self
+            .tailnet
+            .service_hosts(&credential, name)
+            .await
+            .map_err(text)?;
+        if !hosts.is_empty() {
+            return Ok(ServiceDeletion::Kept(format!(
+                "`{name}` is advertised by {}",
+                unrecorded_hosts(&hosts, &[], None).join(", ")
+            )));
+        }
+        let current = match self
+            .tailnet
+            .get_service(&credential, name)
+            .await
+            .map_err(text)?
+        {
+            None => return Ok(ServiceDeletion::Gone),
+            Some(current) => current,
+        };
+        // Still this run's, by this install's marker, immediately before
+        // the DELETE: never a Service someone else made at the name.
+        let install = self.deps.records.instance_id().await.map_err(text)?;
+        if let Err(why) = super::run::still_ours(&current, name, &install, creator_run_id) {
+            return Ok(ServiceDeletion::Kept(why));
+        }
+        if let Some(why) = current.differs_from(shown) {
+            return Ok(ServiceDeletion::Kept(format!(
+                "{why} since you were asked, so Temps did not delete it"
+            )));
+        }
+        self.tailnet
+            .delete_service(&credential, name)
+            .await
+            .map_err(text)?;
+        txn.commit().await.map_err(text)?;
+        info!(%tailnet, service = %name, "deleted a Tailscale Service Temps created");
+        Ok(ServiceDeletion::Deleted)
     }
 
     async fn sleep(&self, duration: Duration) {
@@ -2626,13 +3599,33 @@ fn dns_record_type(record_type: &str) -> DnsRecordType {
 /// Who a custom domain is for, as stored.
 pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
     let audience = Audience::parse(&row.audience);
-    let private = audience == Audience::Private;
+    let private = audience.is_private();
     AddressAudience {
         audience,
         network_range: row.private_range.clone().filter(|_| private),
         private_node_id: row.private_node_id.filter(|_| private),
         private_listener: row.private_listener.clone().filter(|_| private),
+        // `listener` is phase 2's way in, which journals record as `None`.
+        private_via: row
+            .private_via
+            .clone()
+            .filter(|v| private && v != via::LISTENER),
+        private_service: row.private_service.clone().filter(|_| private),
+        principals: Vec::new(),
     }
+}
+
+/// `audience` with the list a `tailnet_users` row admits (ADR 065 D6).
+async fn with_principals<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    row: &project_custom_domains::Model,
+    mut audience: AddressAudience,
+) -> Result<AddressAudience, sea_orm::DbErr> {
+    if audience.audience == Audience::TailnetUsers {
+        audience.principals =
+            super::principals::load(db, &private_address_id(true, row.id)).await?;
+    }
+    Ok(audience)
 }
 
 /// Write `audience` with what bounds it; a public one clears the private
@@ -2641,11 +3634,19 @@ fn set_address_audience_on(
     active: &mut project_custom_domains::ActiveModel,
     audience: &AddressAudience,
 ) {
-    let private = audience.audience == Audience::Private;
+    let private = audience.audience.is_private();
     active.audience = Set(audience.audience.as_str().to_string());
     active.private_range = Set(audience.network_range.clone().filter(|_| private));
     active.private_node_id = Set(audience.private_node_id.filter(|_| private));
     active.private_listener = Set(audience.private_listener.clone().filter(|_| private));
+    // ADR 065 D11: a private row always says how it is served.
+    active.private_via = Set(private.then(|| {
+        audience
+            .private_via
+            .clone()
+            .unwrap_or_else(|| via::LISTENER.to_string())
+    }));
+    active.private_service = Set(audience.private_service.clone().filter(|_| private));
 }
 
 /// A worker in private mode as its last report describes it.
@@ -2764,10 +3765,76 @@ pub fn private_facts_of(
             })
         });
     PrivateFacts {
+        tailnet_users: None,
         worker,
         bound,
         tailscale,
         inside,
+        tailnet: None,
+    }
+}
+
+/// A worker's last tailscaled report (ADR 065 D2) and how many minutes old
+/// it is. `None` when it never sent one, or sent one this version cannot
+/// read.
+pub fn tailscale_report_of(
+    row: &node_public_ingress::Model,
+    now: chrono::DateTime<Utc>,
+) -> Option<(TailscaleReport, i64)> {
+    let value = row.tailscale.as_ref()?;
+    let report: TailscaleReport = serde_json::from_value(value.clone()).ok()?;
+    let received: chrono::DateTime<Utc> = value
+        .get("received_at")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or(row.updated_at);
+    Some((report, (now - received).num_minutes().max(0)))
+}
+
+/// What the control plane knows of `node_id` serving `binding` through
+/// tailscaled (ADR 065 D5): its last report, the address's Serve entry
+/// and the worker's inside check of it.
+pub fn tailnet_facts_of(
+    binding: &PrivateBinding,
+    node_id: i32,
+    node: Option<&nodes::Model>,
+    row: Option<&node_public_ingress::Model>,
+    entry: Option<&tailnet_serve_entries::Model>,
+    now: chrono::DateTime<Utc>,
+) -> PrivateFacts {
+    let worker = node
+        .map(|n| n.name.clone())
+        .unwrap_or_else(|| format!("node {node_id}"));
+    let report = row.and_then(|r| tailscale_report_of(r, now));
+    let bound = match (node, &report) {
+        (None, _) => Err(format!("{worker} is no longer part of this cluster.")),
+        (Some(n), _) if n.status != "active" => Err(format!(
+            "{worker} is {}. Bring it back, or make the address reachable on another worker.",
+            n.status
+        )),
+        (_, None) => Err(format!("{worker} has not reported on Tailscale yet.")),
+        _ => Ok(()),
+    };
+    let (report, minutes_ago) = report.unwrap_or_default();
+    PrivateFacts {
+        tailnet_users: None,
+        worker,
+        bound,
+        tailscale: true,
+        inside: None,
+        tailnet: Some(TailnetFacts {
+            report,
+            minutes_ago,
+            entry: entry
+                .filter(|e| e.address_id == binding.address_id)
+                .map(|e| ServeEntryState {
+                    entry_id: e.id,
+                    hostname: e.hostname.clone(),
+                    removing: e.state == tailnet_serve_entries::STATE_REMOVING,
+                    report: e.report.clone(),
+                    detail: e.report_detail.clone(),
+                }),
+            service: None,
+        }),
     }
 }
 

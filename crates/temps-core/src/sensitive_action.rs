@@ -152,6 +152,18 @@ pub enum SensitiveAction {
         from: String,
         to: String,
     },
+    /// Delete a Tailscale Service Temps created (ADR 065 D4). The Services
+    /// API has no conditional delete, so a person confirms it, with the
+    /// definition they were shown.
+    DeleteTailscaleService {
+        tailnet: String,
+        name: String,
+    },
+    /// Change who a `tailnet_users` address admits (ADR 065 D6), on a run
+    /// or its undo: a longer list lets more people in.
+    ChangeTailnetPrincipals {
+        hostname: String,
+    },
 }
 
 impl SensitiveAction {
@@ -197,6 +209,8 @@ impl SensitiveAction {
             Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
             Self::ChangeDockerSocketHealth { .. } => "change_docker_socket_health",
             Self::ChangeAddressAudience { .. } => "change_address_audience",
+            Self::DeleteTailscaleService { .. } => "delete_tailscale_service",
+            Self::ChangeTailnetPrincipals { .. } => "change_tailnet_principals",
         }
     }
 }

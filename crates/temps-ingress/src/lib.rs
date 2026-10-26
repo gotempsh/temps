@@ -19,6 +19,7 @@ pub mod provider;
 pub mod reachability;
 pub mod registry;
 pub mod service;
+pub mod tailscale;
 pub mod wire;
 
 pub use error::IngressError;

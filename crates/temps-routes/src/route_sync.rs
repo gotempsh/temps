@@ -121,6 +121,66 @@ pub struct PublicIngressSnapshot {
     /// private mode ignore the field and serve none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_routes: Vec<PrivateRouteEntryDto>,
+    /// What this worker serves through tailscaled (ADR 065 D4): its
+    /// `tailnet_serve_entries` rows, being removed or not. Never in `routes`
+    /// or `private_routes`; agents that predate it ignore the field and
+    /// never touch tailscaled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub serve_entries: Vec<ServeEntryDto>,
+    /// `tailnet_users` private addresses (ADR 065 D6), each with who it
+    /// admits. Never in `private_routes`: an agent that predates identity
+    /// checks ignores this field, so it serves none of them by construction,
+    /// whatever it reported earlier. Sent only when the snapshot request
+    /// itself declared `tailnet_identity.v1`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_private_routes: Vec<PrivateRouteEntryDto>,
+    /// The routes of `tailnet_users` Serve entries, by address id. Their
+    /// entry in `serve_entries` carries no route, so an agent that ignores
+    /// this field answers their socket 404. Sent on the same condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_serve_routes: Vec<IdentityServeRouteDto>,
+}
+
+/// Where a `tailnet_users` Serve socket sends requests, and who it admits
+/// (ADR 065 D6).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IdentityServeRouteDto {
+    pub address_id: String,
+    pub route: RouteEntryDto,
+    /// Never absent: an empty list admits nobody.
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
+}
+
+/// One Serve entry for the worker that applies it (ADR 065 D4).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServeEntryDto {
+    /// The row, named back in the agent's report.
+    pub entry_id: i32,
+    pub address_id: String,
+    /// The tailnet name.
+    pub hostname: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    /// No run references it: the agent takes it off and reports.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removing: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_etag: Option<String>,
+    /// Where its socket sends requests. `None` while held back (the reason
+    /// is in `unsupported_reasons`) or being removed: the socket answers 404.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<RouteEntryDto>,
+    /// A Service's TailVIPs as Tailscale assigned them, from the run that
+    /// created it: what the inside check accepts for the name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addrs: Vec<String>,
+    /// For `tailnet_users` (ADR 065 D6): who the socket admits. Never
+    /// serialized: [`split_tailnet_users`] moves it, with the route, into
+    /// `identity_serve_routes`.
+    #[serde(skip)]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 /// A private address on a worker's private listener (ADR 064 D5).
@@ -135,6 +195,10 @@ pub struct PrivateRouteEntryDto {
     /// The listener address DNS points at: what the inside check compares
     /// the hostname's answer with and dials.
     pub listener: String,
+    /// For `tailnet_users` (ADR 065 D6): who the listener admits, by whois
+    /// of the TCP peer. Only ever set in `identity_private_routes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -284,6 +348,15 @@ pub async fn get_routes_snapshot(
     Query(q): Query<RouteSnapshotQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
+    // ADR 065 D6: what this request's agent enforces, from this request
+    // only. A capability reported earlier says nothing about the binary
+    // asking now (it may have been rolled back).
+    let tailnet_identity = temps_core::tailnet::header_names_capability(
+        headers
+            .get(temps_core::tailnet::AGENT_CAPABILITIES_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+    );
 
     // Arm the notifier BEFORE checking the generation. `Notify::notified()`
     // captures the current notify epoch at construction time, so a reload
@@ -310,7 +383,7 @@ pub async fn get_routes_snapshot(
     let mut current = app_state.peer_table.current_generation();
     if current != q.since {
         return Ok(Json(
-            build_snapshot(&app_state, &node, current)
+            build_snapshot(&app_state, &node, current, tailnet_identity)
                 .await
                 .map_err(snapshot_error_response)?,
         ));
@@ -346,7 +419,7 @@ pub async fn get_routes_snapshot(
     // also drops a token revoked while the request was parked.
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
     Ok(Json(
-        build_snapshot(&app_state, &node, current)
+        build_snapshot(&app_state, &node, current, tailnet_identity)
             .await
             .map_err(snapshot_error_response)?,
     ))
@@ -642,6 +715,72 @@ pub fn private_listener_of(
     Some(ip)
 }
 
+/// Whether the worker's last listener report names `capability` (ADR 065
+/// D6). Agents that predate capabilities report none.
+pub fn reports_capability(
+    row: Option<&temps_entities::node_public_ingress::Model>,
+    capability: &str,
+) -> bool {
+    row.and_then(|r| r.listening.as_ref())
+        .and_then(|l| l.get("capabilities"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|caps| caps.iter().any(|c| c.as_str() == Some(capability)))
+}
+
+/// The `tailnet_users` routes of a snapshot, kept apart (ADR 065 D6).
+#[derive(Debug, Default)]
+pub struct IdentityRoutes {
+    pub private_routes: Vec<PrivateRouteEntryDto>,
+    pub serve_routes: Vec<IdentityServeRouteDto>,
+}
+
+/// ADR 065 D6: take every `tailnet_users` route out of the fields every
+/// agent reads. `private_routes` keeps only range-only addresses, and a
+/// `tailnet_users` Serve entry keeps no route, so an agent that predates
+/// identity checks serves none of them, whatever it reported before. When
+/// the requesting agent declared `identity`, the routes come back to be sent
+/// in the fields only it reads; otherwise they are dropped, with why.
+pub fn split_tailnet_users(
+    private_routes: &mut Vec<PrivateRouteEntryDto>,
+    serve_entries: &mut [ServeEntryDto],
+    identity: bool,
+    node_name: &str,
+) -> (IdentityRoutes, Vec<String>) {
+    let mut routes = IdentityRoutes::default();
+    let mut held_back = Vec::new();
+    let mut hold_back =
+        |host: &str| held_back.push(temps_core::tailnet::messages::update_agent(host, node_name));
+    let (restricted, open): (Vec<_>, Vec<_>) = std::mem::take(private_routes)
+        .into_iter()
+        .partition(|route| route.principals.is_some());
+    *private_routes = open;
+    for route in restricted {
+        if identity {
+            routes.private_routes.push(route);
+        } else {
+            hold_back(&route.route.host);
+        }
+    }
+    for entry in serve_entries.iter_mut() {
+        let Some(principals) = entry.principals.take() else {
+            continue;
+        };
+        let Some(route) = entry.route.take() else {
+            continue;
+        };
+        if identity {
+            routes.serve_routes.push(IdentityServeRouteDto {
+                address_id: entry.address_id.clone(),
+                route,
+                principals,
+            });
+        } else {
+            hold_back(&entry.hostname);
+        }
+    }
+    (routes, held_back)
+}
+
 /// The private addresses `node_id` serves (ADR 064 D5), and why any it was
 /// given are held back.
 pub fn worker_private_routes(
@@ -689,6 +828,7 @@ pub fn worker_private_routes(
                 address_id: private.address.address_id.clone(),
                 range,
                 listener,
+                principals: private.address.principals.clone(),
             }),
         }
     }
@@ -696,10 +836,104 @@ pub fn worker_private_routes(
     (routes, held_back)
 }
 
+/// The Serve entries `node_id` applies (ADR 065 D4), each with its route
+/// when the address is one this worker serves through tailscaled and passes
+/// the public worker rules; why any is held back.
+pub fn worker_serve_entries(
+    peer_table: &CachedPeerTable,
+    policy: &WorkerRoutePolicy,
+    node_id: i32,
+    rows: Vec<temps_entities::tailnet_serve_entries::Model>,
+) -> (Vec<ServeEntryDto>, Vec<String>) {
+    use temps_entities::tailnet_serve_entries::STATE_REMOVING;
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut held_back = Vec::new();
+    for row in rows {
+        let removing = row.state == STATE_REMOVING;
+        let mut principals = None;
+        let route = if removing {
+            None
+        } else {
+            let host = row.hostname.clone();
+            match peer_table.worker_tailnet_route(node_id, &row.hostname) {
+                // The address now names another way in or another worker:
+                // the entry no longer matches it, and serves nothing.
+                None => {
+                    held_back.push(format!(
+                        "{host}: the address is no longer served through Tailscale on this worker"
+                    ));
+                    None
+                }
+                Some((private, _))
+                    if private.address.address_id != row.address_id
+                        || private.address.via.as_deref() != Some(row.private_via.as_str()) =>
+                {
+                    held_back.push(format!(
+                        "{host}: the address is no longer served through this Serve entry"
+                    ));
+                    None
+                }
+                Some((private, servable)) => {
+                    let why = if let Some(policy) = policy.blocking_policies.first() {
+                        Some(format!("{policy}, which only the control plane enforces"))
+                    } else if !servable {
+                        Some("it needs a redirect, static files, wake-up, attack mode, security settings or path routing, which only the control plane serves".to_string())
+                    } else {
+                        None
+                    };
+                    let entry = entry_from_route(host.clone(), &private.route).filter(|entry| {
+                        entry.backends.iter().all(|backend| {
+                            public_backend_is_registered_worker(
+                                &backend.address,
+                                &policy.registered_worker_addresses,
+                            )
+                        })
+                    });
+                    match (why, entry) {
+                        (Some(why), _) => {
+                            held_back.push(format!("{host}: {why}"));
+                            None
+                        }
+                        (None, None) => {
+                            held_back.push(format!(
+                                "{host}: its backends are not on a worker this one can reach"
+                            ));
+                            None
+                        }
+                        (None, Some(route)) => {
+                            principals = private.address.principals.clone();
+                            Some(route)
+                        }
+                    }
+                }
+            }
+        };
+        entries.push(ServeEntryDto {
+            entry_id: row.id,
+            address_id: row.address_id,
+            hostname: row.hostname,
+            via: row.private_via,
+            service: row.service_name,
+            removing,
+            applied_etag: row.applied_etag,
+            route,
+            addrs: row
+                .service_addrs
+                .as_ref()
+                .and_then(|addrs| serde_json::from_value::<Vec<String>>(addrs.clone()).ok())
+                .unwrap_or_default(),
+            principals,
+        });
+    }
+    entries.sort_by(|a, b| a.address_id.cmp(&b.address_id));
+    (entries, held_back)
+}
+
 async fn build_snapshot(
     state: &RouteSyncAppState,
     node: &nodes::Model,
     generation: u64,
+    tailnet_identity: bool,
 ) -> Result<RouteSnapshot, SnapshotBuildError> {
     let raw = state.peer_table.snapshot_internal_routes();
     let mut routes = Vec::with_capacity(raw.len());
@@ -725,18 +959,16 @@ async fn build_snapshot(
     };
     // A worker in private mode (ADR 064 D5) gets the private addresses
     // recorded for it, and only while it is bound on a private address.
-    let private_listener = {
-        let row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
-            .one(state.db.as_ref())
-            .await
-            .map_err(|source| SnapshotBuildError::Database {
-                node_id: node.id,
-                operation: "load private ingress state",
-                source,
-            })?;
-        private_listener_of(row.as_ref())
-    };
-    let (private_routes, private_held_back) = if private_listener.is_some() {
+    let ingress_row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
+        .one(state.db.as_ref())
+        .await
+        .map_err(|source| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation: "load private ingress state",
+            source,
+        })?;
+    let private_listener = private_listener_of(ingress_row.as_ref());
+    let (mut private_routes, mut private_held_back) = if private_listener.is_some() {
         let policy = worker_route_policy(
             state.db.as_ref(),
             !state.request_policy_gate.supports_worker_ingress(),
@@ -751,20 +983,67 @@ async fn build_snapshot(
     } else {
         (Vec::new(), Vec::new())
     };
-    let public_ingress =
-        if !private_routes.is_empty() && !node.public_ingress_enabled && !runs_connector {
-            let hosts: std::collections::HashSet<String> = private_routes
-                .iter()
-                .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase())
-                .collect();
+    // ADR 065 D4: what this worker serves through tailscaled. Only its own
+    // rows; a worker never learns another's.
+    let serve_rows = {
+        use sea_orm::{ColumnTrait, QueryFilter};
+        temps_entities::tailnet_serve_entries::Entity::find()
+            .filter(temps_entities::tailnet_serve_entries::Column::NodeId.eq(node.id))
+            .all(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+                node_id: node.id,
+                operation: "load tailnet serve entries",
+                source,
+            })?
+    };
+    let (mut serve_entries, mut serve_held_back) = if serve_rows.is_empty() {
+        (Vec::new(), Vec::new())
+    } else {
+        let policy = worker_route_policy(
+            state.db.as_ref(),
+            !state.request_policy_gate.supports_worker_ingress(),
+        )
+        .await
+        .map_err(|(operation, source)| SnapshotBuildError::Database {
+            node_id: node.id,
+            operation,
+            source,
+        })?;
+        worker_serve_entries(&state.peer_table, &policy, node.id, serve_rows)
+    };
+    let (identity_routes, held_back) =
+        split_tailnet_users(&mut private_routes, &mut [], tailnet_identity, &node.name);
+    private_held_back.extend(held_back);
+    let (identity_serve, held_back) = split_tailnet_users(
+        &mut Vec::new(),
+        &mut serve_entries,
+        tailnet_identity,
+        &node.name,
+    );
+    serve_held_back.extend(held_back);
+    let identity_private_routes = identity_routes.private_routes;
+    let identity_serve_routes = identity_serve.serve_routes;
+    // Every host the private listener terminates, range-only or not.
+    let private_hosts: std::collections::HashSet<String> = private_routes
+        .iter()
+        .chain(&identity_private_routes)
+        .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase())
+        .collect();
+    let mut public_ingress =
+        if !private_hosts.is_empty() && !node.public_ingress_enabled && !runs_connector {
+            let hosts = &private_hosts;
             PublicIngressSnapshot {
                 enabled: true,
                 routes: Vec::new(),
                 unsupported_route_count: private_held_back.len(),
                 unsupported_reasons: private_held_back,
-                certificates: encrypt_public_certificates(state, node, &hosts).await?,
+                certificates: encrypt_public_certificates(state, node, hosts).await?,
                 listen: None,
                 private_routes,
+                serve_entries: Vec::new(),
+                identity_private_routes,
+                identity_serve_routes: Vec::new(),
             }
         } else if node.public_ingress_enabled || runs_connector {
             let WorkerPublicRoutes {
@@ -790,11 +1069,7 @@ async fn build_snapshot(
                 .iter()
                 .filter(|_| node.public_ingress_enabled)
                 .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
-                .chain(
-                    private_routes
-                        .iter()
-                        .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase()),
-                )
+                .chain(private_hosts.iter().cloned())
                 .collect();
             let mut unsupported_reasons = unsupported_reasons;
             unsupported_reasons.extend(private_held_back.iter().cloned());
@@ -806,7 +1081,7 @@ async fn build_snapshot(
                 // Only a node that terminates TLS itself gets private keys. A
                 // connector serves plain HTTP on loopback and the provider holds
                 // the certificate, so running one is no reason to ship keys.
-                certificates: if node.public_ingress_enabled || !private_routes.is_empty() {
+                certificates: if node.public_ingress_enabled || !private_hosts.is_empty() {
                     encrypt_public_certificates(state, node, &allowed_certificate_hosts).await?
                 } else {
                     None
@@ -817,10 +1092,22 @@ async fn build_snapshot(
                     None
                 },
                 private_routes,
+                serve_entries: Vec::new(),
+                identity_private_routes,
+                identity_serve_routes: Vec::new(),
             }
         } else {
             PublicIngressSnapshot::default()
         };
+    if !serve_entries.is_empty() {
+        // A worker that only serves through tailscaled still needs the
+        // authorization lease its Serve sockets route under.
+        public_ingress.enabled = true;
+        public_ingress.unsupported_route_count += serve_held_back.len();
+        public_ingress.unsupported_reasons.extend(serve_held_back);
+        public_ingress.serve_entries = serve_entries;
+        public_ingress.identity_serve_routes = identity_serve_routes;
+    }
     Ok(RouteSnapshot {
         generation,
         routes,
@@ -1092,6 +1379,241 @@ pub(crate) mod tests {
     use crate::route_table::BackendEntry;
     use crate::test_utils::TestDBMockOperations;
 
+    fn ingress_row(
+        listening: Option<serde_json::Value>,
+    ) -> temps_entities::node_public_ingress::Model {
+        let now = chrono::Utc::now();
+        temps_entities::node_public_ingress::Model {
+            node_id: 3,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening,
+            mode: Some("private".to_string()),
+            last_check: None,
+            private_checks: None,
+            tailscale: None,
+            checked_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn a_capability_counts_only_when_the_agent_reported_it() {
+        let cap = temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY;
+        assert!(!reports_capability(None, cap));
+        assert!(!reports_capability(Some(&ingress_row(None)), cap));
+        assert!(!reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"http": "100.64.0.3:80"})
+            ))),
+            cap
+        ));
+        assert!(!reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"capabilities": ["tailnet_identity.v2"]})
+            ))),
+            cap
+        ));
+        assert!(reports_capability(
+            Some(&ingress_row(Some(
+                serde_json::json!({"capabilities": [cap]})
+            ))),
+            cap
+        ));
+    }
+
+    fn held_route(host: &str) -> RouteEntryDto {
+        RouteEntryDto {
+            host: host.to_string(),
+            backends: Vec::new(),
+            deployment_id: None,
+            project_id: None,
+            environment_id: None,
+        }
+    }
+
+    /// ADR 065 D6: an agent that cannot check who a visitor is never gets a
+    /// `tailnet_users` address; everything else it serves is unchanged.
+    #[test]
+    fn tailnet_users_addresses_are_held_back_from_agents_without_identity() {
+        let alice = vec![
+            temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login"),
+        ];
+        let private = |host: &str, principals: Option<Vec<_>>| PrivateRouteEntryDto {
+            route: held_route(host),
+            address_id: "custom:1".to_string(),
+            range: "100.64.0.0/10".to_string(),
+            listener: "100.64.0.3".to_string(),
+            principals,
+        };
+        let serve = |host: &str, principals: Option<Vec<_>>| ServeEntryDto {
+            entry_id: 1,
+            address_id: "custom:2".to_string(),
+            hostname: host.to_string(),
+            via: "tailscale_serve".to_string(),
+            service: None,
+            removing: false,
+            applied_etag: None,
+            route: Some(held_route(host)),
+            addrs: Vec::new(),
+            principals,
+        };
+        let routes = || {
+            vec![
+                private("range.example.test", None),
+                private("users.example.test", Some(alice.clone())),
+                private("nobody.example.test", Some(Vec::new())),
+            ]
+        };
+        let entries = || {
+            vec![
+                serve("homelab.example.ts.net", None),
+                serve("users.example.ts.net", Some(alice.clone())),
+            ]
+        };
+
+        // An agent that declared identity checks gets them, apart.
+        let (mut kept, mut served) = (routes(), entries());
+        let (identity, why) = split_tailnet_users(&mut kept, &mut served, true, "homelab");
+        assert!(why.is_empty());
+        assert_eq!(kept, vec![private("range.example.test", None)]);
+        assert_eq!(
+            identity.private_routes,
+            vec![
+                private("users.example.test", Some(alice.clone())),
+                private("nobody.example.test", Some(Vec::new())),
+            ]
+        );
+        assert_eq!(served[0], serve("homelab.example.ts.net", None));
+        assert_eq!(
+            (served[1].route.as_ref(), served[1].principals.as_ref()),
+            (None, None)
+        );
+        assert_eq!(
+            identity.serve_routes,
+            vec![IdentityServeRouteDto {
+                address_id: "custom:2".to_string(),
+                route: held_route("users.example.ts.net"),
+                principals: alice.clone(),
+            }]
+        );
+
+        // One that did not gets none of them, and is told why.
+        let (mut kept, mut served) = (routes(), entries());
+        let (identity, why) = split_tailnet_users(&mut kept, &mut served, false, "homelab");
+        assert!(identity.private_routes.is_empty() && identity.serve_routes.is_empty());
+        assert_eq!(kept, vec![private("range.example.test", None)]);
+        assert_eq!(served[0], serve("homelab.example.ts.net", None));
+        assert_eq!(served[1].route, None);
+        assert_eq!(served[1].principals, None);
+        assert_eq!(why.len(), 3);
+        assert!(
+            why.iter()
+                .all(|w| w.contains("update the agent on `homelab`")),
+            "{why:?}"
+        );
+    }
+
+    /// ADR 065 D6: a snapshot sent to an agent that checks identity, read
+    /// by the 3b agent's own snapshot types (an agent rolled back), holds no
+    /// `tailnet_users` route anywhere that agent looks.
+    #[test]
+    fn an_agent_that_predates_identity_checks_reads_no_restricted_route() {
+        #[derive(serde::Deserialize)]
+        struct OldResponse {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            #[serde(default)]
+            private_routes: Vec<OldPrivateRoute>,
+            #[serde(default)]
+            serve_entries: Vec<OldServeEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPrivateRoute {
+            host: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldServeEntry {
+            hostname: String,
+            #[serde(default)]
+            route: Option<serde_json::Value>,
+        }
+
+        let alice = vec![
+            temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login"),
+        ];
+        let mut private_routes = vec![
+            PrivateRouteEntryDto {
+                route: held_route("range.example.test"),
+                address_id: "custom:1".to_string(),
+                range: "100.64.0.0/10".to_string(),
+                listener: "100.64.0.3".to_string(),
+                principals: None,
+            },
+            PrivateRouteEntryDto {
+                route: held_route("users.example.test"),
+                address_id: "custom:3".to_string(),
+                range: "100.64.0.0/10".to_string(),
+                listener: "100.64.0.3".to_string(),
+                principals: Some(alice.clone()),
+            },
+        ];
+        let mut serve_entries = vec![ServeEntryDto {
+            entry_id: 1,
+            address_id: "custom:2".to_string(),
+            hostname: "users.example.ts.net".to_string(),
+            via: "tailscale_serve".to_string(),
+            service: None,
+            removing: false,
+            applied_etag: None,
+            route: Some(held_route("users.example.ts.net")),
+            addrs: Vec::new(),
+            principals: Some(alice),
+        }];
+        let (identity, _) =
+            split_tailnet_users(&mut private_routes, &mut serve_entries, true, "homelab");
+        let snapshot = RouteSnapshot {
+            generation: 1,
+            routes: Vec::new(),
+            public_ingress: PublicIngressSnapshot {
+                enabled: true,
+                private_routes,
+                serve_entries,
+                identity_private_routes: identity.private_routes,
+                identity_serve_routes: identity.serve_routes,
+                ..PublicIngressSnapshot::default()
+            },
+        };
+        let wire = serde_json::to_string(&snapshot).expect("serialize");
+        assert!(wire.contains("users.example.test"), "sent to a new agent");
+
+        let old: OldResponse = serde_json::from_str(&wire).expect("the 3b agent parses it");
+        let hosts: Vec<&str> = old
+            .public_ingress
+            .private_routes
+            .iter()
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["range.example.test"]);
+        let entry = &old.public_ingress.serve_entries[0];
+        assert_eq!(entry.hostname, "users.example.ts.net");
+        assert!(
+            entry.route.is_none(),
+            "the old agent's socket must answer 404"
+        );
+        // The principals never ride in a field an old agent reads.
+        let value: serde_json::Value = serde_json::from_str(&wire).expect("json");
+        assert!(value["public_ingress"]["serve_entries"][0]
+            .get("principals")
+            .is_none());
+    }
+
     pub(crate) fn test_node(public_ingress_enabled: bool) -> nodes::Model {
         let now = chrono::Utc::now();
         nodes::Model {
@@ -1215,6 +1737,7 @@ pub(crate) mod tests {
             },
             &node,
             1,
+            false,
         )
         .await?;
         assert_eq!(open_snapshot.public_ingress.routes.len(), 1);
@@ -1245,6 +1768,7 @@ pub(crate) mod tests {
                 },
                 &node,
                 1,
+                false,
             )
             .await?;
             assert!(snapshot.public_ingress.routes.is_empty());
@@ -1293,6 +1817,7 @@ pub(crate) mod tests {
             },
             &node,
             1,
+            false,
         )
         .await?;
         assert!(limited_snapshot.public_ingress.routes.is_empty());
@@ -1336,6 +1861,7 @@ pub(crate) mod tests {
                 },
                 &node,
                 1,
+                false,
             )
             .await
         };

@@ -101,6 +101,12 @@ pub struct JoinCommand {
     #[arg(long, default_value = "auto")]
     pub listen: String,
 
+    /// With `--ingress private`: let the agent configure this machine's
+    /// tailscaled for tailnet names (ADR 065 D2). May be given without a
+    /// `--listen` address. The agent must run as root.
+    #[arg(long)]
+    pub tailscale_serve: bool,
+
     /// With `--ingress fixed`: local port for public HTTP.
     #[arg(long, default_value_t = 80)]
     pub ingress_http_port: u16,
@@ -1083,15 +1089,31 @@ impl JoinCommand {
         &self,
     ) -> anyhow::Result<Option<temps_core::worker_ingress::LocalIngress>> {
         use temps_core::worker_ingress::{IngressMode, LocalIngress};
+        let tailscale_serve_needs_private = || {
+            anyhow::anyhow!(
+                "--tailscale-serve goes with --ingress private: `temps join … --ingress private \
+                 --listen tailscale --tailscale-serve`."
+            )
+        };
         let Some(flag) = self.ingress else {
+            // Consent without the ingress it belongs to would be dropped.
+            if self.tailscale_serve {
+                return Err(tailscale_serve_needs_private());
+            }
             return Ok(None);
         };
         let mode = match flag {
             IngressFlag::Off => IngressMode::Off,
             IngressFlag::Fixed => IngressMode::Fixed,
             IngressFlag::Delegated => IngressMode::Delegated,
-            IngressFlag::Private => return super::agent_ingress::private(&self.listen).map(Some),
+            IngressFlag::Private => {
+                return super::agent_ingress::private(Some(&self.listen), self.tailscale_serve)
+                    .map(Some)
+            }
         };
+        if self.tailscale_serve {
+            return Err(tailscale_serve_needs_private());
+        }
         let mut ingress = LocalIngress {
             mode,
             ..LocalIngress::default()
@@ -2197,6 +2219,8 @@ mod tests {
             &["--ingress", "fixed", "--listen", "not-an-ip"],
             &["--ingress", "fixed", "--listen", "127.0.0.1"],
             &["--ingress", "fixed", "--ingress-http-port", "443"],
+            &["--tailscale-serve"],
+            &["--ingress", "fixed", "--tailscale-serve"],
         ] {
             assert!(join(refused).requested_ingress().is_err(), "{refused:?}");
         }

@@ -299,6 +299,7 @@ mod tests {
             address_id: "custom:7".into(),
             range: "127.0.0.0/8".into(),
             listener: listener.into(),
+            principals: None,
         }
     }
 

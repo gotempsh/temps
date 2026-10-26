@@ -19,6 +19,9 @@ pub enum Audience {
     Private,
     /// Anyone who signs in. Reserved (phase 4).
     SignedIn,
+    /// Private, and only the tailnet users and tags listed for the address
+    /// (ADR 065 D6). Served only by an agent that checks who they are.
+    TailnetUsers,
     /// A stored value this version does not know, written by a newer one.
     /// Served to nobody and never changed by a run, so a rolled-back
     /// control plane cannot widen it to a whole network (ADR 065 D6).
@@ -31,14 +34,24 @@ impl Audience {
             Audience::Public => temps_entities::audience::PUBLIC,
             Audience::Private => temps_entities::audience::PRIVATE,
             Audience::SignedIn => temps_entities::audience::SIGNED_IN,
+            Audience::TailnetUsers => temps_entities::audience::TAILNET_USERS,
             Audience::Unsupported => "unsupported",
         }
+    }
+
+    /// Served only on private ways in (ADR 064 D5): `private`, and
+    /// `tailnet_users`, which is private and narrower.
+    pub fn is_private(self) -> bool {
+        matches!(self, Audience::Private | Audience::TailnetUsers)
     }
 
     /// Whether this version can serve the audience (`signed_in` arrives in
     /// phase 4). Anything else is served to nobody.
     pub fn is_served(self) -> bool {
-        matches!(self, Audience::Public | Audience::Private)
+        matches!(
+            self,
+            Audience::Public | Audience::Private | Audience::TailnetUsers
+        )
     }
 
     /// The stored value. An unknown one is [`Audience::Unsupported`], never
@@ -49,6 +62,7 @@ impl Audience {
             temps_entities::audience::PUBLIC => Audience::Public,
             temps_entities::audience::PRIVATE => Audience::Private,
             temps_entities::audience::SIGNED_IN => Audience::SignedIn,
+            temps_entities::audience::TAILNET_USERS => Audience::TailnetUsers,
             _ => Audience::Unsupported,
         }
     }
@@ -179,6 +193,10 @@ pub struct PlanRequest {
     pub audience: Audience,
     /// The hostname to make reachable; Temps suggests one without it.
     pub address: Option<String>,
+    /// For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
+    /// D6). At least one; checked and lower-cased.
+    #[serde(default)]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 /// One way to make the address reachable.
@@ -199,6 +217,15 @@ pub enum PlanOptionKind {
     /// as a tailnet (ADR 064 D5): DNS points at its private address and
     /// the certificate comes through DNS-01.
     PrivateWorker,
+    /// The worker's own tailnet name through tailscaled's Serve (ADR 065
+    /// D1): `<machine>.<tailnet>.ts.net`, no DNS record, no ACME.
+    TailscaleServe,
+    /// The app's own name in the tailnet as a Tailscale Service (ADR 065
+    /// D1): `<service>.<tailnet>.ts.net`, with the cluster's Tailscale
+    /// credential.
+    TailscaleService,
+    /// A Tailscale Service, after saving a pasted Tailscale OAuth client.
+    TailscaleServiceWithCredential,
 }
 
 impl PlanOptionKind {
@@ -210,6 +237,9 @@ impl PlanOptionKind {
             PlanOptionKind::DirectManagedDns,
             PlanOptionKind::DirectManualDns,
             PlanOptionKind::PrivateWorker,
+            PlanOptionKind::TailscaleServe,
+            PlanOptionKind::TailscaleService,
+            PlanOptionKind::TailscaleServiceWithCredential,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -223,6 +253,9 @@ impl PlanOptionKind {
             PlanOptionKind::NewTunnelWithToken => "new_tunnel_with_token",
             PlanOptionKind::DirectManualDns => "direct_manual_dns",
             PlanOptionKind::PrivateWorker => "private_worker",
+            PlanOptionKind::TailscaleServe => "tailscale_serve",
+            PlanOptionKind::TailscaleService => "tailscale_service",
+            PlanOptionKind::TailscaleServiceWithCredential => "tailscale_service_with_credential",
         }
     }
 }
@@ -245,6 +278,18 @@ pub enum StepKind {
     /// Records who an address is for, and for a private one the network
     /// range and the listener that serve it (ADR 064 D5).
     SetAudience,
+    /// Declares the worker's Serve entry for the address and waits for its
+    /// agent to apply it (ADR 065 D4).
+    ConfigureTailscaleServe,
+    /// Proves a pasted Tailscale OAuth client's scopes and saves it (ADR 065
+    /// D2).
+    SaveTailscaleCredential,
+    /// Creates the Tailscale Service, or finds this install's own, and
+    /// checks its definition and hosts (ADR 065 D4).
+    DefineTailscaleService,
+    /// Waits for the tailnet admin to approve the worker as the Service's
+    /// host; never approves it.
+    WaitForServiceApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -308,6 +353,10 @@ pub struct ReachabilityPlan {
     pub options: Vec<PlanOption>,
     /// Set when `options` is empty.
     pub blocked: Option<PlanBlocked>,
+    /// For `tailnet_users`: who the address will admit, as the plan was
+    /// made for them (ADR 065 D6). Apply sets exactly this list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 /// `POST …/reachability/apply`.
@@ -559,6 +608,37 @@ pub enum RunResource {
     Certificate {
         domain: String,
     },
+    /// This run's reference to a worker's Serve entry (ADR 065 D4). Undo
+    /// drops the reference; the entry goes with its last one.
+    TailscaleServe {
+        node_id: i32,
+        node_name: String,
+        address_id: String,
+        hostname: String,
+        entry_id: i32,
+        /// This run created the entry, rather than finding it.
+        created: bool,
+    },
+    /// A Tailscale OAuth client the run saved (ADR 065 D2).
+    TailscaleCredential {
+        id: i32,
+        name: String,
+    },
+    /// A Tailscale Service the run created or found (ADR 065 D4). Undo
+    /// deletes it only once nothing uses it, and only when a person
+    /// confirms.
+    TailscaleService {
+        /// The tailnet's MagicDNS suffix, for the Service's lock and messages.
+        tailnet: String,
+        /// `svc:myapp`.
+        name: String,
+        /// This run created it (`created`), rather than finding it.
+        created: bool,
+        /// The run whose marker it carries.
+        creator_run_id: i32,
+        /// As read back once the step was done, with its addresses.
+        definition: crate::tailscale::ServiceDefinition,
+    },
 }
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
@@ -575,6 +655,18 @@ pub struct AddressAudience {
     /// inside check dials.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+    /// `tailscale_service`. `None` is phase 2's listener, so runs journaled
+    /// before this column compare equal to what they set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_via: Option<String>,
+    /// For `tailscale_service`: the `svc:` name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_service: Option<String>,
+    /// For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo
+    /// puts the earlier list back with the audience.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
 }
 
 impl AddressAudience {
@@ -582,12 +674,26 @@ impl AddressAudience {
         Self::default()
     }
 
+    /// Served through tailscaled (ADR 065 D1), not a listener.
+    pub fn on_tailscale(&self) -> bool {
+        self.audience.is_private()
+            && self.private_via.as_deref().is_some_and(|via| {
+                via == temps_entities::audience::via::TAILSCALE_SERVE
+                    || via == temps_entities::audience::via::TAILSCALE_SERVICE
+            })
+    }
+
     pub fn describe(&self) -> String {
         match (self.audience, &self.network_range) {
+            (Audience::Private, _) if self.on_tailscale() => "private to your tailnet".to_string(),
             (Audience::Private, Some(range)) => format!("private to {range}"),
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
             (Audience::SignedIn, _) => "for people who sign in".to_string(),
+            (Audience::TailnetUsers, _) => match self.principals.len() {
+                1 => format!("only for {}", self.principals[0].value),
+                n => format!("only for {n} tailnet users and tags"),
+            },
             (Audience::Unsupported, _) => "set by a newer version of Temps".to_string(),
         }
     }
@@ -622,6 +728,15 @@ impl RunResource {
                 before.describe()
             ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
+            RunResource::TailscaleServe {
+                node_name, hostname, ..
+            } => format!("{node_name} serving {hostname} through Tailscale Serve"),
+            RunResource::TailscaleCredential { name, .. } => {
+                format!("Tailscale OAuth client {name}")
+            }
+            RunResource::TailscaleService { name, tailnet, .. } => {
+                format!("Tailscale Service `{name}` in {tailnet}")
+            }
         }
     }
 }
@@ -681,6 +796,28 @@ pub enum Intent {
     Certificate {
         domain: String,
     },
+    /// Found by the `tailnet_serve_entries` row and this run's reference to
+    /// it (ADR 065 D4); the step is done only on the agent's report.
+    TailscaleServe {
+        node_id: i32,
+        node_name: String,
+        address_id: String,
+        hostname: String,
+        /// The `svc:` name, for a Service.
+        #[serde(default)]
+        service: Option<String>,
+    },
+    /// Found by its Temps row's name.
+    TailscaleCredential {
+        name: String,
+    },
+    /// Found by `GET …/services/{name}` and the marker in its `comment`.
+    TailscaleService {
+        tailnet: String,
+        name: String,
+        /// `temps:<install>:<this run>`.
+        marker: String,
+    },
 }
 
 /// Whether a lookup that misses proves the resource absent (ADR 064 D4).
@@ -706,6 +843,12 @@ impl Intent {
         match self {
             Intent::DnsRecord { .. } | Intent::DnsChange { .. } => LookupAuthority::Settled {
                 timeout: Duration::from_secs(30),
+                settle: Duration::from_secs(30),
+            },
+            // Tailscale documents no read-after-write guarantee for a
+            // Service either (ADR 065 D4: two misses, as Cloudflare DNS).
+            Intent::TailscaleService { .. } => LookupAuthority::Settled {
+                timeout: Duration::from_secs(20),
                 settle: Duration::from_secs(30),
             },
             // A tunnel is found by its Temps row, which is committed
@@ -734,6 +877,10 @@ impl Intent {
                 record_type,
                 ..
             } => format!("Check the {record_type} record for `{hostname}` at your DNS provider."),
+            Intent::TailscaleService { name, .. } => format!(
+                "Check whether `{name}` exists at login.tailscale.com/admin/services, and what its \
+                 comment says."
+            ),
             other => format!("Check whether {} exists.", other.describe()),
         }
     }
@@ -776,6 +923,15 @@ impl Intent {
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
+            Intent::TailscaleServe {
+                node_id,
+                address_id,
+                ..
+            } => format!("tailscale_serve/{node_id}/{address_id}"),
+            Intent::TailscaleCredential { name } => format!("tailscale_credential/{name}"),
+            Intent::TailscaleService { tailnet, name, .. } => {
+                format!("tailscale_service/{tailnet}/{name}")
+            }
         };
         format!("run-{run_id}/{what}")
     }
@@ -803,6 +959,15 @@ impl Intent {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
+            Intent::TailscaleServe {
+                node_name,
+                hostname,
+                ..
+            } => format!("{node_name} serving {hostname} through Tailscale Serve"),
+            Intent::TailscaleCredential { name } => format!("Tailscale OAuth client {name}"),
+            Intent::TailscaleService { name, tailnet, .. } => {
+                format!("Tailscale Service `{name}` in {tailnet}")
+            }
         }
     }
 }
@@ -888,6 +1053,11 @@ pub struct JournalEntry {
     /// nothing to put back for it.
     #[serde(default)]
     pub unwritten: bool,
+    /// The Tailscale Service as shown to the user when undo asked whether
+    /// to delete it (ADR 065 D4): the delete goes ahead only while a read
+    /// made immediately before it still equals this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shown_service: Option<crate::tailscale::ServiceDefinition>,
 }
 
 impl JournalEntry {
@@ -908,6 +1078,7 @@ impl JournalEntry {
             deleting: false,
             tunnel_id: None,
             unwritten: false,
+            shown_service: None,
         }
     }
 }

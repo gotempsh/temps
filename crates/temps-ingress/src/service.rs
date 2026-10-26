@@ -60,9 +60,13 @@ pub fn is_deleting(connector: &ingress_connectors::Model) -> bool {
     connector.status == STATUS_DELETING
 }
 
-/// The connectors sync and reconcile act on: every one not being removed.
+/// The connectors sync and reconcile act on: every tunnel not being
+/// removed. Credential rows (ADR 065's `tailscale`) are never tunnels.
 pub fn live_connectors(models: Vec<ingress_connectors::Model>) -> Vec<ingress_connectors::Model> {
-    models.into_iter().filter(|m| !is_deleting(m)).collect()
+    models
+        .into_iter()
+        .filter(|m| !is_deleting(m) && !crate::registry::is_credential_kind(&m.provider))
+        .collect()
 }
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
@@ -417,6 +421,124 @@ impl IngressConnectorService {
         self.registry.infos()
     }
 
+    /// The credential providers this control plane offers (ADR 065 D2).
+    pub fn credential_providers(&self) -> Vec<ProviderInfo> {
+        self.registry.credential_infos()
+    }
+
+    /// Save a credential provider's answers as a connector row no tunnel
+    /// path reads (ADR 065 D2): checked against the fields, proven by the
+    /// provider, the secrets sealed with the encryption service. Returns the
+    /// row id.
+    pub async fn save_credential(
+        &self,
+        kind: &str,
+        name: &str,
+        values: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<i32, IngressError> {
+        let factory = self.registry.credential(kind)?;
+        let info = factory.info();
+        let setup = self.resolve_setup(&info, values).await?;
+        factory.validate(&self.deps(), &setup).await?;
+        let mut settings = serde_json::Map::new();
+        settings.insert(SETUP_KEY.into(), serde_json::json!(setup.settings));
+        let json = serde_json::to_string(&setup.secrets)
+            .map_err(|e| IngressError::Encryption(e.to_string()))?;
+        let sealed = self
+            .encryption
+            .encrypt_string(&json)
+            .map_err(|e| IngressError::Encryption(e.to_string()))?;
+        settings.insert(SETUP_SECRETS_KEY.into(), serde_json::Value::String(sealed));
+        let now = Utc::now();
+        let row = ingress_connectors::ActiveModel {
+            name: Set(name.to_string()),
+            provider: Set(info.kind.clone()),
+            dns_provider_id: Set(None),
+            domain: Set(String::new()),
+            settings: Set(serde_json::Value::Object(settings)),
+            edge_port: Set(DEFAULT_EDGE_PORT),
+            auto_publish: Set(false),
+            status: Set("ready".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(self.db.as_ref())
+        .await
+        .map_err(|error| match error {
+            sea_orm::DbErr::Query(_) | sea_orm::DbErr::Exec(_)
+                if error.to_string().contains("ingress_connectors_name_key") =>
+            {
+                IngressError::Validation(format!(
+                    "A connector or credential named '{name}' already exists."
+                ))
+            }
+            other => IngressError::Database(other),
+        })?;
+        Ok(row.id)
+    }
+
+    /// The cluster's credential of `kind`, the oldest first, with its
+    /// `text` and decrypted `secret` answers.
+    #[allow(clippy::type_complexity)]
+    pub async fn credential(
+        &self,
+        kind: &str,
+    ) -> Result<
+        Option<(
+            ingress_connectors::Model,
+            BTreeMap<String, String>,
+            BTreeMap<String, String>,
+        )>,
+        IngressError,
+    > {
+        let Some(row) = ingress_connectors::Entity::find()
+            .filter(ingress_connectors::Column::Provider.eq(kind))
+            .order_by_asc(ingress_connectors::Column::Id)
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let settings: BTreeMap<String, String> = row
+            .settings
+            .get(SETUP_KEY)
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|e| {
+                IngressError::Validation(format!(
+                    "The settings of credential {} ('{}') cannot be read: {e}",
+                    row.id, row.name
+                ))
+            })?
+            .unwrap_or_default();
+        let secrets = self.setup_secrets(&row)?;
+        Ok(Some((row, settings, secrets)))
+    }
+
+    /// The credential row `id`, if it is one.
+    pub async fn credential_row(
+        &self,
+        id: i32,
+    ) -> Result<Option<ingress_connectors::Model>, IngressError> {
+        Ok(ingress_connectors::Entity::find_by_id(id)
+            .one(self.db.as_ref())
+            .await?
+            .filter(|m| crate::registry::is_credential_kind(&m.provider)))
+    }
+
+    /// Remove the credential row `id`; one that is not a credential, or is
+    /// gone, is left alone.
+    pub async fn delete_credential(&self, id: i32) -> Result<(), IngressError> {
+        if self.credential_row(id).await?.is_some() {
+            ingress_connectors::Entity::delete_by_id(id)
+                .exec(self.db.as_ref())
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn provider_for(
         &self,
         connector: &ingress_connectors::Model,
@@ -589,10 +711,12 @@ impl IngressConnectorService {
         }))
     }
 
+    /// The tunnel `id`. A credential row is not one.
     async fn find(&self, id: i32) -> Result<ingress_connectors::Model, IngressError> {
         ingress_connectors::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
+            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
             .ok_or(IngressError::NotFound(id))
     }
 
@@ -607,6 +731,7 @@ impl IngressConnectorService {
     ) -> Result<ConnectorList, IngressError> {
         let (page, page_size) = page_bounds(page, page_size);
         let paginator = ingress_connectors::Entity::find()
+            .filter(ingress_connectors::Column::Provider.ne(crate::tailscale::KIND))
             .order_by_desc(ingress_connectors::Column::CreatedAt)
             .order_by_desc(ingress_connectors::Column::Id)
             .paginate(self.db.as_ref(), page_size);

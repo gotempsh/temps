@@ -29,6 +29,9 @@ mod runtime_health;
 pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
+pub mod tailnet_identity;
+pub mod tailscale_api;
+pub mod tailscale_serve;
 pub mod worker_metrics;
 
 use serde::{Deserialize, Serialize};
@@ -377,6 +380,7 @@ impl AgentConfig {
                 interface: None,
                 http_port: self.public_ingress_http_port,
                 https_port: self.public_ingress_https_port,
+                tailscale_serve: false,
             },
             None => LocalIngress::default(),
         }

@@ -66,6 +66,7 @@ pub mod sensitive_action;
 pub mod serve_profile;
 pub mod source_drop;
 pub mod static_files;
+pub mod tailnet;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;

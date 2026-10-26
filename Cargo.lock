@@ -12678,6 +12678,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "hickory-resolver",
  "http 1.5.0",
  "http-body-util",
  "hyper",

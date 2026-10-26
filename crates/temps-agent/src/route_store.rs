@@ -79,6 +79,95 @@ pub struct PublicIngressSnapshot {
     /// `routes`: the direct listeners and the tunnel origin answer them 404.
     #[serde(default)]
     pub private_routes: Vec<PrivateRouteEntry>,
+    /// What this worker serves through tailscaled (ADR 065 D4). Never in
+    /// `routes` or `private_routes`: only the address's own Serve socket
+    /// answers it.
+    #[serde(default)]
+    pub serve_entries: Vec<ServeEntry>,
+    /// `tailnet_users` private addresses (ADR 065 D6). Never in
+    /// `private_routes`, here or in `routes.json`: an agent rolled back to a
+    /// version without identity checks reads that file and ignores this
+    /// field, so it serves none of them to the whole range.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_private_routes: Vec<PrivateRouteEntry>,
+    /// The routes of `tailnet_users` Serve entries (ADR 065 D6). Their entry
+    /// in `serve_entries` keeps no route, so an older agent's socket answers
+    /// 404 for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identity_serve_routes: Vec<IdentityServeRoute>,
+}
+
+/// Where a `tailnet_users` Serve socket sends requests, and who it admits.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdentityServeRoute {
+    pub address_id: String,
+    pub route: RouteEntry,
+    /// An empty list admits nobody.
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
+}
+
+impl PublicIngressSnapshot {
+    /// ADR 065 D6: move every `tailnet_users` route out of the fields an
+    /// older agent reads, whatever put it there, and make sure none of the
+    /// moved ones is left without a list (that would be the whole range).
+    fn separate_tailnet_users(&mut self) {
+        let (restricted, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.private_routes)
+            .into_iter()
+            .partition(|route| route.principals.is_some());
+        self.private_routes = open;
+        self.identity_private_routes.extend(restricted);
+        for route in &mut self.identity_private_routes {
+            route.principals.get_or_insert_with(Vec::new);
+        }
+        for entry in &mut self.serve_entries {
+            let Some(principals) = entry.principals.take() else {
+                continue;
+            };
+            if let Some(route) = entry.route.take() {
+                self.identity_serve_routes.push(IdentityServeRoute {
+                    address_id: entry.address_id.clone(),
+                    route,
+                    principals,
+                });
+            }
+        }
+    }
+}
+
+/// One Serve entry the control plane declared for this worker (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServeEntry {
+    /// The `tailnet_serve_entries` row: what the agent's report names.
+    pub entry_id: i32,
+    /// The address, and so its socket.
+    pub address_id: String,
+    /// The tailnet name visitors open.
+    pub hostname: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    /// The `svc:` name, for a Service.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// No run needs it any more: take it off, then report.
+    #[serde(default)]
+    pub removing: bool,
+    /// The Serve config `Etag` the agent's last write produced, as recorded.
+    #[serde(default)]
+    pub applied_etag: Option<String>,
+    /// Where requests go. `None` while it is held back or being removed:
+    /// the socket then answers 404.
+    #[serde(default)]
+    pub route: Option<RouteEntry>,
+    /// A Service's addresses as Tailscale assigned them (D4): the only
+    /// answers the inside check accepts for its name.
+    #[serde(default)]
+    pub addrs: Vec<String>,
+    /// For `tailnet_users` (ADR 065 D6): who the socket admits. `None` is
+    /// the whole tailnet; an empty list admits nobody. Set only in the
+    /// lookup index, from `identity_serve_routes`: in a snapshot, and so in
+    /// `routes.json`, it is always moved out with the route.
+    #[serde(default)]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 /// A private address and what bounds it (ADR 064 D5).
@@ -91,6 +180,11 @@ pub struct PrivateRouteEntry {
     pub range: String,
     /// The listener address DNS points at.
     pub listener: String,
+    /// For `tailnet_users` (ADR 065 D6): who the listener admits, by whois
+    /// of the TCP peer. `None` is the whole range; an empty list admits
+    /// nobody.
+    #[serde(default)]
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -136,6 +230,8 @@ pub struct RouteStore {
     public_enabled: AtomicBool,
     public_routes: ArcSwap<HashMap<String, RouteEntry>>,
     private_routes: ArcSwap<HashMap<String, PrivateRouteEntry>>,
+    /// Serve entries with a route, by address id (ADR 065 D3).
+    serve_routes: ArcSwap<HashMap<String, ServeEntry>>,
     public_certificates: RwLock<Option<(String, HashMap<String, PublicIngressCertBundle>)>>,
     public_tls_private_key: RwLock<Option<String>>,
     public_tls_keys: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
@@ -153,6 +249,7 @@ impl RouteStore {
             public_enabled: AtomicBool::new(false),
             public_routes: ArcSwap::from_pointee(HashMap::new()),
             private_routes: ArcSwap::from_pointee(HashMap::new()),
+            serve_routes: ArcSwap::from_pointee(HashMap::new()),
             public_certificates: RwLock::new(None),
             public_tls_private_key: RwLock::new(None),
             public_tls_keys: ArcSwap::from_pointee(HashMap::new()),
@@ -201,7 +298,8 @@ impl RouteStore {
     /// Apply the authenticated public-ingress portion of the control-plane
     /// snapshot. The encrypted certificate bundles are safe to cache on disk;
     /// decrypted private keys are never stored here.
-    pub fn apply_public_snapshot(&self, snapshot: PublicIngressSnapshot) {
+    pub fn apply_public_snapshot(&self, mut snapshot: PublicIngressSnapshot) {
+        snapshot.separate_tailnet_users();
         if !snapshot.enabled {
             self.public_enabled.store(false, Ordering::Release);
         }
@@ -253,6 +351,26 @@ impl RouteStore {
             .load()
             .get(host.trim_end_matches('.').to_ascii_lowercase().as_str())
             .cloned()
+    }
+
+    /// The address a Serve socket serves (ADR 065 D3), by its id, under the
+    /// same authorization lease as public routes. Only an entry the control
+    /// plane still wants served, with a route.
+    pub fn lookup_serve(&self, address_id: &str) -> Option<ServeEntry> {
+        if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
+            return None;
+        }
+        self.serve_routes.load().get(address_id).cloned()
+    }
+
+    /// Every declared Serve entry, being removed or not, for the Serve
+    /// manager. Not gated on the lease: a control plane out of reach is no
+    /// reason to change tailscaled's config, and the sockets refuse on their
+    /// own once the lease lapses.
+    pub fn serve_entries(&self) -> Vec<ServeEntry> {
+        let mut entries = self.public_ingress.read().serve_entries.clone();
+        entries.sort_by(|a, b| a.address_id.cmp(&b.address_id));
+        entries
     }
 
     /// The private addresses currently served, for the inside checks.
@@ -384,10 +502,12 @@ impl RouteStore {
         let now = chrono::Utc::now().timestamp();
         let valid_expiry = snap.public_ingress_expires_at > now
             && snap.public_ingress_expires_at <= now.saturating_add(300);
-        *self.public_ingress.write() = PublicIngressSnapshot {
+        let mut public_ingress = PublicIngressSnapshot {
             enabled: snap.public_ingress.enabled && valid_expiry,
             ..snap.public_ingress
         };
+        public_ingress.separate_tailnet_users();
+        *self.public_ingress.write() = public_ingress;
         self.public_enabled
             .store(self.public_ingress.read().enabled, Ordering::Release);
         self.rebuild_public_indexes(&self.public_ingress.read());
@@ -443,10 +563,34 @@ impl RouteStore {
     }
 
     fn rebuild_public_indexes(&self, snapshot: &PublicIngressSnapshot) {
+        let mut serve_routes: HashMap<String, ServeEntry> = snapshot
+            .serve_entries
+            .iter()
+            .filter(|entry| !entry.removing && entry.route.is_some())
+            .map(|entry| (entry.address_id.clone(), entry.clone()))
+            .collect();
+        for identity in &snapshot.identity_serve_routes {
+            let declared = snapshot
+                .serve_entries
+                .iter()
+                .find(|entry| entry.address_id == identity.address_id && !entry.removing);
+            if let Some(entry) = declared {
+                serve_routes.insert(
+                    identity.address_id.clone(),
+                    ServeEntry {
+                        route: Some(identity.route.clone()),
+                        principals: Some(identity.principals.clone()),
+                        ..entry.clone()
+                    },
+                );
+            }
+        }
+        self.serve_routes.store(Arc::new(serve_routes));
         self.private_routes.store(Arc::new(
             snapshot
                 .private_routes
                 .iter()
+                .chain(&snapshot.identity_private_routes)
                 .map(|private| {
                     (
                         private
@@ -692,6 +836,129 @@ mod tests {
         assert!(!store.container_id_has_project("unknown", 10));
     }
 
+    /// ADR 065 D6: a `tailnet_users` route given in the fields every agent
+    /// reads is moved out of them, so `routes.json` never holds one there.
+    /// The 3b agent's own types, reading that file after a rollback, find
+    /// no restricted route; this agent still serves it, with its list.
+    #[test]
+    fn routes_json_holds_no_restricted_route_where_an_older_agent_reads() {
+        #[derive(serde::Deserialize)]
+        struct OldDisk {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            #[serde(default)]
+            private_routes: Vec<OldPrivateRoute>,
+            #[serde(default)]
+            serve_entries: Vec<OldServeEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPrivateRoute {
+            route: RouteEntry,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldServeEntry {
+            address_id: String,
+            #[serde(default)]
+            route: Option<RouteEntry>,
+        }
+
+        let alice =
+            vec![temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").unwrap()];
+        let private = |host: &str, id: &str, principals| PrivateRouteEntry {
+            route: entry(host, "10.0.0.1:80"),
+            address_id: id.to_string(),
+            range: "100.64.0.0/10".to_string(),
+            listener: "100.64.0.3".to_string(),
+            principals,
+        };
+        let serve = |id: &str, host: &str, principals| ServeEntry {
+            entry_id: 1,
+            address_id: id.to_string(),
+            hostname: host.to_string(),
+            via: "tailscale_serve".to_string(),
+            service: None,
+            removing: false,
+            applied_etag: None,
+            route: Some(entry(host, "10.0.0.1:80")),
+            addrs: Vec::new(),
+            principals,
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("routes.json");
+        let store = RouteStore::new(path.clone());
+        store.apply_public_snapshot(PublicIngressSnapshot {
+            enabled: true,
+            private_routes: vec![
+                private("range.example.test", "custom:1", None),
+                private("users.example.test", "custom:2", Some(alice.clone())),
+            ],
+            serve_entries: vec![serve(
+                "custom:3",
+                "users.example.ts.net",
+                Some(alice.clone()),
+            )],
+            identity_private_routes: vec![private("nolist.example.test", "custom:4", None)],
+            ..PublicIngressSnapshot::default()
+        });
+        store.apply_snapshot(1, Vec::new());
+
+        // This agent serves them, each with who it admits.
+        assert_eq!(
+            store
+                .lookup_private("users.example.test")
+                .unwrap()
+                .principals,
+            Some(alice.clone())
+        );
+        assert_eq!(
+            store
+                .lookup_private("nolist.example.test")
+                .unwrap()
+                .principals,
+            Some(Vec::new()),
+            "an identity route without a list admits nobody"
+        );
+        assert_eq!(
+            store
+                .lookup_private("range.example.test")
+                .unwrap()
+                .principals,
+            None
+        );
+        let socket = store.lookup_serve("custom:3").expect("served here");
+        assert_eq!(socket.principals, Some(alice.clone()));
+        assert!(socket.route.is_some());
+
+        // The 3b agent, reading the same file, serves none of them.
+        let old: OldDisk = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hosts: Vec<String> = old
+            .public_ingress
+            .private_routes
+            .iter()
+            .map(|r| r.route.host.clone())
+            .collect();
+        assert_eq!(hosts, vec!["range.example.test".to_string()]);
+        assert_eq!(old.public_ingress.serve_entries[0].address_id, "custom:3");
+        assert!(old.public_ingress.serve_entries[0].route.is_none());
+
+        // And this agent, restarted on that file, still restricts them.
+        let reloaded = RouteStore::new(path);
+        reloaded.load_from_disk();
+        assert_eq!(
+            reloaded
+                .lookup_private("users.example.test")
+                .unwrap()
+                .principals,
+            Some(alice.clone())
+        );
+        assert_eq!(
+            reloaded.lookup_serve("custom:3").unwrap().principals,
+            Some(alice)
+        );
+    }
+
     #[test]
     fn missing_disk_is_silent() {
         let dir = TempDir::new().unwrap();
@@ -722,6 +989,9 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
 
         assert!(store.lookup_public("example.com").is_some());

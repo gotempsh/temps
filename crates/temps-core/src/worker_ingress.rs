@@ -200,6 +200,11 @@ pub struct LocalIngress {
     pub http_port: u16,
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+    /// The worker owner allows the agent to drive tailscaled (ADR 065 D2):
+    /// Serve entries for tailnet names, `AdvertiseServices`, status and
+    /// whois. Without it the agent never opens tailscaled's socket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tailscale_serve: bool,
 }
 
 fn default_http_port() -> u16 {
@@ -218,6 +223,7 @@ impl Default for LocalIngress {
             interface: None,
             http_port: 80,
             https_port: 443,
+            tailscale_serve: false,
         }
     }
 }
@@ -252,6 +258,14 @@ pub struct ListenerReport {
     /// it serves (ADR 064 D7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_checks: Vec<PrivateCheck>,
+    /// What the agent found about tailscaled and did with its Serve entries
+    /// (ADR 065 D2, D4). `None` from agents that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale: Option<crate::tailnet::TailscaleReport>,
+    /// What this agent enforces, e.g. `tailnet_identity.v1` (ADR 065 D6).
+    /// A route that needs one is never sent to an agent without it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// The port a private listener serves HTTPS on, always (ADR 064 D5): a

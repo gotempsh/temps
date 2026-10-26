@@ -49,6 +49,7 @@ temps-workload-node = { path = "../temps-workload-node" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-metrics = { path = "../temps-metrics" }
 ipnet = "2.10"
+hickory-resolver = "0.26"
 parking_lot = "0.12"
 libc = { workspace = true }
 if-addrs = "0.15"

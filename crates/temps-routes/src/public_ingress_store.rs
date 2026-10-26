@@ -10,14 +10,60 @@ use sea_orm::{
     ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
     QueryFilter,
 };
+use temps_core::tailnet::{ServeEntryReport, ServeOutcome, TailscaleReport};
 use temps_core::worker_ingress::ListenerReport;
-use temps_entities::{node_public_ingress, nodes};
+use temps_entities::{node_public_ingress, nodes, tailnet_serve_entries};
 
 /// Most host addresses kept from one report; a host with more is unusual and
 /// the console only needs the plausible candidates.
 const MAX_INTERFACES: usize = 64;
 /// Most inside checks kept from one report.
 const MAX_PRIVATE_CHECKS: usize = 256;
+/// Most Serve entry reports and tailnet checks kept from one report (ADR 065).
+const MAX_SERVE_ENTRIES: usize = 256;
+/// Most capabilities one report may name (ADR 065 D6).
+const MAX_CAPABILITIES: usize = 16;
+
+fn clip(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
+/// The Tailscale facts as stored, clipped like the rest of the report and
+/// stamped with when they arrived (ADR 065 D4's fingerprint, D5's checks).
+fn stored_tailscale(
+    mut report: TailscaleReport,
+    now: chrono::DateTime<chrono::Utc>,
+) -> serde_json::Value {
+    let short = |v: Option<String>| v.map(|v| clip(&v, 253));
+    report.user = short(report.user);
+    report.error = report.error.map(|v| clip(&v, 1000));
+    report.version = report.version.map(|v| clip(&v, 64));
+    report.backend_state = report.backend_state.map(|v| clip(&v, 32));
+    report.dns_name = short(report.dns_name);
+    report.tailnet = short(report.tailnet);
+    report.login = short(report.login);
+    report.port_443_held_by = report.port_443_held_by.map(|v| clip(&v, 300));
+    report.cert_domains.truncate(64);
+    report.tags.truncate(64);
+    report.addresses.truncate(16);
+    report.entries.truncate(MAX_SERVE_ENTRIES);
+    report.checks.truncate(MAX_SERVE_ENTRIES);
+    for entry in &mut report.entries {
+        entry.address_id = clip(&entry.address_id, 64);
+        entry.etag = entry.etag.as_deref().map(|v| clip(v, 128));
+        entry.detail = entry.detail.as_deref().map(|v| clip(v, 1000));
+    }
+    for check in &mut report.checks {
+        check.address_id = clip(&check.address_id, 64);
+        check.hostname = clip(&check.hostname, 253);
+        check.message = clip(&check.message, 1000);
+    }
+    let mut value = serde_json::json!(report);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("received_at".to_string(), serde_json::json!(now));
+    }
+    value
+}
 
 /// ADR 064 Security: a worker in `private` mode reporting a listener on an
 /// address that is not private. The control plane never routes a private
@@ -101,6 +147,7 @@ impl<'a> PublicIngressStore<'a> {
         mut report: ListenerReport,
     ) -> Result<(), DbErr> {
         report.interfaces.truncate(MAX_INTERFACES);
+        let tailscale = report.tailscale.take();
         let clip = |value: Option<String>, max: usize| {
             value.map(|v| v.chars().take(max).collect::<String>())
         };
@@ -127,10 +174,28 @@ impl<'a> PublicIngressStore<'a> {
                     }))
                     .collect::<Vec<_>>())
             });
+        // ADR 065 D6: what the agent enforces decides which routes it gets,
+        // so a change rebuilds its snapshot.
+        let mut capabilities: Vec<String> = report
+            .capabilities
+            .iter()
+            .take(MAX_CAPABILITIES)
+            .map(|c| c.chars().take(64).collect())
+            .collect();
+        capabilities.sort();
+        capabilities.dedup();
+        let capabilities_before: Vec<String> = node_public_ingress::Entity::find_by_id(node_id)
+            .one(self.db)
+            .await?
+            .and_then(|row| row.listening)
+            .and_then(|l| l.get("capabilities").cloned())
+            .and_then(|c| serde_json::from_value(c).ok())
+            .unwrap_or_default();
         let listening = serde_json::json!({
             "http": clip(report.http, 64),
             "https": clip(report.https, 64),
             "error": clip(report.error, 1000),
+            "capabilities": capabilities,
         });
         let row = node_public_ingress::ActiveModel {
             node_id: Set(node_id),
@@ -143,6 +208,7 @@ impl<'a> PublicIngressStore<'a> {
             mode: Set(report.mode.map(|mode| mode.as_str().to_string())),
             last_check: Set(None),
             private_checks: Set(private_checks),
+            tailscale: Set(tailscale.clone().map(|t| stored_tailscale(t, now))),
             checked_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
@@ -155,13 +221,121 @@ impl<'a> PublicIngressStore<'a> {
                         node_public_ingress::Column::Listening,
                         node_public_ingress::Column::Mode,
                         node_public_ingress::Column::PrivateChecks,
+                        node_public_ingress::Column::Tailscale,
                         node_public_ingress::Column::UpdatedAt,
                     ])
                     .to_owned(),
             )
             .exec(self.db)
             .await?;
+        let mut changed = capabilities_before != capabilities;
+        if let Some(tailscale) = tailscale {
+            let mut entries = tailscale.entries;
+            entries.truncate(MAX_SERVE_ENTRIES);
+            changed |= self.record_serve_reports(node_id, &entries, now).await?;
+        }
+        if changed {
+            self.announce_change().await?;
+        }
         Ok(())
+    }
+
+    /// Apply what the agent did with each Serve entry to its row (ADR 065
+    /// D4). A report names the row it is for: one about a row that was since
+    /// replaced, or for another node, changes nothing. Returns whether a row
+    /// was deleted, so the snapshot drops it.
+    pub async fn record_serve_reports(
+        &self,
+        node_id: i32,
+        reports: &[ServeEntryReport],
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, DbErr> {
+        use tailnet_serve_entries::{
+            Column, Entity, REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR,
+        };
+        use tailnet_serve_entries::{STATE_ACTIVE, STATE_REMOVING};
+        let mut deleted = false;
+        for report in reports {
+            let detail = report.detail.as_deref().map(|v| clip(v, 1000));
+            match serve_report_effect(report.outcome) {
+                ServeReportEffect::Delete => {
+                    // Only a row being removed is deleted on `removed` or
+                    // `absent`; an active one keeps serving.
+                    let result = Entity::delete_many()
+                        .filter(Column::Id.eq(report.entry_id))
+                        .filter(Column::NodeId.eq(node_id))
+                        .filter(Column::AddressId.eq(report.address_id.as_str()))
+                        .filter(Column::State.eq(STATE_REMOVING))
+                        .exec(self.db)
+                        .await?;
+                    deleted |= result.rows_affected > 0;
+                }
+                ServeReportEffect::Record(outcome) => {
+                    let report_value = match outcome {
+                        ServeOutcome::Applied => REPORT_APPLIED,
+                        ServeOutcome::Conflict => REPORT_CONFLICT,
+                        ServeOutcome::Error | ServeOutcome::Removed | ServeOutcome::Absent => {
+                            REPORT_ERROR
+                        }
+                    };
+                    let detail = match (outcome, report.funnel) {
+                        (ServeOutcome::Applied, true) => Some(
+                            "Funnel is on for this name: the agent refuses its requests"
+                                .to_string(),
+                        ),
+                        _ => detail,
+                    };
+                    let mut update = Entity::update_many()
+                        .col_expr(Column::Report, Expr::value(report_value))
+                        .col_expr(Column::ReportDetail, Expr::value(detail))
+                        .col_expr(Column::ReportedAt, Expr::value(now))
+                        .col_expr(Column::UpdatedAt, Expr::value(now));
+                    update = match outcome {
+                        // An applied report on a row being removed is the
+                        // agent's state before it saw the removal: ignored.
+                        ServeOutcome::Applied => update
+                            .col_expr(
+                                Column::AppliedEtag,
+                                Expr::value(report.etag.as_deref().map(|v| clip(v, 128))),
+                            )
+                            .filter(Column::State.eq(STATE_ACTIVE)),
+                        // A conflict on a row being removed: the slot holds
+                        // something the agent did not write. The row stays
+                        // until the user decides.
+                        ServeOutcome::Conflict
+                        | ServeOutcome::Error
+                        | ServeOutcome::Removed
+                        | ServeOutcome::Absent => update,
+                    };
+                    update
+                        .filter(Column::Id.eq(report.entry_id))
+                        .filter(Column::NodeId.eq(node_id))
+                        .filter(Column::AddressId.eq(report.address_id.as_str()))
+                        .exec(self.db)
+                        .await?;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+}
+
+/// What one entry report does to its row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServeReportEffect {
+    /// Record the outcome on the row.
+    Record(ServeOutcome),
+    /// The agent took the entry off (or it was never there): the row goes,
+    /// if it is being removed.
+    Delete,
+}
+
+fn serve_report_effect(outcome: ServeOutcome) -> ServeReportEffect {
+    match outcome {
+        ServeOutcome::Removed | ServeOutcome::Absent => ServeReportEffect::Delete,
+        ServeOutcome::Applied | ServeOutcome::Conflict | ServeOutcome::Error => {
+            ServeReportEffect::Record(outcome)
+        }
     }
 }
 
@@ -209,6 +383,7 @@ mod tests {
             mode: Some(mode.to_string()),
             last_check: None,
             private_checks: None,
+            tailscale: None,
             checked_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

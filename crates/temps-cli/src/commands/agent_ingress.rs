@@ -10,7 +10,9 @@
 //! - `fixed`: the worker picks its listen address and ports.
 //! - `delegated`: Temps picks among the addresses the worker reports.
 //! - `private`: listen only on a tailnet or LAN address, for addresses whose
-//!   audience is private (ADR 064 D5).
+//!   audience is private (ADR 064 D5). With `--tailscale-serve` the worker
+//!   owner also lets the agent configure tailscaled's Serve for tailnet names
+//!   (ADR 065 D2), with or without that listener.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -43,9 +45,15 @@ pub struct PrivateArgs {
     /// `tailscale` for this machine's Tailscale address (`tailscale0`), or a
     /// private address of this machine: 100.64.0.0/10, 10.0.0.0/8,
     /// 172.16.0.0/12, 192.168.0.0/16 or fd00::/8. The port is always 443,
-    /// and 80 only redirects to it.
+    /// and 80 only redirects to it. Optional with `--tailscale-serve`, which
+    /// then serves only through Tailscale Serve.
     #[arg(long)]
-    pub listen: String,
+    pub listen: Option<String>,
+    /// Let the agent configure this machine's tailscaled (ADR 065 D2): Serve
+    /// entries for tailnet names (`<machine>.<tailnet>.ts.net` or a Tailscale
+    /// Service), only its own, never Funnel. The agent must run as root.
+    #[arg(long)]
+    pub tailscale_serve: bool,
     #[command(flatten)]
     pub target: Target,
 }
@@ -85,7 +93,10 @@ impl AgentIngressCommand {
                 },
             ),
             Self::Fixed(args) => (&args.target, fixed(args)?),
-            Self::Private(args) => (&args.target, private(&args.listen)?),
+            Self::Private(args) => (
+                &args.target,
+                private(args.listen.as_deref(), args.tailscale_serve)?,
+            ),
         };
         let path = config_path(target)?;
         write_ingress(&path, &desired)?;
@@ -114,6 +125,13 @@ impl AgentIngressCommand {
                 "Nothing listens publicly. In the console, choose \"Only my private network\" \
                  in Make it reachable for the addresses this worker should serve."
             ),
+        }
+        if desired.tailscale_serve && !running_as_root() {
+            println!(
+                "Warning: --tailscale-serve needs the agent to run as root, since tailscaled lets \
+                 only root point Serve at a socket. Run the agent as root (`temps agent service \
+                 install` does)."
+            );
         }
         Ok(())
     }
@@ -144,23 +162,33 @@ fn fixed(args: &FixedArgs) -> anyhow::Result<LocalIngress> {
         interface: None,
         http_port: args.http_port,
         https_port: args.https_port,
+        tailscale_serve: false,
     })
 }
 
-/// `--listen` for private ingress: `tailscale`, or a private address. Used
-/// by `temps join --ingress private` too, so both refuse the same things.
-pub(crate) fn private(listen: &str) -> anyhow::Result<LocalIngress> {
+fn running_as_root() -> bool {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// `--listen` for private ingress: `tailscale`, or a private address, and
+/// `--tailscale-serve`, which may stand alone (ADR 065 D2). Used by `temps
+/// join --ingress private` too, so both refuse the same things.
+pub(crate) fn private(listen: Option<&str>, tailscale_serve: bool) -> anyhow::Result<LocalIngress> {
     let mut ingress = LocalIngress {
         mode: IngressMode::Private,
         http_port: PRIVATE_HTTP_PORT,
         https_port: PRIVATE_HTTPS_PORT,
+        tailscale_serve,
         ..LocalIngress::default()
     };
-    match listen.trim() {
+    match listen.unwrap_or_default().trim() {
         "tailscale" => ingress.interface = Some(TAILSCALE_INTERFACE.to_string()),
+        "" | "auto" if tailscale_serve => {}
         "" | "auto" => anyhow::bail!(
             "Private ingress needs to know which private address to listen on: use `--listen \
-             tailscale`, or a private address of this machine."
+             tailscale`, or a private address of this machine, or `--tailscale-serve` to serve \
+             only through Tailscale Serve."
         ),
         value => {
             let ip: IpAddr = value.parse().map_err(|_| {
@@ -191,16 +219,31 @@ fn describe(ingress: &LocalIngress) -> String {
             ingress.http_port,
             ingress.https_port
         ),
-        IngressMode::Private => format!(
-            "private on {} port 443 (80 redirects to it); serves only private addresses",
-            match (&ingress.interface, ingress.listen) {
-                (Some(interface), _) if interface == TAILSCALE_INTERFACE =>
-                    "this machine's Tailscale address".to_string(),
-                (Some(interface), _) => format!("{interface}'s address"),
-                (None, Some(ip)) => ip.to_string(),
-                (None, None) => "no address".to_string(),
+        IngressMode::Private => {
+            let listener = match (&ingress.interface, ingress.listen) {
+                (Some(interface), _) if interface == TAILSCALE_INTERFACE => {
+                    Some("this machine's Tailscale address".to_string())
+                }
+                (Some(interface), _) => Some(format!("{interface}'s address")),
+                (None, Some(ip)) => Some(ip.to_string()),
+                (None, None) => None,
+            };
+            match (listener, ingress.tailscale_serve) {
+                (Some(listener), false) => format!(
+                    "private on {listener} port 443 (80 redirects to it); serves only private \
+                     addresses"
+                ),
+                (Some(listener), true) => format!(
+                    "private on {listener} port 443 (80 redirects to it), and through Tailscale \
+                     Serve; serves only private addresses"
+                ),
+                (None, true) => {
+                    "private through Tailscale Serve only; serves only private addresses"
+                        .to_string()
+                }
+                (None, false) => "private on no address".to_string(),
             }
-        ),
+        }
     }
 }
 
@@ -308,6 +351,7 @@ mod tests {
 
     #[test]
     fn private_takes_tailscale_or_a_private_address_only() {
+        let private = |listen: &str| super::private(Some(listen), false);
         let tailscale = private("tailscale").unwrap();
         assert_eq!(tailscale.mode, IngressMode::Private);
         assert_eq!(tailscale.interface.as_deref(), Some("tailscale0"));
@@ -321,5 +365,36 @@ mod tests {
             assert!(error.contains("--listen tailscale"), "{refused}: {error}");
         }
         assert!(describe(&tailscale).contains("Tailscale"));
+        assert!(!tailscale.tailscale_serve);
+    }
+
+    // ADR 065 D2: the consent flag is saved, alone or with a listener, and
+    // never set without being asked for.
+    #[test]
+    fn tailscale_serve_is_consent_saved_in_agent_json() {
+        let serve_only = private(None, true).unwrap();
+        assert_eq!(serve_only.mode, IngressMode::Private);
+        assert!(serve_only.tailscale_serve);
+        assert_eq!(
+            (serve_only.listen, serve_only.interface.as_deref()),
+            (None, None)
+        );
+        assert!(describe(&serve_only).contains("Tailscale Serve only"));
+        let both = private(Some("tailscale"), true).unwrap();
+        assert!(both.tailscale_serve);
+        assert_eq!(both.interface.as_deref(), Some("tailscale0"));
+        assert!(private(None, false).is_err());
+
+        let saved = serde_json::to_value(&both).unwrap();
+        assert_eq!(saved["tailscale_serve"], serde_json::json!(true));
+        // Without consent the field is not written at all, so agent.json is
+        // unchanged for every install that never opts in (ADR 065 D11).
+        let without = serde_json::to_value(private(Some("tailscale"), false).unwrap()).unwrap();
+        assert!(without.get("tailscale_serve").is_none());
+        let old: LocalIngress = serde_json::from_value(
+            serde_json::json!({"mode": "private", "interface": "tailscale0"}),
+        )
+        .unwrap();
+        assert!(!old.tailscale_serve);
     }
 }

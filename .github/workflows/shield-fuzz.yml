@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Shield fuzz
+
+# Fuzzes the JA4 ClientHello parser (ADR 066, I11): every TLS connection
+# hands it bytes a client chose. Ten minutes nightly; one minute on pull
+# requests that touch it.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/temps-shield/src/ja4.rs"
+      - "crates/temps-shield/fuzz/**"
+      - ".github/workflows/shield-fuzz.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  ja4:
+    name: Fuzz the JA4 parser
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Seed the corpus with real ClientHellos
+        working-directory: crates/temps-shield
+        run: |
+          mkdir -p fuzz/corpus/ja4
+          grep -v '^#' tests/data/ja4_wireshark.txt | cut -d'|' -f4 | while read -r payload; do
+            [ -n "$payload" ] || continue
+            echo "$payload" | xxd -r -p > "fuzz/corpus/ja4/$(echo "$payload" | sha256sum | cut -c1-16)"
+          done
+      - name: Fuzz
+        working-directory: crates/temps-shield
+        env:
+          SECONDS_TO_RUN: ${{ github.event_name == 'pull_request' && '60' || '600' }}
+        run: cargo fuzz run ja4 -- -max_total_time="$SECONDS_TO_RUN" -max_len=20000
+      - name: Keep the crash
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ja4-fuzz-artifacts
+          path: crates/temps-shield/fuzz/artifacts

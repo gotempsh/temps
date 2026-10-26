@@ -122,10 +122,34 @@ pub trait ProviderFactory: Send + Sync {
     fn spec_provider(&self, http: &reqwest::Client) -> Box<dyn TunnelProvider>;
 }
 
+/// A provider that is a credential rather than a tunnel (ADR 065 D2's
+/// `tailscale`): described and checked like a tunnel provider, stored on a
+/// connector row with its secrets sealed, but never synced, published
+/// through or run on a node.
+#[async_trait]
+pub trait CredentialFactory: Send + Sync {
+    fn info(&self) -> ProviderInfo;
+
+    /// Proves what the credential can do before it is saved. Errors say
+    /// what to change.
+    async fn validate(
+        &self,
+        deps: &ProviderDeps<'_>,
+        setup: &ProviderSetup,
+    ) -> Result<(), IngressError>;
+}
+
+/// Whether connector rows of `kind` are credentials, which every tunnel
+/// path skips.
+pub fn is_credential_kind(kind: &str) -> bool {
+    kind == crate::tailscale::KIND
+}
+
 /// The providers this control plane offers.
 #[derive(Clone)]
 pub struct ProviderRegistry {
     factories: Vec<Arc<dyn ProviderFactory>>,
+    credentials: Vec<Arc<dyn CredentialFactory>>,
 }
 
 impl ProviderRegistry {
@@ -133,16 +157,49 @@ impl ProviderRegistry {
     pub fn builtin() -> Self {
         Self {
             factories: vec![Arc::new(crate::cloudflare::CloudflareTunnelFactory)],
+            credentials: vec![Arc::new(crate::tailscale::TailscaleFactory)],
         }
     }
 
     /// Exactly these providers, for tests.
     #[cfg(test)]
     pub(crate) fn of(factories: Vec<Arc<dyn ProviderFactory>>) -> Self {
-        Self { factories }
+        Self {
+            factories,
+            credentials: Vec::new(),
+        }
+    }
+
+    /// The credential provider of `kind`.
+    pub fn credential(&self, kind: &str) -> Result<Arc<dyn CredentialFactory>, IngressError> {
+        self.credentials
+            .iter()
+            .find(|f| f.info().kind == kind)
+            .cloned()
+            .ok_or_else(|| {
+                IngressError::Validation(format!(
+                    "Unknown credential provider '{kind}'. This control plane offers: {}.",
+                    self.credentials
+                        .iter()
+                        .map(|f| f.info().kind)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })
+    }
+
+    /// The credential providers, for the console.
+    pub fn credential_infos(&self) -> Vec<ProviderInfo> {
+        self.credentials.iter().map(|f| f.info()).collect()
     }
 
     pub fn get(&self, kind: &str) -> Result<Arc<dyn ProviderFactory>, IngressError> {
+        if is_credential_kind(kind) {
+            return Err(IngressError::Validation(format!(
+                "'{kind}' is a credential, not a tunnel: Temps adds it while making a private \
+                 app reachable."
+            )));
+        }
         self.factories
             .iter()
             .find(|f| f.info().kind == kind)

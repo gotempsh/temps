@@ -3,9 +3,10 @@
 ## Status
 
 Proposed — 2026-10-25. Phase 1 (the challenge fix) shipped with this ADR.
-Phase 2 (reputation lists in `log` mode) is implemented in the pull request
-that amends it on 2026-10-26, which also corrects what D2 said about the
-lists' terms; the later phases are proposed. File and line references are to
+Phase 2 (reputation lists in `log` mode) shipped on 2026-10-26, with a
+correction to what D2 said about the lists' terms. Phase 3 (JA4) is being
+implemented in the order its entry in Phases gives, starting with the
+parser; the later phases are proposed. File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
@@ -663,31 +664,35 @@ heartbeat.
 
 ### I6. JA4 extraction
 
-**Parser (`temps_shield::ja4`).** Pure Rust, no dependencies beyond `sha2`,
-no allocation on the parse path beyond the output:
+**Parser (`temps_shield::ja4`).** Pure Rust, no dependencies beyond `sha2`.
+Implemented in phase 3 as:
 
 ```rust
-pub struct ClientHello<'a> {
-    pub record_version: u16,
+pub struct ClientHello {
     pub legacy_version: u16,
-    pub random: &'a [u8; 32],
-    pub ciphers: SmallVec<[u16; 32]>,      // GREASE removed
-    pub extensions: SmallVec<[u16; 24]>,   // in order, GREASE removed
+    pub random: [u8; 32],
+    pub ciphers: Vec<u16>,                 // GREASE removed
+    pub extensions: Vec<u16>,              // in order, GREASE removed
     pub sni: bool,
-    pub alpn_first: Option<&'a [u8]>,
-    pub supported_versions: SmallVec<[u16; 4]>,
-    pub sig_algs: SmallVec<[u16; 16]>,
+    pub alpn_first: Option<Vec<u8>>,
+    pub supported_versions: Vec<u16>,
+    pub signature_algorithms: Vec<u16>,    // in order
 }
 
-pub enum Need { More(usize), Done(usize) }      // bytes still needed / total consumed
+pub enum Need { More(usize), Done(usize) }      // bytes still needed / bytes the hello takes
 
 pub fn needed(buf: &[u8]) -> Result<Need, ParseError>;
-pub fn parse(buf: &[u8]) -> Result<ClientHello<'_>, ParseError>;
-pub fn ja4(hello: &ClientHello<'_>, transport: Transport) -> Ja4;  // Ja4([u8; 36])
+pub fn parse(buf: &[u8]) -> Result<ClientHello, ParseError>;
+pub fn ja4(hello: &ClientHello, transport: Transport) -> Ja4;  // Ja4([u8; 36])
+pub fn ja4_raw(hello: &ClientHello, transport: Transport) -> String;
+impl Ja4 { pub fn parse_forwarded(value: &str) -> Option<Ja4> }  // the D4 format check
 ```
 
-It accepts a ClientHello split across several TLS records (post-quantum key
-shares make Chrome's about 1.8 KB) and gives up at 16 KB. Anything that is
+The hello is owned rather than borrowed: it is parsed once per connection,
+and owning it lets a multi-record hello be joined without tying the result
+to a temporary buffer. It accepts a ClientHello split across several TLS
+records (post-quantum key shares make Chrome's about 1.8 KB) and reads no
+more than 16 KB, record headers included. Anything that is
 not a TLS ClientHello (SSLv2 hello, plain HTTP on 443, garbage) is a
 `ParseError`; the bytes are put back and the TLS library fails the
 connection as it does today.
@@ -866,9 +871,15 @@ which every control plane registers:
 - JA4: reference vectors from the JA4 repository (BSD) and our own captures
   of current Chrome, Firefox, Safari, Edge, curl, Go `net/http`, Python
   `requests` and `httpx`, Nuclei and zgrab2, checked against the values
-  Bunny (`CDN-JA4`) reports for the same clients. Fragmented ClientHellos
+  Bunny (`CDN-JA4`) reports for the same clients. The parser's first tests
+  are the specification's worked example and five real ClientHellos (curl,
+  `openssl s_client`, Python `ssl`) with the JA4 and `ja4_r` Wireshark 4.4.7
+  computed for each (`crates/temps-shield/tests/data/ja4_wireshark.txt`);
+  browser captures follow with the control-plane hook. Fragmented ClientHellos
   (one byte per TCP segment), the 16 KB limit, SSLv2, plain HTTP on 443,
-  truncated records. A `cargo fuzz` target on `parse` runs nightly.
+  truncated records. A `cargo fuzz` target on `needed` and `parse` runs
+  nightly for ten minutes, and for one on pull requests that touch it
+  (`.github/workflows/shield-fuzz.yml`).
 - Pingora with the pre-TLS hook still negotiates TLS 1.2 and 1.3, h2 and
   http/1.1, and on-demand certificates; the JA4 reaches every request on a
   keep-alive connection; parse and hash cost under 5 µs per handshake.
