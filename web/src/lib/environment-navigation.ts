@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-export type EnvironmentView = 'containers' | 'metrics' | 'settings'
+export type EnvironmentView = 'containers' | 'metrics' | 'shield' | 'settings'
 
 export function resolveEnvironmentView(value: string | null): EnvironmentView {
   if (value === 'settings') return 'settings'
   if (value === 'metrics') return 'metrics'
+  if (value === 'shield') return 'shield'
   return 'containers'
 }
 
@@ -49,7 +50,11 @@ export function updateEnvironmentSearchParams(
     next.set('environment', change.environmentId.toString())
   }
 
-  if (change.view === 'settings' || change.view === 'metrics') {
+  if (
+    change.view === 'settings' ||
+    change.view === 'metrics' ||
+    change.view === 'shield'
+  ) {
     next.set('view', change.view)
   } else if (change.view === 'containers') {
     next.delete('view')

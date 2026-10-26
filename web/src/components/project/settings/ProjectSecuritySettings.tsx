@@ -2,10 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
+import type { ShieldMode } from '@/api/client/types.gen'
 import {
   updateProjectDeploymentConfigMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { SHIELD_MODES } from '@/lib/shield'
+import { ShieldWouldHaveCounts } from './ShieldWouldHaveCounts'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -61,7 +65,7 @@ interface SecurityConfig {
 
 interface FormData {
   security: SecurityConfig
-  attack_mode?: boolean
+  shield_mode: ShieldMode
   ai_alert_summaries_enabled?: boolean
   ai_api_traffic_summary_enabled?: boolean
   vulnerability_scanning_enabled?: boolean
@@ -81,7 +85,7 @@ export function ProjectSecuritySettings({
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
     meta: {
-      errorTitle: 'Failed to update attack mode',
+      errorTitle: 'Failed to update service settings',
     },
   })
 
@@ -94,7 +98,7 @@ export function ProjectSecuritySettings({
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
     defaultValues: {
-      attack_mode: project.attack_mode ?? false,
+      shield_mode: project.shield_mode ?? 'log',
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
@@ -139,7 +143,7 @@ export function ProjectSecuritySettings({
   // `defaultValues` are only read on mount, but this component stays mounted
   // when the route switches between two projects' settings pages. Without
   // this reset the form would still hold the previous project's toggles, and
-  // Save would apply the old project's attack mode / AI / vulnerability
+  // Save would apply the old project's Shield mode / AI / vulnerability
   // scanning choices to the newly-selected project.
   //
   // Keyed on the project *identity*, not its values: a plain refetch of the
@@ -151,7 +155,7 @@ export function ProjectSecuritySettings({
     }
     syncedProjectId.current = project.id
     reset({
-      attack_mode: project.attack_mode ?? false,
+      shield_mode: project.shield_mode ?? 'log',
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
@@ -194,7 +198,6 @@ export function ProjectSecuritySettings({
   }, [project, reset])
 
   const securityConfig = useWatch({ control, name: 'security' })
-  const attackMode = useWatch({ control, name: 'attack_mode' })
   const aiAlertSummariesEnabled = useWatch({
     control,
     name: 'ai_alert_summaries_enabled',
@@ -212,15 +215,15 @@ export function ProjectSecuritySettings({
     if (!project?.id) return
 
     try {
-      // Collect changed project-level toggles (attack mode + AI opt-ins).
+      // Collect changed project-level settings (Shield mode + AI opt-ins).
       const projectSettings: {
-        attack_mode?: boolean
+        shield_mode?: ShieldMode
         ai_alert_summaries_enabled?: boolean
         ai_api_traffic_summary_enabled?: boolean
         vulnerability_scanning_enabled?: boolean
       } = {}
-      if (data.attack_mode !== project.attack_mode) {
-        projectSettings.attack_mode = data.attack_mode
+      if (data.shield_mode !== project.shield_mode) {
+        projectSettings.shield_mode = data.shield_mode
       }
       if (
         (data.ai_alert_summaries_enabled ?? false) !==
@@ -338,51 +341,57 @@ export function ProjectSecuritySettings({
         </AlertDescription>
       </Alert>
 
-      {/* Attack Mode Card */}
+      {/* Shield Card (ADR 066): replaces the Attack Mode card */}
       <SettingsSection
-        title="Attack Mode"
-        description="Enable CAPTCHA protection to defend against DDoS attacks and bot traffic"
+        title="Shield"
+        description="How this service acts on Shield's verdicts. Environments follow this mode unless they set their own."
         icon={Shield}
       >
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="attack-mode">Enable Attack Mode</Label>
-              <p className="text-sm text-muted-foreground">
-                Require CAPTCHA verification for all visitors to this service
-              </p>
-            </div>
-            <Switch
-              id="attack-mode"
-              checked={attackMode ?? false}
-              onCheckedChange={(checked) =>
-                setValue('attack_mode', checked, { shouldDirty: true })
-              }
-            />
-          </div>
-          {attackMode && (
-            <>
-              <Separator />
-              <Alert>
-                <InfoIcon className="h-4 w-4" />
-                <AlertTitle>Attack Mode Active</AlertTitle>
-                <AlertDescription>
-                  All visitors will be required to complete a CAPTCHA challenge
-                  before accessing your application. Sessions are valid for 24
-                  hours.
-                </AlertDescription>
-              </Alert>
-            </>
-          )}
+          <Controller
+            control={control}
+            name="shield_mode"
+            render={({ field }) => (
+              <RadioGroup
+                value={field.value}
+                onValueChange={(value) => field.onChange(value as ShieldMode)}
+                aria-label="Shield mode"
+                className="gap-0 divide-y rounded-lg border"
+              >
+                {SHIELD_MODES.map((mode) => (
+                  <div key={mode.value} className="flex items-start gap-3 p-3">
+                    <RadioGroupItem
+                      id={`shield-mode-${mode.value}`}
+                      value={mode.value}
+                      className="mt-0.5"
+                    />
+                    <div className="min-w-0 space-y-0.5">
+                      <Label htmlFor={`shield-mode-${mode.value}`}>
+                        {mode.label}
+                      </Label>
+                      <p className="text-sm text-muted-foreground">
+                        {mode.description}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </RadioGroup>
+            )}
+          />
+          <Separator />
+          <ShieldWouldHaveCounts projectId={project.id} />
         </div>
         <div className="mt-6">
           <Button
             type="submit"
             disabled={
-              !isDirty || isSubmitting || updateDeploymentConfig.isPending
+              !isDirty ||
+              isSubmitting ||
+              updateDeploymentConfig.isPending ||
+              updateProjectSettings.isPending
             }
           >
-            Save Attack Mode Settings
+            Save Shield settings
           </Button>
         </div>
       </SettingsSection>
