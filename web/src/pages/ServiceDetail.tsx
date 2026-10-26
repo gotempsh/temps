@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  memberProgress,
+  type MemberProgressInput,
+} from '@/lib/cluster-member-progress'
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
@@ -1097,8 +1101,8 @@ export function ServiceDetail() {
             {service.service.topology === 'cluster' &&
               service.service.status === 'creating' && (
                 <Callout tone="info" title="Creating cluster members…">
-                  This may take a minute. Members will appear below as they are
-                  provisioned.
+                  Members are created one at a time, the monitor first. Each row
+                  below shows what it is doing.
                 </Callout>
               )}
 
@@ -1254,6 +1258,7 @@ export function ServiceDetail() {
                                     </span>
                                   )}
                                 </div>
+                                <MemberProgressLine member={member} />
                               </div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
@@ -2165,6 +2170,22 @@ function LinkedResourceNote({ serviceType }: { serviceType: string }) {
         </>
       ) : null}
       {copy.trail}
+    </p>
+  )
+}
+
+function MemberProgressLine({ member }: { member: MemberProgressInput }) {
+  const progress = memberProgress(member)
+  if (!progress) return null
+  return (
+    <p
+      className={
+        progress.tone === 'error'
+          ? 'text-xs text-destructive break-words'
+          : 'text-xs text-muted-foreground'
+      }
+    >
+      {progress.text}
     </p>
   )
 }

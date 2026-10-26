@@ -1637,9 +1637,9 @@ pub struct ServiceMemberInfo {
     /// prefers this over `hostname` because it's the only path that
     /// reliably reaches the container from any node.
     pub compute_ip: Option<String>,
-    /// Most recent phase of the background add-member provisioning task,
-    /// when applicable. See `MemberProvisioningStep` for the canonical
-    /// step names. NULL for members not created through that flow.
+    /// Most recent provisioning phase, written by initial cluster creation
+    /// and by the add-member task. See `member_provisioning_step` for the
+    /// canonical names. NULL for members created before steps were recorded.
     pub provisioning_step: Option<String>,
     pub provisioning_error: Option<String>,
     /// Live FSM state from the pg_auto_failover monitor (`primary`,
@@ -2231,6 +2231,9 @@ pub mod member_provisioning_step {
     pub const RESOLVING_MONITOR: &str = "resolving_monitor";
     pub const INSERTING_ROW: &str = "inserting_row";
     pub const PROVISIONING_CONTAINER: &str = "provisioning_container";
+    /// Initial cluster creation only: the monitor's container is up and the
+    /// data nodes wait until it is ready to accept their registration.
+    pub const WAITING_FOR_HEALTH: &str = "waiting_for_health";
     pub const REGISTERING_DNS: &str = "registering_dns";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
@@ -2241,9 +2244,28 @@ pub mod member_provisioning_step {
         RESOLVING_MONITOR,
         INSERTING_ROW,
         PROVISIONING_CONTAINER,
+        WAITING_FOR_HEALTH,
         REGISTERING_DNS,
         DONE,
     ];
+}
+
+/// Whether a cluster member's container is ready: running, and healthy when
+/// its image defines a health check. `health` is Docker's status in any of
+/// the spellings the agent and the local inspect produce (`healthy`,
+/// `HEALTHY`, `"healthy"`); `none` or an empty status means the image has no
+/// health check, so running is enough.
+fn member_container_ready(running: bool, health: Option<&str>) -> bool {
+    if !running {
+        return false;
+    }
+    match health {
+        None => true,
+        Some(status) => {
+            let status = status.trim().trim_matches('"').to_ascii_lowercase();
+            matches!(status.as_str(), "healthy" | "none" | "")
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -9288,6 +9310,8 @@ echo "[restore] Pre-seed complete"
             node_id: Option<i32>,
         }
         let mut created_members: Vec<CreatedMember> = Vec::new();
+        // The member being worked on, so a failure is recorded on its row.
+        let mut current_member_id: Option<i32> = None;
 
         // Create each member container (in order: monitor first, then data nodes)
         let create_result: Result<(), ExternalServiceError> = async {
@@ -9321,9 +9345,14 @@ echo "[restore] Pre-seed complete"
                     )?;
                     let mut active: service_members::ActiveModel = existing.into();
                     active.status = Set("creating".to_string());
+                    active.provisioning_step = Set(Some(
+                        member_provisioning_step::PROVISIONING_CONTAINER.to_string(),
+                    ));
+                    active.provisioning_error = Set(None);
                     active.updated_at = Set(Utc::now());
                     active.update(self.db.as_ref()).await?
                 };
+                current_member_id = Some(member_model.id);
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
                 // Reserved (and validated against the block) with the rows.
@@ -9449,12 +9478,24 @@ echo "[restore] Pre-seed complete"
                         "Waiting for monitor '{}' to become healthy...",
                         result.container_name
                     );
-                    self.wait_for_container_health(&result.container_name, 60)
-                        .await
-                        .map_err(|e| ExternalServiceError::InitializationFailed {
+                    self.claim_provisioning_step(
+                        member_model.id,
+                        member_provisioning_step::WAITING_FOR_HEALTH,
+                    )
+                    .await?;
+                    self.wait_for_member_ready(
+                        service_id,
+                        spec.node_id,
+                        &result.container_name,
+                        60,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ExternalServiceError::InitializationFailed {
                             id: service_id,
                             reason: format!("Monitor failed health check: {}", e),
-                        })?;
+                        }
+                    })?;
                 }
 
                 // Compute the FQDN for this member (ADR-011). Registered in the
@@ -9487,6 +9528,8 @@ echo "[restore] Pre-seed complete"
                 member_update.container_id = Set(Some(container_id));
                 member_update.port = Set(host_port);
                 member_update.status = Set("running".to_string());
+                member_update.provisioning_step =
+                    Set(Some(member_provisioning_step::REGISTERING_DNS.to_string()));
                 member_update.hostname = Set(Some(member_hostname));
                 member_update.compute_ip = Set(compute_ip.clone());
                 member_update.updated_at = Set(Utc::now());
@@ -9550,6 +9593,8 @@ echo "[restore] Pre-seed complete"
                         );
                     }
                 }
+                self.claim_provisioning_step(member_id, member_provisioning_step::DONE)
+                    .await?;
             }
             Ok(())
         }
@@ -9561,6 +9606,32 @@ echo "[restore] Pre-seed complete"
                 "Cluster member creation failed for service {}: {}. Rolling back {} created container(s).",
                 service_id, e, created_members.len()
             );
+
+            // Say which member failed and why, on its own row, so the console
+            // shows the reason next to it rather than only on the service.
+            if let Some(member_id) = current_member_id {
+                if let Err(db_err) = service_members::Entity::update_many()
+                    .col_expr(
+                        service_members::Column::ProvisioningStep,
+                        Expr::value(member_provisioning_step::FAILED),
+                    )
+                    .col_expr(
+                        service_members::Column::ProvisioningError,
+                        Expr::value(e.to_string()),
+                    )
+                    .col_expr(service_members::Column::UpdatedAt, Expr::value(Utc::now()))
+                    .filter(service_members::Column::Id.eq(member_id))
+                    .exec(self.db.as_ref())
+                    .await
+                {
+                    error!(
+                        service_id,
+                        member_id,
+                        "Failed to record the cluster member's provisioning error: {}",
+                        db_err
+                    );
+                }
+            }
 
             for member in &created_members {
                 if let Some(node_id) = member.node_id {
@@ -12063,58 +12134,93 @@ echo "[restore] Pre-seed complete"
         Ok((response.id, host_port, compute_ip))
     }
 
-    /// Wait for a container to become healthy (Docker health check).
-    async fn wait_for_container_health(
+    /// Wait until a cluster member's container is running and, when its
+    /// image defines a health check, healthy.
+    ///
+    /// A member on a worker is asked about through that worker's agent: the
+    /// control plane's own Docker daemon does not have the container, so
+    /// inspecting it locally never succeeds and the wait only ever timed
+    /// out. The timeout error carries the last state seen, so the operator
+    /// learns whether the container never started, kept restarting or stayed
+    /// unhealthy.
+    async fn wait_for_member_ready(
         &self,
+        service_id: i32,
+        node_id: Option<i32>,
         container_name: &str,
         timeout_secs: u64,
     ) -> Result<(), ExternalServiceError> {
         use bollard::query_parameters::InspectContainerOptions;
         use std::time::{Duration, Instant};
 
-        let docker = self.require_docker()?;
+        let remote = match node_id {
+            Some(node_id) => Some((node_id, self.get_remote_client(node_id).await?)),
+            None => None,
+        };
+        let docker = match remote {
+            Some(_) => None,
+            None => Some(self.require_docker()?),
+        };
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
+        let mut last_state: String;
 
         loop {
+            let observed = match (&remote, &docker) {
+                (Some((_, client)), _) => match client.service_status(container_name).await {
+                    Ok(status) => Ok((status.running, status.health)),
+                    Err(e) => Err(format!("status check failed: {}", e)),
+                },
+                (None, Some(docker)) => {
+                    match docker
+                        .inspect_container(container_name, None::<InspectContainerOptions>)
+                        .await
+                    {
+                        Ok(info) => {
+                            let state = info.state.as_ref();
+                            Ok((
+                                state.and_then(|s| s.running).unwrap_or(false),
+                                state
+                                    .and_then(|s| s.health.as_ref())
+                                    .and_then(|h| h.status.as_ref())
+                                    .map(|s| s.to_string()),
+                            ))
+                        }
+                        Err(e) => Err(format!("inspect failed: {}", e)),
+                    }
+                }
+                (None, None) => Err("no Docker client".to_string()),
+            };
+
+            match observed {
+                Ok((running, health)) => {
+                    if member_container_ready(running, health.as_deref()) {
+                        return Ok(());
+                    }
+                    last_state = format!(
+                        "running: {}, health: {}",
+                        running,
+                        health.as_deref().unwrap_or("none")
+                    );
+                }
+                Err(reason) => last_state = reason,
+            }
+
             if start.elapsed() > timeout {
+                let place = match &remote {
+                    Some((node_id, _)) => format!("on node {}", node_id),
+                    None => "on the control plane".to_string(),
+                };
                 return Err(ExternalServiceError::InitializationFailed {
-                    id: 0,
+                    id: service_id,
                     reason: format!(
-                        "Container {} did not become healthy within {}s",
-                        container_name, timeout_secs
+                        "Container {} {} did not become ready within {}s (last state: {})",
+                        container_name, place, timeout_secs, last_state
                     ),
                 });
             }
 
-            if let Ok(info) = docker
-                .inspect_container(container_name, None::<InspectContainerOptions>)
-                .await
-            {
-                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-
-                if running {
-                    // Check if container has a healthcheck and if it's healthy
-                    let health_status = info
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.health.as_ref())
-                        .and_then(|h| h.status.as_ref())
-                        .map(|s| format!("{:?}", s));
-
-                    match health_status.as_deref() {
-                        Some("\"HEALTHY\"") | Some("Healthy") => return Ok(()),
-                        None => {
-                            // No healthcheck defined — just check if running
-                            return Ok(());
-                        }
-                        _ => {} // Still starting or unhealthy — keep waiting
-                    }
-                }
-            }
-            // Container not found or not running yet — keep waiting
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
@@ -17947,6 +18053,27 @@ mod tests {
     /// experimental, off-by-default `cluster_dns.enabled` resolver wiring
     /// is on, which broke every single-host cluster by default before this
     /// fix).
+    /// The agent reports Docker's health with `{:?}` (`HEALTHY`), the local
+    /// inspect with `Display` (`healthy`); both must count as ready, and a
+    /// member without a health check is ready once it runs.
+    #[test]
+    fn member_container_ready_accepts_every_health_spelling() {
+        assert!(member_container_ready(true, None));
+        assert!(member_container_ready(true, Some("HEALTHY")));
+        assert!(member_container_ready(true, Some("healthy")));
+        assert!(member_container_ready(true, Some("\"HEALTHY\"")));
+        assert!(member_container_ready(true, Some("NONE")));
+        assert!(member_container_ready(true, Some("")));
+    }
+
+    #[test]
+    fn member_container_ready_waits_for_start_and_health() {
+        assert!(!member_container_ready(false, None));
+        assert!(!member_container_ready(false, Some("HEALTHY")));
+        assert!(!member_container_ready(true, Some("STARTING")));
+        assert!(!member_container_ready(true, Some("unhealthy")));
+    }
+
     #[test]
     fn resolve_member_hostname_prefers_fqdn_only_when_cluster_spans_hosts() {
         assert_eq!(
