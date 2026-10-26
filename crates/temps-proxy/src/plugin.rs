@@ -238,9 +238,15 @@ impl TempsPlugin for ProxyPlugin {
         let proxy_log_service = context.require_service::<ProxyLogService>();
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
+        let project_ip_access_service = context.require_service::<ProjectIpAccessService>();
+        // ADR 064 D9: the ingress plugin knows which addresses come through a
+        // tunnel. Every plugin has registered its services by now.
+        if let Some(ways_in) = context.get_service::<dyn temps_core::ways_in::EnvironmentWaysIn>() {
+            project_ip_access_service.attach_ways_in(ways_in);
+        }
         let project_ip_access_state =
             Arc::new(crate::handler::project_ip_access::ProjectIpAccessState {
-                service: context.require_service::<ProjectIpAccessService>(),
+                service: project_ip_access_service,
                 audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
                 project_access_checker: project_access_checker.clone(),
             });

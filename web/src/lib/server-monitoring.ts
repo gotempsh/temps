@@ -14,22 +14,6 @@ import type { ProxyRangePreset } from '@/lib/proxy-metrics-window'
 /** The control-plane node always has id 0 (`CONTROL_PLANE_NODE_ID`). */
 export const CONTROL_PLANE_NODE_ID = 0
 
-/**
- * Which metric families a node can have. The control plane samples itself, so
- * it also records network and block I/O counters and has a Docker daemon the
- * console can query. A worker only reports CPU, memory and disk, once per
- * heartbeat, so panels for anything else would sit empty forever.
- */
-export function nodeMetricCapabilities(nodeId: number): {
-  /** Network and block I/O counters are recorded. */
-  ioCounters: boolean
-  /** `GET /nodes/{id}/docker-disk-usage` answers for this node. */
-  dockerUsage: boolean
-} {
-  const isControlPlane = nodeId === CONTROL_PLANE_NODE_ID
-  return { ioCounters: isControlPlane, dockerUsage: isControlPlane }
-}
-
 /** Bucket width the store uses for each preset (`duration_to_step`). */
 export const STEP_SECONDS: Record<ProxyRangePreset, number> = {
   '1h': 60,

@@ -122,6 +122,14 @@ impl From<AgentError> for Problem {
                     .with_title("Not Available For Sandboxes On Worker Nodes")
                     .with_detail(error.to_string())
             }
+            // ADR 063: a control plane that runs no workloads. Not the
+            // worker-node-required problem: adding a worker does not make an
+            // agent run or an application workspace possible here yet.
+            AgentError::NoLocalSandboxHost { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(crate::error::NO_LOCAL_SANDBOX_HOST_TYPE)
+                .with_title(crate::error::NO_LOCAL_SANDBOX_HOST_TITLE)
+                .with_detail(error.to_string())
+                .with_value("error_code", crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE),
             AgentError::SandboxConflictOnNode { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_type("https://temps.sh/probs/sandbox-node-conflict")
                 .with_title("Sandbox Conflict On Worker Node")
@@ -729,6 +737,27 @@ mod tests {
         });
         let response = axum::response::IntoResponse::into_response(problem);
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn no_local_sandbox_host_is_a_typed_conflict_naming_the_workaround() {
+        let problem = Problem::from(AgentError::NoLocalSandboxHost {
+            operation: "An AI agent run".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        let body = serde_json::to_value(&problem.body).unwrap();
+        assert_eq!(body["type"], crate::error::NO_LOCAL_SANDBOX_HOST_TYPE);
+        assert_eq!(
+            body["error_code"],
+            crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
+        );
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with("An AI agent run needs a sandbox"),
+            "{detail}"
+        );
+        assert!(detail.contains("worker nodes"), "{detail}");
+        assert!(detail.contains("/settings/nodes"), "{detail}");
     }
 
     #[test]

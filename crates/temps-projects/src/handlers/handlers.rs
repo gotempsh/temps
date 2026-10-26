@@ -2015,6 +2015,7 @@ pub async fn update_project_settings(
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
         previous_image_retention_hours,
+        serves_own_temps_api: settings.serves_own_temps_api,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {

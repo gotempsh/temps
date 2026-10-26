@@ -31,6 +31,9 @@ pub enum ClusterNetworkError {
 
     #[error("could not read the cluster network: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("{0}")]
+    InvalidOverlayNetworkName(String),
 }
 
 /// One worker's view of the overlay.
@@ -47,6 +50,9 @@ pub struct ClusterNetworkNode {
     pub overlay_last_error: Option<String>,
     /// The last automatic move of its allocation, and why.
     pub overlay_remediation: Option<String>,
+    /// The overlay network name it uses: its own when `temps join` found the
+    /// cluster's name taken on its host, else the cluster's (ADR 059).
+    pub overlay_network_name: String,
     /// Whether its allocation locks the pool, and why when it does.
     pub in_use: bool,
     pub in_use_reason: Option<String>,
@@ -73,6 +79,10 @@ pub struct ClusterNetworkStatus {
     /// The WireGuard mesh pool; a compute pool may not overlap it.
     pub mesh_pool_cidr: String,
     pub mesh_enabled: bool,
+    /// The cluster's overlay network name (ADR 059): the Docker network
+    /// `<name>`, bridge `br-<name>` and VXLAN device `vxlan-<name>` on each
+    /// host whose node does not override it.
+    pub overlay_network_name: String,
     /// Whether an operator has confirmed the pool, or a member already uses
     /// it. The console asks for it once before adding the first node.
     pub pool_confirmed: bool,
@@ -158,6 +168,31 @@ impl ClusterNetworkService {
         Ok((change, first_confirmation))
     }
 
+    /// Change the cluster's overlay network name (ADR 059). Returns the
+    /// previous name. Nodes that override it keep theirs; every other host
+    /// builds the new network beside the old one, which is never removed.
+    pub async fn change_overlay_network_name(
+        &self,
+        name: &str,
+    ) -> Result<String, ClusterNetworkError> {
+        let name = name.trim();
+        temps_network::overlay_name::validate_overlay_network_name(name)
+            .map_err(|e| ClusterNetworkError::InvalidOverlayNetworkName(e.to_string()))?;
+        let db = self.db.as_ref();
+        let cfg = network_config::Entity::find_by_id(1).one(db).await?.ok_or(
+            AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            },
+        )?;
+        let previous = cfg.docker_network_name.clone();
+        if previous != name {
+            let mut active: network_config::ActiveModel = cfg.into();
+            active.docker_network_name = sea_orm::ActiveValue::Set(name.to_owned());
+            sea_orm::ActiveModelTrait::update(active, db).await?;
+        }
+        Ok(previous)
+    }
+
     /// Record that an operator chose the pool. Saving it, changed or not, is
     /// the confirmation; the first one is kept. True when this was it.
     async fn confirm_pool(&self) -> Result<bool, ClusterNetworkError> {
@@ -191,6 +226,10 @@ pub(crate) fn status_of(
                 overlay_status: node.overlay_status.clone(),
                 overlay_last_error: node.overlay_last_error.clone(),
                 overlay_remediation: node.overlay_remediation.clone(),
+                overlay_network_name: node
+                    .overlay_network_name
+                    .clone()
+                    .unwrap_or_else(|| cfg.docker_network_name.clone()),
                 in_use: in_use_reason.is_some(),
                 in_use_reason,
                 occupied_ranges: temps_network::allocator::occupied_of(node)
@@ -233,6 +272,7 @@ pub(crate) fn status_of(
         default_compute_pool_cidr: network_config::DEFAULT_COMPUTE_POOL_CIDR.to_owned(),
         mesh_pool_cidr: cfg.wireguard_cidr.clone(),
         mesh_enabled: cfg.wireguard_enabled,
+        overlay_network_name: cfg.docker_network_name.clone(),
         pool_confirmed: cfg.compute_pool_confirmed_at.is_some() || !change_blocked_by.is_empty(),
         can_change: change_blocked_by.is_empty(),
         change_blocked_by,

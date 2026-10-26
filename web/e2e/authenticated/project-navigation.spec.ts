@@ -20,10 +20,11 @@ test('direct project links and direct flat settings navigation', async ({
   await page.goto(`${root}/settings`)
   await expect(page).toHaveURL(/settings\/general$/)
   const primary = page.getByRole('list', { name: 'Service navigation' })
-  await expect(primary.getByRole('link')).toHaveCount(12)
+  await expect(primary.getByRole('link')).toHaveCount(13)
   await expect(primary.getByRole('link')).toHaveText([
     'Overview',
     'Deployments',
+    'Domains',
     'Environments',
     'Environment Variables',
     'Logs',
@@ -54,13 +55,12 @@ test('direct project links and direct flat settings navigation', async ({
   await expect(settings.getByRole('link')).toHaveText([
     'General',
     'Build & deploy',
-    'Domains',
     'Variables',
     'Automation',
     'Integrations',
     'Telemetry',
   ])
-  await expect(settings.locator('a > svg')).toHaveCount(7)
+  await expect(settings.locator('a > svg')).toHaveCount(6)
   await settings
     .getByRole('link', { name: 'Build & deploy', exact: true })
     .click()

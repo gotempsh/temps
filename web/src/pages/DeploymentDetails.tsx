@@ -104,6 +104,7 @@ import { useEffect, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { announceOperation } from '@/components/operations/operations-tray-store'
+import { ReachableAfterDeploy } from '@/components/reachability/ReachableAfterDeploy'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -1569,6 +1570,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         />
 
         <DeployFailureReport project={project} deployment={deployment} />
+
+        <ReachableAfterDeploy
+          enabled={
+            deployment.status === 'completed' &&
+            project.hosting !== 'external' &&
+            project.source_type !== 'external'
+          }
+          projectId={deployment.project_id}
+          environmentId={deployment.environment_id}
+          environmentName={deployment.environment.name}
+        />
 
         {isComposeProject(project) && (
           <ComposeCheckAction

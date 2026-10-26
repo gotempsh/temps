@@ -135,6 +135,12 @@ impl TempsPlugin for SandboxPlugin {
                 Arc::new(SnapshotService::new(db.clone(), registry.clone(), provider));
             context.register_service(snapshot_service.clone());
 
+            // ADR 063: on a control plane that runs no workloads, sandboxes
+            // are placed on worker nodes only.
+            let local_workloads = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            )
+            .local_workloads_enabled();
             let service = Arc::new(
                 SandboxService::new(
                     db.clone(),
@@ -147,7 +153,8 @@ impl TempsPlugin for SandboxPlugin {
                     node_probe,
                 )
                 .with_runtime_credentials(runtime_credentials)
-                .with_snapshot_service(snapshot_service),
+                .with_snapshot_service(snapshot_service)
+                .with_local_workloads(local_workloads),
             );
             let network_reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> =
                 service.clone();
@@ -181,6 +188,12 @@ impl TempsPlugin for SandboxPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
             let sandbox_service = context.get_service::<SandboxService>();
+            // ADR 063: a control plane that runs no workloads has nothing of
+            // its own to recover or reconcile; worker sandboxes are recovered
+            // lazily, as on every install.
+            let local_sandboxes = sandbox_service
+                .as_ref()
+                .is_none_or(|service| service.runs_local_sandboxes());
 
             // Firecracker and microsandbox VMs are children of this process,
             // so a service manager that kills the whole unit on restart takes
@@ -217,11 +230,21 @@ impl TempsPlugin for SandboxPlugin {
                 }
             }
 
-            match sandboxes::Entity::find()
-                .filter(sandboxes::Column::Status.eq("running"))
-                .all(db.as_ref())
-                .await
-            {
+            if !local_sandboxes {
+                info!(
+                    "Sandbox plugin: this control plane runs no workloads; sandboxes run on \
+                     worker nodes, so no sandbox on this host is recovered or reconciled"
+                );
+            }
+            let local_rows = if local_sandboxes {
+                sandboxes::Entity::find()
+                    .filter(sandboxes::Column::Status.eq("running"))
+                    .all(db.as_ref())
+                    .await
+            } else {
+                Ok(Vec::new())
+            };
+            match local_rows {
                 Ok(rows) => {
                     // Control-plane sandboxes only. Worker-node sandboxes
                     // (ADR-048) are recovered lazily on first use (the
@@ -263,6 +286,9 @@ impl TempsPlugin for SandboxPlugin {
                     // sandboxes with nothing behind them. Move those to
                     // `stopped` now so listings are true and `resume` works.
                     match &sandbox_service {
+                        // ADR 063: no VM runs on a control plane without
+                        // workloads, so there is nothing to reconcile.
+                        Some(_) if !local_sandboxes => {}
                         Some(service) => {
                             // In the background: a wedged VM costs up to the
                             // per-check deadline, and startup must not wait

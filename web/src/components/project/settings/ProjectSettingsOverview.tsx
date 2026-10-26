@@ -62,7 +62,7 @@ const settingsGroups: SettingsGroup[] = [
       {
         title: 'Domains',
         description: 'Attach and manage service domains.',
-        url: 'settings/domains',
+        url: 'domains',
         icon: Globe,
       },
     ],

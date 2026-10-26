@@ -1,5 +1,5 @@
 import { SettingsSection } from '@/components/ui/settings-section'
-import { FolderPen, GitFork, FileCode, Trash2 } from 'lucide-react'
+import { FolderPen, GitFork, FileCode, Route, Trash2 } from 'lucide-react'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -176,6 +176,26 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
     refetch()
   }
 
+  const handleToggleServesOwnTempsApi = async (enabled: boolean) => {
+    if (!project?.id) return
+
+    await toast.promise(
+      updateProjectSettings.mutateAsync({
+        path: { project_id: project.id! },
+        body: {
+          serves_own_temps_api: enabled,
+        },
+      }),
+      {
+        loading: 'Updating Temps API routing...',
+        success: enabled
+          ? 'Temps API paths now reach this service'
+          : 'Temps API paths now reach this Temps instance',
+      }
+    )
+    refetch()
+  }
+
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const deleteProjectMutationM = useMutation({
     ...deleteProjectMutation(),
@@ -322,6 +342,33 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
               id="error-source-context"
               checked={project?.error_source_context_enabled ?? false}
               onCheckedChange={handleToggleErrorSourceContext}
+              disabled={updateProjectSettings.isPending}
+            />
+          </div>
+        </div>
+      </SettingsSection>
+
+      {/* Which side answers /api/_temps and /api/otel on this service's domains */}
+      <SettingsSection title="Temps API routing" icon={Route}>
+        <div>
+          <div className="flex flex-row items-center justify-between rounded-lg border p-4">
+            <div className="space-y-0.5 pr-4">
+              <Label htmlFor="serves-own-temps-api" className="text-base">
+                App serves its own Temps API
+              </Label>
+              <p className="text-sm text-muted-foreground">
+                Send <code>/api/_temps</code> and <code>/api/otel</code>{' '}
+                requests on this project&apos;s domains to the app instead of
+                this Temps instance&apos;s console. Turn this on only if the app
+                is itself a Temps console or API — with it on, Temps&apos; own
+                analytics and OpenTelemetry ingest stop receiving this
+                project&apos;s traffic.
+              </p>
+            </div>
+            <Switch
+              id="serves-own-temps-api"
+              checked={project?.serves_own_temps_api ?? false}
+              onCheckedChange={handleToggleServesOwnTempsApi}
               disabled={updateProjectSettings.isPending}
             />
           </div>

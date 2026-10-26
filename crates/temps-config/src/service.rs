@@ -2432,6 +2432,85 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         Ok(current)
     }
 
+    /// Apply the telemetry-export consent carried by Temps Cloud's bootstrap
+    /// file, at most once per instance (ADR-045 Amendment 2): in one locked
+    /// transaction, turn `cloud.telemetry_enabled` on and record
+    /// `cloud.telemetry_consent_bootstrapped`. Returns `None`, writing
+    /// nothing, when an earlier bootstrap already did -- whatever the operator
+    /// has chosen since stands.
+    pub async fn grant_bootstrap_telemetry_consent(
+        &self,
+    ) -> Result<Option<AppSettings>, ConfigServiceError> {
+        let transaction = self.db.begin().await?;
+        let query = settings::Entity::find_by_id(1);
+        let query = if self.is_postgres() {
+            query.lock_exclusive()
+        } else {
+            query
+        };
+        let existing = query.one(&transaction).await?;
+        // Read and write the raw document: decoding it whole falls back to
+        // defaults when an unrelated section is malformed, which would drop
+        // the marker (re-granting a consent the operator withdrew) and, on
+        // write-back, reset every other setting.
+        let mut document = existing
+            .as_ref()
+            .map(|model| model.data.clone())
+            .unwrap_or_else(|| AppSettings::default().to_json());
+        let fields =
+            document
+                .as_object_mut()
+                .ok_or(ConfigServiceError::MalformedSettingsSection {
+                    section: "settings",
+                })?;
+        let cloud = fields
+            .entry("cloud")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        if cloud.is_null() {
+            *cloud = serde_json::Value::Object(serde_json::Map::new());
+        }
+        let cloud = cloud
+            .as_object_mut()
+            .ok_or(ConfigServiceError::MalformedSettingsSection { section: "cloud" })?;
+        // Anything but an absent or `false` marker counts as already decided:
+        // a corrupt marker must not hand the operator's choice back to the
+        // bootstrap file.
+        match cloud.get("telemetry_consent_bootstrapped") {
+            None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(false)) => {}
+            Some(_) => {
+                transaction.rollback().await?;
+                return Ok(None);
+            }
+        }
+        cloud.insert(
+            "telemetry_enabled".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        cloud.insert(
+            "telemetry_consent_bootstrapped".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let now = Utc::now();
+        if let Some(model) = existing {
+            let mut active: settings::ActiveModel = model.into();
+            active.data = Set(document.clone());
+            active.updated_at = Set(now);
+            active.update(&transaction).await?;
+        } else {
+            settings::ActiveModel {
+                id: Set(1),
+                data: Set(document.clone()),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(&transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        self.invalidate_settings_cache().await;
+        Ok(Some(AppSettings::from_json(document)))
+    }
+
     /// Persist only the console-access switch under the shared settings lock.
     /// Used when an operator explicitly configures remote console access.
     pub async fn set_console_access_enabled(
@@ -3531,6 +3610,95 @@ mod tests {
             .expect("settings update statement");
         assert!(
             update_sql.contains(r#""anonymous_telemetry_enabled":false"#),
+            "{update_sql}"
+        );
+        assert!(update_sql.contains("kept.example.com"), "{update_sql}");
+        assert!(update_sql.contains("not-an-object"), "{update_sql}");
+    }
+
+    /// The bootstrap marker is read from the raw document: a malformed
+    /// unrelated section must not hide it and re-grant a consent the
+    /// operator has since withdrawn.
+    #[tokio::test]
+    async fn bootstrap_telemetry_consent_reads_its_marker_past_a_malformed_section() {
+        let mut row = settings_row("kept.example.com");
+        row.data["rate_limiting"] = serde_json::json!("not-an-object");
+        row.data["cloud"]["telemetry_enabled"] = serde_json::json!(false);
+        row.data["cloud"]["telemetry_consent_bootstrapped"] = serde_json::json!(true);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![vec![row]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        assert!(svc
+            .grant_bootstrap_telemetry_consent()
+            .await
+            .expect("an already-applied consent is not an error")
+            .is_none());
+        drop(svc);
+
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        assert!(!statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .any(|statement| statement.to_string().starts_with("UPDATE ")));
+    }
+
+    /// Granting writes only the two telemetry keys: a malformed unrelated
+    /// section and every other setting survive untouched.
+    #[tokio::test]
+    async fn bootstrap_telemetry_consent_writes_only_its_own_keys() {
+        let mut locked = settings_row("kept.example.com");
+        locked.data["rate_limiting"] = serde_json::json!("not-an-object");
+        locked.data["cloud"]["backups_enabled"] = serde_json::json!(true);
+        let mut written = locked.clone();
+        written.data["cloud"]["telemetry_enabled"] = serde_json::json!(true);
+        written.data["cloud"]["telemetry_consent_bootstrapped"] = serde_json::json!(true);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results(vec![
+                    vec![locked],
+                    vec![written.clone()],
+                    vec![written.clone()],
+                    vec![written],
+                ])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db.clone());
+
+        svc.grant_bootstrap_telemetry_consent()
+            .await
+            .expect("bootstrap consent applied")
+            .expect("first bootstrap grants the consent");
+        drop(svc);
+
+        let statements = Arc::try_unwrap(db)
+            .expect("test should release database connection")
+            .into_transaction_log();
+        let update_sql = statements
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(ToString::to_string)
+            .find(|sql| sql.starts_with("UPDATE "))
+            .expect("settings update statement");
+        assert!(
+            update_sql.contains(r#""telemetry_enabled":true"#),
+            "{update_sql}"
+        );
+        assert!(
+            update_sql.contains(r#""telemetry_consent_bootstrapped":true"#),
+            "{update_sql}"
+        );
+        assert!(
+            update_sql.contains(r#""backups_enabled":true"#),
             "{update_sql}"
         );
         assert!(update_sql.contains("kept.example.com"), "{update_sql}");
@@ -4995,6 +5163,7 @@ mod tests {
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
             compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
             updated_at: Utc::now(),
         }
     }
@@ -6491,6 +6660,10 @@ mod tests {
                 updated_at: Utc::now(),
                 certificate_id: None,
                 service_name: None,
+                audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6508,6 +6681,10 @@ mod tests {
                 environment_id: 4,
                 domain: "hooks.example.com".into(),
                 created_at: Utc::now(),
+                audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6538,6 +6715,10 @@ mod tests {
                     updated_at: Utc::now(),
                     certificate_id: None,
                     service_name: None,
+                    audience: "public".to_string(),
+                    private_range: None,
+                    private_node_id: None,
+                    private_listener: None,
                 }]])
                 .into_connection(),
         );

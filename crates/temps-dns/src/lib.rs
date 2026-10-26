@@ -67,6 +67,6 @@ pub use proxy_sync::{proxy_dns_sync_router, start_proxy_dns_sync_service, ProxyD
 pub use services::{
     ChangeSet, DeploymentDnsPublisher, DnsOperationResult, DnsProviderService, DnsRecordService,
     DnsRegistry, DnsRegistryError, EndpointDraft, ManagedDnsRecordService, ManualDnsInstructions,
-    OwnerKind as InternalOwnerKind, OwnershipScope, RecordOwnership,
+    OwnerKind as InternalOwnerKind, OwnershipScope, RecordOwnership, RecordSnapshot,
     RecordType as InternalRecordType, ResolverHealth, StaleResolver, ZoneSnapshot,
 };

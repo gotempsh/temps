@@ -24,11 +24,15 @@ pub struct Model {
     pub interfaces: Option<Json>,
     /// What the agent actually bound, `{http, https}`, or `None`.
     pub listening: Option<Json>,
-    /// What the worker allows: `off`, `fixed` or `delegated`, as it last
+    /// What the worker allows: `off`, `fixed`, `delegated` or `private`, as it last
     /// reported. `None` from agents that predate ingress modes.
     pub mode: Option<String>,
     /// Outcome of the last reachability check.
     pub last_check: Option<Json>,
+    /// The worker's last inside checks of its private addresses (ADR 064
+    /// D7), `[{address_id, hostname, outcome, message, ...}]`.
+    #[serde(default)]
+    pub private_checks: Option<Json>,
     pub checked_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

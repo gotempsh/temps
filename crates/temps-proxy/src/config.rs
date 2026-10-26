@@ -40,6 +40,12 @@ pub struct ProxyConfig {
     /// page explaining why instead of a generic 503. `None` for the split
     /// `temps proxy` process, which cannot observe a separate console.
     pub console_startup: Option<Arc<temps_core::console_startup::ConsoleStartupState>>,
+    /// Whether this proxy also samples the machine-wide `node.*` series
+    /// (CPU, memory, disk, network). Only the single-process `temps serve`
+    /// sets it: in split topology the console samples the host, which is
+    /// also the only process a console-only deployment runs, and a split
+    /// proxy reports just its own file descriptors.
+    pub host_metrics: bool,
 }
 
 impl Default for ProxyConfig {
@@ -54,6 +60,7 @@ impl Default for ProxyConfig {
             disable_https_redirect: false,
             on_demand_cert_manager: None,
             console_startup: None,
+            host_metrics: false,
         }
     }
 }

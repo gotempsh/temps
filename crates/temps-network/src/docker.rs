@@ -70,10 +70,16 @@ pub async fn preflight_network_for_subnets(
                     name,
                     reason: format!(
                         "existing Temps-owned Docker network does not use authoritative subnet {} \
-                         and gateway {}; the node's allocation changed. Remove it (`docker network \
-                         rm {}` after disconnecting its containers) so it is recreated on the new \
-                         subnet",
-                        alloc.compute_cidr, alloc.bridge_address, config.docker_network_name
+                         and gateway {}: it was created for another allocation, often by another \
+                         cluster this host belonged to. Temps never removes it. Re-run `sudo \
+                         temps join` on this host: it sees the conflict and gives this node \
+                         another overlay network name, so this cluster gets its own network \
+                         beside it. Or, if nothing uses '{}' any more, remove it (`docker network rm {}` after disconnecting its \
+                         containers) so it is recreated on the new subnet",
+                        alloc.compute_cidr,
+                        alloc.bridge_address,
+                        config.docker_network_name,
+                        config.docker_network_name
                     ),
                 });
             }
@@ -184,7 +190,11 @@ pub async fn validate_owned_network(docker: &Docker, config: &NetworkConfig) -> 
         return Err(NetworkError::InterfaceConflict {
             name: config.docker_network_name.clone(),
             reason: format!(
-                "existing network is not the Temps-owned bridge (driver={:?}, owned={owned}, bridge_matches={bridge_matches}, masquerade_disabled={masquerade_disabled})",
+                "existing network is not this overlay's Temps-owned bridge (driver={:?}, \
+                 owned={owned}, bridge_matches={bridge_matches}, \
+                 masquerade_disabled={masquerade_disabled}). Temps never removes it: re-run \
+                 `sudo temps join` on this host, which gives this node another overlay network \
+                 name so the overlay gets its own network",
                 inspect.driver
             ),
         });

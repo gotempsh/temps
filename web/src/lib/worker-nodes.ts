@@ -233,3 +233,98 @@ export function sameOriginSetupPath(path: string | undefined): string {
   if (/[^\x21-\x7e]|\\/.test(path)) return WORKER_NODES_URL
   return path
 }
+
+/** The fields of a node the removal rule reads. */
+export interface NodeRemovalFacts {
+  id: number
+  role: string
+  status: string
+  last_heartbeat?: string | null
+  serving_containers?: number | null
+  live_sandboxes?: number | null
+}
+
+/**
+ * What the console offers for removing a node.
+ *
+ * - `none`: no removal action (the control plane's own entry, or a state such
+ *   as `pending` the server would not remove directly).
+ * - `remove`: the node can be removed in one step. For an unreachable or
+ *   offline node the server may still refuse and offer a forced removal.
+ * - `drain-first`: a reachable node still runs deployment containers; a drain
+ *   moves them (or is already moving them, when `draining`).
+ * - `sandboxes`: the node hosts sandboxes, which draining does not move; they
+ *   have to be destroyed first.
+ * - `unknown`: the server predates `serving_containers`/`live_sandboxes`, so
+ *   callers keep their previous behaviour: the node detail page decides from
+ *   the drain status, and the node list offers no action.
+ */
+export type NodeRemoval =
+  | { kind: 'none' }
+  | { kind: 'remove' }
+  | { kind: 'drain-first'; containers: number; draining: boolean }
+  | { kind: 'sandboxes'; sandboxes: number }
+  | { kind: 'unknown' }
+
+/** The control plane's id in the node list (`CONTROL_PLANE_NODE_ID`). */
+export const CONTROL_PLANE_NODE_ID = 0
+
+/**
+ * Whether, and how, a node can be removed, from what the node list reports.
+ *
+ * Mirrors what `DELETE /internal/nodes/{id}` accepts: a reachable node is
+ * removed directly once nothing serves from it and it hosts no sandboxes; an
+ * unreachable or offline node can be removed whatever it ran (a drain cannot
+ * finish without its agent, ADR 057), with the server asking before it
+ * forcibly removes containers still serving. Sandboxes block either way.
+ */
+export function nodeRemoval(
+  node: NodeRemovalFacts,
+  now: number = Date.now()
+): NodeRemoval {
+  if (node.role === 'control-plane' || node.id === CONTROL_PLANE_NODE_ID) {
+    return { kind: 'none' }
+  }
+  const serving = node.serving_containers
+  const sandboxes = node.live_sandboxes
+  if (serving == null || sandboxes == null) return { kind: 'unknown' }
+  // Sandboxes block every removal, forced or not, and a drain never moves
+  // them.
+  if (sandboxes > 0) return { kind: 'sandboxes', sandboxes }
+  if (nodeIsUnreachable(node, now) || node.status === 'offline') {
+    return { kind: 'remove' }
+  }
+  if (serving > 0) {
+    return {
+      kind: 'drain-first',
+      containers: serving,
+      draining: node.status === 'draining',
+    }
+  }
+  return node.status === 'active' ||
+    node.status === 'draining' ||
+    node.status === 'drained'
+    ? { kind: 'remove' }
+    : { kind: 'none' }
+}
+
+function plural(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`
+}
+
+/**
+ * Why a node cannot be removed yet, in one short line, or `null` when nothing
+ * stands in the way (or the rule has nothing to say).
+ */
+export function nodeRemovalBlocker(removal: NodeRemoval): string | null {
+  switch (removal.kind) {
+    case 'drain-first':
+      return removal.draining
+        ? `Draining — ${plural(removal.containers, 'container', 'containers')} left`
+        : `Drain first — it has ${plural(removal.containers, 'container', 'containers')}`
+    case 'sandboxes':
+      return `Hosts ${plural(removal.sandboxes, 'sandbox', 'sandboxes')} — destroy ${removal.sandboxes === 1 ? 'it' : 'them'} first (draining does not move sandboxes)`
+    default:
+      return null
+  }
+}

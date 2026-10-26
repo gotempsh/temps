@@ -1213,6 +1213,7 @@ mod tests {
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
             compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
             updated_at: chrono::Utc::now(),
         }
     }

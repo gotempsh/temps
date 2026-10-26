@@ -178,6 +178,17 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Whether this project's own app answers Temps' public paths on its
+    /// domains. The proxy normally sends `/api/_temps*` (browser analytics,
+    /// session replay) and `/api/otel*` (OTLP ingest and queries) to this
+    /// instance's console on every hostname, because deployed apps' SDKs post
+    /// to their own domain. A project that is itself a Temps console or API
+    /// serves those paths, and with this on they reach the project's upstream
+    /// instead — so this instance's own analytics and OTLP ingest stop
+    /// receiving that project's traffic. Off by default.
+    #[sea_orm(default_value = "false")]
+    #[serde(default)]
+    pub serves_own_temps_api: bool,
     /// Opt-in for AI summarization of API traffic analytics for this project.
     /// NULL/false = off; true = generate an AI summary when AI is configured
     /// and the project calls `GET /projects/{id}/api-analytics/summary`.

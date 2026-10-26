@@ -308,7 +308,10 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::McpConfigFieldNotFound { .. }
         | AgentError::SkillDefinitionAlreadyExists { .. }
         | AgentError::McpDefinitionAlreadyExists { .. }
-        | AgentError::DockerSocketWriteRequiresAdmin { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        | AgentError::DockerSocketWriteRequiresAdmin { .. }
+        // Only a control plane that runs no workloads refuses this way
+        // (ADR 063); a worker always has a real provider.
+        | AgentError::NoLocalSandboxHost { .. } => StatusCode::INTERNAL_SERVER_ERROR,
     };
     err(status, e.to_string())
 }

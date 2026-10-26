@@ -43,7 +43,7 @@ use tracing::{debug, info, warn};
 /// produced on the CP — overlay IP for same-node containers, underlay
 /// IP + published port for cross-node, etc. The agent does not parse
 /// or rewrite it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteBackend {
     pub address: String,
     pub container_id: Option<String>,
@@ -52,7 +52,7 @@ pub struct RouteBackend {
 
 /// One internal-zone route. `host` is the lower-cased FQDN the proxy
 /// matches `Host:` against.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RouteEntry {
     pub host: String,
     pub backends: Vec<RouteBackend>,
@@ -75,6 +75,22 @@ pub struct PublicIngressSnapshot {
     /// node takes no direct traffic or the control plane predates it.
     #[serde(default)]
     pub listen: Option<PublicListen>,
+    /// Addresses only the private listener serves (ADR 064 D5). Never in
+    /// `routes`: the direct listeners and the tunnel origin answer them 404.
+    #[serde(default)]
+    pub private_routes: Vec<PrivateRouteEntry>,
+}
+
+/// A private address and what bounds it (ADR 064 D5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PrivateRouteEntry {
+    pub route: RouteEntry,
+    /// What the control plane calls it; the inside check maps it back here.
+    pub address_id: String,
+    /// The network a visitor's TCP peer address must be in.
+    pub range: String,
+    /// The listener address DNS points at.
+    pub listener: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +135,7 @@ pub struct RouteStore {
     public_ingress: RwLock<PublicIngressSnapshot>,
     public_enabled: AtomicBool,
     public_routes: ArcSwap<HashMap<String, RouteEntry>>,
+    private_routes: ArcSwap<HashMap<String, PrivateRouteEntry>>,
     public_certificates: RwLock<Option<(String, HashMap<String, PublicIngressCertBundle>)>>,
     public_tls_private_key: RwLock<Option<String>>,
     public_tls_keys: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
@@ -135,6 +152,7 @@ impl RouteStore {
             public_ingress: RwLock::new(PublicIngressSnapshot::default()),
             public_enabled: AtomicBool::new(false),
             public_routes: ArcSwap::from_pointee(HashMap::new()),
+            private_routes: ArcSwap::from_pointee(HashMap::new()),
             public_certificates: RwLock::new(None),
             public_tls_private_key: RwLock::new(None),
             public_tls_keys: ArcSwap::from_pointee(HashMap::new()),
@@ -223,6 +241,29 @@ impl RouteStore {
             .load()
             .get(&host.to_ascii_lowercase())
             .cloned()
+    }
+
+    /// A private address the private listener serves (ADR 064 D5), under
+    /// the same authorization lease as public routes.
+    pub fn lookup_private(&self, host: &str) -> Option<PrivateRouteEntry> {
+        if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
+            return None;
+        }
+        self.private_routes
+            .load()
+            .get(host.trim_end_matches('.').to_ascii_lowercase().as_str())
+            .cloned()
+    }
+
+    /// The private addresses currently served, for the inside checks.
+    pub fn private_routes(&self) -> Vec<PrivateRouteEntry> {
+        if !self.public_enabled.load(Ordering::Acquire) || !self.public_ingress_authorized() {
+            return Vec::new();
+        }
+        let mut routes: Vec<PrivateRouteEntry> =
+            self.private_routes.load().values().cloned().collect();
+        routes.sort_by(|a, b| a.address_id.cmp(&b.address_id));
+        routes
     }
 
     pub fn lookup_public_certificate(
@@ -402,6 +443,22 @@ impl RouteStore {
     }
 
     fn rebuild_public_indexes(&self, snapshot: &PublicIngressSnapshot) {
+        self.private_routes.store(Arc::new(
+            snapshot
+                .private_routes
+                .iter()
+                .map(|private| {
+                    (
+                        private
+                            .route
+                            .host
+                            .trim_end_matches('.')
+                            .to_ascii_lowercase(),
+                        private.clone(),
+                    )
+                })
+                .collect(),
+        ));
         self.public_routes.store(Arc::new(
             snapshot
                 .routes
@@ -664,6 +721,7 @@ mod tests {
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
+            private_routes: Vec::new(),
         });
 
         assert!(store.lookup_public("example.com").is_some());

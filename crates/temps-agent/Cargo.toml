@@ -47,6 +47,7 @@ temps-providers = { path = "../temps-providers" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-node = { path = "../temps-workload-node" }
 temps-workload-docker = { path = "../temps-workload-docker" }
+temps-metrics = { path = "../temps-metrics" }
 ipnet = "2.10"
 parking_lot = "0.12"
 libc = { workspace = true }
@@ -74,5 +75,6 @@ temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 Phase 4: `external_services` rows for the shadow-pass proof.
 temps-entities = { path = "../temps-entities" }
 tempfile = "3"
+rcgen = { workspace = true }
 # `test-util` provides the paused clock the build-queue tests use.
 tokio = { workspace = true, features = ["test-util"] }

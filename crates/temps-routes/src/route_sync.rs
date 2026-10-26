@@ -76,7 +76,7 @@ pub struct RouteSnapshotQuery {
 /// One backend instance behind a host. `address` is "ip:port" exactly
 /// the way the proxy will dial it (overlay IP for local-node
 /// containers, underlay-IP+published-port for cross-node).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteBackendDto {
     pub address: String,
     pub container_id: Option<String>,
@@ -86,7 +86,7 @@ pub struct RouteBackendDto {
 /// One internal-zone route. Workers index by `host` (lower-cased) and
 /// pick from `backends`. `deployment_id` is sent back through the
 /// proxy chain as a header for log correlation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteEntryDto {
     pub host: String,
     pub backends: Vec<RouteBackendDto>,
@@ -115,6 +115,26 @@ pub struct PublicIngressSnapshot {
     /// that predate it keep using `--public-ingress-address`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<PublicListenDto>,
+    /// Addresses only this worker's private listener serves (ADR 064 D5),
+    /// each with the range a visitor must come from. Never in `routes`, so
+    /// direct listeners and tunnels never answer them; agents that predate
+    /// private mode ignore the field and serve none of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub private_routes: Vec<PrivateRouteEntryDto>,
+}
+
+/// A private address on a worker's private listener (ADR 064 D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateRouteEntryDto {
+    #[serde(flatten)]
+    pub route: RouteEntryDto,
+    /// What the worker's inside check is told to check, instead of a host.
+    pub address_id: String,
+    /// The network a visitor must come from, by TCP peer address.
+    pub range: String,
+    /// The listener address DNS points at: what the inside check compares
+    /// the hostname's answer with and dials.
+    pub listener: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -498,11 +518,18 @@ pub struct WorkerPublicRoutes {
     pub blocking_policies: Vec<String>,
 }
 
-pub async fn worker_public_routes(
+/// What keeps routes off workers: cluster-wide policies only the
+/// control-plane proxy enforces, and the addresses of registered workers a
+/// worker-served backend must be on.
+pub struct WorkerRoutePolicy {
+    pub blocking_policies: Vec<String>,
+    pub registered_worker_addresses: std::collections::HashSet<std::net::IpAddr>,
+}
+
+pub async fn worker_route_policy(
     db: &DatabaseConnection,
-    peer_table: &CachedPeerTable,
     custom_request_policy: bool,
-) -> Result<WorkerPublicRoutes, (&'static str, sea_orm::DbErr)> {
+) -> Result<WorkerRoutePolicy, (&'static str, sea_orm::DbErr)> {
     use sea_orm::{ColumnTrait, PaginatorTrait, QueryFilter};
     use temps_entities::{ip_access_control, project_ip_access_rules, settings};
     let app_settings = settings::Entity::find()
@@ -556,6 +583,21 @@ pub async fn worker_public_routes(
         blocking_policies
             .push("a custom request-policy provider requires control-plane ingress".to_string());
     }
+    Ok(WorkerRoutePolicy {
+        blocking_policies,
+        registered_worker_addresses,
+    })
+}
+
+pub async fn worker_public_routes(
+    db: &DatabaseConnection,
+    peer_table: &CachedPeerTable,
+    custom_request_policy: bool,
+) -> Result<WorkerPublicRoutes, (&'static str, sea_orm::DbErr)> {
+    let WorkerRoutePolicy {
+        blocking_policies,
+        registered_worker_addresses,
+    } = worker_route_policy(db, custom_request_policy).await?;
     let public_route_count = peer_table.worker_public_route_count();
     let raw_public_routes = if blocking_policies.is_empty() {
         peer_table.snapshot_worker_public_routes()
@@ -581,6 +623,77 @@ pub async fn worker_public_routes(
         unsupported_reasons,
         blocking_policies,
     })
+}
+
+/// The listener a worker's private ingress is bound on (ADR 064 D5), as it
+/// reported: `None` unless it reports `private` mode and is bound on a
+/// private address. The control plane never routes a private address to a
+/// listener on a public one, whatever the worker says.
+pub fn private_listener_of(
+    row: Option<&temps_entities::node_public_ingress::Model>,
+) -> Option<std::net::IpAddr> {
+    let row = row?;
+    if row.mode.as_deref() != Some(temps_core::worker_ingress::IngressMode::Private.as_str()) {
+        return None;
+    }
+    let https = row.listening.as_ref()?.get("https")?.as_str()?;
+    let ip = temps_core::worker_ingress::parse_reported_ip(https)?;
+    temps_core::worker_ingress::check_private_listen(ip).ok()?;
+    Some(ip)
+}
+
+/// The private addresses `node_id` serves (ADR 064 D5), and why any it was
+/// given are held back.
+pub fn worker_private_routes(
+    peer_table: &CachedPeerTable,
+    policy: &WorkerRoutePolicy,
+    node_id: i32,
+) -> (Vec<PrivateRouteEntryDto>, Vec<String>) {
+    let mut routes = Vec::new();
+    let mut held_back = Vec::new();
+    for (host, private, servable) in peer_table.snapshot_worker_private_routes(node_id) {
+        let why = if let Some(policy) = policy.blocking_policies.first() {
+            Some(format!("{policy}, which only the control plane enforces"))
+        } else if !servable {
+            Some("it needs a redirect, static files, wake-up, attack mode, security settings or path routing, which only the control plane serves".to_string())
+        } else {
+            None
+        };
+        let range = private
+            .address
+            .range
+            .clone()
+            // A range that does not parse, or reaches past one private
+            // block, admits nobody rather than everybody.
+            .filter(|range| temps_core::ways_in::cidr_is_private(range) == Some(true));
+        let listener = private.address.listener.clone();
+        let entry = entry_from_route(host.clone(), &private.route).filter(|entry| {
+            entry.backends.iter().all(|backend| {
+                public_backend_is_registered_worker(
+                    &backend.address,
+                    &policy.registered_worker_addresses,
+                )
+            })
+        });
+        match (why, range, listener, entry) {
+            (Some(why), ..) => held_back.push(format!("{host}: {why}")),
+            (None, None, ..) => held_back.push(format!(
+                "{host}: it has no private network range; make it reachable again"
+            )),
+            (None, _, None, _) => held_back.push(format!("{host}: it has no listener address")),
+            (None, _, _, None) => held_back.push(format!(
+                "{host}: its backends are not on a worker this one can reach"
+            )),
+            (None, Some(range), Some(listener), Some(route)) => routes.push(PrivateRouteEntryDto {
+                route,
+                address_id: private.address.address_id.clone(),
+                range,
+                listener,
+            }),
+        }
+    }
+    routes.sort_by(|a, b| a.route.host.cmp(&b.route.host));
+    (routes, held_back)
 }
 
 async fn build_snapshot(
@@ -610,15 +723,22 @@ async fn build_snapshot(
             })?
             .is_some()
     };
-    let public_ingress = if node.public_ingress_enabled || runs_connector {
-        let WorkerPublicRoutes {
-            routes: public_routes,
-            unsupported_route_count,
-            unsupported_reasons,
-            ..
-        } = worker_public_routes(
+    // A worker in private mode (ADR 064 D5) gets the private addresses
+    // recorded for it, and only while it is bound on a private address.
+    let private_listener = {
+        let row = temps_entities::node_public_ingress::Entity::find_by_id(node.id)
+            .one(state.db.as_ref())
+            .await
+            .map_err(|source| SnapshotBuildError::Database {
+                node_id: node.id,
+                operation: "load private ingress state",
+                source,
+            })?;
+        private_listener_of(row.as_ref())
+    };
+    let (private_routes, private_held_back) = if private_listener.is_some() {
+        let policy = worker_route_policy(
             state.db.as_ref(),
-            &state.peer_table,
             !state.request_policy_gate.supports_worker_ingress(),
         )
         .await
@@ -627,32 +747,80 @@ async fn build_snapshot(
             operation,
             source,
         })?;
-        let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
-            .iter()
-            .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
-            .collect();
-        PublicIngressSnapshot {
-            enabled: true,
-            routes: public_routes,
-            unsupported_route_count,
-            unsupported_reasons,
-            // Only a node that terminates TLS itself gets private keys. A
-            // connector serves plain HTTP on loopback and the provider holds
-            // the certificate, so running one is no reason to ship keys.
-            certificates: if node.public_ingress_enabled {
-                encrypt_public_certificates(state, node, &allowed_certificate_hosts).await?
-            } else {
-                None
-            },
-            listen: if node.public_ingress_enabled {
-                Some(public_listen(state, node).await?)
-            } else {
-                None
-            },
-        }
+        worker_private_routes(&state.peer_table, &policy, node.id)
     } else {
-        PublicIngressSnapshot::default()
+        (Vec::new(), Vec::new())
     };
+    let public_ingress =
+        if !private_routes.is_empty() && !node.public_ingress_enabled && !runs_connector {
+            let hosts: std::collections::HashSet<String> = private_routes
+                .iter()
+                .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase())
+                .collect();
+            PublicIngressSnapshot {
+                enabled: true,
+                routes: Vec::new(),
+                unsupported_route_count: private_held_back.len(),
+                unsupported_reasons: private_held_back,
+                certificates: encrypt_public_certificates(state, node, &hosts).await?,
+                listen: None,
+                private_routes,
+            }
+        } else if node.public_ingress_enabled || runs_connector {
+            let WorkerPublicRoutes {
+                routes: public_routes,
+                unsupported_route_count,
+                unsupported_reasons,
+                ..
+            } = worker_public_routes(
+                state.db.as_ref(),
+                &state.peer_table,
+                !state.request_policy_gate.supports_worker_ingress(),
+            )
+            .await
+            .map_err(|(operation, source)| SnapshotBuildError::Database {
+                node_id: node.id,
+                operation,
+                source,
+            })?;
+            // A node gets keys only for what it terminates itself: its public
+            // routes when it listens publicly, and its private routes. A
+            // connector-only node terminates none of the public ones.
+            let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
+                .iter()
+                .filter(|_| node.public_ingress_enabled)
+                .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
+                .chain(
+                    private_routes
+                        .iter()
+                        .map(|route| route.route.host.trim_end_matches('.').to_ascii_lowercase()),
+                )
+                .collect();
+            let mut unsupported_reasons = unsupported_reasons;
+            unsupported_reasons.extend(private_held_back.iter().cloned());
+            PublicIngressSnapshot {
+                enabled: true,
+                routes: public_routes,
+                unsupported_route_count,
+                unsupported_reasons,
+                // Only a node that terminates TLS itself gets private keys. A
+                // connector serves plain HTTP on loopback and the provider holds
+                // the certificate, so running one is no reason to ship keys.
+                certificates: if node.public_ingress_enabled || !private_routes.is_empty() {
+                    encrypt_public_certificates(state, node, &allowed_certificate_hosts).await?
+                } else {
+                    None
+                },
+                listen: if node.public_ingress_enabled {
+                    Some(public_listen(state, node).await?)
+                } else {
+                    None
+                },
+                private_routes,
+            }
+        } else {
+            PublicIngressSnapshot::default()
+        };
     Ok(RouteSnapshot {
         generation,
         routes,
@@ -967,6 +1135,7 @@ pub(crate) mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: now,
             updated_at: now,
         }

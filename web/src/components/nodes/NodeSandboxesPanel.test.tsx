@@ -25,6 +25,10 @@ import {
   isEvictionInProgress,
   withHttpStatus,
 } from './node-eviction'
+import {
+  isControlPlaneWithoutWorkloads,
+  nodeSandboxesFailure,
+} from './node-sandboxes-state'
 
 const ME = 7
 
@@ -100,7 +104,8 @@ function fakeQuery(
 
 function renderPanel(
   query: UseQueryResult<NodeSandboxesResponse, Error>,
-  canSee = true
+  canSee = true,
+  features: { sandboxesAvailable?: boolean; sandboxesLocal?: boolean } = {}
 ) {
   return wrap(
     <NodeSandboxesPanel
@@ -110,8 +115,21 @@ function renderPanel(
       query={query}
       page={1}
       onPageChange={() => {}}
+      sandboxesAvailable={features.sandboxesAvailable}
+      sandboxesLocal={features.sandboxesLocal}
     />
   )
+}
+
+const controlPlane: PlacementNode = {
+  id: 0,
+  name: 'control-plane',
+  is_control_plane: true,
+  status: 'active',
+  allowed: false,
+  eligible: false,
+  reason: 'this control plane runs no workloads; sandboxes run on worker nodes',
+  live_sandboxes: 0,
 }
 
 describe('NodeSandboxesPanel', () => {
@@ -208,6 +226,183 @@ describe('NodeSandboxesPanel', () => {
     expect(html).toContain(
       'This node does not accept new sandboxes: its sandboxes are being destroyed'
     )
+  })
+
+  // ADR 063: the bug this guards is a worker's tab on a hosted control plane
+  // reading "Could not load sandboxes on this node: Not Found".
+  test('never shows a bare "Not Found" for a listing that was not served', () => {
+    const html = renderPanel(
+      fakeQuery({
+        isError: true,
+        error: { title: 'Not Found', status: 404 } as unknown as Error,
+      })
+    )
+    expect(html).not.toContain('Not Found')
+    expect(html).toContain('Could not load sandboxes on this node:')
+    expect(html).toContain('Update Temps on the control plane')
+    expect(html).toContain('Retry')
+  })
+
+  test('shows the server’s own explanation when it gives one', () => {
+    const html = renderPanel(
+      fakeQuery({
+        isError: true,
+        error: {
+          title: 'Sandbox Node Not Found',
+          detail: "Node 'worker-9' does not exist.",
+          status: 422,
+        } as unknown as Error,
+      })
+    )
+    expect(html).toContain('Node &#x27;worker-9&#x27; does not exist.')
+  })
+
+  test('offers to add a worker when sandboxes need one', () => {
+    const html = renderPanel(
+      fakeQuery({
+        isError: true,
+        error: {
+          title: 'This control plane runs no local workloads',
+          detail:
+            'No node can run this sandbox: this control plane runs no workloads, so sandboxes run only on worker nodes, and no worker node has joined it yet. Add a worker node to run containers, builds and services, then retry.',
+          error_code: 'WORKER_NODE_REQUIRED',
+          setup_path: '/settings/nodes',
+          status: 409,
+        } as unknown as Error,
+      })
+    )
+    expect(html).toContain('Add worker node')
+    expect(html).toContain('href="/settings/nodes"')
+    expect(html).toContain('no worker node has joined it yet')
+    expect(html).not.toContain('Could not load sandboxes')
+  })
+
+  test('explains, without an error, that a control plane without workloads runs no sandboxes', () => {
+    const html = renderPanel(
+      fakeQuery({
+        data: {
+          node: controlPlane,
+          sandboxes: [],
+          total: 0,
+          page: 1,
+          page_size: 20,
+        },
+      }),
+      true,
+      { sandboxesLocal: false }
+    )
+    expect(html).toContain(
+      'This control plane runs no workloads, so sandboxes never run here; they run on worker nodes.'
+    )
+    expect(html).toContain('No sandboxes run on this control plane.')
+    expect(html).toContain('href="/settings/nodes"')
+    expect(html).not.toContain('sandbox create --node')
+    expect(html).not.toContain('Could not load')
+    expect(html).not.toContain('does not accept new sandboxes')
+  })
+
+  test('keeps a full install’s control plane exactly as before', () => {
+    const html = renderPanel(
+      fakeQuery({
+        data: {
+          node: {
+            ...controlPlane,
+            allowed: true,
+            eligible: true,
+            reason: null,
+          },
+          sandboxes: [],
+          total: 0,
+          page: 1,
+          page_size: 20,
+        },
+      }),
+      true,
+      { sandboxesLocal: true }
+    )
+    expect(html).toContain('This node accepts new sandboxes.')
+    expect(html).toContain('No sandboxes on this node.')
+    expect(html).not.toContain('runs no workloads')
+  })
+
+  test('lists sandboxes left on a control plane that no longer runs workloads', () => {
+    const html = renderPanel(
+      fakeQuery({
+        data: {
+          node: controlPlane,
+          sandboxes: [
+            {
+              sandbox: sandbox('sbx_old', { node_id: null }),
+              owner_user_id: ME,
+              owner_email: 'me@example.com',
+            },
+          ],
+          total: 1,
+          page: 1,
+          page_size: 20,
+        },
+      }),
+      true,
+      { sandboxesLocal: false }
+    )
+    expect(html).toContain('sbx_old')
+    expect(html).toContain('This control plane runs no workloads')
+  })
+
+  test('says the feature is unavailable when the server does not serve sandboxes', () => {
+    const html = renderPanel(fakeQuery({}), true, {
+      sandboxesAvailable: false,
+    })
+    expect(html).toContain('Sandboxes is not available')
+    expect(html).not.toContain('Could not load')
+  })
+})
+
+describe('nodeSandboxesFailure', () => {
+  test('prefers the server detail', () => {
+    expect(
+      nodeSandboxesFailure({ title: 'Conflict', detail: 'Exactly this.' })
+    ).toEqual({ kind: 'message', message: 'Exactly this.' })
+  })
+
+  test('replaces bare statuses with what to do', () => {
+    for (const [status, phrase] of [
+      [404, 'Update Temps on the control plane'],
+      [401, 'Sign in again'],
+      [403, 'Ask an administrator'],
+      [502, 'check the Temps server logs'],
+    ] as const) {
+      const failure = nodeSandboxesFailure({ title: 'Whatever', status })
+      expect(failure.kind).toBe('message')
+      if (failure.kind === 'message') {
+        expect(failure.message).toContain(phrase)
+        expect(failure.message).not.toContain('Whatever')
+      }
+    }
+    const offline = nodeSandboxesFailure(undefined)
+    expect(offline.kind === 'message' && offline.message).toContain(
+      'Check your connection'
+    )
+  })
+
+  test('keeps worker-node-required setup links on this origin', () => {
+    const failure = nodeSandboxesFailure({
+      error_code: 'WORKER_NODE_REQUIRED',
+      setup_path: '//evil.example/settings/nodes',
+    })
+    expect(failure).toEqual({
+      kind: 'worker-node-required',
+      reason: expect.any(String),
+      setupPath: '/settings/nodes',
+    })
+  })
+
+  test('only a control plane without workloads gets the explanation', () => {
+    expect(isControlPlaneWithoutWorkloads(true, false)).toBe(true)
+    expect(isControlPlaneWithoutWorkloads(true, true)).toBe(false)
+    // Unknown (older server, or features still loading) keeps the old view.
+    expect(isControlPlaneWithoutWorkloads(true, undefined)).toBe(false)
+    expect(isControlPlaneWithoutWorkloads(false, false)).toBe(false)
   })
 })
 

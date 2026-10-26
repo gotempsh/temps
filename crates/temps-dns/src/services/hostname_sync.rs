@@ -645,6 +645,7 @@ fn generated_host_scope(environment_id: i32) -> OwnershipScope {
         project_id: None,
         environment_id: Some(environment_id),
         controller: Some(GENERATED_HOSTNAME_CONTROLLER),
+        run_id: None,
     }
 }
 
@@ -1868,6 +1869,7 @@ async fn restore_replaced(
                 project_id: record.project_id,
                 environment_id: record.environment_id,
                 controller: Some(GENERATED_HOSTNAME_CONTROLLER),
+                run_id: None,
             },
         )
         .await;

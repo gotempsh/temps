@@ -10,8 +10,8 @@ use tempfile::TempDir;
 use temps_agent::internal_proxy::spawn_public_http;
 use temps_agent::public_ingress::{self, PublicIngressConfig};
 use temps_agent::route_store::{
-    PublicIngressCertBundle, PublicIngressCertificates, PublicIngressSnapshot, RouteBackend,
-    RouteEntry, RouteStore, SharedRouteStore,
+    PrivateRouteEntry, PublicIngressCertBundle, PublicIngressCertificates, PublicIngressSnapshot,
+    RouteBackend, RouteEntry, RouteStore, SharedRouteStore,
 };
 use temps_agent::route_sync_client::RouteSyncClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -48,6 +48,7 @@ impl IngressHarness {
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
+            private_routes: Vec::new(),
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -124,6 +125,7 @@ async fn spawn_acme_test_ingress(
             control_plane_ca: None,
             node_id: 7,
             node_token: "test-node-token".to_string(),
+            private: false,
         },
         store,
         Arc::clone(&shutdown),
@@ -142,6 +144,7 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
         listen: None,
+        private_routes: Vec::new(),
     });
     store
 }
@@ -386,6 +389,7 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
+            private_routes: Vec::new(),
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -583,6 +587,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
         listen: None,
+        private_routes: Vec::new(),
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -595,6 +600,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             control_plane_ca: None,
             node_id: 7,
             node_token: "test-node-token".to_string(),
+            private: false,
         },
         store,
         Arc::clone(&shutdown),
@@ -726,6 +732,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         unsupported_route_count: 0,
         unsupported_reasons: Vec::new(),
         listen: None,
+        private_routes: Vec::new(),
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(
@@ -737,6 +744,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
             control_plane_ca: None,
             node_id: 7,
             node_token: "test-node-token".to_string(),
+            private: false,
         },
         Arc::clone(&store),
         Arc::clone(&ingress_shutdown),
@@ -1196,4 +1204,123 @@ async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
         .expect("websocket echo timed out")
         .expect("read tunneled echo");
     assert_eq!(&echoed, b"ping");
+}
+
+fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> PrivateRouteEntry {
+    PrivateRouteEntry {
+        route: RouteEntry {
+            host: host.to_string(),
+            backends: vec![RouteBackend {
+                address: backend.to_string(),
+                container_id: Some("test-backend".to_string()),
+                container_name: Some("private-ingress-test-backend".to_string()),
+            }],
+            deployment_id: Some(51),
+            project_id: Some(52),
+            environment_id: Some(53),
+        },
+        address_id: "custom:9".to_string(),
+        range: range.to_string(),
+        listener: "127.0.0.1".to_string(),
+    }
+}
+
+async fn raw_request(address: std::net::SocketAddr, host: &str) -> String {
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    stream
+        .write_all(
+            format!("GET /inside?x=1 HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("response timed out")
+        .expect("read response");
+    String::from_utf8(response).expect("UTF-8 response")
+}
+
+/// ADR 064 D5/D7: a private address is answered only by the private
+/// listener, only for a TCP peer inside its range, and its port 80 only
+/// redirects to HTTPS. The direct listener answers it 404.
+#[tokio::test]
+async fn test_private_addresses_are_served_only_by_the_private_listener_within_range() {
+    install_rustls_provider();
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let snapshot_dir = TempDir::new().expect("snapshot dir");
+    let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+    store.apply_public_snapshot(PublicIngressSnapshot {
+        enabled: true,
+        routes: Vec::new(),
+        certificates: None,
+        unsupported_route_count: 0,
+        unsupported_reasons: Vec::new(),
+        listen: None,
+        private_routes: vec![
+            // Loopback peers are inside this one...
+            private_route("inside.example.test", backend_address, "127.0.0.0/8"),
+            // ...and outside this one.
+            private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
+        ],
+    });
+    let shutdown = Arc::new(Notify::new());
+    let private = public_ingress::spawn(
+        PublicIngressConfig {
+            http_address: "127.0.0.1:0".parse().unwrap(),
+            https_address: "127.0.0.1:0".parse().unwrap(),
+            private_key_b64: "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=".to_string(),
+            control_plane_url: "http://127.0.0.1:9".to_string(),
+            control_plane_ca: None,
+            node_id: 7,
+            node_token: "test-node-token".to_string(),
+            private: true,
+        },
+        Arc::clone(&store),
+        Arc::clone(&shutdown),
+    )
+    .await
+    .expect("start the private listener");
+
+    let inside = raw_request(private.http_address(), "inside.example.test").await;
+    assert!(inside.starts_with("HTTP/1.1 308"), "{inside}");
+    assert!(
+        inside
+            .to_ascii_lowercase()
+            .contains("location: https://inside.example.test/inside?x=1"),
+        "{inside}"
+    );
+
+    let outside = raw_request(private.http_address(), "tailnet.example.test").await;
+    assert!(outside.starts_with("HTTP/1.1 403"), "{outside}");
+    assert!(
+        outside
+            .to_ascii_lowercase()
+            .contains("x-temps-private-ingress: outside-range"),
+        "{outside}"
+    );
+
+    let unknown = raw_request(private.http_address(), "app.example.test").await;
+    assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+
+    // The direct (public) listener on the same store never serves them.
+    let public = spawn_public_http(
+        "127.0.0.1:0".parse().unwrap(),
+        Arc::clone(&store),
+        Arc::clone(&shutdown),
+    )
+    .await
+    .expect("start the public listener");
+    let direct = raw_request(public, "inside.example.test").await;
+    assert!(direct.starts_with("HTTP/1.1 404"), "{direct}");
+
+    assert!(
+        timeout(Duration::from_millis(150), requests.recv())
+            .await
+            .is_err(),
+        "nothing reached the backend over plain HTTP"
+    );
+    shutdown.notify_waiters();
+    backend_shutdown.notify_waiters();
 }

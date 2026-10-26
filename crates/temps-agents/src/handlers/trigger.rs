@@ -464,6 +464,34 @@ pub struct SandboxStatusResponse {
     pub firecracker_terminal: crate::sandbox::TerminalCapability,
 }
 
+/// Sandbox status on a control plane that runs no workloads (ADR 063).
+/// Nothing on this host is probed: there is no daemon to ask, and the
+/// microVM backends are never set up here. The error says what is and is
+/// not possible instead of "Docker is not available".
+fn sandbox_status_without_local_host() -> SandboxStatusResponse {
+    let reason = AgentError::NoLocalSandboxHost {
+        operation: "An AI agent run".to_string(),
+    }
+    .to_string();
+    let not_here = "this control plane runs no workloads, so no microVM runs on its own host";
+    SandboxStatusResponse {
+        docker_available: false,
+        image_ready: false,
+        image_name: String::new(),
+        error: Some(reason),
+        firecracker_available: false,
+        microsandbox: crate::sandbox::microsandbox::MicrosandboxCapability {
+            configured: false,
+            reason: Some(not_here.to_string()),
+            setup_path: None,
+            setup_command: None,
+            runtime_version: crate::sandbox::microsandbox::MICROSANDBOX_VERSION.to_string(),
+            terminal: crate::sandbox::TerminalCapability::unsupported(not_here, None),
+        },
+        firecracker_terminal: crate::sandbox::TerminalCapability::unsupported(not_here, None),
+    }
+}
+
 #[utoipa::path(
     tag = "Agents",
     get,
@@ -485,6 +513,10 @@ pub async fn get_sandbox_status(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsRead);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    if !app_state.local_workloads {
+        return Ok(Json(sandbox_status_without_local_host()));
+    }
 
     let sandbox_registry = &app_state.executor.sandbox_registry();
     let provider = sandbox_registry.provider();
@@ -538,6 +570,10 @@ pub async fn get_global_sandbox_status(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
+    if !app_state.local_workloads {
+        return Ok(Json(sandbox_status_without_local_host()));
+    }
+
     let provider = app_state.executor.sandbox_registry().provider();
     let docker_available = provider.is_available().await;
 
@@ -583,6 +619,7 @@ pub async fn get_global_sandbox_status(
     path = "/settings/sandbox-rebuild",
     responses(
         (status = 200, description = "Server-Sent Events stream of rebuild progress; final event `{\"type\":\"done\",\"success\":bool,...}`", content_type = "text/event-stream"),
+        (status = 409, description = "This control plane runs no workloads, so it builds no sandbox image", body = temps_core::problemdetails::ProblemDetails),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
     ),
@@ -593,6 +630,11 @@ pub async fn rebuild_sandbox_image(
     State(app_state): State<Arc<AppState>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Problem> {
     permission_guard!(auth, SettingsWrite);
+    if !app_state.local_workloads {
+        return Err(Problem::from(AgentError::NoLocalSandboxHost {
+            operation: "Building the sandbox image".to_string(),
+        }));
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(64);
 
@@ -755,6 +797,24 @@ pub async fn smoke_test_agent(
         // Sandbox is the only execution mode. Test inside a sandbox container.
         let registry = app_state.executor.sandbox_registry();
         let provider = registry.provider();
+
+        if !app_state.local_workloads {
+            return Ok(Json(SmokeTestResponse {
+                passed: false,
+                environment: "sandbox".into(),
+                cli_installed: false,
+                cli_authenticated: false,
+                cli_version: None,
+                auth_info: None,
+                setup_hint: Some(
+                    AgentError::NoLocalSandboxHost {
+                        operation: "Testing an AI CLI".to_string(),
+                    }
+                    .to_string(),
+                ),
+                detail: None,
+            }));
+        }
 
         if !provider.is_available().await {
             return Ok(Json(SmokeTestResponse {

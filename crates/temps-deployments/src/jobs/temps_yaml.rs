@@ -134,6 +134,7 @@ pub(crate) mod test_support {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            serves_own_temps_api: false,
             image_retention_hours: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,

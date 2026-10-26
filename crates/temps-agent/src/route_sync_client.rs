@@ -64,6 +64,18 @@ struct SnapshotPublicIngress {
     certificates: Option<SnapshotCertificates>,
     #[serde(default)]
     listen: Option<crate::route_store::PublicListen>,
+    #[serde(default)]
+    private_routes: Vec<SnapshotPrivateRoute>,
+}
+
+/// A private address for the private listener (ADR 064 D5).
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotPrivateRoute {
+    #[serde(flatten)]
+    route: SnapshotRoute,
+    address_id: String,
+    range: String,
+    listener: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -324,6 +336,17 @@ impl RouteSyncClient {
                 }
             }),
             listen: body.public_ingress.listen,
+            private_routes: body
+                .public_ingress
+                .private_routes
+                .into_iter()
+                .map(|private| crate::route_store::PrivateRouteEntry {
+                    route: snapshot_route_into_entry(private.route),
+                    address_id: private.address_id,
+                    range: private.range,
+                    listener: private.listener,
+                })
+                .collect(),
         };
         let listen = public_ingress.listen.clone();
         self.store.apply_public_snapshot(public_ingress);
@@ -518,6 +541,7 @@ mod tests {
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
+            private_routes: Vec::new(),
         }
     }
 
@@ -639,6 +663,7 @@ mod tests {
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
+            private_routes: Vec::new(),
         });
 
         crate::public_ingress::update_snapshot_health(&store);

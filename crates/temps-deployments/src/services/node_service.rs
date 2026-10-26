@@ -345,6 +345,20 @@ pub enum NodeError {
     #[error("Identity '{claimed}' is already held by node '{owner}'; a node cannot register under another node's name or address")]
     IdentityClaimed { claimed: String, owner: String },
 
+    /// ADR 060: a worker presented the WireGuard key node `node_name` holds,
+    /// under that name, without proof that it is that node.
+    #[error(
+        "This worker's WireGuard key belongs to node '{node_name}' (id {node_id}); joining it \
+         again updates that node only with proof of its current agent credential, {}",
+        rejoin_proof_state(*.proof_given)
+    )]
+    RejoinNotProven {
+        node_id: i32,
+        node_name: String,
+        /// Whether a credential was sent (and did not match).
+        proof_given: bool,
+    },
+
     #[error(
         "No node can run this image: it was built for [{image_platforms}], \
          the control plane runs {local_platform}, and no active worker node \
@@ -871,6 +885,76 @@ fn undeclared_advertisements(
         .collect()
 }
 
+fn rejoin_proof_state(proof_given: bool) -> &'static str {
+    if proof_given {
+        "and the proof sent does not match it"
+    } else {
+        "which was not sent"
+    }
+}
+
+/// What a worker joining outbound claims to prove it is a known node with
+/// (ADR 060).
+#[derive(Clone, Copy)]
+pub struct RejoinClaim<'a> {
+    /// [`temps_core::node_pki::rejoin_proof`] as the worker computed it.
+    pub proof: &'a str,
+    /// The join token of this enrollment, which the proof is bound to.
+    pub join_token: &'a str,
+}
+
+/// The node a mesh enrollment joins again (ADR 060): the node holding
+/// `public_key` as its mesh key, under the same `name`, when the caller
+/// proved it holds that node's current agent token: `claim` carries
+/// [`temps_core::node_pki::rejoin_proof`] keyed by the stored token hash and
+/// bound to this enrollment's join token, compared in constant time.
+///
+/// A WireGuard public key is not a secret, so the key and name alone prove
+/// nothing: without a valid proof the enrollment is refused with
+/// [`NodeError::RejoinNotProven`], which changes nothing. `Ok(None)` when no
+/// node holds the key, or a node of another name does: the enrollment then
+/// goes on as a new one, which refuses a key in use.
+pub async fn proven_rejoin<C: ConnectionTrait>(
+    db: &C,
+    name: &str,
+    public_key: &str,
+    claim: Option<RejoinClaim<'_>>,
+) -> Result<Option<nodes::Model>, NodeError> {
+    let Some(node) = nodes::Entity::find()
+        .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
+        .one(db)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if node.name != name.trim() {
+        return Ok(None);
+    }
+    let proven = claim.is_some_and(|claim| {
+        temps_core::node_pki::rejoin_proof(&node.token_hash, name, public_key, claim.join_token)
+            .is_some_and(|expected| {
+                constant_time_eq(
+                    expected.as_bytes(),
+                    claim.proof.trim().to_ascii_lowercase().as_bytes(),
+                )
+            })
+    });
+    if !proven {
+        tracing::warn!(
+            node_id = node.id,
+            node_name = %node.name,
+            proof_given = claim.is_some(),
+            "Refused a mesh enrollment with a node's WireGuard key and name but without proof it is that node"
+        );
+        return Err(NodeError::RejoinNotProven {
+            node_id: node.id,
+            node_name: node.name,
+            proof_given: claim.is_some(),
+        });
+    }
+    Ok(Some(node))
+}
+
 /// Constant-time comparison of two equal-purpose byte slices (SHA-256 hex
 /// token hashes) to avoid leaking a match via timing.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -1042,7 +1126,7 @@ impl PairingSource {
     ) -> Option<temps_network::mesh::OwnMeshAddress> {
         (temps_network::mesh::identity_ipv4(private_address) == Some(self.mesh_address)).then_some(
             temps_network::mesh::OwnMeshAddress {
-                pairing_id: self.pairing_id,
+                owner: temps_network::mesh::MeshAddressOwner::Pairing(self.pairing_id),
                 address: self.mesh_address,
             },
         )
@@ -1305,6 +1389,42 @@ impl NodeService {
         })
     }
 
+    /// The one mesh-pool address this registration may name as its own, if
+    /// any: the address its pairing reserved (ADR 055), or the address the
+    /// node of this name already holds when it registers again from that
+    /// address over the mesh node API (ADR 060). The node API only sees a
+    /// peer address WireGuard routed from the key that holds it, so arriving
+    /// from the node's own mesh address proves the caller holds that node's
+    /// mesh key; `private_address` must name that same address.
+    pub async fn own_mesh_address(
+        &self,
+        pairing_source: Option<PairingSource>,
+        node_name: &str,
+        private_address: &str,
+        node_api_peer: Option<std::net::IpAddr>,
+    ) -> Result<Option<temps_network::mesh::OwnMeshAddress>, NodeError> {
+        if let Some(own) =
+            pairing_source.and_then(|source| source.own_mesh_address(private_address))
+        {
+            return Ok(Some(own));
+        }
+        let Some(std::net::IpAddr::V4(peer)) = node_api_peer.map(|peer| peer.to_canonical()) else {
+            return Ok(None);
+        };
+        if temps_network::mesh::identity_ipv4(private_address) != Some(peer) {
+            return Ok(None);
+        }
+        let node = nodes::Entity::find()
+            .filter(nodes::Column::Name.eq(node_name.trim()))
+            .filter(nodes::Column::MeshWgAddress.eq(peer.to_string()))
+            .one(self.db.as_ref())
+            .await?;
+        Ok(node.map(|node| temps_network::mesh::OwnMeshAddress {
+            owner: temps_network::mesh::MeshAddressOwner::Node(node.id),
+            address: peer,
+        }))
+    }
+
     /// Reserve signed IP identities independently of the node lifecycle.
     /// `own` is the registration's own mesh address (ADR 055), the one pool
     /// address a leaf may name.
@@ -1354,8 +1474,16 @@ impl NodeService {
             .assert_pairing_source(&node_name, token_id, context.node_api_peer)
             .await?;
         // A worker that joined outbound only registers under the address its
-        // pairing reserved (ADR 055); nothing else in the pool is exempt.
-        let own = source.and_then(|source| source.own_mesh_address(&request.private_address));
+        // pairing reserved (ADR 055), and re-registers under the address it
+        // holds (ADR 060); nothing else in the pool is exempt.
+        let own = self
+            .own_mesh_address(
+                source,
+                &node_name,
+                &request.private_address,
+                context.node_api_peer,
+            )
+            .await?;
         self.assert_not_control_plane_identity(&request, &context.control_plane_hosts, own)
             .await?;
         temps_network::pairing::check_linkable(self.db.as_ref(), token_id)
@@ -2137,6 +2265,40 @@ impl NodeService {
         Ok(())
     }
 
+    /// Stop placing work on an active node that is about to be removed in
+    /// one step (an empty node needs no drain first). Only an `active` node
+    /// changes, in one conditional update, so a node an operator is
+    /// draining, or one that went offline meanwhile, is left as it is.
+    /// Returns whether this call moved it to `draining`; only then should
+    /// [`Self::restore_after_failed_removal`] put it back.
+    pub async fn cordon_for_removal(&self, node_id: i32) -> Result<bool, NodeError> {
+        let result = nodes::Entity::update_many()
+            .col_expr(nodes::Column::Status, Expr::value("draining"))
+            .filter(nodes::Column::Id.eq(node_id))
+            .filter(nodes::Column::Status.eq("active"))
+            .exec(self.db.as_ref())
+            .await?;
+        let cordoned = result.rows_affected == 1;
+        if cordoned {
+            tracing::info!(node_id, "Node marked as draining for its removal");
+        }
+        Ok(cordoned)
+    }
+
+    /// Undo [`Self::cordon_for_removal`] after the removal did not happen:
+    /// the node is active again, unless it changed status meanwhile (a
+    /// drain that finished on its own counts as ours: nothing was on it).
+    pub async fn restore_after_failed_removal(&self, node_id: i32) -> Result<(), NodeError> {
+        nodes::Entity::update_many()
+            .col_expr(nodes::Column::Status, Expr::value("active"))
+            .filter(nodes::Column::Id.eq(node_id))
+            .filter(nodes::Column::Status.is_in(["draining", "drained"]))
+            .exec(self.db.as_ref())
+            .await?;
+        tracing::info!(node_id, "Node removal did not happen; node active again");
+        Ok(())
+    }
+
     /// Reactivate a drained or draining node so it can accept new deployments again.
     /// Only nodes in "draining" or "drained" status can be undrained.
     pub async fn mark_active(&self, node_id: i32) -> Result<(), NodeError> {
@@ -2677,6 +2839,74 @@ impl NodeService {
                  AND (newer.finished_at IS NULL \
                       OR newer.finished_at > deployments.finished_at))",
             ))
+    }
+
+    /// How many containers on the node a deployment still uses: what a
+    /// drain has to move before the node can be removed.
+    pub async fn serving_container_count(&self, node_id: i32) -> Result<usize, NodeError> {
+        Self::serving_container_count_on(self.db.as_ref(), node_id).await
+    }
+
+    /// [`Self::serving_container_count`] of every node that has any, in one
+    /// grouped query (the node list shows it per row).
+    pub async fn serving_container_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<i32, usize>, NodeError> {
+        let rows: Vec<(Option<i32>, i64)> = deployment_containers::Entity::find()
+            .select_only()
+            .column(deployment_containers::Column::NodeId)
+            .column_as(
+                Expr::col((
+                    deployment_containers::Entity,
+                    deployment_containers::Column::Id,
+                ))
+                .count(),
+                "count",
+            )
+            .join(
+                JoinType::InnerJoin,
+                deployment_containers::Relation::Deployment.def(),
+            )
+            .join(JoinType::LeftJoin, deployments::Relation::Environment.def())
+            .filter(deployment_containers::Column::NodeId.is_not_null())
+            .filter(Self::not_confirmed_gone())
+            .filter(Self::serving_condition())
+            .group_by(deployment_containers::Column::NodeId)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(node_id, count)| {
+                node_id.map(|id| (id, usize::try_from(count).unwrap_or(usize::MAX)))
+            })
+            .collect())
+    }
+
+    /// [`Self::live_sandbox_count`] of every node that has any, in one
+    /// grouped query.
+    pub async fn live_sandbox_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<i32, u64>, NodeError> {
+        let rows: Vec<(Option<i32>, i64)> = sandboxes::Entity::find()
+            .select_only()
+            .column(sandboxes::Column::NodeId)
+            .column_as(
+                Expr::col((sandboxes::Entity, sandboxes::Column::Id)).count(),
+                "count",
+            )
+            .filter(sandboxes::Column::NodeId.is_not_null())
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .group_by(sandboxes::Column::NodeId)
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(node_id, count)| {
+                node_id.map(|id| (id, u64::try_from(count).unwrap_or(0)))
+            })
+            .collect())
     }
 
     /// How many containers on the node a deployment still uses. One COUNT,
@@ -3559,6 +3789,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -6028,6 +6259,43 @@ mod tests {
             );
         }
 
+        /// Removing an empty active node in one step marks it draining
+        /// first, so nothing is placed on it meanwhile, and only an active
+        /// node: one an operator drains, or one gone offline, keeps its
+        /// status. A removal that did not happen makes it active again.
+        #[tokio::test]
+        async fn removal_cordons_only_an_active_node_and_restores_it() {
+            let Some(test_db) = migrated_test_db().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let service = NodeService::new(db.clone());
+            let node = service
+                .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+                .await
+                .unwrap();
+            let status = |id: i32| {
+                let service = &service;
+                async move { service.get_by_id(id).await.unwrap().status }
+            };
+            assert_eq!(status(node.id).await, "active");
+            assert_eq!(service.live_sandbox_counts().await.unwrap().len(), 0);
+
+            assert!(service.cordon_for_removal(node.id).await.unwrap());
+            assert_eq!(status(node.id).await, "draining");
+            // Already draining: not ours to undo.
+            assert!(!service.cordon_for_removal(node.id).await.unwrap());
+            service.restore_after_failed_removal(node.id).await.unwrap();
+            assert_eq!(status(node.id).await, "active");
+
+            let mut offline: nodes::ActiveModel = service.get_by_id(node.id).await.unwrap().into();
+            offline.status = Set("offline".to_string());
+            offline.update(db.as_ref()).await.unwrap();
+            assert!(!service.cordon_for_removal(node.id).await.unwrap());
+            service.restore_after_failed_removal(node.id).await.unwrap();
+            assert_eq!(status(node.id).await, "offline");
+        }
+
         async fn seed_deployment(
             db: &sea_orm::DatabaseConnection,
             project_id: i32,
@@ -6180,6 +6448,20 @@ mod tests {
             assert!(
                 matches!(err, NodeError::StillServing { count: 2, .. }),
                 "{err:?}"
+            );
+            // The counts the console decides removal on agree, one node at a
+            // time and grouped for the list.
+            assert_eq!(service.serving_container_count(n).await.unwrap(), 2);
+            assert_eq!(
+                service
+                    .serving_container_count(other_node.id)
+                    .await
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                service.serving_container_counts().await.unwrap(),
+                std::collections::HashMap::from([(n, 2)])
             );
 
             // A newer successful deployment that is not current is the

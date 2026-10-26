@@ -16,6 +16,25 @@ use temps_entities::{node_public_ingress, nodes};
 /// Most host addresses kept from one report; a host with more is unusual and
 /// the console only needs the plausible candidates.
 const MAX_INTERFACES: usize = 64;
+/// Most inside checks kept from one report.
+const MAX_PRIVATE_CHECKS: usize = 256;
+
+/// ADR 064 Security: a worker in `private` mode reporting a listener on an
+/// address that is not private. The control plane never routes a private
+/// address to it ([`crate::route_sync::private_listener_of`]) and says why.
+pub fn refuse_public_private_listener(report: &ListenerReport) -> Option<String> {
+    use temps_core::worker_ingress::{check_private_listen, parse_reported_ip, IngressMode};
+    if report.mode != Some(IngressMode::Private) {
+        return None;
+    }
+    let ip = report.https.as_deref().and_then(parse_reported_ip)?;
+    check_private_listen(ip).err().map(|why| {
+        format!(
+            "The control plane refuses this worker's private listener: {why} Run `temps agent \
+             ingress private --listen tailscale` on the worker."
+        )
+    })
+}
 
 /// Outcome of offering an ingress key.
 #[derive(Debug, PartialEq, Eq)]
@@ -85,12 +104,34 @@ impl<'a> PublicIngressStore<'a> {
         let clip = |value: Option<String>, max: usize| {
             value.map(|v| v.chars().take(max).collect::<String>())
         };
+        if let Some(refused) = refuse_public_private_listener(&report) {
+            report.error = Some(refused);
+        }
+        let now = chrono::Utc::now();
+        // Inside checks (ADR 064 D7), stamped with when they arrived: the
+        // worker's clock never says when an address was last seen working.
+        report.private_checks.truncate(MAX_PRIVATE_CHECKS);
+        let private_checks =
+            (report.mode == Some(temps_core::worker_ingress::IngressMode::Private)).then(|| {
+                serde_json::json!(report
+                    .private_checks
+                    .iter()
+                    .map(|check| serde_json::json!({
+                        "address_id": check.address_id.chars().take(64).collect::<String>(),
+                        "hostname": check.hostname.chars().take(253).collect::<String>(),
+                        "listener": check.listener.chars().take(64).collect::<String>(),
+                        "outcome": check.outcome,
+                        "message": check.message.chars().take(1000).collect::<String>(),
+                        "status": check.status,
+                        "received_at": now,
+                    }))
+                    .collect::<Vec<_>>())
+            });
         let listening = serde_json::json!({
             "http": clip(report.http, 64),
             "https": clip(report.https, 64),
             "error": clip(report.error, 1000),
         });
-        let now = chrono::Utc::now();
         let row = node_public_ingress::ActiveModel {
             node_id: Set(node_id),
             listen_address: Set(None),
@@ -101,6 +142,7 @@ impl<'a> PublicIngressStore<'a> {
             listening: Set(Some(listening)),
             mode: Set(report.mode.map(|mode| mode.as_str().to_string())),
             last_check: Set(None),
+            private_checks: Set(private_checks),
             checked_at: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
@@ -112,6 +154,7 @@ impl<'a> PublicIngressStore<'a> {
                         node_public_ingress::Column::Interfaces,
                         node_public_ingress::Column::Listening,
                         node_public_ingress::Column::Mode,
+                        node_public_ingress::Column::PrivateChecks,
                         node_public_ingress::Column::UpdatedAt,
                     ])
                     .to_owned(),
@@ -131,6 +174,63 @@ mod tests {
         let mut node = crate::route_sync::tests::test_node(true);
         node.edge_public_key = key.map(str::to_string);
         node
+    }
+
+    #[test]
+    fn a_private_listener_on_a_public_address_is_refused() {
+        use temps_core::worker_ingress::IngressMode;
+        let report = |mode, https: &str| ListenerReport {
+            mode: Some(mode),
+            https: Some(https.to_string()),
+            ..ListenerReport::default()
+        };
+        let refused =
+            refuse_public_private_listener(&report(IngressMode::Private, "203.0.113.7:443"))
+                .expect("refused");
+        assert!(refused.contains("not a private address"), "{refused}");
+        assert_eq!(
+            refuse_public_private_listener(&report(IngressMode::Private, "100.101.102.103:443")),
+            None
+        );
+        // Other modes listen publicly on purpose.
+        assert_eq!(
+            refuse_public_private_listener(&report(IngressMode::Fixed, "203.0.113.7:443")),
+            None
+        );
+
+        let row = |mode: &str, https: &str| node_public_ingress::Model {
+            node_id: 1,
+            listen_address: None,
+            http_port: 80,
+            https_port: 443,
+            public_address: None,
+            interfaces: None,
+            listening: Some(serde_json::json!({ "https": https })),
+            mode: Some(mode.to_string()),
+            last_check: None,
+            private_checks: None,
+            checked_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        use crate::route_sync::private_listener_of;
+        assert_eq!(
+            private_listener_of(Some(&row("private", "100.101.102.103:443"))),
+            "100.101.102.103".parse().ok()
+        );
+        assert_eq!(
+            private_listener_of(Some(&row("private", "203.0.113.7:443"))),
+            None
+        );
+        assert_eq!(
+            private_listener_of(Some(&row("private", "0.0.0.0:443"))),
+            None
+        );
+        assert_eq!(
+            private_listener_of(Some(&row("fixed", "10.0.0.2:443"))),
+            None
+        );
+        assert_eq!(private_listener_of(None), None);
     }
 
     #[tokio::test]

@@ -55,6 +55,11 @@ pub struct NodeAppState {
     /// Per-IP + global rate limiter for the registration endpoint
     /// (ADR-020 WS-1.3 / enroll-3).
     pub rate_limiter: Arc<RegistrationRateLimiter>,
+    /// Its own window for `/internal/nodes/plane-identity` (ADR 060): it
+    /// serves only public data, and one `temps join` asks it before it
+    /// registers, so sharing the registration window would spend that
+    /// window twice per join and rate-limit workers behind one NAT.
+    pub plane_identity_rate_limiter: Arc<RegistrationRateLimiter>,
     /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
     /// Alarm pipeline — used to resolve the node-offline alarm when a node
@@ -179,6 +184,12 @@ pub struct RegisterNodeApiRequest {
     /// allocation avoids them. Absent from older CLIs.
     #[serde(default)]
     pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
+    /// The overlay network name this node uses instead of the cluster's
+    /// (ADR 059). `temps join` sends one when the host already has a network
+    /// of the cluster's name it does not own. Absent keeps the node's current
+    /// name; older CLIs never send it.
+    #[serde(default)]
+    pub overlay_network_name: Option<String>,
 }
 
 /// One IPv4 range a node already uses outside Temps (ADR 056).
@@ -469,6 +480,16 @@ pub struct NodeInfoResponse {
     /// The last automatic move of this node's allocation, and why.
     #[serde(default)]
     pub overlay_remediation: Option<String>,
+    /// Containers on this node that a deployment still uses: a node with
+    /// any is drained before it is removed; one with none is removed in one
+    /// step. `None` for the control plane, or when it could not be counted.
+    #[serde(default)]
+    pub serving_containers: Option<u64>,
+    /// Sandboxes (any owner) not destroyed on this node (ADR-048). Draining
+    /// does not move them: a node with any cannot be removed. `None` for the
+    /// control plane, or when they could not be counted.
+    #[serde(default)]
+    pub live_sandboxes: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -722,6 +743,7 @@ pub struct ClusterDnsStatusResponse {
     paths(
         register_node,
         mesh_enroll,
+        plane_identity,
         node_heartbeat,
         get_s3_credentials,
         crate::handlers::network::list_peers,
@@ -761,6 +783,7 @@ pub struct ClusterDnsStatusResponse {
         RegisterNodeResponse,
         MeshEnrollApiRequest,
         MeshEnrollResponse,
+        PlaneIdentityResponse,
         HeartbeatApiRequest,
         HeartbeatResponse,
         DnsResolverHeartbeat,
@@ -847,6 +870,9 @@ pub fn configure_routes() -> Router<Arc<NodeAppState>> {
         // Not on the mesh node API (`is_node_route`): a worker only calls it
         // before it is on the mesh (ADR 055).
         .route("/internal/nodes/mesh-enroll", post(mesh_enroll))
+        // Unauthenticated, like the two above: `temps join` reads it before
+        // it sends the join token (ADR 060).
+        .route("/internal/nodes/plane-identity", get(plane_identity))
         .route("/internal/nodes/{node_id}/heartbeat", post(node_heartbeat))
         .route(
             "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
@@ -1623,6 +1649,22 @@ async fn register_node_inner(
     Json(request): Json<RegisterNodeApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     check_enrollment_rate(&app_state, addr.ip(), &request.name)?;
+    // Rejected before the enrollment token is touched, so a corrected
+    // request can still use it.
+    let overlay_network_name = request
+        .overlay_network_name
+        .as_deref()
+        .map(str::trim)
+        .map(|name| {
+            temps_network::overlay_name::validate_overlay_network_name(name)
+                .map(|()| name.to_owned())
+                .map_err(|e| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Overlay Network Name")
+                        .with_detail(e.to_string())
+                })
+        })
+        .transpose()?;
     let settings = enrollment_settings(&app_state).await?;
     let authorized = authorize_enrollment(
         &app_state,
@@ -1755,19 +1797,23 @@ async fn register_node_inner(
                 })?;
         // Claim the token after CSR validation but before reserving addresses.
         // A losing concurrent claim must never create certificate history.
+        // A worker that joined outbound only registers under its own mesh
+        // address (ADR 055), and a node joining again re-registers under the
+        // one it holds (ADR 060); the service re-checks the rest.
+        let own = app_state
+            .node_service
+            .own_mesh_address(
+                authorized.pairing_source,
+                request.name.trim(),
+                &private_address,
+                node_api_peer.map(|peer| peer.ip()),
+            )
+            .await
+            .map_err(Problem::from)?;
         claim_token_use(&app_state, provided_token, enrollment_token_id).await?;
         if let Err(error) = app_state
             .node_service
-            .reserve_certificate_addresses(
-                &ca.cert_pem,
-                &allowed_sans,
-                request.name.trim(),
-                // A worker that joined outbound only registers under its own
-                // mesh address (ADR 055); the service re-checks the rest.
-                authorized
-                    .pairing_source
-                    .and_then(|source| source.own_mesh_address(&private_address)),
-            )
+            .reserve_certificate_addresses(&ca.cert_pem, &allowed_sans, request.name.trim(), own)
             .await
         {
             if let Some(token_id) = enrollment_token_id {
@@ -1857,6 +1903,9 @@ async fn register_node_inner(
     .await;
     // ADR 056: record what the machine already uses first, so the allocation
     // below avoids it, and move an existing never-applied allocation off it.
+    if let Some(name) = overlay_network_name.as_deref() {
+        persist_overlay_network_name(app_state.db.as_ref(), node.id, name).await;
+    }
     if let Some(reports) = request.occupied_ranges {
         let ranges = occupied_ranges_from_report(Some(node.id), reports);
         if let Err(error) = app_state
@@ -1900,15 +1949,34 @@ pub struct MeshEnrollApiRequest {
     /// Scheduling labels the worker will register with; checked against the
     /// token's bound labels and carried over to the pairing's token.
     pub labels: Option<serde_json::Value>,
+    /// Proof that the worker is the node holding `wg_public_key` under
+    /// `name`, sent only when it joins the control plane it already belongs
+    /// to (ADR 060): `temps_core::node_pki::rejoin_proof`, an HMAC keyed by
+    /// the hash of its current agent token over the name, the key and this
+    /// `join_token`. With it the node is updated in place instead of refused
+    /// for a key in use. Never stored.
+    #[serde(default)]
+    pub rejoin_proof: Option<temps_core::secret_string::SecretString>,
 }
 
 /// What a worker that joins outbound only needs to bring its end of the mesh
 /// up and register over it (ADR 055): a pairing code without its secret.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MeshEnrollResponse {
-    /// The pairing created for the worker.
-    pub pairing_id: i32,
-    /// The name the pairing's join token is bound to.
+    /// The pairing created for the worker; `None` when it joins again as the
+    /// node it already is (`rejoined_node_id`).
+    pub pairing_id: Option<i32>,
+    /// The node this worker already is on this control plane, when it proved
+    /// it and joins again (ADR 060): it keeps its mesh key and address, and
+    /// registering with `join_token` updates that node in place.
+    #[serde(default)]
+    pub rejoined_node_id: Option<i32>,
+    /// With `rejoined_node_id`: `temps_core::node_pki::rejoin_ack` over the
+    /// worker's proof, keyed by the node's agent token hash. The worker
+    /// checks it before treating this as the control plane it belongs to.
+    #[serde(default)]
+    pub rejoin_ack: Option<String>,
+    /// The name the join token is bound to.
     pub name: String,
     pub control_plane_public_key: String,
     /// `ip:port` the worker dials.
@@ -1924,8 +1992,8 @@ pub struct MeshEnrollResponse {
     pub node_api_port: u16,
     /// SHA-256 fingerprint of the cluster CA the node API presents.
     pub ca_fingerprint: String,
-    /// Single-use join token bound to `name`, accepted only over the mesh
-    /// node API from `node_address`.
+    /// Single-use join token bound to `name`. A new pairing's is accepted
+    /// only over the mesh node API from `node_address`.
     pub join_token: String,
     /// When the pairing and its token expire (RFC 3339).
     pub expires_at: String,
@@ -1942,10 +2010,10 @@ pub struct MeshEnrollResponse {
     path = "/internal/nodes/mesh-enroll",
     request_body = MeshEnrollApiRequest,
     responses(
-        (status = 201, description = "Pairing created; register over the mesh next", body = MeshEnrollResponse),
+        (status = 201, description = "Pairing created, or the worker proved it is the node it joins again as; register over the mesh next", body = MeshEnrollResponse),
         (status = 400, description = "Invalid name or WireGuard key"),
         (status = 403, description = "Missing, unknown or unusable join token"),
-        (status = 409, description = "Mesh off or not ready, control plane not dialable, key in use, or too many pairings"),
+        (status = 409, description = "Mesh off or not ready, control plane not dialable, key in use (including a node's own key and name without its current agent credential), or too many pairings"),
         (status = 429, description = "Rate limited"),
         (status = 500, description = "Internal server error")
     )
@@ -1976,7 +2044,9 @@ async fn mesh_enroll_inner(
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
     Json(request): Json<MeshEnrollApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    use crate::services::node_pairing_admin::{NodePairingAdminError, NodePairingAdminService};
+    use crate::services::node_pairing_admin::{
+        NodePairingAdminError, NodePairingAdminService, OutboundEnrollmentKind,
+    };
 
     check_enrollment_rate(&app_state, addr.ip(), &request.name)?;
     let name = request.name.trim();
@@ -2047,12 +2117,28 @@ async fn mesh_enroll_inner(
                 .token
                 .as_ref()
                 .and_then(|token| token.bound_labels.clone()),
+            request
+                .rejoin_proof
+                .as_ref()
+                .map(|proof| crate::services::node_service::RejoinClaim {
+                    proof: proof.expose(),
+                    join_token: authorized.join_token,
+                }),
         )
         .await
     {
         Ok(enrollment) => enrollment,
         Err(error) => {
-            if let Some(token_id) = token_id {
+            // A wrong node credential keeps the use it cost (ADR 060): each
+            // guess at a node's credential spends a use of a join token.
+            let wrong_credential = matches!(
+                error,
+                NodePairingAdminError::Rejoin(NodeError::RejoinNotProven {
+                    proof_given: true,
+                    ..
+                })
+            );
+            if let Some(token_id) = token_id.filter(|_| !wrong_credential) {
                 release_token_use(&app_state, token_id).await;
             }
             return Err(match error {
@@ -2062,31 +2148,57 @@ async fn mesh_enroll_inner(
         }
     };
 
-    info!(
-        node = %name,
-        pairing = enrollment.pairing.id,
-        mesh_address = %enrollment.node_address,
-        "worker enrolled on the WireGuard mesh with no address of its own"
-    );
-    let audit = crate::handlers::audit::NodePairingCreatedAudit {
-        context: AuditContext {
-            // No user: a worker holding a join token. `0` is the codebase's
-            // convention for an actor that isn't a user.
-            user_id: 0,
-            ip_address: Some(addr.ip().to_string()),
-            user_agent: "temps-join/mesh-enroll".to_string(),
-        },
-        pairing_id: enrollment.pairing.id,
-        name: enrollment.pairing.name.clone(),
-        node_endpoint: None,
+    let context = AuditContext {
+        // No user: a worker holding a join token. `0` is the codebase's
+        // convention for an actor that isn't a user.
+        user_id: 0,
+        ip_address: Some(addr.ip().to_string()),
+        user_agent: "temps-join/mesh-enroll".to_string(),
     };
-    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
-        error!(%error, "mesh enrollment created a pairing but its audit record failed");
-    }
+    let (pairing_id, rejoined_node_id, rejoin_ack) = match &enrollment.kind {
+        OutboundEnrollmentKind::Pairing(pairing) => {
+            info!(
+                node = %name,
+                pairing = pairing.id,
+                mesh_address = %enrollment.node_address,
+                "worker enrolled on the WireGuard mesh with no address of its own"
+            );
+            let audit = crate::handlers::audit::NodePairingCreatedAudit {
+                context,
+                pairing_id: pairing.id,
+                name: pairing.name.clone(),
+                node_endpoint: None,
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(%error, "mesh enrollment created a pairing but its audit record failed");
+            }
+            (Some(pairing.id), None, None)
+        }
+        OutboundEnrollmentKind::Rejoin { node_id, ack } => {
+            info!(
+                node = %name,
+                node_id,
+                mesh_address = %enrollment.node_address,
+                "node joins its control plane again; it registers next to be updated in place"
+            );
+            let audit = crate::handlers::audit::NodeRejoinStartedAudit {
+                context,
+                node_id: *node_id,
+                name: enrollment.name.clone(),
+                mesh_address: enrollment.node_address.to_string(),
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(%error, node_id, "a node started joining again but its audit record failed");
+            }
+            (None, Some(*node_id), ack.clone())
+        }
+    };
 
     let response = MeshEnrollResponse {
-        pairing_id: enrollment.pairing.id,
-        name: enrollment.pairing.name.clone(),
+        pairing_id,
+        rejoined_node_id,
+        rejoin_ack,
+        name: enrollment.name.clone(),
         control_plane_public_key: enrollment.control_plane_public_key,
         control_plane_endpoint: enrollment.control_plane_endpoint,
         control_plane_address: enrollment.control_plane_address.to_string(),
@@ -2096,7 +2208,7 @@ async fn mesh_enroll_inner(
         node_api_port: enrollment.node_api_port,
         ca_fingerprint: enrollment.ca_fingerprint,
         join_token: enrollment.join_token.to_string(),
-        expires_at: enrollment.pairing.expires_at.to_rfc3339(),
+        expires_at: enrollment.expires_at.to_rfc3339(),
     };
     Ok((
         StatusCode::CREATED,
@@ -2104,6 +2216,90 @@ async fn mesh_enroll_inner(
         [(axum::http::header::CACHE_CONTROL, "no-store")],
         Json(response),
     ))
+}
+
+/// What identifies this control plane to a worker that already joined one
+/// (ADR 060). Both values are public keys' digests or public keys, so they
+/// are served without authentication.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PlaneIdentityResponse {
+    /// SHA-256 fingerprint (hex) of the cluster CA every worker of this
+    /// control plane pins. `None` before the first worker joined.
+    pub ca_fingerprint: Option<String>,
+    /// The control plane's WireGuard mesh public key. `None` while the mesh
+    /// is off or not up yet.
+    pub control_plane_wg_public_key: Option<String>,
+}
+
+/// Identify this control plane to a joining worker (ADR 060)
+///
+/// `temps join` compares this with the cluster CA and control-plane mesh key
+/// in the agent config it finds on the machine, before it sends the join
+/// token: the same identity is a re-join of the same control plane, another
+/// one is a move to another cluster.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/internal/nodes/plane-identity",
+    responses(
+        (status = 200, description = "This control plane's identity", body = PlaneIdentityResponse),
+        (status = 429, description = "Rate limited"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+async fn plane_identity(
+    State(app_state): State<Arc<NodeAppState>>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+) -> Result<impl IntoResponse, Problem> {
+    if let Err(retry_after) = app_state.plane_identity_rate_limiter.check(addr.ip()) {
+        warn!(ip = %addr.ip(), retry_after, "Plane identity rate-limited");
+        return Err(problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Too Many Requests")
+            .with_detail(format!(
+                "Control-plane identity rate limit exceeded; retry in {retry_after}s"
+            )));
+    }
+    let settings = app_state
+        .config_service
+        .get_settings()
+        .await
+        .map_err(|error| {
+            error!(%error, "could not read settings for plane-identity");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("the control plane could not read its settings; see its logs")
+        })?;
+    let ca_fingerprint = match settings.multi_node.cluster_ca_cert_pem.as_deref() {
+        Some(pem) => match temps_core::node_pki::ca_fingerprint_sha256(pem) {
+            Ok(fingerprint) => Some(fingerprint),
+            Err(error) => {
+                error!(%error, "the stored cluster CA certificate cannot be fingerprinted");
+                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Cluster CA Unreadable")
+                    .with_detail(
+                        "The control plane's stored cluster CA certificate could not be read; \
+                         see its logs.",
+                    ));
+            }
+        },
+        None => None,
+    };
+    let control_plane_wg_public_key =
+        match temps_network::mesh::published_control_plane(app_state.db.as_ref()).await {
+            Ok(published) => published.map(|control_plane| control_plane.public_key),
+            Err(error) => {
+                error!(%error, "could not read the control plane's mesh key for plane-identity");
+                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("WireGuard Mesh Error")
+                    .with_detail(
+                        "the control plane could not read the WireGuard mesh state; see its logs",
+                    ));
+            }
+        };
+    Ok(Json(PlaneIdentityResponse {
+        ca_fingerprint,
+        control_plane_wg_public_key,
+    }))
 }
 
 /// Refuse a mesh enrollment the mesh state cannot take (ADR 055), before a
@@ -2194,6 +2390,33 @@ fn mesh_enroll_problem(error: temps_network::mesh::MeshError) -> Problem {
 /// this one over the overlay. Best-effort: failures are logged and
 /// swallowed because the operator can fix manually and the agent will
 /// pick up the change on its next poll.
+/// Record the overlay network name a joining node chose because its host
+/// already had the cluster's (ADR 059). Best-effort like the underlay: if it
+/// is lost, the agent reports the name conflict with the fix.
+async fn persist_overlay_network_name(db: &sea_orm::DatabaseConnection, node_id: i32, name: &str) {
+    use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
+    use temps_entities::nodes;
+
+    let result = nodes::Entity::update_many()
+        .col_expr(nodes::Column::OverlayNetworkName, Expr::value(name))
+        .filter(nodes::Column::Id.eq(node_id))
+        .exec(db)
+        .await;
+    match result {
+        Ok(_) => info!(
+            node_id,
+            overlay_network_name = name,
+            "overlay network name set"
+        ),
+        Err(e) => warn!(
+            node_id,
+            "failed to set the overlay network name; the node's agent will report the name \
+             conflict: {}",
+            e
+        ),
+    }
+}
+
 async fn persist_underlay_address(db: &sea_orm::DatabaseConnection, node_id: i32, underlay: &str) {
     use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter};
     use temps_entities::nodes;
@@ -2989,6 +3212,9 @@ fn control_plane_node_response(app_state: &AppState) -> NodeInfoResponse {
         overlay_status: None,
         overlay_last_error: None,
         overlay_remediation: None,
+        // Never removed, so nothing to count for its removal.
+        serving_containers: None,
+        live_sandboxes: None,
     }
 }
 
@@ -3014,10 +3240,33 @@ async fn admin_list_nodes(
         .list_all()
         .await
         .map_err(Problem::from)?;
+    // What is on each node decides how the console offers its removal. A
+    // count that cannot be read leaves the field unset (the console then
+    // offers the drain-first flow) rather than failing the whole list.
+    let serving = match app_state.node_service.serving_container_counts().await {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            warn!(%error, "could not count the containers serving from each node");
+            None
+        }
+    };
+    let sandboxes = match app_state.node_service.live_sandbox_counts().await {
+        Ok(counts) => Some(counts),
+        Err(error) => {
+            warn!(%error, "could not count the live sandboxes on each node");
+            None
+        }
+    };
 
     let mut node_responses: Vec<NodeInfoResponse> = nodes
         .into_iter()
         .map(|n| NodeInfoResponse {
+            serving_containers: serving
+                .as_ref()
+                .map(|counts| counts.get(&n.id).map_or(0, |&count| count as u64)),
+            live_sandboxes: sandboxes
+                .as_ref()
+                .map(|counts| counts.get(&n.id).copied().unwrap_or(0)),
             id: n.id,
             name: n.name,
             address: n.address,
@@ -3091,8 +3340,28 @@ async fn admin_get_node(
         .get_by_id(node_id)
         .await
         .map_err(Problem::from)?;
+    let serving_containers = match app_state
+        .node_service
+        .serving_container_count(node.id)
+        .await
+    {
+        Ok(count) => Some(count as u64),
+        Err(error) => {
+            warn!(node_id = node.id, %error, "could not count the containers serving from a node");
+            None
+        }
+    };
+    let live_sandboxes = match app_state.node_service.live_sandbox_count(node.id).await {
+        Ok(count) => Some(count),
+        Err(error) => {
+            warn!(node_id = node.id, %error, "could not count the live sandboxes on a node");
+            None
+        }
+    };
 
     Ok(Json(NodeInfoResponse {
+        serving_containers,
+        live_sandboxes,
         id: node.id,
         name: node.name,
         address: node.address,
@@ -4221,131 +4490,184 @@ async fn admin_remove_node(
         }));
     }
 
-    let leftovers = match app_state
-        .node_service
-        .remove_leftover_containers_with(&node, remote_deployer.as_deref(), serving_containers)
-        .await
-    {
-        Ok(leftovers) => leftovers,
-        Err(error) => {
-            // A cleanup that stopped partway may already have removed
-            // containers from the host; a refusal before it started records
-            // zero of each.
-            let (outcome, confirmed_gone, unconfirmed) = match &error {
-                NodeError::LeftoverCleanupInterrupted {
+    // An empty active node is removed in one step: the drain's bookkeeping
+    // happens here. It is counted first, so a node with workloads is refused
+    // without its status flapping; then it is marked draining so nothing is
+    // placed on it while it is removed (`remove_with` counts again under the
+    // node's row lock), and made active again if the removal does not
+    // happen.
+    let cordoned = if serving_containers == ServingContainers::Refuse && node.status == "active" {
+        let serving = app_state
+            .node_service
+            .serving_container_count(node_id)
+            .await
+            .map_err(Problem::from)?;
+        if serving > 0 {
+            record_audit(
+                &app_state,
+                &audit_removal("refused_still_serving", 0, 0),
+                node_id,
+            )
+            .await;
+            let error = NodeError::StillServing {
+                node_id,
+                node_name: node.name.clone(),
+                count: serving,
+            };
+            return Err(still_serving_problem(&app_state, &node, query.force, error).await);
+        }
+        app_state
+            .node_service
+            .cordon_for_removal(node_id)
+            .await
+            .map_err(Problem::from)?
+    } else {
+        false
+    };
+
+    let result = async {
+        let leftovers = match app_state
+            .node_service
+            .remove_leftover_containers_with(&node, remote_deployer.as_deref(), serving_containers)
+            .await
+        {
+            Ok(leftovers) => leftovers,
+            Err(error) => {
+                // A cleanup that stopped partway may already have removed
+                // containers from the host; a refusal before it started records
+                // zero of each.
+                let (outcome, confirmed_gone, unconfirmed) = match &error {
+                    NodeError::LeftoverCleanupInterrupted {
+                        confirmed_gone,
+                        unremoved_count,
+                        ..
+                    } => ("cleanup_interrupted", *confirmed_gone, *unremoved_count),
+                    NodeError::StillServing { .. } => ("refused_still_serving", 0, 0),
+                    _ => ("cleanup_failed", 0, 0),
+                };
+                record_audit(
+                    &app_state,
+                    &audit_removal(outcome, confirmed_gone, unconfirmed),
+                    node_id,
+                )
+                .await;
+                return Err(still_serving_problem(&app_state, &node, query.force, error).await);
+            }
+        };
+        let unremoved_count = leftovers.unremoved_count;
+        let confirmed_gone = leftovers.confirmed_gone;
+        let unremoved = leftovers.unremoved_report();
+        if unremoved_count > 0 && !query.force {
+            // Containers may already have been removed from the host above.
+            record_audit(
+                &app_state,
+                &audit_removal(
+                    "refused_unconfirmed_containers",
                     confirmed_gone,
                     unremoved_count,
-                    ..
-                } => ("cleanup_interrupted", *confirmed_gone, *unremoved_count),
-                NodeError::StillServing { .. } => ("refused_still_serving", 0, 0),
-                _ => ("cleanup_failed", 0, 0),
-            };
-            record_audit(
-                &app_state,
-                &audit_removal(outcome, confirmed_gone, unconfirmed),
+                ),
                 node_id,
             )
             .await;
-            return Err(still_serving_problem(&app_state, &node, query.force, error).await);
-        }
-    };
-    let unremoved_count = leftovers.unremoved_count;
-    let confirmed_gone = leftovers.confirmed_gone;
-    let unremoved = leftovers.unremoved_report();
-    if unremoved_count > 0 && !query.force {
-        // Containers may already have been removed from the host above.
-        record_audit(
-            &app_state,
-            &audit_removal(
-                "refused_unconfirmed_containers",
-                confirmed_gone,
+            return Err(node_holds_containers_problem(
+                node_id,
+                &node.name,
                 unremoved_count,
-            ),
-            node_id,
-        )
-        .await;
-        return Err(node_holds_containers_problem(
-            node_id,
-            &node.name,
-            unremoved_count,
-            &unremoved,
-        ));
-    }
-
-    let node_name = node.name.clone();
-
-    let removal = match app_state
-        .node_service
-        .remove_with(node_id, serving_containers)
-        .await
-    {
-        Ok(removal) => removal,
-        Err(error) => {
-            let outcome = match &error {
-                NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
-                NodeError::StillServing { .. } => "refused_still_serving",
-                _ => "failed",
-            };
-            record_audit(
-                &app_state,
-                &audit_removal(outcome, confirmed_gone, unremoved_count),
-                node_id,
-            )
-            .await;
-            return Err(still_serving_problem(&app_state, &node, query.force, error).await);
+                &unremoved,
+            ));
         }
-    };
-    let placement_notes: Vec<String> = removal
-        .placements_updated
-        .iter()
-        .map(|placement| format!("{placement} now targets {:?}", placement.target_nodes))
-        .collect();
-    let mut removed_audit = audit_removal("removed", confirmed_gone, unremoved_count);
-    removed_audit.placements_updated = placement_notes.clone();
-    removed_audit.lost_environments = removal.lost_environments.clone();
-    record_audit(&app_state, &removed_audit, node_id).await;
 
-    info!(
-        node_id,
-        node_name = %node_name,
-        orphaned_containers = unremoved_count,
-        "Node removed from cluster"
-    );
+        let node_name = node.name.clone();
 
-    let mut message = if unremoved_count == 0 {
-        format!("Node '{}' removed from cluster", node_name)
-    } else {
-        format!(
-            "Node '{}' removed from cluster. {} container(s) could not be removed and were \
-             recorded as orphaned on it; if the host still exists, remove them there with \
-             `docker rm -f`: {}",
-            node_name,
-            unremoved_count,
-            unremoved.join("; ")
-        )
-    };
-    if !placement_notes.is_empty() {
-        message.push_str(&format!(
-            ". Its ID was removed from the target nodes of {} placement(s): {}. A machine \
-             that rejoins gets a new node ID; add it to these placements if they should use it",
-            placement_notes.len(),
-            placement_notes.join("; ")
-        ));
+        let removal = match app_state
+            .node_service
+            .remove_with(node_id, serving_containers)
+            .await
+        {
+            Ok(removal) => removal,
+            Err(error) => {
+                let outcome = match &error {
+                    NodeError::OnlyPlacementTarget { .. } => "refused_only_placement_target",
+                    NodeError::StillServing { .. } => "refused_still_serving",
+                    _ => "failed",
+                };
+                record_audit(
+                    &app_state,
+                    &audit_removal(outcome, confirmed_gone, unremoved_count),
+                    node_id,
+                )
+                .await;
+                return Err(still_serving_problem(&app_state, &node, query.force, error).await);
+            }
+        };
+        let placement_notes: Vec<String> = removal
+            .placements_updated
+            .iter()
+            .map(|placement| format!("{placement} now targets {:?}", placement.target_nodes))
+            .collect();
+        let mut removed_audit = audit_removal("removed", confirmed_gone, unremoved_count);
+        removed_audit.placements_updated = placement_notes.clone();
+        removed_audit.lost_environments = removal.lost_environments.clone();
+        record_audit(&app_state, &removed_audit, node_id).await;
+
+        info!(
+            node_id,
+            node_name = %node_name,
+            orphaned_containers = unremoved_count,
+            "Node removed from cluster"
+        );
+
+        let mut message = if unremoved_count == 0 {
+            format!("Node '{}' removed from cluster", node_name)
+        } else {
+            format!(
+                "Node '{}' removed from cluster. {} container(s) could not be removed and were \
+                 recorded as orphaned on it; if the host still exists, remove them there with \
+                 `docker rm -f`: {}",
+                node_name,
+                unremoved_count,
+                unremoved.join("; ")
+            )
+        };
+        if !placement_notes.is_empty() {
+            message.push_str(&format!(
+                ". Its ID was removed from the target nodes of {} placement(s): {}. A machine \
+                 that rejoins gets a new node ID; add it to these placements if they should use it",
+                placement_notes.len(),
+                placement_notes.join("; ")
+            ));
+        }
+        if !removal.lost_environments.is_empty() {
+            message.push_str(&format!(
+                ". These environments were still serving from it; any with no replicas on another \
+                 node serves nothing until you redeploy it: {}",
+                removal.lost_environments.join("; ")
+            ));
+        }
+        Ok::<_, Problem>(Json(RemoveNodeResponse {
+            id: node_id,
+            message,
+            orphaned_containers: unremoved,
+            placements_updated: removal.placements_updated,
+            lost_environments: removal.lost_environments,
+        }))
     }
-    if !removal.lost_environments.is_empty() {
-        message.push_str(&format!(
-            ". These environments were still serving from it; any with no replicas on another \
-             node serves nothing until you redeploy it: {}",
-            removal.lost_environments.join("; ")
-        ));
+    .await;
+    if cordoned && result.is_err() {
+        if let Err(error) = app_state
+            .node_service
+            .restore_after_failed_removal(node_id)
+            .await
+        {
+            error!(
+                node_id,
+                %error,
+                "a removal that did not happen left the node draining; undrain it on the Worker \
+                 Nodes page"
+            );
+        }
     }
-    Ok(Json(RemoveNodeResponse {
-        id: node_id,
-        message,
-        orphaned_containers: unremoved,
-        placements_updated: removal.placements_updated,
-        lost_environments: removal.lost_environments,
-    }))
+    result
 }
 
 /// The problem for a failed removal. A [`NodeError::StillServing`] refusal
@@ -4438,62 +4760,99 @@ async fn admin_drain_status(
         .await
         .map_err(Problem::from)?;
 
+    let serving_containers = app_state
+        .node_service
+        .serving_container_count(node_id)
+        .await
+        .map_err(Problem::from)?;
+
     let unreachable = crate::services::node_service::node_is_unreachable(&node, chrono::Utc::now());
     Ok(Json(drain_status(
         node_id,
         node.name,
         node.status,
-        containers.len(),
-        remaining_sandboxes,
+        DrainCounts {
+            remaining_containers: containers.len(),
+            serving_containers,
+            remaining_sandboxes,
+        },
         unreachable,
     )))
+}
+
+/// What is still on a node, for [`drain_status`].
+#[derive(Debug, Clone, Copy)]
+struct DrainCounts {
+    /// Containers recorded on the node and not deleted.
+    remaining_containers: usize,
+    /// Those a deployment still uses: what removing it would take away.
+    serving_containers: usize,
+    remaining_sandboxes: u64,
 }
 
 /// Drain progress of a node from what is still on it. Draining moves
 /// containers, never sandboxes (ADR-048): a node still hosting sandboxes
 /// cannot be removed, and the message says how to clear them. A drain on a
 /// node the control plane cannot reach never finishes, and the message says
-/// so instead of reporting progress (ADR 057).
+/// so instead of reporting progress (ADR 057). An active node the control
+/// plane reaches with nothing serving from it is removed in one step, with
+/// no drain first.
 fn drain_status(
     node_id: i32,
     node_name: String,
     status: String,
-    remaining_containers: usize,
-    remaining_sandboxes: u64,
+    counts: DrainCounts,
     unreachable: bool,
 ) -> DrainStatusResponse {
+    let DrainCounts {
+        remaining_containers,
+        serving_containers,
+        remaining_sandboxes,
+    } = counts;
     let is_draining = status == "draining";
     let is_drained = status == "drained";
     let drain_complete = is_drained || (is_draining && remaining_containers == 0);
+    let empty_active = status == "active" && !unreachable && serving_containers == 0;
     let can_remove = remaining_sandboxes == 0
-        && (drain_complete || (status == "offline" && remaining_containers == 0));
+        && (drain_complete || (status == "offline" && remaining_containers == 0) || empty_active);
 
-    let message = if remaining_sandboxes > 0 && (drain_complete || status == "offline") {
-        format!(
-            "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
+    let message =
+        if remaining_sandboxes > 0 && (drain_complete || status == "offline" || empty_active) {
+            format!(
+                "Node '{node_name}' still hosts {remaining_sandboxes} sandbox(es). Draining does \
              not move sandboxes: destroy them from the node's Sandboxes tab or with \
              `bunx @temps-sdk/cli sandbox nodes evict {node_name}`, then remove the node."
-        )
-    } else if drain_complete {
-        format!(
-            "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
+            )
+        } else if drain_complete {
+            format!(
+                "Drain complete. Node '{node_name}' has no remaining containers and can be safely \
              removed."
-        )
-    } else if is_draining && unreachable {
-        format!(
+            )
+        } else if is_draining && unreachable {
+            format!(
             "Draining cannot finish: node '{node_name}' has stopped sending heartbeats, so its \
              {remaining_containers} container(s) cannot be moved. Start `temps agent` on it, or \
              if the host is gone for good, remove the node anyway; the environments serving \
              from it stop until you redeploy them."
         )
-    } else if is_draining {
-        format!(
-            "Draining: {remaining_containers} container(s) still on node '{node_name}'. \
+        } else if is_draining {
+            format!(
+                "Draining: {remaining_containers} container(s) still on node '{node_name}'. \
              Workloads are being migrated."
-        )
-    } else {
-        format!("Node '{node_name}' is {status} (not draining)")
-    };
+            )
+        } else if empty_active {
+            format!(
+                "Node '{node_name}' is active with nothing serving from it; it can be removed \
+             without draining it first."
+            )
+        } else if status == "active" && serving_containers > 0 {
+            format!(
+                "Node '{node_name}' is active and {serving_containers} container(s) still serve \
+             from it; drain it before removing it."
+            )
+        } else {
+            format!("Node '{node_name}' is {status} (not draining)")
+        };
 
     DrainStatusResponse {
         node_id,
@@ -4859,6 +5218,24 @@ impl From<NodeError> for Problem {
                      another node's name or address",
                     claimed, owner
                 )),
+            NodeError::RejoinNotProven {
+                node_id,
+                ref node_name,
+                proof_given,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("WireGuard Key In Use")
+                .with_detail(format!(
+                    "{error}. Nothing was changed on the control plane. If this machine is node \
+                     '{node_name}', run `sudo temps join` so its agent config (agent.json) is \
+                     read and its credential sent with the join; a join that cannot tell the \
+                     control plane at the URL is the one it belongs to does not send it. If \
+                     this machine only copied that node's key, delete its `wireguard` key \
+                     directory and re-run `temps join`. To replace the node, remove \
+                     '{node_name}' on the Worker Nodes page first."
+                ))
+                .with_value("node_id", node_id)
+                .with_value("node_name", node_name.clone())
+                .with_value("proof_given", proof_given),
             NodeError::Validation { ref message } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(message.clone()),
@@ -5226,7 +5603,13 @@ mod tests {
 
     #[test]
     fn a_drained_node_with_sandboxes_cannot_be_removed() {
-        let status = drain_status(4, "worker-4".into(), "drained".into(), 0, 2, false);
+        let status = drain_status(
+            4,
+            "worker-4".into(),
+            "drained".into(),
+            counts(0, 0, 2),
+            false,
+        );
         assert!(status.drain_complete);
         assert!(!status.can_remove);
         assert_eq!(status.remaining_sandboxes, 2);
@@ -5241,7 +5624,13 @@ mod tests {
 
     #[test]
     fn an_offline_node_with_sandboxes_cannot_be_removed() {
-        let status = drain_status(4, "worker-4".into(), "offline".into(), 0, 1, false);
+        let status = drain_status(
+            4,
+            "worker-4".into(),
+            "offline".into(),
+            counts(0, 0, 1),
+            false,
+        );
         assert!(!status.can_remove);
         assert!(status.message.contains("still hosts 1 sandbox(es)"));
     }
@@ -5249,28 +5638,106 @@ mod tests {
     #[test]
     fn an_empty_drained_or_offline_node_can_be_removed() {
         for node_status in ["drained", "offline"] {
-            let status = drain_status(4, "worker-4".into(), node_status.into(), 0, 0, false);
+            let status = drain_status(
+                4,
+                "worker-4".into(),
+                node_status.into(),
+                counts(0, 0, 0),
+                false,
+            );
             assert!(status.can_remove, "{node_status}");
         }
-        let draining = drain_status(4, "worker-4".into(), "draining".into(), 0, 0, false);
+        let draining = drain_status(
+            4,
+            "worker-4".into(),
+            "draining".into(),
+            counts(0, 0, 0),
+            false,
+        );
         assert!(draining.drain_complete && draining.can_remove);
     }
 
+    fn counts(remaining: usize, serving: usize, sandboxes: u64) -> DrainCounts {
+        DrainCounts {
+            remaining_containers: remaining,
+            serving_containers: serving,
+            remaining_sandboxes: sandboxes,
+        }
+    }
+
     #[test]
-    fn a_node_still_draining_or_active_cannot_be_removed() {
-        let draining = drain_status(4, "worker-4".into(), "draining".into(), 3, 0, false);
+    fn a_node_still_draining_cannot_be_removed() {
+        let draining = drain_status(
+            4,
+            "worker-4".into(),
+            "draining".into(),
+            counts(3, 3, 0),
+            false,
+        );
         assert!(!draining.drain_complete && !draining.can_remove);
         assert!(draining.message.contains("3 container(s)"));
-        let active = drain_status(4, "worker-4".into(), "active".into(), 0, 0, false);
-        assert!(!active.can_remove);
-        assert!(active.message.contains("not draining"));
+    }
+
+    /// An active node with nothing serving from it needs no drain first; one
+    /// with workloads does, and says how many.
+    #[test]
+    fn an_empty_active_node_can_be_removed_and_a_busy_one_cannot() {
+        // Leftover containers no deployment uses do not hold it: the removal
+        // cleans them up.
+        let empty = drain_status(
+            4,
+            "worker-4".into(),
+            "active".into(),
+            counts(2, 0, 0),
+            false,
+        );
+        assert!(empty.can_remove && !empty.drain_complete);
+        assert!(
+            empty.message.contains("without draining"),
+            "{}",
+            empty.message
+        );
+
+        let busy = drain_status(
+            4,
+            "worker-4".into(),
+            "active".into(),
+            counts(3, 2, 0),
+            false,
+        );
+        assert!(!busy.can_remove);
+        assert!(busy.message.contains("2 container(s)"), "{}", busy.message);
+
+        let sandboxes = drain_status(
+            4,
+            "worker-4".into(),
+            "active".into(),
+            counts(0, 0, 1),
+            false,
+        );
+        assert!(!sandboxes.can_remove);
+        assert!(
+            sandboxes.message.contains("1 sandbox(es)"),
+            "{}",
+            sandboxes.message
+        );
+
+        // An unreachable node keeps the force flow (ADR 057).
+        let gone = drain_status(4, "worker-4".into(), "active".into(), counts(0, 0, 0), true);
+        assert!(!gone.can_remove);
     }
 
     /// A drain whose node stopped heartbeating can never move its
     /// containers; the status says so and points at removing it anyway.
     #[test]
     fn a_drain_on_an_unreachable_node_says_it_cannot_finish() {
-        let stuck = drain_status(4, "worker-4".into(), "draining".into(), 1, 0, true);
+        let stuck = drain_status(
+            4,
+            "worker-4".into(),
+            "draining".into(),
+            counts(1, 1, 0),
+            true,
+        );
         assert!(!stuck.drain_complete && !stuck.can_remove);
         assert!(stuck.message.contains("cannot finish"), "{}", stuck.message);
         assert!(
@@ -5427,6 +5894,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -5527,6 +5995,7 @@ mod tests {
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            plane_identity_rate_limiter: Arc::new(RegistrationRateLimiter::new()),
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
                 test_db_for_enrollment,
             )),
@@ -7194,6 +7663,60 @@ mod tests {
         (response, log)
     }
 
+    async fn get_plane_identity(app: Router) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/internal/nodes/plane-identity")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    /// ADR 060: without authentication, the control plane says who it is,
+    /// its cluster CA fingerprint and mesh key, and what it does not have
+    /// yet as `null`. It never creates the CA to answer.
+    #[tokio::test]
+    async fn plane_identity_names_the_cluster_ca_and_mesh_key() {
+        let ca = temps_core::node_pki::generate_cluster_ca().unwrap();
+        let mut settings = settings_with_join_token();
+        settings.multi_node.cluster_ca_cert_pem = Some(ca.cert_pem.clone());
+        let config =
+            crate::handlers::wireguard_mesh::admin_test_support::network_config(true, true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![config]])
+            .into_connection();
+        let (status, body) = get_plane_identity(make_app_with_settings(db, settings)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["ca_fingerprint"],
+            temps_core::node_pki::ca_fingerprint_sha256(&ca.cert_pem).unwrap()
+        );
+        assert_eq!(
+            body["control_plane_wg_public_key"],
+            "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE="
+        );
+
+        let config =
+            crate::handlers::wireguard_mesh::admin_test_support::network_config(false, false);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![config]])
+            .into_connection();
+        let (status, body) =
+            get_plane_identity(make_app_with_settings(db, settings_with_join_token())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["ca_fingerprint"].is_null(), "{body}");
+        assert!(body["control_plane_wg_public_key"].is_null(), "{body}");
+    }
+
     #[tokio::test]
     async fn mesh_enroll_refuses_a_missing_or_unknown_token_like_register() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
@@ -7467,7 +7990,8 @@ mod tests {
         assert_ne!(answer.join_token, join_token);
         assert!(chrono::DateTime::parse_from_rfc3339(&answer.expires_at).is_ok());
 
-        let pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id)
+        assert_eq!(answer.rejoined_node_id, None);
+        let pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id.unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -7529,7 +8053,7 @@ mod tests {
                 .is_some(),
             "the superseded pairing token is revoked"
         );
-        let resumed_pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id)
+        let resumed_pairing = temps_network::pairing::get(db.as_ref(), answer.pairing_id.unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -7553,5 +8077,171 @@ mod tests {
             0,
             "a refused enrollment gives the token its use back"
         );
+    }
+    /// ADR 060 on a real database: a worker that is node `edge-1` (its mesh
+    /// key, its name, its current agent credential) joining again gets no
+    /// pairing, keeps its mesh address and is told which node it updates.
+    /// The same key and name without the credential, or with a wrong one, is
+    /// refused; under another name the key is in use as before.
+    #[tokio::test]
+    async fn mesh_enroll_rejoins_a_proven_node_in_place_and_refuses_an_unproven_one() {
+        use sea_orm::{ActiveModelTrait, IntoActiveModel, PaginatorTrait};
+
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        temps_network::mesh::enable(db.as_ref(), Some("10.201.0.0/24"), Some(51820), None)
+            .await
+            .unwrap();
+        temps_network::mesh::publish_control_plane(
+            db.as_ref(),
+            "Y29udHJvbC1wbGFuZS1rZXktMzItYnl0ZXMtbG9uZyE=",
+            Some("198.51.100.1:51820".parse().unwrap()),
+        )
+        .await
+        .unwrap();
+        let mut node = sample_node();
+        node.name = "edge-1".to_string();
+        node.token_hash = sha256_hash("edge-1-agent-credential");
+        node.mesh_wg_public_key = Some(WORKER_KEY.to_string());
+        node.mesh_wg_address = Some("10.201.0.9".to_string());
+        node.private_address = "10.201.0.9".to_string();
+        let mut node = node.into_active_model();
+        node.id = sea_orm::ActiveValue::NotSet;
+        let node = node.insert(db.as_ref()).await.unwrap();
+
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            test_server_config(),
+            db.clone(),
+        ));
+        let tokens = Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
+        let mint = |name: &'static str| {
+            let tokens = tokens.clone();
+            async move {
+                tokens
+                    .mint(temps_config::MintParams {
+                        max_uses: 1,
+                        ttl_secs: 3600,
+                        bound_node_name: Some(name.to_string()),
+                        bound_labels: None,
+                        created_by_user_id: None,
+                        ca_fingerprint: None,
+                    })
+                    .await
+                    .unwrap()
+            }
+        };
+        let used = |id: i32| {
+            let db = db.clone();
+            async move {
+                temps_entities::node_enrollment_tokens::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .used_count
+            }
+        };
+        let app = make_app_with_enrollment(
+            db.clone(),
+            config_service.clone(),
+            encryption.clone(),
+            db.clone(),
+        );
+        let proof = |agent_token: &str, name: &str, join_token: &str| {
+            temps_core::node_pki::rejoin_proof(
+                &temps_core::node_pki::agent_token_hash(agent_token),
+                name,
+                WORKER_KEY,
+                join_token,
+            )
+            .unwrap()
+        };
+
+        // No credential: refused, nothing changed, the token keeps its use.
+        let (join_token, token) = mint("edge-1").await;
+        let response =
+            post_mesh_enroll(app.clone(), &mesh_enroll_body("edge-1", &join_token)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "WireGuard Key In Use");
+        assert_eq!(problem["node_id"], node.id);
+        assert_eq!(problem["proof_given"], false);
+        assert!(problem["detail"].as_str().unwrap().contains("was not sent"));
+        assert_eq!(used(token.id).await, 0);
+
+        // A wrong credential: refused, and the guess costs the token's use.
+        let mut body = mesh_enroll_body("edge-1", &join_token);
+        body["rejoin_proof"] =
+            serde_json::json!(proof("not-the-credential", "edge-1", &join_token));
+        let response = post_mesh_enroll(app.clone(), &body).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["proof_given"], true);
+        assert_eq!(used(token.id).await, 1);
+
+        // A proof made for another join token (one replayed from elsewhere)
+        // proves nothing either.
+        let (join_token, _) = mint("edge-1").await;
+        let mut body = mesh_enroll_body("edge-1", &join_token);
+        body["rejoin_proof"] = serde_json::json!(proof(
+            "edge-1-agent-credential",
+            "edge-1",
+            "another-join-token"
+        ));
+        let response = post_mesh_enroll(app.clone(), &body).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(problem_of(response).await["proof_given"], true);
+
+        // The node's credential: the node is joined again in place.
+        let (join_token, token) = mint("edge-1").await;
+        let mut body = mesh_enroll_body("edge-1", &join_token);
+        body["rejoin_proof"] =
+            serde_json::json!(proof("edge-1-agent-credential", "edge-1", &join_token));
+        let response = post_mesh_enroll(app.clone(), &body).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let answer: MeshEnrollResponse = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(answer.rejoined_node_id, Some(node.id));
+        assert_eq!(answer.pairing_id, None);
+        assert_eq!(answer.name, "edge-1");
+        assert_eq!(answer.node_address, "10.201.0.9");
+        assert_ne!(answer.join_token, join_token);
+        assert_eq!(used(token.id).await, 1);
+        assert_eq!(
+            temps_entities::node_pairings::Entity::find()
+                .count(db.as_ref())
+                .await
+                .unwrap(),
+            0,
+            "a re-join reserves nothing"
+        );
+        let unchanged = nodes::Entity::find_by_id(node.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.token_hash, node.token_hash);
+        assert_eq!(unchanged.mesh_wg_address, node.mesh_wg_address);
+
+        // The same key under another name, even with the credential: in use.
+        let (join_token, token) = mint("edge-2").await;
+        let mut body = mesh_enroll_body("edge-2", &join_token);
+        body["rejoin_proof"] =
+            serde_json::json!(proof("edge-1-agent-credential", "edge-2", &join_token));
+        let response = post_mesh_enroll(app, &body).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let problem = problem_of(response).await;
+        assert_eq!(problem["title"], "WireGuard Key In Use");
+        assert!(problem.get("node_id").is_none(), "{problem}");
+        assert_eq!(used(token.id).await, 0);
     }
 }

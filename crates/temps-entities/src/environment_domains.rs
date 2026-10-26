@@ -15,6 +15,20 @@ pub struct Model {
     pub environment_id: i32,
     pub domain: String,
     pub created_at: DBDateTime,
+    /// Who this address is for (ADR 064): `public`, or the reserved
+    /// `private` / `signed_in`. Defaults to `public`.
+    #[serde(default = "crate::audience::default_audience")]
+    pub audience: String,
+    /// For a `private` address (ADR 064 D5): the network range a visitor
+    /// must come from, e.g. `100.64.0.0/10`.
+    #[serde(default)]
+    pub private_range: Option<String>,
+    /// For a `private` address: the worker whose private listener serves it.
+    #[serde(default)]
+    pub private_node_id: Option<i32>,
+    /// For a `private` address: the listener address DNS points at.
+    #[serde(default)]
+    pub private_listener: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

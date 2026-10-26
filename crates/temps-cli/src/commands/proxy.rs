@@ -529,6 +529,8 @@ impl ProxyCommand {
             // proxy cannot observe its startup, so console-bound failures
             // keep the generic unavailable page.
             console_startup: None,
+            // The console process samples the host (`temps serve --role=console`).
+            host_metrics: false,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),

@@ -2589,6 +2589,11 @@ fn preserve_cloud_settings_not_sent_by_every_client(
     // unattended bootstrap path, is set exactly once and audited there), so
     // a generic settings write must never be able to flip it either way.
     incoming.cloud.console_access_enabled = current.cloud.console_access_enabled;
+    // ADR-045 Amendment 2: the once-only bootstrap marker is written only by
+    // `grant_bootstrap_telemetry_consent`. A stale full snapshot writing it
+    // back to `false` would let the next upgrade re-grant telemetry export
+    // the operator has since turned off.
+    incoming.cloud.telemetry_consent_bootstrapped = current.cloud.telemetry_consent_bootstrapped;
 
     if !sent.backend_url {
         incoming.cloud.backend_url = current.cloud.backend_url.clone();
@@ -4502,6 +4507,10 @@ mod tests {
                 environment_id: 2,
                 domain: "shop.example.com".into(),
                 created_at: chrono::Utc::now(),
+                audience: "public".to_string(),
+                private_range: None,
+                private_node_id: None,
+                private_listener: None,
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(
@@ -5468,6 +5477,7 @@ mod tests {
         // bootstrap default), never a side effect of an unrelated settings
         // save.
         incoming.cloud.console_access_enabled = true;
+        incoming.cloud.telemetry_consent_bootstrapped = true;
 
         preserve_cloud_settings_not_sent_by_every_client(
             &mut incoming,
@@ -5479,6 +5489,7 @@ mod tests {
         assert!(!incoming.cloud.backups_enabled);
         assert!(!incoming.cloud.notifications_enabled);
         assert!(!incoming.cloud.console_access_enabled);
+        assert!(!incoming.cloud.telemetry_consent_bootstrapped);
     }
 
     #[test]
@@ -5488,6 +5499,7 @@ mod tests {
         current.cloud.backups_enabled = true;
         current.cloud.notifications_enabled = true;
         current.cloud.console_access_enabled = true;
+        current.cloud.telemetry_consent_bootstrapped = true;
         let mut incoming = AppSettings::default();
 
         preserve_cloud_settings_not_sent_by_every_client(
@@ -5500,6 +5512,7 @@ mod tests {
         assert!(incoming.cloud.backups_enabled);
         assert!(incoming.cloud.notifications_enabled);
         assert!(incoming.cloud.console_access_enabled);
+        assert!(incoming.cloud.telemetry_consent_bootstrapped);
     }
 
     /// A settings row whose operator-tuned Cloud fields have all been moved off

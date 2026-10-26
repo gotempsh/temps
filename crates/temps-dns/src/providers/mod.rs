@@ -18,6 +18,10 @@ pub mod route53;
 pub mod traits;
 
 // Re-export commonly used types
+/// Metadata key a provider fills with when a record last changed (RFC 3339),
+/// where it reports one (Cloudflare does).
+pub const METADATA_MODIFIED_ON: &str = "modified_on";
+
 pub use azure::AzureProvider;
 pub use bunny::BunnyProvider;
 pub use cloudflare::CloudflareProvider;

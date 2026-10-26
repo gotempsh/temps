@@ -27,11 +27,16 @@ import {
 } from '@/components/ui/collapsible'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
+import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { workerIngressWay } from '@/lib/worker-ingress'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NodeRowActions } from '@/components/nodes/NodeRowActions'
+import { useNodeRemoval } from '@/components/nodes/useNodeRemoval'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
-import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/contexts/AuthContext-shared'
@@ -49,11 +54,9 @@ import {
 import {
   canAddWorkerNode,
   nodeIsUnreachable,
-  servingOnUnreachableNode,
+  nodeRemoval,
+  nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
-  type ServingOnUnreachableNode,
-  unremovedNodeContainers,
-  type UnremovedNodeContainers,
   WORKER_NODES_URL,
 } from '@/lib/worker-nodes'
 import {
@@ -66,6 +69,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
@@ -81,8 +85,6 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
-  NodePlacementReference,
-  RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
@@ -129,7 +131,6 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
-import { describeUpdatedPlacements } from '@/lib/node-placements'
 import { NodeWorkloadSettings } from '@/components/nodes/NodeWorkloadSettings'
 import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
@@ -615,9 +616,13 @@ function NodeTable({
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
             <TableHead className="hidden md:table-cell">Address</TableHead>
+            <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
             {showOverlay && <TableHead>Cross-node</TableHead>}
             <TableHead>Last Heartbeat</TableHead>
+            <TableHead className="text-right">
+              <span className="sr-only">Actions</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -665,6 +670,9 @@ function NodeTable({
                     {node.private_address}
                   </span>
                 </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <WorkerIngressBadge node={node} />
+                </TableCell>
                 {showMesh && (
                   <TableCell>
                     {meshNode ? (
@@ -706,6 +714,11 @@ function NodeTable({
                   <span className="text-sm text-muted-foreground">
                     {formatRelativeTime(node.last_heartbeat)}
                   </span>
+                </TableCell>
+                <TableCell className="text-right">
+                  {node.role !== 'control-plane' && (
+                    <NodeRowActions node={node} />
+                  )}
                 </TableCell>
               </TableRow>
             )
@@ -986,64 +999,6 @@ export function NodeDetailPage() {
   )
 }
 
-/**
- * What removing a node affects. Plain inline content only: the dialog wraps it
- * in a paragraph, so the refusal lists are joined into the sentence.
- */
-function removeNodeConsequences(
-  pinnedPlacements: NodePlacementReference[] | null,
-  unremovedContainers: UnremovedNodeContainers | null,
-  servingOnGoneNode: ServingOnUnreachableNode | null
-) {
-  if (pinnedPlacements) {
-    const targets = pinnedPlacements
-      .map((placement) =>
-        placement.environment_name
-          ? `${placement.project_name} / ${placement.environment_name}`
-          : `${placement.project_name} (project default)`
-      )
-      .join(', ')
-    return `The node was not removed: it is the only target node of ${targets}. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.`
-  }
-  if (servingOnGoneNode) {
-    return (
-      <>
-        This node stopped sending heartbeats, so a drain cannot move the{' '}
-        {servingOnGoneNode.count} container(s) live deployments still have on it
-        {servingOnGoneNode.environments.length > 0 && (
-          <>
-            {' '}
-            (
-            <span className="break-words">
-              {servingOnGoneNode.environments.join(', ')}
-            </span>
-            )
-          </>
-        )}
-        . If the host still exists, start its agent and drain it instead. If it
-        is gone for good, remove it anyway: those containers are recorded as
-        orphaned, and any of these environments with no replicas on another node
-        stops serving until you redeploy it.
-      </>
-    )
-  }
-  if (unremovedContainers) {
-    return (
-      <>
-        Temps could not confirm that {unremovedContainers.count} container(s) it
-        placed on this node are gone, so the node was not removed:{' '}
-        <span className="font-mono text-xs break-all">
-          {unremovedContainers.lines.join(', ')}
-        </span>
-        . Start the agent on the node and try again, or remove them on that host
-        with docker rm -f. If the host is gone for good, remove the node anyway:
-        these containers are then recorded as orphaned and never touched again.
-      </>
-    )
-  }
-  return 'The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'
-}
-
 function NodeDetail({
   nodeId,
   onBack,
@@ -1057,22 +1012,8 @@ function NodeDetail({
   // moment one of those succeeds.
   const invalidateCapability = useInvalidateNodeCapability()
   const [showDrainDialog, setShowDrainDialog] = useState(false)
-  const [showRemoveDialog, setShowRemoveDialog] = useState(false)
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
   const [drainPending, setDrainPending] = useState(false)
-  const [removePending, setRemovePending] = useState(false)
-  // Containers a removal could not confirm are gone. While set, the remove
-  // dialog lists them and offers to remove the node anyway.
-  const [unremovedContainers, setUnremovedContainers] =
-    useState<UnremovedNodeContainers | null>(null)
-  // Environments pinned only to this node, from a refused removal.
-  const [pinnedPlacements, setPinnedPlacements] = useState<
-    NodePlacementReference[] | null
-  >(null)
-  // Live deployments an unreachable node still serves, from a refused
-  // removal. While set, the dialog names them and offers to remove anyway.
-  const [servingOnGoneNode, setServingOnGoneNode] =
-    useState<ServingOnUnreachableNode | null>(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1097,19 +1038,45 @@ function NodeDetail({
   // admins may list other users' sandboxes, so others see an explanation.
   const { user } = useAuth()
   const canSeeSandboxes = canManageSandboxPlacement(user?.role)
+  // A server that does not serve the sandbox API is not asked (its answer
+  // would be a bare 404); the panel says why instead. Unknown features
+  // (loading, or a server that predates them) still ask, as before.
+  const platformFeatures = usePlatformFeatures()
+  const sandboxesAvailable = platformFeatures.data?.sandboxes !== false
   const [sandboxPage, setSandboxPage] = useState(1)
   const sandboxesQuery = useQuery({
     ...listNodeSandboxesOptions({
       path: { node: String(nodeId) },
       query: { page: sandboxPage, page_size: 20 },
     }),
-    enabled: canSeeSandboxes,
+    enabled: canSeeSandboxes && sandboxesAvailable,
     refetchInterval: 15_000,
   })
   const liveSandboxes = sandboxesQuery.data?.total ?? 0
   const [searchParams, setSearchParams] = useSearchParams()
   const tab =
     searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+  // The remove flow, shared with the node list's row action.
+  const {
+    requestRemoval,
+    pending: removePending,
+    dialog: removeDialog,
+  } = useNodeRemoval({
+    nodeId,
+    nodeName: node?.name ?? '',
+    onRemoved: onBack,
+    // Live sandboxes block removal and draining doesn't move them: point
+    // straight at the tab that can destroy them.
+    onShowSandboxes: () =>
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.set('tab', 'sandboxes')
+          return next
+        },
+        { replace: true }
+      ),
+  })
 
   // Drain status decides whether the node can be removed; the server folds
   // in live sandboxes, which draining does not move. Poll every 5s while
@@ -1159,117 +1126,6 @@ function NodeDetail({
     } finally {
       setDrainPending(false)
       setShowDrainDialog(false)
-    }
-  }
-
-  const handleRemove = async (force = false) => {
-    setRemovePending(true)
-    let keepDialogOpen = false
-    try {
-      const resp = await client.delete({
-        url: '/internal/nodes/{node_id}',
-        path: { node_id: nodeId },
-        query: force ? { force: true } : undefined,
-      })
-      if (resp.error) {
-        if (handleSensitiveActionError(resp.error, () => handleRemove(force))) {
-          return
-        }
-        // Containers Temps placed on the node may still exist: keep the
-        // dialog open with the list so the operator decides whether the
-        // host is gone for good.
-        const pinned = (resp.error as { placements?: unknown }).placements
-        if (Array.isArray(pinned) && pinned.length > 0) {
-          setPinnedPlacements(pinned as NodePlacementReference[])
-          keepDialogOpen = true
-          setShowRemoveDialog(true)
-          return
-        }
-        const serving = servingOnUnreachableNode(resp.error)
-        if (serving && !force) {
-          setServingOnGoneNode(serving)
-          keepDialogOpen = true
-          setShowRemoveDialog(true)
-          return
-        }
-        const unremoved = unremovedNodeContainers(resp.error)
-        if (unremoved && !force) {
-          setUnremovedContainers(unremoved)
-          keepDialogOpen = true
-          setShowRemoveDialog(true)
-          return
-        }
-        // Live sandboxes block removal and draining doesn't move them:
-        // point straight at the tab that can destroy them.
-        const hostsSandboxes =
-          (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
-        toast.error('Could not remove node', {
-          description: problemDetail(
-            resp.error,
-            'Check your permissions and try again.'
-          ),
-          action: hostsSandboxes
-            ? {
-                label: 'Show sandboxes',
-                onClick: () =>
-                  setSearchParams(
-                    (prev) => {
-                      const next = new URLSearchParams(prev)
-                      next.set('tab', 'sandboxes')
-                      return next
-                    },
-                    { replace: true }
-                  ),
-              }
-            : undefined,
-        })
-        return
-      }
-      const removal = resp.data as RemoveNodeResponse | undefined
-      const orphaned = removal?.orphaned_containers ?? []
-      const lost = removal?.lost_environments ?? []
-      // Environments whose target nodes listed this node no longer do; say
-      // which, since a rejoined machine gets a new ID and is not targeted.
-      const placements = describeUpdatedPlacements(removal?.placements_updated)
-      if (lost.length > 0) {
-        toast.warning('Node removed', {
-          description: [
-            `These environments were still serving from it; redeploy any with no replicas on another node: ${lost.join(', ')}.`,
-            'If the host comes back, remove its containers there with docker rm -f.',
-            placements,
-          ]
-            .filter(Boolean)
-            .join(' '),
-        })
-      } else if (orphaned.length > 0) {
-        toast.warning('Node removed', {
-          description: [
-            'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
-            placements,
-          ]
-            .filter(Boolean)
-            .join(' '),
-        })
-      } else if (placements) {
-        toast.warning('Node removed', { description: placements })
-      } else {
-        toast.success('Node removed')
-      }
-      queryClient.invalidateQueries({
-        queryKey: adminListNodesOptions().queryKey,
-      })
-      invalidateCapability()
-      onBack()
-    } catch {
-      toast.error('Failed to remove node')
-    } finally {
-      setRemovePending(false)
-      if (!keepDialogOpen) {
-        setShowRemoveDialog(false)
-        setUnremovedContainers(null)
-        setPinnedPlacements(null)
-        setServingOnGoneNode(null)
-      }
     }
   }
 
@@ -1338,17 +1194,30 @@ function NodeDetail({
 
   const canDrain = node.status === 'active'
   const canUndrain = node.status === 'draining' || node.status === 'drained'
+  // What the server reports is on the node decides how it can be removed
+  // (ADR 060): an empty node in one step, one with workloads after a drain.
+  const removal = nodeRemoval(node)
+  const removalBlocker = nodeRemovalBlocker(removal)
   // Draining does not move sandboxes; they have to be destroyed first.
-  const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
-  // A node the control plane stopped hearing from can be removed whatever
-  // its status: a drain cannot finish without its agent (ADR 057).
-  const removableState =
-    (node.status === 'drained' &&
+  const remainingSandboxes =
+    removal.kind === 'sandboxes'
+      ? removal.sandboxes
+      : (drainStatus?.remaining_sandboxes ?? liveSandboxes)
+  // A server that reports no counts: decide from the drain status as
+  // before. A node the control plane stopped hearing from can be removed
+  // whatever its status: a drain cannot finish without its agent (ADR 057).
+  const legacyRemovableState =
+    removal.kind === 'unknown' &&
+    ((node.status === 'drained' &&
       (drainStatus?.remaining_containers ?? containers.length) === 0) ||
-    node.status === 'offline' ||
-    nodeIsUnreachable(node)
-  const canRemove = removableState && remainingSandboxes === 0
-  const blockedBySandboxes = removableState && remainingSandboxes > 0
+      node.status === 'offline' ||
+      nodeIsUnreachable(node))
+  const canRemove =
+    removal.kind === 'remove' ||
+    (legacyRemovableState && remainingSandboxes === 0)
+  const blockedBySandboxes =
+    removal.kind === 'sandboxes' ||
+    (legacyRemovableState && remainingSandboxes > 0)
 
   return (
     <div className="space-y-6">
@@ -1373,6 +1242,7 @@ function NodeDetail({
             <StatusBadge status={node.status} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
+            <WorkerIngressBadge node={node} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
@@ -1411,11 +1281,16 @@ function NodeDetail({
               <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
+          {removal.kind === 'drain-first' && removalBlocker && (
+            <span className="text-xs text-muted-foreground">
+              {removalBlocker}
+            </span>
+          )}
           {canRemove && (
             <Button
               variant="destructive"
               size="sm"
-              onClick={() => setShowRemoveDialog(true)}
+              onClick={requestRemoval}
               disabled={removePending}
             >
               {removePending ? (
@@ -1443,37 +1318,8 @@ function NodeDetail({
         onConfirm={handleDrain}
       />
 
-      {/* Remove confirmation dialog */}
-      <ConfirmDeleteDialog
-        open={showRemoveDialog}
-        onOpenChange={(open) => {
-          setShowRemoveDialog(open)
-          if (!open) {
-            setUnremovedContainers(null)
-            setPinnedPlacements(null)
-            setServingOnGoneNode(null)
-          }
-        }}
-        resourceType="node"
-        resourceName={node.name}
-        verb="Remove"
-        confirmLabel={
-          unremovedContainers || servingOnGoneNode
-            ? 'Remove anyway'
-            : 'Remove node'
-        }
-        consequences={removeNodeConsequences(
-          pinnedPlacements,
-          unremovedContainers,
-          servingOnGoneNode
-        )}
-        isPending={removePending}
-        onConfirm={() =>
-          void handleRemove(
-            unremovedContainers !== null || servingOnGoneNode !== null
-          )
-        }
-      />
+      {/* Remove confirmation and refusal dialogs */}
+      {removeDialog}
 
       {/* Undrain confirmation dialog */}
       <AlertDialog open={showUndrainDialog} onOpenChange={setShowUndrainDialog}>
@@ -1743,6 +1589,8 @@ function NodeDetail({
             query={sandboxesQuery}
             page={sandboxPage}
             onPageChange={setSandboxPage}
+            sandboxesAvailable={sandboxesAvailable}
+            sandboxesLocal={platformFeatures.data?.sandboxes_local}
           />
         </TabsContent>
       </Tabs>
@@ -1953,10 +1801,24 @@ export function NodesPage() {
   )
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
+  const { data: tunnels } = useQuery(allTunnelsOptions())
+  // Without local workloads the control plane serves no app traffic, so a
+  // cluster whose workers all lack a way in serves nobody.
+  const activeWorkers = nodes.filter(
+    (node) => node.role !== 'control-plane' && node.status === 'active'
+  )
+  const noWayIn =
+    capability?.local_workloads === false &&
+    tunnels !== undefined &&
+    activeWorkers.length > 0 &&
+    activeWorkers.every(
+      (node) => workerIngressWay(node, tunnels).kind === 'none'
+    )
   const nodeCount = nodes.length
   // The list always includes this server itself; only workers count here.
-  const workerCount = nodes.filter((node) => node.role !== 'control-plane')
-    .length
+  const workerCount = nodes.filter(
+    (node) => node.role !== 'control-plane'
+  ).length
   // "No nodes" means two very different things. With local workloads the
   // control plane runs everything itself and worker nodes are optional
   // scale-out; without them nothing can run at all and this page is the
@@ -2035,6 +1897,34 @@ export function NodesPage() {
           )}
 
           <NodeStateStreamStatus />
+          {noWayIn && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                Visitors can&apos;t reach your apps yet
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  No worker takes traffic from the internet. Deployments run,
+                  but their domains don&apos;t answer until a worker does,
+                  through a tunnel (no public IP needed) or open ports on a
+                  public IP.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <Button asChild size="sm">
+                    <Link to={ingressSetupUrl()}>Set up ingress</Link>
+                  </Button>
+                  <Button asChild size="sm" variant="outline">
+                    <Link
+                      to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
+                    >
+                      Open {activeWorkers[0].name}
+                    </Link>
+                  </Button>
+                </div>
+              </AlertDescription>
+            </Alert>
+          )}
 
           {stranded.length > 0 && (
             <Alert className="border-amber-500/30 bg-amber-500/5">

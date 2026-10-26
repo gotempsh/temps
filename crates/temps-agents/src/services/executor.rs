@@ -2171,6 +2171,12 @@ impl AgentExecutor {
     }
 
     async fn execute_run_inner(&self, run_id: i32, work_dir: &PathBuf) -> Result<(), AgentError> {
+        // ADR 063: on a control plane that runs no workloads there is no
+        // host to run this on. Say so before cloning anything or minting a
+        // run token, instead of failing at sandbox creation.
+        self.sandbox_registry
+            .require_local_host(&format!("AI agent run {run_id}"))?;
+
         // Step 1: Load the run record
         let run = self.run_service.get_run(run_id).await?;
 
@@ -4585,6 +4591,7 @@ mod tests {
             project_type: temps_entities::types::ProjectType::Server,
             service_template: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 

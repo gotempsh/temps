@@ -371,6 +371,7 @@ pub(super) async fn set_managed_record(
                 project_id: request.project_id,
                 environment_id: request.environment_id,
                 controller: None,
+                run_id: None,
             },
         )
         .await;
@@ -523,6 +524,7 @@ pub(super) async fn import_managed_record(
                 project_id: request.project_id,
                 environment_id: request.environment_id,
                 controller: None,
+                run_id: None,
             },
         )
         .await;

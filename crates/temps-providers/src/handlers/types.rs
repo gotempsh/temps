@@ -29,6 +29,9 @@ pub struct AppState {
     /// Metrics store for time-series metric queries and writes.
     /// Optional — present only when the metrics subsystem is enabled in config.
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Worker metrics reporting status (ADR 061); `None` when the control
+    /// plane runs without a metrics store.
+    pub worker_metrics_status: Option<Arc<temps_metrics::WorkerMetricsStatusBoard>>,
     /// Direct DB connection for alert rule CRUD (monitoring_alert_rules table).
     pub db: Arc<DatabaseConnection>,
     /// API key service — used to provision `si_` ingest keys when metrics are

@@ -3277,6 +3277,7 @@ impl ProjectService {
             preset_config,
             ai_alert_summaries_enabled,
             cross_project_trace_sharing,
+            serves_own_temps_api,
             error_source_context_enabled,
             vulnerability_scanning_enabled,
             error_source_root,
@@ -3695,6 +3696,22 @@ impl ProjectService {
                 )))?;
             let mut active_project: projects::ActiveModel = project.into();
             active_project.cross_project_trace_sharing = Set(sharing);
+            active_project.update(self.db.as_ref()).await?;
+        }
+
+        // Whether the project's own app answers `/api/_temps` and `/api/otel`.
+        // The proxy reads it from the route table, which the projects route
+        // trigger reloads when this column changes.
+        if let Some(serves) = serves_own_temps_api {
+            let project = projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or(ProjectError::NotFound(format!(
+                    "Project {} not found",
+                    project_id
+                )))?;
+            let mut active_project: projects::ActiveModel = project.into();
+            active_project.serves_own_temps_api = Set(serves);
             active_project.update(self.db.as_ref()).await?;
         }
 
@@ -6962,6 +6979,7 @@ impl ProjectService {
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             github_webhook_id: db_project.github_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
+            serves_own_temps_api: db_project.serves_own_temps_api,
             image_retention_hours: db_project.image_retention_hours,
         }
     }

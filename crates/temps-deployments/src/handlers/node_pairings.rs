@@ -221,6 +221,10 @@ pub(crate) fn pairing_problem(error: NodePairingAdminError) -> Problem {
         NodePairingAdminError::InvalidMeshAddress { .. } => {
             internal("reserve a mesh address", &error)
         }
+        NodePairingAdminError::Rejoin(source) => Problem::from(source),
+        NodePairingAdminError::InvalidNodeMeshAddress { .. } => {
+            internal("read the node's mesh address", &error)
+        }
     }
 }
 

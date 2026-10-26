@@ -2742,6 +2742,10 @@ mod tests {
             environment_id: env.id,
             domain: env.subdomain.clone(),
             created_at: chrono::Utc::now(),
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

@@ -360,6 +360,14 @@ pub struct CloudSettings {
     #[serde(default)]
     pub console_access_enabled: bool,
 
+    /// Set once Temps Cloud's bootstrap file has applied its telemetry-export
+    /// consent (ADR-045 Amendment 2). Cloud drops that file on every upgrade
+    /// of a hosted plane; this makes the consent apply exactly once, so an
+    /// operator who later turns telemetry off is not overridden by the next
+    /// upgrade. Never set on a self-hosted instance.
+    #[serde(default)]
+    pub telemetry_consent_bootstrapped: bool,
+
     /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
     /// backs Cloud-primary telemetry writes.
     ///
@@ -526,6 +534,7 @@ impl Default for CloudSettings {
             notifications_enabled: false,
             // Linking never changes this explicit operator consent.
             console_access_enabled: false,
+            telemetry_consent_bootstrapped: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
             // ADR-042 §3: unthrottled by default. "Activate now" is what the
             // customer paid for, and a throttle nobody asked for makes a long

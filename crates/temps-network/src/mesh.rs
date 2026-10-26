@@ -360,14 +360,24 @@ pub struct MeshIdentityClaim {
     pub holder: MeshIdentityHolder,
 }
 
-/// The one mesh-pool address a registration may claim (ADR 055): the
-/// address `pairing_id` reserved, for a registration that came through that
-/// pairing, over the node API, from that address. A worker that joined
-/// outbound only registers under its own mesh address.
+/// The one mesh-pool address a registration may claim: its own, reached
+/// over the node API from that very address, which WireGuard routes only to
+/// the key that holds it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OwnMeshAddress {
-    pub pairing_id: i32,
+    pub owner: MeshAddressOwner,
     pub address: Ipv4Addr,
+}
+
+/// Whose mesh address an [`OwnMeshAddress`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeshAddressOwner {
+    /// The pairing that reserved it, for a worker that joined outbound only
+    /// and registers through that pairing (ADR 055).
+    Pairing(i32),
+    /// The node that already holds it, re-registering under its own name
+    /// when it joins the same control plane again (ADR 060).
+    Node(i32),
 }
 
 /// `addresses` without the registration's own mesh address (ADR 055). The
@@ -953,9 +963,11 @@ mod db {
     /// node and pairing lookups keep that true for rows written before the
     /// pool was frozen for pending pairings, and name the holder.
     ///
-    /// `own` is the registration's own mesh address (ADR 055): exempt from
-    /// the pool check and from its own pairing's reservation, but never from
-    /// a node holding it or from being the control plane's address.
+    /// `own` is the registration's own mesh address: exempt from the pool
+    /// check and from its own pairing's reservation (ADR 055), or from the
+    /// node that holds it when that node re-registers (ADR 060), but never
+    /// from another node holding it or from being the control plane's
+    /// address.
     pub async fn mesh_identity_claimed(
         db: &DatabaseConnection,
         claimed: &[String],
@@ -981,12 +993,22 @@ mod db {
                 .map(|(value, _)| value.clone())
                 .unwrap_or_else(|| address.to_string())
         };
-        if let Some(node) = nodes::Entity::find()
-            .filter(nodes::Column::MeshWgAddress.is_in(texts.clone()))
-            .order_by_asc(nodes::Column::Id)
-            .one(db)
-            .await?
+        let mut holders =
+            nodes::Entity::find().filter(nodes::Column::MeshWgAddress.is_in(texts.clone()));
+        // A node re-registering is not refused for the address it holds
+        // itself (ADR 060); any other node holding a claimed address is.
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Node(node_id),
+            address,
+        }) = own
         {
+            holders = holders.filter(
+                sea_orm::Condition::any()
+                    .add(nodes::Column::Id.ne(node_id))
+                    .add(nodes::Column::MeshWgAddress.ne(address.to_string())),
+            );
+        }
+        if let Some(node) = holders.order_by_asc(nodes::Column::Id).one(db).await? {
             return Ok(Some(MeshIdentityClaim {
                 claimed: claimed_text(node.mesh_wg_address.as_deref().unwrap_or_default()),
                 holder: MeshIdentityHolder::Node {
@@ -998,9 +1020,12 @@ mod db {
         let mut pairings = temps_entities::node_pairings::Entity::find()
             .filter(temps_entities::node_pairings::Column::MeshAddress.is_in(texts))
             .filter(temps_entities::node_pairings::Column::Status.is_in(crate::pairing::PENDING));
-        if let Some(own) = own {
-            pairings =
-                pairings.filter(temps_entities::node_pairings::Column::Id.ne(own.pairing_id));
+        if let Some(OwnMeshAddress {
+            owner: MeshAddressOwner::Pairing(pairing_id),
+            ..
+        }) = own
+        {
+            pairings = pairings.filter(temps_entities::node_pairings::Column::Id.ne(pairing_id));
         }
         if let Some(pairing) = pairings
             .order_by_asc(temps_entities::node_pairings::Column::Id)

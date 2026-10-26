@@ -32,8 +32,8 @@ use temps_config::ConfigService;
 use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
     agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
-    external_services, project_services, projects, sandbox_events, sandbox_services, sandboxes,
-    service_members, users,
+    external_services, nodes, project_services, projects, sandbox_events, sandbox_services,
+    sandboxes, service_members, users,
 };
 use temps_git::GitProviderManager;
 
@@ -1334,6 +1334,11 @@ pub struct SandboxService {
     /// Worker nodes whose sandboxes are being evicted right now. They take
     /// no new sandboxes, and a second eviction of the same node is refused.
     evicting_nodes: Arc<EvictingNodes>,
+    /// This server is a control plane that runs no workloads (ADR 063):
+    /// placement never picks it, and anything that needs its own host is
+    /// refused with a typed error. `false` on every install that runs
+    /// workloads.
+    control_plane_runs_no_workloads: bool,
 }
 
 /// Worker nodes with an eviction in progress in this process (ADR-048).
@@ -1406,7 +1411,20 @@ impl SandboxService {
             runtime_credentials: None,
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
+            control_plane_runs_no_workloads: false,
         }
+    }
+
+    /// Whether this server runs workloads itself (ADR 063). With `false`,
+    /// sandboxes are placed on worker nodes only.
+    pub fn with_local_workloads(mut self, enabled: bool) -> Self {
+        self.control_plane_runs_no_workloads = !enabled;
+        self
+    }
+
+    /// Whether this server runs sandboxes on its own host.
+    pub fn runs_local_sandboxes(&self) -> bool {
+        !self.control_plane_runs_no_workloads
     }
 
     pub fn with_runtime_credentials(
@@ -1847,7 +1865,10 @@ impl SandboxService {
                 operation: "load",
                 source,
             })?;
-        Ok(placement::PlacementPolicy { allowed_node_ids })
+        Ok(placement::PlacementPolicy {
+            allowed_node_ids,
+            control_plane_runs_no_workloads: self.control_plane_runs_no_workloads,
+        })
     }
 
     /// Every worker, with those being evicted marked unplaceable.
@@ -1884,6 +1905,10 @@ impl SandboxService {
         // Managed AI application workspaces live in a control-plane
         // directory; they cannot be placed elsewhere.
         if req.host_work_dir_override.is_some() {
+            // ADR 063: that directory is on a host that runs nothing.
+            if self.control_plane_runs_no_workloads {
+                return Err(SandboxError::no_local_host("An application workspace"));
+            }
             return match requested {
                 None | Some(placement::RequestedNode::ControlPlane) => Ok(None),
                 Some(_) => Err(SandboxError::Validation {
@@ -1911,6 +1936,26 @@ impl SandboxService {
         placement::settle(candidates, self.node_probe.as_ref()).await
     }
 
+    /// Whether `requested` names the control plane's own `nodes` row (role
+    /// `control-plane`), which [`placement::classify`] leaves out of the
+    /// worker list. Only asked when a lookup missed.
+    async fn is_control_plane_row(
+        &self,
+        requested: &placement::RequestedNode,
+    ) -> Result<bool, SandboxError> {
+        let query = match requested {
+            placement::RequestedNode::Id(id) => nodes::Entity::find_by_id(*id),
+            placement::RequestedNode::Name(name) => {
+                nodes::Entity::find().filter(nodes::Column::Name.eq(name.as_str()))
+            }
+            placement::RequestedNode::ControlPlane => return Ok(false),
+        };
+        Ok(query
+            .one(self.db.as_ref())
+            .await?
+            .is_some_and(|row| placement::is_control_plane_role(&row.role)))
+    }
+
     /// Every node with its sandbox placement state (control plane first).
     pub async fn placement_nodes(&self) -> Result<Vec<placement::PlacementNode>, SandboxError> {
         let policy = self.placement_policy().await?;
@@ -1929,13 +1974,21 @@ impl SandboxService {
         page_size: Option<u64>,
     ) -> Result<NodeSandboxes, SandboxError> {
         let (page, page_size) = node_sandboxes_page(page, page_size);
-        let requested = placement::RequestedNode::parse(node);
-        let found =
-            placement::find_node(self.placement_nodes().await?, &requested).ok_or_else(|| {
-                SandboxError::NodeNotFound {
-                    node: node.to_string(),
-                }
-            })?;
+        let mut requested = placement::RequestedNode::parse(node);
+        let listing = self.placement_nodes().await?;
+        // The node page addresses every node by its `nodes` row id,
+        // including the control plane's own row, which placement knows only
+        // as `0` / `control-plane`.
+        if placement::find_node(listing.clone(), &requested).is_none()
+            && self.is_control_plane_row(&requested).await?
+        {
+            requested = placement::RequestedNode::ControlPlane;
+        }
+        let found = placement::find_node(listing, &requested).ok_or_else(|| {
+            SandboxError::NodeNotFound {
+                node: node.to_string(),
+            }
+        })?;
 
         let mut query = sandboxes::Entity::find().filter(sandboxes::Column::Status.ne("destroyed"));
         query = if found.is_control_plane {
@@ -9271,6 +9324,7 @@ mod storage_cleanup_tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            serves_own_temps_api: false,
             image_retention_hours: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
@@ -10624,6 +10678,134 @@ mod storage_cleanup_tests {
             .await
             .expect("control plane");
         assert_eq!(placed, None);
+    }
+
+    /// ADR 063: on a control plane that runs no workloads, a create with no
+    /// node goes to a worker (the control plane is never a candidate).
+    #[tokio::test]
+    async fn without_local_workloads_default_placement_picks_a_worker() {
+        let db = Arc::new(
+            settings_and_worker(MockDatabase::new(DatabaseBackend::Postgres))
+                .append_query_results([Vec::<sandboxes::Model>::new()])
+                .into_connection(),
+        );
+        let service = super::tests::preview_test_service_with_db(db).with_local_workloads(false);
+        assert!(!service.runs_local_sandboxes());
+
+        let placed = service
+            .place_sandbox(&CreateSandboxRequest::default())
+            .await
+            .expect("a worker");
+        assert_eq!(placed, Some(7));
+
+        // Naming the control plane is refused rather than honoured.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                .into_connection(),
+        );
+        let service = super::tests::preview_test_service_with_db(db).with_local_workloads(false);
+        let req = CreateSandboxRequest {
+            node: Some("control-plane".into()),
+            ..Default::default()
+        };
+        let err = service
+            .place_sandbox(&req)
+            .await
+            .expect_err("no local host");
+        assert!(matches!(err, SandboxError::NoLocalHost { .. }), "{err:?}");
+    }
+
+    /// ADR 063: with no worker at all, the create fails with the
+    /// worker-node-required error, not a 404 or a local fallback.
+    #[tokio::test]
+    async fn without_local_workloads_and_no_worker_placement_needs_a_worker_node() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                // only the control plane's own row
+                .append_query_results([vec![crate::services::placement::tests::node_row(
+                    "control-plane",
+                    "active",
+                    Some(1),
+                )]])
+                .append_query_results([Vec::<sandboxes::Model>::new()])
+                .into_connection(),
+        );
+        let service = super::tests::preview_test_service_with_db(db).with_local_workloads(false);
+        let err = service
+            .place_sandbox(&CreateSandboxRequest::default())
+            .await
+            .expect_err("no worker");
+        assert!(
+            matches!(&err, SandboxError::NoWorkerNodeForSandboxes { detail }
+                if detail == "no worker node has joined it yet"),
+            "{err:?}"
+        );
+    }
+
+    /// ADR 063: an application workspace needs a directory on this host,
+    /// which runs nothing; refused before any database work.
+    #[tokio::test]
+    async fn without_local_workloads_application_workspaces_are_refused() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = super::tests::preview_test_service_with_db(db).with_local_workloads(false);
+        let req = CreateSandboxRequest {
+            host_work_dir_override: Some(PathBuf::from("/tmp/app-workspace")),
+            ..Default::default()
+        };
+        let err = service
+            .place_sandbox(&req)
+            .await
+            .expect_err("no local host");
+        let SandboxError::NoLocalHost { message } = &err else {
+            panic!("expected NoLocalHost, got {err:?}");
+        };
+        assert!(
+            message.starts_with("An application workspace needs a sandbox"),
+            "{message}"
+        );
+    }
+
+    /// The node page asks for the control plane by its `nodes` row id; that
+    /// resolves to the control plane instead of "node does not exist".
+    #[tokio::test]
+    async fn the_control_planes_own_row_lists_the_control_planes_sandboxes() {
+        let mut cp_row =
+            crate::services::placement::tests::node_row("control-plane", "active", Some(1));
+        cp_row.id = 1;
+        cp_row.name = "cp-1".into();
+        for local_workloads in [true, false] {
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+                    .append_query_results([vec![cp_row.clone()]])
+                    .append_query_results([Vec::<sandboxes::Model>::new()])
+                    // the miss path: is node 1 the control plane's row?
+                    .append_query_results([vec![cp_row.clone()]])
+                    .append_query_results([[std::collections::BTreeMap::from([(
+                        "num_items",
+                        sea_orm::Value::BigInt(Some(0)),
+                    )])]])
+                    .append_query_results([Vec::<sandboxes::Model>::new()])
+                    .into_connection(),
+            );
+            let service = super::tests::preview_test_service_with_db(db)
+                .with_local_workloads(local_workloads);
+            let listing = service
+                .node_sandboxes("1", None, None)
+                .await
+                .expect("the control plane");
+            assert!(listing.node.is_control_plane);
+            assert_eq!(listing.node.eligible, local_workloads);
+            if !local_workloads {
+                assert_eq!(
+                    listing.node.reason.as_deref(),
+                    Some(placement::CONTROL_PLANE_RUNS_NO_WORKLOADS_REASON)
+                );
+            }
+            assert_eq!(listing.total, 0);
+        }
     }
 
     #[test]

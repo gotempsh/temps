@@ -16,6 +16,7 @@ pub mod error;
 pub mod handlers;
 pub mod plugin;
 pub mod provider;
+pub mod reachability;
 pub mod registry;
 pub mod service;
 pub mod wire;

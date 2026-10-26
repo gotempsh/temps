@@ -7,6 +7,7 @@ import {
   type DnsProviderCredentials,
   type DnsProviderType as ApiDnsProviderType,
 } from '@/api/client'
+import { CloudflareTokenGuide } from '@/components/domains/CloudflareTokenGuide'
 import { requireDeliveryData } from '@/components/domains/delivery-errors'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -429,7 +430,14 @@ export function AddDnsProvider() {
       toast.success('DNS provider created successfully')
       queryClient.invalidateQueries({ queryKey: ['dnsProviders'] })
       if (provider) {
-        navigate(`/dns-providers/${provider.id}`)
+        // Opened from a form that needs a provider (e.g. a tunnel's setup):
+        // go back to it. Only paths inside this app.
+        const back = searchParams.get('return')
+        navigate(
+          back && back.startsWith('/') && !back.startsWith('//')
+            ? back
+            : `/dns-providers/${provider.id}`
+        )
       }
     },
     onError: (err: Error) => {
@@ -981,10 +989,7 @@ export function AddDnsProvider() {
                         {...field}
                       />
                     </FormControl>
-                    <FormDescription>
-                      Create a token with Zone:Read and DNS:Edit permissions at
-                      dash.cloudflare.com/profile/api-tokens
-                    </FormDescription>
+                    <CloudflareTokenGuide />
                     <FormMessage />
                   </FormItem>
                 )}

@@ -16,6 +16,7 @@ const project = {
   source_type: 'git',
   cross_project_trace_sharing: true,
   error_source_context_enabled: false,
+  serves_own_temps_api: false,
 } as unknown as ProjectResponse
 
 function render(): string {
@@ -73,7 +74,7 @@ test('service name and slug inputs are named by their visible labels', () => {
   expect(labelFor(markup, slugInput?.id ?? '')).toBe('Service slug')
 })
 
-test('both settings switches are named by their labels', () => {
+test('the settings switches are named by their labels', () => {
   const markup = render()
 
   expect(markup).toContain('id="cross-project-trace-sharing"')
@@ -85,6 +86,18 @@ test('both settings switches are named by their labels', () => {
   expect(labelFor(markup, 'error-source-context')).toBe(
     'Source code in stack traces'
   )
+  expect(markup).toContain('id="serves-own-temps-api"')
+  expect(labelFor(markup, 'serves-own-temps-api')).toBe(
+    'App serves its own Temps API'
+  )
+})
+
+test('the Temps API routing switch is off by default and says what it moves', () => {
+  const markup = render()
+  const tag = /<button\b[^>]*id="serves-own-temps-api"[^>]*>/.exec(markup)?.[0]
+  expect(tag).toContain('aria-checked="false"')
+  expect(markup).toContain('<code>/api/_temps</code>')
+  expect(markup).toContain('<code>/api/otel</code>')
 })
 
 test('every switch on the page is reachable through a label or a name', () => {

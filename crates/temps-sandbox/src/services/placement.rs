@@ -14,6 +14,10 @@
 //!   wins (ties → lowest id).
 //! * A dedicated node (`temps.sh/role=dedicated`) is never chosen
 //!   automatically; it takes a sandbox only when the request names it.
+//! * On a control plane that runs no workloads (ADR 063) the control plane
+//!   is never a candidate, whatever the allow-list says: an explicit request
+//!   for it is refused, and automatic placement with no usable worker fails
+//!   with the worker-node-required problem pointing at Settings → Nodes.
 
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter, QueryOrder,
@@ -40,15 +44,27 @@ const PLACEABLE_STATUS: &str = "active";
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PlacementPolicy {
     pub allowed_node_ids: Option<Vec<i32>>,
+    /// This server is a control plane that runs no workloads (ADR 063), so
+    /// the control plane itself never takes a sandbox. `false` (the
+    /// default) on every install that runs workloads.
+    pub control_plane_runs_no_workloads: bool,
 }
 
 impl PlacementPolicy {
     pub fn allows(&self, node_id: i32) -> bool {
+        if node_id == CONTROL_PLANE_NODE_ID && self.control_plane_runs_no_workloads {
+            return false;
+        }
         self.allowed_node_ids
             .as_ref()
             .is_none_or(|ids| ids.contains(&node_id))
     }
 }
+
+/// Why the control plane takes no sandboxes on a server that runs no
+/// workloads; shown in the placement listing and on its node page.
+pub const CONTROL_PLANE_RUNS_NO_WORKLOADS_REASON: &str =
+    "this control plane runs no workloads; sandboxes run on worker nodes";
 
 /// How a caller named a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +276,9 @@ pub fn candidates(
 ) -> Result<Candidates, SandboxError> {
     match requested {
         Some(RequestedNode::ControlPlane) => {
+            if policy.control_plane_runs_no_workloads {
+                return Err(SandboxError::control_plane_requested_without_workloads());
+            }
             if policy.allows(CONTROL_PLANE_NODE_ID) {
                 Ok(Candidates::ControlPlane)
             } else {
@@ -309,6 +328,11 @@ pub fn candidates(
                 .partition(|w| !w.dedicated);
             if ranked.is_empty() {
                 if dedicated.is_empty() {
+                    if policy.control_plane_runs_no_workloads {
+                        return Err(SandboxError::NoWorkerNodeForSandboxes {
+                            detail: why_no_worker(policy, workers),
+                        });
+                    }
                     return Err(SandboxError::NoPlacementNode);
                 }
                 return Err(SandboxError::DedicatedNodesOnly {
@@ -331,6 +355,34 @@ pub fn candidates(
             ))
         }
     }
+}
+
+/// Why automatic placement found no worker, naming each one: the detail of
+/// [`SandboxError::NoWorkerNodeForSandboxes`].
+fn why_no_worker(policy: &PlacementPolicy, workers: &[WorkerNode]) -> String {
+    if workers.is_empty() {
+        return "no worker node has joined it yet".to_string();
+    }
+    let reasons: Vec<String> = workers
+        .iter()
+        .map(|w| {
+            let why = if !policy.allows(w.id) {
+                "excluded by sandbox placement settings".to_string()
+            } else {
+                match w.placeable() {
+                    Err(why) => why.reason(),
+                    // Only dedicated workers are placeable but unranked, and
+                    // those are reported by `DedicatedNodesOnly` instead.
+                    Ok(()) => "only takes sandboxes that request it".to_string(),
+                }
+            };
+            format!("node '{}': {why}", w.name)
+        })
+        .collect();
+    format!(
+        "none of its worker nodes can take one ({})",
+        reasons.join("; ")
+    )
 }
 
 /// [`candidates`] without asking any worker: the node placement would try
@@ -486,6 +538,11 @@ pub fn describe(
     live: &HashMap<i32, u64>,
 ) -> Vec<PlacementNode> {
     let cp_allowed = policy.allows(CONTROL_PLANE_NODE_ID);
+    let cp_reason = if policy.control_plane_runs_no_workloads {
+        Some(CONTROL_PLANE_RUNS_NO_WORKLOADS_REASON.to_string())
+    } else {
+        (!cp_allowed).then(|| "excluded by sandbox placement settings".to_string())
+    };
     let mut out = vec![PlacementNode {
         id: CONTROL_PLANE_NODE_ID,
         name: CONTROL_PLANE_NAME.to_string(),
@@ -493,7 +550,7 @@ pub fn describe(
         status: PLACEABLE_STATUS.to_string(),
         allowed: cp_allowed,
         eligible: cp_allowed,
-        reason: (!cp_allowed).then(|| "excluded by sandbox placement settings".to_string()),
+        reason: cp_reason,
         live_sandboxes: live.get(&CONTROL_PLANE_NODE_ID).copied().unwrap_or(0),
         dedicated: false,
     }];
@@ -533,13 +590,18 @@ pub async fn load_workers(db: &DatabaseConnection) -> Result<Vec<WorkerNode>, Sa
         .collect())
 }
 
+/// Whether a `nodes.role` is the control plane's own row.
+pub fn is_control_plane_role(role: &str) -> bool {
+    role == "control-plane"
+}
+
 /// Turn a node row into a sandbox worker, or `None` for the control plane,
 /// which is never a sandbox worker even if it has a row. Build-only nodes,
 /// nodes with a plain `http://` agent address and active nodes with stale
 /// heartbeats are kept but blocked, so the operator sees why they don't take
 /// sandboxes.
 pub fn classify(n: nodes::Model, now: chrono::DateTime<chrono::Utc>) -> Option<WorkerNode> {
-    if n.role == "control-plane" {
+    if is_control_plane_role(&n.role) {
         return None;
     }
     let role = n.labels.get(NODE_ROLE_LABEL).and_then(|v| v.as_str());
@@ -688,6 +750,7 @@ pub(crate) mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: now,
             updated_at: now,
         }
@@ -816,7 +879,121 @@ pub(crate) mod tests {
     fn only(ids: &[i32]) -> PlacementPolicy {
         PlacementPolicy {
             allowed_node_ids: Some(ids.to_vec()),
+            ..Default::default()
         }
+    }
+
+    /// A control plane that runs no workloads (ADR 063), with `allowed`
+    /// as its allow-list.
+    fn no_workloads(allowed: Option<&[i32]>) -> PlacementPolicy {
+        PlacementPolicy {
+            allowed_node_ids: allowed.map(<[i32]>::to_vec),
+            control_plane_runs_no_workloads: true,
+        }
+    }
+
+    #[test]
+    fn without_local_workloads_the_control_plane_is_never_chosen() {
+        let live = HashMap::from([(0, 0), (3, 5), (4, 1)]);
+        // Even an allow-list that names the control plane, and even when it
+        // is the emptiest node, automatic placement ranks workers only.
+        for allowed in [None, Some(&[0, 3, 4][..]), Some(&[0, 4][..])] {
+            let policy = no_workloads(allowed);
+            assert!(!policy.allows(CONTROL_PLANE_NODE_ID));
+            assert_eq!(
+                choose(&policy, &workers(), &live, None).unwrap(),
+                Some(4),
+                "{allowed:?}"
+            );
+            match candidates(&policy, &workers(), &live, None).unwrap() {
+                Candidates::Ranked(ranked) => {
+                    assert!(ranked.iter().all(|(id, _)| *id != CONTROL_PLANE_NODE_ID))
+                }
+                other => panic!("expected ranked workers, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn without_local_workloads_an_explicit_control_plane_request_is_refused() {
+        let cp = RequestedNode::parse("control-plane");
+        let err = choose(&no_workloads(None), &workers(), &HashMap::new(), Some(&cp)).unwrap_err();
+        assert!(matches!(err, SandboxError::NoLocalHost { .. }), "{err:?}");
+        let message = err.to_string();
+        assert!(message.contains("runs no workloads"), "{message}");
+        assert!(message.contains("Leave `node` empty"), "{message}");
+        // Named workers are still placed as asked.
+        let w2 = RequestedNode::parse("worker-2");
+        assert_eq!(
+            choose(&no_workloads(None), &workers(), &HashMap::new(), Some(&w2)).unwrap(),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn without_local_workloads_and_no_worker_the_error_points_at_worker_nodes() {
+        let err = choose(&no_workloads(None), &[], &HashMap::new(), None).unwrap_err();
+        match &err {
+            SandboxError::NoWorkerNodeForSandboxes { detail } => {
+                assert_eq!(detail, "no worker node has joined it yet")
+            }
+            other => panic!("expected NoWorkerNodeForSandboxes, got {other:?}"),
+        }
+
+        // Workers exist but none can take one: each is named with why.
+        let mut ws = workers();
+        ws[0].blocked = Some(Blocked::BuildOnly);
+        let err = choose(&no_workloads(Some(&[0, 3, 5])), &ws, &HashMap::new(), None).unwrap_err();
+        let SandboxError::NoWorkerNodeForSandboxes { detail } = &err else {
+            panic!("expected NoWorkerNodeForSandboxes, got {err:?}");
+        };
+        assert!(
+            detail.contains("node 'worker-1': node is a build-only node"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("node 'worker-2': excluded by sandbox placement settings"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("node 'worker-3': node is offline"),
+            "{detail}"
+        );
+
+        // The same server running workloads keeps the old error.
+        let err = choose(&only(&[5]), &workers(), &HashMap::new(), None).unwrap_err();
+        assert!(matches!(err, SandboxError::NoPlacementNode));
+    }
+
+    #[test]
+    fn without_local_workloads_the_listing_explains_the_control_plane() {
+        let rows = describe(&no_workloads(None), &workers(), &HashMap::new());
+        assert!(rows[0].is_control_plane);
+        assert!(!rows[0].allowed);
+        assert!(!rows[0].eligible);
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some(CONTROL_PLANE_RUNS_NO_WORKLOADS_REASON)
+        );
+        assert!(rows[1].eligible, "workers are unaffected");
+        // A full install still reports the allow-list reason.
+        let rows = describe(&only(&[3]), &workers(), &HashMap::new());
+        assert_eq!(
+            rows[0].reason.as_deref(),
+            Some("excluded by sandbox placement settings")
+        );
+    }
+
+    #[tokio::test]
+    async fn without_local_workloads_settling_never_lands_on_the_control_plane() {
+        let probe = EveryNodeReady;
+        let placed = settle(
+            candidates(&no_workloads(None), &workers(), &HashMap::new(), None).unwrap(),
+            &probe,
+        )
+        .await
+        .unwrap();
+        assert_eq!(placed, Some(3));
     }
 
     #[test]

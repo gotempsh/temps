@@ -18,6 +18,7 @@ pub mod node_pairing_admin;
 pub mod node_ssh;
 pub mod node_ssh_enrollment;
 pub mod wireguard_mesh;
+pub mod worker_metrics_collector;
 
 pub mod job_processor;
 pub use job_processor::*;

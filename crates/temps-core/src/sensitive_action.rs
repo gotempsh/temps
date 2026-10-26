@@ -144,6 +144,14 @@ pub enum SensitiveAction {
     ChangeDockerSocketHealth {
         project_id: i32,
     },
+    /// Change who an existing address is for (ADR 064 Security), either
+    /// way: private to public exposes what it serves to the internet;
+    /// public to private locks out everyone outside the network.
+    ChangeAddressAudience {
+        hostname: String,
+        from: String,
+        to: String,
+    },
 }
 
 impl SensitiveAction {
@@ -188,6 +196,7 @@ impl SensitiveAction {
             Self::ClaimDockerSocketSlug { .. } => "claim_docker_socket_slug",
             Self::ReleaseDockerSocketSlug { .. } => "release_docker_socket_slug",
             Self::ChangeDockerSocketHealth { .. } => "change_docker_socket_health",
+            Self::ChangeAddressAudience { .. } => "change_address_audience",
         }
     }
 }
@@ -385,6 +394,15 @@ mod tests {
         assert_eq!(
             SensitiveAction::RetentionRetroactiveApply { project_id: 42 }.as_str(),
             "retention_retroactive_apply"
+        );
+        assert_eq!(
+            SensitiveAction::ChangeAddressAudience {
+                hostname: "internal.example.com".to_string(),
+                from: "private".to_string(),
+                to: "public".to_string(),
+            }
+            .as_str(),
+            "change_address_audience"
         );
     }
 

@@ -159,7 +159,8 @@ impl CloudflareTunnelProvider {
             return Err(IngressError::Provider(format!(
                 "Cloudflare refused the API token of DNS provider '{}' to {operation}: {detail}. \
                  Edit that token in Cloudflare (My Profile → API Tokens) so it has \
-                 'Account · Cloudflare Tunnel · Edit' and 'Zone · DNS · Edit', then retry.",
+                 'Zone · Zone · Read', 'Zone · DNS · Edit' and \
+                 'Account · Cloudflare Tunnel · Edit', then retry.",
                 self.credential_label
             )));
         }
@@ -642,7 +643,8 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
             summary: "The worker connects out to Cloudflare, and visitors reach your apps through Cloudflare's network. No public IP, open port or port forward.".to_string(),
             requirements: vec![
                 "A domain on Cloudflare (the free plan works)".to_string(),
-                "That domain added in Temps under a Cloudflare DNS provider whose API token has 'Account · Cloudflare Tunnel · Edit' and 'Zone · DNS · Edit'".to_string(),
+                "That domain added in Temps under a Cloudflare DNS provider".to_string(),
+                "Its API token with only 'Zone · Zone · Read', 'Zone · DNS · Edit' and 'Account · Cloudflare Tunnel · Edit', limited to that account and zone".to_string(),
             ],
             needs_public_ip: false,
             works_behind_cgnat: true,

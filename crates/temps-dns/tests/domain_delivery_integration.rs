@@ -1687,6 +1687,7 @@ async fn test_retry_refuses_record_changed_after_the_failed_attempt_wrote_it() {
             project_id: Some(project_id),
             environment_id: Some(environment_id),
             controller: Some("domain-delivery"),
+            run_id: None,
         });
     }
     let error = service

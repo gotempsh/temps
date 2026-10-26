@@ -852,6 +852,11 @@ fn attach_failure_problem(
         unsupported @ AgentError::SandboxUnsupportedOnNode { .. } => {
             Problem::from(crate::error::from_agent_error(sandbox_id, unsupported))
         }
+        // A sandbox addressed to a control plane that runs no workloads
+        // (ADR 063): say so, rather than suggesting an image problem.
+        no_host @ AgentError::NoLocalSandboxHost { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, no_host))
+        }
         // The VM died between the liveness check and the attach: the same
         // problem (type, title, how to recover) the liveness check returns.
         not_running @ AgentError::SandboxNotRunning { .. } => {

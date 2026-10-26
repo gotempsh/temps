@@ -137,7 +137,8 @@ pub enum AgentError {
     /// is valid, it just cannot be served where this sandbox lives.
     #[error(
         "{feature} is not available yet for sandboxes on worker nodes ({}). \
-         Create the sandbox on the control plane to use it.",
+         Create the sandbox on the control plane to use it (on an install whose \
+         control plane runs workloads itself).",
         unsupported_scope(sandbox_id, node_name)
     )]
     SandboxUnsupportedOnNode {
@@ -145,6 +146,20 @@ pub enum AgentError {
         node_name: String,
         feature: String,
     },
+
+    /// Something asked for a sandbox on this server's own host, and this
+    /// server is a control plane that runs no workloads (ADR 063). Sandboxes
+    /// with a worker node are unaffected; this is what the host half of the
+    /// node router answers instead of falling back to an unsandboxed
+    /// provider. `operation` names what was attempted.
+    #[error(
+        "{operation} needs a sandbox on this server, but this control plane runs no \
+         workloads (serve profile 'control-plane'), so nothing runs on its own host. \
+         Standalone sandboxes run on worker nodes (Settings → Nodes, /settings/nodes); \
+         AI agent runs, autofix and application workspaces cannot run on worker nodes \
+         yet, so run them on an install whose control plane runs workloads."
+    )]
+    NoLocalSandboxHost { operation: String },
 
     /// A worker node refused to create a sandbox because it would replace a
     /// live one (a running sandbox or a create in flight under the same
@@ -206,6 +221,15 @@ pub enum AgentError {
     )]
     DockerSocketWriteRequiresAdmin { slug: String },
 }
+
+/// RFC 7807 `type` of [`AgentError::NoLocalSandboxHost`] responses (ADR 063).
+pub const NO_LOCAL_SANDBOX_HOST_TYPE: &str =
+    "https://temps.sh/probs/control-plane-runs-no-workloads";
+/// Title of [`AgentError::NoLocalSandboxHost`] responses.
+pub const NO_LOCAL_SANDBOX_HOST_TITLE: &str = "This Control Plane Runs No Workloads";
+/// Machine-readable `error_code` of [`AgentError::NoLocalSandboxHost`]
+/// responses, so a client can branch without parsing prose.
+pub const NO_LOCAL_SANDBOX_HOST_ERROR_CODE: &str = "CONTROL_PLANE_RUNS_NO_WORKLOADS";
 
 fn unsupported_scope(sandbox_id: &str, node_name: &str) -> String {
     if sandbox_id.is_empty() {

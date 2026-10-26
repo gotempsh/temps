@@ -38,6 +38,7 @@ pub mod manager;
 pub mod mesh;
 pub mod mesh_doctor;
 pub mod occupied;
+pub mod overlay_name;
 pub mod overlay_routes;
 
 #[cfg(target_os = "linux")]
@@ -59,6 +60,7 @@ pub use config::{NetworkConfig, NodeAlloc, Peer, Transport};
 pub use diff::{PeerDiff, RouteDiff};
 pub use error::NetworkError;
 pub use manager::NetworkManager;
+pub use overlay_name::{OverlayNames, DEFAULT_OVERLAY_NETWORK_NAME};
 
 /// Convenient `Result` alias for the crate.
 pub type Result<T> = std::result::Result<T, NetworkError>;
@@ -88,6 +90,25 @@ pub async fn preflight_compute_routes(
 pub async fn preflight_compute_routes(
     _config: &NetworkConfig,
     _routed: &[ipnet::Ipv4Net],
+) -> Result<()> {
+    Ok(())
+}
+
+/// Release a previous overlay's VXLAN device and its peer routes through
+/// `config`'s bridge, keeping the bridge and Docker network (ADR 059). Used
+/// when this node's overlay network name changes.
+#[cfg(target_os = "linux")]
+pub async fn release_overlay_transport(
+    config: &NetworkConfig,
+    peer_cidrs: &[ipnet::Ipv4Net],
+) -> Result<()> {
+    linux::release_transport(config, peer_cidrs).await
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn release_overlay_transport(
+    _config: &NetworkConfig,
+    _peer_cidrs: &[ipnet::Ipv4Net],
 ) -> Result<()> {
     Ok(())
 }

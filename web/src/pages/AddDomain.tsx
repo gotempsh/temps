@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getCertificateMethodsOptions,
   createCustomDomainMutation,
   createDomainMutation,
   getEnvironmentsOptions,
@@ -9,6 +10,8 @@ import {
   setIngressHostnameChoiceMutation,
   updateIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { CloudflareTokenChecklist } from '@/components/domains/CloudflareTokenGuide'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -45,11 +48,12 @@ import {
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { useEnterSubmit } from '@/hooks/useEnterSubmit'
 import { problemDetail } from '@/lib/api-problem'
+import { certificateChoices } from '@/lib/reachability'
 import {
   chosenTunnel,
   levelsBelow,
@@ -100,6 +104,13 @@ export function AddDomain() {
     ...allTunnelsOptions(),
     retry: false,
   })
+  // HTTP-01 needs something answering on port 80 (ADR 064 D4).
+  const certificateMethods = useQuery({
+    ...getCertificateMethodsOptions(),
+    retry: false,
+    staleTime: 60_000,
+  })
+  const http01Available = certificateMethods.data?.http01_available
   const [attachProject, setAttachProject] = useState<string>('')
   const [attachEnvironment, setAttachEnvironment] = useState<string>('')
   const projectsQuery = useQuery({
@@ -381,6 +392,11 @@ export function AddDomain() {
                     name="challengeType"
                     render={({ field }) => {
                       const isWildcard = watchedValues.domain?.startsWith('*.')
+                      const choices = certificateChoices({
+                        coveringTunnels: covering.length,
+                        wildcard: !!isWildcard,
+                        http01Available,
+                      })
                       return (
                         <FormItem className="space-y-4">
                           <FormLabel>How it gets HTTPS</FormLabel>
@@ -451,7 +467,7 @@ export function AddDomain() {
                                   </Card>
                                 )
                               })}
-                              {!isWildcard && (
+                              {choices.showHttp01 && (
                                 <Card
                                   className={`relative cursor-pointer border-2 transition-colors ${field.value === 'http-01' ? 'border-primary' : 'border-border hover:border-primary/50'}`}
                                 >
@@ -466,7 +482,7 @@ export function AddDomain() {
                                         <Globe className="h-5 w-5 text-primary" />
                                         <div className="font-semibold">
                                           HTTP-01 Challenge
-                                          {covering.length === 0 &&
+                                          {choices.recommended === 'http-01' &&
                                             ' (Recommended)'}
                                         </div>
                                       </div>
@@ -513,6 +529,8 @@ export function AddDomain() {
                                       <Shield className="h-5 w-5 text-primary" />
                                       <div className="font-semibold">
                                         DNS-01 Challenge
+                                        {choices.recommended === 'dns-01' &&
+                                          ' (Recommended)'}
                                       </div>
                                     </div>
                                     <p className="text-sm text-muted-foreground">
@@ -543,6 +561,17 @@ export function AddDomain() {
                                   </div>
                                 </label>
                               </Card>
+                              {choices.http01Note && (
+                                <p className="text-sm text-muted-foreground">
+                                  {choices.http01Note}
+                                </p>
+                              )}
+                              {covering.length === 0 &&
+                                !connectorsQuery.isLoading && (
+                                  <NoTunnelYet
+                                    domain={watchedValues.domain ?? ''}
+                                  />
+                                )}
                             </RadioGroup>
                           </FormControl>
                           <FormMessage />
@@ -719,6 +748,49 @@ export function AddDomain() {
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * The tunnel way in, before any tunnel covers the domain: what it needs and
+ * where to set it up, so the choice is not silently missing.
+ */
+function NoTunnelYet({ domain }: { domain: string }) {
+  return (
+    <Card className="border-2 border-dashed">
+      <div className="flex items-start gap-4 p-4">
+        <Cloud className="mt-1 h-5 w-5 text-muted-foreground" />
+        <div className="flex-1 space-y-3">
+          <div className="space-y-1">
+            <div className="font-semibold">Through a Cloudflare Tunnel</div>
+            <p className="text-sm text-muted-foreground">
+              No tunnel covers {domain || 'this domain'} yet. With one, a worker
+              connects out to Cloudflare: no public IP or open port, and
+              Cloudflare serves HTTPS, so there is no certificate to issue here.
+            </p>
+          </div>
+          <div className="space-y-1 text-sm">
+            <p className="font-medium">You need</p>
+            <ul className="list-disc space-y-0.5 pl-5 text-muted-foreground">
+              <li>The domain on Cloudflare (the free plan works)</li>
+              <li>A worker node to run the tunnel</li>
+              <li>A Cloudflare API token with these permissions:</li>
+            </ul>
+          </div>
+          <CloudflareTokenChecklist />
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="button" size="sm" asChild>
+              <Link to={ingressSetupUrl({ via: 'tunnel' })}>
+                Set up a Cloudflare Tunnel
+              </Link>
+            </Button>
+            <span className="text-xs text-muted-foreground">
+              Then add {domain || 'the domain'} again: it is offered here.
+            </span>
+          </div>
+        </div>
+      </div>
+    </Card>
   )
 }
 

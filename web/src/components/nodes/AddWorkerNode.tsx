@@ -565,6 +565,12 @@ const INGRESS_CHOICES: {
       'It listens on ports 80 and 443 of the address holding its default route, such as a VPS with a public IP. No tunnels.',
   },
   {
+    value: 'private',
+    label: 'Only my private network (Tailscale)',
+    description:
+      'It listens only on its Tailscale address, on port 443 with 80 redirecting to HTTPS, for apps you make reachable on your tailnet. Nothing public.',
+  },
+  {
     value: 'off',
     label: 'No',
     description:

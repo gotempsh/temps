@@ -38,6 +38,7 @@ import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
+import { EnvironmentReachabilityList } from '@/components/reachability/EnvironmentReachabilityList'
 import { AddDomainDialog } from './AddDomainDialog'
 import { EditDomainDialog } from './EditDomainDialog'
 
@@ -226,6 +227,13 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         />
       )}
 
+      {/* Domains lead the page (DESIGN.md); each environment's reachability
+          follows them. An app hosted elsewhere is never served by Temps'
+          ingress. */}
+      {project.hosting !== 'external' && project.source_type !== 'external' && (
+        <EnvironmentReachabilityList projectId={project.id} />
+      )}
+
       <Collapsible className="border-t pt-6">
         <CollapsibleTrigger asChild>
           <Button variant="ghost" className="group w-full justify-between px-0">
@@ -237,7 +245,11 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           Optionally manage DNS records and deliver traffic through Cloudflare
           or bunny.net.
         </p>
-        <CollapsibleContent className="space-y-6 pt-4">
+        <CollapsibleContent
+          role="region"
+          aria-label="DNS and CDN settings"
+          className="space-y-6 pt-4"
+        >
           <Button variant="outline" onClick={() => configureDelivery()}>
             Configure delivery
           </Button>

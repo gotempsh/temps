@@ -24,6 +24,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use sea_orm::EntityTrait;
 use serde::{Deserialize, Serialize};
 use temps_core::problemdetails::{self, Problem};
 use temps_network::allocator::{
@@ -73,6 +74,24 @@ pub struct AllocEntry {
     pub compute_cidr: String,
     pub bridge_address: String,
     pub underlay_address: String,
+    /// The overlay network name this node uses (ADR 059): its override, else
+    /// the cluster's. Agents that predate it ignore the field and keep
+    /// `temps0`; an agent reading a control plane without it assumes
+    /// `temps0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_network_name: Option<String>,
+}
+
+/// The overlay network name a node uses: its own override, else the
+/// cluster's (ADR 059).
+pub(crate) fn effective_overlay_network_name(
+    node_override: Option<&str>,
+    cluster_default: Option<&str>,
+) -> String {
+    node_override
+        .or(cluster_default)
+        .unwrap_or(temps_network::DEFAULT_OVERLAY_NETWORK_NAME)
+        .to_string()
 }
 
 impl From<NodeAllocPersisted> for AllocEntry {
@@ -82,6 +101,7 @@ impl From<NodeAllocPersisted> for AllocEntry {
             compute_cidr: p.compute_cidr.to_string(),
             bridge_address: p.bridge_address.to_string(),
             underlay_address: p.underlay_address.to_string(),
+            overlay_network_name: None,
         }
     }
 }
@@ -232,8 +252,25 @@ pub async fn list_peers(
     if node.mesh_wg_address.is_some() && node.compute_cidr.is_none() {
         allocate_after_mesh_registration(&app_state, node_id).await;
     }
+    let cluster_network_name = temps_entities::network_config::Entity::find_by_id(1)
+        .one(app_state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(node_id, "network_config lookup failed: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(e.to_string())
+        })?
+        .map(|config| config.docker_network_name);
+    let overlay_network_name = effective_overlay_network_name(
+        node.overlay_network_name.as_deref(),
+        cluster_network_name.as_deref(),
+    );
     let alloc = match allocator.get_alloc(node_id).await {
-        Ok(a) => a.map(AllocEntry::from),
+        Ok(a) => a.map(|a| AllocEntry {
+            overlay_network_name: Some(overlay_network_name),
+            ..AllocEntry::from(a)
+        }),
         Err(AllocatorError::NodeNotFound { .. }) => {
             // The node existed at step 1 but vanished — extremely rare
             // race; treat as 404 rather than 500.
@@ -692,6 +729,40 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_name_is_the_node_override_else_the_cluster_default() {
+        assert_eq!(effective_overlay_network_name(None, None), "temps0");
+        assert_eq!(effective_overlay_network_name(None, Some("edge")), "edge");
+        assert_eq!(
+            effective_overlay_network_name(Some("temps1"), Some("edge")),
+            "temps1"
+        );
+    }
+
+    // ADR 059 compatibility: an old agent's alloc has no overlay name and a
+    // new agent reads its absence as `temps0`; both shapes deserialize.
+    #[test]
+    fn alloc_overlay_name_is_optional_on_the_wire() {
+        let old: AllocEntry = serde_json::from_str(
+            r#"{"node_id":"abc","compute_cidr":"172.20.1.0/24",
+                "bridge_address":"172.20.1.1","underlay_address":"10.0.0.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.overlay_network_name, None);
+        assert!(!serde_json::to_string(&old)
+            .unwrap()
+            .contains("overlay_network_name"));
+        let named = AllocEntry {
+            overlay_network_name: Some("temps1".into()),
+            ..old
+        };
+        let json = serde_json::to_string(&named).unwrap();
+        assert!(
+            json.contains("\"overlay_network_name\":\"temps1\""),
+            "{json}"
+        );
+    }
+
+    #[test]
     fn response_omits_alloc_when_none() {
         let resp = PeerListResponse {
             network: NetworkPoolEntry {
@@ -720,6 +791,7 @@ mod tests {
                 compute_cidr: "172.20.1.0/24".into(),
                 bridge_address: "172.20.1.1".into(),
                 underlay_address: "10.0.0.1".into(),
+                overlay_network_name: None,
             }),
             peers: vec![],
             cluster_dns_enabled: false,
@@ -823,6 +895,7 @@ mod tests {
             encryption_service: encryption_service(),
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             rate_limiter: Arc::new(RegistrationRateLimiter::new()),
+            plane_identity_rate_limiter: Arc::new(RegistrationRateLimiter::new()),
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db)),
             alarm_service: None,
             audit_service: Arc::new(

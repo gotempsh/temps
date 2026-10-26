@@ -1340,6 +1340,34 @@ impl ServeCommand {
                  `temps proxy` process). Health: GET {}/readyz",
                 serve_config.console_address
             );
+            // The host's cpu/memory/disk/network series for the Server page.
+            // The proxy samples them only when it shares this process, and a
+            // console-only deployment (a hosted control plane) runs no proxy
+            // at all, so this process owns them in split topology.
+            {
+                let config_service = Arc::new(temps_config::ConfigService::new(
+                    serve_config.clone(),
+                    db.clone(),
+                ));
+                let serve_config = serve_config.clone();
+                let db = db.clone();
+                rt.spawn(async move {
+                    let store = temps_proxy::service::metrics_sampler::build_metrics_store(
+                        &config_service,
+                        &serve_config,
+                        db,
+                    )
+                    .await;
+                    temps_metrics::NodeMetricsSampler::with_scope(
+                        store,
+                        config_service,
+                        serve_config.data_dir.clone(),
+                        temps_metrics::NodeMetricsScope::Host,
+                    )
+                    .run()
+                    .await;
+                });
+            }
             return rt.block_on(async move {
                 start_console_api(params).await.map_err(|e| {
                     tracing::error!("❌ Console API failed: {}", e);

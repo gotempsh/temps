@@ -446,6 +446,11 @@ const FunctionsSettingsPage = lazy(() =>
     default: m.FunctionsSettingsPage,
   }))
 )
+const IngressSetupPage = lazy(() =>
+  import('./pages/settings/IngressSetupPage').then((m) => ({
+    default: m.IngressSetupPage,
+  }))
+)
 const NodeDetailPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodeDetailPage,
@@ -929,6 +934,10 @@ const FullAppRoutes = () => {
                             element={<TelemetrySettingsPage />}
                           />
                           <Route path="nodes" element={<NodesPage />} />
+                          <Route
+                            path="nodes/ingress"
+                            element={<IngressSetupPage />}
+                          />
                           <Route
                             path="nodes/:nodeId"
                             element={<NodeDetailPage />}

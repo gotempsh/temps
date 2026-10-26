@@ -23,6 +23,20 @@ use tracing::warn;
 
 use crate::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 
+/// The series a heartbeat writes. A worker's metrics report
+/// ([`crate::worker_report`]) carries the same host gauges, and the control
+/// plane keeps only the heartbeat's copy, so each series has one writer and
+/// agents older than the report still fill it.
+pub const CAPACITY_METRIC_NAMES: &[&str] = &[
+    "node.cpu_percent",
+    "node.memory_used_bytes",
+    "node.memory_total_bytes",
+    "node.memory_percent",
+    "node.disk_used_bytes",
+    "node.disk_total_bytes",
+    "node.disk_percent",
+];
+
 /// Build the gauge points for one heartbeat.
 ///
 /// Only values that are present and meaningful are emitted, so a gap in the
@@ -265,6 +279,8 @@ mod tests {
                 "node.disk_percent",
             ]
         );
+        // The list the worker report defers to is exactly what is written.
+        assert_eq!(names(&points), CAPACITY_METRIC_NAMES);
         assert_eq!(value(&points, "node.cpu_percent"), 42.5);
         assert_eq!(value(&points, "node.memory_percent"), 25.0);
         assert_eq!(value(&points, "node.disk_percent"), 25.0);

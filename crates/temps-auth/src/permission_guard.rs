@@ -1303,6 +1303,9 @@ mod tests {
             // member of a project could otherwise flip that project's flags
             // with the instance-wide FlagsWrite the default role carries.
             "temps-flags",
+            // Reachability (ADR 064) reads and changes how one project's
+            // environment reaches visitors.
+            "temps-ingress",
             // Group membership, per-member repository inheritance and path
             // routes between member services rewrite what a specific project
             // serves or inherits, so each of those handlers narrows the

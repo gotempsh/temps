@@ -348,10 +348,52 @@ impl CloudService {
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome,
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapError,
     > {
-        crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
-            self.apply_bootstrap_console_oidc_config(config)
-        })
-        .await
+        let mut outcome =
+            crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
+                self.apply_bootstrap_console_oidc_config(config)
+            })
+            .await?;
+        if let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            telemetry,
+            ..
+        } = &mut outcome
+        {
+            if *telemetry == crate::console_oidc_bootstrap::TelemetryConsent::Requested {
+                *telemetry = self.apply_bootstrap_telemetry_consent().await;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Turn telemetry export on because the bootstrap file asked for it (see
+    /// [`crate::console_oidc_bootstrap::TelemetryConsent`]). Never fails the
+    /// bootstrap: console access has already been applied, and a plane that
+    /// cannot switch export on keeps working locally -- the failure is
+    /// returned for the caller to log and audit.
+    async fn apply_bootstrap_telemetry_consent(
+        &self,
+    ) -> crate::console_oidc_bootstrap::TelemetryConsent {
+        use crate::console_oidc_bootstrap::TelemetryConsent;
+        let _update = self.feature_update_lock.lock().await;
+        let previous = self.link.feature_switches();
+        let updated = match self.config.grant_bootstrap_telemetry_consent().await {
+            Ok(Some(updated)) => updated,
+            Ok(None) => return TelemetryConsent::AlreadyDecided,
+            Err(error) => {
+                return TelemetryConsent::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if previous.telemetry {
+            return TelemetryConsent::AlreadyEnabled;
+        }
+        match self.publish_cloud_switches(&updated) {
+            Ok(new) => TelemetryConsent::GrantedByBootstrap { previous, new },
+            Err(error) => TelemetryConsent::Failed {
+                reason: error.to_string(),
+            },
+        }
     }
 
     /// Wire the backup scheduler in once it is registered. Idempotent.
@@ -2591,6 +2633,71 @@ mod tests {
             vec![true],
             "consent must be saved to the settings row, not only held in memory"
         );
+    }
+
+    /// A hosted plane's file also asks for telemetry export: it is switched on,
+    /// persisted, and reported for auditing -- after console access, never
+    /// instead of it.
+    #[tokio::test]
+    async fn bootstrap_file_asking_for_telemetry_turns_export_on() {
+        let settings_db = settings_db_accepting_consent_writes(2);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        assert!(!service.feature_switches().telemetry, "precondition: off");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(
+            &path,
+            r#"{"issuer":"https://cloud.example.com","client_id":"bootstrap-client","client_secret":"shh","telemetry_enabled":true}"#,
+        )
+        .expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            consent,
+            telemetry,
+            ..
+        } = outcome
+        else {
+            panic!("expected Applied");
+        };
+        assert!(consent.was_granted(), "console access is still granted");
+        let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry else {
+            panic!("expected telemetry to be granted by the bootstrap, got {telemetry:?}");
+        };
+        assert!(!previous.telemetry && new.telemetry);
+        assert!(service.feature_switches().telemetry, "link switch is on");
+        assert!(!path.exists(), "the file is consumed");
+    }
+
+    /// Without the field nothing about telemetry changes -- the shape every
+    /// file had before Cloud started asking.
+    #[tokio::test]
+    async fn bootstrap_file_without_the_telemetry_field_leaves_export_alone() {
+        let settings_db = settings_db_accepting_consent_writes(1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                telemetry: crate::TelemetryConsent::NotRequested,
+                ..
+            }
+        ));
+        assert!(!service.feature_switches().telemetry);
     }
 
     #[tokio::test]

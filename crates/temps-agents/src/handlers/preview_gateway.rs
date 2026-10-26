@@ -136,6 +136,7 @@ pub struct PatchSettingsRequest {
     path = "/preview-gateway/status",
     responses(
         (status = 200, body = GatewayStatus),
+        (status = 409, description = "This control plane runs no workloads, so it runs no preview gateway", body = ProblemDetails),
         (status = 500, description = "Docker status request failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -145,8 +146,12 @@ pub async fn get_preview_gateway_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // The gateway is a container on this host: a control plane that runs
+    // no workloads has none, and says so with the worker-node-required
+    // problem (ADR 063).
+    let docker = state.docker.require()?;
     let settings = preview_gateway::load_settings(&state.db).await;
-    let status = preview_gateway::inspect_status(&state.docker, &settings)
+    let status = preview_gateway::inspect_status(&docker, &settings)
         .await
         .map_err(|e| {
             let detail = anyhow_detail(
@@ -167,6 +172,7 @@ pub async fn get_preview_gateway_status(
     params(("tail" = Option<usize>, Query, description = "Lines to tail (default 200, max 2000)")),
     responses(
         (status = 200, body = PreviewGatewayLogsResponse),
+        (status = 409, description = "This control plane runs no workloads, so it runs no preview gateway", body = ProblemDetails),
         (status = 500, description = "Docker log request failed", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -177,24 +183,25 @@ pub async fn get_preview_gateway_logs(
     Query(q): Query<LogsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // The gateway is a container on this host: a control plane that runs
+    // no workloads has none, and says so with the worker-node-required
+    // problem (ADR 063).
+    let docker = state.docker.require()?;
     let tail = q.tail.unwrap_or(200).min(2000);
     // Resolve the container from settings, not the default name — otherwise
     // an instance with a custom container tails a container it doesn't own
     // (or, more likely, none at all).
     let settings = preview_gateway::load_settings(&state.db).await;
-    let lines = preview_gateway::tail_logs(
-        &state.docker,
-        &preview_gateway::container_name(&settings),
-        tail,
-    )
-    .await
-    .map_err(|e| {
-        internal(anyhow_detail(
-            "failed to tail logs",
-            &e,
-            &[&settings.shared_secret],
-        ))
-    })?;
+    let lines =
+        preview_gateway::tail_logs(&docker, &preview_gateway::container_name(&settings), tail)
+            .await
+            .map_err(|e| {
+                internal(anyhow_detail(
+                    "failed to tail logs",
+                    &e,
+                    &[&settings.shared_secret],
+                ))
+            })?;
     Ok(Json(PreviewGatewayLogsResponse { lines }))
 }
 
@@ -214,6 +221,10 @@ pub async fn restart_preview_gateway(
     State(state): State<Arc<AppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // The gateway is a container on this host: a control plane that runs
+    // no workloads has none, and says so with the worker-node-required
+    // problem (ADR 063).
+    let docker = state.docker.require()?;
     // Held from before the settings are read until the restart is done, so
     // a disable saved meanwhile waits for it and then removes the result.
     let held = wait_for_gateway_operations("restart the preview gateway", OPERATION_WAIT).await?;
@@ -225,7 +236,7 @@ pub async fn restart_preview_gateway(
         image = %spec.image,
         "preview gateway restart requested"
     );
-    preview_gateway::force_restart(&held, state.docker.clone(), &state.db, spec)
+    preview_gateway::force_restart(&held, docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
@@ -255,6 +266,10 @@ pub async fn upgrade_preview_gateway(
     Json(body): Json<UpgradeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // The gateway is a container on this host: a control plane that runs
+    // no workloads has none, and says so with the worker-node-required
+    // problem (ADR 063).
+    let docker = state.docker.require()?;
     // Held through the image save and the reconcile: see the restart above.
     let held = wait_for_gateway_operations("upgrade the preview gateway", OPERATION_WAIT).await?;
     require_enabled(&preview_gateway::load_settings(&state.db).await, "upgrade")?;
@@ -282,7 +297,7 @@ pub async fn upgrade_preview_gateway(
             ))
         })?;
     let spec = PreviewGatewaySpec::from_settings(&settings);
-    preview_gateway::reconcile(&held, state.docker.clone(), &state.db, spec)
+    preview_gateway::reconcile(&held, docker.clone(), &state.db, spec)
         .await
         .map_err(|e| {
             internal(anyhow_detail(
@@ -331,6 +346,10 @@ pub async fn patch_preview_gateway_settings(
     Json(patch): Json<PatchSettingsRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    // The gateway is a container on this host: a control plane that runs
+    // no workloads has none, and says so with the worker-node-required
+    // problem (ADR 063).
+    let docker = state.docker.require()?;
     let container_name = submitted_container_name(patch.container_name.as_deref())?;
 
     // Saved and applied under one lock: a restart, upgrade or startup
@@ -359,7 +378,7 @@ pub async fn patch_preview_gateway_settings(
         // to the provider that set up their networks.
         let networks = if sandboxes == 0 {
             preview_gateway::sandbox_networks_still_present(
-                &state.docker,
+                &docker,
                 state.preview_gateway_name.networks_set_up().await,
             )
             .await
@@ -372,7 +391,7 @@ pub async fn patch_preview_gateway_settings(
         // The pair under the previous name still publishes the host port, so
         // it goes before the new name is saved. If removing it fails nothing
         // has changed yet, and saving again retries.
-        preview_gateway::remove_renamed(&held, &state.docker, &previous)
+        preview_gateway::remove_renamed(&held, &docker, &previous)
             .await
             .map_err(|e| {
                 internal(gateway_error_detail(
@@ -435,7 +454,7 @@ pub async fn patch_preview_gateway_settings(
     // Apply the switch now rather than at the next server start: a disabled
     // gateway must stop serving previews at once.
     match switch_effect(&previous, &settings) {
-        Some(SwitchEffect::Remove) => preview_gateway::disable(&held, &state.docker, &settings)
+        Some(SwitchEffect::Remove) => preview_gateway::disable(&held, &docker, &settings)
             .await
             .map_err(|e| {
                 internal(gateway_error_detail(
@@ -446,7 +465,7 @@ pub async fn patch_preview_gateway_settings(
             })?,
         Some(SwitchEffect::Reconcile) => preview_gateway::reconcile(
             &held,
-            state.docker.clone(),
+            docker.clone(),
             &state.db,
             PreviewGatewaySpec::from_settings(&settings),
         )

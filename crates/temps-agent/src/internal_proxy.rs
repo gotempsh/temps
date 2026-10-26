@@ -64,6 +64,7 @@ use tokio::sync::{Notify, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::route_store::{RouteEntry, SharedRouteStore};
+use crate::worker_metrics::RequestRecorder;
 
 #[derive(Clone, Debug)]
 pub(crate) struct PublicTlsSni(pub String);
@@ -177,6 +178,9 @@ struct ProxyState {
     inspection_concurrency: Arc<Semaphore>,
     caller_identities: Arc<RwLock<CallerIdentitySnapshot>>,
     public_mode: bool,
+    /// The private listener (ADR 064 D5): serves only private addresses,
+    /// to TCP peers inside each address's range.
+    private_mode: bool,
     forwarded_proto: &'static str,
     /// HTTPS listeners check the TLS server name against Host. A tunnel
     /// origin is told `https` by the provider, which terminated TLS, so it
@@ -276,6 +280,7 @@ pub async fn spawn(
         inspection_concurrency: Arc::new(Semaphore::new(IDENTITY_INSPECTION_GLOBAL_CONCURRENCY)),
         caller_identities: Arc::clone(&caller_identities),
         public_mode: false,
+        private_mode: false,
         require_sni: false,
         forwarded_proto: "http",
         acme: None,
@@ -365,7 +370,85 @@ pub async fn spawn(
     Ok(())
 }
 
+/// Set on what the private listener refuses, so the worker's inside check
+/// (ADR 064 D7) tells the listener's own refusal from the app's answer.
+pub(crate) const PRIVATE_REFUSAL_HEADER: &str = "x-temps-private-ingress";
+
+fn private_refusal(status: StatusCode, reason: &'static str, message: &str) -> Response {
+    let mut response = error_body(status, message);
+    response.headers_mut().insert(
+        HeaderName::from_static(PRIVATE_REFUSAL_HEADER),
+        HeaderValue::from_static(reason),
+    );
+    response
+}
+
+/// The private listener (ADR 064 D5). Only addresses whose audience is
+/// private, each only to a TCP peer inside its range: the peer comes from
+/// the accepted connection, never from a forwarded header. Port 80 only
+/// redirects to HTTPS.
+async fn handle_private(state: &ProxyState, req: Request) -> Response {
+    let Some(host) = extract_host(req.headers()) else {
+        return error_body(StatusCode::BAD_REQUEST, "missing or malformed Host header");
+    };
+    if state.forwarded_proto == "https"
+        && req
+            .extensions()
+            .get::<PublicTlsSni>()
+            .map(|sni| sni.0.as_str())
+            != Some(host.as_str())
+    {
+        return error_body(
+            StatusCode::MISDIRECTED_REQUEST,
+            "TLS server name does not match Host",
+        );
+    }
+    let Some(private) = state.store.lookup_private(&host) else {
+        return private_refusal(
+            StatusCode::NOT_FOUND,
+            "no-route",
+            "no private route for this host",
+        );
+    };
+    let peer = req.extensions().get::<PublicPeer>().map(|peer| peer.0.ip());
+    if !peer.is_some_and(|ip| temps_core::worker_ingress::ip_in_range(ip, &private.range)) {
+        return private_refusal(
+            StatusCode::FORBIDDEN,
+            "outside-range",
+            "this address is only for its private network",
+        );
+    }
+    if state.forwarded_proto == "http" {
+        let path = req
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/");
+        let mut response = StatusCode::PERMANENT_REDIRECT.into_response();
+        if let Ok(location) = HeaderValue::from_str(&format!("https://{host}{path}")) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LOCATION, location);
+        }
+        return response;
+    }
+    if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
+        recorder.mark_project();
+    }
+    let entry = private.route;
+    if entry.backends.is_empty() {
+        return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
+    }
+    if is_upgrade_request(req.headers()) {
+        return proxy_upgrade(&entry, req, state.forwarded_proto).await;
+    }
+    proxy_with_retries(state, &entry, req).await
+}
+
 async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+    if state.private_mode {
+        return handle_private(&state, req).await;
+    }
     // Reachability check from the control plane (ADR 058 D7): answered on the
     // public HTTP listener before any host routing, since the check dials the
     // bare address.
@@ -418,6 +501,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
             Some(entry) => entry,
             None => return error_body(StatusCode::NOT_FOUND, "no public route for this host"),
         };
+        if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
+            recorder.mark_project();
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
@@ -509,6 +595,15 @@ pub(crate) fn public_router(
     public_router_with(store, forwarded_proto, acme, true)
 }
 
+/// The private listener's router (ADR 064 D5): no ACME relay (a private
+/// address takes its certificate through DNS-01), no reachability probe.
+pub(crate) fn private_router(
+    store: SharedRouteStore,
+    forwarded_proto: &'static str,
+) -> std::io::Result<axum::Router> {
+    router_with(store, forwarded_proto, None, true, true)
+}
+
 /// The loopback origin an ingress connector forwards to (ADR 058): serves
 /// the public snapshot like the public HTTPS listener, without a server name
 /// to check, and takes the visitor's address from `client_address_header`
@@ -575,6 +670,16 @@ fn public_router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
 ) -> std::io::Result<axum::Router> {
+    router_with(store, forwarded_proto, acme, require_sni, false)
+}
+
+fn router_with(
+    store: SharedRouteStore,
+    forwarded_proto: &'static str,
+    acme: Option<PublicAcmeConfig>,
+    require_sni: bool,
+    private_mode: bool,
+) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
         .connect_timeout(UPSTREAM_TIMEOUT)
         // Reqwest applies this between successful reads, rather than to the
@@ -592,12 +697,17 @@ fn public_router_with(
         inspection_concurrency: Arc::new(Semaphore::new(1)),
         caller_identities: Arc::new(RwLock::new(CallerIdentitySnapshot::new(HashMap::new()))),
         public_mode: true,
+        private_mode,
         forwarded_proto,
         require_sni,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
     });
-    Ok(axum::Router::new().fallback(handle).with_state(state))
+    // ADR 061: public edge traffic is counted like the control plane's proxy.
+    Ok(crate::worker_metrics::recorded(
+        axum::Router::new().fallback(handle).with_state(state),
+        crate::worker_metrics::proxy_metrics(),
+    ))
 }
 
 async fn proxy_acme_challenge(state: &ProxyState, host: &str, req: Request) -> Response {
@@ -975,6 +1085,9 @@ async fn proxy_upgrade(
         .extensions()
         .get::<PublicConnectionPermit>()
         .map(|permit| Arc::clone(&permit.0));
+    // Held by the tunnel task, so the session is recorded when it ends.
+    let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let dialled = Instant::now();
     let original_host = headers
         .get("host")
         .and_then(|v| v.to_str().ok())
@@ -1117,6 +1230,9 @@ async fn proxy_upgrade(
             return error_body(StatusCode::BAD_GATEWAY, "upstream malformed");
         }
     };
+    if let Some(recorder) = &recorder {
+        recorder.upstream_answered(dialled);
+    }
 
     // Non-101 ⇒ backend declined the upgrade; relay status+headers
     // and any leftover body, then close. No bidirectional tunnel.
@@ -1156,6 +1272,7 @@ async fn proxy_upgrade(
         // Keep the listener's bounded connection slot owned until the
         // detached upgraded tunnel actually exits.
         let _connection_permit = connection_permit;
+        let _recorder = recorder;
         let upgraded = match tokio::time::timeout(UPSTREAM_TIMEOUT, on_upgrade).await {
             Ok(Ok(u)) => u,
             Ok(Err(e)) => {
@@ -1347,11 +1464,13 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
             .get::<ConnectInfo<SocketAddr>>()
             .map(|peer| PublicPeer(peer.0))
     });
+    let recorder = req.extensions().get::<RequestRecorder>().cloned();
     let metadata = ForwardRequestMetadata {
         method,
         uri,
         headers,
         public_peer,
+        recorder,
     };
     let retryable = metadata.method == axum::http::Method::GET
         || metadata.method == axum::http::Method::HEAD
@@ -1441,6 +1560,8 @@ struct ForwardRequestMetadata {
     uri: Uri,
     headers: HeaderMap,
     public_peer: Option<PublicPeer>,
+    /// Public listeners only (ADR 061).
+    recorder: Option<RequestRecorder>,
 }
 
 async fn forward_once(
@@ -1502,8 +1623,14 @@ async fn forward_once(
     );
     builder = builder.body(reqwest::Body::wrap_stream(stream));
 
+    let dialled = Instant::now();
     let upstream = match builder.send().await {
-        Ok(r) => r,
+        Ok(r) => {
+            if let Some(recorder) = &metadata.recorder {
+                recorder.upstream_answered(dialled);
+            }
+            r
+        }
         Err(e) => {
             warn!(
                 upstream = %upstream_url,

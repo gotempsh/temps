@@ -573,6 +573,23 @@ async fn create(
                 reason: format!("underlay device '{}' not found", underlay_dev),
             })?;
 
+    // The kernel refuses a second device on the same VNI and port with a
+    // bare EEXIST. The usual holder is another cluster's overlay left on
+    // this host under another name (ADR 059): name it, since every node of
+    // a cluster must share the VNI and port and only the holder can move.
+    if let Some(holder) = vxlan_holding(name, vni, port).await? {
+        return Err(NetworkError::Vxlan {
+            device: name.into(),
+            reason: format!(
+                "VXLAN device '{holder}' already holds vni={vni}, port={port} on this host, \
+                 so this cluster's overlay cannot use them. If '{holder}' belongs to an \
+                 overlay this host no longer serves, delete it (`ip link delete {holder}`): \
+                 its bridge and Docker network can stay, and their containers keep local \
+                 traffic. Two clusters' overlays cannot run on one host at once"
+            ),
+        });
+    }
+
     let builder = LinkVxlan::new(name, vni)
         .dev(parent_index)
         .port(port)

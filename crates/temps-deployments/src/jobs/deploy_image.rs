@@ -7753,6 +7753,7 @@ mod tests {
                 overlay_last_error: None,
                 overlay_ready_cidr: None,
                 overlay_remediation: None,
+                overlay_network_name: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -7840,6 +7841,7 @@ mod tests {
                 overlay_last_error: None,
                 overlay_ready_cidr: None,
                 overlay_remediation: None,
+                overlay_network_name: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -7928,6 +7930,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8126,6 +8129,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -8212,6 +8216,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

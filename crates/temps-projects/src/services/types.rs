@@ -126,6 +126,9 @@ pub struct Project {
     /// model). Operators can set false to suppress cross-project links to this
     /// project.
     pub cross_project_trace_sharing: bool,
+    /// Whether `/api/_temps*` and `/api/otel*` on this project's domains reach
+    /// the project's app rather than this instance's console.
+    pub serves_own_temps_api: bool,
     /// How long (hours) to retain built Docker images before nightly cleanup.
     /// None = use the system default (336 h / 14 days out of the box, from
     /// `AppSettings.image_retention.default_hours`).
@@ -277,6 +280,8 @@ pub struct UpdateProjectSettingsParams {
     pub preset_config: Option<serde_json::Value>,
     pub ai_alert_summaries_enabled: Option<bool>,
     pub cross_project_trace_sharing: Option<bool>,
+    /// Send `/api/_temps*` and `/api/otel*` on the project's domains to its app.
+    pub serves_own_temps_api: Option<bool>,
     pub error_source_context_enabled: Option<bool>,
     pub vulnerability_scanning_enabled: Option<bool>,
     pub error_source_root: Option<String>,

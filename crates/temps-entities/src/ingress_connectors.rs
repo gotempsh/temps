@@ -32,7 +32,8 @@ pub struct Model {
     /// Publish every worker-served hostname under `domain` (true), or only
     /// the hostnames chosen for this tunnel (false).
     pub auto_publish: bool,
-    /// `pending`, `ready` or `error`.
+    /// `pending`, `ready`, `error`, or `deleting` while it is being removed
+    /// (ADR 064 D4): sync and reconcile skip it, and it is never reverted.
     pub status: String,
     pub last_error: Option<String>,
     pub created_at: DBDateTime,

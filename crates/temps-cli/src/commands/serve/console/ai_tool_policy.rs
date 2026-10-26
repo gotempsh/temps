@@ -113,6 +113,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_dns_changes",
             "mesh_enroll",
             "node_heartbeat",
+            "plane_identity",
             "post_dns_ack",
             "register_node",
             "stream_container_metrics",

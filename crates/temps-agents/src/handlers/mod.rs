@@ -240,8 +240,14 @@ pub struct AppState {
     pub autofixer_service: Arc<AutofixerService>,
     pub secret_service: Arc<SecretService>,
     pub definition_service: Arc<DefinitionService>,
-    /// Docker client used by the preview gateway supervisor handlers.
-    pub docker: Arc<bollard::Docker>,
+    /// Docker client used by the preview gateway supervisor handlers. A
+    /// handle, because a control plane that runs no workloads has no client
+    /// (ADR 063): the handlers then answer the worker-node-required problem.
+    pub docker: Arc<temps_core::DockerHandle>,
+    /// Whether this server runs workloads (and so sandboxes) itself. `false`
+    /// on a control plane, where the sandbox status endpoints say so rather
+    /// than reporting Docker as missing (ADR 063).
+    pub local_workloads: bool,
     /// Platform settings service used by the preview gateway handlers to
     /// persist image / auto-upgrade changes.
     pub platform_config_service: Arc<temps_config::ConfigService>,

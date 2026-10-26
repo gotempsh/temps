@@ -49,6 +49,7 @@ import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import { Link, useNavigate } from 'react-router'
 import { liveVisitorsPillLabel } from '@/components/analytics/analytics-onboarding'
+import { ReachabilityStatus } from '@/components/reachability/ReachabilityStatus'
 
 /** Badge variant for the problem states, which link to the overview. */
 const deploymentStatusBadgeVariant: Record<
@@ -359,6 +360,15 @@ export function ProjectDetailHeader({
             )}
             <ServiceGroupControl project={project} />
           </div>
+          {!isExternal && !isWorker && healthEnvironment && (
+            // Per environment, per address (ADR 064 D3): what a visitor
+            // can open, or why not and the button that fixes it.
+            <ReachabilityStatus
+              projectId={project.id}
+              environmentId={healthEnvironment.id}
+              environmentName={healthEnvironment.name}
+            />
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {activeVisitorsCount !== undefined && !isWorker && (

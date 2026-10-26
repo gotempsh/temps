@@ -770,6 +770,50 @@ two-layer role gate in §4). The residual risks, accepted and documented:
 - Revoke/disable (`ConsoleOidcRevoke`, the Settings toggle off, disconnect) is
   untouched: it still deletes the provider row and its sessions.
 
+## Amendment 2: the bootstrap file also carries telemetry-export consent
+
+**Date:** 2026-10-23 · **Amends:** Amendment 1 §1 ("never touches telemetry")
+
+### What was wrong
+
+A Cloud-hosted plane reads its logs and traces from Cloud (Cloud-primary read
+routing is installed at boot), but `cloud.telemetry_enabled` defaults off and
+nothing on the hosted path ever turned it on. Its Logs and Traces pages showed
+"telemetry export is switched off" and stayed empty: the product a hosted plane
+exists to deliver was off until the customer found a switch.
+
+### Decision
+
+1. The file Cloud writes (`cloud-oidc.json`) gains an optional
+   `"telemetry_enabled": true`. Cloud always sets it for hosted planes. Only an
+   explicit JSON `true` counts; a missing, `false`, mistyped or unparseable
+   value is "not asked". Older planes ignore the field (unknown fields were
+   already tolerated), and older Cloud builds simply don't send it.
+2. Applying it is **after** the console-access part and never fails it: the
+   console-access outcome stands, and a failed telemetry write is logged at
+   `error` with the remedy ("turn it on in Settings > Temps Cloud").
+3. **At most once per instance.** Cloud re-drops the file on every upgrade.
+   The grant runs in one locked settings transaction that turns
+   `cloud.telemetry_enabled` on *and* sets `cloud.telemetry_consent_bootstrapped`;
+   when that marker is already set nothing is written. An operator who turns
+   telemetry off after the first boot is therefore never overridden by an
+   upgrade. (Console access, by contrast, is re-granted by each file, per
+   Amendment 1's residual-risk note.)
+4. **Audited.** Turning it on writes `CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP`
+   (actor: unattended bootstrap) with the before/after feature switches. The
+   plane also logs a `warn` naming the switch, like the console-access grant.
+5. **Self-hosted is unchanged.** No file, no change: telemetry export stays
+   off until the operator enables it.
+
+### Why this is a valid consent signal
+
+Same reasoning as Amendment 1: the file is written by the provisioner into a
+data directory it controls, as part of standing up a product whose stated
+purpose includes hosted telemetry retention, and anyone able to write that
+directory can already edit the settings row. Billing is unaffected in kind:
+ingest is metered server-side at Cloud's gateway as for any other enrolled
+instance, and quota behaviour (head-sampling, never silent drops) applies.
+
 ---
 
 ## References

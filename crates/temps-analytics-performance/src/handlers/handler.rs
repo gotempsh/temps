@@ -971,6 +971,7 @@ mod tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
             ai_api_traffic_summary_enabled: None,
             image_retention_hours: None,
             cloud_telemetry_fidelity:

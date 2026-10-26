@@ -17,6 +17,7 @@ describe('flat project navigation', () => {
     expect(PROJECT_PRIMARY_ROUTES).toEqual([
       'project',
       'deployments',
+      'domains',
       'environments',
       'environment-variables',
       'functions',
@@ -37,6 +38,16 @@ describe('flat project navigation', () => {
       'settings/access',
     ])
       expect(resolveProjectPrimaryRoute(path)).toBe('security')
+  })
+  test('puts Domains in the main navigation and keeps its old URL', () => {
+    expect(resolveProjectPrimaryRoute('domains')).toBe('domains')
+    expect(resolveProjectPrimaryRoute('settings/domains')).toBe('domains')
+    expect(resolveProjectSectionLink('domains', 'settings/domains', '')).toBe(
+      'domains'
+    )
+    expect(
+      PROJECT_SECTION_LINKS.settings?.some((link) => link.url === 'domains')
+    ).toBe(false)
   })
   test('keeps deep links in their owning section', () => {
     for (const [path, section] of Object.entries({
@@ -122,8 +133,8 @@ describe('flat project navigation', () => {
       )
     }
   })
-  test('settings has only seven destinations', () => {
-    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(7)
+  test('settings has only six destinations', () => {
+    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(6)
   })
   test('every existing tool has a direct contextual destination', () => {
     for (const tool of flattenProjectTools(projectToolGroups)) {

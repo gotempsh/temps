@@ -185,6 +185,52 @@ impl ConsoleOidcApplyFailure {
     }
 }
 
+/// What the bootstrap file asked for, and did, about telemetry export
+/// (`cloud.telemetry_enabled`). A Cloud-hosted plane exists to keep its logs,
+/// traces and metrics in Cloud, so Temps Cloud writes `"telemetry_enabled":
+/// true` into the file it drops on create and on every upgrade; like console
+/// access (ADR-045 Amendment 1), the file's presence is the operator's consent.
+/// Files without the field -- and every self-hosted instance, which never gets
+/// a file -- leave telemetry exactly as it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TelemetryConsent {
+    /// The file did not ask for telemetry export.
+    NotRequested,
+    /// The file asked for it; not yet applied. Only
+    /// [`apply_console_oidc_bootstrap_file_with`] returns this --
+    /// [`crate::service::CloudService::apply_console_oidc_bootstrap_file`]
+    /// resolves it into one of the outcomes below.
+    Requested,
+    /// The switch was already on; nothing changed.
+    AlreadyEnabled,
+    /// An earlier boot already applied this consent. The file is re-dropped
+    /// on every upgrade, so this is the normal case after the first one; the
+    /// operator's current choice stands, even if it is "off".
+    AlreadyDecided,
+    /// The bootstrap turned telemetry export on.
+    GrantedByBootstrap {
+        previous: CloudFeatureSwitches,
+        new: CloudFeatureSwitches,
+    },
+    /// Turning it on failed. The console-access part of the bootstrap still
+    /// applied; telemetry stays off until an operator enables it.
+    Failed { reason: String },
+}
+
+#[derive(Deserialize)]
+struct RawTelemetryRequest {
+    #[serde(default)]
+    telemetry_enabled: bool,
+}
+
+/// Whether the bootstrap file's bytes ask for telemetry export. Anything
+/// unreadable counts as "no": consent is never inferred from a malformed file.
+pub fn bootstrap_requests_telemetry(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<RawTelemetryRequest>(bytes)
+        .map(|raw| raw.telemetry_enabled)
+        .unwrap_or(false)
+}
+
 /// Outcome of [`apply_console_oidc_bootstrap_file_with`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConsoleOidcBootstrapOutcome {
@@ -198,6 +244,7 @@ pub enum ConsoleOidcBootstrapOutcome {
         issuer: String,
         client_id: String,
         consent: ConsoleAccessConsent,
+        telemetry: TelemetryConsent,
     },
 }
 
@@ -256,6 +303,11 @@ where
 
     let issuer = config.issuer.clone();
     let client_id = config.client_id.clone();
+    let telemetry = if bootstrap_requests_telemetry(&bytes) {
+        TelemetryConsent::Requested
+    } else {
+        TelemetryConsent::NotRequested
+    };
 
     let consent = apply(config)
         .await
@@ -279,6 +331,7 @@ where
         issuer,
         client_id,
         consent,
+        telemetry,
     })
 }
 
@@ -290,6 +343,21 @@ mod tests {
 
     fn valid_json() -> &'static str {
         r#"{"issuer":"https://cloud.example.com","client_id":"abc123","client_secret":"shh"}"#
+    }
+
+    #[test]
+    fn telemetry_request_is_read_only_from_an_explicit_true() {
+        assert!(!bootstrap_requests_telemetry(valid_json().as_bytes()));
+        assert!(bootstrap_requests_telemetry(
+            br#"{"issuer":"https://c","client_id":"a","client_secret":"s","telemetry_enabled":true}"#
+        ));
+        assert!(!bootstrap_requests_telemetry(
+            br#"{"issuer":"https://c","client_id":"a","client_secret":"s","telemetry_enabled":false}"#
+        ));
+        assert!(!bootstrap_requests_telemetry(b"not json"));
+        assert!(!bootstrap_requests_telemetry(
+            br#"{"telemetry_enabled":"yes"}"#
+        ));
     }
 
     #[test]
@@ -395,6 +463,7 @@ mod tests {
                 issuer: "https://cloud.example.com".to_string(),
                 client_id: "abc123".to_string(),
                 consent: ConsoleAccessConsent::AlreadyEnabled,
+                telemetry: TelemetryConsent::NotRequested,
             }
         );
         assert!(

@@ -208,6 +208,10 @@ pub struct ProjectSettingsUpdatedFields {
     /// because the new value alone can't answer "how much rollback history
     /// did this just cost" during an incident review.
     pub previous_image_retention_hours: Option<i32>,
+    /// New value of `serves_own_temps_api`, when the update set it. Audited
+    /// because it moves `/api/_temps` and `/api/otel` traffic on the
+    /// project's domains away from this instance's analytics and OTLP ingest.
+    pub serves_own_temps_api: Option<bool>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {
@@ -361,6 +365,7 @@ mod tests {
                 compose_configuration_updated: Some(true),
                 image_retention_hours: None,
                 previous_image_retention_hours: None,
+                serves_own_temps_api: None,
             },
         };
 

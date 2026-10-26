@@ -105,15 +105,15 @@ pub struct NetworkConfig {
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            bridge_name: "br-temps0".into(),
-            docker_network_name: "temps0".into(),
+            bridge_name: crate::OverlayNames::default().bridge,
+            docker_network_name: crate::OverlayNames::default().docker_network,
             transport: Transport::Vxlan {
                 vni: 42,
                 port: 4789,
             },
             underlay_mtu: 1500,
             underlay_dev: "eth0".into(),
-            vxlan_dev_name: "vxlan-temps0".into(),
+            vxlan_dev_name: crate::OverlayNames::default().vxlan,
         }
     }
 }
@@ -159,6 +159,24 @@ fn validate_interface_name(name: &str, field: &str) -> crate::Result<()> {
 }
 
 impl NetworkConfig {
+    /// The same config on the overlay named `names` (ADR 059): the Docker
+    /// network, bridge and VXLAN device all follow the overlay network name.
+    pub fn with_overlay_names(mut self, names: &crate::OverlayNames) -> Self {
+        self.docker_network_name = names.docker_network.clone();
+        self.bridge_name = names.bridge.clone();
+        self.vxlan_dev_name = names.vxlan.clone();
+        self
+    }
+
+    /// The host-side names this config uses.
+    pub fn overlay_names(&self) -> crate::OverlayNames {
+        crate::OverlayNames {
+            docker_network: self.docker_network_name.clone(),
+            bridge: self.bridge_name.clone(),
+            vxlan: self.vxlan_dev_name.clone(),
+        }
+    }
+
     /// Validate the config in isolation (without considering peers).
     ///
     /// Per-peer validation lives in [`Self::validate_with`].

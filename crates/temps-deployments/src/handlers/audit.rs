@@ -316,6 +316,17 @@ pub struct NodePairingCreatedAudit {
     pub node_endpoint: Option<String>,
 }
 
+/// A worker proved it is node `node_id` (its WireGuard key, name and current
+/// agent credential) and started joining the same control plane again, which
+/// updates that node in place when it registers (ADR 060).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeRejoinStartedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub name: String,
+    pub mesh_address: String,
+}
+
 /// An operator cancelled a pending node pairing.
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePairingCancelledAudit {
@@ -342,6 +353,14 @@ pub struct ClusterComputePoolChangedAudit {
     pub to: String,
     /// `<node>: <old subnet> -> <new subnet>` per moved allocation.
     pub reassigned: Vec<String>,
+}
+
+/// An operator changed the cluster's overlay network name (ADR 059).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterOverlayNetworkNameChangedAudit {
+    pub context: AuditContext,
+    pub from: String,
+    pub to: String,
 }
 
 /// An operator confirmed the cluster compute pool for the first time
@@ -563,8 +582,13 @@ impl_audit_operation!(
     ClusterComputePoolConfirmedAudit,
     "CLUSTER_COMPUTE_POOL_CONFIRMED"
 );
+impl_audit_operation!(
+    ClusterOverlayNetworkNameChangedAudit,
+    "CLUSTER_OVERLAY_NETWORK_NAME_CHANGED"
+);
 impl_audit_operation!(NodePairingCreatedAudit, "NODE_PAIRING_CREATED");
 impl_audit_operation!(NodePairingCancelledAudit, "NODE_PAIRING_CANCELLED");
+impl_audit_operation!(NodeRejoinStartedAudit, "NODE_REJOIN_STARTED");
 impl_audit_operation!(NodeSshEnrollmentStartedAudit, "NODE_SSH_ENROLLMENT_STARTED");
 impl_audit_operation!(
     NodeSshEnrollmentSucceededAudit,

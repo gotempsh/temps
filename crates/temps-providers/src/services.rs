@@ -11788,12 +11788,11 @@ echo "[restore] Pre-seed complete"
     /// (single-host setups). Callers fall back to Docker's default DNS
     /// in that case.
     async fn lookup_overlay_bridge_gateway(&self) -> Option<Vec<String>> {
-        // The overlay docker network name is fixed in temps-network's
-        // Config::default (`temps0`). We don't take a hard dep on
-        // temps-network just for this constant — if it ever changes,
-        // the fallback (None → no DNS) keeps clusters functional, just
-        // without FQDN resolution inside containers.
-        const OVERLAY_NETWORK: &str = "temps0";
+        // The overlay this process reconciles (`temps0` unless the cluster
+        // names another, ADR 059). If it does not exist on this host, the
+        // fallback (None → no DNS) keeps clusters functional, just without
+        // FQDN resolution inside containers.
+        let overlay_network = temps_network::overlay_name::current().docker_network;
 
         let docker = match self.docker.get() {
             Some(d) => d,
@@ -11801,7 +11800,7 @@ echo "[restore] Pre-seed complete"
         };
         let inspected = match docker
             .inspect_network(
-                OVERLAY_NETWORK,
+                &overlay_network,
                 None::<bollard::query_parameters::InspectNetworkOptions>,
             )
             .await
@@ -11810,7 +11809,7 @@ echo "[restore] Pre-seed complete"
             Err(e) => {
                 debug!(
                     error = %e,
-                    network = OVERLAY_NETWORK,
+                    network = %overlay_network,
                     "Overlay docker network not present; skipping DNS injection"
                 );
                 return None;
@@ -11972,7 +11971,7 @@ echo "[restore] Pre-seed complete"
         // routable cross-node IP and the DNS registry can write A
         // records pointing at it. Skipped silently when the overlay
         // isn't bootstrapped on this host (single-host mode).
-        let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+        let overlay_name = temps_network::overlay_name::current().docker_network;
         match docker
             .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
             .await
@@ -12041,7 +12040,7 @@ echo "[restore] Pre-seed complete"
             .await
         {
             Ok(info) => {
-                let overlay_name = temps_network::NetworkConfig::default().docker_network_name;
+                let overlay_name = temps_network::overlay_name::current().docker_network;
                 info.network_settings
                     .as_ref()
                     .and_then(|ns| ns.networks.as_ref())
@@ -13776,12 +13775,6 @@ echo "[restore] Pre-seed complete"
         Ok((container_name, internal_port, host_port))
     }
 
-    /// Docker name of the multi-host overlay network. Fixed in
-    /// `temps_network::NetworkConfig::default`.
-    fn overlay_network_name() -> String {
-        temps_network::NetworkConfig::default().docker_network_name
-    }
-
     /// Best-effort dual-attach of a locally-managed container to the
     /// multi-host overlay, returning the IP it ended up with there.
     ///
@@ -13795,8 +13788,11 @@ echo "[restore] Pre-seed complete"
     /// (single-node installs), which is not an error: single-node installs
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
-        let overlay = Self::overlay_network_name();
-        let network_config = temps_network::NetworkConfig::default();
+        // One read of the selected overlay (ADR 059), so the network
+        // validated is the one connected to.
+        let names = temps_network::overlay_name::current();
+        let network_config = temps_network::NetworkConfig::default().with_overlay_names(&names);
+        let overlay = names.docker_network;
         let docker = match self.docker.get() {
             Some(d) => d,
             None => {
@@ -18640,6 +18636,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -18942,6 +18939,7 @@ mod tests {
             overlay_last_error: None,
             overlay_ready_cidr: None,
             overlay_remediation: None,
+            overlay_network_name: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -22489,6 +22487,7 @@ mod tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
+            serves_own_temps_api: false,
             ai_api_traffic_summary_enabled: None,
             image_retention_hours: None,
             cloud_telemetry_fidelity: Default::default(),
@@ -25144,6 +25143,7 @@ mod tests {
             mesh_hub_node_id: None,
             mesh_hub_control_plane: false,
             compute_pool_confirmed_at: None,
+            docker_network_name: "temps0".into(),
             updated_at: Utc::now(),
         }
     }

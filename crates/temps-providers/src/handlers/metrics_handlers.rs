@@ -1422,6 +1422,307 @@ async fn get_node_metrics_latest(
 }
 
 // ---------------------------------------------------------------------------
+// Nodes — all nodes at once (ADR 061)
+// ---------------------------------------------------------------------------
+
+/// Most nodes one cluster query may combine.
+const MAX_CLUSTER_NODES: usize = 64;
+
+/// A node whose newest sample is older than this is left out of the
+/// "All nodes" headline numbers rather than adding a stale value to them.
+const CLUSTER_LATEST_MAX_AGE_MINUTES: i64 = 10;
+
+/// Query for one metric combined across several nodes.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[into_params(parameter_in = Query)]
+pub struct ClusterMetricsRangeQuery {
+    /// Metric name, e.g. `"proxy.requests"`.
+    pub metric: String,
+    /// Comma-separated node ids (`0` = control plane), at most 64.
+    pub node_ids: String,
+    /// Time window: `"1h"` | `"6h"` | `"24h"` | `"7d"`.
+    /// Ignored when `start_time` and `end_time` are both set.
+    #[serde(default = "default_range")]
+    pub range: String,
+    /// Explicit window start (ISO 8601). Must be paired with `end_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T00:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub start_time: Option<UtcDateTime>,
+    /// Explicit window end (ISO 8601). Must be paired with `start_time`.
+    #[param(value_type = Option<String>, example = "2026-08-13T12:00:00Z")]
+    #[schema(value_type = Option<String>)]
+    pub end_time: Option<UtcDateTime>,
+}
+
+/// Nodes to combine for the latest values.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+#[into_params(parameter_in = Query)]
+pub struct ClusterMetricsLatestQuery {
+    /// Comma-separated node ids (`0` = control plane), at most 64.
+    pub node_ids: String,
+}
+
+/// Whether a worker is reporting metrics to the control plane.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct NodeMetricsReportingStatus {
+    pub node_id: i32,
+    /// `reporting`, `agent_too_old`, `unreachable`, `rejected` or `invalid`.
+    pub state: String,
+    /// ISO 8601, when the control plane last pulled.
+    pub last_attempt_at: String,
+    /// ISO 8601, when a report from the node was last stored.
+    pub last_report_at: Option<String>,
+    /// What went wrong, when `state` is not `reporting`.
+    pub detail: Option<String>,
+}
+
+fn parse_node_ids(raw: &str) -> Result<Vec<i32>, Problem> {
+    let mut ids: Vec<i32> = Vec::new();
+    for part in raw.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let id: i32 = part.parse().map_err(|_| {
+            bad_request()
+                .detail(format!("node_ids: '{part}' is not a node id"))
+                .build()
+        })?;
+        if id < 0 {
+            return Err(bad_request()
+                .detail(format!("node_ids: {id} is not a node id"))
+                .build());
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+        if ids.len() > MAX_CLUSTER_NODES {
+            return Err(bad_request()
+                .detail(format!(
+                    "node_ids: at most {MAX_CLUSTER_NODES} nodes can be combined"
+                ))
+                .build());
+        }
+    }
+    if ids.is_empty() {
+        return Err(bad_request()
+            .detail("node_ids: name at least one node")
+            .build());
+    }
+    Ok(ids)
+}
+
+fn require_metrics_store(
+    state: &AppState,
+) -> Result<&Arc<dyn temps_metrics::MetricsStore>, Problem> {
+    state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })
+}
+
+type NodeSeries = Vec<(DateTime<Utc>, Option<f64>)>;
+
+/// One metric's series for each node, over the same window and step so the
+/// buckets line up.
+async fn node_series(
+    store: &Arc<dyn temps_metrics::MetricsStore>,
+    node_ids: &[i32],
+    metric: &str,
+    window: (DateTime<Utc>, DateTime<Utc>, Duration),
+) -> Result<Vec<NodeSeries>, Problem> {
+    let (from, to, step) = window;
+    futures::future::try_join_all(node_ids.iter().map(|id| {
+        store.query_range_filled(RangeQuery {
+            source_kind: SourceKind::Node,
+            source_id: *id,
+            monotonic: is_monotonic_counter(metric),
+            name: metric.to_string(),
+            from,
+            to,
+            step,
+        })
+    }))
+    .await
+    .map_err(|e| {
+        error!(metric = %metric, error = %e, "Failed to query cluster metric range");
+        internal_server_error()
+            .detail(format!("Failed to query metrics: {e}"))
+            .build()
+    })
+}
+
+/// Fetch one metric combined across several nodes: summed counters, ratios
+/// of summed parts, the slowest node's latency, otherwise the mean.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/cluster",
+    operation_id = "NodeMetricsGetClusterRange",
+    tag = "Metrics",
+    params(ClusterMetricsRangeQuery),
+    responses(
+        (status = 200, description = "Combined metric time series", body = Vec<MetricDataPoint>),
+        (status = 400, description = "Invalid query parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_metrics_range(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ClusterMetricsRangeQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    use temps_metrics::cluster::{
+        cluster_aggregate, combine_series, ratio_series, ClusterAggregate,
+    };
+    permission_guard!(auth, SettingsRead);
+    let store = require_metrics_store(&state)?;
+    let node_ids = parse_node_ids(&params.node_ids)?;
+    let window = resolve_range_window(&MetricsRangeQuery {
+        metric: params.metric.clone(),
+        range: params.range.clone(),
+        percentile: None,
+        start_time: params.start_time,
+        end_time: params.end_time,
+    })?;
+
+    let series = match cluster_aggregate(&params.metric) {
+        ClusterAggregate::Ratio {
+            numerator,
+            denominator,
+            scale,
+        } => {
+            let num = node_series(store, &node_ids, numerator, window).await?;
+            let den = node_series(store, &node_ids, denominator, window).await?;
+            ratio_series(
+                &combine_series(&num, ClusterAggregate::Sum),
+                &combine_series(&den, ClusterAggregate::Sum),
+                scale,
+            )
+        }
+        how => combine_series(
+            &node_series(store, &node_ids, &params.metric, window).await?,
+            how,
+        ),
+    };
+
+    let response: Vec<MetricDataPoint> = series
+        .into_iter()
+        .map(|(ts, v)| MetricDataPoint {
+            time: ts.to_rfc3339(),
+            value: v,
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Latest value of every metric, combined across several nodes. Nodes with
+/// nothing recorded in the last 10 minutes are left out.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/cluster/latest",
+    operation_id = "NodeMetricsGetClusterLatest",
+    tag = "Metrics",
+    params(ClusterMetricsLatestQuery),
+    responses(
+        (status = 200, description = "Map of metric name to combined latest value", body = HashMap<String, f64>),
+        (status = 400, description = "Invalid query parameters"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_cluster_metrics_latest(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ClusterMetricsLatestQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let store = require_metrics_store(&state)?;
+    let node_ids = parse_node_ids(&params.node_ids)?;
+    let fresh_after = Utc::now() - Duration::minutes(CLUSTER_LATEST_MAX_AGE_MINUTES);
+
+    let per_node = futures::future::try_join_all(node_ids.iter().map(|id| async move {
+        let newest = store.latest_timestamp(SourceKind::Node, *id).await?;
+        if newest.is_none_or(|at| at < fresh_after) {
+            return Ok(None);
+        }
+        store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: *id,
+                names: vec![],
+            })
+            .await
+            .map(Some)
+    }))
+    .await
+    .map_err(|e: temps_metrics::MetricsError| {
+        error!(error = %e, "Failed to query latest cluster metrics");
+        internal_server_error()
+            .detail(format!("Failed to query latest metrics: {e}"))
+            .build()
+    })?;
+    let per_node: Vec<HashMap<String, f64>> = per_node.into_iter().flatten().collect();
+
+    Ok((
+        StatusCode::OK,
+        Json(temps_metrics::cluster::combine_latest(&per_node)),
+    ))
+}
+
+/// Whether each worker is reporting metrics, and why not. Workers the
+/// control plane does not pull yet (and the control plane itself) are absent.
+#[utoipa::path(
+    get,
+    path = "/nodes/metrics/reporting",
+    operation_id = "NodeMetricsGetReporting",
+    tag = "Metrics",
+    responses(
+        (status = 200, description = "Reporting status per worker", body = Vec<NodeMetricsReportingStatus>),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_metrics_reporting(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    let statuses: Vec<NodeMetricsReportingStatus> = state
+        .worker_metrics_status
+        .as_ref()
+        .map(|board| board.snapshot())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(node_id, status)| NodeMetricsReportingStatus {
+            node_id,
+            state: reporting_state_name(status.state).to_string(),
+            last_attempt_at: iso8601(status.last_attempt_at),
+            last_report_at: status.last_report_at.map(iso8601),
+            detail: status.detail,
+        })
+        .collect();
+    Ok((StatusCode::OK, Json(statuses)))
+}
+
+fn reporting_state_name(state: temps_metrics::WorkerReportState) -> &'static str {
+    use temps_metrics::WorkerReportState as S;
+    match state {
+        S::Reporting => "reporting",
+        S::AgentTooOld => "agent_too_old",
+        S::Unreachable => "unreachable",
+        S::Rejected => "rejected",
+        S::Invalid => "invalid",
+    }
+}
+
+fn iso8601(at: DateTime<Utc>) -> String {
+    at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+// ---------------------------------------------------------------------------
 // Nodes — alert rules
 // ---------------------------------------------------------------------------
 
@@ -2159,6 +2460,12 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
             patch(toggle_deployment_metrics),
         )
         // Node metrics
+        .route("/nodes/metrics/cluster", get(get_cluster_metrics_range))
+        .route(
+            "/nodes/metrics/cluster/latest",
+            get(get_cluster_metrics_latest),
+        )
+        .route("/nodes/metrics/reporting", get(get_node_metrics_reporting))
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
         .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
         .route(
@@ -2192,6 +2499,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         toggle_deployment_metrics,
         get_node_metrics_range,
         get_node_metrics_latest,
+        get_cluster_metrics_range,
+        get_cluster_metrics_latest,
+        get_node_metrics_reporting,
         list_node_alert_rules,
         create_node_alert_rule,
         update_node_alert_rule,
@@ -2200,6 +2510,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
     components(schemas(
         MetricDataPoint,
         MetricsRangeQuery,
+        ClusterMetricsRangeQuery,
+        ClusterMetricsLatestQuery,
+        NodeMetricsReportingStatus,
         MetricsStatusResponse,
         DatabaseMetricsRow,
         DatabaseMetricsResponse,
@@ -2225,6 +2538,36 @@ pub struct MetricsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cluster_node_ids_are_bounded_and_deduplicated() {
+        assert_eq!(parse_node_ids("0, 2,2,5").unwrap(), vec![0, 2, 5]);
+        assert!(parse_node_ids("").is_err());
+        assert!(parse_node_ids("1,x").is_err());
+        assert!(parse_node_ids("-1").is_err());
+        let too_many: Vec<String> = (0..=MAX_CLUSTER_NODES as i32)
+            .map(|i| i.to_string())
+            .collect();
+        assert!(parse_node_ids(&too_many.join(",")).is_err());
+        let max: Vec<String> = (0..MAX_CLUSTER_NODES as i32)
+            .map(|i| i.to_string())
+            .collect();
+        assert_eq!(
+            parse_node_ids(&max.join(",")).unwrap().len(),
+            MAX_CLUSTER_NODES
+        );
+    }
+
+    #[test]
+    fn reporting_timestamps_are_utc_with_a_z() {
+        use chrono::TimeZone;
+        let at = Utc.with_ymd_and_hms(2026, 10, 23, 19, 40, 0).unwrap();
+        assert_eq!(iso8601(at), "2026-10-23T19:40:00Z");
+        assert_eq!(
+            reporting_state_name(temps_metrics::WorkerReportState::AgentTooOld),
+            "agent_too_old"
+        );
+    }
 
     #[test]
     fn test_histogram_quantile_p50() {

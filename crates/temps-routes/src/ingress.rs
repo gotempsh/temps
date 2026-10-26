@@ -808,6 +808,7 @@ mod tests {
             service_template: None,
             github_webhook_id: None,
             github_webhook_signing_token: None,
+            serves_own_temps_api: false,
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,

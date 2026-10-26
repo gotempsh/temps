@@ -29,7 +29,9 @@ pub use dns_registry::{
     StaleResolver, ZoneSnapshot,
 };
 pub use hostname_sync::{HostChange, HostnameModeResult, RecordChange};
-pub use managed_records::{ManagedDnsRecordService, OwnershipScope, RecordOwnership};
+pub use managed_records::{
+    ManagedDnsRecordService, OwnershipScope, RecordOwnership, RecordSnapshot,
+};
 pub use provider_service::{
     AddManagedDomainRequest, CreateProviderRequest, DnsProviderService, UpdateManagedDomainRequest,
     UpdateProviderRequest,

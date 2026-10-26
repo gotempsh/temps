@@ -99,6 +99,10 @@ pub struct OwnershipScope {
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub controller: Option<&'static str>,
+    /// The run writing the record, for a workflow with runs (ADR 064).
+    /// Stamped into the marker it writes; never part of [`Self::permits`]:
+    /// any run of the same scope may change what an earlier one wrote.
+    pub run_id: Option<i32>,
 }
 
 impl OwnershipScope {
@@ -110,6 +114,7 @@ impl OwnershipScope {
             project_id: None,
             environment_id: None,
             controller: Some(controller),
+            run_id: None,
         }
     }
 
@@ -144,6 +149,7 @@ impl OwnershipScope {
             project_id: self.project_id.or(existing.project_id),
             environment_id: self.environment_id.or(existing.environment_id),
             controller: self.controller,
+            run_id: self.run_id,
         }
     }
 
@@ -188,6 +194,60 @@ pub enum RecordOwnership {
     BlockedByOther(OwnershipMarker),
     /// The reserved ownership registry name contains foreign or ambiguous TXT.
     RegistryConflict,
+}
+
+/// One provider record and its owner, as read just now.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordSnapshot {
+    pub provider_id: i32,
+    /// The provider's id for the record.
+    pub record_id: Option<String>,
+    pub record_type: String,
+    /// The record's value, canonical (`203.0.113.7`, `origin.example.net`).
+    pub content: String,
+    /// When the provider says it last changed, where it says.
+    pub modified_on: Option<String>,
+    /// This install's signed marker covers it.
+    pub managed: bool,
+    pub controller: Option<String>,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
+    /// The run that last wrote it, from its marker.
+    pub run_id: Option<i32>,
+}
+
+impl RecordSnapshot {
+    fn of(
+        provider_id: i32,
+        record_type: DnsRecordType,
+        ownership: RecordOwnership,
+    ) -> Option<Self> {
+        let (record, marker) = match ownership {
+            RecordOwnership::Owned(record, marker) => (record, Some(marker)),
+            RecordOwnership::Unmanaged(record) | RecordOwnership::OwnedByOther(record, _) => {
+                (record, None)
+            }
+            RecordOwnership::NotFound
+            | RecordOwnership::Orphaned(_)
+            | RecordOwnership::BlockedByOther(_)
+            | RecordOwnership::RegistryConflict => return None,
+        };
+        Some(Self {
+            provider_id,
+            record_id: record.id.clone(),
+            record_type: record_type.to_string(),
+            content: record.content.canonical().to_value_string(),
+            modified_on: record
+                .metadata
+                .get(crate::providers::METADATA_MODIFIED_ON)
+                .cloned(),
+            managed: marker.is_some(),
+            controller: marker.as_ref().and_then(|m| m.controller.clone()),
+            project_id: marker.as_ref().and_then(|m| m.project_id),
+            environment_id: marker.as_ref().and_then(|m| m.environment_id),
+            run_id: marker.as_ref().and_then(|m| m.run_id),
+        })
+    }
 }
 
 /// State of the ownership registry name itself (the `_temps-owned-<type>.…`
@@ -645,6 +705,28 @@ impl ManagedDnsRecordService {
         .await
     }
 
+    /// The record at `name` and `record_type` under `domain`'s zone as the
+    /// provider has it now, and who owns it: what a workflow compares with
+    /// what it saw before writing (ADR 064 D4). `None` when there is none.
+    pub async fn read_record(
+        &self,
+        domain: &str,
+        name: &str,
+        record_type: DnsRecordType,
+    ) -> Result<Option<RecordSnapshot>, DnsError> {
+        let (provider_model, _) = self
+            .provider_service
+            .find_provider_for_domain(domain)
+            .await?
+            .ok_or_else(|| DnsError::DomainNotManaged(domain.to_string()))?;
+        let ownership = self.record_ownership(domain, name, record_type).await?;
+        Ok(RecordSnapshot::of(
+            provider_model.id,
+            record_type,
+            ownership,
+        ))
+    }
+
     async fn validate_scope(&self, scope: OwnershipScope) -> Result<(), DnsError> {
         let project = if let Some(project_id) = scope.project_id {
             Some(
@@ -986,7 +1068,8 @@ impl ManagedDnsRecordService {
                 stamp_scope.project_id,
                 stamp_scope.environment_id,
                 stamp_scope.controller,
-            )
+            )?
+            .with_run_id(signing_key, stamp_scope.run_id)
         };
 
         // Creates are marker-first and create-only: a TXT or target record
@@ -2044,6 +2127,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(2),
                 controller: None,
+                run_id: None,
             },
         )
         .await
@@ -2767,6 +2851,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(2),
                 controller: None,
+                run_id: None,
             },
         )
         .await
@@ -2951,6 +3036,7 @@ mod tests {
         project_id: Some(1),
         environment_id: Some(2),
         controller: Some("domain-delivery"),
+        run_id: None,
     };
 
     async fn test_guarded_set_scoped(
@@ -3025,6 +3111,7 @@ mod tests {
             project_id: Some(4),
             environment_id: Some(6),
             controller: None,
+            run_id: None,
         }
         .stamped_over(Some(&marker));
         assert_eq!(explicit.environment_id, Some(6));
@@ -3085,6 +3172,7 @@ mod tests {
                 project_id: Some(3),
                 environment_id: Some(30),
                 controller: Some("domain-delivery"),
+                run_id: None,
             },
         )
         .await

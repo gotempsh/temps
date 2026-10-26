@@ -64,6 +64,11 @@ impl From<ProjectIpAccessError> for Problem {
                     .with_title("Invalid IP Access Policy")
                     .with_detail(error.to_string())
             }
+            ProjectIpAccessError::PrivateOnlyAllowListBehindProxy { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Allow List Would Block Proxied Visitors")
+                    .with_detail(error.to_string())
+            }
             ProjectIpAccessError::ConcurrentUpdate { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("IP Access Policy Changed")

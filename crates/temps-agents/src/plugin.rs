@@ -23,6 +23,7 @@ use temps_deployments::services::deployment_token_service::DeploymentTokenServic
 use crate::handlers::AppState;
 use crate::sandbox::docker::{DockerSandboxConfig, DockerSandboxProvider};
 use crate::sandbox::local::LocalSandboxProvider;
+use crate::sandbox::no_local::NoLocalSandboxProvider;
 use crate::sandbox::node_routing::{DbRemoteNodeResolver, NodeRoutingSandboxProvider};
 use crate::sandbox::SandboxProvider;
 use crate::services::autofixer::AutofixerService;
@@ -135,10 +136,50 @@ fn filter_agents_for_trigger(
     }
 }
 
-/// Guarded constructor for `LocalSandboxProvider`. The local provider runs
-/// agent-executed commands **directly on the host** with no namespace
-/// isolation, no resource limits, and no capability dropping — it is safe
-/// only for single-developer machines. We require an explicit opt-in via
+/// Which sandbox provider runs on this server's own host (ADR 063).
+/// Sandboxes on worker nodes are routed by `NodeRoutingSandboxProvider`
+/// whatever this says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostSandbox {
+    /// Docker, plus Firecracker / microsandbox where they are set up.
+    Docker,
+    /// The unsandboxed `LocalSandboxProvider`. It runs agent-executed
+    /// commands **directly on the host** with no namespace isolation, no
+    /// resource limits and no capability dropping, so it is safe only on a
+    /// single-developer machine, and needs an explicit
+    /// `TEMPS_ALLOW_LOCAL_SANDBOX=1`: a production host that temporarily
+    /// loses Docker must not fall through to running untrusted agent code
+    /// as the `temps` service user.
+    Unsandboxed,
+    /// Nothing runs here: a control plane without local workloads.
+    NoLocal,
+    /// Docker is down and the unsandboxed fallback was not opted into.
+    Refuse,
+}
+
+/// Pure decision behind [`HostSandbox`]. With local workloads off the answer
+/// is always [`HostSandbox::NoLocal`]: neither a reachable daemon nor
+/// `TEMPS_ALLOW_LOCAL_SANDBOX` may put a sandbox on a control plane, and in
+/// particular there is never an unsandboxed fallback there.
+fn host_sandbox_choice(
+    local_workloads: bool,
+    docker_reachable: bool,
+    allow_unsandboxed: bool,
+) -> HostSandbox {
+    match (local_workloads, docker_reachable, allow_unsandboxed) {
+        (false, _, _) => HostSandbox::NoLocal,
+        (true, true, _) => HostSandbox::Docker,
+        (true, false, true) => HostSandbox::Unsandboxed,
+        (true, false, false) => HostSandbox::Refuse,
+    }
+}
+
+fn local_sandbox_opt_in() -> bool {
+    std::env::var("TEMPS_ALLOW_LOCAL_SANDBOX")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Assemble the sandbox provider registered for the whole server (ADR-029
 /// §2/§3, ADR-050). Docker is always present at this point; Firecracker
 /// joins when `temps firecracker setup` has provisioned this host and its
@@ -466,28 +507,6 @@ fn microsandbox_provider(data_dir: &std::path::Path) -> Option<Arc<dyn SandboxPr
         capability.reason.unwrap_or_default()
     );
     None
-}
-
-/// `TEMPS_ALLOW_LOCAL_SANDBOX=1` so production deployments that temporarily
-/// lose Docker don't silently fall through to executing untrusted agent
-/// code as the `temps` service user.
-fn ensure_local_sandbox_allowed() -> Result<Arc<dyn SandboxProvider>, PluginError> {
-    let allowed = std::env::var("TEMPS_ALLOW_LOCAL_SANDBOX")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
-        .unwrap_or(false);
-    if !allowed {
-        return Err(PluginError::InitializationFailed(
-            "agents: Docker sandbox unavailable and TEMPS_ALLOW_LOCAL_SANDBOX is not set. \
-             Refusing to run agents directly on the host — set the env var to '1' to accept \
-             the risk on a dev machine, or fix Docker in production."
-                .to_string(),
-        ));
-    }
-    tracing::warn!(
-        "⚠️  TEMPS_ALLOW_LOCAL_SANDBOX=1 — agents will execute on the host with no isolation. \
-         This is INSECURE and intended for development only."
-    );
-    Ok(Arc::new(LocalSandboxProvider::new()))
 }
 
 pub struct AgentsPlugin;
@@ -852,57 +871,92 @@ impl TempsPlugin for AgentsPlugin {
             // build on every boot. That work is deferred entirely to the
             // first agent run: `create()` pulls/builds the image lazily the
             // first time a sandbox is actually needed.
+            // ADR 063: a control plane that runs no workloads never connects
+            // to Docker here, never probes for Firecracker or microsandbox,
+            // never stages guest agents and never falls back to the
+            // unsandboxed provider. Its sandboxes run on worker nodes only.
+            let workload_policy = temps_core::policy_or_default(
+                context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            );
+            let local_workloads = workload_policy.local_workloads_enabled();
             let mut workload_vm_driver: Option<Arc<dyn temps_workload::RuntimeDriver>> = None;
-            let sandbox_provider: Arc<dyn SandboxProvider> =
+            // Only a process that runs workloads ever contacts the daemon.
+            let docker = if local_workloads {
                 match bollard::Docker::connect_with_local_defaults() {
-                    Ok(docker) => {
-                        let docker = Arc::new(docker);
-                        match docker.ping().await {
-                            Ok(_) => {
-                                let config = DockerSandboxConfig {
-                                    runtime: global_sandbox.runtime.clone(),
-                                    custom_image: global_sandbox.custom_image.clone(),
-                                    default_cpu_limit: global_sandbox.cpu_limit,
-                                    default_memory_limit_mb: global_sandbox.memory_limit_mb,
-                                    network_mode: global_sandbox.network_mode.clone(),
-                                    control_plane_url: platform_config_service
-                                        .resolve_internal_url()
-                                        .await,
-                                    preview_gateway_container_name: preview_gateway_name.clone(),
-                                    exec_output_limit: None,
-                                };
-                                let provider =
-                                    Arc::new(DockerSandboxProvider::new(docker.clone(), config));
-                                provider
-                                    .quarantine_stale_sandboxes()
-                                    .await
-                                    .map_err(|error| {
-                                        PluginError::InitializationFailed(format!(
-                                            "validate existing sandbox isolation: {error}"
-                                        ))
-                                    })?;
-                                tracing::info!(
-                                    "Docker sandbox provider initialized (image built on demand at first agent run)"
-                                );
-                                build_sandbox_provider(
-                                    provider,
-                                    docker,
-                                    &global_sandbox,
-                                    &mut workload_vm_driver,
-                                )
-                                .await
-                            }
-                            Err(e) => {
-                                tracing::warn!("Docker not responding, using local sandbox: {}", e);
-                                ensure_local_sandbox_allowed()?
-                            }
+                    Ok(docker) => match docker.ping().await {
+                        Ok(_) => Some(Arc::new(docker)),
+                        Err(e) => {
+                            tracing::warn!("Docker not responding: {}", e);
+                            None
                         }
-                    }
+                    },
                     Err(e) => {
-                        tracing::warn!("Docker not available, using local sandbox: {}", e);
-                        ensure_local_sandbox_allowed()?
+                        tracing::warn!("Docker not available: {}", e);
+                        None
                     }
-                };
+                }
+            } else {
+                None
+            };
+            let choice =
+                host_sandbox_choice(local_workloads, docker.is_some(), local_sandbox_opt_in());
+            let sandbox_provider: Arc<dyn SandboxProvider> = match (choice, docker) {
+                (HostSandbox::Docker, Some(docker)) => {
+                    let config = DockerSandboxConfig {
+                        runtime: global_sandbox.runtime.clone(),
+                        custom_image: global_sandbox.custom_image.clone(),
+                        default_cpu_limit: global_sandbox.cpu_limit,
+                        default_memory_limit_mb: global_sandbox.memory_limit_mb,
+                        network_mode: global_sandbox.network_mode.clone(),
+                        control_plane_url: platform_config_service.resolve_internal_url().await,
+                        preview_gateway_container_name: preview_gateway_name.clone(),
+                        exec_output_limit: None,
+                    };
+                    let provider = Arc::new(DockerSandboxProvider::new(docker.clone(), config));
+                    provider
+                        .quarantine_stale_sandboxes()
+                        .await
+                        .map_err(|error| {
+                            PluginError::InitializationFailed(format!(
+                                "validate existing sandbox isolation: {error}"
+                            ))
+                        })?;
+                    tracing::info!(
+                        "Docker sandbox provider initialized (image built on demand at first agent run)"
+                    );
+                    build_sandbox_provider(
+                        provider,
+                        docker,
+                        &global_sandbox,
+                        &mut workload_vm_driver,
+                    )
+                    .await
+                }
+                (HostSandbox::NoLocal, _) => {
+                    tracing::info!(
+                        profile = workload_policy.profile(),
+                        "Sandboxes run on worker nodes only: this control plane runs no \
+                         workloads, so no sandbox provider runs on its own host (AI agent runs \
+                         and application workspaces are unavailable here)"
+                    );
+                    Arc::new(NoLocalSandboxProvider::new())
+                }
+                (HostSandbox::Unsandboxed, _) => {
+                    tracing::warn!(
+                        "⚠️  TEMPS_ALLOW_LOCAL_SANDBOX=1 — agents will execute on the host with no \
+                         isolation. This is INSECURE and intended for development only."
+                    );
+                    Arc::new(LocalSandboxProvider::new())
+                }
+                (HostSandbox::Refuse, _) | (HostSandbox::Docker, None) => {
+                    return Err(PluginError::InitializationFailed(
+                        "agents: Docker sandbox unavailable and TEMPS_ALLOW_LOCAL_SANDBOX is not \
+                         set. Refusing to run agents directly on the host — set the env var to \
+                         '1' to accept the risk on a dev machine, or fix Docker in production."
+                            .to_string(),
+                    ));
+                }
+            };
             // ADR-048: wrap the host provider so sandboxes can also live on
             // worker nodes. Anything created without a node (every agent run,
             // every sandbox on a single-node install) stays on this host
@@ -936,7 +990,11 @@ impl TempsPlugin for AgentsPlugin {
                 ));
             }
 
-            let sandbox_registry = Arc::new(SandboxRegistry::new(sandbox_provider));
+            let sandbox_registry = Arc::new(if local_workloads {
+                SandboxRegistry::new(sandbox_provider)
+            } else {
+                SandboxRegistry::without_local_host(sandbox_provider)
+            });
             // Registered so the temps-sandbox plugin can inject its managed
             // run-sandbox service (agent runs then get first-class
             // `sandboxes` rows in the standalone sandbox API).
@@ -1090,7 +1148,12 @@ impl TempsPlugin for AgentsPlugin {
                 autofixer_service,
                 secret_service,
                 definition_service,
-                docker: context.require_service::<bollard::Docker>(),
+                // The handle, not the raw client: a control plane has no
+                // client, and the preview-gateway handlers answer the typed
+                // worker-node-required problem there instead of this
+                // lookup panicking at boot.
+                docker: context.require_service::<temps_core::DockerHandle>(),
+                local_workloads,
                 platform_config_service,
                 preview_gateway_name,
                 telemetry: context
@@ -1192,6 +1255,7 @@ fn route_state(context: &PluginContext) -> Option<Arc<AppState>> {
         secret_service: old.secret_service.clone(),
         definition_service: old.definition_service.clone(),
         docker: old.docker.clone(),
+        local_workloads: old.local_workloads,
         platform_config_service: old.platform_config_service.clone(),
         preview_gateway_name: old.preview_gateway_name.clone(),
         telemetry: old.telemetry.clone(),
@@ -1214,6 +1278,31 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, Value};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn a_host_that_runs_workloads_keeps_its_provider_choice() {
+        assert_eq!(host_sandbox_choice(true, true, false), HostSandbox::Docker);
+        assert_eq!(host_sandbox_choice(true, true, true), HostSandbox::Docker);
+        assert_eq!(
+            host_sandbox_choice(true, false, true),
+            HostSandbox::Unsandboxed
+        );
+        assert_eq!(host_sandbox_choice(true, false, false), HostSandbox::Refuse);
+    }
+
+    #[test]
+    fn a_control_plane_without_workloads_never_gets_a_host_sandbox() {
+        // Neither a reachable daemon nor the unsandboxed opt-in changes it.
+        for docker in [false, true] {
+            for opt_in in [false, true] {
+                assert_eq!(
+                    host_sandbox_choice(false, docker, opt_in),
+                    HostSandbox::NoLocal,
+                    "docker={docker} opt_in={opt_in}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn startup_refresh_updates_all_three_targets_and_leaves_unconfigured_backends_alone() {

@@ -61,12 +61,15 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { WorkerIngressSummary } from '@/components/nodes/WorkerIngressSummary'
 import { WorkerTunnels } from '@/components/nodes/WorkerTunnels'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import {
   ALLOW_INGRESS_COMMANDS,
+  PRIVATE_INGRESS_COMMAND,
   type AddressScope,
   addressScope,
+  privateIngressSummary,
   scopeLabel,
   workerIngressStatus,
 } from '@/lib/worker-ingress'
@@ -247,6 +250,8 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   // predate modes report none and keep the old, console-managed behaviour.
   const mode = settings?.mode ?? null
   const workerOff = mode === 'off'
+  // ADR 064 D5: the worker's owner chose to serve only its private network.
+  const privateOnly = mode === 'private'
   const listenLocked = mode === 'off' || mode === 'fixed'
   const shownCheck = check ?? settings?.last_check ?? null
   // Tunnels expose a worker as much as open ports do, so they need the
@@ -261,6 +266,16 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   // With a tunnel already carrying this worker, open ports are a second,
   // optional way in: keep their settings folded away unless asked for.
   const showDirectSettings = directOpen ?? (enabled && !tunnelHere)
+  // A worker with no way in is not a finished state: lead with the choices
+  // instead of a summary that says nothing works.
+  const unconfigured =
+    !!settings &&
+    !workerOff &&
+    !privateOnly &&
+    connectorsQuery.isSuccess &&
+    !tunnelHere &&
+    !enabled
+  const showEditor = editing || unconfigured
 
   const tunnels = (
     <section className="space-y-3" aria-labelledby={`tunnels-${node.id}`}>
@@ -271,7 +286,13 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
         {!tunnelHere && (
           <p className="text-sm text-muted-foreground">
             The worker connects out to a tunnel provider, and visitors come in
-            through it. No public IP, open port or router change.
+            through it. No public IP, open port or router change.{' '}
+            <Link
+              className="underline"
+              to={ingressSetupUrl({ worker: node.id, via: 'tunnel' })}
+            >
+              Set up Cloudflare Tunnel from your API token
+            </Link>
           </p>
         )}
       </div>
@@ -292,14 +313,19 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
   )
 
   return (
-    <Card className="shadow-none" id="public-ingress">
+    <Card
+      className={
+        unconfigured ? 'border-amber-500/40 shadow-none' : 'shadow-none'
+      }
+      id="public-ingress"
+    >
       <CardContent className="space-y-4 p-4">
         <div className="flex flex-wrap items-start justify-between gap-2">
           <div className="min-w-0 space-y-1">
             <div className="flex items-center gap-2 text-sm font-medium">
               <Globe className="h-4 w-4" /> How visitors reach this worker
             </div>
-            {editing && (
+            {showEditor && (
               <p className="text-sm text-muted-foreground">
                 Take application traffic on this worker and forward it to
                 containers on any worker in the cluster. Apps&apos; hostnames
@@ -311,7 +337,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
               </p>
             )}
           </div>
-          {settings && (
+          {settings && !unconfigured && !privateOnly && (
             <Button
               size="sm"
               variant={editing ? 'default' : 'outline'}
@@ -336,7 +362,39 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           </div>
         )}
 
-        {settings && !editing && (
+        {settings && privateOnly && (
+          <div className="space-y-2 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <Badge variant="secondary">Private network only</Badge>
+              {settings.private_on_tailscale && (
+                <Badge variant="outline">Tailscale detected</Badge>
+              )}
+            </div>
+            <p
+              className={
+                settings.private_listener
+                  ? 'text-muted-foreground'
+                  : 'text-destructive'
+              }
+            >
+              {privateIngressSummary(settings)}
+            </p>
+            {!settings.private_listener && (
+              <WorkerCommand
+                command={PRIVATE_INGRESS_COMMAND}
+                hint="Run as root on the worker once Tailscale is up."
+              />
+            )}
+            <p className="text-xs text-muted-foreground">
+              Apps are reachable here only through addresses made private with
+              Make it reachable → Only my private network. To take public
+              traffic too, run <code>{ALLOW_INGRESS_COMMANDS.delegated}</code>{' '}
+              on the worker.
+            </p>
+          </div>
+        )}
+
+        {settings && !showEditor && !privateOnly && (
           <WorkerIngressSummary
             node={node}
             settings={settings}
@@ -344,8 +402,25 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
           />
         )}
 
-        {settings && draft && editing && (
+        {settings && draft && showEditor && !privateOnly && (
           <div className="space-y-4">
+            {unconfigured && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    Visitors can&apos;t reach apps through this worker yet. Pick
+                    one way in: a tunnel works from anywhere, with no public IP
+                    or open port; open ports need a public IP that sends 80 and
+                    443 here.
+                  </p>
+                  <Button asChild size="sm">
+                    <Link to={ingressSetupUrl({ worker: node.id })}>
+                      Set up ingress step by step
+                    </Link>
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
             {!settings.agent_reports && (
               <Alert>
                 <AlertDescription>
@@ -673,7 +748,7 @@ export function WorkerIngressCard({ node }: { node: NodeInfoResponse }) {
             </Alert>
           )}
 
-        {editing && (
+        {showEditor && (
           <Collapsible>
             <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
               <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />

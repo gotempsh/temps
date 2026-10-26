@@ -541,6 +541,16 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
+    /// Whether the route's project answers Temps' own public paths
+    /// (`/api/_temps*`, `/api/otel*`) itself, so the proxy must hand them to
+    /// it rather than to this instance's console. `false` for routes without
+    /// a project (custom routes).
+    pub fn serves_own_temps_api(&self) -> bool {
+        self.project
+            .as_ref()
+            .is_some_and(|project| project.serves_own_temps_api)
+    }
+
     /// Select the next backend (address + container metadata) using round-robin.
     /// Returns a fallback selection if this is a static directory backend.
     pub fn select_backend(&self) -> BackendSelection {
@@ -743,6 +753,57 @@ async fn load_status_page_hosts(
     Ok(bindings)
 }
 
+/// What bounds an address whose audience is `private` (ADR 064 D5).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrivateAddress {
+    /// [`temps_core::worker_ingress::private_address_id`]: what the worker's
+    /// inside check is given instead of a hostname.
+    pub address_id: String,
+    /// The network a visitor must come from; `None` admits nobody.
+    pub range: Option<String>,
+    /// The worker whose private listener serves it; `None` means nobody.
+    pub node_id: Option<i32>,
+    /// The listener address DNS was pointed at.
+    pub listener: Option<String>,
+}
+
+/// How a non-public address is bounded. Only `private` is served, by the
+/// listener and to the range it names. Any other audience (`signed_in`
+/// before phase 4, or a value a newer version wrote) admits nobody: it is
+/// never served to the whole private range, so a rolled-back control plane
+/// cannot widen it (ADR 065 D6).
+fn private_address(
+    audience: &str,
+    address_id: String,
+    range: Option<String>,
+    node_id: Option<i32>,
+    listener: Option<String>,
+) -> PrivateAddress {
+    if audience == temps_entities::audience::PRIVATE {
+        PrivateAddress {
+            address_id,
+            range,
+            node_id,
+            listener,
+        }
+    } else {
+        PrivateAddress {
+            address_id,
+            range: None,
+            node_id: None,
+            listener: None,
+        }
+    }
+}
+
+/// A private address with the route it would take. Never part of the maps
+/// this proxy serves from, and never exported as a public worker route.
+#[derive(Clone, Debug)]
+pub struct PrivateRoute {
+    pub route: RouteInfo,
+    pub address: PrivateAddress,
+}
+
 #[derive(Clone, Debug, Default)]
 struct LegacyRouteTable {
     exact: HashMap<String, RouteInfo>,
@@ -757,6 +818,10 @@ struct LegacyRouteTable {
     /// worker nodes, not cert-eligible for on-demand TLS, and never resolve
     /// to a project.
     status_page_hosts: HashMap<String, StatusPageHostRoute>,
+    /// Addresses whose audience is `private` (ADR 064 D5), lower-cased.
+    /// Only a worker's private listener serves them: this proxy and every
+    /// public worker route treat them as unknown.
+    private_hosts: HashSet<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -775,6 +840,8 @@ struct RouteTableSnapshot {
     /// Compiled ingress endpoints of every non-legacy environment (ADR-055
     /// §11). Shared by reference: a request takes one refcount, never a copy.
     ingress: Arc<crate::ingress::IngressSnapshot>,
+    /// Private addresses and their routes (ADR 064 D5), by host.
+    private: HashMap<String, PrivateRoute>,
 }
 
 impl RouteTableSnapshot {
@@ -797,6 +864,8 @@ impl LegacyRouteTable {
         self.reserved_console_host.as_deref() == Some(host)
             || self.reserved_ingress_host.as_deref() == Some(host)
             || self.status_page_hosts.contains_key(host)
+            || (!self.private_hosts.is_empty()
+                && self.private_hosts.contains(host.trim_end_matches('.')))
     }
 
     fn get(&self, host: &str) -> Option<&RouteInfo> {
@@ -807,6 +876,67 @@ impl LegacyRouteTable {
             .get(host)
             .or_else(|| self.wildcards.match_domain(host))
     }
+}
+
+/// Take private addresses (ADR 064 D5) out of the maps the control-plane
+/// proxy serves from and out of the wake path: the routes they would take,
+/// by host, and every private host, lower-cased, for lookups to refuse.
+fn withdraw_private_addresses(
+    private_meta: HashMap<String, PrivateAddress>,
+    routes: &mut HashMap<String, RouteInfo>,
+    http_routes: &mut HashMap<String, RouteInfo>,
+    tls_routes: &mut HashMap<String, RouteInfo>,
+    unavailable: &mut HashMap<String, UnavailableRoute>,
+    sleeping: &mut Vec<SleepingEnvironmentEntry>,
+) -> (HashMap<String, PrivateRoute>, HashSet<String>) {
+    let mut private_routes = HashMap::new();
+    let mut private_hosts = HashSet::new();
+    for (host, address) in private_meta {
+        http_routes.remove(&host);
+        tls_routes.remove(&host);
+        unavailable.remove(&host);
+        private_hosts.insert(host.trim_end_matches('.').to_ascii_lowercase());
+        if let Some(route) = routes.remove(&host) {
+            private_routes.insert(host, PrivateRoute { route, address });
+        }
+    }
+    if !private_hosts.is_empty() {
+        sleeping.retain(|entry| {
+            !private_hosts.contains(&entry.domain.trim_end_matches('.').to_ascii_lowercase())
+        });
+    }
+    (private_routes, private_hosts)
+}
+
+/// Whether a worker can serve `route` without bypassing what only the
+/// control-plane proxy enforces: an upstream backend, no redirect, no path
+/// routes (ADR 050), not asleep, no attack mode, no security settings.
+fn worker_servable(snapshot: &RouteTableSnapshot, route: &RouteInfo) -> bool {
+    route.redirect_to.is_none()
+        && matches!(route.backend, BackendType::Upstream { .. })
+        && !route.environment.as_ref().is_some_and(|environment| {
+            snapshot
+                .path_routes
+                .get(&environment.id)
+                .is_some_and(|rules| !rules.is_empty())
+        })
+        && route.environment.as_ref().is_some_and(|environment| {
+            !environment.sleeping
+                && environment.attack_mode != Some(true)
+                && environment
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|config| config.security.as_ref())
+                    .is_none()
+        })
+        && route.project.as_ref().is_some_and(|project| {
+            !project.attack_mode
+                && project
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|config| config.security.as_ref())
+                    .is_none()
+        })
 }
 
 /// Minimal, immutable hostname ownership index for wake-on-request gating.
@@ -1576,6 +1706,9 @@ impl CachedPeerTable {
         // App hostnames skipped below because their deployment has no live
         // upstream. Served as a 503 by the proxy instead of the console.
         let mut unavailable = UnavailableHosts::default();
+        // Addresses whose audience is `private` (ADR 064 D5): routed like any
+        // other below, then moved out of everything this proxy serves.
+        let mut private_meta: HashMap<String, PrivateAddress> = HashMap::new();
 
         // Build entity caches as we go - only cache what we actually need for routing
         let mut projects_cache: HashMap<i32, Arc<projects::Model>> = HashMap::new();
@@ -1628,6 +1761,18 @@ impl CachedPeerTable {
         );
 
         for env_domain in env_domains {
+            if env_domain.audience != temps_entities::audience::PUBLIC {
+                private_meta.insert(
+                    env_domain.domain.clone(),
+                    private_address(
+                        &env_domain.audience,
+                        temps_core::worker_ingress::private_address_id(false, env_domain.id),
+                        env_domain.private_range.clone(),
+                        env_domain.private_node_id,
+                        env_domain.private_listener.clone(),
+                    ),
+                );
+            }
             // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&env_domain.environment_id) {
                 if let Ok(Some(env)) = environments::Entity::find_by_id(env_domain.environment_id)
@@ -1903,6 +2048,18 @@ impl CachedPeerTable {
         );
 
         for custom_domain in custom_domains {
+            if custom_domain.audience != temps_entities::audience::PUBLIC {
+                private_meta.insert(
+                    custom_domain.domain.clone(),
+                    private_address(
+                        &custom_domain.audience,
+                        temps_core::worker_ingress::private_address_id(true, custom_domain.id),
+                        custom_domain.private_range.clone(),
+                        custom_domain.private_node_id,
+                        custom_domain.private_listener.clone(),
+                    ),
+                );
+            }
             // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&custom_domain.environment_id) {
                 if let Ok(Some(env)) =
@@ -2994,6 +3151,20 @@ impl CachedPeerTable {
             }
         }
 
+        // ADR 064 D5: a private address is served only by the private
+        // listener of the worker recorded for it. Take it out of every map
+        // this proxy serves from, and out of the wake path, so neither this
+        // proxy nor a public worker route ever answers it, whatever DNS says.
+        // `signed_in` (reserved) is held back the same way until it has a gate.
+        let (private_routes, private_hosts) = withdraw_private_addresses(
+            private_meta,
+            &mut routes,
+            &mut http_routes_map,
+            &mut tls_routes_map,
+            &mut unavailable.exact,
+            &mut sleeping_environments,
+        );
+
         // A live route always wins over an unavailable entry for the same
         // host, whichever section recorded it, and the console hostname is
         // never reported as an application host. Lookups re-check live
@@ -3100,11 +3271,13 @@ impl CachedPeerTable {
                 reserved_console_host: app_settings.console_hostname(),
                 reserved_ingress_host: ingress_host,
                 status_page_hosts,
+                private_hosts,
             },
             ownership: route_ownership,
             path_routes,
             unavailable,
             ingress,
+            private: private_routes,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -3502,35 +3675,43 @@ impl CachedPeerTable {
             .exact
             .iter()
             .filter(|(host, route)| {
-                !host.ends_with(".temps.local")
-                    && route.redirect_to.is_none()
-                    && matches!(route.backend, BackendType::Upstream { .. })
-                    && !route.environment.as_ref().is_some_and(|environment| {
-                        snapshot
-                            .path_routes
-                            .get(&environment.id)
-                            .is_some_and(|rules| !rules.is_empty())
-                    })
-                    && route.environment.as_ref().is_some_and(|environment| {
-                        !environment.sleeping
-                            && environment.attack_mode != Some(true)
-                            && environment
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|config| config.security.as_ref())
-                                .is_none()
-                    })
-                    && route.project.as_ref().is_some_and(|project| {
-                        !project.attack_mode
-                            && project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|config| config.security.as_ref())
-                                .is_none()
-                    })
+                !host.ends_with(".temps.local") && worker_servable(&snapshot, route)
             })
             .map(|(host, route)| (host.clone(), route.clone()))
             .collect()
+    }
+
+    /// Private addresses a worker serves on its private listener (ADR 064
+    /// D5), for `node_id` only, with whether each passes the same rules as a
+    /// public worker route. A private address another worker serves, or no
+    /// worker, is never in it.
+    pub fn snapshot_worker_private_routes(
+        &self,
+        node_id: i32,
+    ) -> Vec<(String, PrivateRoute, bool)> {
+        let snapshot = self.route_snapshot.load();
+        snapshot
+            .private
+            .iter()
+            .filter(|(_, private)| private.address.node_id == Some(node_id))
+            .map(|(host, private)| {
+                (
+                    host.clone(),
+                    private.clone(),
+                    worker_servable(&snapshot, &private.route),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `host` is a private address (ADR 064 D5).
+    pub fn is_private_hostname(&self, host: &str) -> bool {
+        let snapshot = self.route_snapshot.load();
+        !snapshot.legacy.private_hosts.is_empty()
+            && snapshot
+                .legacy
+                .private_hosts
+                .contains(&host.trim_end_matches('.').to_ascii_lowercase())
     }
 
     pub fn worker_public_route_count(&self) -> usize {
@@ -4504,6 +4685,7 @@ mod tests {
                 bitbucket_webhook_hook_id: None,
                 generic_webhook_token: None,
                 cross_project_trace_sharing: false,
+                serves_own_temps_api: false,
                 ai_api_traffic_summary_enabled: None,
                 image_retention_hours: None,
                 cloud_telemetry_fidelity: Default::default(),
@@ -4558,6 +4740,152 @@ mod tests {
                 .map(|(host, _)| host)
                 .collect();
             assert_eq!(hosts, vec!["api.example.com"]);
+        }
+
+        /// ADR 065 D6: only `private` is served to a range. `signed_in` before
+        /// phase 4, or a value a newer version wrote, admits nobody, so a
+        /// rolled-back control plane never serves it to a whole network.
+        #[test]
+        fn only_a_private_audience_is_served_to_its_range() {
+            let bounded = |audience: &str| {
+                private_address(
+                    audience,
+                    "custom:7".into(),
+                    Some("100.64.0.0/10".into()),
+                    Some(3),
+                    Some("100.101.102.103".into()),
+                )
+            };
+            let private = bounded(temps_entities::audience::PRIVATE);
+            assert_eq!(private.range.as_deref(), Some("100.64.0.0/10"));
+            assert_eq!(private.node_id, Some(3));
+            for audience in [temps_entities::audience::SIGNED_IN, "tailnet_users", ""] {
+                let nobody = bounded(audience);
+                assert_eq!(nobody.address_id, "custom:7", "{audience}");
+                assert_eq!(nobody.range, None, "{audience}");
+                assert_eq!(nobody.node_id, None, "{audience}");
+                assert_eq!(nobody.listener, None, "{audience}");
+            }
+        }
+
+        /// ADR 064 D5: a private address is served by nobody but the private
+        /// listener of the worker recorded for it. This proxy, wildcard
+        /// routes, public worker routes (and so tunnels) never answer it.
+        #[test]
+        fn a_private_address_is_never_a_public_route() {
+            let production = env(10, 1, "production", Some(100));
+            let mut web = route(&production, 100, "10.0.0.1:3000");
+            web.project = Some(project(1));
+            let mut routes = HashMap::from([
+                ("app.internal.example.com".to_string(), web.clone()),
+                ("www.example.com".to_string(), web.clone()),
+                ("*.internal.example.com".to_string(), web.clone()),
+            ]);
+            let mut sleeping = vec![SleepingEnvironmentEntry {
+                domain: "app.internal.example.com".into(),
+                environment_id: 10,
+                project_id: 1,
+                deployment_id: 100,
+                wake_timeout_seconds: 30,
+            }];
+            let address = PrivateAddress {
+                address_id: "custom:7".into(),
+                range: Some("100.64.0.0/10".into()),
+                node_id: Some(3),
+                listener: Some("100.101.102.103".into()),
+            };
+            let (private, private_hosts) = withdraw_private_addresses(
+                HashMap::from([("app.internal.example.com".to_string(), address.clone())]),
+                &mut routes,
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &mut sleeping,
+            );
+            assert!(
+                sleeping.is_empty(),
+                "a private address is never woken by this proxy"
+            );
+            let table = table_with(routes, HashMap::new());
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            let mut wildcards = WildcardMatcher::new();
+            wildcards.insert("*.internal.example.com", web.clone());
+            snapshot.legacy.wildcards = wildcards;
+            snapshot.legacy.private_hosts = private_hosts;
+            snapshot.private = private;
+            table.route_snapshot.store(Arc::new(snapshot));
+
+            // Not served here, not even through the wildcard that covers it.
+            assert!(table.get_route("app.internal.example.com").is_none());
+            assert!(table
+                .get_route_by_host("app.internal.example.com")
+                .is_none());
+            assert!(table
+                .resolve_route_for_sni("app.internal.example.com")
+                .is_none());
+            assert!(table.get_route("www.example.com").is_some());
+            assert!(table.is_private_hostname("App.Internal.Example.com."));
+            // Never a public worker route, so never published by a tunnel.
+            let public: Vec<String> = table
+                .snapshot_worker_public_routes()
+                .into_iter()
+                .map(|(host, _)| host)
+                .collect();
+            assert!(!public.contains(&"app.internal.example.com".to_string()));
+            assert!(public.contains(&"www.example.com".to_string()));
+            assert!(!table
+                .public_hostnames()
+                .contains(&"app.internal.example.com".to_string()));
+            // Only the worker recorded for it gets it, with its range.
+            let mine = table.snapshot_worker_private_routes(3);
+            assert_eq!(mine.len(), 1);
+            assert_eq!(mine[0].0, "app.internal.example.com");
+            assert_eq!(mine[0].1.address, address);
+            assert!(mine[0].2);
+            assert!(table.snapshot_worker_private_routes(4).is_empty());
+
+            // What the worker's snapshot carries: the range and listener, and
+            // nothing when a policy only the control plane enforces is on,
+            // the range is not one private block, or the backend is not on
+            // a registered worker.
+            let worker: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+            let policy = |blocking: &[&str]| crate::route_sync::WorkerRoutePolicy {
+                blocking_policies: blocking.iter().map(|b| b.to_string()).collect(),
+                registered_worker_addresses: HashSet::from([worker]),
+            };
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(held.is_empty(), "{held:?}");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].address_id, "custom:7");
+            assert_eq!(entries[0].range, "100.64.0.0/10");
+            assert_eq!(entries[0].listener, "100.101.102.103");
+            let (entries, held) = crate::route_sync::worker_private_routes(
+                &table,
+                &policy(&["project IP access rules are configured"]),
+                3,
+            );
+            assert!(entries.is_empty());
+            assert!(
+                held[0].contains("only the control plane enforces"),
+                "{held:?}"
+            );
+            let mut snapshot = (*table.route_snapshot.load_full()).clone();
+            if let Some(entry) = snapshot.private.get_mut("app.internal.example.com") {
+                entry.address.range = Some("0.0.0.0/0".into());
+            }
+            table.route_snapshot.store(Arc::new(snapshot));
+            let (entries, held) = crate::route_sync::worker_private_routes(&table, &policy(&[]), 3);
+            assert!(entries.is_empty());
+            assert!(held[0].contains("no private network range"), "{held:?}");
+            let unregistered = crate::route_sync::WorkerRoutePolicy {
+                blocking_policies: Vec::new(),
+                registered_worker_addresses: HashSet::new(),
+            };
+            assert!(
+                crate::route_sync::worker_private_routes(&table, &unregistered, 3)
+                    .0
+                    .is_empty()
+            );
         }
     }
 
@@ -5039,6 +5367,10 @@ mod tests {
                             environment_id: 1,
                             domain: "worker.example.com".into(),
                             created_at: now,
+                            audience: "public".to_string(),
+                            private_range: None,
+                            private_node_id: None,
+                            private_listener: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])

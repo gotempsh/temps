@@ -73,6 +73,20 @@ impl UpstreamResolverImpl {
         }
     }
 
+    /// The route that answers this host, by SNI or Host header, in the same
+    /// order the route lookup in `resolve_peer_for_request` tries them. The
+    /// console's own hostname is reserved, so it never has one.
+    fn claiming_route(
+        &self,
+        host: &str,
+        sni_hostname: Option<&str>,
+    ) -> Option<temps_routes::RouteInfo> {
+        self.route_table
+            .get_route_by_sni(sni_hostname.unwrap_or(host))
+            .or_else(|| self.route_table.get_route_by_host(host))
+            .or_else(|| self.route_table.get_route(host))
+    }
+
     /// Where requests that may only reach the console's public routes go:
     /// the public-only listener when one exists, the console listener
     /// otherwise (a split proxy started without an ingress address).
@@ -141,21 +155,41 @@ impl UpstreamResolver for UpstreamResolverImpl {
             ));
         }
 
-        // Route API and OTLP paths directly to the console (API server),
-        // regardless of the Host header — needed for OTLP push from containers
-        // that use host.docker.internal as the host. Public ingest paths go to
-        // the public-only listener, so "reachable from any host" is a property
-        // of what that listener mounts rather than of a path prefix. The OTLP
-        // query API shares the `/api/otel` prefix but is an authenticated
-        // console API, so it keeps going to the full console listener.
-        if path.starts_with(ROUTE_PREFIX_TEMPS) || path.starts_with(ROUTE_PREFIX_OTEL) {
-            let address = if is_public_ingest_path(path) {
-                self.public_surface_address()
-            } else {
-                self.server_config.console_address.as_str()
-            };
-            debug!("Routing temps API request to console: {}", address);
-            return Ok(console_peer(address));
+        let is_ingest = is_public_ingest_path(path);
+        if is_ingest || path.starts_with(ROUTE_PREFIX_OTEL) {
+            let claiming_route = self.claiming_route(host, sni_hostname);
+            if claiming_route
+                .as_ref()
+                .is_some_and(temps_routes::RouteInfo::serves_own_temps_api)
+            {
+                // The project is itself a Temps console or API (it opted in
+                // with `serves_own_temps_api`): its `/api/_temps` and
+                // `/api/otel` are its own, and reach it through the route
+                // lookup below like any other path.
+                debug!(
+                    host,
+                    path, "Project serves its own Temps API; routing to the project"
+                );
+            } else if is_ingest {
+                // Public ingest paths reach the console regardless of the Host
+                // header — every deployed app's analytics SDK posts to its own
+                // domain, and containers push OTLP via host.docker.internal.
+                // They go to the public-only listener, so "reachable from any
+                // host" is a property of what that listener mounts rather
+                // than of a path prefix.
+                let address = self.public_surface_address();
+                debug!("Routing temps ingest request to console: {}", address);
+                return Ok(console_peer(address));
+            } else if claiming_route.is_none() {
+                // The rest of `/api/otel` is the console's authenticated query
+                // API. It is the console's only on hosts no project route
+                // claims: an app that serves its own `/api/otel` (a Temps
+                // console deployed as a project, say) must get its own
+                // requests, not a 404 from this one.
+                let address = self.server_config.console_address.as_str();
+                debug!("Routing temps API request to console: {}", address);
+                return Ok(console_peer(address));
+            }
         }
 
         // Try the in-memory route table across all three lookup strategies
@@ -460,28 +494,68 @@ mod public_ingress_tests {
     const INGRESS: &str = "127.0.0.1:18086";
     const INGRESS_HOST: &str = "hooks.example.com";
 
+    const SEED_UPSTREAM: &str = "127.0.0.1:18080";
+    const OWN_API_HOST: &str = "plane.example.com";
+    const OWN_API_UPSTREAM: &str = "127.0.0.1:18090";
+
+    fn upstream_route(
+        address: &str,
+        project: Option<temps_entities::projects::Model>,
+    ) -> temps_routes::RouteInfo {
+        temps_routes::RouteInfo {
+            backend: temps_routes::BackendType::Upstream {
+                backends: vec![temps_routes::BackendEntry {
+                    address: address.into(),
+                    container_id: None,
+                    container_name: None,
+                }],
+                round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: project.map(Arc::new),
+            environment: None,
+            deployment: None,
+            cert_eligible: false,
+        }
+    }
+
+    fn project(id: i32, serves_own_temps_api: bool) -> temps_entities::projects::Model {
+        let mut project: temps_entities::projects::Model =
+            serde_json::from_value(serde_json::json!({
+                "id": id, "name": "app", "slug": format!("app-{id}"), "repo_name": "app",
+                "repo_owner": "example", "directory": ".", "main_branch": "main",
+                "preset": "dockerfile", "created_at": chrono::Utc::now(),
+                "updated_at": chrono::Utc::now(), "pull_only_root_directory": false,
+                "is_deleted": false, "is_public_repo": false, "attack_mode": false,
+                "ai_write_actions_enabled": false, "error_source_context_enabled": false,
+                "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
+                "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
+                "preview_envs_wake_timeout_seconds": 30, "source_type": "docker_image",
+                "project_type": temps_entities::types::ProjectType::Server,
+                "hosting": temps_entities::types::Hosting::Hosted,
+                "cross_project_trace_sharing": true, "cloud_telemetry_fidelity": "metered",
+                "cloud_telemetry_attribute_allowlist": [], "cloud_telemetry_write_mode": "local",
+                "cloud_analytics_write_mode": "local"
+            }))
+            .expect("test project fixture deserializes");
+        project.serves_own_temps_api = serves_own_temps_api;
+        project
+    }
+
     fn resolver(ingress_listener: bool, ingress_host: Option<&str>) -> UpstreamResolverImpl {
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
         let route_table = Arc::new(CachedPeerTable::new(db.clone()));
         // Loaded, so an unmatched host falls through without the startup wait.
+        // A project that leaves the flag off: Temps' paths stay the console's.
         route_table.insert_route_for_test(
             "seed.example.com",
-            temps_routes::RouteInfo {
-                backend: temps_routes::BackendType::Upstream {
-                    backends: vec![temps_routes::BackendEntry {
-                        address: "127.0.0.1:18080".into(),
-                        container_id: None,
-                        container_name: None,
-                    }],
-                    round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                },
-                redirect_to: None,
-                status_code: None,
-                project: None,
-                environment: None,
-                deployment: None,
-                cert_eligible: false,
-            },
+            upstream_route(SEED_UPSTREAM, Some(project(1, false))),
+        );
+        // A project that is itself a Temps console and opted in.
+        route_table.insert_route_for_test(
+            OWN_API_HOST,
+            upstream_route(OWN_API_UPSTREAM, Some(project(2, true))),
         );
         if let Some(host) = ingress_host {
             route_table.reserve_public_ingress_hostname_for_test(host);
@@ -593,6 +667,105 @@ mod public_ingress_tests {
             peer(&resolver, "console.example.com", "/api/otel/traces").await,
             CONSOLE
         );
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn a_project_keeps_its_own_otel_query_paths() {
+        let resolver = resolver(true, None);
+        // A project that serves `/api/otel` itself (a Temps console deployed
+        // as a project) gets its own query requests.
+        for path in [
+            "/api/otel/traces",
+            "/api/otel/global/trace-summaries?limit=25",
+            "/api/otel/metrics",
+        ] {
+            assert_eq!(
+                peer(&resolver, "seed.example.com", path).await,
+                "127.0.0.1:18080",
+                "{path}"
+            );
+        }
+        // Ingest still goes to this console's public listener on any host.
+        assert_eq!(
+            peer(&resolver, "seed.example.com", "/api/otel/v1/traces").await,
+            INGRESS
+        );
+        // A host no route claims keeps reaching the console's query API.
+        assert_eq!(
+            peer(&resolver, "host.docker.internal", "/api/otel/traces").await,
+            CONSOLE
+        );
+    }
+
+    const TEMPS_PATHS: [&str; 8] = [
+        "/api/_temps/event",
+        "/api/_temps/session-replay/init",
+        "/api/_temps",
+        "/api/otel/v1/traces",
+        "/api/otel/v1/1/2/3/logs",
+        "/api/otel/traces",
+        "/api/otel/global/trace-summaries?limit=25",
+        "/api/otel/metrics",
+    ];
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn a_project_that_serves_its_own_temps_api_gets_ingest_and_query_paths() {
+        for ingress_listener in [true, false] {
+            let resolver = resolver(ingress_listener, None);
+            for path in TEMPS_PATHS {
+                assert_eq!(
+                    peer(&resolver, OWN_API_HOST, path).await,
+                    OWN_API_UPSTREAM,
+                    "{path} (ingress listener: {ingress_listener})"
+                );
+            }
+            // Everything else on the host is the project's, as before.
+            assert_eq!(peer(&resolver, OWN_API_HOST, "/").await, OWN_API_UPSTREAM);
+        }
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn without_the_flag_ingest_keeps_reaching_the_console() {
+        let resolver = resolver(true, None);
+        for path in ["/api/_temps/event", "/api/_temps", "/api/otel/v1/traces"] {
+            assert_eq!(
+                peer(&resolver, "seed.example.com", path).await,
+                INGRESS,
+                "{path}"
+            );
+        }
+        // A host no route claims is the console's for every Temps path,
+        // whichever project elsewhere has opted in.
+        for path in TEMPS_PATHS {
+            let expected = if is_public_ingest_path(path) {
+                INGRESS
+            } else {
+                CONSOLE
+            };
+            assert_eq!(
+                peer(&resolver, "host.docker.internal", path).await,
+                expected,
+                "{path}"
+            );
+        }
+    }
+
+    // Paused clock: an unmatched host waits out the first-load grace period
+    // on a table that was never loaded from a database.
+    #[tokio::test(start_paused = true)]
+    async fn the_ingress_host_ignores_the_flag() {
+        // The public ingress hostname is pinned to the public-only listener
+        // before any path or project rule is considered.
+        let resolver = resolver(true, Some(OWN_API_HOST));
+        for path in TEMPS_PATHS {
+            assert_eq!(peer(&resolver, OWN_API_HOST, path).await, INGRESS, "{path}");
+        }
     }
 
     // Paused clock: an unmatched host waits out the first-load grace period

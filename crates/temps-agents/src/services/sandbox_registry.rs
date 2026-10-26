@@ -21,6 +21,9 @@ pub struct SandboxRegistry {
     /// first-class `sandboxes` row instead of a bare container. Set once
     /// during plugin initialization; `None` = raw-provider fallback.
     managed: std::sync::OnceLock<Arc<dyn RunSandboxService>>,
+    /// `false` on a control plane that runs no workloads (ADR 063): agent
+    /// runs need a sandbox on this host, and there is none.
+    runs_on_this_host: bool,
 }
 
 impl SandboxRegistry {
@@ -29,6 +32,31 @@ impl SandboxRegistry {
             provider,
             sandboxes: RwLock::new(HashMap::new()),
             managed: std::sync::OnceLock::new(),
+            runs_on_this_host: true,
+        }
+    }
+
+    /// A registry on a control plane that runs no workloads (ADR 063).
+    /// Every agent-run sandbox is refused by [`Self::require_local_host`]
+    /// before any work (a clone, a token) is done for it.
+    pub fn without_local_host(provider: Arc<dyn SandboxProvider>) -> Self {
+        Self {
+            runs_on_this_host: false,
+            ..Self::new(provider)
+        }
+    }
+
+    /// `Err(NoLocalSandboxHost)` when agent-run sandboxes cannot run on this
+    /// server. Agent runs bind-mount a repository cloned on this host, so
+    /// they cannot be sent to a worker node (ADR 063); callers check this
+    /// first so a run fails with the reason before cloning anything.
+    pub fn require_local_host(&self, operation: &str) -> Result<(), AgentError> {
+        if self.runs_on_this_host {
+            Ok(())
+        } else {
+            Err(AgentError::NoLocalSandboxHost {
+                operation: operation.to_string(),
+            })
         }
     }
 
@@ -62,6 +90,7 @@ impl SandboxRegistry {
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         let run_id = config.run_id;
+        self.require_local_host(&format!("Agent run {run_id}"))?;
 
         // Check if we already have a sandbox for this run
         {
@@ -280,6 +309,34 @@ mod tests {
             idle_timeout: Duration::from_secs(3600),
             backend: None,
         }
+    }
+
+    #[tokio::test]
+    async fn without_a_local_host_an_agent_run_is_refused_before_the_provider_is_asked() {
+        // A provider that would happily create: the refusal must come from
+        // the registry, never from whatever the provider would have done.
+        let provider = Arc::new(LocalSandboxProvider::new());
+        let registry = SandboxRegistry::without_local_host(provider);
+
+        match registry.require_local_host("An autofix run") {
+            Err(AgentError::NoLocalSandboxHost { operation }) => {
+                assert_eq!(operation, "An autofix run")
+            }
+            other => panic!("expected NoLocalSandboxHost, got {other:?}"),
+        }
+        match registry.get_or_create(test_config(91)).await {
+            Err(AgentError::NoLocalSandboxHost { operation }) => {
+                assert_eq!(operation, "Agent run 91")
+            }
+            other => panic!("expected NoLocalSandboxHost, got {other:?}"),
+        }
+        assert!(!registry.has_sandbox(91).await);
+    }
+
+    #[test]
+    fn a_registry_with_a_local_host_allows_agent_runs() {
+        let registry = SandboxRegistry::new(Arc::new(LocalSandboxProvider::new()));
+        registry.require_local_host("An AI agent run").unwrap();
     }
 
     #[tokio::test]

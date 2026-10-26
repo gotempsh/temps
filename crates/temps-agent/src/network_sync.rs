@@ -29,7 +29,7 @@ use temps_deployer::{ContainerDeployer, ContainerInfo};
 use temps_dns_resolver::{
     ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
-use temps_network::{NetworkConfig, NetworkManager, NodeAlloc, Peer};
+use temps_network::{overlay_name, NetworkConfig, NetworkManager, NodeAlloc, OverlayNames, Peer};
 use temps_wireguard::mesh::{MeshInterface, MeshKey, MeshPeer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -227,6 +227,20 @@ fn overlay_fingerprint(
     hasher.finish()
 }
 
+/// The overlay the occupied-range collection leaves out: the built manager's,
+/// else the latest snapshot's (the manager may not be built yet, and until it
+/// is `overlay_name::current()` still says `temps0`), else `temps0`'s.
+fn occupied_scan_config(
+    built: Option<&NetworkConfig>,
+    snapshot_names: Option<&OverlayNames>,
+) -> NetworkConfig {
+    match (built, snapshot_names) {
+        (Some(config), _) => config.clone(),
+        (None, Some(names)) => NetworkConfig::default().with_overlay_names(names),
+        (None, None) => NetworkConfig::default().with_overlay_names(&overlay_name::current()),
+    }
+}
+
 /// The ranges this host already uses outside Temps, for the control plane
 /// (ADR 056). Routes the overlay itself installed towards peers (a native
 /// transport puts them on the underlay device) are left out: they are
@@ -331,6 +345,21 @@ struct WireAlloc {
     compute_cidr: String,
     bridge_address: String,
     underlay_address: String,
+    /// The overlay network name this node uses (ADR 059). Absent from
+    /// control planes that predate it, which means `temps0`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overlay_network_name: Option<String>,
+}
+
+impl WireAlloc {
+    /// The host-side names of this node's overlay; `temps0`'s when the
+    /// control plane sent none.
+    fn overlay_names(&self) -> Result<OverlayNames, SyncError> {
+        match &self.overlay_network_name {
+            None => Ok(OverlayNames::default()),
+            Some(name) => OverlayNames::new(name).map_err(|e| SyncError::WireParse(e.to_string())),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -544,13 +573,36 @@ async fn run(
     let mut restore_attempted = false;
     // What the snapshot file holds, so an unchanged tick doesn't rewrite it.
     let mut saved: Option<WirePeerListResponse> = None;
+    // The overlay this node ran before its overlay network name changed, and
+    // the peer subnets it routed, until its VXLAN device and routes are
+    // released (ADR 059). Seeded from the snapshot the last run applied, so a
+    // rename across a restart is handled too.
+    let last_snapshot = {
+        let path = snapshot_path.clone();
+        tokio::task::spawn_blocking(move || load_snapshot(&path))
+            .await
+            .ok()
+            .flatten()
+    };
+    let mut renamed_from: Option<PreviousOverlay> = last_snapshot
+        .as_ref()
+        .and_then(PreviousOverlay::from_snapshot);
+    // The overlay names of the latest snapshot (the one the last run applied,
+    // then each polled one), so the occupied-range collection leaves this
+    // node's own bridge and Docker network out before a manager is built.
+    let mut snapshot_names: Option<OverlayNames> = last_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.alloc.as_ref())
+        .and_then(|alloc| alloc.overlay_names().ok());
+    // Peer subnets of the last applied payload, for `renamed_from`.
+    let mut applied_peer_subnets: Vec<Ipv4Net> = Vec::new();
 
     loop {
         let occupied = {
-            let net_config = manager
-                .as_ref()
-                .map(|(manager, _)| manager.config().clone())
-                .unwrap_or_default();
+            let net_config = occupied_scan_config(
+                manager.as_ref().map(|(manager, _)| manager.config()),
+                snapshot_names.as_ref(),
+            );
             match collect_occupied_ranges(&net_config, &peer_subnets).await {
                 Ok(ranges) => {
                     if occupied_error.take().is_some() {
@@ -701,6 +753,56 @@ async fn run(
                     tokio::time::sleep(overlay_retry.remaining(now).min(POLL_INTERVAL)).await;
                     continue;
                 }
+                let names = match payload.alloc.as_ref().map(WireAlloc::overlay_names) {
+                    Some(Ok(names)) => names,
+                    Some(Err(e)) => {
+                        let wait = overlay_failed(
+                            &mut overlay_retry,
+                            &overlay_report,
+                            attempted_cidr,
+                            e.to_string(),
+                            fingerprint,
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    None => OverlayNames::default(),
+                };
+                snapshot_names = Some(names.clone());
+                let node_id = payload
+                    .alloc
+                    .as_ref()
+                    .map(|alloc| alloc.node_id.clone())
+                    .unwrap_or_default();
+                if let Some((built, _)) = &manager {
+                    let built_names = built.config().overlay_names();
+                    if built_names != names {
+                        renamed_from = Some(PreviousOverlay {
+                            node_id: node_id.clone(),
+                            names: built_names,
+                            peer_subnets: applied_peer_subnets.clone(),
+                        });
+                        manager = None;
+                        bootstrapped = None;
+                    }
+                }
+                if let Some(previous) = renamed_from
+                    .take_if(|previous| previous.node_id == node_id && previous.names != names)
+                {
+                    if let Err(e) = release_previous_overlay(&previous, &names).await {
+                        let wait = overlay_failed(
+                            &mut overlay_retry,
+                            &overlay_report,
+                            attempted_cidr,
+                            e,
+                            fingerprint,
+                        );
+                        renamed_from = Some(previous);
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                }
+                renamed_from = None;
                 if manager
                     .as_ref()
                     .is_some_and(|(_, built_on_mesh)| *built_on_mesh != on_mesh)
@@ -717,8 +819,11 @@ async fn run(
                 }
                 let manager = match &manager {
                     Some((manager, _)) => manager,
-                    None => match build_manager(&config, on_mesh).await {
-                        Ok(built) => &manager.insert((built, on_mesh)).0,
+                    None => match build_manager(&config, on_mesh, &names).await {
+                        Ok(built) => {
+                            overlay_name::set_current(names.clone());
+                            &manager.insert((built, on_mesh)).0
+                        }
                         Err(e) => {
                             let wait = overlay_failed(
                                 &mut overlay_retry,
@@ -733,6 +838,7 @@ async fn run(
                     },
                 };
                 let snapshot = (!offline).then(|| payload.clone());
+                let payload_peer_subnets = peer_subnets.clone();
                 if let Err(e) = apply(
                     manager,
                     payload,
@@ -755,6 +861,7 @@ async fn run(
                     continue;
                 }
                 applied_once = true;
+                applied_peer_subnets = payload_peer_subnets;
                 let failures = overlay_retry.succeeded();
                 if failures > 0 {
                     info!(
@@ -836,11 +943,74 @@ fn overlay_failed(
     step.delay.min(POLL_INTERVAL)
 }
 
+/// The overlay a node ran under its previous overlay network name.
+#[derive(Debug, Clone, PartialEq)]
+struct PreviousOverlay {
+    /// The allocation it belonged to. A snapshot left by another cluster's
+    /// registration of this host names another node and is ignored: that
+    /// overlay is not this node's to release.
+    node_id: String,
+    names: OverlayNames,
+    peer_subnets: Vec<Ipv4Net>,
+}
+
+impl PreviousOverlay {
+    /// What the snapshot of the last run says this node's overlay was. A
+    /// snapshot without a usable allocation says nothing.
+    fn from_snapshot(snapshot: &WirePeerListResponse) -> Option<Self> {
+        let alloc = snapshot.alloc.as_ref()?;
+        Some(Self {
+            node_id: alloc.node_id.clone(),
+            names: alloc.overlay_names().ok()?,
+            peer_subnets: snapshot
+                .peers
+                .iter()
+                .filter_map(|peer| Ipv4Net::from_str(&peer.compute_cidr).ok())
+                .collect(),
+        })
+    }
+}
+
+/// Make room for a renamed overlay (ADR 059): release the previous overlay's
+/// VXLAN device, which holds the cluster's VNI and port, and its peer routes.
+/// Its bridge and Docker network are never removed: containers on them keep
+/// local connectivity, and lose cross-node traffic until redeployed.
+async fn release_previous_overlay(
+    previous: &PreviousOverlay,
+    names: &OverlayNames,
+) -> Result<(), String> {
+    warn!(
+        previous_network = %previous.names.docker_network,
+        network = %names.docker_network,
+        "this node's overlay network name changed; building '{}' beside '{}'. Temps leaves \
+         '{}' and its bridge in place: containers attached to it keep running but lose \
+         cross-node traffic until they are redeployed, and the network can be removed once \
+         nothing uses it",
+        names.docker_network,
+        previous.names.docker_network,
+        previous.names.docker_network,
+    );
+    let config = NetworkConfig::default().with_overlay_names(&previous.names);
+    temps_network::release_overlay_transport(&config, &previous.peer_subnets)
+        .await
+        .map_err(|e| {
+            format!(
+                "could not release the previous overlay '{}' so '{}' can use the cluster's \
+                 VXLAN VNI and port: {e}",
+                previous.names.docker_network, names.docker_network
+            )
+        })
+}
+
 /// Build the overlay manager. On the WireGuard mesh the underlay is the mesh
 /// interface; otherwise the configured device, the one holding the node's
 /// private address, or the default-route device.
-async fn build_manager(config: &AgentConfig, on_mesh: bool) -> Result<NetworkManager, SyncError> {
-    let mut net_config = NetworkConfig::default();
+async fn build_manager(
+    config: &AgentConfig,
+    on_mesh: bool,
+    names: &OverlayNames,
+) -> Result<NetworkManager, SyncError> {
+    let mut net_config = NetworkConfig::default().with_overlay_names(names);
     match (on_mesh, &config.underlay_dev) {
         (true, _) => {
             info!(
@@ -1989,7 +2159,7 @@ async fn sweep_overlay_container_routes(
     // actually on the overlay. Includes stopped containers (filters
     // are OR'd on status by default), but `inspect.state.pid > 0` will
     // skip those before we try to nsenter.
-    let overlay_name = NetworkConfig::default().docker_network_name;
+    let overlay_name = overlay_name::current().docker_network;
     let mut filters = std::collections::HashMap::new();
     filters.insert("network".to_string(), vec![overlay_name.clone()]);
     let opts = ListContainersOptions {
@@ -2385,6 +2555,7 @@ mod tests {
             compute_cidr: "172.20.5.0/24".into(),
             bridge_address: "172.20.5.1".into(),
             underlay_address: "10.0.0.5".into(),
+            overlay_network_name: None,
         }
     }
 
@@ -2678,6 +2849,82 @@ mod tests {
         let resp: WirePeerListResponse = serde_json::from_str(json).unwrap();
         assert!(resp.alloc.is_some());
         assert_eq!(resp.peers.len(), 1);
+    }
+
+    // ADR 059: a control plane that predates the overlay network name sends
+    // no field, which means `temps0`; a newer one names the node's overlay.
+    #[test]
+    fn an_alloc_without_an_overlay_name_keeps_temps0() {
+        let alloc: WireAlloc = serde_json::from_value(serde_json::json!({
+            "node_id": "00000000-0000-0000-0000-00000000002a",
+            "compute_cidr": "172.20.5.0/24",
+            "bridge_address": "172.20.5.1",
+            "underlay_address": "10.0.0.5"
+        }))
+        .unwrap();
+        assert_eq!(alloc.overlay_network_name, None);
+        assert_eq!(alloc.overlay_names().unwrap(), OverlayNames::default());
+        // Serialised back (the snapshot), it stays absent for older readers.
+        assert!(!serde_json::to_string(&alloc)
+            .unwrap()
+            .contains("overlay_network_name"));
+    }
+
+    // Before the first manager build `overlay_name::current()` still says
+    // `temps0`; the collection must leave out the snapshot's overlay instead.
+    #[test]
+    fn the_occupied_scan_leaves_out_the_snapshot_overlay_before_a_build() {
+        let temps1 = OverlayNames::new("temps1").unwrap();
+        let config = occupied_scan_config(None, Some(&temps1));
+        assert_eq!(config.docker_network_name, "temps1");
+        assert_eq!(config.bridge_name, "br-temps1");
+        assert_eq!(config.vxlan_dev_name, "vxlan-temps1");
+        // A built manager is authoritative.
+        let built =
+            NetworkConfig::default().with_overlay_names(&OverlayNames::new("temps2").unwrap());
+        let config = occupied_scan_config(Some(&built), Some(&temps1));
+        assert_eq!(config.docker_network_name, "temps2");
+    }
+
+    #[test]
+    fn an_alloc_names_its_overlay_and_rejects_an_unsafe_name() {
+        let mut alloc = wire_alloc();
+        alloc.overlay_network_name = Some("temps1".into());
+        let names = alloc.overlay_names().unwrap();
+        assert_eq!(names.docker_network, "temps1");
+        assert_eq!(names.bridge, "br-temps1");
+        assert_eq!(names.vxlan, "vxlan-temps1");
+        let round_trip: WireAlloc =
+            serde_json::from_str(&serde_json::to_string(&alloc).unwrap()).unwrap();
+        assert_eq!(round_trip, alloc);
+
+        alloc.overlay_network_name = Some("br0; rm -rf".into());
+        assert!(alloc.overlay_names().is_err());
+    }
+
+    #[test]
+    fn the_previous_overlay_comes_from_the_last_applied_snapshot() {
+        let mut alloc = wire_alloc();
+        alloc.overlay_network_name = Some("temps1".into());
+        let snapshot = WirePeerListResponse {
+            network: None,
+            alloc: Some(alloc),
+            peers: vec![wire_peer()],
+            cluster_dns_enabled: false,
+            wireguard: None,
+        };
+        let previous = PreviousOverlay::from_snapshot(&snapshot).unwrap();
+        assert_eq!(previous.node_id, "00000000-0000-0000-0000-00000000002a");
+        assert_eq!(previous.names, OverlayNames::new("temps1").unwrap());
+        assert_eq!(
+            previous.peer_subnets,
+            vec![Ipv4Net::from_str("172.20.6.0/24").unwrap()]
+        );
+        let unallocated = WirePeerListResponse {
+            alloc: None,
+            ..snapshot
+        };
+        assert_eq!(PreviousOverlay::from_snapshot(&unallocated), None);
     }
 
     // ADR-024: cluster_dns_enabled must default to false when the field is

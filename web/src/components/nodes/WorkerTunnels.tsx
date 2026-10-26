@@ -6,10 +6,17 @@
 
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CheckCircle2, Loader2, RefreshCw, Trash2, XCircle } from 'lucide-react'
+import {
+  CheckCircle2,
+  ChevronRight,
+  Loader2,
+  RefreshCw,
+  Trash2,
+  XCircle,
+} from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useForm, type UseFormReturn } from 'react-hook-form'
-import { Link } from 'react-router'
+import { Link, useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import {
@@ -30,11 +37,20 @@ import type {
   ProviderInfo,
   SetupField,
 } from '@/api/client/types.gen'
+import {
+  CloudflareTokenChecklist,
+  CloudflareTokenGuide,
+} from '@/components/domains/CloudflareTokenGuide'
 import { TunnelHostnames } from '@/components/domains/TunnelHostnames'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Dialog,
@@ -301,10 +317,20 @@ export function WorkerTunnels({
                 {provider.summary}
               </p>
               <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted-foreground">
-                {provider.requirements.map((r) => (
-                  <li key={r}>{r}</li>
-                ))}
+                {provider.requirements
+                  // The checklist below spells the token out.
+                  .filter(
+                    (r) =>
+                      provider.kind !== CLOUDFLARE_TUNNEL ||
+                      !r.startsWith('Its API token')
+                  )
+                  .map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
               </ul>
+              {provider.kind === CLOUDFLARE_TUNNEL && (
+                <CloudflareTokenChecklist />
+              )}
               <div className="mt-auto flex items-center gap-2 pt-1">
                 <Button
                   size="sm"
@@ -391,6 +417,8 @@ interface DomainPick {
 }
 
 const EMPTY_PICK: DomainPick = { zone: '', subdomain: '' }
+/** `temps_ingress::cloudflare::KIND`. */
+const CLOUDFLARE_TUNNEL = 'cloudflare_tunnel'
 const TUNNEL_NAME = /^[A-Za-z0-9-]{1,50}$/
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
@@ -543,6 +571,20 @@ function ProviderSetupDialog({
                   <DialogTitle>Set up {provider.name}</DialogTitle>
                   <DialogDescription>{provider.summary}</DialogDescription>
                 </DialogHeader>
+                {provider.kind === CLOUDFLARE_TUNNEL && (
+                  <div className="space-y-2">
+                    <CloudflareTokenChecklist />
+                    <Collapsible>
+                      <CollapsibleTrigger className="group flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground">
+                        <ChevronRight className="h-4 w-4 transition-transform group-data-[state=open]:rotate-90" />
+                        Step by step in Cloudflare
+                      </CollapsibleTrigger>
+                      <CollapsibleContent className="pt-2">
+                        <CloudflareTokenGuide tunnel="required" />
+                      </CollapsibleContent>
+                    </Collapsible>
+                  </div>
+                )}
                 <FormField
                   control={form.control}
                   name="name"
@@ -679,6 +721,7 @@ function DnsProviderSelect({
   onChange: (value: string) => void
 }) {
   const query = useQuery(listDnsProvidersOptions())
+  const location = useLocation()
   const providers = (query.data ?? []).filter(
     (p) =>
       p.is_active &&
@@ -688,14 +731,23 @@ function DnsProviderSelect({
     return <Skeleton className="h-9 w-full" />
   }
   if (providers.length === 0) {
+    const cloudflare = providerType === 'cloudflare'
+    const label = cloudflare ? 'Cloudflare' : providerType
+    const back = `${location.pathname}${location.search}`
+    const add = providerType
+      ? `/dns-providers/add?provider=${encodeURIComponent(providerType)}&return=${encodeURIComponent(back)}`
+      : `/dns-providers/add?return=${encodeURIComponent(back)}`
     return (
       <Alert>
-        <AlertDescription>
-          No {providerType ? `${providerType} ` : ''}DNS provider yet.{' '}
-          <Link className="underline" to="/dns-providers/add">
-            Add one
-          </Link>
-          , then come back.
+        <AlertDescription className="space-y-2">
+          <p>
+            No {label ? `${label} ` : ''}DNS provider yet.{' '}
+            <Link className="underline" to={add}>
+              Add one
+            </Link>
+            ; you come back here once it is added.
+          </p>
+          {cloudflare && <CloudflareTokenChecklist className="bg-background" />}
         </AlertDescription>
       </Alert>
     )

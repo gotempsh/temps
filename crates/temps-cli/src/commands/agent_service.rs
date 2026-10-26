@@ -101,6 +101,7 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
 
     require_root()?;
     require_systemd()?;
+    warn_about_host(&config);
     refuse_unsafe_paths(&binary, &data_dir, &config)?;
     refuse_foreign_unit(Path::new(UNIT_PATH))?;
     let temporary = Path::new(UNIT_PATH).with_extension("service.tmp");
@@ -114,6 +115,38 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
     println!("  Status: temps agent service status");
     println!("  Logs:   journalctl -u {SERVICE_NAME} -f");
     Ok(())
+}
+
+/// The checks `temps join` stops on, as warnings (ADR 059): the agent is
+/// about to start, and what would keep its overlay or ingress down is
+/// cheaper to read here than in its logs.
+fn warn_about_host(config: &Path) {
+    use super::host_preflight::{assess, gather, Purpose};
+
+    let saved: Option<temps_agent::AgentConfig> = std::fs::read_to_string(config)
+        .ok()
+        .and_then(|data| serde_json::from_str(&data).ok());
+    // Without a readable config the mode is unknown: check what a public
+    // listener would need rather than miss a held port.
+    let ingress = saved.as_ref().map_or_else(
+        || temps_core::worker_ingress::LocalIngress {
+            mode: temps_core::worker_ingress::IngressMode::Fixed,
+            ..Default::default()
+        },
+        temps_agent::AgentConfig::local_ingress,
+    );
+    let (ports, serves_public) = super::host_preflight::served_ports(&ingress);
+    let facts = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(gather(saved.as_ref())),
+        Err(error) => {
+            eprintln!("Warning: could not check this machine before installing ({error}).");
+            return;
+        }
+    };
+    assess(&facts, Purpose::ServiceInstall, &ports, serves_public).print_warnings();
 }
 
 fn uninstall() -> anyhow::Result<()> {

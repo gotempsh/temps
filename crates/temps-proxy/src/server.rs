@@ -670,11 +670,13 @@ pub fn setup_proxy_server(
     // the store is the meeting point, never in-process state. Mirrors the
     // dedicated-thread pattern of the proxy-log batch writer above.
     //
-    // The same thread also runs `NodeMetricsSampler` (cpu/memory/disk/fd
-    // percent for the machine the proxy itself is running on) — this is the
-    // process most likely to be under connection-count stress, so it is the
-    // natural place to catch the machine approaching socket/fd exhaustion
-    // before it starts refusing new connections.
+    // The same thread also runs `NodeMetricsSampler`. Its process fd series
+    // always come from here — this is the process most likely to be under
+    // connection-count stress, so it is the natural place to catch it
+    // approaching its descriptor ceiling before it starts refusing new
+    // connections. The machine-wide series (cpu/memory/disk/network) are
+    // sampled here only when the console shares this process; in split
+    // topology the console samples them, so the host is written once.
     {
         let proxy_metrics = lb.proxy_metrics();
         let sampler_config_service = config_service.clone();
@@ -682,6 +684,11 @@ pub fn setup_proxy_server(
         let sampler_db = db.clone();
         let node_sampler_config_service = config_service.clone();
         let node_sampler_data_dir = config.data_dir.clone();
+        let node_sampler_scope = if proxy_config.host_metrics {
+            temps_metrics::NodeMetricsScope::All
+        } else {
+            temps_metrics::NodeMetricsScope::Process
+        };
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -700,10 +707,11 @@ pub fn setup_proxy_server(
                     sampler_config_service,
                 )
                 .run();
-                let node_sampler = temps_metrics::NodeMetricsSampler::new(
+                let node_sampler = temps_metrics::NodeMetricsSampler::with_scope(
                     store,
                     node_sampler_config_service,
                     node_sampler_data_dir,
+                    node_sampler_scope,
                 )
                 .run();
                 tokio::join!(proxy_sampler, node_sampler);

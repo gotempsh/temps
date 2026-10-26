@@ -77,6 +77,17 @@ pub enum NodePairingAdminError {
     },
     #[error("node pairing {pairing_id} not found")]
     NotFound { pairing_id: i32 },
+    /// The worker's key belongs to a node of the same name, and it did not
+    /// prove it is that node (ADR 060), or the node could not be read.
+    #[error(transparent)]
+    Rejoin(crate::services::node_service::NodeError),
+    #[error("node {node_id} holds mesh key but its mesh address {address:?} is not an IPv4 address: {source}")]
+    InvalidNodeMeshAddress {
+        node_id: i32,
+        address: Option<String>,
+        #[source]
+        source: AddrParseError,
+    },
     #[error("node pairing {pairing_id} is {status}; nothing to cancel")]
     AlreadyFinished { pairing_id: i32, status: String },
 }
@@ -97,7 +108,11 @@ pub struct StartedPairing {
 /// and without the node's endpoint. The join token is single-use and bound
 /// to the node's name; hand it only to that worker.
 pub struct OutboundEnrollment {
-    pub pairing: node_pairings::Model,
+    pub kind: OutboundEnrollmentKind,
+    /// The name the join token is bound to.
+    pub name: String,
+    /// When the join token (and a new pairing) expires.
+    pub expires_at: chrono::DateTime<chrono::Utc>,
     pub control_plane_public_key: String,
     pub control_plane_endpoint: String,
     pub control_plane_address: Ipv4Addr,
@@ -107,6 +122,25 @@ pub struct OutboundEnrollment {
     pub node_api_port: u16,
     pub ca_fingerprint: String,
     pub join_token: Zeroizing<String>,
+}
+
+/// A freshly minted single-use enrollment token.
+struct MintedToken {
+    ca_fingerprint: String,
+    join_token: String,
+    token: temps_entities::node_enrollment_tokens::Model,
+}
+
+/// How an outbound enrollment reached the mesh.
+pub enum OutboundEnrollmentKind {
+    /// A new pairing reserved the worker a mesh address (ADR 055).
+    Pairing(Box<node_pairings::Model>),
+    /// The worker is node `node_id` joining the same control plane again
+    /// (ADR 060): it proved it is that node, keeps its mesh key and address,
+    /// and registers again to update the node in place. `ack` is
+    /// [`temps_core::node_pki::rejoin_ack`] over its proof, so the worker
+    /// can tell this is the control plane it belongs to.
+    Rejoin { node_id: i32, ack: Option<String> },
 }
 
 /// The enrollment token and encrypted secret a new pairing is created with.
@@ -285,12 +319,20 @@ impl NodePairingAdminService {
     /// can dial. The pairing's token is bound to `name` and, like the token
     /// the worker authorized with, to `bound_labels`. The caller validated
     /// that token and claimed one use of it.
+    ///
+    /// When `public_key` is the mesh key of the node named `name` and
+    /// `rejoin` proves the caller holds that node's current agent
+    /// credential, nothing is reserved: the answer carries the node's own
+    /// mesh address and a fresh single-use token bound to its name, so it
+    /// registers again and the node is updated in place (ADR 060). Without
+    /// that proof it is refused ([`NodePairingAdminError::Rejoin`]).
     pub async fn start_outbound(
         &self,
         name: &str,
         public_key: &str,
         created_by_user_id: Option<i32>,
         bound_labels: Option<serde_json::Value>,
+        rejoin: Option<crate::services::node_service::RejoinClaim<'_>>,
     ) -> Result<OutboundEnrollment, NodePairingAdminError> {
         let db = self.db.as_ref();
         if !crate::services::node_service::is_valid_node_name(name) {
@@ -298,6 +340,10 @@ impl NodePairingAdminService {
                 name: name.to_string(),
             });
         }
+        let proof = rejoin.as_ref().map(|claim| claim.proof.to_string());
+        let rejoining = crate::services::node_service::proven_rejoin(db, name, public_key, rejoin)
+            .await
+            .map_err(NodePairingAdminError::Rejoin)?;
         let settings = temps_network::mesh::load_settings(db)
             .await
             .map_err(mesh("read the mesh settings"))?
@@ -309,6 +355,49 @@ impl NodePairingAdminService {
         let control_plane_endpoint = control_plane
             .endpoint
             .ok_or(NodePairingAdminError::ControlPlaneNotDialable)?;
+
+        if let Some(node) = rejoining {
+            let node_address = node
+                .mesh_wg_address
+                .as_deref()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|source| NodePairingAdminError::InvalidNodeMeshAddress {
+                    node_id: node.id,
+                    address: node.mesh_wg_address.clone(),
+                    source,
+                })?;
+            let MintedToken {
+                ca_fingerprint,
+                join_token,
+                token,
+            } = self
+                .mint_token(name, created_by_user_id, bound_labels)
+                .await?;
+            info!(
+                node_id = node.id,
+                name, "a node joins its control plane again; it keeps its mesh key and address"
+            );
+            return Ok(OutboundEnrollment {
+                kind: OutboundEnrollmentKind::Rejoin {
+                    node_id: node.id,
+                    ack: proof.as_deref().and_then(|proof| {
+                        temps_core::node_pki::rejoin_ack(&node.token_hash, proof)
+                    }),
+                },
+                name: node.name,
+                expires_at: token.expires_at,
+                control_plane_public_key: control_plane.public_key,
+                control_plane_endpoint,
+                control_plane_address: settings.control_plane_address(),
+                node_address,
+                prefix_len: settings.cidr.prefix_len(),
+                listen_port: settings.port,
+                node_api_port: settings.node_api_port,
+                ca_fingerprint,
+                join_token: Zeroizing::new(join_token),
+            });
+        }
 
         let pairing_id = PairingId::generate()
             .map_err(|source| NodePairingAdminError::Randomness { what: "id", source })?;
@@ -388,7 +477,9 @@ impl NodePairingAdminService {
             }
         })?;
         Ok(OutboundEnrollment {
-            pairing,
+            name: pairing.name.clone(),
+            expires_at: pairing.expires_at,
+            kind: OutboundEnrollmentKind::Pairing(Box::new(pairing)),
             control_plane_public_key: control_plane.public_key,
             control_plane_endpoint,
             control_plane_address: settings.control_plane_address(),
@@ -411,6 +502,43 @@ impl NodePairingAdminService {
         created_by_user_id: Option<i32>,
         bound_labels: Option<serde_json::Value>,
     ) -> Result<PairingCredentials, NodePairingAdminError> {
+        let MintedToken {
+            ca_fingerprint,
+            join_token,
+            token,
+        } = self
+            .mint_token(name, created_by_user_id, bound_labels)
+            .await?;
+        let secret_encrypted = match self
+            .encryption_service
+            .encrypt(secret.to_base64url().as_bytes())
+        {
+            Ok(encrypted) => encrypted,
+            Err(error) => {
+                self.revoke_unused_token(token.id).await;
+                return Err(NodePairingAdminError::EncryptSecret {
+                    name: name.to_string(),
+                    reason: error.to_string(),
+                });
+            }
+        };
+        Ok(PairingCredentials {
+            ca_fingerprint,
+            join_token,
+            token_id: token.id,
+            expires_at: token.expires_at,
+            secret_encrypted,
+        })
+    }
+
+    /// Mint a single-use enrollment token bound to `name`, valid for
+    /// [`PAIRING_TTL_SECS`], with the cluster CA's fingerprint.
+    async fn mint_token(
+        &self,
+        name: &str,
+        created_by_user_id: Option<i32>,
+        bound_labels: Option<serde_json::Value>,
+    ) -> Result<MintedToken, NodePairingAdminError> {
         let ca = crate::cluster_ca::ensure_cluster_ca(
             self.config_service.as_ref(),
             self.encryption_service.as_ref(),
@@ -435,25 +563,10 @@ impl NodePairingAdminService {
                 name: name.to_string(),
                 source,
             })?;
-        let secret_encrypted = match self
-            .encryption_service
-            .encrypt(secret.to_base64url().as_bytes())
-        {
-            Ok(encrypted) => encrypted,
-            Err(error) => {
-                self.revoke_unused_token(token.id).await;
-                return Err(NodePairingAdminError::EncryptSecret {
-                    name: name.to_string(),
-                    reason: error.to_string(),
-                });
-            }
-        };
-        Ok(PairingCredentials {
+        Ok(MintedToken {
             ca_fingerprint,
             join_token,
-            token_id: token.id,
-            expires_at: token.expires_at,
-            secret_encrypted,
+            token,
         })
     }
 

@@ -1080,6 +1080,18 @@ impl DoctorCommand {
             ),
         }
 
+        // The cluster's overlay name (ADR 059); `temps0` before the column
+        // existed.
+        let overlay_name = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT docker_network_name FROM network_config WHERE id = 1".to_string(),
+            ))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|row| String::try_get_by(&row, "docker_network_name").ok())
+            .unwrap_or_else(|| temps_network::DEFAULT_OVERLAY_NETWORK_NAME.to_string());
         let overlay_exists = match bollard::Docker::connect_with_defaults() {
             Ok(docker) => tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -1091,7 +1103,7 @@ impl DoctorCommand {
             .map(|networks| {
                 networks
                     .iter()
-                    .any(|network| network.name.as_deref() == Some("temps0"))
+                    .any(|network| network.name.as_deref() == Some(overlay_name.as_str()))
             })
             .unwrap_or(false),
             Err(_) => false,
@@ -1099,11 +1111,11 @@ impl DoctorCommand {
         report.add(
             "Docker overlay",
             if overlay_exists {
-                CheckResult::Pass("temps0 exists".to_string())
+                CheckResult::Pass(format!("{overlay_name} exists"))
             } else {
-                CheckResult::Fail(
-                    "temps0 is missing. Run `sudo temps network setup-multi-node`.".to_string(),
-                )
+                CheckResult::Fail(format!(
+                    "{overlay_name} is missing. Run `sudo temps network setup-multi-node`."
+                ))
             },
         );
         report.add(

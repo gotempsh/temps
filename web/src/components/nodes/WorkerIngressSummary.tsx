@@ -20,6 +20,8 @@ import type {
 import { Button } from '@/components/ui/button'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { replicaState } from '@/components/nodes/WorkerTunnels'
+import { Link } from 'react-router'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { workerIngressStatus } from '@/lib/worker-ingress'
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
@@ -160,9 +162,16 @@ export function WorkerIngressSummary({
         <p className="text-sm text-muted-foreground">
           Visitors can&apos;t reach apps through this worker yet.
         </p>
-        <Button size="sm" onClick={onChange}>
-          Set up
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button asChild size="sm">
+            <Link to={ingressSetupUrl({ worker: node.id })}>
+              Set up ingress
+            </Link>
+          </Button>
+          <Button size="sm" variant="outline" onClick={onChange}>
+            Configure here
+          </Button>
+        </div>
       </div>
     )
   }

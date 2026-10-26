@@ -10,6 +10,7 @@ pub mod guest_agent_build;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;
+pub mod no_local;
 pub mod node_routing;
 pub mod pty_agent_bundle;
 pub mod remote;

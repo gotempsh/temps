@@ -81,12 +81,69 @@ struct CpuSnapshot {
     total: u64,
 }
 
+/// Which series a [`NodeMetricsCollector`] emits.
+///
+/// The machine-wide series and the `node.process_*` series belong to different
+/// owners once the console and the proxy run as separate processes (ADR-017):
+/// the host is sampled once, by the console, and each proxy reports only its
+/// own file descriptors. Sampling the host from both would write every
+/// machine-wide series twice under the same node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NodeMetricsScope {
+    /// Everything: one process runs both the console and the proxy.
+    #[default]
+    All,
+    /// Machine-wide series only: CPU, memory, load, disk space, system-wide
+    /// file descriptors, block and network I/O.
+    Host,
+    /// This process's own file descriptors only (`node.process_*`).
+    Process,
+}
+
+impl NodeMetricsScope {
+    fn host(self) -> bool {
+        matches!(self, Self::All | Self::Host)
+    }
+
+    fn process(self) -> bool {
+        matches!(self, Self::All | Self::Process)
+    }
+}
+
+/// Every series [`NodeMetricsScope::Host`] can emit, on any platform.
+///
+/// This is the closed set a worker may report for its host (ADR 061): the
+/// control plane stores a worker-reported host point only when its name is in
+/// this list, so a worker cannot make the control plane create a series this
+/// collector would never have written. A test keeps it in step with the
+/// collector.
+pub const HOST_METRIC_NAMES: &[&str] = &[
+    "node.cpu_percent",
+    "node.memory_used_bytes",
+    "node.memory_total_bytes",
+    "node.memory_percent",
+    "node.load_avg_1m",
+    "node.load_avg_5m",
+    "node.load_avg_15m",
+    "node.disk_used_bytes",
+    "node.disk_total_bytes",
+    "node.disk_percent",
+    "node.fd_allocated",
+    "node.fd_max",
+    "node.fd_percent",
+    "node.disk_read_bytes_total",
+    "node.disk_write_bytes_total",
+    "node.network_rx_bytes_total",
+    "node.network_tx_bytes_total",
+];
+
 /// Node metric collector.
 ///
 /// Holds CPU baseline state across calls inside a `Mutex` so the collector can
 /// implement `Sync` while mutating the snapshot.  All other metrics are
 /// stateless reads from `/proc` or `statvfs(2)`.
 pub struct NodeMetricsCollector {
+    scope: NodeMetricsScope,
     /// Previous CPU tick snapshot; `None` before the first scrape.
     prev_cpu: Mutex<Option<CpuSnapshot>>,
     /// Cross-platform fallback state (non-Linux only). `sysinfo` computes CPU
@@ -98,7 +155,12 @@ pub struct NodeMetricsCollector {
 
 impl NodeMetricsCollector {
     pub fn new() -> Self {
+        Self::with_scope(NodeMetricsScope::All)
+    }
+
+    pub fn with_scope(scope: NodeMetricsScope) -> Self {
         Self {
+            scope,
             prev_cpu: Mutex::new(None),
             #[cfg(not(target_os = "linux"))]
             fallback: Mutex::new(fallback::FallbackState::new()),
@@ -131,29 +193,35 @@ impl Collector for NodeMetricsCollector {
         let now = Utc::now();
         let mut points = Vec::new();
 
-        // CPU — synchronous (no I/O latency).
-        points.extend(self.collect_cpu(source_id, config, now));
+        if self.scope.host() {
+            // CPU — synchronous (no I/O latency).
+            points.extend(self.collect_cpu(source_id, config, now));
 
-        // Memory — async file read.
-        points.extend(collect_memory(source_id, config, now).await);
+            // Memory — async file read.
+            points.extend(collect_memory(source_id, config, now).await);
 
-        // Load average — async file read.
-        points.extend(collect_loadavg(source_id, config, now).await);
+            // Load average — async file read.
+            points.extend(collect_loadavg(source_id, config, now).await);
 
-        // Disk — synchronous statvfs call.
-        points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
+            // Disk — synchronous statvfs call.
+            points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
 
-        // File descriptors — synchronous /proc reads + getrlimit(2).
-        points.extend(collect_system_fds(source_id, config, now));
-        points.extend(collect_process_fds(source_id, config, now));
+            // System-wide file descriptors — synchronous /proc reads.
+            points.extend(collect_system_fds(source_id, config, now));
 
-        // Block + network I/O — cumulative kernel counters.
-        points.extend(collect_disk_io(source_id, config, now).await);
-        points.extend(collect_network_io(source_id, config, now).await);
+            // Block + network I/O — cumulative kernel counters.
+            points.extend(collect_disk_io(source_id, config, now).await);
+            points.extend(collect_network_io(source_id, config, now).await);
 
-        // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
-        #[cfg(not(target_os = "linux"))]
-        points.extend(self.collect_fallback(source_id, config, now));
+            // Non-Linux: fill whatever `/proc` could not answer from `sysinfo`.
+            #[cfg(not(target_os = "linux"))]
+            points.extend(self.collect_fallback(source_id, config, now));
+        }
+
+        // This process's file descriptors — /proc/self/fd + getrlimit(2).
+        if self.scope.process() {
+            points.extend(collect_process_fds(source_id, config, now));
+        }
 
         debug!(
             source_id,
@@ -1439,5 +1507,31 @@ docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
         assert!(names.contains(&"node.memory_used_bytes"), "{names:?}");
         assert!(names.contains(&"node.memory_total_bytes"), "{names:?}");
         assert!(names.contains(&"node.cpu_percent"), "{names:?}");
+    }
+
+    /// A worker reports its host with this collector in host scope, and the
+    /// control plane accepts only `HOST_METRIC_NAMES`. Anything the collector
+    /// emits outside that list would be silently refused for every worker.
+    #[tokio::test]
+    async fn host_scope_emits_only_names_a_worker_may_report() {
+        let collector = NodeMetricsCollector::with_scope(NodeMetricsScope::Host);
+        let config = make_config(1, "/tmp");
+        // Two passes: the first primes the CPU baseline, the second carries
+        // `node.cpu_percent`.
+        let _ = collector.collect(&config).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let points = collector.collect(&config).await.unwrap();
+        assert!(!points.is_empty());
+        for p in &points {
+            assert!(
+                HOST_METRIC_NAMES.contains(&p.name.as_str()),
+                "host scope emitted {} which a worker could not report",
+                p.name
+            );
+        }
+        // And the list holds nothing process-scoped.
+        assert!(HOST_METRIC_NAMES
+            .iter()
+            .all(|name| !name.starts_with("node.process_")));
     }
 }

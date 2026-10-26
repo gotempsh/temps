@@ -13584,6 +13584,7 @@ mod tests {
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 

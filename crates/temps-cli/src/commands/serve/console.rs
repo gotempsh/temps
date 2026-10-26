@@ -983,9 +983,11 @@ async fn bootstrap_console_oidc_from_file(
             issuer,
             client_id,
             consent,
+            telemetry,
         }) => {
             report_console_oidc_bootstrap_applied(service_context, &issuer, &client_id, &consent)
                 .await;
+            report_telemetry_bootstrap(service_context, &telemetry).await;
         }
         Err(error) => report_console_oidc_bootstrap_error(service_context, &error).await,
     }
@@ -1054,6 +1056,46 @@ async fn report_console_oidc_bootstrap_error(
                 }
             }
         }
+    }
+}
+
+/// Log and audit what the bootstrap file did to telemetry export.
+async fn report_telemetry_bootstrap(
+    service_context: &temps_core::plugin::ServiceRegistrationContext,
+    telemetry: &temps_cloud::TelemetryConsent,
+) {
+    match telemetry {
+        temps_cloud::TelemetryConsent::GrantedByBootstrap { .. } => warn!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned \
+             cloud.telemetry_enabled on (on a Cloud-hosted plane the file is the operator's \
+             consent); logs, traces and metrics now export to Temps Cloud. Disable it in \
+             Settings > Temps Cloud if that is not intended"
+        ),
+        temps_cloud::TelemetryConsent::Failed { reason } => {
+            error!(
+                %reason,
+                "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file asked for telemetry \
+                 export but it could not be switched on; telemetry stays local. Turn it on \
+                 in Settings > Temps Cloud"
+            );
+            return;
+        }
+        _ => return,
+    }
+    match service_context.get_service::<dyn temps_core::AuditLogger>() {
+        Some(audit_logger) => {
+            temps_cloud::record_telemetry_bootstrap_audit(
+                audit_logger.as_ref(),
+                CloudEnrollmentActor::UnattendedBootstrap,
+                telemetry,
+            )
+            .await;
+        }
+        None => error!(
+            "the {CONSOLE_OIDC_BOOTSTRAP_FILENAME} bootstrap file turned telemetry export on \
+             but no audit logger is registered; the CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP \
+             audit record was not written"
+        ),
     }
 }
 
@@ -3958,16 +4000,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // 8.6. AgentsPlugin - MUST be registered before DeploymentsPlugin so DeploymentsPlugin can
     // resolve AgentSyncService via the plugin context. If registered after, DeploymentsPlugin
     // falls back to NoOpAgentSyncService and agent sync is silently skipped on every deployment.
-    // Agent sandboxes ARE local containers. DeploymentsPlugin resolves the
-    // AgentSyncService with `get_service` and falls back to a no-op, so
-    // skipping this is safe — see the ordering note above.
-    if local_workloads {
-        debug!("Registering AgentsPlugin");
-        let agents_plugin = Box::new(AgentsPlugin::new());
-        plugin_manager.register_plugin(agents_plugin);
-    } else {
-        skipped_plugins.push("agents");
-    }
+    //
+    // Registered in EVERY profile (ADR 063). It owns the sandbox provider and
+    // the worker-node resolver the sandbox API needs. Under `control-plane`
+    // it never contacts Docker: the host half of the provider refuses every
+    // sandbox on this host with a typed error (never an unsandboxed
+    // fallback), while sandboxes on worker nodes route over their mTLS agent
+    // API exactly as on a full install.
+    debug!("Registering AgentsPlugin");
+    let agents_plugin = Box::new(AgentsPlugin::new());
+    plugin_manager.register_plugin(agents_plugin);
 
     // 8.7. AI Gateway Plugin - registers the provider-neutral AiService.
     // Application harness turns must see the sandbox provider registered by
@@ -4001,16 +4043,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     plugin_manager.register_plugin(mcp_plugin);
 
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
-    // Consumes the shared SandboxProvider registered by AgentsPlugin.
     // Consumes the SandboxProvider AgentsPlugin registers, so it goes
-    // wherever AgentsPlugin goes.
-    if local_workloads {
-        debug!("Registering SandboxPlugin");
-        let sandbox_plugin = Box::new(SandboxPlugin::new());
-        plugin_manager.register_plugin(sandbox_plugin);
-    } else {
-        skipped_plugins.push("sandbox");
-    }
+    // wherever AgentsPlugin goes: every profile (ADR 063). Under
+    // `control-plane` placement never picks the control plane, and a create
+    // with no usable worker answers the worker-node-required problem.
+    debug!("Registering SandboxPlugin");
+    let sandbox_plugin = Box::new(SandboxPlugin::new());
+    plugin_manager.register_plugin(sandbox_plugin);
 
     // 9.1. LogAggregatorPlugin - structured log collection, storage, search, and streaming
     // Depends on database, Docker (from DeployerPlugin), and AuditLogger (from AuditPlugin).
@@ -4730,6 +4769,22 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     // can retrieve it for HTTP query endpoints.
                     service_context.register_service(metrics_store.clone());
 
+                    // ADR 061: pull each worker's edge-proxy and host metrics
+                    // into the same store, under the worker's node id. The
+                    // board is what the console reads to explain a worker
+                    // with no data (e.g. an agent too old to report).
+                    let worker_metrics_status =
+                        Arc::new(temps_metrics::WorkerMetricsStatusBoard::new());
+                    service_context.register_service(worker_metrics_status.clone());
+                    let worker_metrics = temps_deployments::services::worker_metrics_collector::WorkerMetricsCollector::new(
+                        db.clone(),
+                        metrics_store.clone(),
+                        cfg_svc.clone(),
+                        enc_svc.clone(),
+                        worker_metrics_status,
+                    );
+                    tokio::spawn(worker_metrics.run());
+
                     let mut scraper =
                         MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
                     // HA clusters are scraped at their elected primary, which
@@ -4924,6 +4979,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         encryption_service: encryption_service_for_nodes,
         telemetry: node_telemetry,
         rate_limiter: Arc::new(temps_deployments::handlers::nodes::RegistrationRateLimiter::new()),
+        plane_identity_rate_limiter: Arc::new(
+            temps_deployments::handlers::nodes::RegistrationRateLimiter::new(),
+        ),
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
         alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),

@@ -782,6 +782,7 @@ mod command_tree_tests {
             "agent ingress delegated",
             "agent ingress fixed",
             "agent ingress off",
+            "agent ingress private",
             "agent ingress status",
             "agent service install",
             "agent service status",

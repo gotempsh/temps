@@ -1680,7 +1680,7 @@ async fn certificate_reservation_and_pool_changes_are_serialized() {
 async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_endpoint() {
     use std::net::Ipv4Addr;
     use temps_network::{
-        mesh::{self, MeshError, MeshIdentityHolder, OwnMeshAddress},
+        mesh::{self, MeshAddressOwner, MeshError, MeshIdentityHolder, OwnMeshAddress},
         pairing::{self, NewOutboundPairing},
     };
 
@@ -1759,7 +1759,7 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
 
     // Its own reserved address is the one pool address it may claim.
     let own = OwnMeshAddress {
-        pairing_id: a.id,
+        owner: MeshAddressOwner::Pairing(a.id),
         address: Ipv4Addr::new(10, 204, 0, 2),
     };
     let claim = |values: &[&str]| values.iter().map(|v| v.to_string()).collect::<Vec<_>>();
@@ -1779,7 +1779,7 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
     );
     // Another pairing's exemption does not cover this pairing's address.
     let foreign = OwnMeshAddress {
-        pairing_id: a.id + 1000,
+        owner: MeshAddressOwner::Pairing(a.id + 1000),
         ..own
     };
     assert!(matches!(
@@ -1792,7 +1792,7 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
         Some(claim) if claim.claimed == "10.204.0.9"
     ));
     let control_plane = OwnMeshAddress {
-        pairing_id: a.id,
+        owner: MeshAddressOwner::Pairing(a.id),
         address: Ipv4Addr::new(10, 204, 0, 1),
     };
     assert!(matches!(
@@ -1824,10 +1824,38 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
     assert_eq!(row.mesh_wg_endpoint, None);
     assert_eq!(row.mesh_wg_address.as_deref(), Some("10.204.0.2"));
     assert_eq!(row.underlay_address.as_deref(), Some("10.204.0.2"));
-    // A node holding the address is never exempt.
+    // A node holding the address is never exempt for a pairing.
     assert!(matches!(
         mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2"]), Some(own)).await.unwrap(),
         Some(claim) if matches!(claim.holder, MeshIdentityHolder::Node { .. })
+    ));
+    // ADR 060: the node itself, re-registering from that address, may name
+    // it; another node may not, nor may it name any other pool address.
+    let rejoin = OwnMeshAddress {
+        owner: MeshAddressOwner::Node(node),
+        address: Ipv4Addr::new(10, 204, 0, 2),
+    };
+    assert_eq!(
+        mesh::mesh_identity_claimed(
+            &db,
+            &claim(&["10.204.0.2", "https://10.204.0.2:3100"]),
+            Some(rejoin)
+        )
+        .await
+        .unwrap(),
+        None
+    );
+    let impostor = OwnMeshAddress {
+        owner: MeshAddressOwner::Node(node + 1000),
+        ..rejoin
+    };
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.2"]), Some(impostor)).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::Node { node_id, .. } if node_id == node)
+    ));
+    assert!(matches!(
+        mesh::mesh_identity_claimed(&db, &claim(&["10.204.0.9"]), Some(rejoin)).await.unwrap(),
+        Some(claim) if matches!(claim.holder, MeshIdentityHolder::Pool { .. })
     ));
 
     // The agent re-registering with no endpoint changes nothing.
@@ -1852,7 +1880,7 @@ async fn an_outbound_pairing_starts_with_its_key_and_links_a_node_without_an_end
         "test-ca",
         &claim(&["10.204.0.3"]),
         Some(OwnMeshAddress {
-            pairing_id: 0,
+            owner: MeshAddressOwner::Pairing(0),
             address: Ipv4Addr::new(10, 204, 0, 3),
         }),
     )

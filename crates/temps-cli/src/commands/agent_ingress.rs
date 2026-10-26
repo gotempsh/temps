@@ -9,12 +9,17 @@
 //! - `off`: no public ports (the default).
 //! - `fixed`: the worker picks its listen address and ports.
 //! - `delegated`: Temps picks among the addresses the worker reports.
+//! - `private`: listen only on a tailnet or LAN address, for addresses whose
+//!   audience is private (ADR 064 D5).
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use clap::{Args, Subcommand};
-use temps_core::worker_ingress::{IngressMode, LocalIngress};
+use temps_core::worker_ingress::{
+    check_private_listen, IngressMode, LocalIngress, PRIVATE_HTTPS_PORT, PRIVATE_HTTP_PORT,
+    TAILSCALE_INTERFACE,
+};
 
 const UNIT_PATH: &str = "/etc/systemd/system/temps-agent.service";
 
@@ -28,6 +33,21 @@ pub enum AgentIngressCommand {
     Fixed(FixedArgs),
     /// Let Temps choose the listen address and ports among this worker's own
     Delegated(Target),
+    /// Listen only on a private address (a tailnet or LAN), port 443, for
+    /// addresses only your private network may open
+    Private(PrivateArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrivateArgs {
+    /// `tailscale` for this machine's Tailscale address (`tailscale0`), or a
+    /// private address of this machine: 100.64.0.0/10, 10.0.0.0/8,
+    /// 172.16.0.0/12, 192.168.0.0/16 or fd00::/8. The port is always 443,
+    /// and 80 only redirects to it.
+    #[arg(long)]
+    pub listen: String,
+    #[command(flatten)]
+    pub target: Target,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -65,6 +85,7 @@ impl AgentIngressCommand {
                 },
             ),
             Self::Fixed(args) => (&args.target, fixed(args)?),
+            Self::Private(args) => (&args.target, private(&args.listen)?),
         };
         let path = config_path(target)?;
         write_ingress(&path, &desired)?;
@@ -88,6 +109,10 @@ impl AgentIngressCommand {
             ),
             IngressMode::Delegated => println!(
                 "Choose the listen address and public address for this worker in the console."
+            ),
+            IngressMode::Private => println!(
+                "Nothing listens publicly. In the console, choose \"Only my private network\" \
+                 in Make it reachable for the addresses this worker should serve."
             ),
         }
         Ok(())
@@ -116,9 +141,39 @@ fn fixed(args: &FixedArgs) -> anyhow::Result<LocalIngress> {
     Ok(LocalIngress {
         mode: IngressMode::Fixed,
         listen,
+        interface: None,
         http_port: args.http_port,
         https_port: args.https_port,
     })
+}
+
+/// `--listen` for private ingress: `tailscale`, or a private address. Used
+/// by `temps join --ingress private` too, so both refuse the same things.
+pub(crate) fn private(listen: &str) -> anyhow::Result<LocalIngress> {
+    let mut ingress = LocalIngress {
+        mode: IngressMode::Private,
+        http_port: PRIVATE_HTTP_PORT,
+        https_port: PRIVATE_HTTPS_PORT,
+        ..LocalIngress::default()
+    };
+    match listen.trim() {
+        "tailscale" => ingress.interface = Some(TAILSCALE_INTERFACE.to_string()),
+        "" | "auto" => anyhow::bail!(
+            "Private ingress needs to know which private address to listen on: use `--listen \
+             tailscale`, or a private address of this machine."
+        ),
+        value => {
+            let ip: IpAddr = value.parse().map_err(|_| {
+                anyhow::anyhow!(
+                    "--listen '{value}' is not `tailscale` or an IP address. Use `--listen \
+                     tailscale`, or a private address of this machine."
+                )
+            })?;
+            check_private_listen(ip).map_err(|why| anyhow::anyhow!("--listen {why}"))?;
+            ingress.listen = Some(ip);
+        }
+    }
+    Ok(ingress)
 }
 
 fn describe(ingress: &LocalIngress) -> String {
@@ -135,6 +190,16 @@ fn describe(ingress: &LocalIngress) -> String {
             ),
             ingress.http_port,
             ingress.https_port
+        ),
+        IngressMode::Private => format!(
+            "private on {} port 443 (80 redirects to it); serves only private addresses",
+            match (&ingress.interface, ingress.listen) {
+                (Some(interface), _) if interface == TAILSCALE_INTERFACE =>
+                    "this machine's Tailscale address".to_string(),
+                (Some(interface), _) => format!("{interface}'s address"),
+                (None, Some(ip)) => ip.to_string(),
+                (None, None) => "no address".to_string(),
+            }
         ),
     }
 }
@@ -235,4 +300,26 @@ fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
     std::fs::rename(&tmp, path)
         .map_err(|e| anyhow::anyhow!("Could not replace {}: {e}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_takes_tailscale_or_a_private_address_only() {
+        let tailscale = private("tailscale").unwrap();
+        assert_eq!(tailscale.mode, IngressMode::Private);
+        assert_eq!(tailscale.interface.as_deref(), Some("tailscale0"));
+        assert_eq!((tailscale.http_port, tailscale.https_port), (80, 443));
+        assert_eq!(
+            private("192.168.1.8").unwrap().listen,
+            Some("192.168.1.8".parse().unwrap())
+        );
+        for refused in ["0.0.0.0", "::", "203.0.113.7", "auto", "eth0"] {
+            let error = private(refused).unwrap_err().to_string();
+            assert!(error.contains("--listen tailscale"), "{refused}: {error}");
+        }
+        assert!(describe(&tailscale).contains("Tailscale"));
+    }
 }

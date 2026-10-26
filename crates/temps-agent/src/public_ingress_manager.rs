@@ -108,7 +108,43 @@ pub fn start(
 struct Bound {
     http: SocketAddr,
     https: SocketAddr,
+    /// The private listener (ADR 064 D5), not a public one.
+    private: bool,
     handle: PublicIngressHandle,
+}
+
+/// How often the private listener's addresses are checked from inside
+/// (ADR 064 D7), when nothing changed.
+const PRIVATE_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+/// Most private addresses checked in one pass, as `private_check::check_all`.
+const PRIVATE_CHECK_LIMIT: usize = 64;
+/// Private addresses checked at once. Each check can take ~20 s (lookup and
+/// connect timeouts), and the manager loop waits for the pass: one at a time,
+/// 64 addresses would hold off re-reading agent.json, rebinding and the
+/// listener report for over 20 minutes.
+const PRIVATE_CHECK_CONCURRENCY: usize = 8;
+
+/// Check the private listener's addresses (ADR 064 D7) a few at a time,
+/// reporting them in the snapshot's order.
+async fn check_private_routes(
+    routes: &[crate::route_store::PrivateRouteEntry],
+) -> Vec<temps_core::worker_ingress::PrivateCheck> {
+    use futures::StreamExt;
+    use temps_core::worker_ingress::PRIVATE_HTTPS_PORT;
+
+    use crate::private_check::{check, SystemResolver};
+
+    // The futures are built up front: a lazily mapped stream inside the
+    // spawned manager task trips rustc's "FnOnce is not general enough".
+    let checks: Vec<_> = routes
+        .iter()
+        .take(PRIVATE_CHECK_LIMIT)
+        .map(|entry| check(entry, &SystemResolver, None, PRIVATE_HTTPS_PORT))
+        .collect();
+    futures::stream::iter(checks)
+        .buffered(PRIVATE_CHECK_CONCURRENCY)
+        .collect()
+        .await
 }
 
 async fn run(
@@ -140,6 +176,13 @@ async fn run(
     // The last failed bind, so it is retried every RETRY_INTERVAL rather
     // than on every pass.
     let mut failed: Option<((SocketAddr, SocketAddr), String, tokio::time::Instant)> = None;
+    // Inside checks of the private addresses (ADR 064 D7), and what they
+    // were run against, so a changed snapshot is checked at once.
+    let mut private_checks: Vec<temps_core::worker_ingress::PrivateCheck> = Vec::new();
+    let mut private_checked: Option<(
+        Vec<crate::route_store::PrivateRouteEntry>,
+        tokio::time::Instant,
+    )> = None;
 
     loop {
         if !config.pinned {
@@ -171,6 +214,7 @@ async fn run(
 
         let desired = listen.borrow_and_update().clone();
         let target = resolve(&local, desired.as_ref());
+        let private = local.mode == IngressMode::Private;
         let mut error = None;
         match target {
             Ok(None) => {
@@ -180,9 +224,12 @@ async fn run(
                 }
             }
             Ok(Some((http, https))) => {
-                let unchanged = bound
-                    .as_ref()
-                    .is_some_and(|b| b.http == http && b.https == https && b.handle.is_ready());
+                let unchanged = bound.as_ref().is_some_and(|b| {
+                    b.http == http
+                        && b.https == https
+                        && b.private == private
+                        && b.handle.is_ready()
+                });
                 let backing_off = failed.as_ref().filter(|(target, _, at)| {
                     *target == (http, https) && tokio::time::Instant::now() < *at
                 });
@@ -209,6 +256,7 @@ async fn run(
                                 control_plane_ca: config.control_plane_ca.clone(),
                                 node_id: config.node_id,
                                 node_token: config.node_token.clone(),
+                                private,
                             };
                             match public_ingress::spawn(ingress, store.clone(), shutdown.clone())
                                 .await
@@ -219,6 +267,7 @@ async fn run(
                                     bound = Some(Bound {
                                         http: handle.http_address(),
                                         https: handle.https_address(),
+                                        private,
                                         handle,
                                     });
                                 }
@@ -247,12 +296,31 @@ async fn run(
             }
         }
 
+        // ADR 064 D7: the private listener's addresses, checked from here.
+        match bound.as_ref().filter(|b| b.private && b.handle.is_ready()) {
+            Some(_) => {
+                let routes = store.private_routes();
+                let due = private_checked.as_ref().is_none_or(|(checked, at)| {
+                    *checked != routes || at.elapsed() >= PRIVATE_CHECK_INTERVAL
+                });
+                if due {
+                    private_checks = check_private_routes(&routes).await;
+                    private_checked = Some((routes, tokio::time::Instant::now()));
+                }
+            }
+            None => {
+                private_checks.clear();
+                private_checked = None;
+            }
+        }
+
         let report = ListenerReport {
             interfaces: host_interfaces(),
             http: bound.as_ref().map(|b| b.http.to_string()),
             https: bound.as_ref().map(|b| b.https.to_string()),
             mode: Some(local.mode),
             error: error.clone(),
+            private_checks: private_checks.clone(),
         };
         if last_reported.as_ref() != Some(&report) || last_report_at.elapsed() >= REPORT_INTERVAL {
             match send_report(&client, &base, &config, &report).await {
@@ -284,6 +352,13 @@ fn resolve(
 ) -> Result<Option<(SocketAddr, SocketAddr)>, String> {
     let (address, http_port, https_port) = match local.mode {
         IngressMode::Off => return Ok(None),
+        IngressMode::Private => {
+            let ip = private_listen_address(local, &own_addresses())?;
+            return Ok(Some((
+                SocketAddr::new(ip, temps_core::worker_ingress::PRIVATE_HTTP_PORT),
+                SocketAddr::new(ip, temps_core::worker_ingress::PRIVATE_HTTPS_PORT),
+            )));
+        }
         IngressMode::Fixed => (local.listen, local.http_port, local.https_port),
         IngressMode::Delegated => {
             // Off in the console, or a control plane that predates modes.
@@ -315,6 +390,59 @@ fn resolve(
         SocketAddr::new(address, http_port),
         SocketAddr::new(address, https_port),
     )))
+}
+
+/// Where `private` mode binds (ADR 064 D5): the saved address, or the named
+/// interface's (`tailscale0`), IPv4 first; only ever a private address. The
+/// control plane checks the same on what the worker reports.
+fn private_listen_address(
+    local: &LocalIngress,
+    own: &[(String, IpAddr)],
+) -> Result<IpAddr, String> {
+    use temps_core::worker_ingress::{check_private_listen, TAILSCALE_INTERFACE};
+    let ip = match (&local.interface, local.listen) {
+        (Some(interface), _) => {
+            let mut found: Vec<IpAddr> = own
+                .iter()
+                .filter(|(name, ip)| name == interface && check_private_listen(*ip).is_ok())
+                .map(|(_, ip)| *ip)
+                .collect();
+            found.sort_by_key(|ip| !ip.is_ipv4());
+            match found.first() {
+                Some(ip) => *ip,
+                None if interface == TAILSCALE_INTERFACE => {
+                    return Err(format!(
+                        "private ingress listens on Tailscale, but this worker has no \
+                         {TAILSCALE_INTERFACE} address. Start Tailscale (`tailscale up`), or run \
+                         `temps agent ingress private --listen <a private address of this machine>`."
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "private ingress listens on {interface}, which has no private address on \
+                         this worker. Run `temps agent ingress private --listen tailscale` or with \
+                         a private address of this machine."
+                    ))
+                }
+            }
+        }
+        (None, Some(ip)) => ip,
+        (None, None) => {
+            return Err(
+                "private ingress has no listen address. Run `temps agent ingress private \
+                 --listen tailscale`."
+                    .to_string(),
+            )
+        }
+    };
+    check_private_listen(ip).map_err(|why| format!("refused private listen address: {why}"))?;
+    if !own.iter().any(|(_, address)| *address == ip) {
+        return Err(format!(
+            "{ip} is not an address of this worker. Run `temps agent ingress private --listen \
+             tailscale`, or with one of this machine's private addresses."
+        ));
+    }
+    Ok(ip)
 }
 
 /// Interface name prefixes that are Temps' own or container networking: the
@@ -418,6 +546,7 @@ fn host_interfaces() -> Vec<ReportedInterface> {
         })
         .map(|i| ReportedInterface {
             default_route: Some(i.ip()) == default,
+            tailscale: is_tailscale(&i.name, i.ip()),
             address: i.ip().to_string(),
             name: i.name,
         })
@@ -429,6 +558,12 @@ fn host_interfaces() -> Vec<ReportedInterface> {
     });
     out.dedup();
     out
+}
+
+/// Tailscale's interface, as `--listen tailscale` finds it.
+fn is_tailscale(name: &str, ip: IpAddr) -> bool {
+    name == temps_core::worker_ingress::TAILSCALE_INTERFACE
+        && temps_core::worker_ingress::check_private_listen(ip).is_ok()
 }
 
 /// The private key to bind with, and whether the control plane has its
@@ -541,6 +676,33 @@ async fn send_report(
 mod tests {
     use super::*;
 
+    // Checked a few at a time, the results keep the snapshot's order and the
+    // pass stops at the limit. A listener that is not an address fails
+    // before any lookup, so nothing here touches the network.
+    #[tokio::test]
+    async fn private_checks_keep_the_snapshot_order_and_stop_at_the_limit() {
+        use crate::route_store::{PrivateRouteEntry, RouteEntry};
+        let routes: Vec<PrivateRouteEntry> = (0..PRIVATE_CHECK_LIMIT + 6)
+            .map(|i| PrivateRouteEntry {
+                route: RouteEntry {
+                    host: format!("app{i}.tail.example"),
+                    backends: Vec::new(),
+                    deployment_id: None,
+                    project_id: None,
+                    environment_id: None,
+                },
+                address_id: format!("a{i}"),
+                range: "100.64.0.0/10".into(),
+                listener: "not-an-address".into(),
+            })
+            .collect();
+        let checks = check_private_routes(&routes).await;
+        assert_eq!(checks.len(), PRIVATE_CHECK_LIMIT);
+        for (i, check) in checks.iter().enumerate() {
+            assert_eq!(check.address_id, format!("a{i}"));
+        }
+    }
+
     fn host() -> Vec<(String, IpAddr)> {
         vec![
             ("lo".into(), "127.0.0.1".parse().unwrap()),
@@ -567,10 +729,58 @@ mod tests {
     }
 
     #[test]
+    fn private_mode_binds_only_a_private_address_of_this_worker_on_443() {
+        let own = vec![
+            ("eth0".to_string(), "203.0.113.7".parse().unwrap()),
+            (
+                "tailscale0".to_string(),
+                "fd7a:115c:a1e0::5".parse().unwrap(),
+            ),
+            ("tailscale0".to_string(), "100.101.102.103".parse().unwrap()),
+            ("wlan0".to_string(), "192.168.1.8".parse().unwrap()),
+        ];
+        let tailscale = LocalIngress {
+            mode: IngressMode::Private,
+            interface: Some("tailscale0".into()),
+            ..LocalIngress::default()
+        };
+        assert_eq!(
+            private_listen_address(&tailscale, &own),
+            Ok("100.101.102.103".parse().unwrap())
+        );
+        let missing = private_listen_address(&tailscale, &own[..1]).unwrap_err();
+        assert!(missing.contains("tailscale up"), "{missing}");
+        let lan = LocalIngress {
+            mode: IngressMode::Private,
+            listen: Some("192.168.1.8".parse().unwrap()),
+            ..LocalIngress::default()
+        };
+        assert_eq!(
+            private_listen_address(&lan, &own),
+            Ok("192.168.1.8".parse().unwrap())
+        );
+        // agent.json edited by hand: still refused.
+        for refused in ["203.0.113.7", "0.0.0.0", "10.9.9.9"] {
+            let local = LocalIngress {
+                mode: IngressMode::Private,
+                listen: Some(refused.parse().unwrap()),
+                ..LocalIngress::default()
+            };
+            assert!(private_listen_address(&local, &own).is_err(), "{refused}");
+        }
+        assert!(is_tailscale(
+            "tailscale0",
+            "100.101.102.103".parse().unwrap()
+        ));
+        assert!(!is_tailscale("eth0", "100.101.102.103".parse().unwrap()));
+    }
+
+    #[test]
     fn fixed_mode_keeps_the_workers_own_choice() {
         let local = LocalIngress {
             mode: IngressMode::Fixed,
             listen: Some("0.0.0.0".parse().unwrap()),
+            interface: None,
             http_port: 80,
             https_port: 443,
         };

@@ -111,6 +111,11 @@ pub struct OwnershipMarker {
     /// reconciler can never claim records belonging to another workflow.
     pub controller: Option<String>,
 
+    /// The run of the workflow that last wrote the record, when it has runs
+    /// (ADR 064: a *Make it reachable* run). Signed, and left out of the
+    /// payload when absent, so markers without one verify as they always did.
+    pub run_id: Option<i32>,
+
     /// Marker format version.
     pub v: u32,
 
@@ -139,6 +144,8 @@ struct StoredMarker {
     environment_id: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     controller: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run_id: Option<i32>,
     v: u32,
     signature: String,
 }
@@ -167,6 +174,7 @@ impl OwnershipMarker {
             project_id,
             environment_id,
             controller: controller.map(str::to_string),
+            run_id: None,
             v: OWNERSHIP_MARKER_VERSION,
             signature: String::new(),
         };
@@ -193,6 +201,21 @@ impl OwnershipMarker {
         Ok(self)
     }
 
+    /// This marker, naming the run that writes the record; re-signed. `None`
+    /// leaves it as it is.
+    pub fn with_run_id(
+        mut self,
+        signing_key: &[u8; 32],
+        run_id: Option<i32>,
+    ) -> Result<Self, DnsError> {
+        if run_id.is_none() {
+            return Ok(self);
+        }
+        self.run_id = run_id;
+        self.signature = self.compute_signature(signing_key)?;
+        Ok(self)
+    }
+
     /// Whether an update this marker was prepared for may not have
     /// completed: the next write of the record finalizes the marker.
     pub fn has_pending_fingerprint(&self) -> bool {
@@ -215,6 +238,7 @@ impl OwnershipMarker {
             project_id: self.project_id,
             environment_id: self.environment_id,
             controller: self.controller.clone(),
+            run_id: self.run_id,
             v: self.v,
             signature: self.signature.clone(),
         })
@@ -282,6 +306,7 @@ impl OwnershipMarker {
             project_id: stored.project_id,
             environment_id: stored.environment_id,
             controller: stored.controller,
+            run_id: stored.run_id,
             v: stored.v,
             signature: stored.signature,
         })
@@ -354,6 +379,8 @@ impl OwnershipMarker {
             project_id: Option<i32>,
             environment_id: Option<i32>,
             controller: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            run_id: Option<i32>,
             v: u32,
         }
 
@@ -368,6 +395,7 @@ impl OwnershipMarker {
             project_id: self.project_id,
             environment_id: self.environment_id,
             controller: self.controller.as_deref(),
+            run_id: self.run_id,
             v: self.v,
         })
         .map_err(DnsError::Serialization)
@@ -701,6 +729,27 @@ mod tests {
         assert!(!marker(DnsRecordType::A).has_pending_fingerprint());
     }
 
+    /// The run id is signed: another run's id does not verify, and a marker
+    /// without one is byte-for-byte what it was before runs existed.
+    #[test]
+    fn run_id_is_signed_and_round_trips() {
+        let plain = marker(DnsRecordType::A);
+        assert_eq!(plain.run_id, None);
+        assert!(!plain.to_txt_content().unwrap().contains("run_id"));
+        // No run: the marker is exactly what it was before runs existed.
+        assert_eq!(plain.clone().with_run_id(&KEY, None).unwrap(), plain);
+
+        let stamped = plain.with_run_id(&KEY, Some(31)).unwrap();
+        let content = stamped.to_txt_content().unwrap();
+        let parsed = read_back(&content).unwrap();
+        assert_eq!(parsed.run_id, Some(31));
+        assert!(parsed.covers(&KEY, "inst-abc123", "example.com", "app", DnsRecordType::A));
+        // Another run's id does not verify.
+        let forged = read_back(&content.replace("\"run_id\":31", "\"run_id\":32")).unwrap();
+        assert_eq!(forged.run_id, Some(32));
+        assert!(!forged.covers(&KEY, "inst-abc123", "example.com", "app", DnsRecordType::A));
+    }
+
     /// The pending value grants ownership, so it is signed: a marker whose
     /// pending fingerprint was swapped for another value no longer verifies,
     /// and a malformed one does not even parse as a marker.
@@ -757,6 +806,8 @@ mod tests {
                 Some(i32::MIN),
                 Some("generated-hostname"),
             )
+            .unwrap()
+            .with_run_id(&KEY, Some(i32::MIN))
             .unwrap()
             .with_pending_fingerprint(&KEY, &"b".repeat(64))
             .unwrap();

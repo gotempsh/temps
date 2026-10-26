@@ -559,6 +559,7 @@ mod tests {
             query_service: Arc::new(crate::QueryService::new(manager)),
             health_monitor: None,
             metrics_store: None,
+            worker_metrics_status: None,
             db: db.clone(),
             api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
             config_service: None,

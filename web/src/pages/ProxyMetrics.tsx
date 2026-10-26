@@ -9,8 +9,10 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
  * Route: /proxy
  *
  * Two data sources, switched by the project/environment filter:
- *   - "All projects" (default): process-wide proxy.* node metrics on the
- *     control-plane node (id 0). These have no project dimension by design.
+ *   - "All projects" (default): process-wide proxy.* node metrics of the
+ *     node picked in the node selector — the control plane (id 0), a worker's
+ *     edge proxy, or all nodes combined (ADR 061). These have no project
+ *     dimension by design.
  *   - Project/environment filtered: proxy-log-derived time buckets from
  *     GET /proxy-logs/stats/time-buckets (request/error counts, avg + p50/p95/p99
  *     latency, bandwidth).
@@ -24,8 +26,13 @@ import {
   getProjectsHealthOptions,
   getProjectsOptions,
   getTimeBucketStatsOptions,
-  nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import {
+  NodeReportingNotice,
+  NodeScopeSelect,
+} from '@/components/monitoring/NodeScopeSelect'
+import { useMetricNodeScope } from '@/hooks/useMetricNodeScope'
+import { nodeRangeQuery, type NodeScope } from '@/lib/node-scope'
 import type { TimeBucketStats } from '@/api/client/types.gen'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
@@ -85,9 +92,6 @@ import {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/** The control-plane node always has id 0. */
-const CONTROL_PLANE_NODE_ID = 0
 
 /** One line in a chart panel: data key + display label + stroke color. */
 type SeriesDef = {
@@ -346,7 +350,7 @@ const FD_PANELS: NodePanelDef[] = [
   {
     title: 'File descriptors in use',
     description:
-      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the temps binary against its own RLIMIT_NOFILE',
+      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the control plane’s temps binary against its own RLIMIT_NOFILE',
     series: [
       {
         metric: 'node.fd_percent',
@@ -403,19 +407,23 @@ function isMetricsUnavailable(err: unknown): boolean {
   return msg.includes('not available') || msg.includes('unavailable')
 }
 
-/** Shared query options for one proxy metric series on the CP node. */
-function proxySeriesQuery(metric: string, window: ResolvedProxyWindow) {
+/** Shared query options for one proxy metric series over the node scope. */
+function proxySeriesQuery(
+  metric: string,
+  window: ResolvedProxyWindow,
+  scope: NodeScope
+) {
   return {
-    ...nodeMetricsGetRangeOptions({
-      path: { id: CONTROL_PLANE_NODE_ID },
-      query: window.rangeParam
+    ...nodeRangeQuery(
+      scope,
+      window.rangeParam
         ? { metric, range: window.rangeParam }
         : {
             metric,
             start_time: window.startIso,
             end_time: window.endIso,
-          },
-    }),
+          }
+    ),
     staleTime: 15_000,
     // A refused read (a role without settings:read) is neither retried nor
     // polled again: the answer cannot change until the role does.
@@ -583,14 +591,16 @@ function ChartPanel({
 function NodeMetricPanel({
   panel,
   window,
+  scope,
   emptyText = 'No proxy metrics yet — data appears within a minute of traffic',
 }: {
   panel: NodePanelDef
   window: ResolvedProxyWindow
+  scope: NodeScope
   emptyText?: string
 }) {
   const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window)),
+    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window, scope)),
   })
 
   const isPending = results.some((r) => r.isPending)
@@ -801,19 +811,25 @@ function StatCard({ title, value, isPending, sub }: StatCardProps) {
 }
 
 /** Unfiltered stats — computed from the process-wide node metric series. */
-function NodeSummaryStats({ window }: { window: ResolvedProxyWindow }) {
+function NodeSummaryStats({
+  window,
+  scope,
+}: {
+  window: ResolvedProxyWindow
+  scope: NodeScope
+}) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
   const [requests, errors5xx, p95, destProject, destConsole, destOther] =
     useQueries({
       queries: [
-        proxySeriesQuery('proxy.requests', window),
-        proxySeriesQuery('proxy.requests_5xx', window),
-        proxySeriesQuery('proxy.request_duration_p95_ms', window),
+        proxySeriesQuery('proxy.requests', window, scope),
+        proxySeriesQuery('proxy.requests_5xx', window, scope),
+        proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
         // Destination split — same options the "Requests by destination"
         // panel uses, so React Query dedupes the fetches.
-        proxySeriesQuery('proxy.requests_project', window),
-        proxySeriesQuery('proxy.requests_console', window),
-        proxySeriesQuery('proxy.requests_other', window),
+        proxySeriesQuery('proxy.requests_project', window, scope),
+        proxySeriesQuery('proxy.requests_console', window, scope),
+        proxySeriesQuery('proxy.requests_other', window, scope),
       ],
     })
 
@@ -1322,15 +1338,26 @@ export default function ProxyMetrics() {
   // Node metrics need settings:read, which only instance administrators hold.
   // Everyone else gets one explanation instead of 26 refused series queries.
   const canReadNodeMetrics = useIsInstanceAdmin()
+  // ADR 061: one node, or all of them. Hidden with only the control plane.
+  const nodes = useMetricNodeScope(canReadNodeMetrics)
 
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
         <PageHeader
           title="Proxy"
-          description="Hot-path traffic and latency metrics for the control-plane proxy"
+          description="Hot-path traffic and latency metrics for the Temps proxy"
           actions={
             <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              {/* Per-project views read the control plane's request logs,
+                  so the node choice only applies to the unfiltered view. */}
+              {!isFiltered && canReadNodeMetrics && (
+                <NodeScopeSelect
+                  options={nodes.options}
+                  scope={nodes.scope}
+                  onChange={nodes.setScope}
+                />
+              )}
               <FilterBar filter={filter} onChange={setFilter} />
               <DateTimeRange
                 value={{
@@ -1364,15 +1391,23 @@ export default function ProxyMetrics() {
           </>
         ) : !canReadNodeMetrics ? (
           <NodeMetricsAccessDenied />
+        ) : !nodes.ready ? (
+          <Skeleton className="h-24 w-full" />
         ) : (
           <>
-            <NodeSummaryStats window={resolved} />
+            <NodeReportingNotice
+              scope={nodes.scope}
+              options={nodes.options}
+              statuses={nodes.statuses}
+            />
+            <NodeSummaryStats window={resolved} scope={nodes.scope} />
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
               {NODE_PANELS.map((panel) => (
                 <NodeMetricPanel
                   key={panel.title}
                   panel={panel}
                   window={resolved}
+                  scope={nodes.scope}
                 />
               ))}
             </div>
@@ -1398,6 +1433,7 @@ export default function ProxyMetrics() {
                     key={panel.title}
                     panel={panel}
                     window={resolved}
+                    scope={nodes.scope}
                     emptyText="No file-descriptor samples in this window. These are read from /proc, so they are only collected when temps runs on Linux."
                   />
                 ))}

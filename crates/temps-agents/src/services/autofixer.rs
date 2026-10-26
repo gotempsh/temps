@@ -354,6 +354,9 @@ impl AutofixerService {
     }
 
     async fn run_analysis_inner(&self, run_id: i32) -> Result<(), AgentError> {
+        // ADR 063: refuse before the repository is cloned on this host.
+        self.sandbox_registry
+            .require_local_host(&format!("Autofix run {run_id}"))?;
         let run = self.run_service.get_run(run_id).await?;
         let cfg = self.resolve_config(&run).await?;
 

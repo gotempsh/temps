@@ -99,6 +99,7 @@ pub fn build_router(
     let auth = Arc::new(AgentAuth::new(&config.token));
 
     let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
+    let worker_metrics_routes = crate::worker_metrics::router(config, auth.clone());
 
     // API routes — all protected by bearer token auth
     let api_routes = Router::new()
@@ -232,11 +233,13 @@ pub fn build_router(
     // Swagger UI — no auth required so it's accessible for documentation
     let mut api = AgentApiDoc::openapi();
     api.merge(crate::runtime_health::RuntimeHealthApiDoc::openapi());
+    api.merge(crate::worker_metrics::WorkerMetricsApiDoc::openapi());
     let swagger_ui = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
 
     api_routes
         .merge(sandbox_routes)
         .merge(runtime_health_routes)
+        .merge(worker_metrics_routes)
         .merge(swagger_ui)
 }
 
@@ -1342,6 +1345,8 @@ pub(crate) mod tests {
             wg_endpoint: None,
             control_plane_trust: Some(crate::ControlPlaneTrust::PublicRoots),
             control_plane_legacy_cert_path: None,
+            join_url: None,
+            overlay_network_name: None,
         }
     }
 

@@ -219,6 +219,21 @@ impl From<SandboxError> for Problem {
                     .with_title("Sandbox Node Not Ready")
                     .with_detail(error.to_string())
             }
+            // ADR 063. No `setup_path`: a worker does not make the control
+            // plane able to run this; the message says what does.
+            SandboxError::NoLocalHost { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(temps_agents::error::NO_LOCAL_SANDBOX_HOST_TYPE)
+                .with_title(temps_agents::error::NO_LOCAL_SANDBOX_HOST_TITLE)
+                .with_detail(error.to_string())
+                .with_value(
+                    "error_code",
+                    temps_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE,
+                ),
+            // ADR 063: the same problem every "needs a worker" path returns,
+            // so the console offers the same Add worker node action.
+            SandboxError::NoWorkerNodeForSandboxes { .. } => {
+                temps_core::worker_node_required_problem(error.to_string())
+            }
             SandboxError::NoPlacementNode => problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                 .with_type("https://temps.sh/probs/sandbox-no-placement-node")
                 .with_title("No Node Available For Sandboxes")

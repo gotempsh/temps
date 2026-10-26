@@ -416,6 +416,8 @@ pub fn start_proxy_server(
         disable_https_redirect,
         on_demand_cert_manager,
         console_startup: Some(console_startup),
+        // Console and proxy share this process, so it samples the host too.
+        host_metrics: true,
     };
 
     info!(

@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * ServerMonitoring — resource usage of one machine: the control plane by
- * default, or a worker node when `nodeId` is given.
+ * ServerMonitoring — resource usage of the machines running Temps: the
+ * control plane, and each worker once it has joined (ADR 061). The Server
+ * page chooses the node (or "All nodes"); a worker's own page pins `nodeId`.
  *
  * Route: /monitoring/server (standalone Server page, control plane), and
  * embedded in the worker node detail page (`embedded`, `nodeId`).
@@ -12,20 +13,28 @@
  * (current value + progress bar + history), Docker disk usage (docker system
  * df by images / containers / volumes / build cache), block I/O and network
  * I/O. Everything comes from `GET /nodes/{id}/metrics*` (the node sampler in
- * the proxy process for the control plane, the worker's heartbeats for a
- * worker) and, for the control plane only, `GET /nodes/0/docker-disk-usage`,
- * through the generated SDK bindings. A worker records only CPU, memory and
- * disk, so the panels with no data source are not rendered for it.
+ * the proxy process for node 0; for a worker, CPU, memory and disk from its
+ * heartbeats and the rest pulled from its agent), the combined
+ * `GET /nodes/metrics/cluster*` for "All nodes", and, for the control plane
+ * only, `GET /nodes/0/docker-disk-usage`, through the generated SDK bindings.
  */
 
 import { HelpPopover } from '@temps-sdk/ds'
 
 import { PageHeader } from '@temps-sdk/ds'
+import { nodeDockerDiskUsageGetOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
-  nodeDockerDiskUsageGetOptions,
-  nodeMetricsGetLatestOptions,
-  nodeMetricsGetRangeOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+  NodeReportingNotice,
+  NodeScopeSelect,
+} from '@/components/monitoring/NodeScopeSelect'
+import { useMetricNodeScope } from '@/hooks/useMetricNodeScope'
+import {
+  isControlPlaneOnly,
+  nodeLatestQuery,
+  nodeRangeQuery,
+  scopeSubject,
+  type NodeScope,
+} from '@/lib/node-scope'
 import type { MetricDataPoint } from '@/api/client/types.gen'
 import {
   ThresholdLineChart,
@@ -45,6 +54,7 @@ import {
 import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { useNodeCapability } from '@/hooks/useNodeCapability'
 import { useSettings } from '@/hooks/useSettings'
 import { NodeMetricsAccessDenied } from '@/components/monitoring/NodeMetricsAccessDenied'
 import { NoNodeSamplesState } from '@/components/monitoring/NoNodeSamplesState'
@@ -68,7 +78,6 @@ import {
   lastSampleOf,
   isMetricsUnavailable,
   mergeSeries,
-  nodeMetricCapabilities,
   peakOf,
   projectDisk,
   toRatePerSecond,
@@ -85,7 +94,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { AlertTriangle, Pause, Play, RefreshCw, Settings } from 'lucide-react'
-import { useState } from 'react'
+import { useMemo, useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 const METRICS_SETTINGS_PATH = '/settings/metrics-monitoring'
@@ -109,17 +118,14 @@ function pollInterval(interval: number | false) {
 }
 
 function useNodeSeries(
-  nodeId: number,
   metric: string,
   range: ProxyRangePreset,
   refetchInterval: number | false,
-  enabled: boolean
+  enabled: boolean,
+  scope: NodeScope
 ) {
   return useQuery({
-    ...nodeMetricsGetRangeOptions({
-      path: { id: nodeId },
-      query: { metric, range },
-    }),
+    ...nodeRangeQuery(scope, { metric, range }),
     staleTime: 15_000,
     refetchInterval: pollInterval(refetchInterval),
     retry: false,
@@ -466,7 +472,7 @@ function DockerDiskUsageCard() {
 // ---------------------------------------------------------------------------
 
 type SubjectCopy = {
-  /** "the control-plane host" / "this worker". */
+  /** "the control-plane host", a worker's name, or "every node". */
   host: string
   /** Clause completing "This server has no metrics store, so …". */
   noStoreCause: string
@@ -479,26 +485,32 @@ type SubjectCopy = {
   diskDescription: string
 }
 
-function describeSubject(nodeId: number): SubjectCopy {
-  if (nodeId === CONTROL_PLANE_NODE_ID) {
+function describeSubject(
+  scope: NodeScope,
+  options: Parameters<typeof scopeSubject>[1]
+): SubjectCopy {
+  const host = hostSubject(scope, options)
+  if (scope.kind === 'all' || scope.id === CONTROL_PLANE_NODE_ID) {
     return {
-      host: 'the control-plane host',
+      host,
       noStoreCause: 'the proxy process is not sampling this host',
-      panelList:
-        'CPU, memory, disk, Docker disk usage, block I/O and network I/O of the control-plane host',
+      panelList: `CPU, memory, disk, block I/O and network I/O of ${host}`,
       silentCause:
         'The node sampler runs inside the proxy process and writes one sample on a fixed interval.',
       process: 'temps serve',
       silentCheck: '',
-      diskDescription: 'Volume under the Temps data directory',
+      diskDescription:
+        scope.kind === 'all'
+          ? 'Root volumes of every node, summed'
+          : 'Volume under the Temps data directory',
     }
   }
   return {
-    host: 'this worker',
-    noStoreCause: 'nothing records the CPU, memory and disk its agent reports',
-    panelList: "this worker's CPU, memory and disk",
+    host,
+    noStoreCause: 'nothing records what its agent reports',
+    panelList: `the CPU, memory, disk, block I/O and network I/O of ${host}`,
     silentCause:
-      'A worker reports CPU, memory and disk with every agent heartbeat, and the control plane stores each one as a sample.',
+      'A worker reports CPU, memory and disk with every agent heartbeat, and the control plane pulls the rest from its agent on the scrape interval.',
     process: 'temps agent',
     silentCheck: ' on the worker and can reach the control plane',
     diskDescription: 'Root filesystem (/) of the worker',
@@ -517,7 +529,10 @@ const memoryBands = bandsOf(MEMORY_THRESHOLDS)
 const diskBands = bandsOf(DISK_THRESHOLDS)
 
 export type ServerMonitoringProps = {
-  /** Node to show; the control plane (`0`) when omitted. */
+  /**
+   * Node to show, with no node selector. Omitted: the `?node=` scope, which
+   * is the control plane until a worker has joined.
+   */
   nodeId?: number
   /**
    * Render inside another page: a section toolbar instead of the page
@@ -529,12 +544,10 @@ export type ServerMonitoringProps = {
 }
 
 export function ServerMonitoring({
-  nodeId = CONTROL_PLANE_NODE_ID,
+  nodeId,
   embedded = false,
   rangeParamName = 'range',
 }: ServerMonitoringProps = {}) {
-  const { ioCounters, dockerUsage } = nodeMetricCapabilities(nodeId)
-  const subject = describeSubject(nodeId)
   // The window lives in the URL (`?range=6h`) so a link opens on the same
   // view and the browser's back button walks the ranges.
   const [searchParams, setSearchParams] = useSearchParams()
@@ -564,71 +577,90 @@ export function ServerMonitoring({
   // Node metrics need settings:read, which only instance administrators
   // hold. Other roles get one explanation below and send no metric requests.
   const canReadNodeMetrics = useIsInstanceAdmin()
+  // ADR 061: one node, or all of them. Hidden with only the control plane.
+  const nodes = useMetricNodeScope(canReadNodeMetrics)
+  const pinned = nodeId != null
+  const scope: NodeScope = useMemo(
+    () => (nodeId != null ? { kind: 'node', id: nodeId } : nodes.scope),
+    [nodeId, nodes.scope]
+  )
+  const metricsEnabled = canReadNodeMetrics && (pinned || nodes.ready)
+  const controlPlaneOnly = isControlPlaneOnly(scope)
+  // A control-plane-profile install has no Docker daemon by design (its
+  // workloads run on worker nodes), so `docker system df` can only fail
+  // there. Wait for the capability so that request is never sent, but fail
+  // open: an unreadable capability still shows the card.
+  const capability = useNodeCapability()
+  // Docker disk usage is only read from the control plane's own daemon.
+  const showDockerDiskUsage =
+    controlPlaneOnly &&
+    !capability.isPending &&
+    capability.data?.local_workloads !== false
 
   const latest = useQuery({
-    ...nodeMetricsGetLatestOptions({ path: { id: nodeId } }),
+    ...nodeLatestQuery(scope),
     staleTime: 15_000,
     refetchInterval: pollInterval(refetchInterval),
     retry: false,
-    enabled: canReadNodeMetrics,
+    enabled: metricsEnabled,
   })
   const cpu = useNodeSeries(
-    nodeId,
     'node.cpu_percent',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const memory = useNodeSeries(
-    nodeId,
     'node.memory_percent',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const disk = useNodeSeries(
-    nodeId,
     'node.disk_used_bytes',
     range,
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   // The projection always reads the longest window: extrapolating a fill
   // date from the last hour turns one image pull into "full in 3 days".
   const diskHistory = useNodeSeries(
-    nodeId,
     'node.disk_used_bytes',
     '7d',
     refetchInterval,
-    canReadNodeMetrics
+    metricsEnabled,
+    scope
   )
   const rx = useNodeSeries(
-    nodeId,
     'node.network_rx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics && ioCounters
+    metricsEnabled,
+    scope
   )
   const tx = useNodeSeries(
-    nodeId,
     'node.network_tx_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics && ioCounters
+    metricsEnabled,
+    scope
   )
   const read = useNodeSeries(
-    nodeId,
     'node.disk_read_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics && ioCounters
+    metricsEnabled,
+    scope
   )
   const write = useNodeSeries(
-    nodeId,
     'node.disk_write_bytes_total',
     range,
     refetchInterval,
-    canReadNodeMetrics && ioCounters
+    metricsEnabled,
+    scope
   )
 
   const snapshot = (latest.data ?? {}) as Record<string, number>
@@ -702,9 +734,7 @@ export function ServerMonitoring({
 
   // Any failed request surfaces at page level with one Retry that refetches
   // everything; the chart it belongs to also says so in place.
-  const queries = ioCounters
-    ? [latest, cpu, memory, disk, rx, tx, read, write]
-    : [latest, cpu, memory, disk]
+  const queries = [latest, cpu, memory, disk, rx, tx, read, write]
   const firstError = queries.find((q) => q.isError)?.error
   const refreshAll = () => {
     for (const q of queries) void q.refetch()
@@ -715,11 +745,19 @@ export function ServerMonitoring({
   const noSamples =
     !firstError &&
     hasNoNodeSamples({
-      series: ioCounters
-        ? [cpu.data, memory.data, disk.data, rx.data, tx.data]
-        : [cpu.data, memory.data, disk.data],
+      series: [cpu.data, memory.data, disk.data, rx.data, tx.data],
       current: [cpuNow, memPct, diskPct],
     })
+
+  const subject = describeSubject(scope, nodes.options)
+  const nodeSelect =
+    !pinned && nodes.options.length > 1 ? (
+      <NodeScopeSelect
+        options={nodes.options}
+        scope={scope}
+        onChange={nodes.setScope}
+      />
+    ) : null
 
   const bucketCaption = `${step >= 3600 ? `${step / 3600} h` : `${step / 60} min`} buckets · last ${range} · kept ${retentionDays} days`
   const seriesError = (q: { isError: boolean }) =>
@@ -746,6 +784,7 @@ export function ServerMonitoring({
           onTogglePause={() => setPaused((p) => !p)}
           embedded={embedded}
           subject={subject}
+          nodeSelect={nodeSelect}
         />
         <Card className="shadow-none">
           <CardHeader>
@@ -784,9 +823,16 @@ export function ServerMonitoring({
         onTogglePause={() => setPaused((p) => !p)}
         embedded={embedded}
         subject={subject}
+        nodeSelect={nodeSelect}
       />
 
-      {firstError && (
+      <NodeReportingNotice
+        scope={scope}
+        options={nodes.options}
+        statuses={nodes.statuses}
+      />
+
+      {firstError != null && (
         <Alert variant="destructive">
           <AlertTriangle className="h-4 w-4" />
           <AlertTitle>Could not read node metrics</AlertTitle>
@@ -820,7 +866,9 @@ export function ServerMonitoring({
           scrapeInterval={scrapeInterval}
           settingsPath={METRICS_SETTINGS_PATH}
           nodeKind={
-            nodeId === CONTROL_PLANE_NODE_ID ? 'control-plane' : 'worker'
+            scope.kind === 'node' && scope.id !== CONTROL_PLANE_NODE_ID
+              ? 'worker'
+              : 'control-plane'
           }
         />
       )}
@@ -830,7 +878,11 @@ export function ServerMonitoring({
           <>
             <UsageCard
               title="CPU usage"
-              description={`All cores of ${subject.host}`}
+              description={
+                scope.kind === 'all'
+                  ? 'Mean across nodes of each one’s share of all its cores'
+                  : `All cores of ${subject.host}`
+              }
               percent={cpuNow}
               absolute={null}
               thresholds={CPU_THRESHOLDS}
@@ -878,7 +930,7 @@ export function ServerMonitoring({
           </>
         )}
         {/* Docker's own `system df` answers without any recorded sample. */}
-        {dockerUsage && <DockerDiskUsageCard />}
+        {showDockerDiskUsage && <DockerDiskUsageCard />}
       </div>
 
       {!noSamples && (
@@ -927,44 +979,50 @@ export function ServerMonitoring({
             emptyText="No disk samples in this window yet"
             footer={bucketCaption}
           />
-          {ioCounters && (
-            <>
-              <ChartPanel
-                title="Network I/O"
-                description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
-                series={[
-                  { dataKey: 'in', label: 'In', tone: 'primary' },
-                  { dataKey: 'out', label: 'Out', tone: 'good' },
-                ]}
-                data={networkData}
-                valueFormatter={formatBytesPerSecond}
-                tickFormatter={formatRateTick}
-                isPending={rx.isPending || tx.isPending}
-                errorText={seriesError(rx) ?? seriesError(tx)}
-                emptyText="No network samples in this window yet"
-                footer={bucketCaption}
-              />
-              <ChartPanel
-                title="Block I/O"
-                description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
-                series={[
-                  { dataKey: 'read', label: 'Read', tone: 'primary' },
-                  { dataKey: 'write', label: 'Write', tone: 'good' },
-                ]}
-                data={blockIoData}
-                valueFormatter={formatBytesPerSecond}
-                tickFormatter={formatRateTick}
-                isPending={read.isPending || write.isPending}
-                errorText={seriesError(read) ?? seriesError(write)}
-                emptyText="No block I/O samples in this window yet"
-                footer={bucketCaption}
-              />
-            </>
-          )}
+          <ChartPanel
+            title="Network I/O"
+            description="Bytes per second on physical interfaces (loopback, bridges and tunnels excluded)"
+            series={[
+              { dataKey: 'in', label: 'In', tone: 'primary' },
+              { dataKey: 'out', label: 'Out', tone: 'good' },
+            ]}
+            data={networkData}
+            valueFormatter={formatBytesPerSecond}
+            tickFormatter={formatRateTick}
+            isPending={rx.isPending || tx.isPending}
+            errorText={seriesError(rx) ?? seriesError(tx)}
+            emptyText="No network samples in this window yet"
+            footer={bucketCaption}
+          />
+          <ChartPanel
+            title="Block I/O"
+            description="Bytes per second read from and written to physical disks (partitions, loop and device-mapper excluded)"
+            series={[
+              { dataKey: 'read', label: 'Read', tone: 'primary' },
+              { dataKey: 'write', label: 'Write', tone: 'good' },
+            ]}
+            data={blockIoData}
+            valueFormatter={formatBytesPerSecond}
+            tickFormatter={formatRateTick}
+            isPending={read.isPending || write.isPending}
+            errorText={seriesError(read) ?? seriesError(write)}
+            emptyText="No block I/O samples in this window yet"
+            footer={bucketCaption}
+          />
         </div>
       )}
     </div>
   )
+}
+
+/** "the control-plane host", a worker's name, or "every node". */
+function hostSubject(
+  scope: NodeScope,
+  options: Parameters<typeof scopeSubject>[1]
+): string {
+  if (scope.kind === 'all') return 'every node'
+  if (scope.id === CONTROL_PLANE_NODE_ID) return 'the control-plane host'
+  return scopeSubject(scope, options)
 }
 
 function SectionIntro({
@@ -976,6 +1034,7 @@ function SectionIntro({
   onTogglePause,
   embedded,
   subject,
+  nodeSelect,
 }: {
   range: ProxyRangePreset
   onRange: (r: ProxyRangePreset) => void
@@ -985,6 +1044,7 @@ function SectionIntro({
   onTogglePause: () => void
   embedded: boolean
   subject: SubjectCopy
+  nodeSelect: ReactNode
 }) {
   const toolbar = (
     <div className="flex min-w-0 flex-wrap items-center gap-1">
@@ -1019,6 +1079,7 @@ function SectionIntro({
         )}
         {paused ? 'Resume' : 'Pause'}
       </Button>
+      {nodeSelect && <div className="mr-2">{nodeSelect}</div>}
       {PROXY_RANGE_PRESETS.map((opt) => (
         <Button
           key={opt.value}
