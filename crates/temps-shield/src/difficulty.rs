@@ -229,7 +229,8 @@ impl FailureTracker {
 mod tests {
     use super::*;
 
-    const NOW: u64 = 1_800_000_000 - 1_800_000_000 % 60;
+    /// A minute boundary.
+    const NOW: u64 = 30_000_000 * 60;
 
     #[test]
     fn the_base_follows_the_cause_and_the_cap_holds() {
