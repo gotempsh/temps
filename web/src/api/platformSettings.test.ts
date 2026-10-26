@@ -14,6 +14,14 @@ describe('buildPlatformSettingsUpdateBody', () => {
     expect(body.trust_loopback_forwarded_ip).toBe(true)
   })
 
+  test('round-trips the loopback JA4 header on unrelated saves', () => {
+    const body = buildPlatformSettingsUpdateBody({
+      loopback_ja4_header: 'x-ja4',
+    } as PlatformSettings)
+
+    expect(body.loopback_ja4_header).toBe('x-ja4')
+  })
+
   test('sends the trusted private networks the Security page edits', () => {
     const body = buildPlatformSettingsUpdateBody({
       trusted_private_networks: ['10.0.0.0/8', 'fd12:3456::/48'],
