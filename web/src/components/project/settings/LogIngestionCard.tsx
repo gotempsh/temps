@@ -23,22 +23,24 @@ export function LogIngestionCard({
     meta: { errorTitle: 'Failed to update log ingestion budget' },
   })
 
+  // `toast.promise` returns a toast handle, not the request, so awaiting it
+  // would refetch before the save landed and show the old budget. Await the
+  // mutation itself, then refetch.
   const handleSave = async (budget: LogIngestionBudget) => {
-    await toast.promise(
-      updateProjectSettings.mutateAsync({
-        path: { project_id: project.id },
-        body: {
-          // Explicit null returns the field to the platform budget.
-          log_ingest_lines_per_sec: budget.lines,
-          log_ingest_kib_per_sec: budget.kib,
-        },
-      }),
-      {
-        loading: 'Updating log ingestion budget...',
-        success: 'Log ingestion budget updated',
-        error: 'Failed to update log ingestion budget',
-      }
-    )
+    const saving = updateProjectSettings.mutateAsync({
+      path: { project_id: project.id },
+      body: {
+        // Explicit null returns the field to the platform budget.
+        log_ingest_lines_per_sec: budget.lines,
+        log_ingest_kib_per_sec: budget.kib,
+      },
+    })
+    toast.promise(saving, {
+      loading: 'Updating log ingestion budget...',
+      success: 'Log ingestion budget updated',
+      error: 'Failed to update log ingestion budget',
+    })
+    await saving
     refetch()
   }
 

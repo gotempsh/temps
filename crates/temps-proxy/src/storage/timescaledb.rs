@@ -33,16 +33,16 @@ use crate::traffic_aggregation::{
     TrafficMetricValues, TrafficOrderField, TrafficSortDirection,
 };
 
-/// The exact column list (and order) used by the prior `batch_insert`. Kept
-/// verbatim so the INSERT is byte-for-byte identical to the original hard-coded
-/// path. NOTE: `trace_id` and `error_group_id` are intentionally omitted here to
-/// match the original behaviour (they exist on the entity but were never written
-/// by the batch path).
 /// Rows per multi-row INSERT statement. `INSERT_COLUMNS.len()` parameters
 /// per row must stay under Postgres's 65 535 bind-parameter limit.
 const TIMESCALE_ROWS_PER_INSERT: usize = 1_000;
 const _: () = assert!(TIMESCALE_ROWS_PER_INSERT * INSERT_COLUMNS.len() < 65_535);
 
+/// The exact column list (and order) used by the prior `batch_insert`. Kept
+/// verbatim so the INSERT is byte-for-byte identical to the original hard-coded
+/// path. NOTE: `trace_id` and `error_group_id` are intentionally omitted here to
+/// match the original behaviour (they exist on the entity but were never written
+/// by the batch path).
 const INSERT_COLUMNS: [&str; 35] = [
     "timestamp",
     "method",
@@ -168,84 +168,93 @@ impl TimescaleDbProxyLogStore {
         entries: &[CreateProxyLogRequest],
         order: Vec<usize>,
     ) -> Result<(), sea_orm::DbErr> {
-        if entries.is_empty() {
-            return Ok(());
+        insert_rows(self.db.as_ref(), entries, &order).await
+    }
+}
+
+/// One multi-row `INSERT` of `entries[order[..]]`, on `conn` (the pool, or a
+/// transaction that groups several of these).
+async fn insert_rows<C: ConnectionTrait>(
+    conn: &C,
+    entries: &[CreateProxyLogRequest],
+    order: &[usize],
+) -> Result<(), sea_orm::DbErr> {
+    if order.is_empty() {
+        return Ok(());
+    }
+
+    let cols_per_row = INSERT_COLUMNS.len();
+
+    let mut sql = format!(
+        "INSERT INTO proxy_logs ({}) VALUES ",
+        INSERT_COLUMNS.join(", ")
+    );
+
+    let mut params: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * cols_per_row);
+    let now = chrono::Utc::now();
+
+    for (i, entry) in order.iter().map(|&index| &entries[index]).enumerate() {
+        if i > 0 {
+            sql.push_str(", ");
         }
-
-        let cols_per_row = INSERT_COLUMNS.len();
-
-        let mut sql = format!(
-            "INSERT INTO proxy_logs ({}) VALUES ",
-            INSERT_COLUMNS.join(", ")
-        );
-
-        let mut params: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * cols_per_row);
-        let now = chrono::Utc::now();
-
-        for (i, entry) in order.into_iter().map(|index| &entries[index]).enumerate() {
-            if i > 0 {
+        let offset = i * cols_per_row;
+        sql.push('(');
+        for j in 0..cols_per_row {
+            if j > 0 {
                 sql.push_str(", ");
             }
-            let offset = i * cols_per_row;
-            sql.push('(');
-            for j in 0..cols_per_row {
-                if j > 0 {
-                    sql.push_str(", ");
-                }
-                sql.push_str(&format!("${}", offset + j + 1));
-            }
-            sql.push(')');
-
-            let created_date = now.date_naive();
-
-            params.push(now.into()); // timestamp
-            params.push(entry.method.clone().into()); // method
-            params.push(entry.path.clone().into()); // path
-            params.push(entry.query_string.clone().into()); // query_string
-            params.push(entry.host.clone().into()); // host
-            params.push(entry.status_code.into()); // status_code
-            params.push(entry.response_time_ms.into()); // response_time_ms
-            params.push(entry.request_source.clone().into()); // request_source
-            params.push(entry.is_system_request.into()); // is_system_request
-            params.push(entry.routing_status.clone().into()); // routing_status
-            params.push(entry.project_id.into()); // project_id
-            params.push(entry.environment_id.into()); // environment_id
-            params.push(entry.deployment_id.into()); // deployment_id
-            params.push(entry.session_id.into()); // session_id
-            params.push(entry.visitor_id.into()); // visitor_id
-            params.push(entry.container_id.clone().into()); // container_id
-            params.push(entry.upstream_host.clone().into()); // upstream_host
-            params.push(entry.error_message.clone().into()); // error_message
-            params.push(entry.client_ip.clone().into()); // client_ip
-            params.push(entry.user_agent.clone().into()); // user_agent
-            params.push(entry.referrer.clone().into()); // referrer
-            params.push(entry.request_id.clone().into()); // request_id
-            params.push(entry.ip_geolocation_id.into()); // ip_geolocation_id
-            params.push(entry.browser.clone().into()); // browser
-            params.push(entry.browser_version.clone().into()); // browser_version
-            params.push(entry.operating_system.clone().into()); // operating_system
-            params.push(entry.device_type.clone().into()); // device_type
-            params.push(entry.is_bot.into()); // is_bot
-            params.push(entry.bot_name.clone().into()); // bot_name
-            params.push(entry.request_size_bytes.into()); // request_size_bytes
-            params.push(entry.response_size_bytes.into()); // response_size_bytes
-            params.push(entry.cache_status.clone().into()); // cache_status
-            params.push(entry.request_headers.clone().into()); // request_headers
-            params.push(entry.response_headers.clone().into()); // response_headers
-            params.push(created_date.into()); // created_date
+            sql.push_str(&format!("${}", offset + j + 1));
         }
+        sql.push(')');
 
-        self.db
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                &sql,
-                params,
-            ))
-            .await?;
+        let created_date = now.date_naive();
 
-        debug!("Batch inserted {} proxy log entries", entries.len());
-        Ok(())
+        params.push(now.into()); // timestamp
+        params.push(entry.method.clone().into()); // method
+        params.push(entry.path.clone().into()); // path
+        params.push(entry.query_string.clone().into()); // query_string
+        params.push(entry.host.clone().into()); // host
+        params.push(entry.status_code.into()); // status_code
+        params.push(entry.response_time_ms.into()); // response_time_ms
+        params.push(entry.request_source.clone().into()); // request_source
+        params.push(entry.is_system_request.into()); // is_system_request
+        params.push(entry.routing_status.clone().into()); // routing_status
+        params.push(entry.project_id.into()); // project_id
+        params.push(entry.environment_id.into()); // environment_id
+        params.push(entry.deployment_id.into()); // deployment_id
+        params.push(entry.session_id.into()); // session_id
+        params.push(entry.visitor_id.into()); // visitor_id
+        params.push(entry.container_id.clone().into()); // container_id
+        params.push(entry.upstream_host.clone().into()); // upstream_host
+        params.push(entry.error_message.clone().into()); // error_message
+        params.push(entry.client_ip.clone().into()); // client_ip
+        params.push(entry.user_agent.clone().into()); // user_agent
+        params.push(entry.referrer.clone().into()); // referrer
+        params.push(entry.request_id.clone().into()); // request_id
+        params.push(entry.ip_geolocation_id.into()); // ip_geolocation_id
+        params.push(entry.browser.clone().into()); // browser
+        params.push(entry.browser_version.clone().into()); // browser_version
+        params.push(entry.operating_system.clone().into()); // operating_system
+        params.push(entry.device_type.clone().into()); // device_type
+        params.push(entry.is_bot.into()); // is_bot
+        params.push(entry.bot_name.clone().into()); // bot_name
+        params.push(entry.request_size_bytes.into()); // request_size_bytes
+        params.push(entry.response_size_bytes.into()); // response_size_bytes
+        params.push(entry.cache_status.clone().into()); // cache_status
+        params.push(entry.request_headers.clone().into()); // request_headers
+        params.push(entry.response_headers.clone().into()); // response_headers
+        params.push(created_date.into()); // created_date
     }
+
+    conn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        &sql,
+        params,
+    ))
+    .await?;
+
+    debug!("Batch inserted {} proxy log entries", order.len());
+    Ok(())
 }
 
 #[async_trait]
@@ -254,11 +263,23 @@ impl ProxyLogStorage for TimescaleDbProxyLogStore {
         &self,
         entries: &[CreateProxyLogRequest],
     ) -> Result<(), ProxyLogServiceError> {
-        // One statement per chunk: a multi-row INSERT binds one parameter per
-        // column per row, and Postgres caps a statement at 65 535 parameters.
-        for chunk in entries.chunks(TIMESCALE_ROWS_PER_INSERT) {
-            self.batch_insert(chunk).await?;
+        if entries.len() <= TIMESCALE_ROWS_PER_INSERT {
+            // One statement is already one implicit transaction.
+            self.batch_insert(entries).await?;
+            return Ok(());
         }
+        // Postgres caps a statement at 65 535 bind parameters, so a large
+        // batch takes several INSERT statements. They share one transaction: the
+        // writer retries the *whole* batch after a deadlock, and a chunk
+        // committed before a later one failed would be inserted twice. The
+        // lock order is computed over the whole batch so every chunk keeps
+        // taking parent locks in the same global order.
+        let order = fk_lock_order(entries);
+        let transaction = self.db.begin().await?;
+        for chunk in order.chunks(TIMESCALE_ROWS_PER_INSERT) {
+            insert_rows(&transaction, entries, chunk).await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -993,6 +1014,82 @@ mod tests {
         let (sql, _, _) = build_traffic_query(7, &request).expect("valid descending query");
         assert!(sql
             .contains("ORDER BY error_rate DESC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
+    }
+
+    /// A batch larger than one INSERT is written in one transaction: when a
+    /// later chunk fails, the earlier ones roll back with it, so the writer's
+    /// whole-batch retry cannot insert them a second time.
+    #[tokio::test]
+    async fn a_multi_statement_batch_lands_whole_or_not_at_all() {
+        use temps_database::test_utils::TestDatabase;
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!("Skipping multi-statement batch test: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO projects (id, name, repo_name, repo_owner, directory, main_branch, \
+             preset, created_at, updated_at, slug) VALUES \
+             (7002, 'batch-atomicity', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), \
+              'batch-atomicity')",
+            Vec::<Value>::new(),
+        ))
+        .await
+        .expect("insert batch atomicity project");
+
+        unsafe { std::env::set_var("TEMPS_GEO_MOCK", "true") };
+        let geoip = Arc::new(
+            temps_geo::GeoIpService::new().expect("create mock GeoIpService for batch test"),
+        );
+        let ip_service = Arc::new(temps_geo::IpAddressService::new(db.clone(), geoip));
+        let store = TimescaleDbProxyLogStore::new(db.clone(), ip_service);
+
+        let count = |prefix: &'static str| {
+            let db = db.clone();
+            async move {
+                db.query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    "SELECT COUNT(*)::bigint AS n FROM proxy_logs WHERE request_id LIKE $1",
+                    vec![Value::from(format!("{prefix}%"))],
+                ))
+                .await
+                .expect("count proxy logs")
+                .expect("count row")
+                .try_get::<i64>("", "n")
+                .expect("count value")
+            }
+        };
+
+        // A full first chunk for the existing project, then -- last in lock
+        // order, so in the second statement -- a row whose project does not
+        // exist and fails its foreign key.
+        let mut entries: Vec<CreateProxyLogRequest> = (0..TIMESCALE_ROWS_PER_INSERT)
+            .map(|i| entry_with_parents(&format!("atomic-{i}"), Some(7002), None, None))
+            .collect();
+        entries.push(entry_with_parents(
+            "atomic-orphan",
+            Some(999_999),
+            None,
+            None,
+        ));
+        assert!(store.write_batch(&entries).await.is_err());
+        assert_eq!(
+            count("atomic-").await,
+            0,
+            "the first chunk must roll back with the failing one"
+        );
+
+        // The same size of batch with valid rows lands whole.
+        let entries: Vec<CreateProxyLogRequest> = (0..=TIMESCALE_ROWS_PER_INSERT)
+            .map(|i| entry_with_parents(&format!("whole-{i}"), Some(7002), None, None))
+            .collect();
+        store.write_batch(&entries).await.expect("valid batch");
+        assert_eq!(count("whole-").await, TIMESCALE_ROWS_PER_INSERT as i64 + 1);
     }
 
     #[tokio::test]

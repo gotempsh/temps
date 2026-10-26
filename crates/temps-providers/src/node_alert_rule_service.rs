@@ -25,12 +25,33 @@ use temps_entities::{monitoring_alert_rules, nodes};
 /// Synthetic node ID of the control plane. It has no `nodes` row.
 pub(crate) const CONTROL_PLANE_NODE_ID: i32 = 0;
 
-/// Metrics an operator can alert on, for any node. Percentages, so a threshold
-/// is meaningful on a 4 GB worker and a 512 GB one alike.
-pub(crate) const ALERTABLE_NODE_METRICS: [&str; 3] = [
+/// Usage metrics an operator can alert on, for any node. Percentages, so a
+/// threshold is meaningful on a 4 GB worker and a 512 GB one alike, and is
+/// held to 0..=100.
+const USAGE_PERCENT_NODE_METRICS: [&str; 3] = [
     "node.cpu_percent",
     "node.memory_percent",
     "node.disk_percent",
+];
+
+/// Disk-health metrics every Linux node reports, and that worker nodes get
+/// default rules for. Not usage percentages: degraded arrays and media
+/// errors are counts, and drive wear can pass 100% of rated endurance, so
+/// their thresholds only have to be finite and non-negative.
+const DISK_HEALTH_NODE_METRICS: [&str; 3] = [
+    "node.raid_degraded",
+    "node.disk_wear_percent",
+    "node.disk_media_errors",
+];
+
+/// Every metric a worker node's rule may use.
+pub(crate) const ALERTABLE_NODE_METRICS: [&str; 6] = [
+    USAGE_PERCENT_NODE_METRICS[0],
+    USAGE_PERCENT_NODE_METRICS[1],
+    USAGE_PERCENT_NODE_METRICS[2],
+    DISK_HEALTH_NODE_METRICS[0],
+    DISK_HEALTH_NODE_METRICS[1],
+    DISK_HEALTH_NODE_METRICS[2],
 ];
 
 /// Longest rule name accepted; names are shown in notifications.
@@ -191,8 +212,10 @@ impl NodeAlertRuleService {
     /// it will be stored (the merge of the existing rule and `changes`).
     ///
     /// A worker's rule keeps to what `create` allows: one of the usage
-    /// percentages and a threshold between 0 and 100, so an edit cannot leave
-    /// a rule that can never fire or that has no series to evaluate. The
+    /// percentages with a threshold between 0 and 100, or one of the
+    /// disk-health metrics its default rules use with a non-negative
+    /// threshold, so an edit cannot leave a rule that can never fire or that
+    /// has no series to evaluate. The
     /// control plane's seeded rules cover metrics that are not percentages
     /// (file descriptors, ingest rates), so for node `0` only the shape of the
     /// rule is checked, not the metric or the threshold range.
@@ -344,22 +367,31 @@ impl NodeAlertRuleService {
 }
 
 /// Full validation for a worker rule: its shape, a supported metric and a
-/// percentage threshold.
+/// threshold in that metric's range.
 fn validate(node_id: i32, rule: &NewNodeAlertRule) -> Result<(), NodeAlertRuleError> {
     let invalid = |message: String| NodeAlertRuleError::Validation { node_id, message };
 
     validate_shape(node_id, rule)?;
-    if !ALERTABLE_NODE_METRICS.contains(&rule.metric_name.as_str()) {
+    let metric = rule.metric_name.as_str();
+    if USAGE_PERCENT_NODE_METRICS.contains(&metric) {
+        if !(rule.threshold.is_finite() && (0.0..=100.0).contains(&rule.threshold)) {
+            return Err(invalid(format!(
+                "threshold {} for {metric} is not a percentage between 0 and 100",
+                rule.threshold
+            )));
+        }
+    } else if DISK_HEALTH_NODE_METRICS.contains(&metric) {
+        if !(rule.threshold.is_finite() && rule.threshold >= 0.0) {
+            return Err(invalid(format!(
+                "threshold {} for {metric} must be a finite number of 0 or more",
+                rule.threshold
+            )));
+        }
+    } else {
         return Err(invalid(format!(
             "metric_name '{}' cannot be alerted on; choose one of: {}",
             rule.metric_name,
             ALERTABLE_NODE_METRICS.join(", ")
-        )));
-    }
-    if !(rule.threshold.is_finite() && (0.0..=100.0).contains(&rule.threshold)) {
-        return Err(invalid(format!(
-            "threshold {} is not a percentage between 0 and 100",
-            rule.threshold
         )));
     }
     Ok(())
@@ -659,6 +691,61 @@ mod tests {
 
         assert_eq!(updated.threshold, 80.0);
         assert_eq!(updated.metric_name, "node.disk_percent");
+    }
+
+    /// The disk-health rules seeded on every worker can be edited: turned
+    /// off, or given a count threshold above 100, which only usage
+    /// percentages refuse.
+    #[tokio::test]
+    async fn a_seeded_worker_disk_health_rule_can_be_disabled_and_retuned() {
+        let mut after = stored(9, 7, "node.disk_media_errors");
+        after.enabled = false;
+        after.threshold = 250.0;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(9, 7, "node.disk_media_errors")]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    enabled: Some(false),
+                    threshold: Some(250.0),
+                    ..changes()
+                },
+            )
+            .await
+            .expect("a seeded disk-health rule must be editable");
+
+        assert!(!updated.enabled);
+        assert_eq!(updated.threshold, 250.0);
+    }
+
+    #[tokio::test]
+    async fn a_negative_disk_health_threshold_is_rejected_before_any_write() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    threshold: Some(-1.0),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "node.raid_degraded");
     }
 
     #[tokio::test]

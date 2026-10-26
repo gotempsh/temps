@@ -315,6 +315,18 @@ impl SourceStats {
             || self.bytes_override.load(Ordering::Relaxed) != INHERIT
     }
 
+    /// Whether the limit behind `reason` comes from an override. A project
+    /// may override one dimension and inherit the other, and a drop notice
+    /// must send the operator to whichever setting holds the limit that was
+    /// actually exceeded.
+    fn overridden_for(&self, reason: IngestDropReason) -> bool {
+        let slot = match reason {
+            IngestDropReason::LinesPerSec => &self.lines_override,
+            IngestDropReason::BytesPerSec => &self.bytes_override,
+        };
+        slot.load(Ordering::Relaxed) != INHERIT
+    }
+
     /// The platform limits with this container's override applied.
     fn effective(&self, base: IngestLimits) -> IngestLimits {
         let lines = self.lines_override.load(Ordering::Relaxed);
@@ -865,7 +877,7 @@ impl IngestLimiter {
                     reason = %reason,
                     lines_per_sec_budget = self.bucket.limits.lines_per_sec,
                     bytes_per_sec_budget = self.bucket.limits.bytes_per_sec,
-                    limit_overridden = stats.overridden(),
+                    limit_overridden = stats.overridden_for(reason),
                     "Container exceeds its log ingestion budget; dropping lines"
                 );
             }
@@ -904,7 +916,7 @@ impl IngestLimiter {
                     window_secs: STATS_WINDOW.as_secs(),
                     reason,
                     limits: self.bucket.limits,
-                    overridden: stats.overridden(),
+                    overridden: stats.overridden_for(reason),
                     at,
                 };
                 // A notice not yet written (the caller skipped one) is folded
@@ -1451,6 +1463,37 @@ mod tests {
                 .msg
                 .contains("project's or service's log ingestion settings"),
             "an overridden budget points at the override: {}",
+            notice.msg
+        );
+    }
+
+    /// Lines overridden, bytes inherited: a container that exceeds the byte
+    /// limit must be pointed at the platform budget, which is what holds it.
+    #[test]
+    fn a_notice_points_at_the_setting_behind_the_exceeded_limit() {
+        let budget = budget(0, 1024);
+        let mut overrides = IngestOverrides::default();
+        overrides.projects.insert(
+            3,
+            IngestOverride {
+                lines_per_sec: Some(100_000),
+                bytes_per_sec: None,
+            },
+        );
+        budget.set_overrides(overrides);
+        let mut limiter = budget.limiter(source("c1"));
+
+        let admitted = burst(&mut limiter, t0(), 200, 1_000);
+        assert!(admitted < 200, "the byte limit must drop lines");
+        let throttled = budget.throttled_sources();
+        assert_eq!(throttled[0].reason, IngestDropReason::BytesPerSec);
+        // The source as a whole still reports its override.
+        assert!(throttled[0].limit_overridden);
+
+        let notice = limiter.flush().expect("c1 dropped lines");
+        assert!(
+            notice.msg.contains("Settings > Metrics Monitoring"),
+            "the exceeded byte limit is the platform one: {}",
             notice.msg
         );
     }

@@ -1544,8 +1544,18 @@ docker0: 777 7 0 0 0 0 0 0 888 8 0 0 0 0 0 0
     #[tokio::test]
     async fn disk_health_is_reported_unless_opted_out() {
         let config = make_config(1, "/tmp");
-        let is_disk_health =
-            |name: &str| name.starts_with("node.raid_") || name.starts_with("node.drive");
+        // Every series the disk-health reader emits, RAID and drive alike.
+        const DISK_HEALTH_NAMES: [&str; 8] = [
+            "node.raid_arrays",
+            "node.raid_degraded",
+            "node.raid_devices_failed",
+            "node.disk_health_drives",
+            "node.disk_health_drives_detected",
+            "node.disk_wear_percent",
+            "node.disk_media_errors",
+            "node.disk_bytes_written_total",
+        ];
+        let is_disk_health = |name: &str| DISK_HEALTH_NAMES.contains(&name);
 
         let worker = NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health();
         let points = worker.collect(&config).await.unwrap();

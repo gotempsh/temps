@@ -3938,7 +3938,15 @@ async fn update_service_log_ingestion(
     Json(request): Json<crate::services::ServiceLogIngestion>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
-    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+    // Membership of a linked project is not enough to change its budget: the
+    // caller's role in that project must grant the write as well.
+    super::metrics_handlers::assert_service_permission_for_caller(
+        id,
+        &auth,
+        &app_state,
+        temps_auth::Permission::ExternalServicesWrite,
+    )
+    .await?;
 
     let update = app_state
         .external_service_manager
@@ -4398,6 +4406,120 @@ mod tests {
             .lock()
             .expect("network reconciler mutex should not be poisoned")
             .is_empty());
+    }
+
+    /// The service's linked project grants this member only
+    /// `external_services:read`: the instance-level write permission must not
+    /// let them change the service's log ingestion budget.
+    #[tokio::test]
+    async fn log_ingestion_update_requires_write_in_a_linked_project() {
+        let now = chrono::Utc::now();
+        let service = external_services::Model {
+            id: 17,
+            name: "tenant-database".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("18".to_string()),
+            status: "running".to_string(),
+            created_at: now,
+            updated_at: now,
+            slug: Some("tenant-database".to_string()),
+            config: None,
+            node_id: None,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: None,
+            created_by_user_id: Some(1),
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        };
+        let linked_service = project_services::Model {
+            id: 1,
+            database_provisioning_mode: "project_environment".to_string(),
+            custom_database_name: None,
+            // `NarrowedServiceAccessChecker` grants only read in project 99.
+            project_id: 99,
+            service_id: 17,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .append_query_results([vec![linked_service]])
+                .into_connection(),
+        );
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "log-ingestion-authorization-test",
+        ));
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("Docker client configuration should be available"),
+        );
+        let manager = Arc::new(crate::services::ExternalServiceManager::new(
+            db.clone(),
+            encryption_service,
+            docker,
+            Arc::new(temps_dns::DnsRegistry::new(db.clone())),
+        ));
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AppState {
+            external_service_manager: manager.clone(),
+            data_import_service: crate::handlers::types::test_support::data_import_service(
+                manager.clone(),
+                db.clone(),
+            ),
+            sensitive_action_authorizer:
+                crate::handlers::types::test_support::allow_sensitive_actions(),
+            audit_service: audit.clone(),
+            query_service: Arc::new(crate::QueryService::new(manager)),
+            health_monitor: None,
+            metrics_store: None,
+            worker_metrics_status: None,
+            db: db.clone(),
+            api_key_service: Arc::new(temps_auth::ApiKeyService::new(db)),
+            config_service: None,
+            telemetry: Arc::new(temps_core::NoopTelemetryReporter),
+            project_access_checker: Some(Arc::new(NarrowedServiceAccessChecker)),
+            application_network_reconciler: None,
+            notification_service: Arc::new(crate::handlers::types::StaticNotificationService {
+                destinations: Some(0),
+            }),
+        });
+
+        let result = update_service_log_ingestion(
+            RequireAuth(test_auth_context_with_role(temps_auth::Role::User)),
+            State(state),
+            Path(17),
+            Extension(test_request_metadata()),
+            Json(crate::services::ServiceLogIngestion {
+                log_ingest_lines_per_sec: Some(10_000),
+                log_ingest_kib_per_sec: None,
+            }),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a read-only project role must not change the budget"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.into_response().status(), StatusCode::FORBIDDEN);
+        assert!(
+            audit
+                .operations
+                .lock()
+                .expect("recording audit mutex should not be poisoned")
+                .is_empty(),
+            "a denied update writes nothing and audits nothing"
+        );
     }
 
     struct ListProjectAccessChecker {

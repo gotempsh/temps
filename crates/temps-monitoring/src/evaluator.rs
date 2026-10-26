@@ -1670,12 +1670,18 @@ pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result
     .await
 }
 
-/// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
-/// -scoped default rules, keyed on the `(node_id, metric_name)` unique index.
+/// Shared `INSERT … ON CONFLICT DO NOTHING` for node-scoped default rules,
+/// keyed on the `(node_id, metric_name)` unique index.
+///
+/// All of `seeds` go in **one** multi-row statement, so a node gets its
+/// whole default set or none of it. That matters for worker nodes:
+/// `sync_worker_node_rules` treats a worker holding *any* disk-health rule as
+/// already seeded (so a rule the operator deleted stays deleted), and a seed
+/// that stopped after the first row would leave the rest missing for good.
 ///
 /// Every `RuleSeed` field is a `&'static str`/literal defined in this file
 /// (see `proxy_default_seeds`/`node_fd_default_seeds`), never user input, but
-/// this still binds via `$1..$7` rather than `format!()`-ing the SQL — the
+/// this still binds every value rather than `format!()`-ing the SQL — the
 /// project's raw-query rule (CLAUDE.md: `$1`, `$2` parameter binding) applies
 /// regardless of whether today's callers happen to be safe, since a future
 /// caller passing an operator-supplied `String` would silently inherit
@@ -1684,35 +1690,18 @@ pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result
 /// `caller` names the public wrapper that supplied `seeds` and is emitted as
 /// the log line's prefix, so operators grepping for `seed_default_proxy_rules`
 /// (the pre-refactor log text) still match.
-async fn seed_node_rules(
-    db: &DatabaseConnection,
+async fn seed_node_rules<C: sea_orm::ConnectionTrait>(
+    db: &C,
     caller: &str,
     node_id: i32,
     seeds: &[RuleSeed],
 ) -> Result<(), MetricsError> {
-    use sea_orm::ConnectionTrait;
-    for seed in seeds {
-        let statement = sea_orm::Statement::from_sql_and_values(
-            sea_orm::DatabaseBackend::Postgres,
-            "INSERT INTO monitoring_alert_rules \
-             (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, true) \
-             ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
-            [
-                node_id.into(),
-                seed.name.into(),
-                seed.metric_name.into(),
-                seed.threshold.into(),
-                seed.comparator.into(),
-                seed.severity.into(),
-                seed.for_duration_secs.into(),
-            ],
-        );
-
-        db.execute(statement)
-            .await
-            .map_err(MetricsError::DatabaseError)?;
-    }
+    let Some(statement) = seed_node_rules_statement(node_id, seeds) else {
+        return Ok(());
+    };
+    db.execute(statement)
+        .await
+        .map_err(MetricsError::DatabaseError)?;
 
     info!(
         rule_count = seeds.len(),
@@ -1720,6 +1709,45 @@ async fn seed_node_rules(
     );
 
     Ok(())
+}
+
+/// The single statement [`seed_node_rules`] runs; `None` for no seeds.
+fn seed_node_rules_statement(node_id: i32, seeds: &[RuleSeed]) -> Option<sea_orm::Statement> {
+    if seeds.is_empty() {
+        return None;
+    }
+    const COLUMNS_PER_ROW: usize = 7;
+    let mut values: Vec<sea_orm::Value> = Vec::with_capacity(seeds.len() * COLUMNS_PER_ROW);
+    let rows: Vec<String> = seeds
+        .iter()
+        .enumerate()
+        .map(|(row, seed)| {
+            values.extend([
+                node_id.into(),
+                seed.name.into(),
+                seed.metric_name.into(),
+                seed.threshold.into(),
+                seed.comparator.into(),
+                seed.severity.into(),
+                seed.for_duration_secs.into(),
+            ]);
+            let placeholders: Vec<String> = (1..=COLUMNS_PER_ROW)
+                .map(|column| format!("${}", row * COLUMNS_PER_ROW + column))
+                .collect();
+            format!("(NULL, NULL, {}, true)", placeholders.join(", "))
+        })
+        .collect();
+    Some(sea_orm::Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        format!(
+            "INSERT INTO monitoring_alert_rules \
+             (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
+             VALUES {} \
+             ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
+            rows.join(", ")
+        ),
+        values,
+    ))
 }
 
 // ── Default rule builders ─────────────────────────────────────────────────────
@@ -2666,20 +2694,51 @@ mod tests {
         }
     }
 
+    /// A node's default rules are one statement: it lands whole or not at
+    /// all, so a failure can never leave a worker with some disk-health rules
+    /// (which marks it seeded) and the rest missing for good.
+    #[tokio::test]
+    async fn a_node_is_seeded_in_one_statement() {
+        let seeds = node_disk_health_default_seeds();
+        let statement = seed_node_rules_statement(5, &seeds).expect("seeds");
+        let values = statement.values.as_ref().expect("bound values");
+        assert_eq!(values.0.len(), seeds.len() * 7);
+        let last = seeds.len() * 7;
+        assert!(
+            statement.sql.contains(&format!("${last}, true)")),
+            "{}",
+            statement.sql
+        );
+        assert!(!statement.sql.contains(&format!("${}", last + 1)));
+        assert_eq!(statement.sql.matches("(NULL, NULL, $").count(), seeds.len());
+        assert!(seed_node_rules_statement(5, &[]).is_none());
+
+        // A failing statement inserts nothing and is reported.
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_exec_errors([sea_orm::DbErr::Custom("connection reset".into())])
+            .into_connection();
+        assert!(seed_node_rules(&db, "test", 5, &seeds).await.is_err());
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "one round trip, no partial follow-ups: {log:?}"
+        );
+    }
+
     /// #1618: a new worker gets the disk-health rules once, unless it already
     /// has some; an unchanged node set costs one SELECT; a removed worker's
     /// rules are deleted.
     #[tokio::test]
     async fn worker_disk_health_rules_follow_the_node_set() {
         let seeds = node_disk_health_default_seeds().len();
-        let mut mock = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+        let mock = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             // Cycle 1: workers 5 and 6 appear; 6 already has a disk-health
             // rule (the operator deleted the others), so only 5 is seeded.
             .append_query_results([node_rows(&[5, 6])])
-            .append_query_results([seeded_rows(&[6])]);
-        for _ in 0..seeds {
-            mock = mock.append_exec_results([exec_ok(1)]);
-        }
+            .append_query_results([seeded_rows(&[6])])
+            // One statement seeds every rule of worker 5.
+            .append_exec_results([exec_ok(seeds as u64)]);
         let db = Arc::new(
             mock.append_exec_results([exec_ok(0)])
                 // Cycle 2: unchanged.
@@ -2703,8 +2762,8 @@ mod tests {
             .filter(|s| s.contains("INSERT INTO monitoring_alert_rules"));
         assert_eq!(
             inserts.clone().count(),
-            seeds,
-            "seeded once, not on the unchanged cycle"
+            1,
+            "seeded once, in one statement, not on the unchanged cycle"
         );
         assert!(
             inserts.clone().all(|s| s.contains("Int(Some(5))")),

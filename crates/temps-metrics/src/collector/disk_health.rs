@@ -366,9 +366,9 @@ const ATA_MEDIA_ERROR_ATTRIBUTES: [u64; 2] = [5, 197];
 /// Total_LBAs_Written.
 const ATA_LBAS_WRITTEN: u64 = 241;
 
-/// Decode `smartctl -j -A -i` output for either an ATA or an NVMe drive.
-/// `None` when it holds no health data at all (unsupported device, standby,
-/// permission denied).
+/// Decode `smartctl -j -A -i -l error -l ssd` output for an ATA, NVMe or
+/// SCSI/SAS drive. `None` when it holds no health data at all (unsupported
+/// device, standby, permission denied).
 pub fn parse_smartctl_json(device: &str, json: &serde_json::Value) -> Option<DriveHealth> {
     if let Some(nvme) = json.get("nvme_smart_health_information_log") {
         let units = nvme.get("data_units_written").and_then(|v| v.as_u64());
@@ -380,10 +380,14 @@ pub fn parse_smartctl_json(device: &str, json: &serde_json::Value) -> Option<Dri
         });
     }
 
-    let table = json
+    let Some(table) = json
         .get("ata_smart_attributes")
         .and_then(|a| a.get("table"))
-        .and_then(|t| t.as_array())?;
+        .and_then(|t| t.as_array())
+    else {
+        // SAS/SCSI drives have no ATA attribute table.
+        return parse_scsi_smartctl_json(device, json);
+    };
     let attr = |id: u64| {
         table
             .iter()
@@ -428,6 +432,58 @@ pub fn parse_smartctl_json(device: &str, json: &serde_json::Value) -> Option<Dri
     })
 }
 
+/// smartctl's "gigabytes" in the SCSI error counter log are 10^9 bytes.
+const SCSI_GIGABYTE_BYTES: f64 = 1_000_000_000.0;
+
+/// The SCSI/SAS part of [`parse_smartctl_json`]: endurance from the SSD log
+/// page (`-l ssd`), media errors as the grown defect list plus the
+/// uncorrected read/write/verify errors (`-l error`), and bytes written from
+/// the write error counter. `None` when none of them is present.
+fn parse_scsi_smartctl_json(device: &str, json: &serde_json::Value) -> Option<DriveHealth> {
+    let wear_percent = json
+        .get("scsi_percentage_used_endurance_indicator")
+        .and_then(|v| v.as_f64())
+        .or_else(|| {
+            json.get("endurance_used")
+                .and_then(|e| e.get("current_percent"))
+                .and_then(|v| v.as_f64())
+        });
+
+    let counters = json.get("scsi_error_counter_log");
+    let counter = |direction: &str| counters.and_then(|c| c.get(direction));
+    let media_errors = {
+        let present: Vec<u64> = ["read", "write", "verify"]
+            .iter()
+            .filter_map(|direction| {
+                counter(direction)?
+                    .get("total_uncorrected_errors")?
+                    .as_u64()
+            })
+            .chain(json.get("scsi_grown_defect_list").and_then(|v| v.as_u64()))
+            .collect();
+        (!present.is_empty()).then(|| present.iter().fold(0u64, |a, b| a.saturating_add(*b)))
+    };
+    // A decimal string in smartctl's JSON ("1234.567"); accept a number too.
+    let bytes_written = counter("write")
+        .and_then(|w| w.get("gigabytes_processed"))
+        .and_then(|v| {
+            v.as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+        })
+        .filter(|gb| gb.is_finite() && *gb >= 0.0)
+        .map(|gb| (gb * SCSI_GIGABYTE_BYTES) as u64);
+
+    if wear_percent.is_none() && media_errors.is_none() && bytes_written.is_none() {
+        return None;
+    }
+    Some(DriveHealth {
+        device: device.to_string(),
+        wear_percent,
+        media_errors,
+        bytes_written,
+    })
+}
+
 /// Outcome of trying `smartctl` once.
 enum Smartctl {
     Health(DriveHealth),
@@ -439,11 +495,25 @@ enum Smartctl {
 
 async fn run_smartctl(drive: &Drive) -> Smartctl {
     let mut cmd = tokio::process::Command::new("smartctl");
-    // `-n standby`: never spin up a sleeping disk just to read it.
-    cmd.args(["-j", "-A", "-i", "-n", "standby", &drive.dev_path()])
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
+    // `-n standby`: never spin up a sleeping disk just to read it. A SAS/SCSI
+    // drive reports its uncorrected errors only in the error counter log
+    // (`-l error`) and its endurance only in the SSD page (`-l ssd`); ATA and
+    // NVMe drives just return a little more JSON for them.
+    cmd.args([
+        "-j",
+        "-A",
+        "-i",
+        "-l",
+        "error",
+        "-l",
+        "ssd",
+        "-n",
+        "standby",
+        &drive.dev_path(),
+    ])
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .kill_on_drop(true);
     let output = match tokio::time::timeout(SMARTCTL_TIMEOUT, cmd.output()).await {
         Ok(Ok(output)) => output,
         Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => return Smartctl::Missing,
@@ -812,6 +882,11 @@ pub struct NodeDiskHealth {
     pub drives: Vec<DriveHealth>,
     pub drives_detected: u32,
     pub drives_read: u32,
+    /// When the node last reported any metric. The values above are the
+    /// latest the store holds, so a node that stopped reporting keeps
+    /// returning them; callers compare this with the current time to tell
+    /// stale health from current health. `None` when it could not be read.
+    pub reported_at: Option<DateTime<Utc>>,
 }
 
 const RAID_LABELLED: [&str; 2] = ["node.raid_degraded", "node.raid_devices_failed"];
@@ -869,6 +944,7 @@ pub fn assemble_node_disk_health(
         drives: by_device.into_values().collect(),
         drives_detected: count("node.disk_health_drives_detected").unwrap_or(0),
         drives_read: count("node.disk_health_drives").unwrap_or(0),
+        reported_at: None,
     }
 }
 
@@ -901,7 +977,11 @@ pub async fn read_node_disk_health(
             label_key: "device".into(),
         })
         .await?;
-    Ok(assemble_node_disk_health(&latest, &arrays, &drives))
+    let mut health = assemble_node_disk_health(&latest, &arrays, &drives);
+    if health.reported {
+        health.reported_at = store.latest_timestamp(SourceKind::Node, node_id).await?;
+    }
+    Ok(health)
 }
 
 #[cfg(test)]
@@ -1109,6 +1189,66 @@ unused devices: <none>
     fn smartctl_without_health_data_is_none() {
         let json = serde_json::json!({ "smartctl": { "exit_status": 2 } });
         assert!(parse_smartctl_json("sda", &json).is_none());
+    }
+
+    /// A SAS SSD as `smartctl -j -A -i -l error -l ssd` reports it: no ATA
+    /// attribute table, endurance from the SSD page, uncorrected errors and
+    /// gigabytes (a decimal string) from the error counter log.
+    #[test]
+    fn smartctl_scsi_json_reads_endurance_error_counters_and_writes() {
+        let json = serde_json::json!({
+            "device": { "name": "/dev/sdc", "type": "scsi", "protocol": "SCSI" },
+            "scsi_grown_defect_list": 2,
+            "scsi_percentage_used_endurance_indicator": 7,
+            "scsi_error_counter_log": {
+                "read": {
+                    "errors_corrected_by_eccfast": 0,
+                    "total_errors_corrected": 12,
+                    "gigabytes_processed": "48211.990",
+                    "total_uncorrected_errors": 1
+                },
+                "write": {
+                    "total_errors_corrected": 0,
+                    "gigabytes_processed": "1500.250",
+                    "total_uncorrected_errors": 0
+                },
+                "verify": {
+                    "total_errors_corrected": 0,
+                    "gigabytes_processed": "0.000",
+                    "total_uncorrected_errors": 3
+                }
+            }
+        });
+        let h = parse_smartctl_json("sdc", &json).expect("SCSI health");
+        assert_eq!(h.device, "sdc");
+        assert_eq!(h.wear_percent, Some(7.0));
+        assert_eq!(h.media_errors, Some(2 + 1 + 3));
+        assert_eq!(h.bytes_written, Some(1_500_250_000_000));
+    }
+
+    /// A SAS hard disk has no endurance figure; the error counters still
+    /// count, and newer smartctl's `endurance_used` is honoured for SSDs.
+    #[test]
+    fn smartctl_scsi_hdd_has_no_wear_and_endurance_used_is_read() {
+        let hdd = serde_json::json!({
+            "device": { "type": "scsi" },
+            "scsi_error_counter_log": {
+                "read": { "total_uncorrected_errors": 0 },
+                "write": { "total_uncorrected_errors": 0 }
+            }
+        });
+        let h = parse_smartctl_json("sdd", &hdd).expect("SCSI health");
+        assert_eq!(h.wear_percent, None);
+        assert_eq!(h.media_errors, Some(0));
+        assert_eq!(h.bytes_written, None);
+
+        let ssd = serde_json::json!({ "endurance_used": { "current_percent": 12 } });
+        assert_eq!(
+            parse_smartctl_json("sde", &ssd)
+                .expect("health")
+                .wear_percent,
+            Some(12.0)
+        );
     }
 
     #[test]

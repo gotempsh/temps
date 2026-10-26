@@ -19061,9 +19061,10 @@ export type NodeCostInfo = {
 /**
  * Request body for creating a resource alert on a node.
  *
- * Only the usage percentages can be alerted on: `node.cpu_percent`,
- * `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
- * (0-100). A node has at most one rule per metric.
+ * A rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,
+ * `node.disk_percent`; `threshold` 0-100) or a disk-health metric
+ * (`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;
+ * `threshold` 0 or more). A node has at most one rule per metric.
  */
 export type NodeCreateAlertRuleRequest = {
     /**
@@ -19076,7 +19077,7 @@ export type NodeCreateAlertRuleRequest = {
      */
     for_duration_secs?: number;
     /**
-     * One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+     * One of the usage percentages or disk-health metrics listed above.
      */
     metric_name: string;
     name: string;
@@ -19085,7 +19086,7 @@ export type NodeCreateAlertRuleRequest = {
      */
     severity: string;
     /**
-     * Percentage between 0 and 100.
+     * 0-100 for a usage percentage; 0 or more for a disk-health metric.
      */
     threshold: number;
 };
@@ -30631,7 +30632,7 @@ export type TokenCheckRequest = {
     /**
      * The token, as pasted. Used for this check only; not stored.
      */
-    token: string;
+    token: SecretString;
     /**
      * The zone the token is meant for. With it, a token that reaches any
      * other zone is not ready.

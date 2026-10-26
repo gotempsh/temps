@@ -40923,7 +40923,7 @@
         "type": "object"
       },
       "NodeCreateAlertRuleRequest": {
-        "description": "Request body for creating a resource alert on a node.\n\nOnly the usage percentages can be alerted on: `node.cpu_percent`,\n`node.memory_percent` and `node.disk_percent`. `threshold` is a percentage\n(0-100). A node has at most one rule per metric.",
+        "description": "Request body for creating a resource alert on a node.\n\nA rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,\n`node.disk_percent`; `threshold` 0-100) or a disk-health metric\n(`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;\n`threshold` 0 or more). A node has at most one rule per metric.",
         "properties": {
           "comparator": {
             "description": "One of `>`, `<`, `>=`, `<=`.",
@@ -40938,7 +40938,7 @@
             "type": "integer"
           },
           "metric_name": {
-            "description": "One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.",
+            "description": "One of the usage percentages or disk-health metrics listed above.",
             "type": "string"
           },
           "name": {
@@ -40949,7 +40949,7 @@
             "type": "string"
           },
           "threshold": {
-            "description": "Percentage between 0 and 100.",
+            "description": "0-100 for a usage percentage; 0 or more for a disk-health metric.",
             "format": "double",
             "type": "number"
           }
@@ -65471,8 +65471,8 @@
       "TokenCheckRequest": {
         "properties": {
           "token": {
-            "description": "The token, as pasted. Used for this check only; not stored.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The token, as pasted. Used for this check only; not stored."
           },
           "zone": {
             "description": "The zone the token is meant for. With it, a token that reaches any\nother zone is not ready.",

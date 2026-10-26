@@ -7,26 +7,10 @@
  * Monitoring. Blank inherits the platform budget; 0 lifts the limit.
  */
 
-import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardFooter,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form'
+import { Card, CardContent } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Button, Field, FormErrors, SettingsGroup } from '@temps-sdk/ds'
 import { useLogIngestBudget } from '@/hooks/useGlobalLogs'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useForm } from 'react-hook-form'
@@ -80,34 +64,35 @@ export function LogIngestionBudgetCard({
       lines: budgetInputValue(value?.lines),
       kib: budgetInputValue(value?.kib),
     },
+    // A refetch of the saved budget (after a save, or any other refresh of
+    // the parent's query) must not wipe a field the user is still editing.
+    resetOptions: { keepDirtyValues: true },
   })
+  const { errors } = form.formState
 
+  // The error is surfaced by the caller's toast; swallowing it here keeps
+  // react-hook-form from rethrowing it as an unhandled rejection.
   const handleSave = (values: FormValues) =>
     onSave({
       lines: parseBudget(values.lines, MAX_LINES_PER_SEC) ?? null,
       kib: parseBudget(values.kib, MAX_KIB_PER_SEC) ?? null,
-    })
+    }).catch(() => undefined)
 
   const settingsHref =
     platform.data?.setup_path ??
     '/settings/metrics-monitoring#container-log-ingest-budget'
+  const platformKib = platform.data
+    ? Math.round(platform.data.bytes_per_sec / 1024)
+    : undefined
 
   return (
-    <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSave)}>
-        <Card className="bg-background text-foreground">
-          <CardHeader>
-            <CardTitle>Container log ingestion</CardTitle>
-            <CardDescription>
-              Each container may write this many log lines and KiB per second
-              before Temps drops the excess and records a{' '}
-              <code className="text-xs">temps: dropped N log lines</code>{' '}
-              notice. Raise it for a {scope} that is legitimately chatty, or
-              lower it to keep one noisy {scope} from filling the log store.
-              Applied to running containers within a minute.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
+    <Card className="shadow-none">
+      <CardContent className="p-4 md:p-6">
+        <form onSubmit={form.handleSubmit(handleSave)} noValidate>
+          <SettingsGroup
+            title="Container log ingestion"
+            description={`Each container may write this many log lines and KiB per second before Temps drops the excess and records a "temps: dropped N log lines" notice. Raise it for a ${scope} that is legitimately chatty, or lower it to keep one noisy ${scope} from filling the log store. Applied to running containers within a minute.`}
+          >
             {value === undefined ? (
               <div className="grid gap-4 md:grid-cols-2">
                 <Skeleton className="h-16 w-full" />
@@ -122,18 +107,16 @@ export function LogIngestionBudgetCard({
                   max={MAX_LINES_PER_SEC}
                   platform={platform.data?.lines_per_sec}
                   unit="lines/s"
+                  readOnly={isSaving}
                 />
                 <BudgetField
                   form={form}
                   name="kib"
                   label="KiB per second"
                   max={MAX_KIB_PER_SEC}
-                  platform={
-                    platform.data
-                      ? Math.round(platform.data.bytes_per_sec / 1024)
-                      : undefined
-                  }
+                  platform={platformKib}
                   unit="KiB/s"
+                  readOnly={isSaving}
                 />
               </div>
             )}
@@ -144,15 +127,24 @@ export function LogIngestionBudgetCard({
               </Link>
               ); enter 0 for no limit.
             </p>
-          </CardContent>
-          <CardFooter>
-            <Button type="submit" disabled={isSaving || value === undefined}>
+            <FormErrors
+              errors={{
+                'Lines per second': errors.lines?.message,
+                'KiB per second': errors.kib?.message,
+              }}
+            />
+            <Button
+              type="submit"
+              disabled={value === undefined}
+              busy={isSaving}
+              busyLabel="Saving…"
+            >
               Save budget
             </Button>
-          </CardFooter>
-        </Card>
-      </form>
-    </Form>
+          </SettingsGroup>
+        </form>
+      </CardContent>
+    </Card>
   )
 }
 
@@ -163,6 +155,7 @@ function BudgetField({
   max,
   platform,
   unit,
+  readOnly,
 }: {
   form: ReturnType<typeof useForm<FormValues>>
   name: keyof FormValues
@@ -170,29 +163,29 @@ function BudgetField({
   max: number
   platform: number | undefined
   unit: string
+  readOnly: boolean
 }) {
+  const raw = form.watch(name)
   return (
-    <FormField
-      control={form.control}
-      name={name}
-      render={({ field }) => (
-        <FormItem>
-          <FormLabel>{label}</FormLabel>
-          <FormControl>
-            <Input
-              type="number"
-              min={0}
-              max={max}
-              placeholder={describeBudget(null, platform, unit)}
-              {...field}
-            />
-          </FormControl>
-          <FormDescription>
-            {describeBudget(parseBudget(field.value, max), platform, unit)}
-          </FormDescription>
-          <FormMessage />
-        </FormItem>
+    <Field
+      label={label}
+      optional
+      description={describeBudget(parseBudget(raw, max), platform, unit)}
+      error={form.formState.errors[name]?.message}
+    >
+      {(props) => (
+        <Input
+          {...props}
+          type="number"
+          inputMode="numeric"
+          min={0}
+          max={max}
+          step={1}
+          readOnly={readOnly}
+          placeholder={describeBudget(null, platform, unit)}
+          {...form.register(name)}
+        />
       )}
-    />
+    </Field>
   )
 }

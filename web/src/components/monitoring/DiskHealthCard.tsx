@@ -34,9 +34,9 @@ import {
 const REFRESH_MS = 60_000
 
 const TONE_CLASS: Record<DiskHealthTone, string> = {
-  good: 'text-emerald-600',
-  warn: 'text-amber-600',
-  poor: 'text-rose-600',
+  good: 'text-emerald-700 dark:text-emerald-500',
+  warn: 'text-amber-700 dark:text-amber-500',
+  poor: 'text-rose-700 dark:text-rose-500',
   unknown: 'text-muted-foreground',
 }
 
@@ -74,7 +74,7 @@ export function DiskHealthCard({ nodeId }: { nodeId: number }) {
             <Skeleton className="h-3 w-2/3" />
           </div>
         ) : q.isError || !health ? (
-          <p className="text-sm text-rose-500">
+          <p className="text-sm text-destructive">
             {(q.error as { detail?: string } | null)?.detail ??
               'Could not load disk health.'}
           </p>

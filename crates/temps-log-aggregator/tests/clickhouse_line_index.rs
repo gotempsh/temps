@@ -562,6 +562,67 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
     );
 }
 
+// ── 4a. a tombstone without a chunk-day entry keeps masking ─────────────
+
+/// `log_chunk_days` expires at `day + retention`, before the lines of that
+/// day do (`ts + retention`, and later still under `ttl_only_drop_parts`).
+/// A reclaim pass must not read "no chunk-day entry" as "no rows": it clears
+/// only the tombstones of chunks whose rows it deleted itself.
+#[tokio::test]
+async fn reclaim_keeps_a_tombstone_whose_chunk_day_entry_expired() {
+    let Some(cfg) = shared_config().await else {
+        eprintln!("Skipping: Docker unavailable");
+        return;
+    };
+    let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
+        .await
+        .expect("connect");
+
+    let chunk_labels = labels(9202, "tmp-svc", "prod", "ch-ttl", 22);
+    let seg = Arc::new(vec![mkline(
+        Utc::now(),
+        LogLevel::Info,
+        "x",
+        "hit",
+        "",
+        200,
+        1.0,
+    )]);
+    idx.index_chunk(602, &chunk_labels, std::slice::from_ref(&seg))
+        .await
+        .expect("index chunk");
+    idx.forget_chunks(&[602]).await.expect("forget_chunks");
+
+    // What the chunk-day TTL does before the lines' TTL catches up.
+    idx.client()
+        .expect("a local target owns its client")
+        .query("DELETE FROM log_chunk_days WHERE chunk_seq = 602")
+        .execute()
+        .await
+        .expect("expire the chunk-day entry");
+
+    idx.reclaim_forgotten().await.expect("reclaim_forgotten");
+
+    assert_eq!(
+        row_count(&idx, "chunk_seq = 602").await,
+        1,
+        "the pass had no partition to reclaim the rows from"
+    );
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 602").await,
+        1,
+        "the tombstone must stay while its rows exist"
+    );
+    let visible = idx
+        .matching_chunks(&scoped_query(vec![9202]), &[], 100)
+        .await
+        .expect("matching chunks");
+    assert!(
+        !visible.contains(&602),
+        "the forgotten chunk must stay invisible: {visible:?}"
+    );
+}
+
 // ── 4. forget_chunks + set_retention_days ────────────────────────────────
 
 #[tokio::test]
@@ -675,5 +736,22 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
         engine.engine_full.contains("toIntervalDay(7)"),
         "TTL must be aligned to the new retention (7 days): {}",
         engine.engine_full
+    );
+    // Tombstones outlive the lines by a day: a forgotten line can survive
+    // until its whole day part expires.
+    let tombstones = idx
+        .client()
+        .expect("a local target owns its client")
+        .query(
+            "SELECT engine_full FROM system.tables \
+             WHERE database = 'temps_test' AND name = 'log_forgotten_chunks'",
+        )
+        .fetch_one::<EngineRow>()
+        .await
+        .expect("query system.tables");
+    assert!(
+        tombstones.engine_full.contains("toIntervalDay(8)"),
+        "tombstone TTL must be retention + 1 day (8 days): {}",
+        tombstones.engine_full
     );
 }

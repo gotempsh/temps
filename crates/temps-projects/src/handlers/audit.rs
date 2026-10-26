@@ -209,9 +209,13 @@ pub struct ProjectSettingsUpdatedFields {
     /// did this just cost" during an incident review.
     pub previous_image_retention_hours: Option<i32>,
     /// New per-project log ingestion budget in lines/s. `Some(None)` records
-    /// a return to the platform default; `Some(Some(0))` lifting the limit.
+    /// a return to the platform default (`null`); `Some(Some(0))` lifting the
+    /// limit. Absent when the update did not touch it, so an untouched field
+    /// never reads as a reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_ingest_lines_per_sec: Option<Option<i32>>,
     /// New per-project log ingestion budget in KiB/s, same encoding.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub log_ingest_kib_per_sec: Option<Option<i32>>,
     /// New value of `serves_own_temps_api`, when the update set it. Audited
     /// because it moves `/api/_temps` and `/api/otel` traffic on the
@@ -381,5 +385,32 @@ mod tests {
         assert!(serialized.contains("\"compose_configuration_updated\":true"));
         assert!(!serialized.contains("composeOverride"));
         assert!(!serialized.contains("environment"));
+        assert!(
+            !serialized.contains("log_ingest_"),
+            "an untouched budget is absent, not null: {serialized}"
+        );
+    }
+
+    #[test]
+    fn a_log_budget_reset_is_recorded_as_null() {
+        let fields = ProjectSettingsUpdatedFields {
+            name: None,
+            previous_name: None,
+            slug: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            performance_metrics_enabled: None,
+            compose_configuration_updated: None,
+            image_retention_hours: None,
+            previous_image_retention_hours: None,
+            log_ingest_lines_per_sec: Some(None),
+            log_ingest_kib_per_sec: Some(Some(0)),
+            serves_own_temps_api: None,
+        };
+        let json = serde_json::to_string(&fields).expect("fields serialize");
+        assert!(json.contains("\"log_ingest_lines_per_sec\":null"), "{json}");
+        assert!(json.contains("\"log_ingest_kib_per_sec\":0"), "{json}");
     }
 }

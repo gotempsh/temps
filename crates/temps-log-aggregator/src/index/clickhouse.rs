@@ -985,12 +985,19 @@ impl ClickHouseLineIndex {
     /// One local reclaim pass: for every day partition that still holds
     /// rows of a tombstoned chunk, delete those rows with a partition-scoped
     /// lightweight `DELETE`, then drop the reclaimed `(chunk, day)` entries
-    /// and finally every tombstone whose chunk has no rows left anywhere.
+    /// and finally the tombstones of the chunks this pass reclaimed in full.
     /// Returns the number of `(chunk, day)` pairs reclaimed.
     ///
     /// Each step is idempotent, so a pass interrupted anywhere just leaves
     /// work for the next one; the rows stay masked by their tombstone until
     /// it is gone, and the tombstone is only dropped after its rows are.
+    ///
+    /// A tombstone with no `(chunk, day)` entry is *not* proof the rows are
+    /// gone: `log_chunk_days` expires at `day + retention`, while a line lives
+    /// until `ts + retention` and, with `ttl_only_drop_parts`, until every
+    /// other row of its part has expired too. Such a tombstone is left to its
+    /// own TTL (one day longer than the lines', see `set_retention_days`), so
+    /// it keeps masking those rows until they are dropped.
     async fn reclaim_pass(&self) -> Result<u64, LogAggregatorError> {
         let client = self.read_client()?;
         let days: Vec<ReclaimDayRow> = client
@@ -1004,6 +1011,7 @@ impl ClickHouseLineIndex {
             .await
             .map_err(ch_err)?;
         let mut reclaimed = 0u64;
+        let mut reclaimed_seqs: BTreeSet<u64> = BTreeSet::new();
         for row in &days {
             let day = parse_partition_day(&row.day)?;
             for seqs in row.seqs.chunks(RECLAIM_SEQS_PER_STATEMENT) {
@@ -1031,19 +1039,20 @@ impl ClickHouseLineIndex {
                     .await
                     .map_err(ch_err)?;
                 reclaimed += seqs.len() as u64;
+                reclaimed_seqs.extend(seqs.iter().copied());
             }
         }
-        // A tombstone with no `(chunk, day)` entry left masks nothing: its
-        // rows were reclaimed above or the chunk was never indexed. Tiny
-        // table, so this mutation is cheap.
-        client
-            .query(&format!(
-                "DELETE FROM {LOCAL_FORGOTTEN_CHUNKS_TABLE} \
-                 WHERE chunk_seq NOT IN (SELECT chunk_seq FROM {LOCAL_CHUNK_DAYS_TABLE})"
-            ))
-            .execute()
-            .await
-            .map_err(ch_err)?;
+        // Only the chunks whose rows this pass deleted, and only once no day
+        // of theirs is left to reclaim (a chunk indexed again meanwhile keeps
+        // its tombstone for the next pass). Tiny table, so this is cheap.
+        let reclaimed_seqs: Vec<u64> = reclaimed_seqs.into_iter().collect();
+        for seqs in reclaimed_seqs.chunks(RECLAIM_SEQS_PER_STATEMENT) {
+            client
+                .query(&clear_reclaimed_tombstones_sql(seqs))
+                .execute()
+                .await
+                .map_err(ch_err)?;
+        }
         if reclaimed > 0 {
             info!(
                 chunk_days = reclaimed,
@@ -1318,6 +1327,18 @@ fn parse_partition_day(day: &str) -> Result<chrono::NaiveDate, LogAggregatorErro
 }
 
 /// `1,2,3` for an `IN (...)` list of numeric seqs.
+/// Drop the tombstones of `seqs` (all reclaimed by this pass) that no longer
+/// have any `(chunk, day)` entry left.
+fn clear_reclaimed_tombstones_sql(seqs: &[u64]) -> String {
+    let list = seq_list(seqs);
+    format!(
+        "DELETE FROM {LOCAL_FORGOTTEN_CHUNKS_TABLE} \
+         WHERE chunk_seq IN ({list}) \
+         AND chunk_seq NOT IN (SELECT chunk_seq FROM {LOCAL_CHUNK_DAYS_TABLE} \
+         WHERE chunk_seq IN ({list}))"
+    )
+}
+
 fn seq_list(seqs: &[u64]) -> String {
     seqs.iter()
         .map(|s| s.to_string())
@@ -1403,10 +1424,15 @@ impl LineIndexSink for ClickHouseLineIndex {
             .execute()
             .await
             .map_err(ch_err)?;
+        // One day longer than the lines: a line of the forgotten chunk lives
+        // until every row of its day part has expired (`ttl_only_drop_parts`),
+        // i.e. up to a day past its own `ts + retention`, and the tombstone
+        // must keep masking it until then.
+        let tombstone_days = days.saturating_add(1);
         client
             .query(&format!(
                 "ALTER TABLE {LOCAL_FORGOTTEN_CHUNKS_TABLE} \
-                 MODIFY TTL toDateTime(forgotten_at) + INTERVAL {days} DAY"
+                 MODIFY TTL toDateTime(forgotten_at) + INTERVAL {tombstone_days} DAY"
             ))
             .execute()
             .await
@@ -1608,6 +1634,19 @@ mod tests {
             let err = parse_partition_day(bad).unwrap_err().to_string();
             assert!(err.contains("log_chunk_days"), "{err}");
         }
+    }
+
+    #[test]
+    fn clearing_tombstones_is_limited_to_the_reclaimed_seqs() {
+        let sql = clear_reclaimed_tombstones_sql(&[7, 9]);
+        assert!(
+            sql.starts_with("DELETE FROM log_forgotten_chunks WHERE chunk_seq IN (7,9)"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("NOT IN (SELECT chunk_seq FROM log_chunk_days WHERE chunk_seq IN (7,9))"),
+            "{sql}"
+        );
     }
 
     #[test]

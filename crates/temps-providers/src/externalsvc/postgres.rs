@@ -7004,6 +7004,24 @@ mod tests {
                             )
                         ),
                     ]),
+                    // Same data volume and PGDATA as the real container: the
+                    // recreate guard refuses to replace a container whose
+                    // data lives anywhere else (e.g. an anonymous volume),
+                    // and then `start()` would keep it as it is.
+                    env: Some(vec![format!(
+                        "PGDATA={}",
+                        PostgresService::get_pgdata_path("gotempsh/postgres-walg:18-bookworm")
+                            .expect("PGDATA path for the test image")
+                    )]),
+                    host_config: Some(bollard::models::HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            target: Some("/var/lib/postgresql".to_string()),
+                            source: Some(format!("{container_name}_data")),
+                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )

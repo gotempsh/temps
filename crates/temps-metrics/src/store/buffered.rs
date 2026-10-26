@@ -19,7 +19,12 @@
 //! fixed regardless of the store's health. When the channel is full (the
 //! store is down or slower than the producers) a batch is dropped and the
 //! producer gets [`MetricsError::WriteBufferFull`] — never a blocked
-//! producer. Reads go straight to the inner store, so a point becomes
+//! producer. A flush that does not finish within
+//! [`BufferConfig::write_timeout`] is abandoned and its points dropped, so a
+//! store that hangs (rather than errors) cannot stall the flusher forever and
+//! turn every later write into a dropped batch. Every lost point — channel
+//! overflow, failed flush or timed-out flush — is counted in
+//! [`BufferedMetricsStore::dropped_points`]. Reads go straight to the inner store, so a point becomes
 //! visible up to one flush interval after it is written.
 
 use std::collections::HashMap;
@@ -47,6 +52,8 @@ pub struct BufferConfig {
     pub max_rows: usize,
     /// `write_batch` calls that may be queued before batches are dropped.
     pub channel_capacity: usize,
+    /// Longest one flush may take before its points are dropped.
+    pub write_timeout: Duration,
 }
 
 impl Default for BufferConfig {
@@ -55,6 +62,7 @@ impl Default for BufferConfig {
             flush_interval: Duration::from_secs(5),
             max_rows: 10_000,
             channel_capacity: 1_024,
+            write_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -74,12 +82,18 @@ impl BufferedMetricsStore {
     pub fn spawn(inner: Arc<dyn MetricsStore>, config: BufferConfig) -> Self {
         let capacity = config.channel_capacity.max(1);
         let (sender, receiver) = mpsc::channel(capacity);
-        tokio::spawn(run_flusher(inner.clone(), receiver, config));
+        let dropped_points = Arc::new(AtomicU64::new(0));
+        tokio::spawn(run_flusher(
+            inner.clone(),
+            receiver,
+            config,
+            dropped_points.clone(),
+        ));
         Self {
             inner,
             sender,
             capacity,
-            dropped_points: Arc::new(AtomicU64::new(0)),
+            dropped_points,
         }
     }
 
@@ -94,7 +108,8 @@ impl BufferedMetricsStore {
         Arc::new(Self::spawn(inner, config))
     }
 
-    /// Points dropped because the buffer was full, since start.
+    /// Points lost since start: the buffer was full, or a flush failed or
+    /// timed out.
     pub fn dropped_points(&self) -> u64 {
         self.dropped_points.load(Ordering::Relaxed)
     }
@@ -104,7 +119,13 @@ async fn run_flusher(
     inner: Arc<dyn MetricsStore>,
     mut receiver: mpsc::Receiver<Vec<MetricPoint>>,
     config: BufferConfig,
+    dropped_points: Arc<AtomicU64>,
 ) {
+    let flusher = Flusher {
+        inner,
+        timeout: config.write_timeout,
+        dropped_points,
+    };
     let max_rows = config.max_rows.max(1);
     let mut pending: Vec<MetricPoint> = Vec::new();
     let mut ticker = tokio::time::interval(config.flush_interval);
@@ -118,30 +139,51 @@ async fn run_flusher(
                 Some(points) => {
                     pending.extend(points);
                     if pending.len() >= max_rows {
-                        flush(inner.as_ref(), &mut pending).await;
+                        flusher.flush(&mut pending).await;
                     }
                 }
                 None => {
-                    flush(inner.as_ref(), &mut pending).await;
+                    flusher.flush(&mut pending).await;
                     debug!("metrics write buffer closed; flusher exiting");
                     return;
                 }
             },
-            _ = ticker.tick() => flush(inner.as_ref(), &mut pending).await,
+            _ = ticker.tick() => flusher.flush(&mut pending).await,
         }
     }
 }
 
-async fn flush(inner: &dyn MetricsStore, pending: &mut Vec<MetricPoint>) {
-    if pending.is_empty() {
-        return;
-    }
-    let points = std::mem::take(pending);
-    let count = points.len();
-    // Fail open like every producer did before: a store outage loses these
-    // points, it never backs up into the producers.
-    if let Err(e) = inner.write_batch(points).await {
-        warn!(points = count, error = %e, "metrics write buffer: flush failed; points dropped");
+struct Flusher {
+    inner: Arc<dyn MetricsStore>,
+    timeout: Duration,
+    dropped_points: Arc<AtomicU64>,
+}
+
+impl Flusher {
+    async fn flush(&self, pending: &mut Vec<MetricPoint>) {
+        if pending.is_empty() {
+            return;
+        }
+        let points = std::mem::take(pending);
+        let count = points.len();
+        // Fail open like every producer did before: a store outage loses these
+        // points, it never backs up into the producers.
+        let failure = match tokio::time::timeout(self.timeout, self.inner.write_batch(points)).await
+        {
+            Ok(Ok(())) => return,
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => format!("write did not finish within {:?}", self.timeout),
+        };
+        let dropped_total = self
+            .dropped_points
+            .fetch_add(count as u64, Ordering::Relaxed)
+            + count as u64;
+        warn!(
+            points = count,
+            dropped_total,
+            error = %failure,
+            "metrics write buffer: flush failed; points dropped"
+        );
     }
 }
 
@@ -214,12 +256,14 @@ mod tests {
     struct RecordingStore {
         writes: Mutex<Vec<usize>>,
         stall: bool,
+        /// Stall only on the first `write_batch` call.
+        stall_once: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
     impl MetricsStore for RecordingStore {
         async fn write_batch(&self, points: Vec<MetricPoint>) -> Result<(), MetricsError> {
-            if self.stall {
+            if self.stall || self.stall_once.swap(false, Ordering::SeqCst) {
                 std::future::pending::<()>().await;
             }
             self.writes.lock().unwrap().push(points.len());
@@ -344,6 +388,32 @@ mod tests {
             }
         ));
         assert_eq!(store.dropped_points(), 5);
+    }
+
+    /// A store that hangs instead of failing must not wedge the flusher: the
+    /// hung flush is abandoned (and its points counted as dropped) and the
+    /// next flush goes through.
+    #[tokio::test]
+    async fn a_hung_flush_times_out_and_the_flusher_recovers() {
+        let inner = Arc::new(RecordingStore {
+            stall_once: std::sync::atomic::AtomicBool::new(true),
+            ..Default::default()
+        });
+        let config = BufferConfig {
+            max_rows: 1,
+            write_timeout: Duration::from_millis(50),
+            ..BufferConfig::default()
+        };
+        let store = BufferedMetricsStore::spawn(inner.clone(), config);
+        store.write_batch(points(3)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(store.dropped_points(), 3, "the hung flush is counted");
+        assert!(inner.writes.lock().unwrap().is_empty());
+
+        store.write_batch(points(2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(inner.writes.lock().unwrap().as_slice(), &[2]);
+        assert_eq!(store.dropped_points(), 3);
     }
 
     #[test]

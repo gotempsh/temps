@@ -1808,7 +1808,7 @@ impl ReachabilityService {
     // ----- D8 ----------------------------------------------------------
 
     pub async fn token_check(&self, request: TokenCheckRequest) -> TokenCheckResult {
-        check_token(&self.http, &request.token, request.zone.as_deref()).await
+        check_token(&self.http, request.token.expose(), request.zone.as_deref()).await
     }
 
     /// Whether a direct ingress answers on port 80, so HTTP-01 can work.

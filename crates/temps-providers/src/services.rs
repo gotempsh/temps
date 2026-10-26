@@ -16422,21 +16422,24 @@ echo "[restore] Pre-seed complete"
         )
         .map_err(|reason| ExternalServiceError::ParameterValidationFailed { service_id, reason })?;
 
-        let txn = self.db.begin().await?;
-        let service = external_services::Entity::find_by_id(service_id)
-            .lock_exclusive()
-            .one(&txn)
-            .await?
-            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
-        let previous = ServiceLogIngestion::of(&service);
-        let service_name = service.name.clone();
-        if previous != settings {
-            let mut active: external_services::ActiveModel = service.into();
-            active.log_ingest_lines_per_sec = Set(settings.log_ingest_lines_per_sec);
-            active.log_ingest_kib_per_sec = Set(settings.log_ingest_kib_per_sec);
-            active.updated_at = Set(Utc::now());
-            active.update(&txn).await?;
-        }
+        const OPERATION: &str = "saving the log ingestion budget of";
+        let txn = begin_bounded_transaction(&self.db, service_id, OPERATION, SERVICE_LOCK_TIMEOUT)
+            .await?;
+        let (previous, service_name) =
+            match Self::write_log_ingestion(&txn, service_id, &settings).await {
+                Ok(saved) => saved,
+                Err(error) => {
+                    // Roll back now so the row lock is not held until the
+                    // pooled connection is recycled.
+                    let error = lock_timeout_or_database_error(
+                        service_id,
+                        OPERATION,
+                        SERVICE_LOCK_TIMEOUT,
+                        error,
+                    );
+                    return Err(rollback_before_error(txn, error).await);
+                }
+            };
         txn.commit().await?;
 
         info!(
@@ -16453,6 +16456,30 @@ echo "[restore] Pre-seed complete"
             previous,
             current: settings,
         })
+    }
+
+    /// The locked read-compare-write behind [`Self::set_log_ingestion`].
+    /// Returns the previous override and the service name.
+    async fn write_log_ingestion(
+        txn: &sea_orm::DatabaseTransaction,
+        service_id: i32,
+        settings: &ServiceLogIngestion,
+    ) -> Result<(ServiceLogIngestion, String), ExternalServiceError> {
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+        let previous = ServiceLogIngestion::of(&service);
+        let service_name = service.name.clone();
+        if previous != *settings {
+            let mut active: external_services::ActiveModel = service.into();
+            active.log_ingest_lines_per_sec = Set(settings.log_ingest_lines_per_sec);
+            active.log_ingest_kib_per_sec = Set(settings.log_ingest_kib_per_sec);
+            active.updated_at = Set(Utc::now());
+            active.update(txn).await?;
+        }
+        Ok((previous, service_name))
     }
 
     pub async fn update_service_resource_limits(
@@ -17881,6 +17908,7 @@ mod tests {
     async fn set_log_ingestion_reports_missing_service_by_id() {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
                 .append_query_results([Vec::<external_services::Model>::new()])
                 .into_connection(),
         );
@@ -17907,6 +17935,7 @@ mod tests {
         after.log_ingest_kib_per_sec = Some(0);
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
                 .append_query_results([vec![before]])
                 .append_query_results([vec![after]])
                 .into_connection(),
@@ -17923,6 +17952,57 @@ mod tests {
         assert_eq!(update.previous.log_ingest_lines_per_sec, Some(100));
         assert_eq!(update.current, wanted);
         assert_eq!(update.service_name, "postgres-test");
+    }
+
+    /// The mock result for `begin_bounded_transaction`'s `SET LOCAL`.
+    fn lock_timeout_set() -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    /// A save that cannot get the service row's lock gives up after
+    /// `SERVICE_LOCK_TIMEOUT` with a typed "service busy" error naming the
+    /// service, instead of waiting on the row forever.
+    #[tokio::test]
+    async fn set_log_ingestion_gives_up_on_a_held_row_lock() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "canceling statement due to lock timeout".to_owned(),
+                )])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db.clone()) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let err = manager
+            .set_log_ingestion(7, ServiceLogIngestion::default())
+            .await
+            .expect_err("a held lock must not be waited on forever");
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::LockTimeout {
+                    service_id: 7,
+                    operation: "saving the log ingestion budget of",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        drop(manager);
+        let db = Arc::try_unwrap(db).expect("manager released the database");
+        let log = format!("{:?}", db.into_transaction_log());
+        let bounded = log
+            .find("SET LOCAL lock_timeout")
+            .expect("the lock wait must be bounded");
+        let locked = log.find("FOR UPDATE").expect("the row is locked");
+        assert!(bounded < locked, "the bound must precede the lock: {log}");
     }
 
     /// #1385: the provisioning task claims each irreversible step on the

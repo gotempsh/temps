@@ -44,7 +44,6 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use temps_auth::Permission;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
@@ -302,16 +301,17 @@ pub struct UpdateAlertRuleRequest {
 
 /// Request body for creating a resource alert on a node.
 ///
-/// Only the usage percentages can be alerted on: `node.cpu_percent`,
-/// `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
-/// (0-100). A node has at most one rule per metric.
+/// A rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,
+/// `node.disk_percent`; `threshold` 0-100) or a disk-health metric
+/// (`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;
+/// `threshold` 0 or more). A node has at most one rule per metric.
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(as = NodeCreateAlertRuleRequest)]
 pub struct CreateNodeAlertRuleRequest {
     pub name: String,
-    /// One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+    /// One of the usage percentages or disk-health metrics listed above.
     pub metric_name: String,
-    /// Percentage between 0 and 100.
+    /// 0-100 for a usage percentage; 0 or more for a disk-health metric.
     pub threshold: f64,
     /// One of `>`, `<`, `>=`, `<=`.
     pub comparator: String,
@@ -1473,8 +1473,13 @@ pub struct NodeDiskHealthResponse {
     pub setup_path: String,
 }
 
+/// Disk health from a node whose newest sample is older than this is
+/// reported as stale: it is the last thing the node said, not its state now.
+const DISK_HEALTH_MAX_AGE_MINUTES: i64 = 10;
+
 fn disk_health_reason(
     health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
 ) -> Option<String> {
     if !health.reported {
         return Some(
@@ -1484,6 +1489,17 @@ fn disk_health_reason(
              until the agent is upgraded."
                 .into(),
         );
+    }
+    if let Some(reported_at) = health
+        .reported_at
+        .filter(|at| now - *at > Duration::minutes(DISK_HEALTH_MAX_AGE_MINUTES))
+    {
+        return Some(format!(
+            "This node has not reported metrics since {}. The disk health shown is \
+             from then, not its current state: check that the node is online and, \
+             on a worker, that `temps agent` is running.",
+            reported_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
     }
     if health.drives_detected > health.drives_read {
         let missing = health.drives_detected - health.drives_read;
@@ -1498,8 +1514,12 @@ fn disk_health_reason(
 }
 
 impl NodeDiskHealthResponse {
-    fn new(node_id: i32, health: temps_metrics::collector::disk_health::NodeDiskHealth) -> Self {
-        let reason = disk_health_reason(&health);
+    fn new(
+        node_id: i32,
+        health: temps_metrics::collector::disk_health::NodeDiskHealth,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let reason = disk_health_reason(&health, now);
         Self {
             reported: health.reported,
             raid_arrays: health
@@ -1576,7 +1596,7 @@ async fn get_node_disk_health(
 
     Ok((
         StatusCode::OK,
-        Json(NodeDiskHealthResponse::new(id, health)),
+        Json(NodeDiskHealthResponse::new(id, health, Utc::now())),
     ))
 }
 
@@ -2268,6 +2288,29 @@ pub(crate) async fn assert_service_owned_by_caller(
     auth: &temps_auth::AuthContext,
     state: &AppState,
 ) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, None).await
+}
+
+/// [`assert_service_owned_by_caller`], plus: when project-scoped roles are
+/// configured, a session/API-key/CLI caller must hold `required` *within* a
+/// project the service is linked to, not just be a member of one. The
+/// instance-level `permission_guard!` alone would let a member whose project
+/// role is read-only change a service of that project.
+pub(crate) async fn assert_service_permission_for_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Permission,
+) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, Some(required)).await
+}
+
+async fn authorize_service_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Option<Permission>,
+) -> Result<(), Problem> {
     use temps_entities::project_services;
 
     // For deployment tokens, check against the token's bound project.
@@ -2336,12 +2379,14 @@ pub(crate) async fn assert_service_owned_by_caller(
         return Ok(());
     }
 
-    session_caller_may_access_linked_projects(
-        auth,
-        &project_ids,
-        state.project_access_checker.as_deref(),
-    )
-    .await
+    let checker = state.project_access_checker.as_deref();
+    match required {
+        None => session_caller_may_access_linked_projects(auth, &project_ids, checker).await,
+        Some(required) => {
+            session_caller_has_permission_on_linked_projects(auth, &project_ids, checker, &required)
+                .await
+        }
+    }
 }
 
 fn unlinked_service_creator_may_access(
@@ -2390,7 +2435,10 @@ async fn session_caller_may_access_linked_projects(
 /// service. Installations without scoped project roles retain the existing
 /// membership behavior, while configured roles cannot use an instance-level
 /// permission to mutate a service outside their effective project grants.
-#[cfg(test)]
+///
+/// Per linked project: `Some(perms)` decides on its own (holds `required` or
+/// not); `None` (no scoped opinion) falls back to membership. Both lookups
+/// are batched, and any checker error or omitted project denies.
 async fn session_caller_has_permission_on_linked_projects(
     auth: &temps_auth::AuthContext,
     project_ids: &[i32],
@@ -2405,37 +2453,55 @@ async fn session_caller_has_permission_on_linked_projects(
         return Ok(());
     };
     let required = required.to_string();
-    for &project_id in project_ids {
-        let effective = checker
-            .effective_project_permissions(auth.user_id(), project_id)
+    let effective = checker
+        .effective_project_permissions_batch(auth.user_id(), project_ids)
+        .await
+        .map_err(|error| {
+            error!(
+                project_ids = ?project_ids,
+                error = %error,
+                "external service permission resolution failed closed"
+            );
+            internal_server_error()
+                .detail(format!(
+                    "Could not verify project permissions for external service access: {error}"
+                ))
+                .build()
+        })?;
+    if effective.values().any(
+        |permissions| matches!(permissions, Some(permissions) if permissions.contains(&required)),
+    ) {
+        return Ok(());
+    }
+
+    // Projects the checker returned no scoped opinion for. A project it
+    // omitted is not in this list, so it can only deny.
+    let membership_only: Vec<i32> = effective
+        .iter()
+        .filter(|(_, permissions)| permissions.is_none())
+        .map(|(project_id, _)| *project_id)
+        .collect();
+    if !membership_only.is_empty() {
+        let access = checker
+            .user_can_access_projects(auth.user_id(), &membership_only)
             .await
             .map_err(|error| {
+                error!(
+                    project_ids = ?membership_only,
+                    error = %error,
+                    "external service membership resolution failed closed"
+                );
                 internal_server_error()
                     .detail(format!(
-                        "Could not verify project permissions for external service access: {error}"
+                        "Could not verify project access for external service: {error}"
                     ))
                     .build()
             })?;
-        match effective {
-            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
-                return Ok(());
-            }
-            Some(_) => {}
-            None => {
-                let is_member = checker
-                    .user_can_access_project(auth.user_id(), project_id)
-                    .await
-                    .map_err(|error| {
-                        internal_server_error()
-                            .detail(format!(
-                                "Could not verify project access for external service: {error}"
-                            ))
-                            .build()
-                    })?;
-                if is_member {
-                    return Ok(());
-                }
-            }
+        if membership_only
+            .iter()
+            .any(|project_id| access.get(project_id).copied().unwrap_or(false))
+        {
+            return Ok(());
         }
     }
 
@@ -3182,6 +3248,77 @@ mod tests {
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
+    /// Project 10 has scoped roles (read only); project 11 has none, so its
+    /// membership decides. Failing to resolve permissions denies.
+    struct MixedServicePermissionChecker {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for MixedServicePermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_id == 11)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("permission store unavailable".into());
+            }
+            Ok((project_id == 10).then(|| vec![Permission::ExternalServicesRead.to_string()]))
+        }
+    }
+
+    #[tokio::test]
+    async fn service_mutation_uses_membership_only_where_no_scoped_role_applies() {
+        let auth = test_session_auth(temps_auth::Role::User);
+        let checker = MixedServicePermissionChecker { fail: false };
+        let required = Permission::ExternalServicesWrite;
+
+        session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10, 11],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect("membership of the unscoped project 11 authorizes");
+
+        let problem = session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect_err("project 10's read-only role must not authorize a write");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_fails_closed_when_permissions_cannot_be_resolved() {
+        let checker = MixedServicePermissionChecker { fail: true };
+        let problem = session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[11],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect_err("an unverifiable permission must deny");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[tokio::test]
     async fn service_mutation_falls_back_to_membership_without_scoped_permissions() {
         let checker = EffectiveServicePermissionChecker {
@@ -3288,10 +3425,11 @@ mod tests {
     fn disk_health_response_explains_unread_drives() {
         use temps_metrics::collector::disk_health::{DriveHealth, NodeDiskHealth};
 
-        let none = NodeDiskHealthResponse::new(0, NodeDiskHealth::default());
+        let now = Utc::now();
+        let none = NodeDiskHealthResponse::new(0, NodeDiskHealth::default(), now);
         assert_eq!(none.setup_path, "/monitoring/server");
         assert_eq!(
-            NodeDiskHealthResponse::new(4, NodeDiskHealth::default()).setup_path,
+            NodeDiskHealthResponse::new(4, NodeDiskHealth::default(), now).setup_path,
             "/settings/nodes/4"
         );
         assert!(!none.reported);
@@ -3312,8 +3450,10 @@ mod tests {
                 }],
                 drives_detected: 3,
                 drives_read: 1,
+                reported_at: Some(now - Duration::minutes(1)),
                 ..Default::default()
             },
+            now,
         );
         let reason = partial.reason.expect("two drives were not read");
         assert!(reason.contains("2 of 3"), "{reason}");
@@ -3328,8 +3468,44 @@ mod tests {
                 drives_read: 1,
                 ..Default::default()
             },
+            now,
         );
         assert!(complete.reason.is_none());
+    }
+
+    /// The store keeps returning the last values a node sent after it stops
+    /// reporting, so old health must be called out instead of passing as
+    /// current.
+    #[test]
+    fn disk_health_from_a_node_that_stopped_reporting_is_marked_stale() {
+        use temps_metrics::collector::disk_health::{NodeDiskHealth, RaidArrayStatus};
+
+        let now = Utc::now();
+        let health = |age_minutes: i64| NodeDiskHealth {
+            reported: true,
+            raid_arrays: vec![RaidArrayStatus {
+                name: "md0".into(),
+                degraded: false,
+                devices_failed: 0,
+            }],
+            drives_detected: 1,
+            drives_read: 1,
+            reported_at: Some(now - Duration::minutes(age_minutes)),
+            ..Default::default()
+        };
+
+        let stale = NodeDiskHealthResponse::new(3, health(DISK_HEALTH_MAX_AGE_MINUTES + 50), now);
+        let reason = stale.reason.expect("old health must be explained");
+        assert!(reason.contains("not reported metrics since"), "{reason}");
+        assert!(reason.contains("not its current state"), "{reason}");
+        assert_eq!(
+            stale.raid_arrays.len(),
+            1,
+            "the last values are still shown"
+        );
+
+        let fresh = NodeDiskHealthResponse::new(3, health(2), now);
+        assert!(fresh.reason.is_none(), "{:?}", fresh.reason);
     }
 
     #[test]

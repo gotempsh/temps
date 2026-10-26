@@ -15,12 +15,13 @@ import { Loader2, Save } from 'lucide-react'
 import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
 import { useEffect } from 'react'
 import { useForm } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
 import { toast } from 'sonner'
 import type { BuildLimitsSettings } from '@/api/platformSettings'
-
-interface BuildLimitsFormData {
-  build_limits: BuildLimitsSettings
-}
+import {
+  buildLimitsFormSchema,
+  type BuildLimitsFormData,
+} from '@/lib/build-limits'
 
 const DEFAULTS: BuildLimitsSettings = {
   max_concurrent: 2,
@@ -41,6 +42,7 @@ export function BuildLimitsPage() {
     formState: { isDirty, isSubmitting, errors },
     reset,
   } = useForm<BuildLimitsFormData>({
+    resolver: zodResolver(buildLimitsFormSchema),
     defaultValues: { build_limits: DEFAULTS },
   })
 
@@ -108,9 +110,6 @@ export function BuildLimitsPage() {
                 max={32}
                 {...register('build_limits.max_concurrent', {
                   valueAsNumber: true,
-                  required: true,
-                  min: 1,
-                  max: 32,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -118,7 +117,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.max_concurrent && (
                 <p className="text-xs text-destructive">
-                  Must be between 1 and 32
+                  {errors.build_limits.max_concurrent.message}
                 </p>
               )}
             </div>
@@ -133,8 +132,6 @@ export function BuildLimitsPage() {
                 max={64}
                 {...register('build_limits.cpu_limit_cores', {
                   valueAsNumber: true,
-                  min: 0,
-                  max: 64,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -143,7 +140,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.cpu_limit_cores && (
                 <p className="text-xs text-destructive">
-                  Must be between 0 and 64
+                  {errors.build_limits.cpu_limit_cores.message}
                 </p>
               )}
             </div>
@@ -157,8 +154,6 @@ export function BuildLimitsPage() {
                 max={262144}
                 {...register('build_limits.memory_limit_mb', {
                   valueAsNumber: true,
-                  min: 0,
-                  max: 262144,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -167,7 +162,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.memory_limit_mb && (
                 <p className="text-xs text-destructive">
-                  Must be between 0 and 262144
+                  {errors.build_limits.memory_limit_mb.message}
                 </p>
               )}
             </div>
@@ -189,8 +184,6 @@ export function BuildLimitsPage() {
                 max={10000}
                 {...register('build_limits.build_cache_max_gb', {
                   valueAsNumber: true,
-                  min: 0,
-                  max: 10000,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -199,7 +192,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.build_cache_max_gb && (
                 <p className="text-xs text-destructive">
-                  Must be between 0 and 10000
+                  {errors.build_limits.build_cache_max_gb.message}
                 </p>
               )}
             </div>
@@ -215,9 +208,6 @@ export function BuildLimitsPage() {
                 max={365}
                 {...register('build_limits.build_cache_max_unused_days', {
                   valueAsNumber: true,
-                  required: true,
-                  min: 1,
-                  max: 365,
                 })}
               />
               <p className="text-xs text-muted-foreground">
@@ -225,7 +215,7 @@ export function BuildLimitsPage() {
               </p>
               {errors.build_limits?.build_cache_max_unused_days && (
                 <p className="text-xs text-destructive">
-                  Must be between 1 and 365
+                  {errors.build_limits.build_cache_max_unused_days.message}
                 </p>
               )}
             </div>
