@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
 use temps_core::EncryptionService;
-use temps_entities::external_services;
+use temps_entities::{external_services, nodes};
 
 use crate::collector::mariadb::MariaDbCollector;
 use crate::collector::mongodb::MongoCollector;
@@ -222,6 +222,10 @@ impl MetricsScraper {
         // Collect the active service ID set for stale-entry pruning after the cycle.
         let active_ids: HashSet<i32> = services.iter().map(|s| s.id).collect();
 
+        // Where each worker node publishes its services, loaded once for the
+        // whole cycle rather than once per service.
+        let worker_addresses = Arc::new(self.load_worker_data_addresses(&services).await);
+
         // Semaphore caps concurrent collector tasks to avoid thundering-herd on
         // the DB pool and TimescaleDB chunk locks.
         let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_COLLECTORS));
@@ -245,6 +249,7 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
+            let worker_addresses = Arc::clone(&worker_addresses);
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
@@ -303,12 +308,30 @@ impl MetricsScraper {
                     }
 
                     // Build a connection string from the encrypted service config.
-                    let params = decrypt_service_params(&service, &encryption).map_err(|e| {
-                        warn!(
-                            service_id,
-                            service_type, "MetricsScraper: cannot read service config: {e}"
-                        );
-                    })?;
+                    let mut params =
+                        decrypt_service_params(&service, &encryption).map_err(|e| {
+                            warn!(
+                                service_id,
+                                service_type, "MetricsScraper: cannot read service config: {e}"
+                            );
+                        })?;
+                    match worker_data_address(service.node_id, &worker_addresses) {
+                        Ok(Some(data_address)) => use_worker_host(&mut params, data_address),
+                        Ok(None) => {}
+                        Err(node_id) => {
+                            // Dialling the stored loopback host would reach
+                            // the control plane, and possibly an unrelated
+                            // service there on the same port.
+                            warn!(
+                                service_id,
+                                service_type,
+                                node_id,
+                                "MetricsScraper: service is placed on node {node_id}, which \
+                                 has no node record; skipping scrape"
+                            );
+                            return Err(());
+                        }
+                    }
                     let connection_string =
                         build_connection_string(&service, &params).map_err(|e| {
                             warn!(
@@ -391,7 +414,93 @@ impl MetricsScraper {
     }
 }
 
+impl MetricsScraper {
+    /// `data_address` of every worker node hosting one of `services`.
+    ///
+    /// A failed lookup is logged and yields an empty map: worker-placed
+    /// services then skip this cycle, while control-plane services are still
+    /// scraped.
+    async fn load_worker_data_addresses(
+        &self,
+        services: &[external_services::Model],
+    ) -> HashMap<i32, String> {
+        let node_ids: HashSet<i32> = services
+            .iter()
+            .filter_map(|s| s.node_id)
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        if node_ids.is_empty() {
+            return HashMap::new();
+        }
+        match nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|node| (node.id, node.data_address().to_string()))
+                .collect(),
+            Err(e) => {
+                warn!(
+                    node_ids = ?node_ids,
+                    "MetricsScraper: failed to load worker node addresses; services on \
+                     worker nodes are skipped this cycle: {e}"
+                );
+                HashMap::new()
+            }
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Node id the control plane uses for itself. A service placed there runs
+/// beside the scraper, like one with no node at all.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// The address to dial for a service on a worker node: `Ok(None)` for a
+/// service on the control plane, `Err(node_id)` when its worker is unknown.
+fn worker_data_address(
+    node_id: Option<i32>,
+    worker_addresses: &HashMap<i32, String>,
+) -> Result<Option<&str>, i32> {
+    match node_id {
+        None | Some(CONTROL_PLANE_NODE_ID) => Ok(None),
+        Some(id) => worker_addresses
+            .get(&id)
+            .map(|address| Some(address.as_str()))
+            .ok_or(id),
+    }
+}
+
+/// Point a worker-placed service's connection at its node.
+///
+/// A managed service on a worker is stored with a loopback `host`, which means
+/// "this machine" to the worker and the wrong machine to the control plane.
+/// The worker's agent publishes the service's host `port` on the node's data
+/// address (its private address, or its WireGuard mesh address when it joined
+/// with a public one — `nodes::Model::data_address`), so that is where the
+/// scraper must dial. A host the operator set explicitly is kept.
+fn use_worker_host(params: &mut ServiceParams, data_address: &str) {
+    let stored = param_str(params, "host");
+    let is_loopback = stored.is_empty()
+        || stored.eq_ignore_ascii_case("localhost")
+        || stored
+            .trim_matches(|c| c == '[' || c == ']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    if !is_loopback {
+        return;
+    }
+    // Every connection string embeds the host in a URL authority, where an
+    // IPv6 literal must be bracketed.
+    let host = match data_address.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{data_address}]"),
+        Err(_) => data_address.to_string(),
+    };
+    params.insert("host".to_string(), serde_json::Value::String(host));
+}
 
 /// Scrape an HA (cluster-topology) service at its current primary.
 ///
@@ -1150,6 +1259,86 @@ mod tests {
         let err = build_connection_string(&service, &params(&[]))
             .expect_err("no credentials at all cannot be scraped");
         assert!(err.contains("Service 6"), "error names the service: {err}");
+    }
+
+    /// Regression: a service placed on a worker node is stored with host
+    /// `localhost`, so the scraper dialled the control plane and never
+    /// reached it. It must dial the worker's data address, where the agent
+    /// publishes the service's host port.
+    #[test]
+    fn worker_placed_mariadb_is_dialled_at_its_node_data_address() {
+        let mut service = cluster_service(12, "mariadb");
+        service.node_id = Some(4);
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        let mut p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("username", "app"),
+            ("password", "app-secret"),
+            ("root_password", "rootpw12"),
+        ]);
+
+        let address = worker_data_address(service.node_id, &workers).expect("node 4 is known");
+        use_worker_host(&mut p, address.expect("node 4 is a worker"));
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:rootpw12@10.100.0.7:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app-secret@10.100.0.7:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn worker_host_applies_to_every_engine() {
+        let mut service = cluster_service(13, "postgres");
+        service.node_id = Some(4);
+        let mut p = params(&[
+            ("host", "127.0.0.1"),
+            ("port", "25432"),
+            ("username", "postgres"),
+            ("password", "pw"),
+            ("database", "app"),
+        ]);
+        use_worker_host(&mut p, "10.100.0.7");
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("postgresql://postgres:pw@10.100.0.7:25432/app".to_string())
+        );
+    }
+
+    #[test]
+    fn control_plane_services_keep_their_stored_host() {
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        assert_eq!(worker_data_address(None, &workers), Ok(None));
+        assert_eq!(
+            worker_data_address(Some(CONTROL_PLANE_NODE_ID), &workers),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn unknown_worker_node_is_reported_not_dialled_locally() {
+        assert_eq!(worker_data_address(Some(9), &HashMap::new()), Err(9));
+    }
+
+    #[test]
+    fn worker_host_keeps_an_explicit_host_and_brackets_ipv6() {
+        let mut explicit = params(&[("host", "db.internal")]);
+        use_worker_host(&mut explicit, "10.100.0.7");
+        assert_eq!(param_str(&explicit, "host"), "db.internal");
+
+        for loopback in ["", "localhost", "127.0.0.1", "::1", "0.0.0.0"] {
+            let mut p = params(&[("host", loopback)]);
+            use_worker_host(&mut p, "fd00::7");
+            assert_eq!(
+                param_str(&p, "host"),
+                "[fd00::7]",
+                "stored host {loopback:?}"
+            );
+        }
     }
 
     /// The MariaDB collector reports raw cumulative status counters; the
