@@ -92,17 +92,20 @@ struct LoopbackTrust {
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
 
-/// The settings handler only stores valid names; one that is not is
-/// ignored rather than trusted.
+/// The settings handler only stores names its rule accepts, but the row
+/// can be written by other means; a name the rule refuses is ignored rather
+/// than trusted, so the proxy never strips a header such as `Authorization`
+/// from every request.
 fn loopback_ja4_header(settings: &temps_core::AppSettings) -> Option<Arc<HeaderName>> {
-    let name = settings.loopback_ja4_header.as_deref()?;
-    match HeaderName::from_bytes(name.as_bytes()) {
-        Ok(header) => Some(Arc::new(header)),
-        Err(_) => {
-            tracing::warn!(name, "Ignoring an invalid loopback JA4 header name");
-            None
+    let stored = settings.loopback_ja4_header.as_deref()?;
+    let name = match temps_core::normalize_loopback_ja4_header(Some(stored)) {
+        Ok(name) => name?,
+        Err(error) => {
+            tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
+            return None;
         }
-    }
+    };
+    HeaderName::from_bytes(name.as_bytes()).ok().map(Arc::new)
 }
 
 /// Returns whether the header changed.
@@ -1221,14 +1224,27 @@ mod preflight_bind_tests {
         assert!(snapshot.load().is_none());
     }
 
-    /// A stored name the handler would refuse is ignored, never trusted.
+    /// A stored name the handler would refuse is ignored, never trusted:
+    /// the proxy strips the header it trusts from every request.
     #[test]
     fn invalid_stored_loopback_ja4_header_is_ignored() {
+        for stored in ["x ja4", "authorization", "cookie"] {
+            let settings = AppSettings {
+                loopback_ja4_header: Some(stored.into()),
+                ..AppSettings::default()
+            };
+            assert!(loopback_ja4_header(&settings).is_none(), "{stored}");
+        }
         let settings = AppSettings {
-            loopback_ja4_header: Some("x ja4".into()),
+            loopback_ja4_header: Some(" X-JA4 ".into()),
             ..AppSettings::default()
         };
-        assert!(loopback_ja4_header(&settings).is_none());
+        assert_eq!(
+            loopback_ja4_header(&settings)
+                .as_deref()
+                .map(HeaderName::as_str),
+            Some("x-ja4")
+        );
     }
 
     #[test]

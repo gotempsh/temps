@@ -4,6 +4,7 @@
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
+import { validateLoopbackJa4Header } from '@/lib/loopback-ja4-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -51,7 +52,7 @@ export function SecurityPage() {
     register,
     handleSubmit,
     control,
-    formState: { isDirty, isSubmitting },
+    formState: { errors, isDirty, isSubmitting },
     reset,
     setValue,
   } = useForm<SecurityFormData>({
@@ -210,8 +211,16 @@ export function SecurityPage() {
               id="loopback-ja4-header"
               className="font-mono text-sm"
               placeholder="x-ja4"
-              {...register('loopback_ja4_header')}
+              aria-invalid={errors.loopback_ja4_header ? true : undefined}
+              {...register('loopback_ja4_header', {
+                validate: validateLoopbackJa4Header,
+              })}
             />
+            {errors.loopback_ja4_header && (
+              <p className="text-xs text-destructive">
+                {errors.loopback_ja4_header.message}
+              </p>
+            )}
             <p className="text-sm text-muted-foreground">
               Your reverse proxy ends TLS, so Temps cannot fingerprint the
               visitor itself. If the proxy computes the visitor&apos;s JA4 and
