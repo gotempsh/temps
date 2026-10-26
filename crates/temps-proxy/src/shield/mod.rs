@@ -6,6 +6,8 @@
 //! Phase 1, the attack-mode challenge, is this module. Phase 2's
 //! reputation lists are [`ShieldLists`], what every request is checked against,
 //! and [`ShieldSources`], the control-plane jobs that fetch and compile them.
+//! Phase 7's [`ShieldLearning`] promotes what the fleet's events show (D9)
+//! and prunes the Shield tables.
 //!
 //! The proxy issues a signed proof-of-work token with the challenge page,
 //! verifies the solution itself at [`VERIFY_PATH`], and admits later
@@ -14,12 +16,14 @@
 //! in a body decides who it is or which environment it cleared.
 
 mod ja4_hook;
+mod learning;
 mod lists;
 mod sources;
 
 pub use ja4_hook::Ja4Hook;
+pub use learning::{EventStore, LearningError, Promoted, Pruned, ShieldLearning};
 pub use lists::{ShieldLists, ShieldListsError, POLL_INTERVAL};
-pub use sources::{Fetched, ShieldSources, SourceError};
+pub use sources::{Fetched, ShieldSources, SourceError, OBSERVED_SOURCE, OPERATOR_SOURCE};
 
 use pingora::http::StatusCode;
 use serde::Deserialize;
