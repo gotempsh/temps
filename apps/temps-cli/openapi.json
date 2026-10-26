@@ -1105,6 +1105,13 @@
               "null"
             ]
           },
+          "principals": {
+            "description": "For `tailnet_users`: who it admits (ADR 065 D6), normalized. Undo\nputs the earlier list back with the audience.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
+          },
           "private_listener": {
             "description": "For `private`: that listener's address, which DNS points at and the\ninside check dials.",
             "type": [
@@ -1117,6 +1124,20 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "private_service": {
+            "description": "For `tailscale_service`: the `svc:` name.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "private_via": {
+            "description": "For `private`: how it is served (ADR 065 D1), `tailscale_serve` or\n`tailscale_service`. `None` is phase 2's listener, so runs journaled\nbefore this column compare equal to what they set.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -5454,6 +5475,7 @@
           "public",
           "private",
           "signed_in",
+          "tailnet_users",
           "unsupported"
         ],
         "type": "string"
@@ -36376,6 +36398,92 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "Found by the `tailnet_serve_entries` row and this run's reference to\nit (ADR 065 D4); the step is done only on the agent's report.",
+            "properties": {
+              "address_id": {
+                "type": "string"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "node_name": {
+                "type": "string"
+              },
+              "service": {
+                "description": "The `svc:` name, for a Service.",
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "enum": [
+                  "tailscale_serve"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "node_id",
+              "node_name",
+              "address_id",
+              "hostname",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by its Temps row's name.",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_credential"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by `GET …/services/{name}` and the marker in its `comment`.",
+            "properties": {
+              "marker": {
+                "description": "`temps:<install>:<this run>`.",
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "tailnet": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_service"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "tailnet",
+              "name",
+              "marker",
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -36618,6 +36726,17 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/RunResource"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shown_service": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ServiceDefinition",
+                "description": "The Tailscale Service as shown to the user when undo asked whether\nto delete it (ADR 065 D4): the delete goes ahead only while a read\nmade immediately before it still equals this."
               },
               {
                 "type": "null"
@@ -47577,7 +47696,10 @@
           "new_tunnel",
           "new_tunnel_with_token",
           "direct_manual_dns",
-          "private_worker"
+          "private_worker",
+          "tailscale_serve",
+          "tailscale_service",
+          "tailscale_service_with_credential"
         ],
         "type": "string"
       },
@@ -47593,6 +47715,13 @@
           },
           "audience": {
             "$ref": "#/components/schemas/Audience"
+          },
+          "principals": {
+            "description": "For `tailnet_users`: the tailnet logins and tags it admits (ADR 065\nD6). At least one; checked and lower-cased.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
           }
         },
         "type": "object"
@@ -48466,6 +48595,14 @@
           "models"
         ],
         "type": "object"
+      },
+      "PrincipalKind": {
+        "description": "What a `tailnet_users` entry names (ADR 065 D6).",
+        "enum": [
+          "login",
+          "tag"
+        ],
+        "type": "string"
       },
       "PrivateIpInfo": {
         "description": "Information about private/local IP addresses",
@@ -52874,6 +53011,13 @@
               "string",
               "null"
             ]
+          },
+          "principals": {
+            "description": "For `tailnet_users`: who the address will admit, as the plan was\nmade for them (ADR 065 D6). Apply sets exactly this list.",
+            "items": {
+              "$ref": "#/components/schemas/TailnetPrincipal"
+            },
+            "type": "array"
           }
         },
         "required": [
@@ -56445,6 +56589,113 @@
               "type"
             ],
             "type": "object"
+          },
+          {
+            "description": "This run's reference to a worker's Serve entry (ADR 065 D4). Undo\ndrops the reference; the entry goes with its last one.",
+            "properties": {
+              "address_id": {
+                "type": "string"
+              },
+              "created": {
+                "description": "This run created the entry, rather than finding it.",
+                "type": "boolean"
+              },
+              "entry_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "node_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "node_name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_serve"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "node_id",
+              "node_name",
+              "address_id",
+              "hostname",
+              "entry_id",
+              "created",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Tailscale OAuth client the run saved (ADR 065 D2).",
+            "properties": {
+              "id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_credential"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "name",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A Tailscale Service the run created or found (ADR 065 D4). Undo\ndeletes it only once nothing uses it, and only when a person\nconfirms.",
+            "properties": {
+              "created": {
+                "description": "This run created it (`created`), rather than finding it.",
+                "type": "boolean"
+              },
+              "creator_run_id": {
+                "description": "The run whose marker it carries.",
+                "format": "int32",
+                "type": "integer"
+              },
+              "definition": {
+                "$ref": "#/components/schemas/ServiceDefinition",
+                "description": "As read back once the step was done, with its addresses."
+              },
+              "name": {
+                "description": "`svc:myapp`.",
+                "type": "string"
+              },
+              "tailnet": {
+                "description": "The tailnet's MagicDNS suffix, for the Service's lock and messages.",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tailscale_service"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "tailnet",
+              "name",
+              "created",
+              "creator_run_id",
+              "definition",
+              "type"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -59833,6 +60084,41 @@
           "threshold",
           "comparator",
           "severity"
+        ],
+        "type": "object"
+      },
+      "ServiceDefinition": {
+        "description": "A Tailscale Service as the API returns it, with the fields D4 compares.",
+        "properties": {
+          "addrs": {
+            "description": "The TailVIPs Tailscale assigned.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "comment": {
+            "type": "string"
+          },
+          "name": {
+            "description": "`svc:myapp`.",
+            "type": "string"
+          },
+          "ports": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
         ],
         "type": "object"
       },
@@ -64766,7 +65052,11 @@
           "issue_certificate",
           "wait_for_publication",
           "check_reachability",
-          "set_audience"
+          "set_audience",
+          "configure_tailscale_serve",
+          "save_tailscale_credential",
+          "define_tailscale_service",
+          "wait_for_service_approval"
         ],
         "type": "string"
       },
@@ -65307,6 +65597,23 @@
           "project_id",
           "service",
           "env"
+        ],
+        "type": "object"
+      },
+      "TailnetPrincipal": {
+        "description": "One person or tag a `tailnet_users` address admits. `value` is always\nASCII-lower-cased: it is compared that way (D6).",
+        "properties": {
+          "kind": {
+            "$ref": "#/components/schemas/PrincipalKind"
+          },
+          "value": {
+            "example": "alice@example.com",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "value"
         ],
         "type": "object"
       },
