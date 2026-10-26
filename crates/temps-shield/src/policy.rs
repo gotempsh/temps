@@ -11,6 +11,7 @@ use crate::bypass::TokenSet;
 
 /// How an environment acts on verdicts (D1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ShieldMode {
     /// Shield does nothing, and records nothing.

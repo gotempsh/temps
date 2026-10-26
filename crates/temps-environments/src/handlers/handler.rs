@@ -261,6 +261,8 @@ pub async fn get_environments(
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
+            shield_exempt_paths: env.shield_exempt_paths.0.clone(),
             force_https: env.force_https,
             last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !env.sleeping {
@@ -332,6 +334,8 @@ pub async fn get_environment(
         protected: env.protected,
         sleeping: env.sleeping,
         attack_mode: env.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(env.shield_mode.as_deref()),
+        shield_exempt_paths: env.shield_exempt_paths.0.clone(),
         force_https: env.force_https,
         last_activity_at: env.last_activity_at.map(|t| t.timestamp_millis()),
         estimated_sleep_at: if !env.sleeping {
@@ -1326,6 +1330,8 @@ fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) 
         || settings.security.is_some()
         || settings.force_https.is_some()
         || settings.attack_mode.is_some()
+        || settings.shield_mode.is_some()
+        || settings.shield_exempt_paths.is_some()
 }
 
 #[utoipa::path(
@@ -1442,6 +1448,17 @@ pub async fn update_environment_settings(
         security_updated: settings.security.is_some(),
         health_updated: settings.health.is_some(),
         attack_mode: settings.attack_mode,
+        shield_mode: (settings.shield_mode.is_some() || settings.attack_mode.is_some()).then(
+            || {
+                crate::handlers::types::stored_shield_mode(
+                    updated_environment.shield_mode.as_deref(),
+                )
+            },
+        ),
+        shield_exempt_paths: settings
+            .shield_exempt_paths
+            .is_some()
+            .then(|| updated_environment.shield_exempt_paths.0.clone()),
         force_https: settings.force_https,
         build_location: settings.build_location,
     };
@@ -1519,6 +1536,10 @@ pub async fn update_environment_settings(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
@@ -1632,6 +1653,10 @@ pub async fn update_environment_subdomain(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
@@ -1788,6 +1813,10 @@ pub async fn wake_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
@@ -1930,6 +1959,10 @@ pub async fn sleep_environment(
         protected: updated_environment.protected,
         sleeping: updated_environment.sleeping,
         attack_mode: updated_environment.attack_mode,
+        shield_mode: crate::handlers::types::stored_shield_mode(
+            updated_environment.shield_mode.as_deref(),
+        ),
+        shield_exempt_paths: updated_environment.shield_exempt_paths.0.clone(),
         force_https: updated_environment.force_https,
         last_activity_at: updated_environment
             .last_activity_at
@@ -2176,6 +2209,10 @@ pub async fn create_environment(
             protected: environment.protected,
             sleeping: environment.sleeping,
             attack_mode: environment.attack_mode,
+            shield_mode: crate::handlers::types::stored_shield_mode(
+                environment.shield_mode.as_deref(),
+            ),
+            shield_exempt_paths: environment.shield_exempt_paths.0.clone(),
             force_https: environment.force_https,
             last_activity_at: environment.last_activity_at.map(|t| t.timestamp_millis()),
             estimated_sleep_at: if !environment.sleeping {
@@ -2850,7 +2887,7 @@ mod tests {
                 ] {
                     let project: projects::Model = serde_json::from_value(serde_json::json!({
                         "id":10,"name":"Worker","slug":slug,"repo_name":"worker","repo_owner":"operator","directory":"/","main_branch":"main","preset":"dockerfile",
-                        "pull_only_root_directory":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"is_deleted":false,"is_public_repo":false,"attack_mode":false,"ai_write_actions_enabled":false,
+                        "pull_only_root_directory":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now(),"is_deleted":false,"is_public_repo":false,"attack_mode":false,"shield_mode":"log","ai_write_actions_enabled":false,
                         "error_source_context_enabled":false,"vulnerability_scanning_enabled":false,"enable_preview_environments":false,"preview_envs_on_demand":false,"preview_envs_idle_timeout_seconds":300,"preview_envs_wake_timeout_seconds":30,
                         "source_type":"docker_image","project_type":"Server","cross_project_trace_sharing":true,"cloud_telemetry_fidelity":"metered","cloud_telemetry_attribute_allowlist":[],"cloud_telemetry_write_mode":"local","cloud_analytics_write_mode":"local","hosting":"hosted"
                     })).unwrap();

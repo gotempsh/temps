@@ -26,6 +26,7 @@ async-trait = { workspace = true, optional = true }
 hickory-resolver = { version = "0.26", optional = true }
 moka = { version = "0.12", features = ["future"], optional = true }
 zstd = { workspace = true }
+utoipa = { workspace = true, optional = true }
 
 [features]
 # `ja4::read_client_hello`, for the ingresses that read a ClientHello off
@@ -33,6 +34,8 @@ zstd = { workspace = true }
 tokio = ["dep:tokio"]
 # `crawler_check`: verifying claimed crawlers by DNS, for the ingresses.
 crawlers = ["tokio", "tokio/time", "dep:async-trait", "dep:hickory-resolver", "dep:moka"]
+# OpenAPI schemas for the types the console API exchanges (`ShieldMode`).
+utoipa = ["dep:utoipa"]
 
 [dev-dependencies]
 # Turns on `tokio` for this crate's own tests.

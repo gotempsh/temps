@@ -13773,6 +13773,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-shield",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -14886,6 +14887,7 @@ dependencies = [
  "temps-presets",
  "temps-providers",
  "temps-queue",
+ "temps-shield",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -15339,6 +15341,7 @@ dependencies = [
  "temps-signatures",
  "thiserror 2.0.21",
  "tokio",
+ "utoipa",
  "zstd 0.14.3",
 ]
 

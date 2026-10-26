@@ -23,6 +23,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
+temps-shield = { path = "../temps-shield", features = ["utoipa"] }
 temps-git = { path = "../temps-git" }
 temps-queue = { path = "../temps-queue" }
 temps-providers = { path = "../temps-providers" }
