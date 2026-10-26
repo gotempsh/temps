@@ -21,6 +21,7 @@ mod plugin_build_handler;
 pub mod private_check;
 pub mod public_ingress;
 pub mod public_ingress_manager;
+mod rewind;
 pub mod route_store;
 pub mod route_sync_client;
 mod runtime_health;

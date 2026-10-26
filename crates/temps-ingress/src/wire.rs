@@ -33,10 +33,22 @@ pub struct NodeConnectorSpec {
     pub edge_port: u16,
     /// Header carrying the visitor's address, trusted only from loopback.
     pub client_address_header: Option<String>,
+    /// Header carrying the visitor's JA4 TLS fingerprint (ADR 066, D4),
+    /// trusted only from loopback. Absent from older control planes.
+    #[serde(default)]
+    pub client_ja4: Option<ForwardedJa4>,
     /// Preference order; the node runs the first one it supports.
     pub drivers: Vec<DriverChoice>,
     /// Secret values by name, referenced from the driver spec.
     pub secrets: BTreeMap<String, String>,
+}
+
+/// Where a connector puts the visitor's JA4, and who computed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ForwardedJa4 {
+    pub header: String,
+    /// The request log's `ja4_source`: `cloudflare` for Cloudflare's edge.
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

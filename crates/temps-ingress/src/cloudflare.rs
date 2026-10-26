@@ -25,7 +25,7 @@ use crate::provider::{
     DnsIntent, TunnelContext, TunnelHandle, TunnelHealth, TunnelLink, TunnelProvider,
 };
 use crate::wire::{
-    Artifact, ContainerSpec, DriverChoice, NodeConnectorSpec, ProcessSpec, Readiness,
+    Artifact, ContainerSpec, DriverChoice, ForwardedJa4, NodeConnectorSpec, ProcessSpec, Readiness,
 };
 
 pub const KIND: &str = "cloudflare_tunnel";
@@ -450,6 +450,11 @@ impl TunnelProvider for CloudflareTunnelProvider {
             revision: String::new(),
             edge_port,
             client_address_header: Some("CF-Connecting-IP".into()),
+            // Cloudflare sends it with Bot Management's request headers.
+            client_ja4: Some(ForwardedJa4 {
+                header: "cf-ja4".into(),
+                source: "cloudflare".into(),
+            }),
             drivers,
             secrets,
         };

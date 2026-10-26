@@ -4298,10 +4298,9 @@ fn strip_untrusted_client_ip_headers(
     // The JA4 headers of D4 (ADR 066): the CDNs', the temps edge's and the
     // one a trusted local proxy is configured to send. An app never sees a
     // JA4 header a visitor could have written.
-    request.remove_header("cf-ja4");
-    request.remove_header("cdn-ja4");
-    request.remove_header("cloudfront-viewer-ja4-fingerprint");
-    request.remove_header("x-temps-edge-client");
+    for name in temps_shield::ja4::FORWARDED_JA4_HEADERS {
+        request.remove_header(name);
+    }
     if let Some(name) = loopback_ja4_header {
         request.remove_header(name);
     }
@@ -10840,6 +10839,9 @@ mod forwarded_authority_tests {
             "x-temps-edge-client",
             "x-ja4",
         ];
+        assert!(temps_shield::ja4::FORWARDED_JA4_HEADERS
+            .iter()
+            .all(|name| names.contains(name)));
         let mut request =
             RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
         for name in names {

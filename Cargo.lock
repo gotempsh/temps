@@ -12452,6 +12452,7 @@ dependencies = [
  "temps-network",
  "temps-providers",
  "temps-runtime-health",
+ "temps-shield",
  "temps-vulnerability-scanner",
  "temps-wireguard",
  "thiserror 2.0.21",
@@ -15418,7 +15419,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "temps-shield",
  "thiserror 2.0.21",
+ "tokio",
  "zstd 0.14.3",
 ]
 

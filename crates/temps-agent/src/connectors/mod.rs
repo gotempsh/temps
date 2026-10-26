@@ -19,7 +19,7 @@ pub mod process;
 pub mod sync;
 pub mod wire;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -132,7 +132,10 @@ pub struct ConnectorSupervisor {
     /// Connectors held back because their tunnel origin could not bind,
     /// with the status that says why. Retried on every [`Self::apply`].
     blocked: Mutex<HashMap<i32, ConnectorStatus>>,
-    listeners: tokio::sync::Mutex<HashSet<u16>>,
+    /// Each bound tunnel origin, by port, with the headers it trusts.
+    listeners: tokio::sync::Mutex<
+        HashMap<u16, Arc<arc_swap::ArcSwap<crate::internal_proxy::TunnelOriginHeaders>>>,
+    >,
 }
 
 impl ConnectorSupervisor {
@@ -154,7 +157,7 @@ impl ConnectorSupervisor {
             shutdown,
             running: tokio::sync::Mutex::new(HashMap::new()),
             blocked: Mutex::new(HashMap::new()),
-            listeners: tokio::sync::Mutex::new(HashSet::new()),
+            listeners: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -269,21 +272,38 @@ impl ConnectorSupervisor {
         statuses
     }
 
+    /// Bind the spec's tunnel origin, or bring a bound one's trusted headers
+    /// up to date: they can change without the connector's revision, which
+    /// only restarts the connector process.
     async fn ensure_listener(&self, spec: &NodeConnectorSpec) -> std::io::Result<()> {
+        let headers = crate::internal_proxy::TunnelOriginHeaders::new(
+            spec.client_address_header.as_deref(),
+            spec.client_ja4.as_ref().map(|forwarded| {
+                (
+                    forwarded.header.as_str(),
+                    // A source this agent does not know is still a proxy
+                    // on loopback.
+                    temps_shield::ja4::Ja4Source::parse(&forwarded.source)
+                        .unwrap_or(temps_shield::ja4::Ja4Source::Local),
+                )
+            }),
+        )?;
         let mut listeners = self.listeners.lock().await;
-        if listeners.contains(&spec.edge_port) {
+        if let Some(current) = listeners.get(&spec.edge_port) {
+            current.store(Arc::new(headers));
             return Ok(());
         }
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), spec.edge_port);
+        let headers = Arc::new(arc_swap::ArcSwap::from_pointee(headers));
         crate::internal_proxy::spawn_tunnel_origin(
             addr,
             self.store.clone(),
             self.shutdown.clone(),
-            spec.client_address_header.clone(),
+            Arc::clone(&headers),
         )
         .await?;
         info!(%addr, "tunnel origin listener started");
-        listeners.insert(spec.edge_port);
+        listeners.insert(spec.edge_port, headers);
         Ok(())
     }
 
@@ -416,9 +436,56 @@ mod tests {
             revision: "r1".into(),
             edge_port,
             client_address_header: None,
+            client_ja4: None,
             drivers: Vec::new(),
             secrets: Default::default(),
         }
+    }
+
+    /// A listener bound before the control plane sent a JA4 header takes
+    /// it on the next sync, without a restart (ADR 066, D4).
+    #[tokio::test]
+    async fn a_bound_tunnel_origin_takes_new_headers_on_the_next_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(RouteStore::new(dir.path().join("routes.json")));
+        let supervisor = ConnectorSupervisor::with_drivers(
+            Vec::new(),
+            dir.path().into(),
+            store,
+            Arc::new(Notify::new()),
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        supervisor.ensure_listener(&spec(7, port)).await.unwrap();
+        let headers = Arc::clone(&supervisor.listeners.lock().await[&port]);
+        assert!(headers.load().client_ja4.is_none());
+
+        let mut updated = spec(7, port);
+        updated.client_address_header = Some("CF-Connecting-IP".into());
+        updated.client_ja4 = Some(wire::ForwardedJa4 {
+            header: "cf-ja4".into(),
+            source: "cloudflare".into(),
+        });
+        supervisor.ensure_listener(&updated).await.unwrap();
+        let current = headers.load();
+        assert_eq!(
+            current
+                .client_ja4
+                .as_ref()
+                .map(|(name, source)| (name.as_str(), *source)),
+            Some(("cf-ja4", temps_shield::ja4::Ja4Source::Cloudflare))
+        );
+        assert_eq!(
+            current
+                .client_address
+                .as_ref()
+                .map(axum::http::HeaderName::as_str),
+            Some("cf-connecting-ip")
+        );
     }
 
     #[tokio::test]
@@ -456,7 +523,7 @@ mod tests {
         supervisor.apply(vec![spec(7, port)]).await;
         assert!(supervisor.blocked.lock().is_empty());
         assert!(supervisor.running.lock().await.contains_key(&7));
-        assert!(supervisor.listeners.lock().await.contains(&port));
+        assert!(supervisor.listeners.lock().await.contains_key(&port));
         let statuses = supervisor.statuses().await;
         assert_eq!(statuses.len(), 1);
         assert!(statuses[0]

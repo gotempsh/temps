@@ -6,8 +6,8 @@ Proposed — 2026-10-25. Phase 1 (the challenge fix) shipped with this ADR.
 Phase 2 (reputation lists in `log` mode) shipped on 2026-10-26, with a
 correction to what D2 said about the lists' terms. Phase 3 (JA4) is being
 implemented in the order its entry in Phases gives: the parser, the
-control plane for direct, Cloudflare and Bunny clients, and the local
-proxy header are done; the later phases are proposed. File and line references are to
+control plane for direct, Cloudflare and Bunny clients, the local proxy
+header and workers are done; the later phases are proposed. File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
@@ -739,15 +739,26 @@ The edge installs the same hook in `temps-edge/src/server.rs:375` and builds
 (`temps-edge/src/proxy.rs:503`).
 
 **Workers (rustls).** In `serve_tls` (`public_ingress.rs:350`), before
-`acceptor.accept(stream)`: read the ClientHello with `ja4::needed` under the
-existing 10 s handshake timeout, wrap the socket in a `Rewind<TcpStream>`
-(an `AsyncRead + AsyncWrite` that serves the saved bytes first, about 40
-lines), and pass the wrapper to `acceptor.accept`. The result is inserted
-next to `PublicTlsSni` and `PublicPeer` as a `PublicClientFingerprint`
-request extension. Workers serve one request per connection
-(`keep_alive(false)`), so no map is needed. The tunnel origin honours
-`cf-ja4` from its loopback `cloudflared` exactly as it honours
-`CF-Connecting-IP`.
+`acceptor.accept(stream)`: read the ClientHello with
+`ja4::read_client_hello` under the existing 10 s handshake timeout, wrap
+the socket in a `Rewind<TcpStream>` (`temps-agent/src/rewind.rs`, an
+`AsyncRead + AsyncWrite` that serves the saved bytes first), and pass the
+wrapper to `acceptor.accept`. The result is inserted next to
+`PublicTlsSni` and `PublicPeer` as a `PublicClientFingerprint` request
+extension. Workers serve one request per connection
+(`keep_alive(false)`), so no map is needed. The tunnel origin honours a
+connector's JA4 header from loopback exactly as it honours its address
+header: the connector spec gains `client_ja4` (header and source),
+Cloudflare Tunnel's being `cf-ja4` and `cloudflare`, and the origin
+removes the header whatever it holds. A bound origin takes changed
+headers on the next connector sync, without restarting the connector. Workers remove every header of
+`ja4::FORWARDED_JA4_HEADERS` before a request goes upstream, as the
+control plane does. Until workers write events (phase 5) they log the
+JA4 and its source at `debug` per request.
+
+`ja4::read_client_hello` is shared by both ingresses, behind
+`temps-shield`'s `tokio` feature so the parser itself stays free of an
+async runtime.
 
 **Settings.**
 
