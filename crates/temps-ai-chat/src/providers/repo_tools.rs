@@ -797,6 +797,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: connection_id,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,

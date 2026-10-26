@@ -25,19 +25,11 @@ use pingora::http::StatusCode;
 use serde::Deserialize;
 use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity, VisitorNetwork};
 
-/// Where the challenge page posts its solution. Answered by the proxy on
-/// every project host; it never reaches the console or the application.
-pub const VERIFY_PATH: &str = "/api/_temps/captcha/verify";
+pub use temps_shield::assets::{challenge_page, MAX_VERIFY_BODY, VERIFY_PATH};
 
 /// Leading zero bits a challenge requires: about a million hashes, one to
 /// two seconds in a current browser.
 pub const CHALLENGE_DIFFICULTY: u8 = 20;
-
-/// The verify body is a token, a nonce and a number; anything larger is not
-/// a solution.
-pub const MAX_VERIFY_BODY: usize = 4 * 1024;
-
-const CHALLENGE_HTML: &str = include_str!("../../captcha/challenge.html");
 
 /// The challenge gate for this process, keyed from the master key so every
 /// ingress that holds it signs and verifies the same tokens.
@@ -136,30 +128,6 @@ pub fn rejection_response(error: ChallengeError) -> (StatusCode, &'static str) {
     }
 }
 
-/// The challenge page for `token`. Every inserted value is escaped, though
-/// the token is base64url and the address a parsed IP.
-pub fn challenge_page(token: &str, difficulty: u8, client_ip: &str) -> String {
-    CHALLENGE_HTML
-        .replace("{{TOKEN}}", &escape_html(token))
-        .replace("{{DIFFICULTY}}", &difficulty.to_string())
-        .replace("{{IP_ADDRESS}}", &escape_html(client_ip))
-}
-
-fn escape_html(text: &str) -> String {
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(c),
-        }
-    }
-    escaped
-}
-
 #[cfg(test)]
 pub(crate) fn test_gate() -> ChallengeGate {
     ChallengeGate::new(ShieldKeys::derive(|label| {
@@ -174,25 +142,6 @@ pub(crate) fn test_gate() -> ChallengeGate {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn page_escapes_what_it_inserts() {
-        let page = challenge_page("tok", 20, "<script>alert(1)</script>");
-        assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
-        assert!(!page.contains("<script>alert(1)"));
-        assert!(page.contains(r#"data-token="tok""#));
-        assert!(page.contains(r#"data-difficulty="20""#));
-        assert!(!page.contains("{{"), "every placeholder is filled");
-    }
-
-    #[test]
-    fn page_posts_only_token_nonce_and_timing() {
-        // The old body named the environment and identifier; the proxy now
-        // derives both, and the page must not send them.
-        assert!(!CHALLENGE_HTML.contains("environment_id"));
-        assert!(!CHALLENGE_HTML.contains("identifier"));
-        assert!(CHALLENGE_HTML.contains(VERIFY_PATH));
-    }
 
     #[test]
     fn identity_tracks_the_tls_fingerprint() {

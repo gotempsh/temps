@@ -27,6 +27,7 @@ members = [
     "crates/temps-domains",
     "crates/temps-proxy",
     "crates/temps-shield",
+    "crates/temps-signatures",
     "crates/temps-providers",
     "crates/temps-query",
     "crates/temps-query-postgres",

@@ -51,6 +51,10 @@ pub struct Model {
     pub git_provider_connection_id: Option<i32>,
     /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
     pub attack_mode: bool,
+    /// ADR 066 D1: how Shield acts on verdicts for the project's
+    /// environments: `off`, `log`, `selective` or `attack`. Replaces
+    /// `attack_mode`, which the API keeps writing for one release.
+    pub shield_mode: String,
     /// ADR-021 Tier 2: opt-in AI summarization of metric alert notifications for
     /// this project. NULL/false = off (the deterministic Tier-1 text is used);
     /// true = enrich with the configured AI provider when one is available.

@@ -19,6 +19,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
+temps-signatures = { path = "../temps-signatures" }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
 zstd = { workspace = true }

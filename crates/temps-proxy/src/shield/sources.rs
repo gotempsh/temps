@@ -468,6 +468,7 @@ impl ShieldSources {
             revision: u64::try_from(revision).unwrap_or(0),
             generated_at: Utc::now().timestamp(),
             lists,
+            ..ShieldSnapshot::default()
         };
         let body = snapshot.encode()?;
         let sha256 = hex::encode(Sha256::digest(&body));

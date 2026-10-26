@@ -387,6 +387,7 @@ mod m20261026_000003_add_ja4_to_proxy_logs;
 mod m20261027_000001_signed_in_gate;
 mod m20261027_000002_cloudflare_access;
 mod m20261028_000001_tunnel_environment_hosts;
+mod m20261029_000001_shield_selective;
 
 pub struct Migrator;
 
@@ -869,6 +870,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20261027_000002_cloudflare_access::Migration),
             // ADR 068 D3: a tunnel that publishes every environment's host.
             Box::new(m20261028_000001_tunnel_environment_hosts::Migration),
+            // ADR 066 phases 4 to 7: Shield modes, bypass tokens, operator
+            // rules, what the fleet learned, and events without ClickHouse.
+            Box::new(m20261029_000001_shield_selective::Migration),
         ]
     }
 }

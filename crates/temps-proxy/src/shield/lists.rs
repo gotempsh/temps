@@ -198,6 +198,7 @@ mod tests {
                 Some(3600),
                 network,
             )],
+            ..ShieldSnapshot::default()
         }
     }
 

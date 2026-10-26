@@ -37,12 +37,50 @@ pub enum SnapshotError {
     TooLarge,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShieldSnapshot {
     /// 0 for the built-in baseline; stored revisions start at 1.
     pub revision: u64,
     pub generated_at: i64,
+    /// Lists that apply to every project: the managed sources, platform-wide
+    /// operator rules and what the fleet learned (D9).
     pub lists: Vec<SourceList>,
+    /// Lists that apply to one project only: its operator rules (phase 4).
+    pub scoped: Vec<ScopedList>,
+    /// Fingerprints with a verdict: operator rules and what the fleet
+    /// learned (D9), phase 4 on.
+    pub ja4: Vec<Ja4Entry>,
+}
+
+/// A list that only one project's requests are checked against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScopedList {
+    pub project_id: i32,
+    pub list: SourceList,
+}
+
+/// One TLS fingerprint with a verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Ja4Entry {
+    pub fingerprint: String,
+    /// `operator` or `observed`.
+    pub source: String,
+    pub verdict: ListVerdict,
+    /// `None` for every project.
+    pub project_id: Option<i32>,
+    /// After this the entry no longer applies, even before the next
+    /// snapshot drops it.
+    pub expires_at: Option<i64>,
+}
+
+/// The snapshot as phases 2 and 3 stored it: the lists alone. A body in
+/// this shape decodes with no scoped lists and no fingerprints, so the rows
+/// already stored keep loading until the compiler writes a new one.
+#[derive(Deserialize)]
+struct LegacySnapshot {
+    revision: u64,
+    generated_at: i64,
+    lists: Vec<SourceList>,
 }
 
 impl ShieldSnapshot {
@@ -68,7 +106,19 @@ impl ShieldSnapshot {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
-        decode(bytes)
+        match decode(bytes) {
+            Ok(snapshot) => Ok(snapshot),
+            Err(SnapshotError::Decode(error)) => match decode::<LegacySnapshot>(bytes) {
+                Ok(legacy) => Ok(Self {
+                    revision: legacy.revision,
+                    generated_at: legacy.generated_at,
+                    lists: legacy.lists,
+                    ..Self::default()
+                }),
+                Err(_) => Err(SnapshotError::Decode(error)),
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 
@@ -246,9 +296,54 @@ mod tests {
                 ),
                 SourceList::new("b", ListVerdict::Block, 6, None, nets(&["255.255.255.255"])),
             ],
+            scoped: vec![ScopedList {
+                project_id: 4,
+                list: SourceList::new(
+                    "operator",
+                    ListVerdict::Allow,
+                    6,
+                    None,
+                    nets(&["10.0.0.0/8"]),
+                ),
+            }],
+            ja4: vec![Ja4Entry {
+                fingerprint: "t13d1516h2_8daaf6152771_02713d6af862".into(),
+                source: "observed".into(),
+                verdict: ListVerdict::Challenge,
+                project_id: None,
+                expires_at: Some(1_800_086_400),
+            }],
         };
         let bytes = snapshot.encode().unwrap();
         assert_eq!(ShieldSnapshot::decode(&bytes).unwrap(), snapshot);
+    }
+
+    /// Rows stored by phases 2 and 3 hold the lists alone.
+    #[test]
+    fn a_snapshot_stored_before_phase_4_still_loads() {
+        #[derive(Serialize)]
+        struct Phase2 {
+            revision: u64,
+            generated_at: i64,
+            lists: Vec<SourceList>,
+        }
+        let lists = vec![SourceList::new(
+            "a",
+            ListVerdict::Block,
+            5,
+            None,
+            nets(&["10.0.0.0/8"]),
+        )];
+        let old = encode(&Phase2 {
+            revision: 9,
+            generated_at: 3,
+            lists: lists.clone(),
+        })
+        .unwrap();
+        let snapshot = ShieldSnapshot::decode(&old).unwrap();
+        assert_eq!(snapshot.revision, 9);
+        assert_eq!(snapshot.lists, lists);
+        assert!(snapshot.scoped.is_empty() && snapshot.ja4.is_empty());
     }
 
     #[test]
@@ -276,6 +371,7 @@ mod tests {
                 None,
                 networks,
             )],
+            ..ShieldSnapshot::default()
         };
         let bytes = snapshot.encode().unwrap();
         assert!(bytes.len() < 100_000, "{} bytes", bytes.len());
@@ -301,6 +397,7 @@ mod tests {
                 SourceList::new("a", ListVerdict::Log, 1, None, nets(&["10.0.0.0/8"])),
                 SourceList::new("b", ListVerdict::Log, 1, None, nets(&["11.0.0.0/8"])),
             ],
+            ..ShieldSnapshot::default()
         };
         let lists = snapshot.with_list(SourceList::new("a", ListVerdict::Block, 2, None, []));
         assert_eq!(lists.len(), 2);
