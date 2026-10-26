@@ -22,14 +22,19 @@ sha2 = "0.11"
 temps-signatures = { path = "../temps-signatures" }
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true }
+async-trait = { workspace = true, optional = true }
+hickory-resolver = { version = "0.26", optional = true }
+moka = { version = "0.12", features = ["future"], optional = true }
 zstd = { workspace = true }
 
 [features]
 # `ja4::read_client_hello`, for the ingresses that read a ClientHello off
 # a socket.
 tokio = ["dep:tokio"]
+# `crawler_check`: verifying claimed crawlers by DNS, for the ingresses.
+crawlers = ["tokio", "tokio/time", "dep:async-trait", "dep:hickory-resolver", "dep:moka"]
 
 [dev-dependencies]
 # Turns on `tokio` for this crate's own tests.
-temps-shield = { path = ".", features = ["tokio"] }
-tokio = { workspace = true }
+temps-shield = { path = ".", features = ["tokio", "crawlers"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

@@ -320,6 +320,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub mcp_server: McpServerSettings,
 
+    /// ADR 066: platform-wide Shield settings.
+    #[serde(default)]
+    pub shield: ShieldSettings,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -2532,6 +2536,7 @@ impl Default for AppSettings {
             clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
+            shield: ShieldSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
@@ -4272,5 +4277,23 @@ mod cloudflare_new_project_tests {
         let restored = AppSettings::from_json(settings.to_json());
         assert!(restored.bunny_new_projects);
         assert!(!restored.cloudflare_new_projects);
+    }
+}
+
+/// Platform-wide Shield settings (ADR 066, I10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ShieldSettings {
+    /// Whether what one environment's visitors did counts for every
+    /// environment (D9): addresses and fingerprints promoted from events
+    /// apply fleet-wide. Off, nothing is promoted.
+    pub share_observations: bool,
+}
+
+impl Default for ShieldSettings {
+    fn default() -> Self {
+        Self {
+            share_observations: true,
+        }
     }
 }

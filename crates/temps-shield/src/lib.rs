@@ -29,6 +29,8 @@ mod baseline;
 pub mod browsers;
 mod budget;
 pub mod bypass;
+#[cfg(feature = "crawlers")]
+pub mod crawler_check;
 pub mod crawlers;
 pub mod difficulty;
 mod engine;
@@ -51,7 +53,7 @@ pub use engine::{
     evaluate, rejection_response, response_header_value, Admitted, Decision, Outcome, Request,
     ShieldEngine, VerifyOutcome, RESPONSE_HEADER,
 };
-pub use events::{EventKind, ShieldEvent};
+pub use events::{EventKind, EventSink, NoEvents, ShieldEvent};
 pub use gate::{
     clearance_cookie_name, Admission, ChallengeGate, Clearance, CLEARANCE_COOKIE_PREFIX,
     DEFAULT_BUDGET_PER_HOUR,

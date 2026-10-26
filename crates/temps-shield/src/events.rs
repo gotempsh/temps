@@ -82,6 +82,20 @@ pub fn bounded(text: &str) -> String {
     text.chars().take(MAX_FIELD_CHARS).collect()
 }
 
+/// Where an ingress hands its events: the control plane writes them, a
+/// worker uploads them (I5). `submit` must not block the request path; a
+/// sink that falls behind drops events rather than slowing requests.
+pub trait EventSink: Send + Sync {
+    fn submit(&self, events: Vec<ShieldEvent>);
+}
+
+/// A sink that keeps nothing, for ingresses that record no events.
+pub struct NoEvents;
+
+impl EventSink for NoEvents {
+    fn submit(&self, _events: Vec<ShieldEvent>) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
