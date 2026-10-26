@@ -11,7 +11,14 @@ import {
 import { Network, Plus, Search, Trash2, X } from 'lucide-react'
 import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
-import { Button, Ledger, PageState, type LedgerColumn } from '@temps-sdk/ds'
+import {
+  Button,
+  DataTable,
+  PageHeader,
+  PageState,
+  type DataTableColumn,
+  type DataTableProps,
+} from '@temps-sdk/ds'
 import {
   Badge,
   Input,
@@ -136,7 +143,7 @@ function NodeModesSummary() {
 function ruleColumns(
   canEdit: boolean,
   onDelete: (rule: NetworkPolicyRule) => void
-): LedgerColumn<NetworkPolicyRule>[] {
+): DataTableColumn<NetworkPolicyRule>[] {
   return [
     {
       key: 'rule',
@@ -328,156 +335,157 @@ export function NetworkPolicyPage() {
     </Button>
   )
 
+  // SettingsLayout owns the page container, so this page renders only its
+  // header, toolbar and table (a Ledger would add a second container).
+  const emptyState = rulesQuery.isError ? (
+    <div className="rounded-md border p-4">
+      <ReadFailure
+        resource="Network policy rules"
+        error={rulesQuery.error}
+        embedded
+        onRetry={
+          isForbiddenRead(rulesQuery.error)
+            ? undefined
+            : () => void rulesQuery.refetch()
+        }
+        retrying={rulesQuery.isFetching}
+      />
+    </div>
+  ) : total > 0 ? (
+    <PageState
+      variant="empty"
+      size="compact"
+      icon={Network}
+      title="No rules on this page"
+      description={`There are ${total} rule(s), on ${totalPages} page(s).`}
+      action={
+        <Button
+          variant="outline"
+          onClick={() => updateParams((next) => next.delete('page'))}
+        >
+          First page
+        </Button>
+      }
+    />
+  ) : filtered ? (
+    <PageState
+      variant="empty"
+      size="compact"
+      icon={Network}
+      title="No matching rules"
+      description="No rule matches the selected workload or origin. Clear the filters to see every rule."
+      action={
+        <Button
+          variant="outline"
+          onClick={() =>
+            updateParams((next) => {
+              next.delete('kind')
+              next.delete('id')
+              next.delete('origin')
+              next.delete('page')
+            })
+          }
+        >
+          Clear filters
+        </Button>
+      }
+    />
+  ) : (
+    <PageState
+      variant="empty"
+      size="compact"
+      icon={Network}
+      title="No network policy rules yet"
+      description="Without rules, deployments, services, functions and jobs reach anything, and sandboxes reach only what a link allows."
+      action={canEdit ? addRuleButton : undefined}
+    />
+  )
+
+  const pagination: DataTableProps<NetworkPolicyRule>['pagination'] =
+    total > 0
+      ? {
+          page,
+          pageSize,
+          total,
+          totalPages,
+          pageSizeOptions: PAGE_SIZE_OPTIONS,
+          onPageChange: (next) =>
+            updateParams((params) => params.set('page', String(next))),
+          onPageSizeChange: (size) =>
+            updateParams((params) => {
+              params.set('page_size', String(size))
+              params.delete('page')
+            }),
+          ariaLabel: 'Network policy rules pagination',
+        }
+      : undefined
+
   return (
-    <>
-      {/* SettingsLayout already owns the PageContainer padding, so the
-          Ledger's own shell drops it instead of padding the page twice. */}
-      <Ledger<NetworkPolicyRule>
-        className="p-0 sm:p-0 lg:p-0"
+    <div className="w-full min-w-0 space-y-6">
+      <PageHeader
         title="Network policy"
         description="What each workload may reach: allow and deny rules per sandbox, service, function, job or deployment, plus the links that create them."
         actions={canEdit ? addRuleButton : undefined}
-        toolbar={
-          <>
-            <NodeModesSummary />
-            <RuleFilters
-              draftKind={draftKind}
-              draftId={draftId}
-              origin={origin}
-              onDraftKindChange={setDraftKind}
-              onDraftIdChange={setDraftId}
-              onInspect={(kind, id) =>
-                updateParams((next) => {
-                  next.set('kind', kind)
-                  next.set('id', String(id))
-                  next.delete('page')
-                })
-              }
-              onOriginChange={(value) =>
-                updateParams((next) => {
-                  if (value === undefined) next.delete('origin')
-                  else next.set('origin', value)
-                  next.delete('page')
-                })
-              }
-            />
-            {subject ? (
-              <div className="space-y-2">
-                <div className="flex justify-end">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() =>
-                      updateParams((next) => {
-                        next.delete('kind')
-                        next.delete('id')
-                        next.delete('page')
-                      })
-                    }
-                  >
-                    <X className="mr-2 h-4 w-4" />
-                    Show every workload
-                  </Button>
-                </div>
-                <SubjectPolicyPanel
-                  key={`${subject.kind}-${subject.id}`}
-                  subjectKind={subject.kind}
-                  subjectId={subject.id}
-                  canEdit={canEdit}
-                />
-              </div>
-            ) : null}
-          </>
+      />
+      <NodeModesSummary />
+      <RuleFilters
+        draftKind={draftKind}
+        draftId={draftId}
+        origin={origin}
+        onDraftKindChange={setDraftKind}
+        onDraftIdChange={setDraftId}
+        onInspect={(kind, id) =>
+          updateParams((next) => {
+            next.set('kind', kind)
+            next.set('id', String(id))
+            next.delete('page')
+          })
         }
-        columns={ruleColumns(canEdit, setToDelete)}
-        rows={rules}
-        rowKey={(rule) => rule.id}
-        isLoading={rulesQuery.isPending}
-        empty={
-          rulesQuery.isError ? (
-            <div className="rounded-md border p-4">
-              <ReadFailure
-                resource="Network policy rules"
-                error={rulesQuery.error}
-                embedded
-                onRetry={
-                  isForbiddenRead(rulesQuery.error)
-                    ? undefined
-                    : () => void rulesQuery.refetch()
-                }
-                retrying={rulesQuery.isFetching}
-              />
-            </div>
-          ) : total > 0 ? (
-            <PageState
-              variant="empty"
-              size="compact"
-              icon={Network}
-              title="No rules on this page"
-              description={`There are ${total} rule(s), on ${totalPages} page(s).`}
-              action={
-                <Button
-                  variant="outline"
-                  onClick={() => updateParams((next) => next.delete('page'))}
-                >
-                  First page
-                </Button>
-              }
-            />
-          ) : filtered ? (
-            <PageState
-              variant="empty"
-              size="compact"
-              icon={Network}
-              title="No matching rules"
-              description="No rule matches the selected workload or origin. Clear the filters to see every rule."
-              action={
-                <Button
-                  variant="outline"
-                  onClick={() =>
-                    updateParams((next) => {
-                      next.delete('kind')
-                      next.delete('id')
-                      next.delete('origin')
-                      next.delete('page')
-                    })
-                  }
-                >
-                  Clear filters
-                </Button>
-              }
-            />
-          ) : (
-            <PageState
-              variant="empty"
-              size="compact"
-              icon={Network}
-              title="No network policy rules yet"
-              description="Without rules, deployments, services, functions and jobs reach anything, and sandboxes reach only what a link allows."
-              action={canEdit ? addRuleButton : undefined}
-            />
-          )
-        }
-        pagination={
-          total > 0
-            ? {
-                page,
-                pageSize,
-                total,
-                totalPages,
-                pageSizeOptions: PAGE_SIZE_OPTIONS,
-                onPageChange: (next) =>
-                  updateParams((params) => params.set('page', String(next))),
-                onPageSizeChange: (size) =>
-                  updateParams((params) => {
-                    params.set('page_size', String(size))
-                    params.delete('page')
-                  }),
-                ariaLabel: 'Network policy rules pagination',
-              }
-            : undefined
+        onOriginChange={(value) =>
+          updateParams((next) => {
+            if (value === undefined) next.delete('origin')
+            else next.set('origin', value)
+            next.delete('page')
+          })
         }
       />
+      {subject ? (
+        <div className="space-y-2">
+          <div className="flex justify-end">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() =>
+                updateParams((next) => {
+                  next.delete('kind')
+                  next.delete('id')
+                  next.delete('page')
+                })
+              }
+            >
+              <X className="mr-2 h-4 w-4" />
+              Show every workload
+            </Button>
+          </div>
+          <SubjectPolicyPanel
+            key={`${subject.kind}-${subject.id}`}
+            subjectKind={subject.kind}
+            subjectId={subject.id}
+            canEdit={canEdit}
+          />
+        </div>
+      ) : null}
+      {!rulesQuery.isPending && rules.length === 0 ? (
+        emptyState
+      ) : (
+        <DataTable<NetworkPolicyRule>
+          columns={ruleColumns(canEdit, setToDelete)}
+          rows={rules}
+          rowKey={(rule) => rule.id}
+          isLoading={rulesQuery.isPending}
+          pagination={pagination}
+        />
+      )}
 
       <CreateRuleDialog
         key={subject ? `${subject.kind}-${subject.id}` : 'any'}
@@ -514,7 +522,7 @@ export function NetworkPolicyPage() {
           if (toDelete) remove.mutate(toDelete)
         }}
       />
-    </>
+    </div>
   )
 }
 

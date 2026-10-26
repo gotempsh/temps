@@ -97,7 +97,7 @@ function render(client: QueryClient, role: string | null, path = '/') {
 }
 
 describe('NetworkPolicyPage', () => {
-  test('lists rules on the Ledger table with enforcement and link guards', () => {
+  test('lists rules in a table with enforcement and link guards', () => {
     const client = createClient()
     client.setQueryData(networkPolicyKeys.nodes, nodes)
     client.setQueryData(networkPolicyKeys.rules(firstPage), {
@@ -129,6 +129,8 @@ describe('NetworkPolicyPage', () => {
     expect(html).toContain('Managed by a link')
     expect(html).toContain('Add rule')
     expect(html).toContain('Network policy rules pagination')
+    // SettingsLayout owns the page container; the page must not add one.
+    expect(html).not.toContain('data-page-container')
     client.clear()
   })
 

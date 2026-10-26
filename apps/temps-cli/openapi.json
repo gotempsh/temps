@@ -67060,8 +67060,8 @@
       "TokenCheckRequest": {
         "properties": {
           "token": {
-            "description": "The token, as pasted. Used for this check only; not stored.",
-            "type": "string"
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The token, as pasted. Used for this check only; not stored. A\nsecret field, so the AI assistant takes it through a secret slot."
           },
           "zone": {
             "description": "The zone the token is meant for. With it, a token that reaches any\nother zone is not ready.",

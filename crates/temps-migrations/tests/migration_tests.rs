@@ -3255,7 +3255,10 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
         "node_dns_state row should cascade-delete with its node"
     );
 
-    // ----- dns_generation singleton seeded with current=0 -----
+    // ----- dns_generation singleton: seeded with current=0, then bumped
+    // once on purpose by m20261022_000001_dns_name_claims (it rewrites
+    // record owners, so resolvers must re-read the zone). Another migration
+    // that bumps the generation adds one here. -----
     let g_row = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -3266,7 +3269,10 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
     let g_id: i32 = g_row.try_get("", "id")?;
     let g_current: i64 = g_row.try_get("", "current")?;
     assert_eq!(g_id, 1);
-    assert_eq!(g_current, 0);
+    assert_eq!(
+        g_current, 1,
+        "dns_generation is seeded at 0 and bumped once by the DNS name claims migration"
+    );
 
     // ----- dns_generation singleton CHECK rejects id != 1 -----
     let bad_id = db

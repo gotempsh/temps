@@ -31702,9 +31702,10 @@ export type ToggleServiceMetricsRequest = {
 
 export type TokenCheckRequest = {
     /**
-     * The token, as pasted. Used for this check only; not stored.
+     * The token, as pasted. Used for this check only; not stored. A
+     * secret field, so the AI assistant takes it through a secret slot.
      */
-    token: string;
+    token: SecretString;
     /**
      * The zone the token is meant for. With it, a token that reaches any
      * other zone is not ready.
