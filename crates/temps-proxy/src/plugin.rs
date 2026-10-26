@@ -95,6 +95,18 @@ impl TempsPlugin for ProxyPlugin {
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
 
+            // ADR 066, I8: the Shield event sink, for events this process
+            // receives from elsewhere (workers post theirs to the console).
+            // Same backend choice as the request log; the Pingora proxy
+            // keeps its own instance for its decisions.
+            let (shield_events, shield_event_writer) =
+                crate::shield::ShieldEventStore::new(crate::shield::EventBackend::from_config(
+                    server_config.as_deref(),
+                    db.clone(),
+                    clickhouse_compression,
+                ));
+            tokio::spawn(shield_event_writer.run());
+
             // Build the proxy-log storage backend (ClickHouse when enabled, else
             // TimescaleDB) and wire it into the read service the handlers use.
             // When ClickHouse is NOT configured this resolves to the default
@@ -157,6 +169,7 @@ impl TempsPlugin for ProxyPlugin {
             context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(project_ip_access_service);
+            context.register_service(shield_events as Arc<dyn temps_shield::EventSink>);
 
             tracing::debug!("Proxy plugin services registered successfully");
             Ok(())

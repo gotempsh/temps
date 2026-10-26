@@ -3,129 +3,40 @@
 
 //! Shield at the proxy (ADR 066).
 //!
-//! Phase 1, the attack-mode challenge, is this module. Phase 2's
-//! reputation lists are [`ShieldLists`], what every request is checked against,
-//! and [`ShieldSources`], the control-plane jobs that fetch and compile them.
+//! Every request to a project goes through one [`temps_shield::ShieldEngine`]
+//! decision ([`ProxyShield`]), with the reputation lists ([`ShieldLists`],
+//! fetched and compiled by [`ShieldSources`]), the environment's mode,
+//! exempt paths and [`BypassTokens`]. Decisions other than `pass` are
+//! recorded through the [`ShieldEventStore`].
 //!
 //! The proxy issues a signed proof-of-work token with the challenge page,
 //! verifies the solution itself at [`VERIFY_PATH`], and admits later
 //! requests on a signed clearance cookie. The visitor identity both are
-//! bound to is computed here from the connection; nothing the client sends
-//! in a body decides who it is or which environment it cleared.
+//! bound to is computed from the connection; nothing the client sends in a
+//! body decides who it is or which environment it cleared.
 
+mod bypass;
+pub mod event_store;
+mod ingress;
 mod ja4_hook;
 mod lists;
 mod sources;
 
+pub use bypass::{BypassTokens, POLL_INTERVAL as BYPASS_POLL_INTERVAL};
+pub use event_store::{EventBackend, ShieldEventStore, ShieldEventWriter};
+pub use ingress::{decision_event, verify_event, EventContext, ProxyShield, CRAWLER_CHECK_TIMEOUT};
 pub use ja4_hook::Ja4Hook;
 pub use lists::{ShieldLists, ShieldListsError, POLL_INTERVAL};
 pub use sources::{Fetched, ShieldSources, SourceError};
 
-use pingora::http::StatusCode;
-use serde::Deserialize;
-use temps_shield::{ChallengeError, ChallengeGate, ShieldKeys, VisitorIdentity, VisitorNetwork};
+use temps_shield::{ChallengeGate, ShieldKeys};
 
 pub use temps_shield::assets::{challenge_page, MAX_VERIFY_BODY, VERIFY_PATH};
-
-/// Leading zero bits a challenge requires: about a million hashes, one to
-/// two seconds in a current browser.
-pub const CHALLENGE_DIFFICULTY: u8 = 20;
 
 /// The challenge gate for this process, keyed from the master key so every
 /// ingress that holds it signs and verifies the same tokens.
 pub fn challenge_gate(encryption: &temps_core::EncryptionService) -> ChallengeGate {
     ChallengeGate::new(ShieldKeys::derive(|label| encryption.derive_subkey(label)))
-}
-
-/// The visitor as this request's connection presents it: the resolved client
-/// address, the User-Agent, and the TLS fingerprint (until the JA4 of phase 3
-/// replaces it).
-pub fn visitor_identity(
-    client_ip: Option<&str>,
-    user_agent: &str,
-    tls_fingerprint: Option<&str>,
-) -> VisitorIdentity {
-    let source = match tls_fingerprint {
-        Some(fingerprint) => format!("tls:{fingerprint}"),
-        None => "none:direct".to_string(),
-    };
-    VisitorIdentity::compute(
-        client_ip.and_then(|ip| ip.parse().ok()),
-        user_agent,
-        &source,
-    )
-}
-
-/// The network `client_ip` belongs to, for the per-network share of the
-/// redeemed-token set.
-pub fn visitor_network(client_ip: Option<&str>) -> VisitorNetwork {
-    VisitorNetwork::of(client_ip.and_then(|ip| ip.parse().ok()))
-}
-
-#[derive(Debug, Deserialize)]
-struct VerifyBody {
-    token: String,
-    nonce: String,
-    /// How long the browser took, for the difficulty measurements of D6.
-    #[serde(default)]
-    solve_ms: Option<u64>,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum VerifyOutcome {
-    /// The solution holds: store this `Set-Cookie` value, the clearance for
-    /// `env_id`.
-    Cleared {
-        env_id: i32,
-        set_cookie: String,
-        solve_ms: Option<u64>,
-    },
-    /// A well-formed request whose token or solution does not hold.
-    Rejected(ChallengeError),
-    /// Not a verify request body at all.
-    BadRequest,
-}
-
-/// Verifies a posted solution for the visitor the proxy resolved for this
-/// request. The clearance is for the environment the signed token names,
-/// whichever environment the verify path itself resolved to.
-pub fn verify(
-    gate: &ChallengeGate,
-    body: &[u8],
-    identity: &VisitorIdentity,
-    network: VisitorNetwork,
-    now: u64,
-) -> VerifyOutcome {
-    let Ok(body) = serde_json::from_slice::<VerifyBody>(body) else {
-        return VerifyOutcome::BadRequest;
-    };
-    match gate.redeem(&body.token, &body.nonce, identity, network, now) {
-        Ok(clearance) => VerifyOutcome::Cleared {
-            env_id: clearance.env_id,
-            set_cookie: clearance.set_cookie(),
-            solve_ms: body.solve_ms,
-        },
-        Err(error) => VerifyOutcome::Rejected(error),
-    }
-}
-
-/// The status and short reason a rejected verify returns to the page. A
-/// full redeemed set is the ingress's limit and a full network share is a
-/// rate limit, not a bad solution; the page offers a retry for every one.
-pub fn rejection_response(error: ChallengeError) -> (StatusCode, &'static str) {
-    match error {
-        ChallengeError::Busy => (StatusCode::SERVICE_UNAVAILABLE, "busy"),
-        ChallengeError::NetworkBusy => (StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        ChallengeError::Expired => (StatusCode::FORBIDDEN, "expired"),
-        ChallengeError::Replayed => (StatusCode::FORBIDDEN, "replayed"),
-        ChallengeError::InsufficientWork | ChallengeError::BadNonce => {
-            (StatusCode::FORBIDDEN, "unsolved")
-        }
-        ChallengeError::Malformed
-        | ChallengeError::BadSignature
-        | ChallengeError::WrongVisitor
-        | ChallengeError::Key => (StatusCode::FORBIDDEN, "invalid"),
-    }
 }
 
 #[cfg(test)]
@@ -137,53 +48,4 @@ pub(crate) fn test_gate() -> ChallengeGate {
         }
         key
     }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn identity_tracks_the_tls_fingerprint() {
-        let ua = "Mozilla/5.0";
-        let a = visitor_identity(Some("203.0.113.9"), ua, Some("t13_aa"));
-        assert_eq!(
-            a,
-            visitor_identity(Some("203.0.113.10"), ua, Some("t13_aa"))
-        );
-        assert_ne!(a, visitor_identity(Some("203.0.113.9"), ua, Some("t13_bb")));
-        assert_ne!(a, visitor_identity(Some("203.0.113.9"), ua, None));
-    }
-
-    #[test]
-    fn capacity_refusals_are_not_forbidden() {
-        assert_eq!(
-            rejection_response(ChallengeError::Busy),
-            (StatusCode::SERVICE_UNAVAILABLE, "busy")
-        );
-        assert_eq!(
-            rejection_response(ChallengeError::NetworkBusy),
-            (StatusCode::TOO_MANY_REQUESTS, "rate_limited")
-        );
-        assert_eq!(
-            rejection_response(ChallengeError::WrongVisitor),
-            (StatusCode::FORBIDDEN, "invalid")
-        );
-    }
-
-    #[test]
-    fn verify_rejects_bodies_that_are_not_solutions() {
-        let gate = test_gate();
-        let who = visitor_identity(Some("203.0.113.9"), "ua", Some("t13_aa"));
-        let net = visitor_network(Some("203.0.113.9"));
-        assert_eq!(verify(&gate, b"", &who, net, 0), VerifyOutcome::BadRequest);
-        assert_eq!(
-            verify(&gate, br#"{"challenge":"x","nonce":"1"}"#, &who, net, 0),
-            VerifyOutcome::BadRequest
-        );
-        assert_eq!(
-            verify(&gate, br#"{"token":"x","nonce":"1"}"#, &who, net, 0),
-            VerifyOutcome::Rejected(ChallengeError::Malformed)
-        );
-    }
 }
