@@ -63,6 +63,11 @@ pub struct RouteEntry {
     /// routes in `gated_routes`, here and in `routes.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<temps_core::gate::GatePolicy>,
+    /// The environment's Shield settings (ADR 066, D10). The lookup index
+    /// keeps them in [`crate::shield::WorkerShield`] instead, so a request
+    /// does not clone them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,6 +110,17 @@ pub struct PublicIngressSnapshot {
     /// none of them, open, for the rest of its lease.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gated_routes: Vec<RouteEntry>,
+    /// Routes whose environment acts on verdicts (ADR 066, D10), each with
+    /// its Shield settings. Never in `routes` or `gated_routes`, here or in
+    /// `routes.json`: an agent rolled back to a version without Shield
+    /// reads that file and ignores this field, so it serves none of them
+    /// unprotected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shield_routes: Vec<RouteEntry>,
+    /// The current Shield snapshot revision, when the control plane runs
+    /// Shield on workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield: Option<temps_core::worker_shield::ShieldRef>,
 }
 
 /// Where a `tailnet_users` Serve socket sends requests, and who it admits.
@@ -131,6 +147,35 @@ impl PublicIngressSnapshot {
                 warn!(host = %route.host, "dropping a signed-in route that names no gate");
             }
             route.gate.is_some()
+        });
+    }
+
+    /// ADR 066 D10: move every route that acts on verdicts out of `routes`
+    /// and `gated_routes`, whatever put it there, and drop any route in
+    /// `shield_routes` that carries no Shield settings (it would be served
+    /// unprotected).
+    fn separate_shielded(&mut self) {
+        let enforces = |route: &RouteEntry| {
+            route
+                .shield
+                .as_ref()
+                .is_some_and(|policy| crate::shield::policy_mode(policy).enforces())
+        };
+        let (shielded, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.routes)
+            .into_iter()
+            .partition(enforces);
+        self.routes = open;
+        self.shield_routes.extend(shielded);
+        let (shielded, gated): (Vec<_>, Vec<_>) = std::mem::take(&mut self.gated_routes)
+            .into_iter()
+            .partition(enforces);
+        self.gated_routes = gated;
+        self.shield_routes.extend(shielded);
+        self.shield_routes.retain(|route| {
+            if route.shield.is_none() {
+                warn!(host = %route.host, "dropping a Shield route that carries no Shield settings");
+            }
+            route.shield.is_some()
         });
     }
 
@@ -264,6 +309,9 @@ pub struct RouteStore {
     public_tls_keys: ArcSwap<HashMap<String, Arc<CertifiedKey>>>,
     public_ingress_expires_at: AtomicI64,
     snapshot_path: PathBuf,
+    /// Shield on this worker's public ingress (ADR 066, D10, I5): the
+    /// loaded snapshot, the challenge gate and each route's settings.
+    shield: Arc<crate::shield::WorkerShield>,
 }
 
 impl RouteStore {
@@ -281,8 +329,17 @@ impl RouteStore {
             public_tls_private_key: RwLock::new(None),
             public_tls_keys: ArcSwap::from_pointee(HashMap::new()),
             public_ingress_expires_at: AtomicI64::new(0),
+            shield: Arc::new(crate::shield::WorkerShield::new(
+                snapshot_path.with_file_name(crate::shield::SNAPSHOT_FILE),
+            )),
             snapshot_path,
         }
+    }
+
+    /// Shield on this worker's public ingress, which reads its routes from
+    /// this store.
+    pub fn shield(&self) -> &Arc<crate::shield::WorkerShield> {
+        &self.shield
     }
 
     /// Replace the in-memory store with the given snapshot, persist
@@ -328,6 +385,7 @@ impl RouteStore {
     pub fn apply_public_snapshot(&self, mut snapshot: PublicIngressSnapshot) {
         snapshot.separate_gated();
         snapshot.separate_tailnet_users();
+        snapshot.separate_shielded();
         if !snapshot.enabled {
             self.public_enabled.store(false, Ordering::Release);
         }
@@ -536,6 +594,7 @@ impl RouteStore {
         };
         public_ingress.separate_gated();
         public_ingress.separate_tailnet_users();
+        public_ingress.separate_shielded();
         *self.public_ingress.write() = public_ingress;
         self.public_enabled
             .store(self.public_ingress.read().enabled, Ordering::Release);
@@ -632,21 +691,38 @@ impl RouteStore {
                 })
                 .collect(),
         ));
-        // A signed-in route comes last, so it wins over an open one for the
-        // same host.
-        self.public_routes.store(Arc::new(
-            snapshot
-                .routes
-                .iter()
-                .chain(&snapshot.gated_routes)
-                .map(|route| {
-                    (
-                        route.host.trim_end_matches('.').to_ascii_lowercase(),
-                        route.clone(),
-                    )
-                })
-                .collect(),
-        ));
+        // A signed-in route comes after an open one, and a Shield route
+        // last, so the stricter one wins for the same host. Shield settings
+        // go to the Shield index, not in the entry a request clones.
+        let mut policies = HashMap::new();
+        let mut public_routes = HashMap::new();
+        for route in snapshot
+            .routes
+            .iter()
+            .chain(&snapshot.gated_routes)
+            .chain(&snapshot.shield_routes)
+        {
+            let host = route.host.trim_end_matches('.').to_ascii_lowercase();
+            match &route.shield {
+                Some(policy) => {
+                    policies.insert(host.clone(), crate::shield::env_policy(policy));
+                }
+                None => {
+                    policies.remove(&host);
+                }
+            }
+            public_routes.insert(
+                host,
+                RouteEntry {
+                    shield: None,
+                    ..route.clone()
+                },
+            );
+        }
+        // Settings before routes: a route that just gained Shield is never
+        // found without them.
+        self.shield.set_routes(policies, snapshot.shield);
+        self.public_routes.store(Arc::new(public_routes));
         *self.public_certificates.write() = snapshot.certificates.as_ref().map(|certificates| {
             (
                 certificates.ephemeral_public_key.clone(),
@@ -825,6 +901,7 @@ mod tests {
             project_id,
             environment_id: Some(1),
             gate: None,
+            shield: None,
         }
     }
 
@@ -1119,6 +1196,8 @@ mod tests {
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
+            shield_routes: Vec::new(),
+            shield: None,
         });
 
         assert!(store.lookup_public("example.com").is_some());

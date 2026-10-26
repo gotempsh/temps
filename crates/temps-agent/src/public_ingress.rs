@@ -97,6 +97,7 @@ pub fn record_failure(error: impl Into<String>) {
 fn served_route_count(snapshot: &crate::route_store::PublicIngressSnapshot) -> usize {
     snapshot.routes.len()
         + snapshot.gated_routes.len()
+        + snapshot.shield_routes.len()
         + snapshot.private_routes.len()
         + snapshot.identity_private_routes.len()
 }
@@ -547,6 +548,7 @@ mod tests {
             project_id: None,
             environment_id: None,
             gate: None,
+            shield: None,
         }
     }
 

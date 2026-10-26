@@ -47,6 +47,7 @@ impl IngressHarness {
                 project_id: Some(42),
                 environment_id: Some(43),
                 gate: None,
+                shield: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
@@ -57,6 +58,8 @@ impl IngressHarness {
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
+            shield_routes: Vec::new(),
+            shield: None,
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -158,6 +161,8 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        shield_routes: Vec::new(),
+        shield: None,
     });
     store
 }
@@ -550,6 +555,7 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
                 project_id: None,
                 environment_id: None,
                 gate: None,
+                shield: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
@@ -560,6 +566,8 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
+            shield_routes: Vec::new(),
+            shield: None,
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -738,6 +746,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             project_id: Some(52),
             environment_id: Some(53),
             gate: None,
+            shield: None,
         }],
         certificates: Some(PublicIngressCertificates {
             ephemeral_public_key: encryption.ephemeral_public_key().to_string(),
@@ -763,6 +772,8 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        shield_routes: Vec::new(),
+        shield: None,
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -913,6 +924,8 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        shield_routes: Vec::new(),
+        shield: None,
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(
@@ -1401,6 +1414,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
             project_id: Some(52),
             environment_id: Some(53),
             gate: None,
+            shield: None,
         },
         address_id: "custom:9".to_string(),
         range: range.to_string(),
@@ -1452,6 +1466,8 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        shield_routes: Vec::new(),
+        shield: None,
     });
     let shutdown = Arc::new(Notify::new());
     let private = public_ingress::spawn(
@@ -1625,12 +1641,15 @@ fn serve_snapshot(
                 project_id: Some(62),
                 environment_id: Some(63),
                 gate: None,
+                shield: None,
             }),
             addrs: Vec::new(),
             principals,
         }],
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        shield_routes: Vec::new(),
+        shield: None,
         gated_routes: Vec::new(),
     }
 }
