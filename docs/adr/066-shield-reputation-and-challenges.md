@@ -5,8 +5,9 @@
 Proposed — 2026-10-25. Phase 1 (the challenge fix) shipped with this ADR.
 Phase 2 (reputation lists in `log` mode) shipped on 2026-10-26, with a
 correction to what D2 said about the lists' terms. Phase 3 (JA4) is being
-implemented in the order its entry in Phases gives, starting with the
-parser; the later phases are proposed. File and line references are to
+implemented in the order its entry in Phases gives: the parser, then the
+control plane for direct, Cloudflare and Bunny clients, are done; the later
+phases are proposed. File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
@@ -703,8 +704,9 @@ L4Stream)`, installed with `Listeners::set_pre_tls_callback`
 (`listeners/mod.rs:149, 481`). `L4Stream::rewind(&[u8])`
 (`protocols/l4/stream.rs:522`) feeds bytes back to the next reader.
 
-1. `Ja4PreTls::process` reads the PROXY header when the peer is allowed
-   (D4), then 5 bytes, asks `ja4::needed`, reads the rest, and rewinds
+1. `Ja4Hook::process` (`temps-proxy/src/shield/ja4_hook.rs`) reads the
+   PROXY header when the peer is allowed (D4; not yet, see Phases), then
+   reads until `ja4::needed` says the hello is whole, and rewinds
    everything it read after the PROXY header. A 2 s timeout covers the whole
    read; on timeout or `ParseError` it rewinds and returns `Ok(())`, so the
    connection behaves as it does today.
@@ -713,10 +715,17 @@ L4Stream)`, installed with `Listeners::set_pre_tls_callback`
 3. `DynamicCertLoader::handshake_complete_callback` (`server.rs:268`) reads
    the client random from the `SslRef` (`client_random`), removes the entry
    and stores it in a new `TlsExtensionData.ja4` field. From there the JA4
-   lives exactly as long as the connection, and `extract_tls_info`
-   (`proxy.rs:1746`) copies it into `ProxyContext.ja4`.
-4. The trust chain of D4 runs in `resolve_session_client_ip`, renamed
-   `resolve_session_client` and returning address and fingerprint together.
+   lives exactly as long as the connection.
+4. `extract_tls_info` (`proxy.rs:1746`) runs the trust chain of D4 in
+   `resolve_client_fingerprint` and stores the result, JA4 and source, as
+   `ProxyContext.client_fingerprint`. It takes the peer and headers the
+   client address resolution takes, and the same loopback trust: a trusted
+   local proxy gives source `local` and no JA4 until `proxy.ja4_header` is
+   set; Cloudflare's addresses give `cf-ja4`, Bunny's `cdn-ja4`, each
+   checked with `Ja4::parse_forwarded`; anyone else gives the computed JA4.
+   `strip_untrusted_client_ip_headers` removes `cf-ja4`, `cdn-ja4`,
+   `cloudfront-viewer-ja4-fingerprint` and `X-Temps-Edge-Client` before
+   any request goes upstream.
 
 The client-random map exists because `SocketDigest` has no slot for
 application data. A client chooses its own random and cannot know another
@@ -816,8 +825,10 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   `ja4 LowCardinality(String) DEFAULT ''` and
   `ja4_source LowCardinality(String) DEFAULT ''`, as new entries in
   `storage/clickhouse_migrations.rs`. Phase 2 adds the first two
-  (`0005_shield_verdict.sql`); the JA4 columns come with phase 3. "Would have blocked" counts come from
-  here.
+  (`0005_shield_verdict.sql`), phase 3 the JA4 columns
+  (`0006_ja4.sql`, and nullable `ja4` and `ja4_source` on the Postgres
+  table). The request log API returns all four. "Would have blocked"
+  counts come from here.
 - New ClickHouse table `shield_events`, created through `temps-clickhouse`
   migrations: timestamp, project and environment ids, node id, request id,
   ip `IPv6`, ja4, verdict `Enum8`, reasons, signature, host, path, user

@@ -38,7 +38,7 @@ use crate::traffic_aggregation::{
 /// path. NOTE: `trace_id` and `error_group_id` are intentionally omitted here to
 /// match the original behaviour (they exist on the entity but were never written
 /// by the batch path).
-const INSERT_COLUMNS: [&str; 37] = [
+const INSERT_COLUMNS: [&str; 39] = [
     "timestamp",
     "method",
     "path",
@@ -76,6 +76,8 @@ const INSERT_COLUMNS: [&str; 37] = [
     "created_date",
     "shield_verdict",
     "shield_reasons",
+    "ja4",
+    "ja4_source",
 ];
 
 /// Foreign-key parents a row of `proxy_logs` pins with `FOR KEY SHARE` while
@@ -235,6 +237,8 @@ impl TimescaleDbProxyLogStore {
                 crate::service::proxy_log_service::shield_reasons_to_json(&entry.shield_reasons)
                     .into(),
             ); // shield_reasons
+            params.push(entry.ja4.clone().into()); // ja4
+            params.push(entry.ja4_source.clone().into()); // ja4_source
         }
 
         self.db
@@ -867,6 +871,8 @@ mod tests {
             error_group_id: None,
             shield_verdict: None,
             shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         }
     }
 
@@ -933,11 +939,11 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_columns_are_37() {
-        // Regression guard: the prior batch_insert wrote exactly 35 columns,
-        // and Shield's verdict and reasons (ADR 066) make 37. trace_id /
-        // error_group_id are intentionally excluded.
-        assert_eq!(INSERT_COLUMNS.len(), 37);
+    fn test_insert_columns_are_39() {
+        // Regression guard: the prior batch_insert wrote exactly 35 columns;
+        // Shield's verdict and reasons and the JA4 and its source (ADR 066)
+        // make 39. trace_id / error_group_id are intentionally excluded.
+        assert_eq!(INSERT_COLUMNS.len(), 39);
         assert!(!INSERT_COLUMNS.contains(&"trace_id"));
         assert!(!INSERT_COLUMNS.contains(&"error_group_id"));
         assert!(!INSERT_COLUMNS.contains(&"id"));
@@ -1072,6 +1078,8 @@ mod tests {
             session_uuid: None,
             shield_verdict: None,
             shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         };
         store
             .write_batch(&[

@@ -324,6 +324,10 @@ pub struct ChProxyLogRow {
     pub shield_verdict: String,
     /// shield_reasons Array(LowCardinality(String))
     pub shield_reasons: Vec<String>,
+    /// ja4 LowCardinality(String) DEFAULT '' (0006_ja4.sql)
+    pub ja4: String,
+    /// ja4_source LowCardinality(String) DEFAULT ''
+    pub ja4_source: String,
 }
 
 impl From<&CreateProxyLogRequest> for ChProxyLogRow {
@@ -393,6 +397,8 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
             retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
             shield_verdict: entry.shield_verdict.clone().unwrap_or_default(),
             shield_reasons: entry.shield_reasons.clone(),
+            ja4: entry.ja4.clone().unwrap_or_default(),
+            ja4_source: entry.ja4_source.clone().unwrap_or_default(),
         }
     }
 }
@@ -447,6 +453,8 @@ struct ChProxyLogReadRow {
     response_headers: String,
     shield_verdict: String,
     shield_reasons: Vec<String>,
+    ja4: String,
+    ja4_source: String,
 }
 
 /// Parse a stored header blob into JSON for the entity model.
@@ -532,6 +540,8 @@ impl ChProxyLogReadRow {
             shield_reasons: crate::service::proxy_log_service::shield_reasons_to_json(
                 &self.shield_reasons,
             ),
+            ja4: opt_str(self.ja4),
+            ja4_source: opt_str(self.ja4_source),
         }
     }
 }
@@ -1181,7 +1191,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
                 cache_status, '' AS request_headers, '' AS response_headers, \
-                shield_verdict, shield_reasons \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_by} \
@@ -1240,7 +1250,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
                 cache_status, '' AS request_headers, '' AS response_headers, \
-                shield_verdict, shield_reasons \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_by} \
@@ -1305,7 +1315,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
                 cache_status, request_headers, response_headers, \
-                shield_verdict, shield_reasons \
+                shield_verdict, shield_reasons, ja4, ja4_source \
              FROM proxy_logs \
              WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
@@ -2538,6 +2548,8 @@ mod tests {
             session_uuid: None,
             shield_verdict: None,
             shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         }
     }
 
@@ -3041,11 +3053,80 @@ mod tests {
             response_headers: String::new(),
             shield_verdict: row.shield_verdict,
             shield_reasons: row.shield_reasons,
+            ja4: row.ja4,
+            ja4_source: row.ja4_source,
         }
         .into_model();
         let response = crate::service::proxy_log_service::ProxyLogResponse::from(model);
         assert_eq!(response.shield_verdict.as_deref(), Some("block"));
         assert_eq!(response.shield_reasons, ["spamhaus_drop (192.0.2.0/24)"]);
+    }
+
+    #[test]
+    fn ja4_round_trips_through_clickhouse_rows() {
+        let mut entry = make_entry("req-ja4");
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!((row.ja4.as_str(), row.ja4_source.as_str()), ("", ""));
+
+        entry.ja4 = Some("t13d1516h2_8daaf6152771_e5627efa2ab1".into());
+        entry.ja4_source = Some("cloudflare".into());
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.ja4, "t13d1516h2_8daaf6152771_e5627efa2ab1");
+        assert_eq!(row.ja4_source, "cloudflare");
+
+        let read = |ja4: String, ja4_source: String| {
+            let model = ChProxyLogReadRow {
+                timestamp_ms: 1_717_200_000_000,
+                method: "GET".into(),
+                path: "/".into(),
+                query_string: String::new(),
+                host: "h".into(),
+                status_code: 200,
+                response_time_ms: None,
+                request_source: "proxy".into(),
+                is_system_request: 0,
+                routing_status: "routed".into(),
+                project_id: None,
+                environment_id: None,
+                deployment_id: None,
+                session_id: None,
+                visitor_id: None,
+                container_id: String::new(),
+                upstream_host: String::new(),
+                error_message: String::new(),
+                client_ip: "192.0.2.9".into(),
+                user_agent: String::new(),
+                referrer: String::new(),
+                request_id: "rid".into(),
+                ip_geolocation_id: None,
+                browser: String::new(),
+                browser_version: String::new(),
+                operating_system: String::new(),
+                device_type: String::new(),
+                is_bot: None,
+                bot_name: String::new(),
+                request_size_bytes: None,
+                response_size_bytes: None,
+                cache_status: String::new(),
+                request_headers: String::new(),
+                response_headers: String::new(),
+                shield_verdict: String::new(),
+                shield_reasons: Vec::new(),
+                ja4,
+                ja4_source,
+            }
+            .into_model();
+            crate::service::proxy_log_service::ProxyLogResponse::from(model)
+        };
+        let response = read(row.ja4, row.ja4_source);
+        assert_eq!(
+            response.ja4.as_deref(),
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1")
+        );
+        assert_eq!(response.ja4_source.as_deref(), Some("cloudflare"));
+        // ClickHouse's empty default reads back as absent.
+        let response = read(String::new(), String::new());
+        assert_eq!((response.ja4, response.ja4_source), (None, None));
     }
 
     #[test]
@@ -3100,6 +3181,8 @@ mod tests {
             response_headers: String::new(),
             shield_verdict: String::new(),
             shield_reasons: Vec::new(),
+            ja4: String::new(),
+            ja4_source: String::new(),
         };
         let model = read.into_model();
         assert_eq!(model.id, 0);

@@ -147,6 +147,13 @@ pub struct ProxyLogResponse {
     /// The lists that hold the client, and the range on each.
     #[schema(example = json!(["spamhaus_drop (192.0.2.0/24)"]))]
     pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint, when its source gives one.
+    #[schema(example = "t13d1516h2_8daaf6152771_e5627efa2ab1")]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`.
+    #[schema(example = "direct")]
+    pub ja4_source: Option<String>,
 }
 
 /// The stored reasons, a JSON array of strings; anything else reads as none.
@@ -226,6 +233,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             response_headers: headers_from_json(model.response_headers),
             shield_verdict: model.shield_verdict,
             shield_reasons: shield_reasons_from_json(model.shield_reasons),
+            ja4: model.ja4,
+            ja4_source: model.ja4_source,
         }
     }
 }
@@ -288,6 +297,14 @@ pub struct CreateProxyLogRequest {
     /// `shield_verdict` is `None`.
     #[serde(default)]
     pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint (ADR 066 D4). `None` when its
+    /// source gives none: plain HTTP, a CDN without the header.
+    #[serde(default)]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`. `None` when the client could not be resolved.
+    #[serde(default)]
+    pub ja4_source: Option<String>,
 }
 
 pub struct ProxyLogService {
@@ -4100,6 +4117,8 @@ mod tests {
             error_group_id: None,
             shield_verdict: None,
             shield_reasons: None,
+            ja4: None,
+            ja4_source: None,
         }
     }
 

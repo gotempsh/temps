@@ -382,6 +382,7 @@ mod m20261025_000001_private_audience;
 mod m20261026_000001_create_shield;
 mod m20261026_000001_tailnet_serve;
 mod m20261026_000002_tailnet_principals;
+mod m20261026_000003_add_ja4_to_proxy_logs;
 
 pub struct Migrator;
 
@@ -856,6 +857,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000001_tailnet_serve::Migration),
             // ADR 065 D6: `tailnet_users` and who it admits.
             Box::new(m20261026_000002_tailnet_principals::Migration),
+            // ADR 066 phase 3: the client's JA4 on the request log.
+            Box::new(m20261026_000003_add_ja4_to_proxy_logs::Migration),
         ]
     }
 }

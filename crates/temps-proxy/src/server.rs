@@ -124,6 +124,9 @@ fn start_forwarded_ip_trust_refresh(
 pub struct TlsExtensionData {
     /// SNI hostname captured during TLS handshake
     pub sni_hostname: String,
+    /// The client's JA4, from the ClientHello the pre-TLS hook read
+    /// (ADR 066, I6). `None` when it could not be read.
+    pub ja4: Option<temps_shield::ja4::Ja4>,
 }
 
 /// How the TLS callback treats an SNI hostname.
@@ -160,6 +163,9 @@ struct DynamicCertLoader {
     /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
     /// the handshake). `None` preserves the pre-ADR behavior exactly.
     on_demand_cert_manager: Option<Arc<crate::on_demand_cert::OnDemandCertManager>>,
+    /// Holds each connection's JA4 from the pre-TLS hook until the handshake
+    /// completes.
+    ja4_hook: Arc<crate::shield::Ja4Hook>,
 }
 
 #[async_trait]
@@ -280,7 +286,17 @@ impl TlsAccept for DynamicCertLoader {
 
         debug!("TLS handshake complete for SNI: {}", sni);
 
-        Some(Arc::new(TlsExtensionData { sni_hostname: sni }))
+        let mut random = [0u8; 32];
+        let ja4 = if ssl_ref.client_random(&mut random) == random.len() {
+            self.ja4_hook.take(&random).await
+        } else {
+            None
+        };
+
+        Some(Arc::new(TlsExtensionData {
+            sni_hostname: sni,
+            ja4,
+        }))
     }
 }
 
@@ -768,10 +784,14 @@ pub fn setup_proxy_server(
         // taken from the proxy config; `None` keeps the legacy fail-fast-only
         // behavior. tls_cert_loader stays a pure DB lookup — the manager lives
         // only in DynamicCertLoader, never in the loader (ADR §7).
+        // ADR 066, I6: the JA4 is read from the raw ClientHello before
+        // OpenSSL sees it, and handed to the handshake callback.
+        let ja4_hook = Arc::new(crate::shield::Ja4Hook::default());
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
             cert_loader,
             route_table: route_table.clone(),
             on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
+            ja4_hook: ja4_hook.clone(),
         });
 
         // Create TLS settings with dynamic certificate callback and HTTP/2 support
@@ -782,6 +802,8 @@ pub fn setup_proxy_server(
         tls_settings.enable_h2();
 
         proxy_service.add_tls_with_settings(tls_address, None, tls_settings);
+        // Runs only on TLS endpoints: Pingora calls it before the handshake.
+        proxy_service.endpoints().set_pre_tls_callback(ja4_hook);
         debug!(
             "TLS listener configured on {} with HTTP/2 support",
             tls_address

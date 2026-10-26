@@ -512,6 +512,8 @@ mod proxy_logs {
         error_group_id: Option<i32>,
         shield_verdict: Option<String>,
         shield_reasons: Option<serde_json::Value>,
+        ja4: Option<String>,
+        ja4_source: Option<String>,
     }
 
     const SELECT: &str = "SELECT \
@@ -521,7 +523,7 @@ mod proxy_logs {
         client_ip, user_agent, referrer, request_id, ip_geolocation_id, browser, browser_version, \
         operating_system, device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
         cache_status, request_headers::text AS request_headers, response_headers::text AS response_headers, \
-        trace_id, error_group_id, shield_verdict, shield_reasons \
+        trace_id, error_group_id, shield_verdict, shield_reasons, ja4, ja4_source \
         FROM proxy_logs \
         WHERE timestamp >= $1 AND timestamp <= $2 \
           AND (timestamp, id) > ($3, $4) \
@@ -575,6 +577,8 @@ mod proxy_logs {
             shield_reasons: temps_proxy::service::proxy_log_service::shield_reasons_from_json(
                 r.shield_reasons.clone(),
             ),
+            ja4: r.ja4.clone().unwrap_or_default(),
+            ja4_source: r.ja4_source.clone().unwrap_or_default(),
         }
     }
 

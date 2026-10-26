@@ -13,9 +13,11 @@
 //! bound to is computed here from the connection; nothing the client sends
 //! in a body decides who it is or which environment it cleared.
 
+mod ja4_hook;
 mod lists;
 mod sources;
 
+pub use ja4_hook::Ja4Hook;
 pub use lists::{ShieldLists, ShieldListsError, POLL_INTERVAL};
 pub use sources::{Fetched, ShieldSources, SourceError};
 

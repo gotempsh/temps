@@ -337,6 +337,44 @@ impl fmt::Debug for Ja4 {
     }
 }
 
+/// Where a request's JA4 came from (D4). It follows the client-address
+/// trust chain: a proxy that ends TLS in front of temps gives its own
+/// ClientHello, so only that proxy's header can carry the visitor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ja4Source {
+    /// Computed by this ingress from the connection's ClientHello.
+    Direct,
+    /// `cf-ja4` from a Cloudflare address.
+    Cloudflare,
+    /// `CDN-JA4` from a Bunny address.
+    Bunny,
+    /// A trusted proxy on loopback.
+    Local,
+    /// A registered temps edge.
+    Edge,
+}
+
+impl Ja4Source {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Cloudflare => "cloudflare",
+            Self::Bunny => "bunny",
+            Self::Local => "local",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+/// A request's client fingerprint. `ja4` is `None` when the source gives
+/// none: plain HTTP, Cloudflare without Bot Management, most local proxies.
+/// Having none is not suspicious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientFingerprint {
+    pub ja4: Option<Ja4>,
+    pub source: Ja4Source,
+}
+
 pub fn ja4(hello: &ClientHello, transport: Transport) -> Ja4 {
     let mut out = [b'0'; 36];
     out[..10].copy_from_slice(&prefix(hello, transport));

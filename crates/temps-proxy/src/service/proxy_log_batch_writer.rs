@@ -873,6 +873,8 @@ mod tests {
             error_group_id: None,
             shield_verdict: None,
             shield_reasons: Vec::new(),
+            ja4: None,
+            ja4_source: None,
         }
     }
 

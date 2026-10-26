@@ -37593,6 +37593,22 @@
           "is_system_request": {
             "type": "boolean"
           },
+          "ja4": {
+            "description": "The client's JA4 TLS fingerprint, when its source gives one.",
+            "example": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4_source": {
+            "description": "Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or\n`edge`.",
+            "example": "direct",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "method": {
             "type": "string"
           },

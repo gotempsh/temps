@@ -23129,6 +23129,15 @@ export type ProxyLogResponse = {
     ip_geolocation_id?: number | null;
     is_bot?: boolean | null;
     is_system_request: boolean;
+    /**
+     * The client's JA4 TLS fingerprint, when its source gives one.
+     */
+    ja4?: string | null;
+    /**
+     * Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+     * `edge`.
+     */
+    ja4_source?: string | null;
     method: string;
     operating_system?: string | null;
     path: string;
