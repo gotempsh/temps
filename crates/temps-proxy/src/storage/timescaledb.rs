@@ -43,7 +43,7 @@ const _: () = assert!(TIMESCALE_ROWS_PER_INSERT * INSERT_COLUMNS.len() < 65_535)
 /// path. NOTE: `trace_id` and `error_group_id` are intentionally omitted here to
 /// match the original behaviour (they exist on the entity but were never written
 /// by the batch path).
-const INSERT_COLUMNS: [&str; 35] = [
+const INSERT_COLUMNS: [&str; 37] = [
     "timestamp",
     "method",
     "path",
@@ -79,6 +79,8 @@ const INSERT_COLUMNS: [&str; 35] = [
     "request_headers",
     "response_headers",
     "created_date",
+    "shield_verdict",
+    "shield_reasons",
 ];
 
 /// Foreign-key parents a row of `proxy_logs` pins with `FOR KEY SHARE` while
@@ -244,6 +246,10 @@ async fn insert_rows<C: ConnectionTrait>(
         params.push(entry.request_headers.clone().into()); // request_headers
         params.push(entry.response_headers.clone().into()); // response_headers
         params.push(created_date.into()); // created_date
+        params.push(entry.shield_verdict.clone().into()); // shield_verdict
+        params.push(
+            crate::service::proxy_log_service::shield_reasons_to_json(&entry.shield_reasons).into(),
+        ); // shield_reasons
     }
 
     conn.execute(Statement::from_sql_and_values(
@@ -888,6 +894,8 @@ mod tests {
             response_headers: None,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: None,
+            shield_reasons: Vec::new(),
         }
     }
 
@@ -954,10 +962,11 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_columns_are_35() {
-        // Regression guard: the prior batch_insert wrote exactly these 35
-        // columns. trace_id / error_group_id are intentionally excluded.
-        assert_eq!(INSERT_COLUMNS.len(), 35);
+    fn test_insert_columns_are_37() {
+        // Regression guard: the prior batch_insert wrote exactly 35 columns,
+        // and Shield's verdict and reasons (ADR 066) make 37. trace_id /
+        // error_group_id are intentionally excluded.
+        assert_eq!(INSERT_COLUMNS.len(), 37);
         assert!(!INSERT_COLUMNS.contains(&"trace_id"));
         assert!(!INSERT_COLUMNS.contains(&"error_group_id"));
         assert!(!INSERT_COLUMNS.contains(&"id"));
@@ -1166,6 +1175,8 @@ mod tests {
             error_group_id: None,
             visitor_uuid: None,
             session_uuid: None,
+            shield_verdict: None,
+            shield_reasons: Vec::new(),
         };
         store
             .write_batch(&[

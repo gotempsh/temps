@@ -548,9 +548,12 @@ pub fn setup_proxy_server(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
-    ));
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(&encryption_service));
+
+    // ADR 066: the reputation lists, the built-in baseline until the loader
+    // finds a compiled snapshot in `shield_snapshots`.
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
@@ -617,13 +620,14 @@ pub fn setup_proxy_server(
         config_service.clone(),
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
         disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
     .with_proxy_metrics(proxy_metrics.clone())
-    .with_request_policy_gate(request_policy_gate);
+    .with_request_policy_gate(request_policy_gate)
+    .with_shield_lists(shield_lists);
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }
@@ -965,9 +969,11 @@ pub fn create_proxy_service(
     // owns the periodic refresh, alongside the IP block-list loop above.
     refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
-    let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-        db.clone(),
+    let challenge_gate = Arc::new(crate::shield::challenge_gate(
+        &temps_core::EncryptionService::new(&config.encryption_key)?,
     ));
+    let shield_lists = Arc::new(crate::shield::ShieldLists::default());
+    shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
 
     let project_context_resolver = Arc::new(ProjectContextResolverImpl::new(route_table.clone()))
         as Arc<dyn ProjectContextResolver>;
@@ -987,12 +993,13 @@ pub fn create_proxy_service(
         config_service,
         ip_access_control_service,
         project_ip_gate,
-        challenge_service,
+        challenge_gate,
         cert_host_cache,
         disable_https_redirect,
     )
     .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
-    .with_proxy_metrics(proxy_metrics);
+    .with_proxy_metrics(proxy_metrics)
+    .with_shield_lists(shield_lists);
 
     Ok(lb)
 }

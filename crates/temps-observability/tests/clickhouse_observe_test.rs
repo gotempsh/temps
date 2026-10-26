@@ -232,6 +232,8 @@ fn proxy_log_entry(
         response_headers: None,
         trace_id: None,
         error_group_id: None,
+        shield_verdict: None,
+        shield_reasons: Vec::new(),
     }
 }
 

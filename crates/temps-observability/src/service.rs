@@ -691,6 +691,8 @@ mod tests {
             visitor_id: None,
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
             error_group_id: Some(99),
+            shield_verdict: None,
+            shield_reasons: None,
         }
     }
 

@@ -14,9 +14,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handler::handler::LbApiDoc,
     service::{
-        challenge_service::ChallengeService, ip_access_control_service::IpAccessControlService,
-        lb_service::LbService, project_ip_access_service::ProjectIpAccessService,
-        proxy_log_service::ProxyLogService,
+        ip_access_control_service::IpAccessControlService, lb_service::LbService,
+        project_ip_access_service::ProjectIpAccessService, proxy_log_service::ProxyLogService,
     },
 };
 
@@ -139,8 +138,18 @@ impl TempsPlugin for ProxyPlugin {
             // side; enforcement is the gate installed in the proxy slot).
             let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
 
-            // Create Challenge service for CAPTCHA
-            let challenge_service = Arc::new(ChallengeService::new(db.clone()));
+            // ADR 066 D2: fetch the Shield reputation lists and compile
+            // them into the snapshots every ingress loads. Every control
+            // plane runs this; claims and an advisory lock keep it to one.
+            match crate::shield::ShieldSources::new(db.clone()) {
+                Ok(sources) => {
+                    Arc::new(sources).spawn();
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Shield lists will not be fetched: no HTTP client"
+                ),
+            }
 
             // Register the services for other plugins to use
             context.register_service(lb_service);
@@ -148,7 +157,6 @@ impl TempsPlugin for ProxyPlugin {
             context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(project_ip_access_service);
-            context.register_service(challenge_service);
 
             tracing::debug!("Proxy plugin services registered successfully");
             Ok(())
@@ -273,22 +281,6 @@ impl TempsPlugin for ProxyPlugin {
             );
 
         Some(PluginRoutes::new(router))
-    }
-
-    /// The proof-of-work CAPTCHA endpoints. A visitor of a protected
-    /// application solves the challenge with no session and from any host, so
-    /// these belong on the public router: `/api/_temps/*` is served by the
-    /// console's public-only surface (ADR-051), and a route under that prefix
-    /// that is only mounted on the admin router is unreachable from there.
-    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let captcha_state = Arc::new(crate::handler::captcha::CaptchaState {
-            db: context.require_service::<DbConnection>(),
-            challenge_service: context.require_service::<ChallengeService>(),
-        });
-
-        Some(PluginRoutes::new(
-            crate::handler::captcha::create_routes().with_state(captcha_state),
-        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
@@ -430,9 +422,6 @@ mod tests {
         let ip_access_control_service =
             Arc::new(IpAccessControlService::new(db_connection.clone()));
 
-        // Create Challenge service
-        let challenge_service = Arc::new(ChallengeService::new(db_connection.clone()));
-
         // Register all services in the service registry
         service_registry.register(db_connection.clone());
         service_registry.register(lb_service);
@@ -440,7 +429,6 @@ mod tests {
         service_registry.register(ip_access_control_service);
         service_registry.register(Arc::new(ProjectIpAccessService::new(db_connection.clone())));
         service_registry.register(Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>);
-        service_registry.register(challenge_service);
 
         let plugin_context = PluginContext::new(service_registry, state_registry);
         let plugin = ProxyPlugin::new();
