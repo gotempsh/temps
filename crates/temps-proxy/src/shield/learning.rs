@@ -995,7 +995,7 @@ mod ch {
     struct AddressRow {
         address: String,
         exploits: u64,
-        signature: String,
+        last_signature: String,
         failed: u64,
         abandoned: u64,
         new_hits: u64,
@@ -1013,7 +1013,10 @@ mod ch {
         let direct = format!("(kind = 'challenge_failed' OR {exploit})");
         let sql = format!(
             "WITH ? AS since_subjects, ? AS since_ms, ? AS judged_before \
-             SELECT address, exploits, signature, failed, \
+             SELECT address, exploits, last_signature, failed, abandoned, new_hits, \
+                 first_seen_ms, last_seen_ms \
+             FROM ( \
+             SELECT address, exploits, last_signature, failed, \
                  arrayFilter(t -> t <= judged_before \
                      AND NOT arrayExists(s -> s >= t AND s <= t + {abandon_ms}, solved), issued) \
                      AS abandoned_at, \
@@ -1025,7 +1028,7 @@ mod ch {
                  SELECT IPv6NumToString(ip) AS address, \
                      since_ms[indexOf(since_subjects, IPv6NumToString(ip))] AS since, \
                      countIf({exploit}) AS exploits, \
-                     toString(argMaxIf(signature, timestamp, {exploit})) AS signature, \
+                     toString(argMaxIf(signature, timestamp, {exploit})) AS last_signature, \
                      countIf(kind = 'challenge_failed') AS failed, \
                      countIf({direct} AND toUnixTimestamp64Milli(timestamp) > since) AS new_direct, \
                      groupArrayIf({max_challenges})(toUnixTimestamp64Milli(timestamp), \
@@ -1041,6 +1044,7 @@ mod ch {
                    AND (kind IN ('challenge_issued', 'challenge_solved', 'challenge_failed') \
                         OR {exploit}) \
                  GROUP BY ip \
+             ) \
              ) \
              WHERE exploits > 0 OR failed + abandoned >= ? \
              ORDER BY exploits DESC, address \
@@ -1065,7 +1069,7 @@ mod ch {
                 Some(AddressEvidence {
                     ip: parse_ip(&row.address)?,
                     exploits: row.exploits,
-                    signature: non_empty(Some(row.signature)),
+                    signature: non_empty(Some(row.last_signature)),
                     failed_challenges: row.failed,
                     abandoned_challenges: row.abandoned,
                     new_hits: row.new_hits,
@@ -1083,8 +1087,8 @@ mod ch {
         exploits: u64,
         new_exploits: u64,
         solved: u8,
-        user_agent: String,
-        signature: String,
+        sample_agent: String,
+        last_signature: String,
         first_seen_ms: i64,
         last_seen_ms: i64,
     }
@@ -1103,8 +1107,8 @@ mod ch {
                  countIf({exploit} AND toUnixTimestamp64Milli(timestamp) > \
                      since_ms[indexOf(since_subjects, toString(ja4))]) AS new_exploits, \
                  toUInt8(countIf(kind = 'challenge_solved') > 0) AS solved, \
-                 toString(anyIf(user_agent, NOT {exploit})) AS user_agent, \
-                 toString(argMaxIf(signature, timestamp, {exploit})) AS signature, \
+                 toString(anyIf(user_agent, NOT {exploit})) AS sample_agent, \
+                 toString(argMaxIf(signature, timestamp, {exploit})) AS last_signature, \
                  toInt64(minIf(toUnixTimestamp64Milli(timestamp), {exploit})) AS first_seen_ms, \
                  toInt64(maxIf(toUnixTimestamp64Milli(timestamp), {exploit})) AS last_seen_ms \
              FROM shield_events \
@@ -1140,8 +1144,8 @@ mod ch {
                     exploits: row.exploits,
                     new_exploits: row.new_exploits,
                     solved: row.solved > 0,
-                    user_agent: non_empty(Some(row.user_agent)),
-                    signature: non_empty(Some(row.signature)),
+                    user_agent: non_empty(Some(row.sample_agent)),
+                    signature: non_empty(Some(row.last_signature)),
                     first_seen_ms: exploited.then_some(row.first_seen_ms),
                     last_seen_ms: exploited.then_some(row.last_seen_ms),
                 })
@@ -1368,5 +1372,488 @@ mod tests {
             ..stored
         };
         assert!(needs_write(&unchanged, Some(&was_challenged)));
+    }
+
+    // ── Against the databases ───────────────────────────────────────────
+
+    use crate::shield::ShieldSources;
+    use sea_orm::{EntityTrait, QueryOrder};
+    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_entities::shield_snapshots;
+    use temps_shield::{Action, Index, ShieldSnapshot};
+
+    const BROWSER_LIKE_JA4: &str = "t13d1715h2_5b57614c22b0_3d5424432f57";
+
+    /// One event, `secs_ago` before now.
+    struct Event {
+        secs_ago: i64,
+        kind: &'static str,
+        ip: String,
+        ja4: Option<&'static str>,
+        signature: Option<&'static str>,
+        user_agent: &'static str,
+    }
+
+    fn event(secs_ago: i64, kind: &'static str, ip: &str) -> Event {
+        Event {
+            secs_ago,
+            kind,
+            ip: ip.to_string(),
+            ja4: None,
+            signature: None,
+            user_agent: "scanner/1.0",
+        }
+    }
+
+    fn exploit(secs_ago: i64, ip: &str, ja4: Option<&'static str>) -> Event {
+        Event {
+            ja4,
+            signature: Some("CVE-2021-41773"),
+            ..event(secs_ago, "verdict", ip)
+        }
+    }
+
+    /// The window as every ingress would have reported it.
+    fn scenario() -> Vec<Event> {
+        let mut events = vec![
+            // One exploit: blocked.
+            exploit(600, "45.33.40.7", None),
+            // Three failed challenges: challenged.
+            event(600, "challenge_failed", "45.33.40.8"),
+            event(540, "challenge_failed", "45.33.40.8"),
+            event(480, "challenge_failed", "45.33.40.8"),
+            // Three challenges never answered: challenged.
+            event(1200, "challenge_issued", "45.33.40.9"),
+            event(900, "challenge_issued", "45.33.40.9"),
+            event(600, "challenge_issued", "45.33.40.9"),
+            // An exploit from before the window: nothing.
+            exploit(2 * 3600, "45.33.40.12", None),
+        ];
+        // Three challenges, each solved a minute later: nothing.
+        for secs_ago in [1200, 900, 600] {
+            events.push(event(secs_ago, "challenge_issued", "45.33.40.10"));
+            events.push(event(secs_ago - 60, "challenge_solved", "45.33.40.10"));
+        }
+        // Three challenges served too recently to call abandoned: nothing.
+        for secs_ago in [120, 60, 30] {
+            events.push(event(secs_ago, "challenge_issued", "45.33.40.11"));
+        }
+        // Twenty addresses exploiting with one fingerprint: it is
+        // challenged, and each address blocked.
+        for n in 1..=20 {
+            events.push(exploit(300, &format!("5.188.10.{n}"), Some(SCANNER_JA4)));
+        }
+        // The same with a fingerprint a browser-claiming visitor without
+        // exploits also used: the addresses only.
+        for n in 1..=20 {
+            events.push(exploit(
+                300,
+                &format!("5.188.11.{n}"),
+                Some(BROWSER_LIKE_JA4),
+            ));
+        }
+        events.push(Event {
+            ja4: Some(BROWSER_LIKE_JA4),
+            user_agent: "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/131.0",
+            ..event(300, "verdict", "5.188.12.1")
+        });
+        events
+    }
+
+    /// What `scenario` promotes, as (kind, subject, verdict, reason).
+    fn expected() -> Vec<(ObservedKind, String, ListVerdict, String)> {
+        let mut expected = vec![
+            (
+                ObservedKind::Ip,
+                "45.33.40.7".to_string(),
+                ListVerdict::Block,
+                "exploit CVE-2021-41773".to_string(),
+            ),
+            (
+                ObservedKind::Ip,
+                "45.33.40.8".to_string(),
+                ListVerdict::Challenge,
+                "3 failed challenges".to_string(),
+            ),
+            (
+                ObservedKind::Ip,
+                "45.33.40.9".to_string(),
+                ListVerdict::Challenge,
+                "3 failed challenges".to_string(),
+            ),
+            (
+                ObservedKind::Ja4,
+                SCANNER_JA4.to_string(),
+                ListVerdict::Challenge,
+                "exploit CVE-2021-41773 from 20 addresses".to_string(),
+            ),
+        ];
+        for block in [10, 11] {
+            for n in 1..=20 {
+                expected.push((
+                    ObservedKind::Ip,
+                    format!("5.188.{block}.{n}"),
+                    ListVerdict::Block,
+                    "exploit CVE-2021-41773".to_string(),
+                ));
+            }
+        }
+        expected.sort();
+        expected
+    }
+
+    fn summary(promotions: &[Promotion]) -> Vec<(ObservedKind, String, ListVerdict, String)> {
+        let mut summary: Vec<_> = promotions
+            .iter()
+            .map(|p| (p.kind, p.subject.clone(), p.verdict, p.reason.clone()))
+            .collect();
+        summary.sort();
+        summary
+    }
+
+    async fn insert_postgres(db: &DatabaseConnection, events: &[Event]) {
+        for e in events {
+            db.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO shield_events (timestamp, project_id, environment_id, request_id, \
+                     kind, ip, ja4, verdict, mode, reasons, signature, host, path, user_agent) \
+                 VALUES (now() - make_interval(secs => $1), 1, 1, 'req', $2, $3, $4, \
+                     CASE WHEN $2 = 'verdict' THEN 'block' ELSE 'challenge' END, 'selective', \
+                     '[]'::jsonb, $5, 'app.example.test', '/x', $6)",
+                [
+                    (e.secs_ago as f64).into(),
+                    e.kind.into(),
+                    e.ip.clone().into(),
+                    e.ja4.map(str::to_string).into(),
+                    e.signature.map(str::to_string).into(),
+                    e.user_agent.into(),
+                ],
+            ))
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn latest_index(db: &DatabaseConnection) -> Index {
+        let row = shield_snapshots::Entity::find()
+            .order_by_desc(shield_snapshots::Column::Revision)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap();
+        Index::new(&ShieldSnapshot::decode(&row.body).unwrap())
+    }
+
+    fn action(index: &Index, ip: &str, ja4: Option<&str>) -> Action {
+        index
+            .evaluate_client(
+                None,
+                Some(ip.parse().unwrap()),
+                ja4,
+                1,
+                Utc::now().timestamp(),
+            )
+            .verdict
+            .action
+    }
+
+    async fn observed_row(
+        db: &DatabaseConnection,
+        subject: &str,
+    ) -> Option<(String, String, i64, i64)> {
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT verdict, reason, hits, \
+                 floor(extract(epoch FROM expires_at - now()))::bigint AS expires_in \
+             FROM shield_observed WHERE subject = $1",
+            [subject.into()],
+        ))
+        .await
+        .unwrap()
+        .map(|row| {
+            (
+                row.try_get("", "verdict").unwrap(),
+                row.try_get("", "reason").unwrap(),
+                row.try_get("", "hits").unwrap(),
+                row.try_get("", "expires_in").unwrap(),
+            )
+        })
+    }
+
+    /// Events become observed rows, the rows become a revision every
+    /// ingress acts on, and operator rules, expiry, the sharing setting
+    /// and pruning all reach it.
+    #[tokio::test]
+    async fn promoted_observations_reach_the_snapshot() -> anyhow::Result<()> {
+        let database = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Shield learning integration: Docker runtime unavailable");
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = database.connection_arc();
+        insert_postgres(&db, &scenario()).await;
+        let sources = Arc::new(ShieldSources::with_feeds(db.clone(), &[]).unwrap());
+        let learning = ShieldLearning::new(db.clone(), EventStore::Postgres, sources.clone());
+
+        // The rules as the pure function applies them, on Postgres's counts.
+        let now_ms = Utc::now().timestamp_millis();
+        let window = Window {
+            start_ms: now_ms - millis(WINDOW),
+            judged_before_ms: now_ms - millis(ABANDONED_AFTER),
+        };
+        let txn = db.begin().await?;
+        let addresses = postgres::addresses(&txn, &[], window).await?;
+        let sightings = postgres::sightings(&txn, &[], window).await?;
+        txn.commit().await?;
+        let promoted = promotions(&addresses, &fingerprints(&sightings));
+        assert_eq!(summary(&promoted), expected());
+
+        let first = learning.promote().await?.unwrap();
+        assert_eq!(first.written, expected().len());
+        let (verdict, reason, hits, expires_in) = observed_row(&db, "45.33.40.7").await.unwrap();
+        assert_eq!(
+            (verdict.as_str(), reason.as_str(), hits),
+            ("block", "exploit CVE-2021-41773", 1)
+        );
+        // Seven days from the hit, ten minutes ago.
+        assert!(
+            (7 * 86_400 - 700..7 * 86_400 - 500).contains(&expires_in),
+            "{expires_in}"
+        );
+        let (verdict, _, hits, _) = observed_row(&db, SCANNER_JA4).await.unwrap();
+        assert_eq!((verdict.as_str(), hits), ("challenge", 20));
+        for absent in [
+            "45.33.40.10",
+            "45.33.40.11",
+            "45.33.40.12",
+            "5.188.12.1",
+            BROWSER_LIKE_JA4,
+        ] {
+            assert_eq!(observed_row(&db, absent).await, None, "{absent}");
+        }
+
+        // The same evidence again changes nothing; a new hit adds one.
+        assert_eq!(learning.promote().await?.unwrap().written, 0);
+        insert_postgres(&db, &[exploit(5, "45.33.40.7", None)]).await;
+        assert_eq!(learning.promote().await?.unwrap().written, 1);
+        assert_eq!(observed_row(&db, "45.33.40.7").await.unwrap().2, 2);
+
+        // A blocked address that then fails challenges stays blocked.
+        db.execute_unprepared(
+            "INSERT INTO shield_observed (kind, subject, verdict, reason, first_seen, last_seen, \
+                 hits, expires_at) \
+             VALUES ('ip', '45.33.40.20', 'block', 'exploit CVE-2021-44228', \
+                 now() - interval '2 hours', now() - interval '2 hours', 1, now() + interval '6 days')",
+        )
+        .await?;
+        insert_postgres(
+            &db,
+            &[
+                event(300, "challenge_failed", "45.33.40.20"),
+                event(200, "challenge_failed", "45.33.40.20"),
+                event(100, "challenge_failed", "45.33.40.20"),
+            ],
+        )
+        .await;
+        assert_eq!(learning.promote().await?.unwrap().written, 1);
+        let (verdict, reason, hits, expires_in) = observed_row(&db, "45.33.40.20").await.unwrap();
+        assert_eq!(
+            (verdict.as_str(), reason.as_str(), hits),
+            ("block", "exploit CVE-2021-44228", 4)
+        );
+        assert!(expires_in > 5 * 86_400, "{expires_in}");
+
+        // Compiled, every ingress acts on them.
+        assert!(sources.compile_with(true).await?.is_some());
+        let index = latest_index(&db).await;
+        assert_eq!(action(&index, "45.33.40.7", None), Action::Block);
+        assert_eq!(action(&index, "45.33.40.8", None), Action::Challenge);
+        assert_eq!(
+            action(&index, "8.8.4.4", Some(SCANNER_JA4)),
+            Action::Challenge
+        );
+        assert_eq!(
+            action(&index, "8.8.4.4", Some(BROWSER_LIKE_JA4)),
+            Action::Pass
+        );
+        // Nothing new: no revision.
+        assert_eq!(learning.promote().await?.unwrap().written, 0);
+        assert_eq!(sources.compile_with(true).await?, None);
+
+        // An operator allow, platform-wide, wins; removing it is a change.
+        db.execute_unprepared(
+            "INSERT INTO shield_operator_entries (scope, network, verdict) \
+             VALUES ('platform', '45.33.40.7/32', 'allow')",
+        )
+        .await?;
+        assert!(sources.compile_with(true).await?.is_some());
+        assert_eq!(
+            action(&latest_index(&db).await, "45.33.40.7", None),
+            Action::Pass
+        );
+        db.execute_unprepared("DELETE FROM shield_operator_entries")
+            .await?;
+        assert!(sources.compile_with(true).await?.is_some());
+        assert_eq!(
+            action(&latest_index(&db).await, "45.33.40.7", None),
+            Action::Block
+        );
+
+        // An expired row leaves the next revision.
+        db.execute_unprepared(
+            "UPDATE shield_observed SET expires_at = now() - interval '1 second' \
+             WHERE subject = '45.33.40.8'",
+        )
+        .await?;
+        assert!(sources.compile_with(true).await?.is_some());
+        assert_eq!(
+            action(&latest_index(&db).await, "45.33.40.8", None),
+            Action::Pass
+        );
+
+        // With sharing off, nothing learned applies.
+        assert!(sources.compile_with(false).await?.is_some());
+        let index = latest_index(&db).await;
+        assert_eq!(action(&index, "45.33.40.7", None), Action::Pass);
+        assert_eq!(action(&index, "8.8.4.4", Some(SCANNER_JA4)), Action::Pass);
+
+        // Pruning drops the expired row and the events past retention only.
+        insert_postgres(&db, &[exploit(8 * 86_400, "45.33.40.30", None)]).await;
+        let pruned = learning.prune().await?.unwrap();
+        assert_eq!((pruned.observed, pruned.events), (1, 1));
+        assert_eq!(observed_row(&db, "45.33.40.8").await, None);
+        assert!(observed_row(&db, "45.33.40.7").await.is_some());
+        let left: i64 = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT count(*) AS left FROM shield_events",
+            ))
+            .await?
+            .unwrap()
+            .try_get("", "left")?;
+        assert_eq!(left, scenario().len() as i64 + 4);
+        Ok(())
+    }
+
+    /// The ClickHouse queries count what the Postgres ones do.
+    #[tokio::test]
+    async fn clickhouse_evidence_matches_the_rules() -> anyhow::Result<()> {
+        use testcontainers::{
+            core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+        let image = GenericImage::new("clickhouse/clickhouse-server", "26.2.5")
+            .with_exposed_port(ContainerPort::Tcp(8123))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/ping")
+                    .with_port(ContainerPort::Tcp(8123))
+                    .with_expected_status_code(200u16),
+            ))
+            .with_env_var("CLICKHOUSE_DB", "shield_test")
+            .with_env_var("CLICKHOUSE_PASSWORD", "test");
+        let container = match image.start().await {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!(
+                    "Skipping ClickHouse Shield learning test: cannot start container ({error})"
+                );
+                return Ok(());
+            }
+        };
+        let port = container.get_host_port_ipv4(8123).await?;
+        let client = temps_clickhouse::build_client(
+            &format!("http://127.0.0.1:{port}"),
+            "shield_test",
+            "default",
+            "test",
+            temps_clickhouse::ClickHouseCompression::default(),
+        );
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.query("SELECT 1").execute().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(ready, "ClickHouse never became ready");
+        // The table as the event writer creates it.
+        client
+            .query(
+                "CREATE TABLE shield_events (
+                   timestamp DateTime64(3),
+                   project_id Int32,
+                   environment_id Int32,
+                   node_id Nullable(Int32),
+                   request_id String,
+                   kind LowCardinality(String),
+                   ip IPv6,
+                   ja4 LowCardinality(String) DEFAULT '',
+                   verdict Enum8('pass' = 0, 'log' = 1, 'challenge' = 2, 'block' = 3),
+                   mode LowCardinality(String),
+                   reasons Array(LowCardinality(String)),
+                   signature LowCardinality(String) DEFAULT '',
+                   host String,
+                   path String,
+                   user_agent String,
+                   difficulty Nullable(UInt8),
+                   solve_ms Nullable(UInt32)
+                 ) ENGINE = MergeTree
+                 ORDER BY (environment_id, timestamp)
+                 TTL toDateTime(timestamp) + INTERVAL 30 DAY",
+            )
+            .execute()
+            .await?;
+        for e in scenario() {
+            client
+                .query(
+                    "INSERT INTO shield_events (timestamp, project_id, environment_id, request_id, \
+                         kind, ip, ja4, verdict, mode, reasons, signature, host, path, user_agent) \
+                     SELECT now64(3) - toIntervalSecond(?), 1, 1, 'req', ?, toIPv6(?), ?, \
+                         if(? = 'verdict', 'block', 'challenge'), 'selective', [], ?, \
+                         'app.example.test', '/x', ?",
+                )
+                .bind(e.secs_ago)
+                .bind(e.kind)
+                .bind(&e.ip)
+                .bind(e.ja4.unwrap_or(""))
+                .bind(e.kind)
+                .bind(e.signature.unwrap_or(""))
+                .bind(e.user_agent)
+                .execute()
+                .await?;
+        }
+
+        let now_ms = Utc::now().timestamp_millis();
+        let window = Window {
+            start_ms: now_ms - millis(WINDOW),
+            judged_before_ms: now_ms - millis(ABANDONED_AFTER),
+        };
+        let addresses = ch::addresses(&client, &[], window).await?;
+        let sightings = ch::sightings(&client, &[], window).await?;
+        let promoted = promotions(&addresses, &fingerprints(&sightings));
+        assert_eq!(summary(&promoted), expected());
+        let abandoned = addresses.iter().find(|a| a.ip == ip("45.33.40.9")).unwrap();
+        assert_eq!((abandoned.abandoned_challenges, abandoned.new_hits), (3, 3));
+
+        // What a stored row already counted is not new.
+        let blocked = addresses.iter().find(|a| a.ip == ip("45.33.40.7")).unwrap();
+        let scanner = fingerprints(&sightings)
+            .into_iter()
+            .find(|f| f.ja4 == SCANNER_JA4)
+            .unwrap();
+        let since_ip = [("45.33.40.7".to_string(), blocked.last_seen_ms)];
+        let again = ch::addresses(&client, &since_ip, window).await?;
+        let again = again.iter().find(|a| a.ip == blocked.ip).unwrap();
+        assert_eq!((again.exploits, again.new_hits), (1, 0));
+        let since_ja4 = [(SCANNER_JA4.to_string(), scanner.last_seen_ms)];
+        let again = fingerprints(&ch::sightings(&client, &since_ja4, window).await?);
+        let again = again.iter().find(|f| f.ja4 == SCANNER_JA4).unwrap();
+        assert_eq!((again.exploit_addresses, again.new_hits), (20, 0));
+        Ok(())
     }
 }
