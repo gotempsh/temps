@@ -108,7 +108,7 @@ pub enum LearningError {
 /// Where the events are: the same choice the request-log storage makes.
 pub enum EventStore {
     Postgres,
-    ClickHouse(::clickhouse::Client),
+    ClickHouse(Box<::clickhouse::Client>),
 }
 
 impl EventStore {
@@ -120,13 +120,13 @@ impl EventStore {
         if !config.is_clickhouse_enabled() {
             return Self::Postgres;
         }
-        Self::ClickHouse(temps_clickhouse::build_client(
+        Self::ClickHouse(Box::new(temps_clickhouse::build_client(
             config.clickhouse_url.as_deref().unwrap_or_default(),
             config.clickhouse_database.as_deref().unwrap_or_default(),
             config.clickhouse_user.as_deref().unwrap_or_default(),
             config.clickhouse_password.as_deref().unwrap_or_default(),
             compression,
-        ))
+        )))
     }
 }
 
@@ -1258,7 +1258,7 @@ mod tests {
             abandoned_challenges: 1,
             ..address("198.51.100.8")
         };
-        assert!(promotions(&[two.clone()], &[]).is_empty());
+        assert!(promotions(std::slice::from_ref(&two), &[]).is_empty());
         let three = AddressEvidence {
             abandoned_challenges: 2,
             ..two
