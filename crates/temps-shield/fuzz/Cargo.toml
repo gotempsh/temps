@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# `cargo +nightly fuzz run ja4` from crates/temps-shield. Not a workspace
+# member: cargo-fuzz needs nightly and its own build settings.
+
+[package]
+name = "temps-shield-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+temps-shield = { path = ".." }
+
+[[bin]]
+name = "ja4"
+path = "fuzz_targets/ja4.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

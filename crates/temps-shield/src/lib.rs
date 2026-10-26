@@ -15,6 +15,9 @@
 //! Phase 2: reputation lists. The control plane fetches public lists and
 //! compiles them into a [`ShieldSnapshot`]; each ingress loads it into an
 //! [`Index`] and records the [`Verdict`] it gives every request.
+//!
+//! Phase 3: [`ja4`], the TLS client fingerprint each ingress computes from
+//! the raw ClientHello.
 
 mod baseline;
 mod budget;
@@ -22,6 +25,7 @@ pub mod feeds;
 mod gate;
 mod identity;
 mod index;
+pub mod ja4;
 mod keys;
 mod net;
 mod redeemed;
