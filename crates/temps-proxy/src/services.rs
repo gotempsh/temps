@@ -527,7 +527,7 @@ mod public_ingress_tests {
                 "repo_owner": "example", "directory": ".", "main_branch": "main",
                 "preset": "dockerfile", "created_at": chrono::Utc::now(),
                 "updated_at": chrono::Utc::now(), "pull_only_root_directory": false,
-                "is_deleted": false, "is_public_repo": false, "attack_mode": false,
+                "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log",
                 "ai_write_actions_enabled": false, "error_source_context_enabled": false,
                 "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
                 "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
@@ -958,7 +958,7 @@ mod path_route_tests {
                 "created_at": "2026-09-28T00:00:00Z", "updated_at": "2026-09-28T00:00:00Z",
                 "project_id": 1, "current_deployment_id": null, "branch": null,
                 "deleted_at": null, "deployment_config": null, "is_preview": false,
-                "protected": false, "sleeping": false, "attack_mode": null,
+                "protected": false, "sleeping": false, "attack_mode": null, "shield_exempt_paths": [],
                 "force_https": null, "last_activity_at": null
             }))
             .expect("environment fixture"),
