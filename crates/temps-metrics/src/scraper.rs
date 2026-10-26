@@ -45,6 +45,7 @@ use temps_config::ConfigService;
 use temps_core::EncryptionService;
 use temps_entities::external_services;
 
+use crate::collector::mariadb::MariaDbCollector;
 use crate::collector::mongodb::MongoCollector;
 use crate::collector::postgres::PostgresCollector;
 use crate::collector::redis::RedisCollector;
@@ -302,8 +303,14 @@ impl MetricsScraper {
                     }
 
                     // Build a connection string from the encrypted service config.
-                    let connection_string = build_connection_string(&service, &encryption)
-                        .map_err(|e| {
+                    let params = decrypt_service_params(&service, &encryption).map_err(|e| {
+                        warn!(
+                            service_id,
+                            service_type, "MetricsScraper: cannot read service config: {e}"
+                        );
+                    })?;
+                    let connection_string =
+                        build_connection_string(&service, &params).map_err(|e| {
                             warn!(
                                 service_id,
                                 service_type, "MetricsScraper: cannot build connection string: {e}"
@@ -320,6 +327,13 @@ impl MetricsScraper {
                         "postgres" => collect_with_timeout(PostgresCollector::new(), &config).await,
                         "redis" => collect_with_timeout(RedisCollector::new(), &config).await,
                         "mongodb" => collect_with_timeout(MongoCollector::new(), &config).await,
+                        "mariadb" => {
+                            let mut collector = MariaDbCollector::new();
+                            if let Some(app_user) = mariadb_app_user_connection_string(&params) {
+                                collector = collector.with_fallback_connection_string(app_user);
+                            }
+                            collect_with_timeout(collector, &config).await
+                        }
                         // RustFS is S3-compatible: reuse the same collector.
                         "s3" | "rustfs" => collect_with_timeout(S3Collector::new(), &config).await,
                         _ => {
@@ -564,16 +578,14 @@ async fn apply_delta(
     out
 }
 
-/// Build a connection string for the given external service using its
-/// encrypted config blob.
-///
-/// Parses the decrypted JSON parameters and produces an appropriate URI or
-/// DSN for the service type.  Returns an error if the config cannot be
-/// decrypted or does not contain the required parameters.
-fn build_connection_string(
+/// Decrypted service parameters, as stored in `external_services.config`.
+type ServiceParams = HashMap<String, serde_json::Value>;
+
+/// Decrypt and parse the given external service's config blob.
+fn decrypt_service_params(
     service: &external_services::Model,
     encryption: &EncryptionService,
-) -> Result<String, String> {
+) -> Result<ServiceParams, String> {
     let encrypted_config = service
         .config
         .as_deref()
@@ -583,16 +595,66 @@ fn build_connection_string(
         .decrypt_string(encrypted_config)
         .map_err(|e| format!("Failed to decrypt config for service {}: {e}", service.id))?;
 
-    let params: HashMap<String, serde_json::Value> = serde_json::from_str(&config_json)
-        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))?;
+    serde_json::from_str(&config_json)
+        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))
+}
 
-    let get_str = |key: &str| -> String {
-        params
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+/// A string parameter, or `""` when it is missing or not a string.
+fn param_str(params: &ServiceParams, key: &str) -> String {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Host and port of a MariaDB service, with the provider's defaults.
+fn mariadb_host_port(params: &ServiceParams) -> (String, String) {
+    let host = param_str(params, "host");
+    let port = param_str(params, "port");
+    (
+        if host.is_empty() {
+            "localhost".to_string()
+        } else {
+            host
+        },
+        if port.is_empty() {
+            "3306".to_string()
+        } else {
+            port
+        },
+    )
+}
+
+/// Connection string for a MariaDB service's application user — the
+/// collector's fallback when the root login is rejected. `None` when the
+/// service has no application credentials.
+fn mariadb_app_user_connection_string(params: &ServiceParams) -> Option<String> {
+    let username = param_str(params, "username");
+    let password = param_str(params, "password");
+    if username.is_empty() || password.is_empty() {
+        return None;
+    }
+    let (host, port) = mariadb_host_port(params);
+    Some(format!(
+        "mysql://{}:{}@{}:{}/",
+        urlencoded(&username),
+        urlencoded(&password),
+        host,
+        port
+    ))
+}
+
+/// Build a connection string for the given external service from its
+/// decrypted parameters.
+///
+/// Produces an appropriate URI or DSN for the service type. Returns an error
+/// if the parameters required for the service type are missing.
+fn build_connection_string(
+    service: &external_services::Model,
+    params: &ServiceParams,
+) -> Result<String, String> {
+    let get_str = |key: &str| -> String { param_str(params, key) };
 
     let host = {
         let h = get_str("host");
@@ -700,6 +762,29 @@ fn build_connection_string(
                 ))
             }
         }
+        // MariaDB: log in as root, the account Temps provisions with, so the
+        // scrape sees every schema (project databases have their own users)
+        // and the replication status. The collector falls back to the
+        // application user — see `mariadb_app_user_connection_string`.
+        "mariadb" => {
+            let root_password = get_str("root_password");
+            if root_password.is_empty() {
+                return mariadb_app_user_connection_string(params).ok_or_else(|| {
+                    format!(
+                        "Service {}: MariaDB config has neither root_password nor \
+                         username/password",
+                        service.id
+                    )
+                });
+            }
+            let (host, port) = mariadb_host_port(params);
+            Ok(format!(
+                "mysql://root:{}@{}:{}/",
+                urlencoded(&root_password),
+                host,
+                port
+            ))
+        }
         // S3 (MinIO) and RustFS both use S3-compatible APIs.
         // The S3Collector expects: region|access_key|secret_key[|endpoint_url]
         // For locally-hosted services the endpoint is http://host:port.
@@ -748,7 +833,7 @@ fn build_connection_string(
 /// Encodes all characters that are either reserved in the URI user-info
 /// position or could break URI parsing if left bare.  Crucially, `%` itself
 /// is encoded first so that subsequent passes do not double-encode it.
-fn urlencoded(s: &str) -> String {
+pub(crate) fn urlencoded(s: &str) -> String {
     // Each byte is encoded independently so multi-byte UTF-8 sequences are
     // handled correctly (each byte gets its own %XX escape).
     let mut out = String::with_capacity(s.len() * 3);
@@ -1017,13 +1102,108 @@ mod tests {
 
     // ── build_connection_string ────────────────────────────────────────────
 
-    // We can't test build_connection_string directly with a real EncryptionService
-    // in unit tests because it requires a real encryption key. Instead, we test
-    // the urlencoded helper and apply_delta logic directly.
-
     #[test]
     fn urlencoded_slash() {
         assert_eq!(urlencoded("a/b"), "a%2Fb");
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> ServiceParams {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    /// Regression: a MariaDB service had no connection string builder, so
+    /// metrics for it could never be collected.
+    #[test]
+    fn mariadb_connects_as_root_with_the_app_user_as_fallback() {
+        let service = cluster_service(5, "mariadb");
+        let p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("database", "appdb"),
+            ("username", "app"),
+            ("password", "app:p@ss"),
+            ("root_password", "r00t/pw#"),
+        ]);
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:r00t%2Fpw%23@localhost:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app%3Ap%40ss@localhost:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn mariadb_without_root_password_connects_as_the_app_user() {
+        let service = cluster_service(6, "MariaDB");
+        let p = params(&[("username", "app"), ("password", "secret12")]);
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://app:secret12@localhost:3306/".to_string())
+        );
+
+        let err = build_connection_string(&service, &params(&[]))
+            .expect_err("no credentials at all cannot be scraped");
+        assert!(err.contains("Service 6"), "error names the service: {err}");
+    }
+
+    /// The MariaDB collector reports raw cumulative status counters; the
+    /// scraper must turn them into per-interval deltas (queries per interval,
+    /// not queries since the server started).
+    #[tokio::test]
+    async fn mariadb_status_counters_become_per_interval_deltas() {
+        use crate::collector::mariadb::{build_points, parse_name_value_rows, MariaDbSnapshot};
+
+        let config = CollectorConfig::new(11, SourceKind::Database, "unused");
+        let snapshot = |questions: &str, connected: &str| MariaDbSnapshot {
+            status: parse_name_value_rows([
+                ("Questions".to_string(), questions.to_string()),
+                ("Threads_connected".to_string(), connected.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1000", "4"), &config),
+        )
+        .await;
+        assert!(
+            first.iter().all(|p| p.name != "mariadb.queries_total"),
+            "the first scrape only records the counter baseline"
+        );
+        assert!(first.iter().any(|p| p.name == "mariadb.connections"));
+
+        let second = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1250", "5"), &config),
+        )
+        .await;
+        let value = |name: &str| second.iter().find(|p| p.name == name).map(|p| p.value);
+        assert_eq!(value("mariadb.queries_total"), Some(250.0));
+        assert_eq!(
+            value("mariadb.connections"),
+            Some(5.0),
+            "gauges pass through"
+        );
+
+        // Server restart: counters start over.
+        let third = apply_delta(&baselines, 11, build_points(&snapshot("30", "1"), &config)).await;
+        assert_eq!(
+            third
+                .iter()
+                .find(|p| p.name == "mariadb.queries_total")
+                .map(|p| p.value),
+            Some(30.0)
+        );
     }
 
     #[tokio::test]

@@ -14541,6 +14541,7 @@ dependencies = [
  "sea-orm 1.1.20",
  "serde",
  "serde_json",
+ "sqlx 0.8.6",
  "sysinfo",
  "tempfile",
  "temps-clickhouse",

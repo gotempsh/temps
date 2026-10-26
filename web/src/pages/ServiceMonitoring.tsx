@@ -86,6 +86,10 @@ import {
   type ServiceAlertComparator,
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
+import {
+  serviceMetricsEngine,
+  type ServiceMetricsEngine,
+} from '@/lib/service-metrics-engine'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -128,7 +132,7 @@ function isMonitoringUnavailable(err: unknown): boolean {
 // Metric metadata per engine
 // ---------------------------------------------------------------------------
 
-type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
+type EngineKind = ServiceMetricsEngine
 
 type MetricGroup = {
   title: string
@@ -292,6 +296,42 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       metrics: ['mongo.replication_buffer_ratio'],
     },
   ],
+  mariadb: [
+    {
+      title: 'Connections',
+      metrics: [
+        'mariadb.connections',
+        'mariadb.max_connections',
+        'mariadb.connections_used_ratio',
+        'mariadb.max_used_connections',
+        'mariadb.threads_running',
+        'mariadb.aborted_connects_total',
+        'mariadb.aborted_clients_total',
+      ],
+    },
+    {
+      title: 'Queries',
+      metrics: ['mariadb.queries_total', 'mariadb.slow_queries_total'],
+    },
+    {
+      title: 'InnoDB',
+      metrics: [
+        'mariadb.buffer_pool_hit_ratio',
+        'mariadb.rows_read_total',
+        'mariadb.rows_inserted_total',
+        'mariadb.rows_updated_total',
+        'mariadb.rows_deleted_total',
+      ],
+    },
+    {
+      title: 'Server',
+      metrics: ['mariadb.database_size_bytes', 'mariadb.uptime_seconds'],
+    },
+    {
+      title: 'Replication',
+      metrics: ['mariadb.replication_lag_seconds'],
+    },
+  ],
   s3: [
     {
       title: 'Storage',
@@ -343,6 +383,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       ],
     },
   ],
+  // Only the engine-agnostic Resources group exists for these.
+  unsupported: [],
 }
 
 // Container resource metrics — CPU/memory of the docker container(s) backing
@@ -427,6 +469,12 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections',
+    'mariadb.queries_total',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.database_size_bytes',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -439,24 +487,16 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_capacity_free_bytes',
     'rustfs_s3_operations_total',
   ],
+  unsupported: [
+    'container.cpu_percent',
+    'container.memory_used_bytes',
+    'container.memory_percent',
+  ],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function normalizeEngine(
-  engine: string,
-  dockerImage?: string | null
-): EngineKind {
-  // An s3 service running the rustfs image should use rustfs metric groups
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
-    return 'rustfs'
-  if (engine === 'rustfs') return 'rustfs'
-  if (['postgres', 'redis', 'mongodb', 's3'].includes(engine))
-    return engine as EngineKind
-  return 'postgres'
-}
 
 /** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
 function formatRelativeTime(iso: string): string {
@@ -1244,12 +1284,15 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
 type MonitoringDashboardProps = {
   serviceId: number
   engine: EngineKind
+  /** Raw service type, named in the notice for engines without a collector. */
+  serviceType: string
   latestMetrics: MetricLatest[]
 }
 
 function MonitoringDashboard({
   serviceId,
   engine,
+  serviceType,
   latestMetrics,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
@@ -1296,6 +1339,17 @@ function MonitoringDashboard({
           >
             View all
           </Link>
+        </div>
+      )}
+
+      {engine === 'unsupported' && (
+        <div className="rounded-lg border border-dashed border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+          <span className="font-medium text-foreground">
+            {serviceType} metrics are not collected yet.
+          </span>{' '}
+          Connections, queries and storage are only reported for PostgreSQL,
+          MariaDB, Redis, MongoDB and S3/RustFS services. Container CPU and
+          memory are still sampled for this service.
         </div>
       )}
 
@@ -1417,7 +1471,7 @@ export function ServiceMonitoring() {
     enabled: !!serviceId,
   })
 
-  const engine = normalizeEngine(
+  const engine = serviceMetricsEngine(
     serviceData?.service?.service_type ?? '',
     serviceData?.current_parameters?.docker_image
   )
@@ -1606,6 +1660,7 @@ export function ServiceMonitoring() {
             <MonitoringDashboard
               serviceId={serviceId}
               engine={engine}
+              serviceType={serviceData?.service?.service_type ?? ''}
               latestMetrics={latestMetrics}
             />
           )}

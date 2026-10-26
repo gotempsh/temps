@@ -83,6 +83,10 @@ import {
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
+import {
+  serviceMetricsEngine,
+  type ServiceMetricsEngine,
+} from '@/lib/service-metrics-engine'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -148,7 +152,7 @@ function isMonitoringUnavailable(err: unknown): boolean {
 // Metric configuration per engine
 // ---------------------------------------------------------------------------
 
-type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
+type EngineKind = ServiceMetricsEngine
 
 const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
   postgres: [
@@ -169,6 +173,12 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.queries_total',
+    'mariadb.slow_queries_total',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -181,6 +191,8 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_capacity_used_bytes',
     'rustfs_cluster_objects_total',
   ],
+  // Only the engine-agnostic container stats exist for these.
+  unsupported: [],
 }
 
 // Container resource metrics — CPU/memory of the docker container(s) backing
@@ -201,8 +213,10 @@ const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   postgres: 'pg.connections',
   redis: 'redis.connected_clients',
   mongodb: 'mongo.connections_current',
+  mariadb: 'mariadb.connections',
   s3: 's3.bucket_count',
   rustfs: 'rustfs_cluster_capacity_used_bytes',
+  unsupported: 'container.cpu_percent',
 }
 
 const KNOWN_METRICS: Record<EngineKind, string[]> = {
@@ -282,6 +296,25 @@ const KNOWN_METRICS: Record<EngineKind, string[]> = {
     'mongo.cursor_timed_out_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections',
+    'mariadb.max_connections',
+    'mariadb.connections_used_ratio',
+    'mariadb.max_used_connections',
+    'mariadb.threads_running',
+    'mariadb.aborted_connects_total',
+    'mariadb.aborted_clients_total',
+    'mariadb.queries_total',
+    'mariadb.slow_queries_total',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.rows_read_total',
+    'mariadb.rows_inserted_total',
+    'mariadb.rows_updated_total',
+    'mariadb.rows_deleted_total',
+    'mariadb.database_size_bytes',
+    'mariadb.uptime_seconds',
+    'mariadb.replication_lag_seconds',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -311,21 +344,12 @@ const KNOWN_METRICS: Record<EngineKind, string[]> = {
     'rustfs_system_process_resident_memory_bytes',
     's3.bucket_count',
   ],
+  unsupported: [],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function isNormalEngine(engine: string): engine is EngineKind {
-  return ['postgres', 'redis', 'mongodb', 's3', 'rustfs'].includes(engine)
-}
-
-function normalizeEngine(engine: string, dockerImage?: string): EngineKind {
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
-    return 'rustfs'
-  return isNormalEngine(engine) ? engine : 'postgres'
-}
 
 /** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
 function formatRelativeTime(iso: string): string {
@@ -812,6 +836,8 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
 type LiveMetricsProps = {
   serviceId: number
   engine: EngineKind
+  /** Raw service type, named in the notice for engines without a collector. */
+  serviceType: string
   latestMetrics: MetricLatest[]
 }
 
@@ -820,7 +846,12 @@ type LiveMetricsProps = {
 // This matches the design token — not an arbitrary choice.
 const CHART_LINE_COLOR = '#0070f3'
 
-function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
+function LiveMetrics({
+  serviceId,
+  engine,
+  serviceType,
+  latestMetrics,
+}: LiveMetricsProps) {
   // Container CPU/memory first — resource saturation is the first thing an
   // operator checks — then the engine-specific headline stats.
   const statMetrics = [
@@ -880,6 +911,13 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
             View
           </Link>
         </div>
+      )}
+
+      {engine === 'unsupported' && (
+        <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+          {serviceType} metrics such as connections, queries and storage are not
+          collected yet. Container CPU and memory are shown below.
+        </p>
       )}
 
       {/* Stat row */}
@@ -1014,7 +1052,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
 
 export interface MonitoringCardProps {
   serviceId: number
-  /** 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs' */
+  /** Service type, e.g. 'postgres', 'mariadb' or 's3' */
   engine: string
   /** Docker image — used to detect RustFS when service_type is 's3' */
   dockerImage?: string
@@ -1040,7 +1078,7 @@ export function MonitoringCard({
   onMonitoringChange,
 }: MonitoringCardProps) {
   const queryClient = useQueryClient()
-  const normalEngine = normalizeEngine(engine, dockerImage)
+  const normalEngine = serviceMetricsEngine(engine, dockerImage)
 
   // Poll /latest every 3s. If the result is null/empty → State B. If data → State C.
   // HTTP 404 from the backend means metrics are not enabled → State A.
@@ -1251,6 +1289,7 @@ export function MonitoringCard({
         <LiveMetrics
           serviceId={serviceId}
           engine={normalEngine}
+          serviceType={engine}
           latestMetrics={latestMetrics}
         />
       </CardContent>

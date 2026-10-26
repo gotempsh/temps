@@ -12,6 +12,7 @@ pub mod store;
 pub mod worker_report;
 
 // Re-exports for convenient use by downstream crates.
+pub use collector::mariadb::MariaDbCollector;
 pub use collector::mongodb::MongoCollector;
 pub use collector::node::{NodeMetricsCollector, NodeMetricsScope, HOST_METRIC_NAMES};
 pub use collector::postgres::PostgresCollector;
