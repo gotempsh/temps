@@ -23,6 +23,8 @@
 //! ([`ShieldMode`]), with exemptions, [`bypass`] tokens, verified
 //! [`crawlers`], adaptive [`difficulty`], exploit signatures and
 //! [`browsers`] that are not what they claim, and records [`events`].
+//! Where netwatch runs, `netwatch` (feature `netwatch`) reads its bans
+//! into a local list and sends it request lines (D12).
 
 pub mod assets;
 mod baseline;
@@ -42,6 +44,8 @@ mod index;
 pub mod ja4;
 mod keys;
 mod net;
+#[cfg(all(feature = "netwatch", unix))]
+pub mod netwatch;
 mod policy;
 mod redeemed;
 mod snapshot;

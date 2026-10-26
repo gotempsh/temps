@@ -15325,6 +15325,7 @@ dependencies = [
 name = "temps-shield"
 version = "0.1.0-beta.57"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64 0.23.1",
  "hickory-resolver",
@@ -15332,13 +15333,16 @@ dependencies = [
  "moka",
  "postcard",
  "rand 0.10.3",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "temps-shield",
  "temps-signatures",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
  "zstd 0.14.3",
 ]
 
