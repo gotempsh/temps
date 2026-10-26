@@ -233,8 +233,9 @@ impl AlertEvaluator {
     /// Give every worker node the default disk-health rules, and drop the
     /// node-scoped rules of workers that were removed. Cheap when nothing
     /// changed: one `SELECT id FROM nodes`. A worker that already has any
-    /// disk-health rule is left alone, so rules an operator deleted on the
-    /// node page stay deleted across restarts. Worker nodes report RAID and
+    /// disk-health rule is left alone, and those rules cannot be deleted
+    /// (`NodeAlertRuleService::delete` refuses; they are disabled instead),
+    /// so an operator's changes to them survive restarts. Worker nodes report RAID and
     /// SMART health in their heartbeat, so these rules have data to read;
     /// the file-descriptor defaults stay control-plane only, since workers
     /// don't report those metrics.

@@ -2064,7 +2064,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let flushes: Flushes = Arc::default();
         let recorded = flushes.clone();
-        let failures = Arc::new(std::sync::atomic::AtomicUsize::new(failures));
+        let failures = Arc::new(std::sync::Mutex::new(failures));
         let task = tokio::spawn(run_trace_hint_writer(
             rx,
             flush_interval,
@@ -2074,13 +2074,12 @@ mod tests {
                 let failures = failures.clone();
                 async move {
                     recorded.lock().expect("flush log").push(hints);
-                    let failing = failures
-                        .fetch_update(
-                            std::sync::atomic::Ordering::SeqCst,
-                            std::sync::atomic::Ordering::SeqCst,
-                            |left| left.checked_sub(1),
-                        )
-                        .is_ok();
+                    let failing = {
+                        let mut left = failures.lock().expect("failure budget");
+                        let failing = *left > 0;
+                        *left = left.saturating_sub(1);
+                        failing
+                    };
                     if failing {
                         Err("hint store unavailable")
                     } else {

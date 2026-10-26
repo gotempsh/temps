@@ -70,13 +70,24 @@ export function LogIngestionBudgetCard({
   })
   const { errors } = form.formState
 
-  // The error is surfaced by the caller's toast; swallowing it here keeps
-  // react-hook-form from rethrowing it as an unhandled rejection.
-  const handleSave = (values: FormValues) =>
-    onSave({
-      lines: parseBudget(values.lines, MAX_LINES_PER_SEC) ?? null,
-      kib: parseBudget(values.kib, MAX_KIB_PER_SEC) ?? null,
-    }).catch(() => undefined)
+  const handleSave = async (values: FormValues) => {
+    try {
+      await onSave({
+        lines: parseBudget(values.lines, MAX_LINES_PER_SEC) ?? null,
+        kib: parseBudget(values.kib, MAX_KIB_PER_SEC) ?? null,
+      })
+    } catch {
+      // The error is surfaced by the caller's toast; swallowing it here keeps
+      // react-hook-form from rethrowing it as an unhandled rejection. The
+      // fields stay dirty, so the user's values are kept for a retry.
+      return
+    }
+    // Saved: the submitted values are now the baseline, so the fields stop
+    // counting as edited and a later refresh of the saved budget shows.
+    // `keepDirtyValues: false` because react-hook-form merges `resetOptions`
+    // into every reset, which would otherwise keep them dirty.
+    form.reset(values, { keepDirtyValues: false })
+  }
 
   const settingsHref =
     platform.data?.setup_path ??

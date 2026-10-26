@@ -20,11 +20,12 @@
 //! store is down or slower than the producers) a batch is dropped and the
 //! producer gets [`MetricsError::WriteBufferFull`] — never a blocked
 //! producer. A flush that does not finish within
-//! [`BufferConfig::write_timeout`] is abandoned and its points dropped, so a
-//! store that hangs (rather than errors) cannot stall the flusher forever and
-//! turn every later write into a dropped batch. Every lost point — channel
-//! overflow, failed flush or timed-out flush — is counted in
-//! [`BufferedMetricsStore::dropped_points`]. Reads go straight to the inner store, so a point becomes
+//! [`BufferConfig::write_timeout`] is abandoned, so a store that hangs
+//! (rather than errors) cannot stall the flusher forever and turn every later
+//! write into a dropped batch. Abandoning only stops waiting: an insert the
+//! store already received can still commit. Every point that may not have
+//! been stored — channel overflow, failed flush or timed-out flush — is
+//! counted in [`BufferedMetricsStore::dropped_points`]. Reads go straight to the inner store, so a point becomes
 //! visible up to one flush interval after it is written.
 
 use std::collections::HashMap;
@@ -52,7 +53,9 @@ pub struct BufferConfig {
     pub max_rows: usize,
     /// `write_batch` calls that may be queued before batches are dropped.
     pub channel_capacity: usize,
-    /// Longest one flush may take before its points are dropped.
+    /// Longest one flush is waited for before it is abandoned. The points
+    /// are then counted as dropped, though an insert already sent may still
+    /// land.
     pub write_timeout: Duration,
 }
 
@@ -108,8 +111,9 @@ impl BufferedMetricsStore {
         Arc::new(Self::spawn(inner, config))
     }
 
-    /// Points lost since start: the buffer was full, or a flush failed or
-    /// timed out.
+    /// Points that may not have been stored since start: lost because the
+    /// buffer was full or a flush failed, or unconfirmed because a flush
+    /// timed out (an insert the store already received can still commit).
     pub fn dropped_points(&self) -> u64 {
         self.dropped_points.load(Ordering::Relaxed)
     }
@@ -167,23 +171,33 @@ impl Flusher {
         let points = std::mem::take(pending);
         let count = points.len();
         // Fail open like every producer did before: a store outage loses these
-        // points, it never backs up into the producers.
-        let failure = match tokio::time::timeout(self.timeout, self.inner.write_batch(points)).await
-        {
+        // points, it never backs up into the producers. `None` is a timeout.
+        let error = match tokio::time::timeout(self.timeout, self.inner.write_batch(points)).await {
             Ok(Ok(())) => return,
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => format!("write did not finish within {:?}", self.timeout),
+            Ok(Err(e)) => Some(e),
+            Err(_) => None,
         };
         let dropped_total = self
             .dropped_points
             .fetch_add(count as u64, Ordering::Relaxed)
             + count as u64;
-        warn!(
-            points = count,
-            dropped_total,
-            error = %failure,
-            "metrics write buffer: flush failed; points dropped"
-        );
+        match error {
+            Some(e) => warn!(
+                points = count,
+                dropped_total,
+                error = %e,
+                "metrics write buffer: flush failed; points dropped"
+            ),
+            // Dropping the write future stops waiting; it does not recall a
+            // request the store already has, so this is not a definite loss.
+            None => warn!(
+                points = count,
+                dropped_total,
+                timeout = ?self.timeout,
+                "metrics write buffer: flush timed out and was abandoned; \
+                 these points may not have been stored"
+            ),
+        }
     }
 }
 

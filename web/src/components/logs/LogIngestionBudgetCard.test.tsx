@@ -3,7 +3,13 @@
 
 import { afterEach, expect, mock, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -89,6 +95,40 @@ test('an out-of-range value is listed and not saved', async () => {
 
   await view.findByText('Fix 1 field before saving')
   expect(onSave).not.toHaveBeenCalled()
+  api.restore()
+})
+
+// Once saved, the fields are no longer "being edited": a later refresh (the
+// server's value, or another admin's change) must show, not the old input.
+test('after a successful save, a refresh of the saved budget shows', async () => {
+  const onSave = mock((_budget: LogIngestionBudget) => Promise.resolve())
+  const { api, view, ui, lines } = setup({ lines: 100, kib: null }, onSave)
+
+  fireEvent.change(lines(), { target: { value: '500' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+  await act(() => new Promise((resolve) => setTimeout(resolve, 0)))
+  expect(lines().value).toBe('500')
+
+  view.rerender(ui({ lines: 750, kib: null }))
+
+  await waitFor(() => expect(lines().value).toBe('750'))
+  api.restore()
+})
+
+test('a failed save keeps the edited value through a refresh', async () => {
+  const onSave = mock((_budget: LogIngestionBudget) =>
+    Promise.reject(new Error('500 from the server'))
+  )
+  const { api, view, ui, lines } = setup({ lines: 100, kib: null }, onSave)
+
+  fireEvent.change(lines(), { target: { value: '500' } })
+  fireEvent.click(view.getByRole('button', { name: 'Save budget' }))
+  await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1))
+
+  view.rerender(ui({ lines: 100, kib: null }))
+
+  expect(lines().value).toBe('500')
   api.restore()
 })
 

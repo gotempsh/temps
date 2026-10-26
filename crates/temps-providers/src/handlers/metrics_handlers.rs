@@ -2188,6 +2188,7 @@ fn log_and_convert(node_id: i32, error: NodeAlertRuleError) -> Problem {
         | NodeAlertRuleError::RuleNotFound { .. }
         | NodeAlertRuleError::AlreadyExists { .. }
         | NodeAlertRuleError::ControlPlaneRuleProtected { .. }
+        | NodeAlertRuleError::DefaultRuleProtected { .. }
         | NodeAlertRuleError::Validation { .. } => {
             info!(node_id, "Rejected node alert rule operation: {}", error)
         }
@@ -2215,6 +2216,13 @@ impl From<NodeAlertRuleError> for Problem {
                 ErrorBuilder::new(StatusCode::CONFLICT)
                     .type_("https://temps.sh/probs/control-plane-alert-rule-protected")
                     .title("Control-Plane Rule Cannot Be Deleted")
+                    .detail(error.to_string())
+                    .build()
+            }
+            NodeAlertRuleError::DefaultRuleProtected { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/default-alert-rule-protected")
+                    .title("Default Rule Cannot Be Deleted")
                     .detail(error.to_string())
                     .build()
             }

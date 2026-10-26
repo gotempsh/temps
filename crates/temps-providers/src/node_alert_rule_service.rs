@@ -117,6 +117,15 @@ pub(crate) enum NodeAlertRuleError {
          on every start; disable it instead of deleting it"
     )]
     ControlPlaneRuleProtected { rule_id: i32 },
+    #[error(
+        "Alert rule {rule_id} on node {node_id} is the default '{metric_name}' rule, which is \
+         re-created when the node has no disk-health rule left; disable it instead of deleting it"
+    )]
+    DefaultRuleProtected {
+        node_id: i32,
+        rule_id: i32,
+        metric_name: String,
+    },
     #[error("Invalid alert rule for node {node_id}: {message}")]
     Validation { node_id: i32, message: String },
     #[error("Database error while managing an alert rule on node {node_id}: {source}")]
@@ -339,7 +348,9 @@ impl NodeAlertRuleService {
     ///
     /// The control plane's rules are refused: its defaults are re-seeded on
     /// every start, so a deleted one silently comes back while `enabled: false`
-    /// survives. Refusing says so up front instead of appearing to work.
+    /// survives. Refusing says so up front instead of appearing to work. A
+    /// worker's default disk-health rules are refused for the same reason: a
+    /// worker with none of them left is seeded again.
     pub(crate) async fn delete(
         &self,
         node_id: i32,
@@ -356,6 +367,15 @@ impl NodeAlertRuleService {
             .await
             .map_err(db_err)?
             .ok_or(NodeAlertRuleError::RuleNotFound { node_id, rule_id })?;
+        // A worker is seeded again whenever it has no disk-health rule (that
+        // is the only record of "seeded"), so deleting these would not stick.
+        if DISK_HEALTH_NODE_METRICS.contains(&rule.metric_name.as_str()) {
+            return Err(NodeAlertRuleError::DefaultRuleProtected {
+                node_id,
+                rule_id,
+                metric_name: rule.metric_name,
+            });
+        }
 
         monitoring_alert_rules::Entity::delete_by_id(rule_id)
             .exec(self.db.as_ref())
@@ -632,6 +652,35 @@ mod tests {
                 rule_id: 5
             }
         ));
+    }
+
+    /// Workers are re-seeded when they have no disk-health rule, so deleting
+    /// the defaults would quietly undo itself after a restart: they are
+    /// refused, with the way out (disable), and nothing is deleted.
+    #[tokio::test]
+    async fn a_worker_default_disk_health_rule_cannot_be_deleted() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let err = svc.delete(7, 9).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                NodeAlertRuleError::DefaultRuleProtected {
+                    node_id: 7,
+                    rule_id: 9,
+                    metric_name,
+                } if metric_name == "node.raid_degraded"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("disable"));
     }
 
     #[tokio::test]

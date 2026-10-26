@@ -190,7 +190,7 @@ async fn insert_rows<C: ConnectionTrait>(
         INSERT_COLUMNS.join(", ")
     );
 
-    let mut params: Vec<sea_orm::Value> = Vec::with_capacity(entries.len() * cols_per_row);
+    let mut params: Vec<sea_orm::Value> = Vec::with_capacity(order.len() * cols_per_row);
     let now = chrono::Utc::now();
 
     for (i, entry) in order.iter().map(|&index| &entries[index]).enumerate() {
