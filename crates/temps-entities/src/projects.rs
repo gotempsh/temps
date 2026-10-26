@@ -54,6 +54,7 @@ pub struct Model {
     /// ADR 066 D1: how Shield acts on verdicts for the project's
     /// environments: `off`, `log`, `selective` or `attack`. Replaces
     /// `attack_mode`, which the API keeps writing for one release.
+    #[serde(default = "default_shield_mode")]
     pub shield_mode: String,
     /// ADR-021 Tier 2: opt-in AI summarization of metric alert notifications for
     /// this project. NULL/false = off (the deterministic Tier-1 text is used);
@@ -302,6 +303,12 @@ pub fn pending_instantiation_token(token: &str) -> String {
 /// Whether `token` is a value produced by [`pending_instantiation_token`].
 pub fn is_pending_instantiation_token(token: &str) -> bool {
     token.starts_with("pending:")
+}
+
+/// The mode a project without one runs in (ADR 066 D1), for rows
+/// serialised before the column existed.
+fn default_shield_mode() -> String {
+    "log".to_string()
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

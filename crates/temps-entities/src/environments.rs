@@ -54,6 +54,7 @@ pub struct Model {
     pub shield_mode: Option<String>,
     /// ADR 066 D7: paths Shield never challenges here (`/api/*`, `/healthz`).
     #[sea_orm(column_type = "JsonBinary")]
+    #[serde(default)]
     pub shield_exempt_paths: ShieldExemptPaths,
     /// Per-environment override for the proxy's HTTP→HTTPS redirect.
     /// `None` (NULL) means inherit the proxy default, which redirects only when
