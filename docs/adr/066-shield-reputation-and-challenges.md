@@ -5,9 +5,9 @@
 Proposed — 2026-10-25. Phase 1 (the challenge fix) shipped with this ADR.
 Phase 2 (reputation lists in `log` mode) shipped on 2026-10-26, with a
 correction to what D2 said about the lists' terms. Phase 3 (JA4) is being
-implemented in the order its entry in Phases gives: the parser, then the
-control plane for direct, Cloudflare and Bunny clients, are done; the later
-phases are proposed. File and line references are to
+implemented in the order its entry in Phases gives: the parser, the
+control plane for direct, Cloudflare and Bunny clients, the local proxy
+header and workers are done; the later phases are proposed. File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
@@ -298,7 +298,7 @@ to the address, by the same rules:
 |---|---|---|---|
 | Cloudflare range | `CF-Connecting-IP` | `cf-ja4` | `cloudflare` |
 | Bunny range | `X-Real-IP` | `CDN-JA4` | `bunny` |
-| Trusted loopback proxy (`trust_loopback_forwarded_ip`) | `X-Forwarded-For` | the configured header, if any (`proxy.ja4_header`) | `local` |
+| Trusted loopback proxy (`trust_loopback_forwarded_ip`) | `X-Forwarded-For` | the configured header, if any (`loopback_ja4_header`) | `local` |
 | Registered temps edge | signed edge header | signed edge header | `edge` |
 | Any other peer | the peer | computed by this ingress | `direct` |
 
@@ -720,12 +720,13 @@ L4Stream)`, installed with `Listeners::set_pre_tls_callback`
    `resolve_client_fingerprint` and stores the result, JA4 and source, as
    `ProxyContext.client_fingerprint`. It takes the peer and headers the
    client address resolution takes, and the same loopback trust: a trusted
-   local proxy gives source `local` and no JA4 until `proxy.ja4_header` is
-   set; Cloudflare's addresses give `cf-ja4`, Bunny's `cdn-ja4`, each
-   checked with `Ja4::parse_forwarded`; anyone else gives the computed JA4.
+   local proxy gives source `local` and the JA4 in `loopback_ja4_header`,
+   or none when that is unset; Cloudflare's addresses give `cf-ja4`,
+   Bunny's `cdn-ja4`; every forwarded value is checked with
+   `Ja4::parse_forwarded`; anyone else gives the computed JA4.
    `strip_untrusted_client_ip_headers` removes `cf-ja4`, `cdn-ja4`,
-   `cloudfront-viewer-ja4-fingerprint` and `X-Temps-Edge-Client` before
-   any request goes upstream.
+   `cloudfront-viewer-ja4-fingerprint`, `X-Temps-Edge-Client` and the
+   configured local header before any request goes upstream.
 
 The client-random map exists because `SocketDigest` has no slot for
 application data. A client chooses its own random and cannot know another
@@ -738,23 +739,41 @@ The edge installs the same hook in `temps-edge/src/server.rs:375` and builds
 (`temps-edge/src/proxy.rs:503`).
 
 **Workers (rustls).** In `serve_tls` (`public_ingress.rs:350`), before
-`acceptor.accept(stream)`: read the ClientHello with `ja4::needed` under the
-existing 10 s handshake timeout, wrap the socket in a `Rewind<TcpStream>`
-(an `AsyncRead + AsyncWrite` that serves the saved bytes first, about 40
-lines), and pass the wrapper to `acceptor.accept`. The result is inserted
-next to `PublicTlsSni` and `PublicPeer` as a `PublicClientFingerprint`
-request extension. Workers serve one request per connection
-(`keep_alive(false)`), so no map is needed. The tunnel origin honours
-`cf-ja4` from its loopback `cloudflared` exactly as it honours
-`CF-Connecting-IP`.
+`acceptor.accept(stream)`: read the ClientHello with
+`ja4::read_client_hello` under the existing 10 s handshake timeout, wrap
+the socket in a `Rewind<TcpStream>` (`temps-agent/src/rewind.rs`, an
+`AsyncRead + AsyncWrite` that serves the saved bytes first), and pass the
+wrapper to `acceptor.accept`. The result is inserted next to
+`PublicTlsSni` and `PublicPeer` as a `PublicClientFingerprint` request
+extension. Workers serve one request per connection
+(`keep_alive(false)`), so no map is needed. The tunnel origin honours a
+connector's JA4 header from loopback exactly as it honours its address
+header: the connector spec gains `client_ja4` (header and source),
+Cloudflare Tunnel's being `cf-ja4` and `cloudflare`, and the origin
+removes the header whatever it holds. A bound origin takes changed
+headers on the next connector sync, without restarting the connector. Workers remove every header of
+`ja4::FORWARDED_JA4_HEADERS` before a request goes upstream, as the
+control plane does. Until workers write events (phase 5) they log the
+JA4 and its source at `debug` per request.
+
+`ja4::read_client_hello` is shared by both ingresses, behind
+`temps-shield`'s `tokio` feature so the parser itself stays free of an
+async runtime.
 
 **Settings.**
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `shield.ja4` | `on` | Compute and record JA4 |
-| `proxy.ja4_header` | unset | Header to trust from a loopback proxy, e.g. `X-JA4` |
+| `loopback_ja4_header` | unset | Header to trust from a loopback proxy, e.g. `x-ja4` |
 | `proxy.proxy_protocol_from` | `[]` | Peers allowed to send a PROXY protocol header |
+
+`loopback_ja4_header` is a platform setting next to
+`trust_loopback_forwarded_ip` (Settings → Security), refreshed by every
+proxy process within seconds like it. Because the proxy strips the header
+from every request, the name must be an HTTP token containing `ja4`, so it
+can never strip a header an app needs such as `Cookie`; the settings API
+answers 400 otherwise.
 
 The raw form (`ja4_r`, the unhashed lists) is logged at `debug` only.
 

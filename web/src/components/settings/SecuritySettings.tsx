@@ -117,6 +117,8 @@ export interface SecuritySettingsFormData {
   security_headers: SecurityHeadersSettings
   rate_limiting: RateLimitSettings
   trust_loopback_forwarded_ip: boolean
+  /** Edited by SecurityPage itself, like the networks below. */
+  loopback_ja4_header: string
   /** Edited by SecurityPage itself; carried here so both share one form. */
   trusted_private_networks_text: string
 }

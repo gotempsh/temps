@@ -23,8 +23,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use pingora_core::listeners::PreTlsProcess;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
-use temps_shield::ja4::{self, Ja4, Need, Transport};
-use tokio::io::{AsyncRead, AsyncReadExt};
+use temps_shield::ja4::{self, Ja4, Transport};
 use tracing::debug;
 
 /// The whole ClientHello read. A TLS handshake would wait for the same
@@ -66,7 +65,7 @@ impl Ja4Hook {
 impl PreTlsProcess for Ja4Hook {
     async fn process(&self, stream: &mut L4Stream) -> pingora_core::Result<()> {
         let mut read = Vec::with_capacity(2048);
-        let hello = tokio::time::timeout(READ_TIMEOUT, read_client_hello(stream, &mut read))
+        let hello = tokio::time::timeout(READ_TIMEOUT, ja4::read_client_hello(stream, &mut read))
             .await
             .ok()
             .flatten();
@@ -78,35 +77,10 @@ impl PreTlsProcess for Ja4Hook {
     }
 }
 
-/// Read until `buf` holds the whole ClientHello, never past the record that
-/// ends it. Everything read is in `buf`, whatever the outcome, and a read
-/// cancelled by the timeout loses nothing: bytes join `buf` only once a
-/// read has returned them.
-async fn read_client_hello<S: AsyncRead + Unpin>(
-    stream: &mut S,
-    buf: &mut Vec<u8>,
-) -> Option<ja4::ClientHello> {
-    let mut chunk = [0u8; 4096];
-    loop {
-        match ja4::needed(buf) {
-            Ok(Need::Done(_)) => return ja4::parse(buf).ok(),
-            Ok(Need::More(n)) => {
-                let want = n.min(chunk.len());
-                let got = stream.read(&mut chunk[..want]).await.ok()?;
-                if got == 0 {
-                    return None;
-                }
-                buf.extend_from_slice(&chunk[..got]);
-            }
-            Err(_) => return None,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A ClientHello from curl, from the parser's Wireshark vectors, and the
     /// JA4 Wireshark gave it.
@@ -159,27 +133,5 @@ mod tests {
             Some(expected)
         );
         assert_eq!(hook.take(&random).await, None, "taken once");
-    }
-
-    /// Plain HTTP on the TLS port, and a client that stalls: nothing is
-    /// recorded and every byte goes back to the TLS library.
-    #[tokio::test]
-    async fn anything_else_is_handed_back_untouched() {
-        let mut buf = Vec::new();
-        let mut http = &b"GET / HTTP/1.1\r\nHost: x\r\n\r\n"[..];
-        assert!(read_client_hello(&mut http, &mut buf).await.is_none());
-        assert_eq!(buf, b"GET /");
-
-        let (hello, _) = curl_hello();
-        let (mut client, mut server) = tokio::io::duplex(64 * 1024);
-        client.write_all(&hello[..300]).await.unwrap();
-        let mut buf = Vec::new();
-        let outcome = tokio::time::timeout(
-            Duration::from_millis(50),
-            read_client_hello(&mut server, &mut buf),
-        )
-        .await;
-        assert!(outcome.is_err(), "still waiting for the rest");
-        assert_eq!(buf, hello[..300]);
     }
 }

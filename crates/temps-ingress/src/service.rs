@@ -2699,6 +2699,7 @@ mod tests {
                     revision: String::new(),
                     edge_port: port,
                     client_address_header: None,
+                    client_ja4: None,
                     drivers: Vec::new(),
                     secrets: BTreeMap::new(),
                 }

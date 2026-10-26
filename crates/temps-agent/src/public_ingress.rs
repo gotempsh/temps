@@ -12,6 +12,7 @@ use std::sync::{Arc, RwLock};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use serde::Serialize;
+use temps_shield::ja4;
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{info, warn};
@@ -396,12 +397,31 @@ async fn serve_tls(
         };
         tokio::spawn(async move {
             let connection_permit = Arc::new(connection_permit);
-            let Ok(Ok(stream)) =
-                tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(stream))
+            // ADR 066, I6: rustls keeps no ClientHello extensions it does not
+            // know, so the JA4 comes from the raw hello, read first and then
+            // handed to rustls whole. The handshake timeout covers both; a
+            // connection that sends no ClientHello fails in rustls as before.
+            let handshake = async move {
+                let mut stream = stream;
+                let mut read = Vec::with_capacity(2048);
+                let ja4 = ja4::read_client_hello(&mut stream, &mut read)
                     .await
+                    .map(|hello| ja4::ja4(&hello, ja4::Transport::Tcp));
+                let stream = acceptor
+                    .accept(crate::rewind::Rewind::new(read, stream))
+                    .await?;
+                Ok::<_, std::io::Error>((stream, ja4))
+            };
+            let Ok(Ok((stream, ja4))) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), handshake).await
             else {
                 return;
             };
+            let fingerprint =
+                crate::internal_proxy::PublicClientFingerprint(ja4::ClientFingerprint {
+                    ja4,
+                    source: ja4::Ja4Source::Direct,
+                });
             let Some(sni) = stream
                 .get_ref()
                 .1
@@ -417,6 +437,7 @@ async fn serve_tls(
                 request
                     .extensions_mut()
                     .insert(crate::internal_proxy::PublicTlsSni(sni.clone()));
+                request.extensions_mut().insert(fingerprint);
                 request
                     .extensions_mut()
                     .insert(crate::internal_proxy::PublicPeer(peer));

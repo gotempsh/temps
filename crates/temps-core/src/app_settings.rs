@@ -96,6 +96,13 @@ pub struct AppSettings {
     /// This is the sole control surface — there is no CLI/env override.
     #[serde(default)]
     pub trust_loopback_forwarded_ip: Option<bool>,
+    /// The header a trusted loopback proxy puts the visitor's JA4 TLS
+    /// fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
+    /// `trust_loopback_forwarded_ip` trusts, and removed from every request
+    /// before it goes upstream. `None` records no JA4 behind such a proxy.
+    /// Set through [`normalize_loopback_ja4_header`].
+    #[serde(default)]
+    pub loopback_ja4_header: Option<String>,
 
     // Docker registry settings
     pub docker_registry: DockerRegistrySettings,
@@ -1797,6 +1804,37 @@ impl std::fmt::Display for ClickHouseCompression {
     }
 }
 
+/// Why a [`AppSettings::loopback_ja4_header`] value was refused.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum LoopbackJa4HeaderError {
+    #[error("'{0}' is not a valid HTTP header name")]
+    InvalidName(String),
+    /// The proxy strips this header from every request, so a name without
+    /// `ja4` in it could strip one an app needs, such as `cookie`.
+    #[error("'{0}' must contain \"ja4\", for example x-ja4")]
+    NotJa4(String),
+}
+
+/// Trim and lowercase a [`AppSettings::loopback_ja4_header`]; blank means
+/// none. The name must be an HTTP token (RFC 9110, 5.6.2) that contains
+/// `ja4`.
+pub fn normalize_loopback_ja4_header(
+    value: Option<&str>,
+) -> Result<Option<String>, LoopbackJa4HeaderError> {
+    let Some(name) = value.map(str::trim).filter(|name| !name.is_empty()) else {
+        return Ok(None);
+    };
+    let is_token_char = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+    if !name.chars().all(is_token_char) {
+        return Err(LoopbackJa4HeaderError::InvalidName(name.to_string()));
+    }
+    let name = name.to_ascii_lowercase();
+    if !name.contains("ja4") {
+        return Err(LoopbackJa4HeaderError::NotJa4(name));
+    }
+    Ok(Some(name))
+}
+
 /// A value that is not one of the [`ClickHouseCompression`] modes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("'{value}' is not a valid ClickHouse compression mode; expected one of: lz4, none")]
@@ -2386,6 +2424,7 @@ impl Default for AppSettings {
             security_headers: SecurityHeadersSettings::default(),
             rate_limiting: RateLimitSettings::default(),
             trust_loopback_forwarded_ip: None,
+            loopback_ja4_header: None,
             docker_registry: DockerRegistrySettings::default(),
             registry_mirror_prefix: None,
             image_retention: ImageRetentionSettings::default(),
@@ -2783,6 +2822,32 @@ impl AppSettings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn loopback_ja4_header_names_are_normalized_and_checked() {
+        assert_eq!(normalize_loopback_ja4_header(None), Ok(None));
+        assert_eq!(normalize_loopback_ja4_header(Some("  ")), Ok(None));
+        assert_eq!(
+            normalize_loopback_ja4_header(Some(" X-JA4 ")),
+            Ok(Some("x-ja4".to_string()))
+        );
+        assert_eq!(
+            normalize_loopback_ja4_header(Some("X-Client-Ja4")),
+            Ok(Some("x-client-ja4".to_string()))
+        );
+        assert_eq!(
+            normalize_loopback_ja4_header(Some("x ja4")),
+            Err(LoopbackJa4HeaderError::InvalidName("x ja4".to_string()))
+        );
+        assert_eq!(
+            normalize_loopback_ja4_header(Some("x-ja4:")),
+            Err(LoopbackJa4HeaderError::InvalidName("x-ja4:".to_string()))
+        );
+        assert_eq!(
+            normalize_loopback_ja4_header(Some("Cookie")),
+            Err(LoopbackJa4HeaderError::NotJa4("cookie".to_string()))
+        );
+    }
+
     #[test]
     fn lowering_proxy_log_retention_holds_addresses_for_the_old_window() {
         let now = Utc::now();
