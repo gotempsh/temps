@@ -9,11 +9,15 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
-description = "Shield: signed proof-of-work challenges and clearance cookies (ADR 066)"
+description = "Shield: proof-of-work challenges, clearance cookies and reputation lists (ADR 066)"
 
 [dependencies]
 base64 = { workspace = true }
 hmac = "0.13"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
+zstd = { workspace = true }

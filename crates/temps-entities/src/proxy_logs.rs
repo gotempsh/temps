@@ -126,6 +126,13 @@ pub struct Model {
     /// `temps-error-tracking`; lets the Observe row deep-link to the group
     /// without an extra query.
     pub error_group_id: Option<i32>,
+
+    /// What Shield would have done with the request (`log`, `challenge` or
+    /// `block`, ADR 066 D1); `None` when no list holds the client.
+    pub shield_verdict: Option<String>,
+
+    /// Why, as a JSON array of strings like `spamhaus_drop (192.0.2.0/24)`.
+    pub shield_reasons: Option<serde_json::Value>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
