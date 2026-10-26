@@ -215,7 +215,13 @@ impl ShieldSources {
                 error,
             })?;
         let digest = hex::encode(list.digest()?);
-        let changed = claim.sha256.as_deref() != Some(digest.as_str());
+        // A stored copy the compiler could not read was left out of the
+        // snapshot, so a readable one is a change even with the same networks.
+        let stored_readable = claim
+            .list
+            .as_deref()
+            .is_some_and(|bytes| SourceList::decode(bytes).is_ok());
+        let changed = !stored_readable || claim.sha256.as_deref() != Some(digest.as_str());
         let entries = list.len();
         let published_at = chrono::DateTime::from_timestamp(list.published_at, 0).unwrap_or(now);
         let body = list.encode()?;
@@ -654,6 +660,27 @@ mod tests {
         assert_eq!(
             sources.fetch(&feeds[0]).await?,
             Fetched::Changed { entries: 1 }
+        );
+
+        // The same networks arriving in full (no ETag to send) over an
+        // unreadable copy whose checksum still matches are a change too, so
+        // the list is back in the next snapshot rather than the next day's.
+        db.execute_unprepared(
+            "UPDATE shield_sources SET list = '\\x00'::bytea, etags = '{}'::jsonb, \
+             last_attempt_at = now() - interval '2 hours' WHERE name = 'good'",
+        )
+        .await?;
+        let before = sources_revision(&db).await;
+        assert_eq!(
+            sources.fetch(&feeds[0]).await?,
+            Fetched::Changed { entries: 1 }
+        );
+        let revision = sources.compile().await?;
+        assert!(revision.is_some() && revision > before);
+        assert!(lists.refresh(&db, &[]).await?);
+        assert_eq!(
+            lists.evaluate(ip, Utc::now().timestamp()).action,
+            Action::Block
         );
 
         // Only the last ten revisions are kept.
