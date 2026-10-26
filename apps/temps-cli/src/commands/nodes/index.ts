@@ -25,6 +25,7 @@ import type {
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { registerNodesSshCommands } from './ssh.js'
+import { registerNodesResourcesCommands } from './resources.js'
 import { parseId, parsePortOption, validPort } from './options.js'
 import { printTable } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -403,6 +404,7 @@ export function registerNodesCommands(program: Command): void {
     .action(pairCancelAction)
 
   registerNodesSshCommands(nodes)
+  registerNodesResourcesCommands(nodes)
 }
 
 // ============================================================================

@@ -14,6 +14,8 @@ Worker nodes and workload placement
 - `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
 - `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+- `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+- `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 ### `nodes capability`
 
@@ -192,6 +194,48 @@ Read the SSH host key of the server at --host, to verify it before `nodes ssh ad
 #### `nodes ssh show`
 
 Show one enrollment: its progress and the log with the server output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes resources`
+
+What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+
+**Subcommands:**
+
+- `show` - Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+- `set` - Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+#### `nodes resources show`
+
+Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes resources set`
+
+Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
+| `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
+| `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes state-status`
+
+Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 **Options:**
 

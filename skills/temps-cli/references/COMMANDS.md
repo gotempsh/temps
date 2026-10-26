@@ -92,6 +92,8 @@ Use this index or search for a top-level command heading to load only the releva
 - [`delivery-profiles`](#delivery-profiles) - Manage traffic delivery profiles (Cloudflare proxy, Bunny CDN) used by project domains
 - [`delivery`](#delivery) - Route project domains through a delivery provider (Cloudflare proxy, Bunny CDN)
 - [`ip-access`](#ip-access) - Manage instance-wide IP access control rules, and per-project lists (ip-access project)
+- [`network-policy`](#network-policy) - Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+- [`functions`](#functions) - Manage scale-to-zero functions (WASM modules or OCI images) in a project
 - [`audit`](#audit) - View audit logs
 - [`proxy-logs`](#proxy-logs) - View proxy request logs and statistics
 - [`logs`](#logs) - Search collected logs across every project and database you can access
@@ -982,6 +984,10 @@ Manage environments and environment variables
 - `timeouts` - View or set upstream request/idle timeouts for an environment
 - `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `placement` - Where the scheduler would run an environment's replicas, and why
+- `isolation` - How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+- `volumes` - Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+- `ingress` - Whether visitors must sign in to Temps to open an environment
 - `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
@@ -1162,6 +1168,190 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments placement`
+
+Where the scheduler would run an environment's replicas, and why
+
+**Subcommands:**
+
+- `explain` - Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+- `recommend` - Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+#### `environments placement explain`
+
+Show the nodes each replica would run on now, the eligible nodes ranked, and the ones excluded with the reason
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments placement recommend`
+
+Recommend target nodes from where the environment actually ran (recommended, never applied)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--window-days <days>` | How many days of history to consider (1-90, default 7) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments isolation`
+
+How an environment's replicas are isolated: a container (process) or a Firecracker microVM (micro_vm). Honoured only for environments whose deployments run on the workload plane
+
+**Subcommands:**
+
+- `show` - Show the isolation and whether it takes effect
+- `set` - Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+#### `environments isolation show`
+
+Show the isolation and whether it takes effect
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments isolation set`
+
+Set the isolation: process or micro_vm (a microVM replica only runs on a node that provides one)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments volumes`
+
+Persistent volumes mounted into an environment's replicas; a replica that mounts one is pinned to its node
+
+**Subcommands:**
+
+- `list` (`ls`) - List the environment's volumes, newest first
+- `create` - Create a volume (attach it to mount it)
+- `status` - Show whether the next deploy mounts the attached volumes, and what to fix if not
+- `attach` - Mount a volume (id or name) into every replica at --mount-path
+- `detach` - Stop mounting a volume (id or name); its data is kept
+- `rm` (`delete`) - Delete a volume (id or name), and its data unless it was created with --retain
+
+#### `environments volumes list` (alias: `ls`)
+
+List the environment's volumes, newest first
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--page <page>` | Page number (default 1) | - | No |
+| `--page-size <size>` | Results per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes create`
+
+Create a volume (attach it to mount it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Volume name: 2-64 characters of a-z, 0-9, "_", "." or "-" | - | No |
+| `--size-mb <mb>` | Size in MB, when the backend supports a size | - | No |
+| `--retain` | Keep the data when the volume is deleted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes status`
+
+Show whether the next deploy mounts the attached volumes, and what to fix if not
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes attach`
+
+Mount a volume (id or name) into every replica at --mount-path
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mount-path <path>` | Absolute path inside each replica | - | No |
+| `--read-only` | Mount it read-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes detach`
+
+Stop mounting a volume (id or name); its data is kept
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments volumes rm` (alias: `delete`)
+
+Delete a volume (id or name), and its data unless it was created with --retain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments ingress`
+
+Whether visitors must sign in to Temps to open an environment
+
+**Subcommands:**
+
+- `show` - Show the login requirement and whether the proxy enforces it now
+- `set` - Require visitors to sign in to Temps, or stop requiring it
+
+#### `environments ingress show`
+
+Show the login requirement and whether the proxy enforces it now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments ingress set`
+
+Require visitors to sign in to Temps, or stop requiring it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--require-login` | Visitors must sign in to Temps | - | No |
+| `--no-require-login` | Visitors do not need to sign in | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments crons`
@@ -2831,6 +3021,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -2892,6 +3083,18 @@ Restore a deleted user
 ### `users reset-password`
 
 Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
+
+### `users reset-mfa`
+
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
 
 **Options:**
 
@@ -3858,6 +4061,8 @@ Worker nodes and workload placement
 - `mesh` - WireGuard mesh: lets nodes that only share the internet with the control plane join it, encrypted. Shows whether it is on and how each node is connected
 - `pair` - Pair nodes this control plane dials: for a control plane nodes cannot reach (a laptop, a server behind NAT). Lists recent pairings and their progress
 - `ssh` - Add servers over SSH: the control plane logs in, installs temps if needed, pairs the server and starts its agent. Lists recent ones and their progress
+- `resources` - What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+- `state-status` - Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 ### `nodes capability`
 
@@ -4036,6 +4241,48 @@ Read the SSH host key of the server at --host, to verify it before `nodes ssh ad
 #### `nodes ssh show`
 
 Show one enrollment: its progress and the log with the server output
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `nodes resources`
+
+What the scheduler keeps for the OS and Temps on a node, and whether a placement that does not fit the remaining capacity is refused
+
+**Subcommands:**
+
+- `show` - Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+- `set` - Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+#### `nodes resources show`
+
+Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `nodes resources set`
+
+Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--policy <policy>` | best_effort (reservations not checked) or enforced (placements that do not fit are refused) | - | No |
+| `--reserve-cpu <millis>` | CPU kept for the OS and Temps, in millicores (1000 = one core) | - | No |
+| `--reserve-memory <mb>` | Memory kept for the OS and Temps, in MB | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `nodes state-status`
+
+Show the workload plane's desired-state stream: whether it runs here, its lag and counters
 
 **Options:**
 
@@ -5930,6 +6177,213 @@ Check whether an address would be allowed
 | `--project-id <id>` | Project ID | - | Yes |
 | `--environment-id <id>` | Environment ID (omit for the project-wide list) | - | No |
 | `--ip <ip>` | Address to evaluate | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+## `network-policy` (alias: `netpol`)
+
+Manage network policy for workloads: rules, egress/ingress profiles and the effective policy
+
+**Subcommands:**
+
+- `rules` - Manage network policy rules
+- `effective` - Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+- `profile` - Manage a workload's egress and ingress profile
+
+### `network-policy rules`
+
+Manage network policy rules
+
+**Subcommands:**
+
+- `list` (`ls`) - List network policy rules
+- `show` - Show one network policy rule
+- `create` (`add`) - Create a network policy rule
+- `rm` (`remove`) - Delete a network policy rule (link rules are removed by unlinking instead)
+
+#### `network-policy rules list` (alias: `ls`)
+
+List network policy rules
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Only rules for this kind (deployment, sandbox, service, function, job) | - | No |
+| `--subject-id <id>` | Only rules for this subject (environment id for deployments) | - | No |
+| `--origin <origin>` | Only rules of this origin (link, operator, system) | - | No |
+| `--page <n>` | Page number (default 1) | - | No |
+| `--page-size <n>` | Rules per page (default 20, max 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules show`
+
+Show one network policy rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `network-policy rules create` (alias: `add`)
+
+Create a network policy rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--subject-kind <kind>` | Workload kind (deployment, sandbox, service, function, job) | - | Yes |
+| `--subject-id <id>` | Environment id for a deployment; the row id for other kinds | - | Yes |
+| `--direction <direction>` | Traffic direction (egress, ingress) | - | Yes |
+| `--peer-kind <kind>` | Peer type: service (by id), workload (<kind>/<id>) or cidr. host rules are refused until a node runs the shared egress proxy | - | Yes |
+| `--peer <ref>` | Peer reference: a service id, <kind>/<id>, or a CIDR | - | Yes |
+| `--action <action>` | What to do with matching traffic (allow, deny) | - | Yes |
+| `--protocol <protocol>` | tcp, udp, any (default tcp) | - | No |
+| `--port <port>` | Port, or the start of a range. Omit for every port | - | No |
+| `--port-end <port>` | End of the port range (needs --port) | - | No |
+| `--description <text>` | Why this rule exists | - | No |
+| `--json` | Output the created rule in JSON format | - | No |
+
+#### `network-policy rules rm` (alias: `remove`)
+
+Delete a network policy rule (link rules are removed by unlinking instead)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+### `network-policy effective`
+
+Show the policy in force for a workload: profile, rules, inbound links and where it is enforced. <kind> is one of deployment, sandbox, service, function, job; <id> is the environment id for a deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `network-policy profile`
+
+Manage a workload's egress and ingress profile
+
+**Subcommands:**
+
+- `set` - Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+#### `network-policy profile set`
+
+Set a workload's profile. Each direction is open, restricted, none; a direction left out is reset to the kind's default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--egress <profile>` | Outbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--ingress <profile>` | Inbound profile (open, restricted, none). Omit for the kind's default | - | No |
+| `--json` | Output in JSON format | - | No |
+
+## `functions` (alias: `fn`)
+
+Manage scale-to-zero functions (WASM modules or OCI images) in a project
+
+**Subcommands:**
+
+- `capability` - Show whether this Temps instance can run functions, and what is missing
+- `list` (`ls`) - List the functions of a project
+- `show` - Show a function (ID or name), including why it is not serving
+- `create` - Create a function from a WASM module or an OCI image
+- `rm` (`delete`) - Delete a function (ID or name)
+- `sleep` - Stop a running function now; the next request wakes it
+- `wake` - Start a function now instead of on its next request
+
+### `functions capability`
+
+Show whether this Temps instance can run functions, and what is missing
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `functions list` (alias: `ls`)
+
+List the functions of a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--page <n>` | Page number | `1` | No |
+| `--page-size <n>` | Items per page (max 100) | `20` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `functions show`
+
+Show a function (ID or name), including why it is not serving
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `functions create`
+
+Create a function from a WASM module or an OCI image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--name <name>` | Function name; part of its hostname | - | No |
+| `--wasm <file>` | WASI preview 1 module (wasm32-wasip1) serving HTTP CGI-style | - | No |
+| `--image <ref>` | OCI image reference serving HTTP on --port | - | No |
+| `--port <port>` | Port the function serves on (default 8080) | - | No |
+| `--memory <mb>` | Memory limit in MiB (1-4096) | - | No |
+| `--idle-timeout <seconds>` | Stop after this many idle seconds (10-86400, default 300) | - | No |
+| `--wake-timeout <seconds>` | How long the first request waits for a start (1-300, default 30) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `functions rm` (alias: `delete`)
+
+Delete a function (ID or name)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `functions sleep`
+
+Stop a running function now; the next request wakes it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `functions wake`
+
+Start a function now instead of on its next request
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `audit`
@@ -8058,6 +8512,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `logs` - Stream logs from a detached job (SSE)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
+- `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+- `egress` - Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
@@ -8090,6 +8546,8 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--egress-allow <host|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
 | `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
@@ -8315,6 +8773,32 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 | `--rotate` | Generate a new random password and set it (default when no flag is given) | - | No |
 | `--length <n>` | Length of the generated password (8..=256, default 24) | - | No |
 | `--clear` | Remove the preview password — preview URLs become open again | - | No |
+
+### `sandbox preview-access`
+
+Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
+| `--allow-ip <ip|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox egress`
+
+Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--internet` | Remove the restriction | - | No |
+| `--deny-all` | Allow no outbound traffic at all | - | No |
+| `--allow <host|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`
 

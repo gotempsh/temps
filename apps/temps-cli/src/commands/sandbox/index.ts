@@ -26,6 +26,17 @@ import {
   resolveProjectIdBySlug,
 } from './workspace-source.js'
 import { shellAction } from './shell.js'
+import {
+  buildEgressPolicy,
+  buildPreviewAccessBody,
+  describeEgressPolicy,
+  describeEgressRule,
+  describePreviewAccess,
+  wantsEgressChange,
+  wantsPreviewAccessChange,
+  type EgressFlags,
+  type PreviewAccessFlags,
+} from './access.js'
 // Placement shapes (ADR-048) come from the generated client so they cannot
 // drift from the server's schema.
 import type {
@@ -33,6 +44,9 @@ import type {
   NodeEvictionResponse,
   NodeSandboxesResponse,
   PlacementNode,
+  PreviewAccessResponse,
+  SandboxEgressPolicy,
+  SandboxPreviewAccess,
   SandboxPlacementResponse,
   UpdateSandboxPlacementBody,
 } from '../../api/types.gen.js'
@@ -75,6 +89,12 @@ interface SandboxInner {
   node_id?: number | null
   /** Hosting node name; `control-plane` for control-plane sandboxes. */
   node_name?: string
+  /** Who may open preview URLs (ADR-055 §11). Absent on older servers. */
+  preview_access?: SandboxPreviewAccess
+  /** Client CIDRs allowed to open previews; empty = any. */
+  preview_allowed_cidrs?: string[]
+  /** Outbound network policy. Absent on older servers. */
+  egress_policy?: SandboxEgressPolicy
 }
 
 /** Single-sandbox responses are wrapped: `{ sandbox, routes }`. */
@@ -398,6 +418,12 @@ export function registerSandboxCommands(program: Command): void {
       'Length of the generated preview password (8..=256, default 24)',
     )
     .option(
+      '--egress-allow <host|cidr[:ports]>',
+      'Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port',
+      (val: string, prev: string[]) => (prev ? [...prev, val] : [val]),
+    )
+    .option('--egress-deny-all', 'Allow no outbound traffic at all')
+    .option(
       '--from-snapshot <snap-id>',
       'Create sandbox from a snapshot (mutually exclusive with --image)',
     )
@@ -596,6 +622,39 @@ export function registerSandboxCommands(program: Command): void {
     .option('--clear', 'Remove the preview password — preview URLs become open again')
     .action(passwordAction)
 
+  sandbox
+    .command('preview-access <id>')
+    .description(
+      'Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only',
+    )
+    .option(
+      '--access <mode>',
+      "temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`)",
+    )
+    .option(
+      '--allow-ip <ip|cidr>',
+      'Only these client networks may open previews, in every mode (repeatable; replaces the list)',
+      (val: string, prev: string[]) => (prev ? [...prev, val] : [val]),
+    )
+    .option('--any-ip', 'Clear the allow-list: any client address may open previews')
+    .option('--json', 'Output as JSON')
+    .action(previewAccessAction)
+
+  sandbox
+    .command('egress <id>')
+    .description(
+      'Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused',
+    )
+    .option('--internet', 'Remove the restriction')
+    .option('--deny-all', 'Allow no outbound traffic at all')
+    .option(
+      '--allow <host|cidr[:ports]>',
+      'Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port',
+      (val: string, prev: string[]) => (prev ? [...prev, val] : [val]),
+    )
+    .option('--json', 'Output as JSON')
+    .action(egressAction)
+
   // ── Filesystem subgroup ──
   const fs = sandbox.command('fs').description('Filesystem operations inside a sandbox')
 
@@ -693,6 +752,8 @@ interface CreateOptions {
   node?: string
   backend?: string
   allowDocker?: boolean
+  egressAllow?: string[]
+  egressDenyAll?: boolean
   json?: boolean
 }
 
@@ -809,6 +870,8 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (options.cpuLimit !== undefined) body.cpu_limit = Number(options.cpuLimit)
   if (options.memoryMb !== undefined) body.memory_limit_mb = Number(options.memoryMb)
   if (options.workspace) body.lifecycle = 'workspace'
+  const egress: EgressFlags = { allow: options.egressAllow, denyAll: options.egressDenyAll }
+  if (wantsEgressChange(egress)) body.egress_policy = buildEgressPolicy(egress)
 
   // A workspace always needs code, so resolve one even when no source flag
   // was passed — that's the whole point of `sandbox create --workspace` in
@@ -1010,6 +1073,130 @@ async function passwordAction(
   warning('Preview password (shown once — copy it now):')
   console.log(`  ${colors.primary(password)}`)
   keyValue('Hint', `ends in …${res.preview_password_hint}`)
+  newline()
+}
+
+interface PreviewAccessOptions extends PreviewAccessFlags {
+  json?: boolean
+}
+
+async function previewAccessAction(id: string, options: PreviewAccessOptions): Promise<void> {
+  const api = await auth()
+  const envelope = await withSpinner('Fetching sandbox...', () =>
+    apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}`),
+  )
+  const inner = envelope.sandbox
+  if (inner.preview_access === undefined) {
+    throw new Error(
+      `Sandbox ${id}: this server does not report preview access; upgrade Temps to manage it`,
+    )
+  }
+
+  if (!wantsPreviewAccessChange(options)) {
+    if (options.json) {
+      json({
+        id: inner.id,
+        preview_access: inner.preview_access,
+        preview_allowed_cidrs: inner.preview_allowed_cidrs ?? [],
+        preview_password_hint: inner.preview_password_hint ?? null,
+      })
+      return
+    }
+    printPreviewAccess(inner.id, inner.preview_access, inner.preview_allowed_cidrs ?? [], inner.preview_password_hint)
+    return
+  }
+
+  const body = buildPreviewAccessBody(options, {
+    access: inner.preview_access,
+    allowedCidrs: inner.preview_allowed_cidrs ?? [],
+  })
+  // The server refuses password mode without a password, but names an API
+  // path; point at the command that sets one instead.
+  if (body.access === 'password' && !inner.preview_password_hint) {
+    throw new Error(
+      `Sandbox ${id} has no preview password yet; set one first with \`temps sandbox password ${id}\``,
+    )
+  }
+  const res = await withSpinner('Updating preview access...', () =>
+    apiRequest<PreviewAccessResponse>(api, `/${encodeURIComponent(id)}/preview-access`, {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    }),
+  )
+  if (options.json) {
+    json(res)
+    return
+  }
+  success(`Preview access updated for ${colors.primary(res.id)}`)
+  printPreviewAccess(res.id, res.preview_access, res.preview_allowed_cidrs, res.preview_password_hint)
+}
+
+function printPreviewAccess(
+  id: string,
+  access: SandboxPreviewAccess,
+  allowedCidrs: string[],
+  passwordHint: string | null | undefined,
+): void {
+  newline()
+  header(`${icons.info} ${id}`)
+  keyValue('Access', access)
+  keyValue('Allowed networks', allowedCidrs.length === 0 ? 'any' : allowedCidrs.join(', '))
+  if (passwordHint) keyValue('Preview password', `ends in …${passwordHint}`)
+  keyValue('Who can open previews', describePreviewAccess(access, allowedCidrs))
+  newline()
+}
+
+interface EgressOptions extends EgressFlags {
+  json?: boolean
+}
+
+async function egressAction(id: string, options: EgressOptions): Promise<void> {
+  const api = await auth()
+
+  if (!wantsEgressChange(options)) {
+    const envelope = await withSpinner('Fetching sandbox...', () =>
+      apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}`),
+    )
+    const inner = envelope.sandbox
+    if (inner.egress_policy === undefined) {
+      throw new Error(
+        `Sandbox ${id}: this server does not report an egress policy; upgrade Temps to manage it`,
+      )
+    }
+    if (options.json) {
+      json({ id: inner.id, egress_policy: inner.egress_policy })
+      return
+    }
+    printEgressPolicy(inner.id, inner.egress_policy)
+    return
+  }
+
+  // Validate before any request, so a typo never reaches the server.
+  const policy = buildEgressPolicy(options)
+  const envelope = await withSpinner('Updating egress policy...', () =>
+    apiRequest<SandboxResponse>(api, `/${encodeURIComponent(id)}/egress-policy`, {
+      method: 'PUT',
+      body: JSON.stringify(policy),
+    }),
+  )
+  if (options.json) {
+    json(envelope)
+    return
+  }
+  success(`Egress policy updated for ${colors.primary(envelope.sandbox.id)}`)
+  printEgressPolicy(envelope.sandbox.id, envelope.sandbox.egress_policy ?? policy)
+}
+
+function printEgressPolicy(id: string, policy: SandboxEgressPolicy): void {
+  newline()
+  header(`${icons.info} ${id}`)
+  keyValue('Outbound', describeEgressPolicy(policy))
+  for (const rule of policy.mode === 'restricted' ? (policy.rules ?? []) : []) {
+    console.log(`  ${colors.muted('allow')} ${describeEgressRule(rule)}`)
+  }
+  if (policy.mode === 'restricted') {
+    info('Private, loopback and cloud metadata addresses are always refused.')
+  }
   newline()
 }
 
@@ -1574,6 +1761,13 @@ async function showAction(id: string, options: { json?: boolean }): Promise<void
   }
   if (sbx.preview_password_hint) {
     keyValue('Preview password', `ends in …${sbx.preview_password_hint}`)
+  }
+  const inner = envelope.sandbox
+  if (inner.preview_access !== undefined) {
+    keyValue('Previews', describePreviewAccess(inner.preview_access, inner.preview_allowed_cidrs))
+  }
+  if (inner.egress_policy !== undefined) {
+    keyValue('Outbound', describeEgressPolicy(inner.egress_policy))
   }
   if (isWorkspace) {
     newline()

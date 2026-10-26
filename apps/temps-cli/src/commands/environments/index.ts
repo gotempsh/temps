@@ -29,6 +29,7 @@ import { printTable, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
+import { registerEnvironmentWorkloadCommands } from './workload.js'
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -178,6 +179,9 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-r, --replicas <count>', 'Number of replicas to set')
     .option('--json', 'Output in JSON format')
     .action(scaleCmd)
+
+  // Placement, isolation, volumes and ingress login (ADR-055)
+  registerEnvironmentWorkloadCommands(environments)
 
   // Cron jobs subcommand
   const crons = environments

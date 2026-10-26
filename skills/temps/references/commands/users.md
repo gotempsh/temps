@@ -16,6 +16,7 @@ Manage platform users
 - `remove` (`rm`) - Remove a user
 - `restore` - Restore a deleted user
 - `reset-password` - Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+- `reset-mfa` - Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
 - `role` - Manage user roles
 
 ### `users list` (alias: `ls`)
@@ -77,6 +78,18 @@ Restore a deleted user
 ### `users reset-password`
 
 Reset another user's password to a generated temporary one. The user is signed out of every browser session and must choose a new password at next sign-in
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompt (for automation) | - | No |
+
+### `users reset-mfa`
+
+Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again
 
 **Options:**
 
