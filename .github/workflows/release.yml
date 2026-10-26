@@ -1246,12 +1246,34 @@ jobs:
           # Release workflows never save Actions caches under tag refs.
           cache: false
 
+      - name: Record scanned server image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        env:
+          IMAGE_DIGEST: ${{ steps.release_image.outputs.digest }}
+          PLATFORM_TAG: ${{ steps.platform_tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid scanned server image digest" >&2
+            exit 1
+          fi
+          mkdir -p scanned-images
+          printf '%s\n' "$IMAGE_DIGEST" > "scanned-images/$PLATFORM_TAG"
+
+      - name: Upload scanned server image digest
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: scanned-server-${{ steps.platform_tag.outputs.tag }}
+          path: scanned-images/*
+          if-no-files-found: error
+          overwrite: true
+
   create-docker-manifest:
     name: Create Docker Manifest
     needs: [build-and-push-docker, create-release]
-    # Merges per-platform tags that build-and-push-docker only pushes on a
-    # real run. On a workflow_dispatch dry-run those source tags don't
-    # exist, so skip the merge too (would otherwise fail on a missing tag).
+    # Merge only the digests scanned by this run. Other runs may overwrite
+    # versioned architecture tags between scanning and promotion.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
     runs-on: ubuntu-latest
     permissions:
@@ -1291,7 +1313,29 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
-      # Merge per-platform tags into a multi-arch manifest under the channel
+      - name: Download scanned server image digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: scanned-server-linux-*
+          merge-multiple: true
+          path: scanned-images
+
+      - name: Validate scanned server image references
+        id: scanned_images
+        env:
+          IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/temps
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            digest=$(cat "scanned-images/linux-$arch")
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid scanned server image digest for $arch" >&2
+              exit 1
+            fi
+            printf '%s_ref=%s@%s\n' "$arch" "$IMAGE_REPOSITORY" "$digest" >> "$GITHUB_OUTPUT"
+          done
+
+      # Merge scanned digests into a multi-arch manifest under the channel
       # ref (`:latest` for stable, `:beta` for betas/RCs, `:nightly` for
       # nightlies). Operators that pin to `:latest` never receive a
       # prerelease, and `:beta` never receives a nightly.
@@ -1299,16 +1343,19 @@ jobs:
         if: needs.create-release.outputs.channel_tag != ''
         env:
           CHANNEL: ${{ needs.create-release.outputs.channel_tag }}
+          AMD64_IMAGE: ${{ steps.scanned_images.outputs.amd64_ref }}
+          ARM64_IMAGE: ${{ steps.scanned_images.outputs.arm64_ref }}
         run: |
           docker buildx imagetools create -t "ghcr.io/${{ github.repository_owner }}/temps:${CHANNEL}" \
-            "ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64" \
-            "ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64"
+            "$AMD64_IMAGE" "$ARM64_IMAGE"
 
       - name: Create and push manifest for version
+        env:
+          AMD64_IMAGE: ${{ steps.scanned_images.outputs.amd64_ref }}
+          ARM64_IMAGE: ${{ steps.scanned_images.outputs.arm64_ref }}
         run: |
           docker buildx imagetools create -t ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }} \
-            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-amd64 \
-            ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-linux-arm64
+            "$AMD64_IMAGE" "$ARM64_IMAGE"
 
       - name: Sign published multi-platform images
         env:
