@@ -36,7 +36,7 @@
     "format:check": "prettier --check \"src/**/*.{ts,tsx,js,jsx,json,css,md}\""
   },
   "dependencies": {
-    "@hookform/resolvers": "^5.9.1",
+    "@hookform/resolvers": "^6.0.0",
     "@monaco-editor/react": "^4.7.0",
     "@nivo/line": "^0.99.0",
     "@radix-ui/react-alert-dialog": "^1.2.1",
