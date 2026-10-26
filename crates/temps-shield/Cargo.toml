@@ -26,6 +26,9 @@ async-trait = { workspace = true, optional = true }
 hickory-resolver = { version = "0.26", optional = true }
 moka = { version = "0.12", features = ["future"], optional = true }
 zstd = { workspace = true }
+arc-swap = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [features]
 # `ja4::read_client_hello`, for the ingresses that read a ClientHello off
@@ -33,8 +36,20 @@ zstd = { workspace = true }
 tokio = ["dep:tokio"]
 # `crawler_check`: verifying claimed crawlers by DNS, for the ingresses.
 crawlers = ["tokio", "tokio/time", "dep:async-trait", "dep:hickory-resolver", "dep:moka"]
+# `netwatch`: netwatch's bans as a local list, and request lines sent to
+# it (D12). Off unless the node runs netwatch.
+netwatch = [
+    "tokio",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+    "dep:arc-swap",
+    "dep:reqwest",
+    "dep:tracing",
+]
 
 [dev-dependencies]
 # Turns on `tokio` for this crate's own tests.
-temps-shield = { path = ".", features = ["tokio", "crawlers"] }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+temps-shield = { path = ".", features = ["tokio", "crawlers", "netwatch"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
