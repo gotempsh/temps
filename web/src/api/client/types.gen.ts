@@ -24299,6 +24299,15 @@ export type ProxyLogResponse = {
     response_time_ms?: number | null;
     routing_status: string;
     session_id?: number | null;
+    /**
+     * The lists that hold the client, and the range on each.
+     */
+    shield_reasons: Array<string>;
+    /**
+     * What Shield would have done with the request: `log`, `challenge` or
+     * `block`. `None` when no reputation list holds the client.
+     */
+    shield_verdict?: string | null;
     status_code: number;
     timestamp: string;
     upstream_host?: string | null;

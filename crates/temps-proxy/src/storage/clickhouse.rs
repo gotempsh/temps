@@ -319,6 +319,11 @@ pub struct ChProxyLogRow {
     /// serialization). The TTL expression in 0004_retention_ttl.sql reads
     /// this column: `toDateTime(timestamp) + toIntervalDay(retention_days)`.
     pub retention_days: u16,
+    /// shield_verdict LowCardinality(String) DEFAULT '' (0005_shield_verdict.sql,
+    /// after `retention_days` for the same reason).
+    pub shield_verdict: String,
+    /// shield_reasons Array(LowCardinality(String))
+    pub shield_reasons: Vec<String>,
 }
 
 impl From<&CreateProxyLogRequest> for ChProxyLogRow {
@@ -386,6 +391,8 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
             // Callers that hold a RetentionResolver should override this field
             // after construction. The fixed default matches the DDL DEFAULT.
             retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
+            shield_verdict: entry.shield_verdict.clone().unwrap_or_default(),
+            shield_reasons: entry.shield_reasons.clone(),
         }
     }
 }
@@ -438,6 +445,8 @@ struct ChProxyLogReadRow {
     cache_status: String,
     request_headers: String,
     response_headers: String,
+    shield_verdict: String,
+    shield_reasons: Vec<String>,
 }
 
 /// Parse a stored header blob into JSON for the entity model.
@@ -519,6 +528,10 @@ impl ChProxyLogReadRow {
             visitor_id: self.visitor_id,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: opt_str(self.shield_verdict),
+            shield_reasons: crate::service::proxy_log_service::shield_reasons_to_json(
+                &self.shield_reasons,
+            ),
         }
     }
 }
@@ -1167,7 +1180,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, '' AS request_headers, '' AS response_headers \
+                cache_status, '' AS request_headers, '' AS response_headers, \
+                shield_verdict, shield_reasons \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_by} \
@@ -1225,7 +1239,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, '' AS request_headers, '' AS response_headers \
+                cache_status, '' AS request_headers, '' AS response_headers, \
+                shield_verdict, shield_reasons \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_by} \
@@ -1289,7 +1304,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
-                cache_status, request_headers, response_headers \
+                cache_status, request_headers, response_headers, \
+                shield_verdict, shield_reasons \
              FROM proxy_logs \
              WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
@@ -2520,6 +2536,8 @@ mod tests {
             error_group_id: None,
             visitor_uuid: None,
             session_uuid: None,
+            shield_verdict: None,
+            shield_reasons: Vec::new(),
         }
     }
 
@@ -2974,6 +2992,63 @@ mod tests {
     }
 
     #[test]
+    fn shield_verdicts_round_trip_through_clickhouse_rows() {
+        let mut entry = make_entry("req-shield");
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.shield_verdict, "");
+        assert!(row.shield_reasons.is_empty());
+
+        entry.shield_verdict = Some("block".into());
+        entry.shield_reasons = vec!["spamhaus_drop (192.0.2.0/24)".into()];
+        let row = ChProxyLogRow::from(&entry);
+        assert_eq!(row.shield_verdict, "block");
+        assert_eq!(row.shield_reasons, ["spamhaus_drop (192.0.2.0/24)"]);
+
+        let model = ChProxyLogReadRow {
+            timestamp_ms: 1_717_200_000_000,
+            method: "GET".into(),
+            path: "/".into(),
+            query_string: String::new(),
+            host: "h".into(),
+            status_code: 200,
+            response_time_ms: None,
+            request_source: "proxy".into(),
+            is_system_request: 0,
+            routing_status: "routed".into(),
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            session_id: None,
+            visitor_id: None,
+            container_id: String::new(),
+            upstream_host: String::new(),
+            error_message: String::new(),
+            client_ip: "192.0.2.9".into(),
+            user_agent: String::new(),
+            referrer: String::new(),
+            request_id: "rid".into(),
+            ip_geolocation_id: None,
+            browser: String::new(),
+            browser_version: String::new(),
+            operating_system: String::new(),
+            device_type: String::new(),
+            is_bot: None,
+            bot_name: String::new(),
+            request_size_bytes: None,
+            response_size_bytes: None,
+            cache_status: String::new(),
+            request_headers: String::new(),
+            response_headers: String::new(),
+            shield_verdict: row.shield_verdict,
+            shield_reasons: row.shield_reasons,
+        }
+        .into_model();
+        let response = crate::service::proxy_log_service::ProxyLogResponse::from(model);
+        assert_eq!(response.shield_verdict.as_deref(), Some("block"));
+        assert_eq!(response.shield_reasons, ["spamhaus_drop (192.0.2.0/24)"]);
+    }
+
+    #[test]
     fn row_conversion_is_bot_tristate() {
         let mut entry = make_entry("req-2");
         entry.is_bot = None;
@@ -3023,6 +3098,8 @@ mod tests {
             request_headers: r#"{"accept":"text/html"}"#.into(),
             // `''` is what the list queries alias in place of the column.
             response_headers: String::new(),
+            shield_verdict: String::new(),
+            shield_reasons: Vec::new(),
         };
         let model = read.into_model();
         assert_eq!(model.id, 0);

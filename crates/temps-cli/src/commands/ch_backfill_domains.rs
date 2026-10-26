@@ -510,6 +510,8 @@ mod proxy_logs {
         response_headers: Option<String>,
         trace_id: Option<String>,
         error_group_id: Option<i32>,
+        shield_verdict: Option<String>,
+        shield_reasons: Option<serde_json::Value>,
     }
 
     const SELECT: &str = "SELECT \
@@ -519,7 +521,7 @@ mod proxy_logs {
         client_ip, user_agent, referrer, request_id, ip_geolocation_id, browser, browser_version, \
         operating_system, device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
         cache_status, request_headers::text AS request_headers, response_headers::text AS response_headers, \
-        trace_id, error_group_id \
+        trace_id, error_group_id, shield_verdict, shield_reasons \
         FROM proxy_logs \
         WHERE timestamp >= $1 AND timestamp <= $2 \
           AND (timestamp, id) > ($3, $4) \
@@ -569,6 +571,10 @@ mod proxy_logs {
             // Source timestamp ms as the dedup version — stable across re-runs.
             _version: ms as u64,
             retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
+            shield_verdict: r.shield_verdict.clone().unwrap_or_default(),
+            shield_reasons: temps_proxy::service::proxy_log_service::shield_reasons_from_json(
+                r.shield_reasons.clone(),
+            ),
         }
     }
 

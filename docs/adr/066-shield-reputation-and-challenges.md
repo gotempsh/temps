@@ -2,10 +2,12 @@
 
 ## Status
 
-Proposed — 2026-10-25. Phase 1 (the challenge fix) is implemented in the
-pull request that adds this ADR; the later phases are proposed. File and line
-references are to `main` at 41dcd5c, before that change, and to
-pingora-core 0.9.0 and the vendored OpenSSL 3.6.2 it builds with.
+Proposed — 2026-10-25. Phase 1 (the challenge fix) shipped with this ADR.
+Phase 2 (reputation lists in `log` mode) is implemented in the pull request
+that amends it on 2026-10-26, which also corrects what D2 said about the
+lists' terms; the later phases are proposed. File and line references are to
+`main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
+OpenSSL 3.6.2 it builds with.
 
 Related: ADR-020 (every ingress serves every app), ADR 048 (ingress is a
 node capability), ADR 051 (public ingress surface; phase 1 moves the CAPTCHA
@@ -200,8 +202,10 @@ with a default verdict the platform admin can change:
 | Source | Default verdict | Notes |
 |---|---|---|
 | `spamhaus_drop` | block | Free list of hijacked and criminal networks |
-| `dshield` | challenge | Top attacking networks, rotates daily |
+| `feodo` | block | Botnet command-and-control addresses (abuse.ch Feodo Tracker) |
+| `dshield` | challenge | Top attacking networks, rotates daily; off until the operator enables it |
 | `fullbogons` | log | Unallocated space; inbound traffic from it is spoofed |
+| `iana_reserved` (built in) | log | Ranges that are never a valid public source address |
 | `crowdsec` (optional) | challenge | CrowdSec community blocklist, when the operator enrols |
 | `operator` | as written | Platform-wide, then per project |
 | `observed` | per rule (D9) | Learned across the fleet, addresses and fingerprints |
@@ -213,22 +217,36 @@ the lookup costs one `ArcSwap` load and a few binary searches. An ingress
 that loses the control plane keeps its last good snapshot; a feed that fails
 to download keeps its previous copy.
 
-**A baseline ships in every binary.** Each temps build embeds the slow-moving
-lists as one compressed baseline snapshot, about 26 KB. Every ingress starts
-from it, so a fresh control plane, a worker before its first sync and an
-air-gapped install all have reputation from the first request. A fetched or
-synced snapshot replaces it as soon as one exists.
+**Lists are fetched from their publishers, never shipped.** Their terms
+decide this:
 
-| Embedded | Max age, then `log` | Why |
+| List | Terms | So |
 |---|---|---|
-| `spamhaus_drop`, IPv4 and IPv6 | 30 days | Changes slowly. Spamhaus allows redistribution if the source, copyright and timestamps are kept, so they ship with the data |
-| `fullbogons`, IPv4 and IPv6 | 30 days (already `log`) | Newly assigned ranges become false bogons in an old copy. Subject to Team Cymru's terms (open question) |
-| Browser JA4 list, verified-crawler domains, exploit signatures (D8) | none | Code and reference data, versioned with the release |
-| Not embedded: `dshield`, `feodo` | — | They rotate within days; an old copy would act on the wrong networks |
+| Spamhaus DROP | Offered free for any use, but the terms grant no licence to the data and restrict use of the Spamhaus name in commercial materials | Fetched from spamhaus.org by each control plane; not copied into the repository or the binary |
+| Team Cymru full bogons | Free to fetch; nothing grants redistribution | Fetched only |
+| abuse.ch Feodo Tracker | CC0, commercial use included | Fetched; could be shipped, but rotates within days |
+| DShield block list | CC BY-NC-SA 2.5, non-commercial | Defined, off by default; an operator whose use the licence allows enables it |
 
-Age counts from each list's own publication time, not the build, so an old
-binary on an offline network stops blocking on a stale list by itself. If
-even the baseline cannot be decoded, verdicts are `pass` (fail open).
+What every binary does carry is the **built-in baseline**: the IANA ranges
+that are never a valid source on the public internet (`0.0.0.0/8`, the three
+IPv4 documentation networks, `240.0.0.0/4`, `::/128`, `100::/64`,
+`2001:db8::/32` and `3fff::/20`). They are code, not data, so they never go
+stale; their verdict is `log`. Loopback, private, link-local, shared (CGNAT)
+and unique-local space is left out, because a proxy's own neighbours
+connect from there. Every ingress starts from the baseline, and every
+snapshot adds to it. The browser JA4 list, verified-crawler domains and
+exploit signatures (D8) are also code, versioned with the release.
+
+| List | Verdict | Max age, then `log` | Age counts from |
+|---|---|---|---|
+| `spamhaus_drop`, IPv4 and IPv6 | block | 30 days | The list's own metadata timestamp |
+| `fullbogons`, IPv4 and IPv6 | log | 30 days | Its `# last updated` header |
+| `feodo` | block | 7 days | The last fetch that confirmed it |
+| `dshield` | challenge | 3 days | The last fetch that confirmed it |
+| `iana_reserved` | log | never | — |
+
+An install that cannot reach a publisher therefore stops acting on its old
+copy by itself, and an air-gapped install has the baseline only.
 
 ### D3. Address and identity come from the connection
 
@@ -467,7 +485,9 @@ dependency in its default features, so the agent can use it:
 
 | Module | Contents |
 |---|---|
-| `snapshot` | `ShieldSnapshot`, `Source`, the compiled index: per source, merged ranges for membership plus the sorted original networks for attribution (longest-prefix match by masking, the netwatch `FeedList::range_of` approach) |
+| `snapshot` | `ShieldSnapshot` and `SourceList`: per source, the collapsed networks, delta-encoded (phase 2) |
+| `index` | The in-memory form of a snapshot plus the baseline, and `evaluate(ip, now)` (phase 2) |
+| `net`, `feeds`, `baseline` | IP networks as integers; the feed definitions and their parsers; the IANA-reserved ranges (phase 2) |
 | `verdict` | `evaluate(&ShieldInput, &Index, &EnvPolicy) -> Verdict` |
 | `token` | Challenge token and clearance cookie: encode, verify, derived keys (phase 1) |
 | `ja4` | ClientHello parser and JA4 string |
@@ -478,7 +498,7 @@ dependency in its default features, so the agent can use it:
 | `identity` | The D3 visitor identity (phase 1) |
 | `crawlers` | Reverse-DNS verification with a moka cache (hickory resolver) |
 | `assets` | `challenge.html` (escaped templating) and the WASM solver bytes |
-| `server` (feature) | Feed fetchers, compiler, promoter, persistence, API handlers, `ShieldPlugin` |
+| `server` (feature) | Feed fetchers, compiler, promoter, persistence, API handlers, `ShieldPlugin`. Phase 2 keeps the fetch and compile jobs in `temps-proxy` (`shield/sources.rs`), next to the loader and started by `ProxyPlugin`; they move here once something other than the proxy needs them |
 
 ```rust
 pub struct ShieldInput<'a> {
@@ -509,19 +529,28 @@ pub struct Verdict {
 
 Migration `mYYYYMMDD_000001_create_shield.rs`:
 
-- `projects.shield_mode TEXT NOT NULL DEFAULT 'log'`,
+- `projects.shield_mode TEXT NOT NULL DEFAULT 'log'` (phase 4; until then
+  every environment records verdicts and attack mode is unchanged),
   `environments.shield_mode TEXT NULL` (inherit). Backfill `'attack'` where
   `attack_mode` is true. The API writes both columns for one release, then
   `attack_mode` is dropped.
 - `environments.shield_exempt_paths JSONB NOT NULL DEFAULT '[]'`.
-- `shield_sources (id, name, kind, url, default_verdict, enabled, etag,
-  last_fetched_at, entries, sha256)`.
+- `shield_sources (name, enabled, etags, last_attempt_at, last_fetched_at,
+  last_error, published_at, entries, sha256, list, created_at, updated_at)`
+  (phase 2). One row per feed in `temps_shield::feeds`, which holds the URL,
+  format and verdict; `list` is the last good copy, and `updated_at` moves
+  only when its networks change. Custom lists (see Later) would add `kind`
+  and `url`.
 - `shield_operator_entries (id, scope, project_id NULL, network CIDR or
   ja4 TEXT, verdict, note, created_by, created_at, expires_at NULL)`.
 - `shield_observed (subject TEXT, kind ip|ja4, verdict, reason,
   first_seen, last_seen, hits, expires_at)`, unique on `(kind, subject)`.
-- `shield_snapshots (revision BIGSERIAL, created_at, sha256, body BYTEA)`,
-  zstd-compressed, keep the last 10.
+- `shield_snapshots (revision BIGSERIAL, created_at, sha256, body BYTEA,
+  sources_updated_at)`, zstd-compressed, keep the last 10 (phase 2).
+  `sources_updated_at` is the newest source change a revision was built
+  from, which is how the compiler knows a list changed since.
+- `proxy_logs.shield_verdict TEXT` and `shield_reasons JSONB`, both null
+  when no list holds the client (phase 2).
 - `shield_bypass_tokens (id, project_id, environment_id NULL, name,
   token_hash, created_by, created_at, last_used_at, revoked_at)`; tokens
   look like `tst_<id>_<secret>` and are stored as SHA-256, like node tokens.
@@ -540,7 +569,10 @@ pub struct ShieldSnapshot {
 }
 ```
 
-The body is serialised with `postcard`. Networks are stored per source,
+Phase 2 implements `revision`, `generated_at` and the lists, as
+`lists: Vec<SourceList>` (source, verdict, publication time, maximum age and
+networks); the other fields arrive with their phases. The body is
+serialised with `postcard`. Networks are stored per source,
 collapsed, sorted and delta-encoded (a LEB128 start delta and a prefix
 byte), and the whole body is compressed with zstd at level 19. Measured on
 2026-10-25:
@@ -558,27 +590,16 @@ matching range. IPv6 full bogons dominate at about 5 MB per ingress.
 Operator and observed entries may overlap and keep the merged-ranges plus
 longest-prefix lookup.
 
-- **Embedded baseline.** The data lives in the repository as
-  `crates/temps-shield/data/baseline.bin.zst`, with `baseline.toml` beside
-  it (source URLs, publication times, sha256, entry counts and Spamhaus's
-  copyright header verbatim), and is compiled in with `include_bytes!`, as
-  the captcha WASM already is (`handler/captcha.rs:174`). `build.rs` never
-  downloads anything, so builds stay offline and reproducible. At start the
-  ingress decodes it (zstd 0.14 is already a workspace dependency) into the
-  same `Index` as revision 0; any synced revision replaces it, and the agent
-  persists the last synced one across restarts.
-- **Refreshing it.** A scheduled GitHub Actions workflow (weekly, and before
-  each release) runs `cargo xtask shield-baseline`. It fetches from the
-  publishers (spamhaus.org `drop_v4.json` and `drop_v6.json`, not the FireHOL
-  mirror, so copyright and timestamps are the originals; Team Cymru for
-  bogons), rebuilds the file and opens a PR showing entry-count changes. The
-  release workflow fails if the baseline is older than 14 days.
-
-- **Control plane (Pingora).** A `ShieldSlot`, created with the other shared
-  slots (`serve/mod.rs:1230–1235`) and passed into `start_proxy_server`,
-  holds an `ArcSwap<Index>`. A loader on `security_refresh_runtime()` polls
-  `max(shield_snapshots.revision)` every 5 s, as `ip_access/gate.rs` does,
-  and swaps in a new index when it moved.
+- **Built-in baseline.** `temps_shield::baseline`, compiled into the
+  `Index` as revision 0 and kept under every loaded snapshot. No data file,
+  generator or refresh workflow is needed while it holds only IANA ranges.
+- **Control plane (Pingora).** `setup_proxy_server` creates a
+  `ShieldLists`, an `ArcSwap<Index>` starting from the baseline. A loader on
+  `security_refresh_runtime()` reads the newest `shield_snapshots` row above
+  the loaded revision every 5 s, one indexed read that returns nothing in
+  the steady state; it checks the row's sha256, decodes it off the runtime
+  threads and swaps the index in. A body that fails either check is skipped
+  and the last good index kept.
 - **Workers.** The full route snapshot is resent on every 25 s poll, so the
   Shield body does not ride in it. `PublicIngressSnapshot`
   (`route_sync.rs:106–118`) gains:
@@ -618,6 +639,11 @@ match verdict.action {
 ```
 
 `ProxyContext` gains `ja4: Option<String>` and `shield: Option<Verdict>`.
+
+Phase 2 adds only the recording: right after the client address is
+resolved, before the IP gate, the lists are evaluated and a verdict other
+than `pass` goes into `ctx.shield`, which the request log stores. Nothing
+acts on it, and attack mode is unchanged.
 The 426 rule for plain HTTP stays only for `attack` mode. The connection
 limiter keeps running before the IP gate, as today.
 
@@ -784,7 +810,8 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
   `shield_reasons Array(LowCardinality(String))`,
   `ja4 LowCardinality(String) DEFAULT ''` and
   `ja4_source LowCardinality(String) DEFAULT ''`, as new entries in
-  `storage/clickhouse_migrations.rs`. "Would have blocked" counts come from
+  `storage/clickhouse_migrations.rs`. Phase 2 adds the first two
+  (`0005_shield_verdict.sql`); the JA4 columns come with phase 3. "Would have blocked" counts come from
   here.
 - New ClickHouse table `shield_events`, created through `temps-clickhouse`
   migrations: timestamp, project and environment ids, node id, request id,
@@ -804,13 +831,14 @@ clearance __Host-temps_clr_<env_id> (56 bytes → 75 chars)
 `ShieldPlugin`, registered before `ProxyPlugin` (`console.rs:4101`), spawns
 `tokio::time::interval` tasks in the style of `temps-audit/src/plugin.rs:54–87`.
 Each task takes `pg_try_advisory_xact_lock` so only one control plane does
-the work:
+the work. Phase 2 runs fetch and compile every 5 minutes from `ProxyPlugin`,
+which every control plane registers:
 
 | Task | Every | Does |
 |---|---|---|
-| fetch sources | 1 h | Download feeds with ETag; CrowdSec if enrolled |
+| fetch sources | 1 h | Download feeds with ETag; CrowdSec if enrolled. Each source is claimed by the `UPDATE` that stamps `last_attempt_at`, so no lock is held across a download. A document that is mostly not networks, or a network broader than /8 (IPv6 /16) on a list that acts, is refused and the last good copy kept |
 | promote | 30 s | Query the last hour of `shield_events`, upsert `shield_observed`, expire old rows |
-| compile | on change | Build and store a new snapshot revision; bump the route generation |
+| compile | on change, and daily | Build and store a new snapshot revision when a source changed since the newest one; daily so lists dated by their fetch stay fresh. Bump the route generation (phase 5) |
 | prune | hourly | Expired observed rows, old snapshots; `challenge_sessions` until it is dropped |
 
 ### I10. API and console
@@ -906,9 +934,10 @@ the work:
   on other plans and most local reverse proxies there is no JA4, and Shield
   falls back to address and User-Agent.
 - Traffic through temps edges gains the real client address.
-- Every binary carries about 26 KB of lists and works without network
-  access to their publishers; a release older than the lists' 30-day max age
-  falls back to logging only, until its plane fetches fresh copies.
+- Every binary carries only the IANA-reserved ranges. The managed lists
+  need the control plane to reach their publishers, with one conditional
+  request per list per hour; an install that cannot reach them falls back
+  to logging once its copies pass their maximum age.
 - The agent gains a snapshot, keys, an event uploader and the challenge
   endpoints; route sync gains one reference and one endpoint.
 - Signatures are shared with netwatch and need review in both projects.
@@ -947,8 +976,9 @@ the work:
    holds the formats and the gate; the proxy answers the verify endpoint
    itself, and the console's captcha routes and `ChallengeService` are
    removed. Ships alone as a security fix.
-2. **Snapshot, sources and embedded baseline in `log` mode** (D1, D2, I2, I3, I8 for the
-   control plane): see what Shield would do before it does anything.
+2. **Snapshot, sources and the built-in baseline in `log` mode** (D1, D2,
+   I2, I3, I8 for the control plane): see what Shield would do before it
+   does anything. Workers receive the snapshot in phase 5.
 3. **JA4** (D4, I6), recorded in logs and used by nothing yet, in this
    order: parser with vectors and fuzzing; control plane, direct
    connections; forwarded sources (Cloudflare, Bunny, local header) and
@@ -976,14 +1006,10 @@ use:
 
 ## Open questions
 
-- Team Cymru's full bogons: do their terms allow embedding the list in an
-  open-source binary? If not, the baseline carries only the IANA
-  special-purpose ranges, which never go stale, and full bogons stay
-  fetch-only.
-- Spamhaus DROP may be redistributed with attribution, copyright and
-  timestamps kept (D2). Does showing "Spamhaus DROP" with the range in the
-  console and in Shield lookups count as the credit their terms ask for
-  in a product?
+- Spamhaus restricts use of its name in commercial materials. Is naming
+  the source in a reason (`spamhaus_drop (…)`) in the console and in Shield
+  lookups within that, or should temps ask Spamhaus? A redistribution
+  licence would also let workers and air-gapped installs carry DROP.
 - Should new projects default to `log` or `selective`?
 - Can `selective` challenge plain HTTP, now that identity no longer needs
   TLS, or should it redirect to HTTPS first?

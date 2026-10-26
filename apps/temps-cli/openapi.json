@@ -51542,6 +51542,24 @@
               "null"
             ]
           },
+          "shield_reasons": {
+            "description": "The lists that hold the client, and the range on each.",
+            "example": [
+              "spamhaus_drop (192.0.2.0/24)"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shield_verdict": {
+            "description": "What Shield would have done with the request: `log`, `challenge` or\n`block`. `None` when no reputation list holds the client.",
+            "example": "block",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "status_code": {
             "format": "int32",
             "type": "integer"
@@ -51579,7 +51597,8 @@
           "request_source",
           "is_system_request",
           "routing_status",
-          "request_id"
+          "request_id",
+          "shield_reasons"
         ],
         "type": "object"
       },

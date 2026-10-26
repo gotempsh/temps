@@ -138,6 +138,19 @@ impl TempsPlugin for ProxyPlugin {
             // side; enforcement is the gate installed in the proxy slot).
             let project_ip_access_service = Arc::new(ProjectIpAccessService::new(db.clone()));
 
+            // ADR 066 D2: fetch the Shield reputation lists and compile
+            // them into the snapshots every ingress loads. Every control
+            // plane runs this; claims and an advisory lock keep it to one.
+            match crate::shield::ShieldSources::new(db.clone()) {
+                Ok(sources) => {
+                    Arc::new(sources).spawn();
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "Shield lists will not be fetched: no HTTP client"
+                ),
+            }
+
             // Register the services for other plugins to use
             context.register_service(lb_service);
             context.register_service(proxy_log_service);

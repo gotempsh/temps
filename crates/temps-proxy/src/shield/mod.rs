@@ -1,13 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The attack-mode challenge at the proxy (ADR 066, phase 1).
+//! Shield at the proxy (ADR 066).
+//!
+//! Phase 1, the attack-mode challenge, is this module. Phase 2's
+//! reputation lists are [`ShieldLists`], what every request is checked against,
+//! and [`ShieldSources`], the control-plane jobs that fetch and compile them.
 //!
 //! The proxy issues a signed proof-of-work token with the challenge page,
 //! verifies the solution itself at [`VERIFY_PATH`], and admits later
 //! requests on a signed clearance cookie. The visitor identity both are
 //! bound to is computed here from the connection; nothing the client sends
 //! in a body decides who it is or which environment it cleared.
+
+mod lists;
+mod sources;
+
+pub use lists::{ShieldLists, ShieldListsError, POLL_INTERVAL};
+pub use sources::{Fetched, ShieldSources, SourceError};
 
 use pingora::http::StatusCode;
 use serde::Deserialize;
@@ -25,7 +35,7 @@ pub const CHALLENGE_DIFFICULTY: u8 = 20;
 /// a solution.
 pub const MAX_VERIFY_BODY: usize = 4 * 1024;
 
-const CHALLENGE_HTML: &str = include_str!("../captcha/challenge.html");
+const CHALLENGE_HTML: &str = include_str!("../../captcha/challenge.html");
 
 /// The challenge gate for this process, keyed from the master key so every
 /// ingress that holds it signs and verifies the same tokens.

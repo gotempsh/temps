@@ -156,6 +156,8 @@ pub mod service_data_imports;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod shield_snapshots;
+pub mod shield_sources;
 pub mod source_bundles;
 pub mod source_type;
 pub mod stateless_control_plane;

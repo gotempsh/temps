@@ -140,6 +140,29 @@ pub struct ProxyLogResponse {
     /// Upstream response headers, redacted on the same terms as
     /// [`Self::request_headers`].
     pub response_headers: Option<BTreeMap<String, String>>,
+    /// What Shield would have done with the request: `log`, `challenge` or
+    /// `block`. `None` when no reputation list holds the client.
+    #[schema(example = "block")]
+    pub shield_verdict: Option<String>,
+    /// The lists that hold the client, and the range on each.
+    #[schema(example = json!(["spamhaus_drop (192.0.2.0/24)"]))]
+    pub shield_reasons: Vec<String>,
+}
+
+/// The stored reasons, a JSON array of strings; anything else reads as none.
+pub fn shield_reasons_from_json(value: Option<serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(reasons)) => reasons
+            .iter()
+            .filter_map(|reason| reason.as_str().map(str::to_string))
+            .collect(),
+        Some(_) | None => Vec::new(),
+    }
+}
+
+/// The reasons as stored: `None` when there are none.
+pub fn shield_reasons_to_json(reasons: &[String]) -> Option<serde_json::Value> {
+    (!reasons.is_empty()).then(|| serde_json::Value::from(reasons.to_vec()))
 }
 
 /// Convert a stored header blob into a typed, sorted map.
@@ -201,6 +224,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             cache_status: model.cache_status,
             request_headers: headers_from_json(model.request_headers),
             response_headers: headers_from_json(model.response_headers),
+            shield_verdict: model.shield_verdict,
+            shield_reasons: shield_reasons_from_json(model.shield_reasons),
         }
     }
 }
@@ -255,6 +280,14 @@ pub struct CreateProxyLogRequest {
     /// produced a captured exception. Lets the Observe row deep-link to the
     /// error group without an extra query.
     pub error_group_id: Option<i32>,
+    /// What Shield would have done with the request (ADR 066 D1): `log`,
+    /// `challenge` or `block`. `None` when no list holds the client.
+    #[serde(default)]
+    pub shield_verdict: Option<String>,
+    /// Why, e.g. `spamhaus_drop (192.0.2.0/24)`. Empty when
+    /// `shield_verdict` is `None`.
+    #[serde(default)]
+    pub shield_reasons: Vec<String>,
 }
 
 pub struct ProxyLogService {
@@ -4065,6 +4098,8 @@ mod tests {
             visitor_id: None,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: None,
+            shield_reasons: None,
         }
     }
 
