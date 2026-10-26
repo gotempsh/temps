@@ -19117,6 +19117,12 @@ export type NodeDiskHealthResponse = {
      * Console path that shows this node's disk health.
      */
     setup_path: string;
+    /**
+     * `true` when the node has not reported recently: the arrays and
+     * drives above are the last values it sent, not its current state, so
+     * they must not be presented as the node's health now.
+     */
+    stale: boolean;
 };
 
 /**

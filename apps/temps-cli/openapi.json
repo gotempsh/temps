@@ -41004,6 +41004,10 @@
           "setup_path": {
             "description": "Console path that shows this node's disk health.",
             "type": "string"
+          },
+          "stale": {
+            "description": "`true` when the node has not reported recently: the arrays and\ndrives above are the last values it sent, not its current state, so\nthey must not be presented as the node's health now.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -41012,6 +41016,7 @@
           "drives",
           "drives_detected",
           "drives_read",
+          "stale",
           "setup_path"
         ],
         "type": "object"

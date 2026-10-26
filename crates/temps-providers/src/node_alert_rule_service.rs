@@ -249,6 +249,23 @@ impl NodeAlertRuleService {
         if changes.is_empty() {
             return Ok(existing);
         }
+        // A default disk-health rule keeps its metric: renamed, it would
+        // escape the delete refusal and leave the node without that alert,
+        // which seeding does not restore while another default remains.
+        if let Some(metric_name) = &changes.metric_name {
+            if *metric_name != existing.metric_name
+                && DISK_HEALTH_NODE_METRICS.contains(&existing.metric_name.as_str())
+            {
+                return Err(NodeAlertRuleError::Validation {
+                    node_id,
+                    message: format!(
+                        "rule {rule_id} is the default '{}' rule and keeps its metric; \
+                         add a separate rule for '{metric_name}' instead",
+                        existing.metric_name
+                    ),
+                });
+            }
+        }
 
         let merged = NewNodeAlertRule {
             name: changes
@@ -771,6 +788,59 @@ mod tests {
 
         assert!(!updated.enabled);
         assert_eq!(updated.threshold, 250.0);
+    }
+
+    /// Renaming a default disk-health rule would leave the node without that
+    /// alert and slip past the delete refusal, so the metric is fixed.
+    #[tokio::test]
+    async fn a_default_disk_health_rule_keeps_its_metric() {
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres).append_query_results([vec![stored(
+                9,
+                7,
+                "node.raid_degraded",
+            )]]),
+        );
+
+        let result = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.cpu_percent".to_string()),
+                    ..changes()
+                },
+            )
+            .await;
+
+        assert_invalid(result, "keeps its metric");
+    }
+
+    /// Restating the same metric is not a rename.
+    #[tokio::test]
+    async fn a_default_disk_health_rule_accepts_its_own_metric() {
+        let mut after = stored(9, 7, "node.raid_degraded");
+        after.enabled = false;
+        let svc = service(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stored(9, 7, "node.raid_degraded")]])
+                .append_query_results([vec![after]]),
+        );
+
+        let updated = svc
+            .update(
+                7,
+                9,
+                NodeAlertRuleChanges {
+                    metric_name: Some("node.raid_degraded".to_string()),
+                    enabled: Some(false),
+                    ..changes()
+                },
+            )
+            .await
+            .expect("same metric with another change is an ordinary edit");
+
+        assert!(!updated.enabled);
     }
 
     #[tokio::test]

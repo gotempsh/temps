@@ -1467,6 +1467,10 @@ pub struct NodeDiskHealthResponse {
     pub drives_detected: u32,
     /// Drives whose SMART data could be read.
     pub drives_read: u32,
+    /// `true` when the node has not reported recently: the arrays and
+    /// drives above are the last values it sent, not its current state, so
+    /// they must not be presented as the node's health now.
+    pub stale: bool,
     /// Why some or all drive health is missing, when it is.
     pub reason: Option<String>,
     /// Console path that shows this node's disk health.
@@ -1476,6 +1480,17 @@ pub struct NodeDiskHealthResponse {
 /// Disk health from a node whose newest sample is older than this is
 /// reported as stale: it is the last thing the node said, not its state now.
 const DISK_HEALTH_MAX_AGE_MINUTES: i64 = 10;
+
+/// When the node last reported, if that is too long ago to call its disk
+/// health current.
+fn disk_health_stale_since(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    health
+        .reported_at
+        .filter(|at| now - *at > Duration::minutes(DISK_HEALTH_MAX_AGE_MINUTES))
+}
 
 fn disk_health_reason(
     health: &temps_metrics::collector::disk_health::NodeDiskHealth,
@@ -1490,10 +1505,7 @@ fn disk_health_reason(
                 .into(),
         );
     }
-    if let Some(reported_at) = health
-        .reported_at
-        .filter(|at| now - *at > Duration::minutes(DISK_HEALTH_MAX_AGE_MINUTES))
-    {
+    if let Some(reported_at) = disk_health_stale_since(health, now) {
         return Some(format!(
             "This node has not reported metrics since {}. The disk health shown is \
              from then, not its current state: check that the node is online and, \
@@ -1520,6 +1532,7 @@ impl NodeDiskHealthResponse {
         now: DateTime<Utc>,
     ) -> Self {
         let reason = disk_health_reason(&health, now);
+        let stale = health.reported && disk_health_stale_since(&health, now).is_some();
         Self {
             reported: health.reported,
             raid_arrays: health
@@ -1543,6 +1556,7 @@ impl NodeDiskHealthResponse {
                 .collect(),
             drives_detected: health.drives_detected,
             drives_read: health.drives_read,
+            stale,
             reason,
             setup_path: disk_health_setup_path(node_id),
         }
@@ -3503,6 +3517,10 @@ mod tests {
         };
 
         let stale = NodeDiskHealthResponse::new(3, health(DISK_HEALTH_MAX_AGE_MINUTES + 50), now);
+        assert!(
+            stale.stale,
+            "old health must be flagged, not only explained"
+        );
         let reason = stale.reason.expect("old health must be explained");
         assert!(reason.contains("not reported metrics since"), "{reason}");
         assert!(reason.contains("not its current state"), "{reason}");
@@ -3513,6 +3531,7 @@ mod tests {
         );
 
         let fresh = NodeDiskHealthResponse::new(3, health(2), now);
+        assert!(!fresh.stale);
         assert!(fresh.reason.is_none(), "{:?}", fresh.reason);
     }
 

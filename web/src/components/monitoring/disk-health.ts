@@ -21,6 +21,9 @@ export function driveTone(d: DriveHealthRow): DiskHealthTone {
 }
 
 export function overallTone(h: NodeDiskHealthResponse): DiskHealthTone {
+  // Old readings are shown in the detail rows, but they are not the node's
+  // health now, so they must not colour the headline.
+  if (h.stale) return 'unknown'
   if (h.raid_arrays.some((a) => a.degraded)) return 'poor'
   const tones = h.drives.map(driveTone)
   if (tones.includes('poor')) return 'poor'

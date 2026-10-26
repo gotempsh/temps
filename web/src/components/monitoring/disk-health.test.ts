@@ -13,6 +13,7 @@ const health = (
   drives: [],
   drives_detected: 0,
   drives_read: 0,
+  stale: false,
   setup_path: '/monitoring/server',
   ...overrides,
 })
@@ -47,6 +48,25 @@ describe('overallTone', () => {
         })
       )
     ).toBe('poor')
+  })
+
+  test('stale readings do not decide the headline', () => {
+    expect(
+      overallTone(
+        health({
+          stale: true,
+          raid_arrays: [{ name: 'md0', degraded: true, devices_failed: 1 }],
+        })
+      )
+    ).toBe('unknown')
+    expect(
+      overallTone(
+        health({
+          stale: true,
+          drives: [{ device: 'nvme0', wear_percent: 10, media_errors: 0 }],
+        })
+      )
+    ).toBe('unknown')
   })
 
   test('nothing found is unknown', () => {
