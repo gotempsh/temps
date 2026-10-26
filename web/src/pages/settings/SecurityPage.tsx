@@ -97,33 +97,38 @@ export function SecurityPage() {
 
   usePageTitle('Security')
 
+  // A refetch updates only the fields the user has not touched, so unsaved
+  // edits survive it; a save resets the form itself first (onSubmit).
   useEffect(() => {
     if (settings) {
-      reset({
-        security_headers: settings.security_headers || {
-          enabled: true,
-          preset: 'moderate',
-          content_security_policy: null,
-          x_frame_options: 'SAMEORIGIN',
-          x_content_type_options: 'nosniff',
-          x_xss_protection: '1; mode=block',
-          strict_transport_security: 'max-age=31536000; includeSubDomains',
-          referrer_policy: 'strict-origin-when-cross-origin',
-          permissions_policy: null,
+      reset(
+        {
+          security_headers: settings.security_headers || {
+            enabled: true,
+            preset: 'moderate',
+            content_security_policy: null,
+            x_frame_options: 'SAMEORIGIN',
+            x_content_type_options: 'nosniff',
+            x_xss_protection: '1; mode=block',
+            strict_transport_security: 'max-age=31536000; includeSubDomains',
+            referrer_policy: 'strict-origin-when-cross-origin',
+            permissions_policy: null,
+          },
+          rate_limiting: settings.rate_limiting || {
+            enabled: false,
+            max_requests_per_minute: 60,
+            max_requests_per_hour: 1000,
+            whitelist_ips: [],
+            blacklist_ips: [],
+          },
+          trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
+          loopback_ja4_header: settings.loopback_ja4_header ?? '',
+          trusted_private_networks_text: (
+            settings.trusted_private_networks ?? []
+          ).join('\n'),
         },
-        rate_limiting: settings.rate_limiting || {
-          enabled: false,
-          max_requests_per_minute: 60,
-          max_requests_per_hour: 1000,
-          whitelist_ips: [],
-          blacklist_ips: [],
-        },
-        trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
-        loopback_ja4_header: settings.loopback_ja4_header ?? '',
-        trusted_private_networks_text: (
-          settings.trusted_private_networks ?? []
-        ).join('\n'),
-      })
+        { keepDirtyValues: true }
+      )
     }
   }, [settings, reset])
 
@@ -138,8 +143,9 @@ export function SecurityPage() {
         ),
       })
       // The server normalizes entries (bare IPs gain /32, host bits are
-      // cleared); the settings refetch re-runs the reset effect above with
-      // the stored form, so the textarea ends up showing what is enforced.
+      // cleared). Resetting with the saved values leaves nothing dirty, so
+      // the refetch's reset above then shows the stored form everywhere and
+      // the textarea ends up showing what is enforced.
       reset({
         ...data,
         loopback_ja4_header: saved.loopback_ja4_header ?? '',
