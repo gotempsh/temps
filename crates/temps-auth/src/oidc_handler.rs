@@ -6,7 +6,7 @@ use std::sync::Arc;
 use axum::{
     extract::{Extension, Path, Query, State},
     http::{
-        header::{COOKIE, SET_COOKIE},
+        header::{CACHE_CONTROL, COOKIE, REFERRER_POLICY, SET_COOKIE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Redirect, Response},
@@ -37,7 +37,9 @@ use crate::permission_guard;
 use crate::state::AuthState;
 use crate::RequireAuth;
 
-#[derive(Debug, Deserialize, IntoParams)]
+/// No `Debug`: the query carries the authorization code and the issuer's
+/// free-text `error_description`, neither of which belongs in a log line.
+#[derive(Deserialize, IntoParams)]
 pub struct OidcCallbackQuery {
     pub code: Option<String>,
     pub state: Option<String>,
@@ -124,6 +126,14 @@ fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, 
     .max_age(cookie::time::Duration::ZERO)
     .build();
     cookie_header_value(&cookie)
+}
+
+/// Login redirects and callback responses carry the authorization `state` (and,
+/// on the callback, the code) in their URLs. Keep them out of caches and out of
+/// the `Referer` the next page would send.
+fn insert_no_store_no_referrer(headers: &mut HeaderMap) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -303,6 +313,7 @@ fn redirect_to_issuer(
         })?;
     let mut headers = HeaderMap::new();
     headers.insert(SET_COOKIE, cookie);
+    insert_no_store_no_referrer(&mut headers);
     Ok((headers, Redirect::temporary(&login.authorize_url)).into_response())
 }
 
@@ -350,6 +361,7 @@ pub async fn oidc_callback(
     } else {
         complete_callback(&state, &metadata, query).await
     };
+    insert_no_store_no_referrer(response.headers_mut());
 
     // The cookie has done its job whatever the outcome.
     if let Some(state_param) = state_param {
@@ -365,32 +377,31 @@ async fn complete_callback(
     metadata: &RequestMetadata,
     query: OidcCallbackQuery,
 ) -> Response {
-    if let Some(err) = query.error {
-        // The IdP's `error` + `error_description` can carry detailed
-        // internal state ("user account locked since 2025-01-01", an
-        // internal IP address, a tenant-policy reason, etc.). Echoing
-        // the raw text into the redirect's `?reason=` query param puts
-        // it in the browser address bar, the history database, and any
-        // `Referer` header sent on subsequent navigations — a leak
-        // path a malicious or merely chatty IdP can exploit.
-        //
-        // Surface a short opaque code to the browser; keep the
-        // raw description in the server log where only operators see
-        // it. The login page maps `idp_error` to a friendly message.
-        let raw = query
-            .error_description
-            .clone()
-            .unwrap_or_else(|| err.clone());
+    let OidcCallbackQuery {
+        code,
+        state: callback_state,
+        error,
+        error_description,
+    } = query;
+    // The IdP's `error` + `error_description` are free text chosen by the
+    // issuer (or by whoever crafted the callback URL) and can carry account
+    // data, internal addresses or protocol secrets. Echoing them into the
+    // redirect's `?reason=` would put them in the address bar, history and
+    // `Referer`; logging them would put attacker-chosen text in the operator
+    // log. Accept the fields and drop them: the browser gets the opaque
+    // `idp_error` code and the log gets a fixed reason code.
+    drop(error_description);
+    if let Some(error) = error {
         warn!(
             target: "temps_auth::oidc",
-            error = %err,
-            error_description = %raw,
-            "OIDC callback returned provider error"
+            reason_code = "idp_error",
+            provider_error = provider_error_code(&error),
+            "OIDC provider declined authorization"
         );
         return redirect_login_error("idp_error");
     }
 
-    let (code, state_param) = match (query.code, query.state) {
+    let (code, state_param) = match (code, callback_state) {
         (Some(code), Some(state_param)) => (code, state_param),
         _ => {
             // Same opaque-code policy as the rest of this handler:
@@ -471,12 +482,47 @@ async fn complete_callback(
                         error!(%audit_error, "Failed to create OIDC login-denied audit log");
                     }
                 }
+                // Operator-side failures keep their actionable detail: the
+                // issuer is operator configuration and the reason comes from
+                // this instance's own HTTP client or database.
+                OidcError::DiscoveryFailed { issuer, reason } => {
+                    warn!(
+                        target: "temps_auth::oidc",
+                        reason_code = login_error_code_for(&err),
+                        %issuer,
+                        %reason,
+                        "OIDC callback failed: issuer discovery failed"
+                    );
+                }
+                OidcError::Database(db_error) => {
+                    warn!(
+                        target: "temps_auth::oidc",
+                        reason_code = login_error_code_for(&err),
+                        error = %db_error,
+                        "OIDC callback failed: database error"
+                    );
+                }
+                // The token-exchange response body and ID-token verification
+                // details are issuer-controlled and can echo protocol data
+                // (codes, tokens, claims): log the HTTP status at most.
+                OidcError::TokenExchangeFailed { status, .. } => {
+                    warn!(
+                        target: "temps_auth::oidc",
+                        reason_code = login_error_code_for(&err),
+                        status = *status,
+                        "OIDC callback failed: issuer refused the code exchange"
+                    );
+                }
                 _ => {
-                    warn!("OIDC callback failed: {}", err);
+                    warn!(
+                        target: "temps_auth::oidc",
+                        reason_code = login_error_code_for(&err),
+                        "OIDC callback failed"
+                    );
                 }
             }
             // Don't reflect the raw error text into the browser URL.
-            // The full error already went to the server log above; the
+            // Diagnostics above retain only safe reason codes; the
             // user sees a short, stable code that the login page can
             // translate into a friendly message (and that won't leak
             // IdP response bodies / discovery details into history,
@@ -484,6 +530,36 @@ async fn complete_callback(
             redirect_login_error(login_error_code_for(&err))
         }
     }
+}
+
+/// The registered OAuth 2.0 / OpenID Connect authorization error codes
+/// (RFC 6749 section 4.1.2.1, OIDC Core section 3.1.2.6, RFC 9101). The
+/// callback's `error` is attacker-controllable text, so only a registered code
+/// is logged as-is; anything else is logged as `unregistered`.
+fn provider_error_code(error: &str) -> &'static str {
+    const REGISTERED: &[&str] = &[
+        "invalid_request",
+        "unauthorized_client",
+        "access_denied",
+        "unsupported_response_type",
+        "invalid_scope",
+        "server_error",
+        "temporarily_unavailable",
+        "interaction_required",
+        "login_required",
+        "account_selection_required",
+        "consent_required",
+        "invalid_request_uri",
+        "invalid_request_object",
+        "request_not_supported",
+        "request_uri_not_supported",
+        "registration_not_supported",
+    ];
+    REGISTERED
+        .iter()
+        .find(|code| **code == error)
+        .copied()
+        .unwrap_or("unregistered")
 }
 
 /// Map an `OidcError` into a short, stable, user-safe code that the
@@ -1202,6 +1278,22 @@ mod login_binding_tests {
     use super::*;
     use axum::http::header::COOKIE;
 
+    #[test]
+    fn only_registered_provider_error_codes_are_logged_verbatim() {
+        assert_eq!(provider_error_code("access_denied"), "access_denied");
+        assert_eq!(provider_error_code("invalid_scope"), "invalid_scope");
+        assert_eq!(provider_error_code("login_required"), "login_required");
+        for crafted in [
+            "",
+            "ACCESS_DENIED",
+            "access_denied ",
+            "account locked for user@example.test",
+            "access_denied\nforged log line",
+        ] {
+            assert_eq!(provider_error_code(crafted), "unregistered", "{crafted:?}");
+        }
+    }
+
     fn crypto() -> CookieCrypto {
         CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap()
     }
@@ -1699,6 +1791,8 @@ mod login_binding_http_tests {
             response.headers().get("location").unwrap(),
             "https://issuer.example.com/authorize?state=state-one"
         );
+        assert_eq!(response.headers()[CACHE_CONTROL], "no-store");
+        assert_eq!(response.headers()[REFERRER_POLICY], "no-referrer");
         let set_cookies: Vec<_> = response.headers().get_all(SET_COOKIE).iter().collect();
         assert_eq!(set_cookies.len(), 1);
         let cookie = set_cookies[0]
@@ -1850,5 +1944,43 @@ mod login_binding_http_tests {
         assert!(location.contains("reason=idp_error"), "{location}");
         let (_, location, _) = callback(&fixture.app, "code=abc", None).await;
         assert!(location.contains("reason=callback_invalid"), "{location}");
+    }
+
+    /// Every callback outcome carries the code and state in its URL, so none
+    /// of them may be cached or leak through `Referer`.
+    #[tokio::test]
+    async fn every_callback_outcome_is_no_store_and_no_referrer() {
+        let Some(fixture) = fixture(&["state-one"]).await else {
+            return;
+        };
+        for query in [
+            // Refused at the browser binding.
+            "code=abc&state=state-one",
+            // Provider error.
+            "error=access_denied&error_description=account%20locked",
+            // Malformed.
+            "code=abc",
+        ] {
+            let response = fixture
+                .app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/auth/oidc/callback?{query}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SEE_OTHER, "{query}");
+            assert_eq!(response.headers()[CACHE_CONTROL], "no-store", "{query}");
+            assert_eq!(
+                response.headers()[REFERRER_POLICY],
+                "no-referrer",
+                "{query}"
+            );
+            let location = response.headers()["location"].to_str().unwrap();
+            assert!(!location.contains("locked"), "{location}");
+        }
     }
 }

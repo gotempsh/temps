@@ -117,7 +117,7 @@ Temps supports any OpenID Connect provider. Configure it under **Settings → Au
 
 - **Automatic accounts.** With just-in-time provisioning (on by default), an account is created the first time someone signs in. Turn it off to allow only people who already have an account.
 - **Roles from groups.** Role mappings assign **Admin** or **User** from the groups in the identity token. Mappings are checked in priority order and the first match wins; `*` matches everyone. Without a match, Temps uses the token's role claim, then the provider's default role (**User**). The role is updated on every sign-in.
-- **Email verification.** By default Temps only links a sign-in to an existing account when the provider reports the email as verified. Enable **trust IdP email** only for providers that always verify email addresses.
+- **Email verification.** By default Temps only links a sign-in to an existing account when the provider reports the email as verified. Enable **trust IdP email** only for providers that always verify email addresses. Console access through Temps Cloud always requires a verified email, on every sign-in, including for accounts that are already linked.
 - **Same browser.** A sign-in must finish in the browser that started it. Temps sets a short-lived cookie when sign-in starts and checks it when the provider sends the browser back, so a callback link opened in a different browser, or with cookies blocked for the console, is refused with "This SSO link is invalid or has already been used". Start sign-in again from the Temps login page.
 
 Team membership is managed in Temps, not mapped from the identity provider.

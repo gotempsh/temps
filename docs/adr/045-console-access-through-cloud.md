@@ -343,7 +343,7 @@ the console-proxy `Hello` completes, Cloud sends `ConsoleOidcConfig
 rest immediately like every other provider's secret,
 `scopes = "openid email profile temps_cloud_instance_role"`,
 `template = "temps_cloud"` (a UI hint), `jit_provisioning = true`,
-`trust_idp_email = true`. **`ConsoleOidcConfig` is re-sent on every
+`trust_idp_email = false`. **`ConsoleOidcConfig` is re-sent on every
 reconnect, and the upsert is idempotent** (same shape as
 `create_provider`/`update_provider` already support for an operator editing
 a provider by hand) — an instance that was offline for a client-secret
@@ -355,19 +355,18 @@ from *its* side, and the instance runs exactly the disconnect/revoke
 sequence below — the same code path §5's local toggle uses, just triggered
 remotely.
 
-`trust_idp_email = true` is deliberate: the `email_verified` gate exists to
-stop an attacker self-registering at an arbitrary IdP with a victim's email
-(`oidc_service.rs:761–797`). Reaching this exchange at all already required
-operator-level access to the Cloud account this instance is enrolled
-under — the same carve-out `trust_idp_email`'s own doc comment describes
-for admin-controlled corporate IdPs (`oidc_providers.rs:27–34`).
+Cloud-managed providers require an affirmative `email_verified` claim for every
+login, including an already linked subject. Instance enrollment and a resource
+role do not establish email ownership. Reconnect converges older managed rows
+to `trust_idp_email = false`; resolution enforces this rule before reconnect
+as well. Ordinary operator-configured IdPs retain their explicit trust setting.
 
 **Claim mapping.** `sub` = the Cloud account's stable id — the same id for
 that person on every instance they administer, so `resolve_user`'s existing
 `(provider_id, subject)` fast path (`oidc_service.rs:744–753`) gives each
 Cloud account its own local user row and its own audit trail on this
 instance, never a shared "cloud-admin" account. `email` = the Cloud
-account's email, taken under `trust_idp_email` as described above. A custom
+account's email, accepted only with affirmative verification evidence. A custom
 claim, `temps_cloud_instance_role`, carries this account's role on *this
 specific instance* (Cloud-computed, since one account can be owner of one
 linked instance and unrelated to another) — distinct from the generic
@@ -828,3 +827,24 @@ instance, and quota behaviour (head-sampling, never silent drops) applies.
 - `crates/temps-entities/src/s3_sources.rs`, `m20260830_000001_add_managed_by_cloud_to_s3_sources.rs` — the `managed_by_cloud` precedent
 - `crates/temps-core/src/app_settings.rs:249–312` — `CloudSettings`; `web/src/pages/settings/CloudSettingsPage.tsx` — switches this ADR's joins
 - ADR-039 (capability negotiation), ADR-040 (compromised-Cloud trust boundary this ADR extends), ADR-044 (provisioning/disconnect ordering this ADR's OIDC lifecycle follows)
+
+### Browser-bound callback correlation
+
+Every OIDC login start, including the Cloud-managed start route, sets a
+short-lived HttpOnly, SameSite=Lax cookie that seals the attempt's `state`
+with `CookieCrypto`. Its name is derived from a hash of the `state`
+(`__Host-oidc_login_<hash>` over HTTPS, with Secure, Path=/ and no Domain;
+`oidc_login_<hash>` over plain HTTP), so concurrent logins in several tabs
+coexist and the name reveals nothing. The callback requires that cookie to
+decrypt to exactly the `state` it carries before the state is consumed or the
+code is exchanged: copying an authorization callback into another browser
+cannot sign that browser in or consume the genuine attempt. The stored state
+remains atomically single-use and expires at its deadline.
+
+Login redirects and callback responses are `Cache-Control: no-store` and
+`Referrer-Policy: no-referrer`. Provider error descriptions and
+token-verification details are excluded from callback diagnostics, and the
+login `state` never appears in an error message or problem detail: operators
+see fixed reason codes, plus the provider's `error` code only when it is one of
+the registered OAuth/OIDC codes. Password login and
+local recovery remain independent of this flow, including during a Cloud outage.
