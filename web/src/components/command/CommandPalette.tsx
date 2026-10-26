@@ -47,7 +47,7 @@ import {
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { TERMS, groupHref } from '@/lib/terminology'
-import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { CLUSTER_DNS_URL, WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
   type SettingsNavigationIcon,
@@ -55,6 +55,7 @@ import {
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
+import { NAV_FUSE_OPTIONS } from './nav-search'
 import {
   Activity,
   BadgeCheck,
@@ -363,6 +364,22 @@ const mainNavItems: NavigationItem[] = [
       'infrastructure',
       'build',
       'deploy',
+    ],
+  },
+  // A card in the Worker Nodes page's collapsed Advanced section; the anchor
+  // opens the section and scrolls to it.
+  {
+    title: 'Cluster DNS',
+    url: CLUSTER_DNS_URL,
+    icon: Globe,
+    keywords: [
+      'cluster',
+      'dns',
+      'temps.local',
+      'service discovery',
+      'resolver',
+      'internal dns',
+      'name resolution',
     ],
   },
 ]
@@ -795,7 +812,7 @@ const secondaryNavigationUrls = new Set([
   ...observeNavItems.map((item) => item.url),
   ...indexedSettingsNavItems.map((item) => item.url),
 ])
-const indexedMainNavItems = excludeNavigationUrls(
+export const indexedMainNavItems = excludeNavigationUrls(
   mergeNavigationItems(
     mainNavItems,
     settingsNavItems.filter((item) => !isSettingsNavigationUrl(item.url)),
@@ -1479,17 +1496,7 @@ export function CommandPalette() {
       allNavItems.push(...projectSpecificItems)
     }
 
-    return new Fuse(allNavItems, {
-      keys: [
-        { name: 'title', weight: 2 },
-        { name: 'url', weight: 1 },
-        { name: 'keywords', weight: 1.5 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
+    return new Fuse(allNavItems, NAV_FUSE_OPTIONS)
   }, [
     currentProjectSlug,
     currentProject,

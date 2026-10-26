@@ -15,6 +15,33 @@ import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/type
  */
 export const WORKER_NODES_URL = '/settings/nodes'
 
+/**
+ * Anchors for the cards in the Worker Nodes page's collapsed "Advanced"
+ * section. Linking to one (`/settings/nodes#cluster-dns`) opens the section
+ * and scrolls to that card, so search and other pages can point at it.
+ */
+export const NODES_ADVANCED_SECTIONS = [
+  'mesh-hub',
+  'cluster-network',
+  'cluster-dns',
+  'cluster-trust',
+] as const
+
+export type NodesAdvancedSection = (typeof NODES_ADVANCED_SECTIONS)[number]
+
+/** The advanced card a location hash points at, if any. */
+export function nodesAdvancedSection(
+  hash: string
+): NodesAdvancedSection | null {
+  const id = hash.replace(/^#/, '')
+  return (NODES_ADVANCED_SECTIONS as readonly string[]).includes(id)
+    ? (id as NodesAdvancedSection)
+    : null
+}
+
+/** The Cluster DNS settings card (`*.temps.local` resolution). */
+export const CLUSTER_DNS_URL = `${WORKER_NODES_URL}#cluster-dns`
+
 /** Public documentation for joining a worker node (`temps join`). */
 export const WORKER_NODES_DOCS_URL = 'https://temps.sh/docs/multi-node'
 

@@ -5,6 +5,8 @@ import { describe, expect, test } from 'bun:test'
 import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/types.gen'
 import {
   canAddWorkerNode,
+  CLUSTER_DNS_URL,
+  nodesAdvancedSection,
   isWorkerNodeRequiredProblem,
   NODE_CAPABILITY_POLL_MS,
   NODE_HEARTBEAT_STALE_SECS,
@@ -395,5 +397,19 @@ describe('nodeRemoval', () => {
     expect(nodeRemovalBlocker({ kind: 'remove' })).toBeNull()
     expect(nodeRemovalBlocker({ kind: 'none' })).toBeNull()
     expect(nodeRemovalBlocker({ kind: 'unknown' })).toBeNull()
+  })
+})
+
+describe('nodesAdvancedSection', () => {
+  test('names the advanced card a hash links to', () => {
+    expect(nodesAdvancedSection('#cluster-dns')).toBe('cluster-dns')
+    expect(nodesAdvancedSection('cluster-trust')).toBe('cluster-trust')
+    expect(CLUSTER_DNS_URL).toBe('/settings/nodes#cluster-dns')
+  })
+
+  test('ignores hashes that are not an advanced card', () => {
+    expect(nodesAdvancedSection('')).toBeNull()
+    expect(nodesAdvancedSection('#ci-builder')).toBeNull()
+    expect(nodesAdvancedSection('#cluster-dns-x')).toBeNull()
   })
 })

@@ -32,7 +32,9 @@ import {
 } from '@/components/ui/select'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { serviceCreationDefaults } from '@/lib/service-creation-defaults'
-import { problemDetail } from '@/lib/api-problem'
+import { handleServiceCreateError } from '@/lib/service-create-error'
+import { placementNeedsClusterDns } from '@/lib/cluster-dns'
+import { ClusterDnsOffNotice } from '@/components/settings/ClusterDnsOffNotice'
 import {
   serviceCreateHref,
   serviceProjectId,
@@ -406,17 +408,11 @@ export function CreateService() {
     meta: {
       errorTitle: 'Failed to create service',
     },
-    onError: (error) => {
-      if (
-        error &&
-        typeof error === 'object' &&
-        'error_code' in error &&
-        error.error_code === 'SERVICE_NAME_CONFLICT'
-      ) {
-        setNameError(problemDetail(error, 'Choose a unique service name.'))
+    onError: (error, _variables, _onMutateResult, context) =>
+      handleServiceCreateError(error, context, (message) => {
+        setNameError(message)
         nameInput.current?.focus()
-      }
-    },
+      }),
     onSuccess: (data) => {
       if (data.status === 'creating') {
         toast.success('Cluster creation started — tracking progress...')
@@ -762,6 +758,28 @@ export function CreateService() {
             </Select>
           </div>
         )}
+
+        {hasWorkerNodes &&
+          placementNeedsClusterDns(
+            topology === 'cluster'
+              ? {
+                  topology: 'cluster',
+                  memberNodeIds: clusterMembers.map((m) => m.node_id),
+                }
+              : {
+                  topology: 'standalone',
+                  nodeId:
+                    standaloneNodeId === 'control-plane'
+                      ? null
+                      : Number(standaloneNodeId),
+                }
+          ) && (
+            <ClusterDnsOffNotice title="Apps on other nodes won't reach it">
+              {topology === 'cluster'
+                ? 'Members on different machines are reached through *.temps.local names, which resolve only with Cluster DNS on.'
+                : 'Apps on other nodes reach a service on a worker through its *.temps.local name, which resolves only with Cluster DNS on. Apps on the same node are unaffected.'}
+            </ClusterDnsOffNotice>
+          )}
 
         {/* Preview summary */}
         <ServicePreviewCard

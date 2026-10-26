@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { ClusterDnsOffNotice } from '@/components/settings/ClusterDnsOffNotice'
 import { ClusterNetworkCard } from '@/components/settings/ClusterNetworkCard'
 import { useClusterNetwork } from '@/hooks/useClusterNetwork'
 import {
@@ -58,6 +59,7 @@ import {
   nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
   WORKER_NODES_URL,
+  nodesAdvancedSection,
 } from '@/lib/worker-nodes'
 import {
   Table,
@@ -111,7 +113,13 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -1842,6 +1850,27 @@ export function NodesPage() {
 
   usePageTitle('Worker Nodes')
 
+  // A link to one of the advanced cards (search, other pages) opens the
+  // section and brings the card into view. A toggle by hand wins until the
+  // link changes.
+  const { hash } = useLocation()
+  const linkedSection = nodesAdvancedSection(hash)
+  const [advancedToggle, setAdvancedToggle] = useState<{
+    hash: string
+    open: boolean
+  } | null>(null)
+  const advancedOpen =
+    advancedToggle?.hash === hash ? advancedToggle.open : linkedSection !== null
+  useEffect(() => {
+    if (!linkedSection) return
+    const frame = requestAnimationFrame(() =>
+      document
+        .getElementById(linkedSection)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    )
+    return () => cancelAnimationFrame(frame)
+  }, [linkedSection, isLoading])
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -1926,6 +1955,15 @@ export function NodesPage() {
             </Alert>
           )}
 
+          {workerCount > 0 && (
+            <ClusterDnsOffNotice title="Apps can't reach a database on another node">
+              Cluster DNS is off, so containers can&apos;t resolve{' '}
+              <code>*.temps.local</code> names. Deployments linked to a managed
+              service on a different node are blocked, and a database cluster
+              spanning nodes can&apos;t be reached by its apps.
+            </ClusterDnsOffNotice>
+          )}
+
           {stranded.length > 0 && (
             <Alert className="border-amber-500/30 bg-amber-500/5">
               <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -1993,22 +2031,33 @@ export function NodesPage() {
         </CardContent>
       </Card>
 
-      <Collapsible>
+      <Collapsible
+        open={advancedOpen}
+        onOpenChange={(open) => setAdvancedToggle({ hash, open })}
+      >
         <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
           <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
           Advanced: mesh hub, cluster network, DNS and trust
         </CollapsibleTrigger>
         <CollapsibleContent className="mt-6 space-y-6">
-          <MeshHubCard
-            mesh={mesh}
-            isLoading={meshLoading}
-            error={meshError}
-            onRetry={() => void refetchMesh()}
-            retrying={meshFetching}
-          />
-          <ClusterNetworkCard />
-          <ClusterDnsCard />
-          <ClusterTrustCard />
+          <div id="mesh-hub" className="scroll-mt-20">
+            <MeshHubCard
+              mesh={mesh}
+              isLoading={meshLoading}
+              error={meshError}
+              onRetry={() => void refetchMesh()}
+              retrying={meshFetching}
+            />
+          </div>
+          <div id="cluster-network" className="scroll-mt-20">
+            <ClusterNetworkCard />
+          </div>
+          <div id="cluster-dns" className="scroll-mt-20">
+            <ClusterDnsCard />
+          </div>
+          <div id="cluster-trust" className="scroll-mt-20">
+            <ClusterTrustCard />
+          </div>
         </CollapsibleContent>
       </Collapsible>
     </div>

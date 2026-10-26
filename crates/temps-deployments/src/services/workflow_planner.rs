@@ -3147,7 +3147,7 @@ mod tests {
         assert!(described.contains("id 7"), "{described}");
         assert!(described.contains("Cluster DNS is disabled"), "{described}");
         assert!(described.contains("Enable cluster DNS"), "{described}");
-        assert_eq!(blocker.setup_path, "/settings/nodes");
+        assert_eq!(blocker.setup_path, "/settings/nodes#cluster-dns");
     }
 
     #[test]

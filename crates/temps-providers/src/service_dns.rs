@@ -171,8 +171,9 @@ impl CrossNodeBlockReason {
     /// exact page rather than to documentation.
     pub fn setup_path(&self, service_id: i32) -> String {
         match self {
-            // The cluster-DNS switch lives on the Worker Nodes settings page.
-            CrossNodeBlockReason::ClusterDnsDisabled => "/settings/nodes".to_string(),
+            // The cluster-DNS switch lives in the Worker Nodes page's
+            // Advanced section; the anchor opens it and scrolls to the card.
+            CrossNodeBlockReason::ClusterDnsDisabled => "/settings/nodes#cluster-dns".to_string(),
             CrossNodeBlockReason::DnsRecordMissing | CrossNodeBlockReason::NoDnsName => {
                 format!("/storage/{}", service_id)
             }
@@ -251,7 +252,7 @@ mod tests {
     fn setup_path_deep_links_to_the_page_that_fixes_it() {
         assert_eq!(
             CrossNodeBlockReason::ClusterDnsDisabled.setup_path(42),
-            "/settings/nodes"
+            "/settings/nodes#cluster-dns"
         );
         assert_eq!(
             CrossNodeBlockReason::DnsRecordMissing.setup_path(42),
