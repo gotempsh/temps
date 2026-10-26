@@ -12,6 +12,9 @@ grep -Fq 'RUN chmod +x /usr/local/bin/temps && /usr/local/bin/temps --version' "
 grep -Fq 'COPY crates/temps-cli/GeoLite2-City.mmdb /usr/share/temps/GeoLite2-City.mmdb' "$dockerfile"
 grep -Fq 'ln -s /usr/share/temps/GeoLite2-City.mmdb /app/GeoLite2-City.mmdb' "$dockerfile"
 grep -Fq 'useradd --uid 1000 --gid temps --create-home' "$dockerfile"
+grep -Fq 'apt-get update && apt-get upgrade -y --no-install-recommends' "$dockerfile"
+grep -Fq '    libbrotli1 \' "$dockerfile"
+grep -Fq 'dpkg --compare-versions "$(dpkg-query -W -f='"'"'${Version}'"'"' libbrotli1)" ge '"'"'1.0.9-2+deb12u1'"'" "$dockerfile"
 
 if grep -Eq 'FROM alpine|\bapk (add|update|upgrade)' "$dockerfile"; then
     echo 'Dockerfile.release must not use a musl/Alpine runtime for glibc release artifacts' >&2

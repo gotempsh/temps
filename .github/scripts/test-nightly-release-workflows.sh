@@ -156,6 +156,51 @@ abort "the test gate bypass must be an explicit, default-off dispatch input" unl
 end
 abort "the server image can be pushed before the test gate passes" unless
   Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
+
+# Mutable package repositories must be refreshed even if the pinned base and
+# Dockerfile haven't changed. Scan each published candidate by digest before
+# either architecture can reach a floating channel tag.
+server_image = release.dig("jobs", "build-and-push-docker")
+image_steps = server_image.fetch("steps")
+build = image_steps.find { |step| step["id"] == "release_image" }
+abort "release images can reuse stale OS packages" unless
+  build && build.dig("with", "pull") == true && build.dig("with", "no-cache") == true
+abort "unscanned candidates must not update channel tags" unless
+  build.dig("with", "tags").lines.map(&:strip) ==
+    ['ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}']
+scan = image_steps.find { |step| step.fetch("uses", "").start_with?("aquasecurity/trivy-action@") }
+abort "release image vulnerability gate is missing or scans a mutable tag" unless
+  scan && image_steps.index(scan) > image_steps.index(build) &&
+  scan["if"] == build.dig("with", "push") &&
+  scan.dig("with", "image-ref") == 'ghcr.io/${{ github.repository_owner }}/temps@${{ steps.release_image.outputs.digest }}' &&
+  scan.dig("with", "format") == "table" &&
+  scan.dig("with", "scanners") == "vuln" &&
+  scan.dig("with", "severity") == "CRITICAL,HIGH" &&
+  scan.dig("with", "exit-code").to_s == "1" &&
+  scan.dig("with", "ignore-unfixed") == true &&
+  scan.dig("env", "TRIVY_PLATFORM") == '${{ matrix.platform }}' &&
+  scan.dig("env", "TRIVY_IMAGE_SRC") == "remote" &&
+  !scan.key?("continue-on-error") && !server_image.key?("continue-on-error")
+abort "release scan matrix must cover both supported architectures" unless
+  server_image.dig("strategy", "matrix", "include").map { |entry| entry["platform"] }.sort ==
+    %w[linux/amd64 linux/arm64]
+manifest_job = release.dig("jobs", "create-docker-manifest")
+abort "channel promotion can bypass the architecture scans" unless
+  manifest_job.fetch("needs").include?("build-and-push-docker") &&
+  manifest_job["if"] == scan["if"] && !manifest_job.key?("continue-on-error")
+channel_merge = manifest_job.fetch("steps").find { |step| step["name"] == "Create and push manifest for channel" }.fetch("run")
+abort "channel promotion must use the scanned version candidates" unless
+  channel_merge.include?('temps:${{ steps.version.outputs.version }}-linux-amd64') &&
+  channel_merge.include?('temps:${{ steps.version.outputs.version }}-linux-arm64') &&
+  !channel_merge.include?('temps:${CHANNEL}-linux-')
+dependency_scan = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/dependency-scan.yml")), aliases: true)
+channels = dependency_scan.dig("jobs", "container-scan", "strategy", "matrix", "include")
+abort "published channel scans must retain existing SARIF categories and cover nightly" unless
+  channels == [
+    {"channel" => "latest", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan"},
+    {"channel" => "beta", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan-beta"},
+    {"channel" => "nightly", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan-nightly"},
+  ]
 promotion = release.dig("jobs", "promote-runtime-images")
 abort "runtime aliases can move before binaries pass" unless
   (%w[build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64] - promotion["needs"]).empty? &&
