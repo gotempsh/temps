@@ -8689,8 +8689,6 @@ mod on_demand_http_tests {
 
 #[cfg(test)]
 mod shield_log_tests {
-    use super::*;
-
     /// ADR 066 phase 2: a listed client's verdict and reasons are what the
     /// request log stores; an unlisted one stores neither.
     #[test]

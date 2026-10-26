@@ -321,19 +321,28 @@ impl ShieldSources {
     }
 
     /// Every document answered 304. An undated list is as fresh as this
-    /// fetch, so its stored copy is re-dated; a dated one keeps its date.
+    /// fetch, so its stored copy is re-dated; a dated one keeps its date. A
+    /// stored copy that no longer decodes is dropped with its ETags, so the
+    /// next fetch downloads the list in full.
     async fn record_unchanged(
         &self,
         feed: &Feed,
         stored: Option<Vec<u8>>,
         now: i64,
     ) -> Result<(), SourceError> {
-        let redated = match stored {
-            Some(bytes) if !feed.dated => {
-                let mut list = SourceList::decode(&bytes).map_err(|error| SourceError::Stored {
+        let list = match stored.as_deref().map(SourceList::decode) {
+            Some(Ok(list)) => Some(list),
+            Some(Err(error)) => {
+                self.forget_stored(feed).await?;
+                return Err(SourceError::Stored {
                     source_name: feed.name.to_string(),
                     error,
-                })?;
+                });
+            }
+            None => None,
+        };
+        let redated = match list {
+            Some(mut list) if !feed.dated => {
                 list.published_at = now;
                 Some(list.encode()?)
             }
@@ -348,6 +357,18 @@ impl ShieldSources {
                  published_at = CASE WHEN $2 IS NULL THEN published_at ELSE $3 END \
                  WHERE name = $1",
                 [feed.name.into(), redated.into(), published_at.into()],
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn forget_stored(&self, feed: &Feed) -> Result<(), DbErr> {
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE shield_sources SET etags = '{}'::jsonb, sha256 = NULL, list = NULL, \
+                 entries = 0, updated_at = clock_timestamp() WHERE name = $1",
+                [feed.name.into()],
             ))
             .await?;
         Ok(())
@@ -408,10 +429,15 @@ impl ShieldSources {
             let (true, Some(bytes)) = (source.enabled, source.list.as_deref()) else {
                 continue;
             };
-            let mut list = SourceList::decode(bytes).map_err(|error| SourceError::Stored {
-                source_name: source.name.clone(),
-                error,
-            })?;
+            // One unreadable copy must not hold back every other list; the
+            // next fetch of that source replaces it.
+            let mut list = match SourceList::decode(bytes) {
+                Ok(list) => list,
+                Err(error) => {
+                    warn!(source = %source.name, error = %error, "Leaving an unreadable Shield list out of the snapshot");
+                    continue;
+                }
+            };
             // The verdict and age limit are the code's, not the row's, so a
             // release that changes them applies to stored copies too.
             if let Some(feed) = self.feeds.iter().find(|feed| feed.name == source.name) {
@@ -555,7 +581,7 @@ mod tests {
         let revision = sources_revision(&db).await;
         assert_eq!(revision, Some(1));
         let lists = crate::shield::ShieldLists::default();
-        assert!(lists.refresh(&db, None).await.unwrap());
+        assert!(lists.refresh(&db, &[]).await.unwrap());
         let ip = "198.18.3.4".parse().unwrap();
         let verdict = lists.evaluate(ip, Utc::now().timestamp());
         assert_eq!(verdict.action, Action::Block);
@@ -603,10 +629,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sources.compile().await.unwrap(), Some(3));
-        assert!(lists.refresh(&db, None).await.unwrap());
+        assert!(lists.refresh(&db, &[]).await.unwrap());
         assert_eq!(
             lists.evaluate(ip, Utc::now().timestamp()),
             temps_shield::Verdict::PASS
+        );
+
+        // An unreadable stored copy is left out of the snapshot rather than
+        // failing it, and a 304 then drops it so the next fetch is in full.
+        db.execute_unprepared(
+            "UPDATE shield_sources SET enabled = true, list = '\\x00'::bytea, \
+             last_attempt_at = now() - interval '2 hours', updated_at = now() WHERE name = 'good'",
+        )
+        .await?;
+        assert!(sources.compile().await?.is_some());
+        assert!(matches!(
+            sources.fetch(&feeds[0]).await,
+            Err(SourceError::Stored { .. })
+        ));
+        db.execute_unprepared(
+            "UPDATE shield_sources SET last_attempt_at = now() - interval '2 hours' WHERE name = 'good'",
+        )
+        .await?;
+        assert_eq!(
+            sources.fetch(&feeds[0]).await?,
+            Fetched::Changed { entries: 1 }
         );
 
         // Only the last ten revisions are kept.

@@ -91,19 +91,25 @@ impl ShieldLists {
     async fn run_loader(self: Arc<Self>, db: Arc<DatabaseConnection>) {
         let mut ticker = tokio::time::interval(POLL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut skipped: Option<i64> = None;
+        // Revisions that failed their checks. At most the retained ones
+        // above the loaded revision, so this stays as small as the table.
+        let mut skipped: Vec<i64> = Vec::new();
         let mut consecutive_failures: u64 = 0;
         loop {
             ticker.tick().await;
-            match self.refresh(&db, skipped).await {
-                Ok(_) => consecutive_failures = 0,
+            match self.refresh(&db, &skipped).await {
+                Ok(_) => {
+                    consecutive_failures = 0;
+                    let loaded = i64::try_from(self.revision()).unwrap_or(i64::MAX);
+                    skipped.retain(|&revision| revision > loaded);
+                }
                 Err(ShieldListsError::Database(e)) if is_missing_table(&e) => {
                     debug!("shield_snapshots does not exist yet; keeping the built-in lists");
                 }
                 Err(e) => {
                     if let Some(revision) = e.bad_revision() {
                         error!(error = %e, "Skipping a Shield snapshot; keeping revision {}", self.revision());
-                        skipped = Some(revision);
+                        skipped.push(revision);
                         continue;
                     }
                     consecutive_failures += 1;
@@ -120,25 +126,24 @@ impl ShieldLists {
         }
     }
 
-    /// Load the newest snapshot if it is newer than the loaded one and not
-    /// `skipped`. Returns whether the index changed.
+    /// Load the newest snapshot that is newer than the loaded one and not
+    /// `skipped`, so a bad newest revision falls back to the good one below
+    /// it. Returns whether the index changed.
     pub async fn refresh(
         &self,
         db: &DatabaseConnection,
-        skipped: Option<i64>,
+        skipped: &[i64],
     ) -> Result<bool, ShieldListsError> {
         let loaded = i64::try_from(self.revision()).unwrap_or(i64::MAX);
         let Some(row) = shield_snapshots::Entity::find()
             .filter(shield_snapshots::Column::Revision.gt(loaded))
+            .filter(shield_snapshots::Column::Revision.is_not_in(skipped.iter().copied()))
             .order_by_desc(shield_snapshots::Column::Revision)
             .one(db)
             .await?
         else {
             return Ok(false);
         };
-        if Some(row.revision) == skipped {
-            return Ok(false);
-        }
         let revision = row.revision;
         if hex::encode(Sha256::digest(&row.body)) != row.sha256 {
             return Err(ShieldListsError::Checksum { revision });
@@ -217,7 +222,7 @@ mod tests {
             .append_query_results([vec![row(4, body)]])
             .append_query_results([Vec::<shield_snapshots::Model>::new()])
             .into_connection();
-        assert!(lists.refresh(&db, None).await.unwrap());
+        assert!(lists.refresh(&db, &[]).await.unwrap());
         assert_eq!(
             lists.revision(),
             4,
@@ -227,7 +232,7 @@ mod tests {
         // The baseline still applies under a loaded snapshot.
         let reserved: IpAddr = "192.0.2.1".parse().unwrap();
         assert_eq!(lists.evaluate(reserved, NOW).action, Action::Log);
-        assert!(!lists.refresh(&db, None).await.unwrap());
+        assert!(!lists.refresh(&db, &[]).await.unwrap());
     }
 
     #[tokio::test]
@@ -239,19 +244,35 @@ mod tests {
         garbage.sha256 = hex::encode(Sha256::digest(&garbage.body));
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![tampered]])
-            .append_query_results([vec![garbage.clone()]])
             .append_query_results([vec![garbage]])
+            // The query leaves out skipped revisions, so the database
+            // answers nothing once 3 is skipped.
+            .append_query_results([Vec::<shield_snapshots::Model>::new()])
             .into_connection();
-        let error = lists.refresh(&db, None).await.unwrap_err();
+        let error = lists.refresh(&db, &[]).await.unwrap_err();
         assert_eq!(error.bad_revision(), Some(3));
         assert!(matches!(error, ShieldListsError::Checksum { .. }));
         assert!(matches!(
-            lists.refresh(&db, None).await.unwrap_err(),
+            lists.refresh(&db, &[]).await.unwrap_err(),
             ShieldListsError::Snapshot { .. }
         ));
-        assert!(!lists.refresh(&db, Some(3)).await.unwrap());
+        assert!(!lists.refresh(&db, &[3]).await.unwrap());
         assert_eq!(lists.revision(), 2);
         let ip: IpAddr = "198.18.0.1".parse().unwrap();
         assert_eq!(lists.evaluate(ip, NOW).action, Action::Block);
+    }
+
+    /// The query leaves out skipped revisions, so the good revision below a
+    /// bad newest one is loaded rather than nothing.
+    #[tokio::test]
+    async fn a_bad_newest_snapshot_falls_back_to_the_one_below() {
+        let lists = ShieldLists::default();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(3, snapshot(3).encode().unwrap())]])
+            .into_connection();
+        assert!(lists.refresh(&db, &[4]).await.unwrap());
+        assert_eq!(lists.revision(), 3);
+        let sql = db.into_transaction_log()[0].statements()[0].sql.clone();
+        assert!(sql.contains("NOT IN"), "{sql}");
     }
 }
