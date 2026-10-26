@@ -10,4 +10,5 @@ pub mod metrics_sampler;
 pub mod project_ip_access_service;
 pub mod proxy_log_batch_writer;
 pub mod proxy_log_service;
+pub mod shield_console_service;
 pub mod static_asset_lookup;

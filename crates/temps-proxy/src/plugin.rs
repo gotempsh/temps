@@ -99,9 +99,9 @@ impl TempsPlugin for ProxyPlugin {
             // TimescaleDB) and wire it into the read service the handlers use.
             // When ClickHouse is NOT configured this resolves to the default
             // TimescaleDB path with no behaviour change.
-            let proxy_log_storage = match server_config {
+            let proxy_log_storage = match server_config.as_ref() {
                 Some(config) => crate::storage::build_proxy_log_storage(
-                    &config,
+                    config,
                     db.clone(),
                     ip_service.clone(),
                     retention_slot as Arc<dyn temps_core::RetentionResolver>,
@@ -151,7 +151,21 @@ impl TempsPlugin for ProxyPlugin {
                 ),
             }
 
+            // ADR 066 I10: the console's Shield tab reads the same backend
+            // as the request log.
+            let shield_console_service = Arc::new(
+                crate::service::shield_console_service::ShieldConsoleService::new(
+                    db.clone(),
+                    crate::storage::shield_stats::build_shield_stats_storage(
+                        server_config.as_deref(),
+                        db.clone(),
+                        clickhouse_compression,
+                    ),
+                ),
+            );
+
             // Register the services for other plugins to use
+            context.register_service(shield_console_service);
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
             context.register_service(api_traffic_data_source);
@@ -259,6 +273,14 @@ impl TempsPlugin for ProxyPlugin {
                 project_access_checker: project_access_checker.clone(),
             });
 
+        let shield_state = Arc::new(crate::handler::shield::ShieldConsoleState {
+            service: context
+                .require_service::<crate::service::shield_console_service::ShieldConsoleService>(),
+            config_service: context.require_service::<temps_config::ConfigService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: project_access_checker.clone(),
+        });
+
         // Create the app state directly
         let app_state = Arc::new(crate::handler::types::AppState { lb_service });
 
@@ -278,7 +300,8 @@ impl TempsPlugin for ProxyPlugin {
             .merge(
                 crate::handler::project_ip_access::create_routes()
                     .with_state(project_ip_access_state),
-            );
+            )
+            .merge(crate::handler::shield::create_routes().with_state(shield_state));
 
         Some(PluginRoutes::new(router))
     }
@@ -289,6 +312,7 @@ impl TempsPlugin for ProxyPlugin {
         let proxy_logs_spec = crate::handler::proxy_logs::openapi();
         let ip_access_control_spec = crate::handler::ip_access_control::openapi();
         let project_ip_access_spec = crate::handler::project_ip_access::openapi();
+        let shield_spec = crate::handler::shield::openapi();
 
         let merged = temps_core::openapi::merge_openapi_schemas(
             lb_spec,
@@ -296,6 +320,7 @@ impl TempsPlugin for ProxyPlugin {
                 proxy_logs_spec,
                 ip_access_control_spec,
                 project_ip_access_spec,
+                shield_spec,
             ],
         );
 
