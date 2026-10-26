@@ -24,6 +24,20 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("t13d171100_ab0a1bf427ad_8e6e362c5eac", "Python ssl"),
 ];
 
+/// JA4 fingerprints of current browsers. All Chrome builds of a release
+/// line share one; the list is kept short and only ever keeps a fingerprint
+/// from being learned as hostile (D9), so an entry that goes stale costs
+/// nothing.
+pub const KNOWN_BROWSERS: &[(&str, &str)] = &[
+    ("t13d1516h2_8daaf6152771_02713d6af862", "Chrome"),
+    ("t13d1516h2_8daaf6152771_e5627efa2ab1", "Chrome"),
+];
+
+/// Whether `ja4` is on [`KNOWN_BROWSERS`].
+pub fn is_known_browser(ja4: &str) -> bool {
+    KNOWN_BROWSERS.iter().any(|(known, _)| *known == ja4)
+}
+
 /// The browser a User-Agent claims to be, if it claims one. Crawlers that
 /// say they are compatible with Mozilla do not claim to be a browser.
 pub fn claimed_browser(user_agent: &str) -> Option<&'static str> {
@@ -77,6 +91,15 @@ mod tests {
     const GOOGLEBOT: &str =
         "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
     const BROWSER_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+
+    #[test]
+    fn browsers_and_tools_are_told_apart() {
+        assert!(is_known_browser(BROWSER_JA4));
+        assert!(!is_known_browser("t13d3012h2_1d37bd780c83_882d495ac381"));
+        for (ja4, _) in KNOWN_BROWSERS {
+            assert_eq!(tool_behind(ja4), None, "{ja4}");
+        }
+    }
 
     #[test]
     fn a_browser_user_agent_names_its_browser() {

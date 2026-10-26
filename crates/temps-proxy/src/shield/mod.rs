@@ -7,7 +7,8 @@
 //! decision ([`ProxyShield`]), with the reputation lists ([`ShieldLists`],
 //! fetched and compiled by [`ShieldSources`]), the environment's mode,
 //! exempt paths and [`BypassTokens`]. Decisions other than `pass` are
-//! recorded through the [`ShieldEventStore`].
+//! recorded through the [`ShieldEventStore`], and [`ShieldLearning`]
+//! promotes what the fleet's events show (D9) and prunes the Shield tables.
 //!
 //! The proxy issues a signed proof-of-work token with the challenge page,
 //! verifies the solution itself at [`VERIFY_PATH`], and admits later
@@ -19,6 +20,7 @@ mod bypass;
 pub mod event_store;
 mod ingress;
 mod ja4_hook;
+mod learning;
 mod lists;
 mod sources;
 
@@ -26,8 +28,9 @@ pub use bypass::{BypassTokens, POLL_INTERVAL as BYPASS_POLL_INTERVAL};
 pub use event_store::{EventBackend, ShieldEventStore, ShieldEventWriter};
 pub use ingress::{decision_event, verify_event, EventContext, ProxyShield, CRAWLER_CHECK_TIMEOUT};
 pub use ja4_hook::Ja4Hook;
+pub use learning::{EvidenceStore, LearningError, Promoted, Pruned, ShieldLearning};
 pub use lists::{ShieldLists, ShieldListsError, POLL_INTERVAL};
-pub use sources::{Fetched, ShieldSources, SourceError};
+pub use sources::{Fetched, ShieldSources, SourceError, OBSERVED_SOURCE, OPERATOR_SOURCE};
 
 use temps_shield::{ChallengeGate, ShieldKeys};
 

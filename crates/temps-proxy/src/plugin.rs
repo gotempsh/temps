@@ -92,6 +92,15 @@ impl TempsPlugin for ProxyPlugin {
                 context.require_service::<temps_core::RequestPolicyGateSlot>();
             let _ = self.request_policy_gate_slot.set(request_policy_slot);
 
+            // D9 reads the evidence for promotion where the request logs
+            // live.
+            let shield_evidence = match &server_config {
+                Some(config) => {
+                    crate::shield::EvidenceStore::from_config(config, clickhouse_compression)
+                }
+                None => crate::shield::EvidenceStore::Postgres,
+            };
+
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
 
@@ -153,9 +162,22 @@ impl TempsPlugin for ProxyPlugin {
             // ADR 066 D2: fetch the Shield reputation lists and compile
             // them into the snapshots every ingress loads. Every control
             // plane runs this; claims and an advisory lock keep it to one.
+            // D9: promote what the fleet's events show, and prune.
             match crate::shield::ShieldSources::new(db.clone()) {
                 Ok(sources) => {
-                    Arc::new(sources).spawn();
+                    let sources = match &config_service {
+                        Some(config) => sources.with_config(config.clone()),
+                        None => sources,
+                    };
+                    let sources = Arc::new(sources);
+                    sources.clone().spawn();
+                    let learning =
+                        crate::shield::ShieldLearning::new(db.clone(), shield_evidence, sources);
+                    let learning = match &config_service {
+                        Some(config) => learning.with_config(config.clone()),
+                        None => learning,
+                    };
+                    Arc::new(learning).spawn();
                 }
                 Err(e) => tracing::warn!(
                     error = %e,
