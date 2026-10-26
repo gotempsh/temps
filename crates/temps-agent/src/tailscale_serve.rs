@@ -427,13 +427,18 @@ impl ServeManager {
                     .collect();
             }
         }
-        // Funnel on an entry: its socket refuses everything (D3).
+        // Funnel on an entry: its socket refuses everything (D3). Only an
+        // outcome that read `AllowFunnel` may lift that: a failed or
+        // conflicting pass says `funnel: false` without having looked, and
+        // the socket keeps what the last read said (fail closed).
         for outcome in &mut report.entries {
             if let Some(bound) = self.sockets.get(&outcome.address_id) {
-                bound
-                    .socket
-                    .funnel_on
-                    .store(outcome.funnel, Ordering::Release);
+                if outcome.funnel || outcome.outcome == ServeOutcome::Applied {
+                    bound
+                        .socket
+                        .funnel_on
+                        .store(outcome.funnel, Ordering::Release);
+                }
                 if bound.socket.funnel_seen.swap(false, Ordering::AcqRel) {
                     outcome.funnel = true;
                 }
@@ -1331,6 +1336,56 @@ mod tests {
             probe.as_ref().is_err_and(|e| e.contains("funnel")),
             "{probe:?}"
         );
+    }
+
+    /// A pass that did not read `AllowFunnel` (the Serve config could not
+    /// be read, or the slot is someone else's) never lifts a socket's Funnel
+    /// refusal: Funnel may still be on.
+    #[tokio::test]
+    async fn a_failed_or_conflicting_pass_keeps_the_funnel_refusal() {
+        let (mut manager, shared, dir) = manager(
+            fake::running(),
+            vec![entry(1, "custom:12", "master.example.ts.net")],
+        )
+        .await;
+        manager.pass(&input()).await;
+        shared.lock().config["AllowFunnel"] =
+            serde_json::json!({"master.example.ts.net:443": true});
+        shared.lock().version += 1;
+        manager.reconciled_at = None;
+        assert!(manager.pass(&input()).await.entries[0].funnel);
+        let socket = dir.path().join("serve").join("custom-12.sock");
+        let socket = socket.as_path();
+        let refused = || async move {
+            let probe = probe_socket(socket, "master.example.ts.net").await;
+            assert!(
+                probe.as_ref().is_err_and(|e| e.contains("funnel")),
+                "{probe:?}"
+            );
+        };
+        refused().await;
+
+        // The Serve config cannot be read: every entry is an Error.
+        shared.lock().config_status = Some(503);
+        manager.reconciled_at = None;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Error);
+        assert!(!report.entries[0].funnel);
+        refused().await;
+
+        // Readable again, but another handler took the slot: a Conflict.
+        {
+            let mut state = shared.lock();
+            state.config_status = None;
+            state.config["Web"]["master.example.ts.net:443"]["Handlers"]["/"]["Proxy"] =
+                serde_json::json!("http://127.0.0.1:3000");
+            state.version += 1;
+        }
+        manager.reconciled_at = None;
+        let report = manager.pass(&input()).await;
+        assert_eq!(report.entries[0].outcome, ServeOutcome::Conflict);
+        assert!(!report.entries[0].funnel);
+        refused().await;
     }
 
     #[tokio::test]

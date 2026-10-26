@@ -23,6 +23,7 @@ use temps_entities::external_services;
 
 use crate::externalsvc::postgres::{
     postgres_healthcheck_cmd, shell_escape, PostgresConfig, PostgresInputConfig,
+    POSTGRES_CONTAINER_INIT,
 };
 use crate::externalsvc::postgres_upgrade::{PostgresConnection, PostgresContainerLifecycle};
 use crate::services::ExternalServiceManager;
@@ -455,6 +456,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
             log_config: Some(crate::utils::default_service_log_config()),
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(512),
+            init: POSTGRES_CONTAINER_INIT,
             restart_policy: Some(bollard::models::RestartPolicy {
                 name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
                 maximum_retry_count: None,

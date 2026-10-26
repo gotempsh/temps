@@ -143,7 +143,7 @@ struct ListBackupsArgs {
 
 #[derive(Args)]
 struct RestoreBackupArgs {
-    /// Database connection URL to restore to (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL to restore to. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     database_url: String,
 
@@ -228,7 +228,7 @@ struct RestoreServiceArgs {
     #[arg(long, env = "TEMPS_ENCRYPTION_KEY", hide_env_values = true)]
     encryption_key: String,
 
-    /// Database URL for the temps database (needed to query service config) (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database URL for the temps database (needed to query service config). Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     database_url: String,
 

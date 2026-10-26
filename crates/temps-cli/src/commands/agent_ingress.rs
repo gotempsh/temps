@@ -166,9 +166,17 @@ fn fixed(args: &FixedArgs) -> anyhow::Result<LocalIngress> {
     })
 }
 
+#[cfg(unix)]
 fn running_as_root() -> bool {
     // SAFETY: geteuid has no preconditions and cannot fail.
     unsafe { libc::geteuid() == 0 }
+}
+
+/// No Unix root to be: tailscaled's Serve sockets need one, so
+/// `--tailscale-serve` is warned about as for any other non-root agent.
+#[cfg(not(unix))]
+fn running_as_root() -> bool {
+    false
 }
 
 /// `--listen` for private ingress: `tailscale`, or a private address, and

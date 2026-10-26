@@ -69,8 +69,9 @@ pub struct NodeAppState {
     /// Audit trail. A node's reported architecture decides where images are
     /// placed, so a change to it is recorded like any other write.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
-    /// Where each heartbeat's CPU/memory/disk reading is stored as `node.*`
-    /// time series, so a worker is charted and alerted on exactly like the
+    /// Where each heartbeat's CPU/memory/disk reading and its disk health
+    /// (software RAID and drive SMART, #1618) are stored as `node.*` time
+    /// series, so a worker is charted and alerted on exactly like the
     /// control plane. `None` when metrics collection is not wired up; the
     /// heartbeat itself is unaffected.
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
@@ -337,6 +338,13 @@ pub struct HeartbeatApiRequest {
     /// clears it.
     pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeat>,
+    /// Software RAID and drive SMART health read by the agent
+    /// (`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw
+    /// JSON here and parsed after the heartbeat is recorded, so a malformed
+    /// report from a mismatched agent version costs only the disk metrics,
+    /// never the heartbeat that keeps the node online.
+    #[schema(value_type = Option<Object>)]
+    pub disk_health: Option<serde_json::Value>,
     /// Cross-node overlay state (ADR 056). `None` from older agents leaves the
     /// stored status untouched.
     #[serde(default)]
@@ -2391,6 +2399,33 @@ async fn allocate_overlay_cidr(db: std::sync::Arc<sea_orm::DatabaseConnection>, 
     }
 }
 
+/// A worker's heartbeat-reported disk health as its `node.*` metric points,
+/// labelled with its node id so the per-node disk-health alert rules and the
+/// node detail's Disk health card read it exactly like the control plane's
+/// own. A malformed report (a mismatched agent version) is logged and yields
+/// no points; the heartbeat still succeeds.
+fn worker_disk_health_points(
+    node_id: i32,
+    report: serde_json::Value,
+) -> Vec<temps_metrics::MetricPoint> {
+    use temps_metrics::collector::disk_health::DiskHealthReport;
+
+    let report: DiskHealthReport = match serde_json::from_value(report) {
+        Ok(report) => report,
+        Err(e) => {
+            warn!(node_id, error = %e, "ignoring malformed disk_health in heartbeat from node {}", node_id);
+            return Vec::new();
+        }
+    };
+    let config = temps_metrics::CollectorConfig::new(
+        node_id,
+        temps_metrics::SourceKind::Node,
+        String::new(),
+    )
+    .with_node_id(node_id);
+    report.points(&config, chrono::Utc::now())
+}
+
 /// Receive a heartbeat from a worker node
 #[utoipa::path(
     tag = "Nodes",
@@ -2445,6 +2480,7 @@ async fn node_heartbeat(
     // Kept aside for the metrics series: `capacity` is moved into the request
     // below, and the store is optional, so only pay for the clone when set.
     let metrics_capacity = app_state.metrics_store.as_ref().map(|_| capacity.clone());
+    let disk_health = request.disk_health;
 
     let heartbeat = HeartbeatRequest {
         capacity,
@@ -2486,8 +2522,22 @@ async fn node_heartbeat(
     // is capped: when the store falls behind the heartbeat rate the sample is
     // skipped (counted and logged), since the node's next heartbeat supersedes
     // it.
+    // The worker's disk health (#1618) rides in the same write.
     if let (Some(store), Some(capacity)) = (app_state.metrics_store.clone(), metrics_capacity) {
-        temps_metrics::node_capacity::spawn_record_capacity(store, node_id, capacity);
+        let disk_health_points = disk_health
+            .map(|report| worker_disk_health_points(node_id, report))
+            .unwrap_or_default();
+        temps_metrics::node_capacity::spawn_record_heartbeat(
+            store,
+            node_id,
+            capacity,
+            disk_health_points,
+        );
+    } else if disk_health.is_some() {
+        tracing::debug!(
+            node_id,
+            "no metrics store configured; dropping worker disk health report"
+        );
     }
 
     // The architecture decides where images are placed and is supplied by the
@@ -7953,5 +8003,44 @@ mod tests {
         assert_eq!(problem["title"], "WireGuard Key In Use");
         assert!(problem.get("node_id").is_none(), "{problem}");
         assert_eq!(used(token.id).await, 0);
+    }
+}
+
+#[cfg(test)]
+mod worker_disk_health_tests {
+    use super::worker_disk_health_points;
+    use temps_metrics::SourceKind;
+
+    #[test]
+    fn a_worker_report_is_stored_under_that_node() {
+        let report = serde_json::json!({
+            "raid_arrays": [{
+                "name": "md0",
+                "level": "raid1",
+                "members": [2, 1],
+                "failed_marked": 0
+            }]
+        });
+        let points = worker_disk_health_points(7, report);
+
+        let degraded = points
+            .iter()
+            .find(|p| p.name == "node.raid_degraded" && p.labels.is_empty())
+            .expect("aggregate degraded point");
+        assert_eq!(
+            degraded.value, 1.0,
+            "a raid1 with 1 of 2 members is degraded"
+        );
+        assert!(points.iter().all(|p| p.source_kind == SourceKind::Node
+            && p.source_id == 7
+            && p.node_id == Some(7)));
+    }
+
+    #[test]
+    fn a_malformed_report_yields_no_points() {
+        assert!(
+            worker_disk_health_points(7, serde_json::json!({"raid_arrays": "nope"})).is_empty()
+        );
+        assert!(worker_disk_health_points(7, serde_json::json!({})).is_empty());
     }
 }

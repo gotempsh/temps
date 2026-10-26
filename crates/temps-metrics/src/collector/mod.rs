@@ -15,6 +15,7 @@
 //! [`MetricKind::Counter`]. The scraper tracks `last_values` and converts
 //! cumulative readings into deltas before calling [`MetricsStore::write_batch`].
 
+pub mod disk_health;
 pub mod mongodb;
 pub mod node;
 pub mod postgres;

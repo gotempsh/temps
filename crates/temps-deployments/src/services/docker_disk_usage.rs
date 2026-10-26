@@ -391,6 +391,86 @@ fn parse_system_df(body: &[u8], api_version: Option<String>) -> Result<DockerDis
     })
 }
 
+/// One build cache record, as far as the nightly size cap cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildCacheRecord {
+    pub size_bytes: u64,
+    /// A build currently holds this record; pruning never removes it.
+    pub in_use: bool,
+    /// When a build last used the record (`None` if never reused).
+    pub last_used_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl BuildCacheRecord {
+    /// The time BuildKit's `until` prune filter compares against: the last
+    /// use, or the creation time for a record that was never reused.
+    pub fn last_activity(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_used_at.or(self.created_at)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBuildCacheRecord {
+    #[serde(rename = "Size")]
+    size: Option<i64>,
+    #[serde(rename = "InUse")]
+    in_use: Option<bool>,
+    #[serde(rename = "LastUsedAt")]
+    last_used_at: Option<String>,
+    #[serde(rename = "CreatedAt")]
+    created_at: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBuildCacheSummaryItems {
+    #[serde(rename = "Items")]
+    items: Option<Vec<RawBuildCacheRecord>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawBuildCacheDf {
+    // API < 1.52 (and newer daemons answering an older client).
+    #[serde(rename = "BuildCache")]
+    build_cache: Option<Vec<RawBuildCacheRecord>>,
+    // API >= 1.52 with `verbose=1`.
+    #[serde(rename = "BuildCacheUsage")]
+    build_cache_usage: Option<RawBuildCacheSummaryItems>,
+    #[serde(rename = "BuildCacheDiskUsage")]
+    build_cache_disk_usage: Option<RawBuildCacheSummaryItems>,
+}
+
+fn parse_docker_time(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let value = value?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.with_timezone(&chrono::Utc))
+        // Docker reports the zero time for "never".
+        .filter(|t| t.timestamp() > 0)
+}
+
+/// Parse the build cache records out of a `/system/df` body in any of the
+/// shapes the daemon uses. A daemon without BuildKit reports none.
+fn parse_build_cache_records(body: &[u8]) -> Result<Vec<BuildCacheRecord>, String> {
+    let raw: RawBuildCacheDf =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let records = raw
+        .build_cache
+        .filter(|list| !list.is_empty())
+        .or_else(|| raw.build_cache_usage.and_then(|s| s.items))
+        .or_else(|| raw.build_cache_disk_usage.and_then(|s| s.items))
+        .unwrap_or_default();
+    Ok(records
+        .into_iter()
+        .map(|r| BuildCacheRecord {
+            size_bytes: r.size.unwrap_or(0).max(0) as u64,
+            in_use: r.in_use.unwrap_or(false),
+            last_used_at: parse_docker_time(r.last_used_at.as_deref()),
+            created_at: parse_docker_time(r.created_at.as_deref()),
+        })
+        .collect())
+}
+
 /// Fetches `docker system df` for the local daemon.
 pub struct DockerDiskUsageService {
     host: DockerHost,
@@ -428,7 +508,7 @@ impl DockerDiskUsageService {
         debug!(host = %host, "fetching docker system df");
 
         let started = std::time::Instant::now();
-        let fetched = tokio::time::timeout(self.timeout, self.raw_get_system_df())
+        let fetched = tokio::time::timeout(self.timeout, self.raw_get_system_df("/system/df"))
             .await
             .map_err(|_| DockerDiskUsageError::Timeout {
                 host: host.clone(),
@@ -459,19 +539,49 @@ impl DockerDiskUsageService {
         Ok(usage)
     }
 
+    /// Every build cache record on the daemon, with the size and last-use
+    /// time the nightly size cap needs to pick what to evict. Same raw-HTTP
+    /// approach and shape tolerance as [`Self::fetch`]; restricted to the
+    /// build cache (`type=build-cache`) so it does not walk images and
+    /// volumes.
+    pub async fn build_cache_records(&self) -> Result<Vec<BuildCacheRecord>, DockerDiskUsageError> {
+        let host = self.host.display();
+        let (status, _api_version, body) = tokio::time::timeout(
+            self.timeout,
+            self.raw_get_system_df("/system/df?type=build-cache&verbose=1"),
+        )
+        .await
+        .map_err(|_| DockerDiskUsageError::Timeout {
+            host: host.clone(),
+            timeout_secs: self.timeout.as_secs(),
+        })??;
+        if status != 200 {
+            let excerpt = String::from_utf8_lossy(&body[..body.len().min(300)]).to_string();
+            return Err(DockerDiskUsageError::UnexpectedStatus {
+                host,
+                status,
+                body: excerpt,
+            });
+        }
+        parse_build_cache_records(&body)
+            .map_err(|reason| DockerDiskUsageError::Parse { host, reason })
+    }
+
     /// Returns `(status, Api-Version header, body)`.
     async fn raw_get_system_df(
         &self,
+        path_and_query: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), DockerDiskUsageError> {
         match &self.host {
-            DockerHost::Unix(path) => self.get_over_unix(path).await,
-            DockerHost::Http(base) => self.get_over_http(base).await,
+            DockerHost::Unix(path) => self.get_over_unix(path, path_and_query).await,
+            DockerHost::Http(base) => self.get_over_http(base, path_and_query).await,
         }
     }
 
     async fn get_over_unix(
         &self,
         path: &std::path::Path,
+        path_and_query: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), DockerDiskUsageError> {
         use http_body_util::{BodyExt, Empty};
         use hyper_util::rt::TokioIo;
@@ -501,7 +611,7 @@ impl DockerDiskUsageService {
         // `parse_system_df` accepts in every known spelling.
         let request = hyper::Request::builder()
             .method(hyper::Method::GET)
-            .uri("/system/df")
+            .uri(path_and_query)
             .header(hyper::header::HOST, "docker")
             .body(Empty::<bytes::Bytes>::new())
             .map_err(|e| DockerDiskUsageError::Unavailable {
@@ -539,6 +649,7 @@ impl DockerDiskUsageService {
     async fn get_over_http(
         &self,
         base: &str,
+        path_and_query: &str,
     ) -> Result<(u16, Option<String>, Vec<u8>), DockerDiskUsageError> {
         let host = self.host.display();
         let client = reqwest::Client::builder()
@@ -549,7 +660,7 @@ impl DockerDiskUsageService {
                 reason: format!("could not build HTTP client: {e}"),
             })?;
         let response = client
-            .get(format!("{base}/system/df"))
+            .get(format!("{base}{path_and_query}"))
             .send()
             .await
             .map_err(|e| DockerDiskUsageError::Unavailable {
@@ -748,5 +859,50 @@ mod tests {
                 + usage.build_cache.size_bytes
         );
         assert!(usage.images.total_count >= usage.images.active_count);
+    }
+
+    #[test]
+    fn build_cache_records_parse_from_the_legacy_list() {
+        let body = br#"{"BuildCache": [
+            {"ID": "a", "Size": 100, "InUse": false, "CreatedAt": "2026-10-01T00:00:00Z", "LastUsedAt": "2026-10-20T12:00:00.5Z"},
+            {"ID": "b", "Size": 50, "InUse": true, "CreatedAt": "2026-10-02T00:00:00Z", "LastUsedAt": null}
+        ]}"#;
+        let records = parse_build_cache_records(body).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].size_bytes, 100);
+        assert!(!records[0].in_use);
+        assert_eq!(
+            records[0].last_activity().unwrap().to_rfc3339(),
+            "2026-10-20T12:00:00.500+00:00"
+        );
+        assert!(records[1].in_use);
+        assert_eq!(records[1].last_used_at, None);
+        assert_eq!(
+            records[1].last_activity(),
+            records[1].created_at,
+            "a never-reused record ages from its creation"
+        );
+    }
+
+    #[test]
+    fn build_cache_records_parse_from_the_1_52_verbose_summary() {
+        let body = br#"{"BuildCacheUsage": {"TotalCount": 1, "TotalSize": 7, "Items": [
+            {"ID": "c", "Size": 7, "InUse": false, "CreatedAt": "2026-10-01T00:00:00Z", "LastUsedAt": "0001-01-01T00:00:00Z"}
+        ]}}"#;
+        let records = parse_build_cache_records(body).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].size_bytes, 7);
+        assert_eq!(
+            records[0].last_used_at, None,
+            "Docker's zero time means never"
+        );
+    }
+
+    #[test]
+    fn build_cache_records_are_empty_without_buildkit() {
+        assert!(parse_build_cache_records(br#"{"Images": []}"#)
+            .unwrap()
+            .is_empty());
+        assert!(parse_build_cache_records(b"not json").is_err());
     }
 }

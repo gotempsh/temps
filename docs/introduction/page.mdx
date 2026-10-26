@@ -178,9 +178,16 @@ That's it! Open `https://temps.yourdomain.com` to access the Temps console.
 
 ### Step 5: Run as a Service (Optional)
 
-To keep Temps running after you log out, create a systemd service:
+To keep Temps running after you log out, create a systemd service. Keep the
+database URL in a root-owned `0600` environment file rather than on
+`ExecStart`, where its password would show up in `ps` and `systemctl cat temps`:
 
 ```bash
+sudo install -d -m 0755 /etc/temps
+sudo install -m 0600 /dev/null /etc/temps/temps.env
+echo 'TEMPS_DATABASE_URL=postgresql://postgres:temps@localhost:16432/temps' \
+  | sudo tee /etc/temps/temps.env > /dev/null
+
 sudo tee /etc/systemd/system/temps.service > /dev/null <<EOF
 [Unit]
 Description=Temps Platform
@@ -188,8 +195,8 @@ After=network.target
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/temps/temps.env
 ExecStart=/usr/local/bin/temps serve \
-  --database-url "postgresql://postgres:temps@localhost:16432/temps" \
   --address 0.0.0.0:80 \
   --tls-address 0.0.0.0:443 \
   --console-address 0.0.0.0:8081
@@ -214,7 +221,8 @@ If Temps hangs during startup, it's likely waiting for the screenshot provider t
 
 ```bash
 export TEMPS_SCREENSHOT_PROVIDER=noop
-temps serve --database-url "..." --address 0.0.0.0:80
+export TEMPS_DATABASE_URL="..."
+temps serve --address 0.0.0.0:80
 ```
 
 ### Database connection issues

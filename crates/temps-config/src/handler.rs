@@ -3257,20 +3257,20 @@ fn validate_container_log_budgets(logs: &temps_core::ContainerLogSettings) -> Re
             .detail("container_logs.head_buffer_mb must be between 1 and 256")
             .build());
     }
-    if logs.ingest_lines_per_sec > 1_000_000 {
+    if logs.ingest_lines_per_sec > temps_core::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail(format!(
-                "container_logs.ingest_lines_per_sec must be between 0 (no limit) and 1000000, \
-                 got {}",
+                "container_logs.ingest_lines_per_sec must be between 0 (no limit) and {}, got {}",
+                temps_core::ContainerLogSettings::MAX_INGEST_LINES_PER_SEC,
                 logs.ingest_lines_per_sec
             ))
             .build());
     }
-    if logs.ingest_kib_per_sec > 1_048_576 {
+    if logs.ingest_kib_per_sec > temps_core::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .detail(format!(
-                "container_logs.ingest_kib_per_sec must be between 0 (no limit) and 1048576 \
-                 (1 GiB/s), got {}",
+                "container_logs.ingest_kib_per_sec must be between 0 (no limit) and {}, got {}",
+                temps_core::ContainerLogSettings::MAX_INGEST_KIB_PER_SEC,
                 logs.ingest_kib_per_sec
             ))
             .build());
@@ -6160,22 +6160,22 @@ mod tests {
             ..ContainerLogSettings::default()
         };
         assert!(validate_container_log_budgets(&zero_head).is_err());
-        let no_ingest_limit = ContainerLogSettings {
+        let unlimited_ingest = ContainerLogSettings {
             ingest_lines_per_sec: 0,
             ingest_kib_per_sec: 0,
             ..ContainerLogSettings::default()
         };
         assert!(
-            validate_container_log_budgets(&no_ingest_limit).is_ok(),
+            validate_container_log_budgets(&unlimited_ingest).is_ok(),
             "0 disables the ingestion budget"
         );
         let absurd_lines = ContainerLogSettings {
-            ingest_lines_per_sec: 1_000_001,
+            ingest_lines_per_sec: ContainerLogSettings::MAX_INGEST_LINES_PER_SEC + 1,
             ..ContainerLogSettings::default()
         };
         assert!(validate_container_log_budgets(&absurd_lines).is_err());
         let absurd_bytes = ContainerLogSettings {
-            ingest_kib_per_sec: 1_048_577,
+            ingest_kib_per_sec: ContainerLogSettings::MAX_INGEST_KIB_PER_SEC + 1,
             ..ContainerLogSettings::default()
         };
         assert!(validate_container_log_budgets(&absurd_bytes).is_err());

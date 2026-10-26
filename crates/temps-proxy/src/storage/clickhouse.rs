@@ -70,8 +70,8 @@ use crate::traffic_aggregation::{
 };
 
 /// Maximum rows per ClickHouse HTTP insert request. Bounds peak buffer memory
-/// in the `clickhouse` client on large batches. Proxy log batches flush at 200
-/// rows so this is rarely hit, but a backlog drain could produce more.
+/// in the `clickhouse` client on large batches. Proxy log batches flush at
+/// 2 000 rows so this is rarely hit, but a backlog drain could produce more.
 const MAX_INSERT_BATCH: usize = 5_000;
 
 // ── Client configuration ────────────────────────────────────────────────────

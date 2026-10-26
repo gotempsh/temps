@@ -485,6 +485,14 @@ pub struct ProjectResponse {
     /// system-wide default from settings.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_retention_hours: Option<i32>,
+    /// This project's container log ingestion budget in lines/s. Absent =
+    /// the platform default (Settings → Monitoring); 0 = unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// This project's container log ingestion budget in KiB/s. Absent = the
+    /// platform default; 0 = unlimited.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_kib_per_sec: Option<i32>,
     /// Where this project is granted host Docker access (ADR 045), and what to
     /// set when it is granted nowhere.
     ///
@@ -555,6 +563,8 @@ impl ProjectResponse {
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             serves_own_temps_api: project.serves_own_temps_api,
             image_retention_hours: project.image_retention_hours,
+            log_ingest_lines_per_sec: project.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: project.log_ingest_kib_per_sec,
             // Filled in by the detail handlers via `with_docker_socket`; the
             // list path deliberately leaves it unset.
             docker_socket: None,
@@ -994,6 +1004,22 @@ pub struct UpdateProjectSettingsRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub image_retention_hours: Option<Option<i32>>,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines per second (0–1,000,000). `0` lifts the limit; explicit `null`
+    /// returns to the platform default; omit to leave unchanged.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_ingest_lines_per_sec: Option<Option<i32>>,
+    /// Same as `log_ingest_lines_per_sec`, in KiB per second (0–1,048,576).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub log_ingest_kib_per_sec: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -1043,6 +1069,8 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             error_source_root: request.error_source_root,
             ai_api_traffic_summary_enabled: request.ai_api_traffic_summary_enabled,
             image_retention_hours: request.image_retention_hours,
+            log_ingest_lines_per_sec: request.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: request.log_ingest_kib_per_sec,
         }
     }
 }
@@ -1727,6 +1755,18 @@ mod tests {
         assert_eq!(omitted.image_retention_hours, None);
         assert_eq!(cleared.image_retention_hours, Some(None));
         assert_eq!(set.image_retention_hours, Some(Some(72)));
+
+        let lifted: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"log_ingest_lines_per_sec":0,"log_ingest_kib_per_sec":null}"#)
+                .unwrap();
+        assert_eq!(lifted.log_ingest_lines_per_sec, Some(Some(0)));
+        assert_eq!(lifted.log_ingest_kib_per_sec, Some(None));
+        assert_eq!(omitted.log_ingest_lines_per_sec, None);
+        let round_trip = serde_json::to_string(&omitted).unwrap();
+        assert!(
+            !round_trip.contains("log_ingest"),
+            "an omitted override must not re-serialize as a reset: {round_trip}"
+        );
     }
 
     /// ADR 045 refusals are 403, not 400: an admin sending the identical

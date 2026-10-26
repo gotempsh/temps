@@ -1009,6 +1009,42 @@ pub struct BuildLimitsSettings {
     /// accepts through the client, with a warning in the server log.
     #[schema(minimum = 0, example = 2048)]
     pub memory_limit_mb: u32,
+
+    /// Upper bound for Docker's build cache, in gigabytes. The nightly
+    /// cleanup removes the least recently used cache records that no build
+    /// is using until the total is at or below this size. 0 disables the
+    /// size cap (only `build_cache_max_unused_days` applies). Re-read on
+    /// every nightly run. Applies to this host's Docker daemon; worker nodes
+    /// use the default.
+    #[schema(minimum = 0, example = 10)]
+    pub build_cache_max_gb: u32,
+
+    /// Build cache records unused for longer than this many days are removed
+    /// by the nightly cleanup, whatever the total size. Valid range 1..=365.
+    #[schema(minimum = 1, maximum = 365, example = 7)]
+    pub build_cache_max_unused_days: u32,
+}
+
+impl BuildLimitsSettings {
+    /// Default build cache cap, in gigabytes.
+    pub const DEFAULT_BUILD_CACHE_MAX_GB: u32 = 10;
+    /// Default age after which unused build cache is removed, in days.
+    pub const DEFAULT_BUILD_CACHE_MAX_UNUSED_DAYS: u32 = 7;
+
+    /// The build cache size cap in bytes, or `None` when the cap is disabled.
+    pub fn build_cache_max_bytes(&self) -> Option<u64> {
+        match self.build_cache_max_gb {
+            0 => None,
+            gb => Some(u64::from(gb) * 1024 * 1024 * 1024),
+        }
+    }
+
+    /// `build_cache_max_unused_days` clamped into 1..=365, so a hand-edited
+    /// settings row can neither wipe the cache every night (0) nor keep it
+    /// for decades.
+    pub fn effective_build_cache_max_unused_days(&self) -> u32 {
+        self.build_cache_max_unused_days.clamp(1, 365)
+    }
 }
 
 /// System-wide retention policy for locally-built deployment images.
@@ -1062,6 +1098,8 @@ impl Default for BuildLimitsSettings {
             // real value via the settings page.
             cpu_limit_cores: 0.0,
             memory_limit_mb: 0,
+            build_cache_max_gb: Self::DEFAULT_BUILD_CACHE_MAX_GB,
+            build_cache_max_unused_days: Self::DEFAULT_BUILD_CACHE_MAX_UNUSED_DAYS,
         }
     }
 }
@@ -1101,13 +1139,47 @@ pub struct ContainerLogSettings {
     /// over budget has its excess lines dropped (not stored or indexed),
     /// a notice written into its log, and is listed as throttled in the log
     /// explorer. Up to 10 seconds of budget may arrive at once. `0` disables
-    /// the line limit. Applied within a minute of saving.
+    /// the line limit. Applied within a minute of saving. A project or
+    /// managed service can override it (`log_ingest_lines_per_sec`).
     #[schema(minimum = 0, maximum = 1000000, example = 250)]
     pub ingest_lines_per_sec: u32,
     /// Per-container ingestion budget, in KiB per second, enforced alongside
-    /// `ingest_lines_per_sec`. `0` disables the byte limit.
+    /// `ingest_lines_per_sec`. `0` disables the byte limit. A project or
+    /// managed service can override it (`log_ingest_kib_per_sec`).
     #[schema(minimum = 0, maximum = 1048576, example = 256)]
     pub ingest_kib_per_sec: u32,
+}
+
+impl ContainerLogSettings {
+    pub const MAX_INGEST_LINES_PER_SEC: u32 = 1_000_000;
+    pub const MAX_INGEST_KIB_PER_SEC: u32 = 1_048_576;
+
+    /// Check a per-project / per-service override (`log_ingest_lines_per_sec`,
+    /// `log_ingest_kib_per_sec`) against the same range as the platform
+    /// budget. `None` (inherit) is always valid; `0` means unlimited.
+    pub fn validate_ingest_override(
+        lines_per_sec: Option<i32>,
+        kib_per_sec: Option<i32>,
+    ) -> Result<(), String> {
+        let check = |field: &str, value: Option<i32>, max: u32| {
+            match value {
+            Some(v) if v < 0 || v as u32 > max => Err(format!(
+                "{field} {v} is not in valid range (0-{max}; 0 = unlimited, null = platform default)"
+            )),
+            _ => Ok(()),
+        }
+        };
+        check(
+            "log_ingest_lines_per_sec",
+            lines_per_sec,
+            Self::MAX_INGEST_LINES_PER_SEC,
+        )?;
+        check(
+            "log_ingest_kib_per_sec",
+            kib_per_sec,
+            Self::MAX_INGEST_KIB_PER_SEC,
+        )
+    }
 }
 
 /// Per-provider credential and configuration entry stored inside
@@ -2900,6 +2972,65 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn ingest_override_validation_accepts_inherit_zero_and_max_only() {
+        let v = ContainerLogSettings::validate_ingest_override;
+        assert!(v(None, None).is_ok());
+        assert!(v(Some(0), Some(0)).is_ok(), "0 = unlimited");
+        assert!(v(Some(1_000_000), Some(1_048_576)).is_ok());
+        let err = v(Some(-1), None).unwrap_err();
+        assert!(err.contains("log_ingest_lines_per_sec -1"), "{err}");
+        let err = v(None, Some(1_048_577)).unwrap_err();
+        assert!(err.contains("log_ingest_kib_per_sec 1048577"), "{err}");
+    }
+
+    #[test]
+    fn container_logs_saved_before_the_ingest_budget_get_the_default_budget() {
+        let saved = serde_json::json!({
+            "max_size": "50m",
+            "max_file": 3,
+            "service_max_size": "20m",
+            "service_max_file": 3,
+            "cache_mb": 4096,
+            "head_buffer_mb": 16
+        });
+        let logs: ContainerLogSettings = serde_json::from_value(saved).unwrap();
+        assert_eq!(logs.cache_mb, 4096, "existing values are kept");
+        let defaults = ContainerLogSettings::default();
+        assert_eq!(logs.ingest_lines_per_sec, defaults.ingest_lines_per_sec);
+        assert_eq!(logs.ingest_kib_per_sec, defaults.ingest_kib_per_sec);
+    }
+
+    #[test]
+    fn build_limits_saved_before_the_cache_cap_get_the_default_cap() {
+        let restored: BuildLimitsSettings = serde_json::from_value(serde_json::json!({
+            "max_concurrent": 3,
+            "cpu_limit_cores": 1.5,
+            "memory_limit_mb": 1024
+        }))
+        .expect("deserialize historical build limits");
+        assert_eq!(restored.max_concurrent, 3);
+        assert_eq!(restored.build_cache_max_gb, 10);
+        assert_eq!(restored.build_cache_max_unused_days, 7);
+        assert_eq!(
+            restored.build_cache_max_bytes(),
+            Some(10 * 1024 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn build_cache_cap_of_zero_disables_it_and_unused_days_are_clamped() {
+        let mut limits = BuildLimitsSettings {
+            build_cache_max_gb: 0,
+            build_cache_max_unused_days: 0,
+            ..Default::default()
+        };
+        assert_eq!(limits.build_cache_max_bytes(), None);
+        assert_eq!(limits.effective_build_cache_max_unused_days(), 1);
+        limits.build_cache_max_unused_days = 10_000;
+        assert_eq!(limits.effective_build_cache_max_unused_days(), 365);
+    }
 
     #[test]
     fn gateway_default_serializes_as_unpinned_across_releases() {

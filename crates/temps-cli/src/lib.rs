@@ -9,6 +9,7 @@
 //! described in ADR 0001 §"Extension points exposed by OSS".
 
 pub mod commands;
+mod database_url_source;
 mod docker_context;
 pub mod otel_export;
 
@@ -556,11 +557,26 @@ unsafe fn scrub_argv_raw(
 /// Convenience entrypoint that parses, installs tracing, and dispatches.
 /// Used by both the OSS `temps` binary (`extra_plugins = vec![]`) and any
 /// EE-bundled binary that wraps the same CLI surface.
+/// Whether `command` logs where its database URL came from and warns when it
+/// was passed with `--database-url`. Only the commands that run as a service
+/// (and so carry the flag in a unit's `ExecStart=`): the warning's advice is
+/// about that definition, and on a one-shot command the log line would land
+/// in stdout ahead of output that scripts parse.
+fn reports_database_url_source(command: &Commands) -> bool {
+    matches!(command, Commands::Serve(_) | Commands::Proxy(_))
+}
+
 pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyhow::Result<()> {
     // Mutates the environment, so it runs before anything can spawn a thread.
     let docker_context = docker_context::adopt_active_docker_context();
+    // Also mutates the environment: exports TEMPS_DATABASE_URL from
+    // TEMPS_DATABASE_URL_FILE or a systemd credential before clap reads it.
+    let database_url_source = database_url_source::adopt_database_url_file()?;
     install_crypto_provider();
     let cli = Cli::parse();
+    // Checked before the scrub below overwrites the value.
+    let database_url_flag_used =
+        database_url_source::database_url_on_command_line(std::env::args_os());
     // Scrub sensitive flag values from argv *after* clap has parsed them so
     // they no longer appear in `pgrep -af` or /proc/self/cmdline.
     scrub_sensitive_argv(&positional_secrets(&cli));
@@ -574,6 +590,25 @@ pub fn run(extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>) -> anyh
     };
     install_tracing_with_otel(&cli.log_level, &cli.log_format, "", otel.layer.take());
     otel.report();
+    // Logs go to stdout, so these notices are kept to the long-running
+    // services they are about: a one-shot command such as
+    // `temps api-key --output-format json` must print only its result.
+    if reports_database_url_source(&cli.command) {
+        match &database_url_source {
+            database_url_source::DatabaseUrlSource::Unchanged => {}
+            database_url_source::DatabaseUrlSource::File(path) => tracing::info!(
+                "Read the database URL from {} (TEMPS_DATABASE_URL_FILE)",
+                path.display()
+            ),
+            database_url_source::DatabaseUrlSource::SystemdCredential(path) => tracing::info!(
+                "Read the database URL from the systemd credential {}",
+                path.display()
+            ),
+        }
+        if database_url_flag_used {
+            tracing::warn!("{}", database_url_source::command_line_warning());
+        }
+    }
     match docker_context {
         Ok(adopted) => tracing::info!(
             "Using Docker context '{}' ({}) because DOCKER_HOST is not set",
@@ -595,7 +630,7 @@ mod argv_scrub_tests {
 
     use clap::Parser;
 
-    use super::{positional_secrets, scrub_argv_raw, Cli};
+    use super::{positional_secrets, reports_database_url_source, scrub_argv_raw, Cli};
 
     /// Run [`scrub_argv_raw`] over an owned copy of `args`, as the process
     /// argv would be, and return what is left.
@@ -708,6 +743,43 @@ mod argv_scrub_tests {
         assert_eq!(positional_secrets(&cli), ["tjoin_tok"]);
         let cli = Cli::try_parse_from(["temps", "join", "--pair", "-"]).unwrap();
         assert!(positional_secrets(&cli).is_empty());
+    }
+
+    /// `temps api-key --output-format json` is parsed by scripts (the
+    /// scenario CI pipes it into `jq`), so a database URL notice must not be
+    /// logged ahead of its JSON; `temps serve` is where the notice belongs.
+    #[test]
+    fn only_service_commands_report_the_database_url_source() {
+        let api_key = Cli::try_parse_from([
+            "temps",
+            "api-key",
+            "--database-url",
+            "postgres://localhost/temps",
+            "--name",
+            "scripted",
+            "--output-format",
+            "json",
+        ])
+        .unwrap();
+        assert!(!reports_database_url_source(&api_key.command));
+
+        let serve = Cli::try_parse_from([
+            "temps",
+            "serve",
+            "--database-url",
+            "postgres://localhost/temps",
+        ])
+        .unwrap();
+        assert!(reports_database_url_source(&serve.command));
+
+        let proxy = Cli::try_parse_from([
+            "temps",
+            "proxy",
+            "--database-url",
+            "postgres://localhost/temps",
+        ])
+        .unwrap();
+        assert!(reports_database_url_source(&proxy.command));
     }
 }
 

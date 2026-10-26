@@ -7766,6 +7766,7 @@ CMD ["cat", "/hello.txt"]
             max_concurrent: 2,
             cpu_limit_cores: 1.5,
             memory_limit_mb: 1024,
+            ..temps_core::BuildLimitsSettings::default()
         };
         assert_eq!(BuildResourceLimits::from_settings(&both), caps(1.5, 1024));
         let no_memory = temps_core::BuildLimitsSettings {
@@ -7904,6 +7905,7 @@ CMD ["cat", "/hello.txt"]
                 max_concurrent,
                 cpu_limit_cores,
                 memory_limit_mb,
+                ..temps_core::BuildLimitsSettings::default()
             })
         };
         let (tx, rx) = tokio::sync::watch::channel(settings(3, 1.0, 256));
@@ -7940,6 +7942,7 @@ CMD ["cat", "/hello.txt"]
             max_concurrent: 2,
             cpu_limit_cores: 0.0,
             memory_limit_mb: 0,
+            ..temps_core::BuildLimitsSettings::default()
         }));
         wait_for(|| rt.build_limits.gate().is_some()).await;
         assert_eq!(gate_limit(&rt), 2);

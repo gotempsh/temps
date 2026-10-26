@@ -254,6 +254,12 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines per second. NULL inherits the platform budget
+    /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// As `log_ingest_lines_per_sec`, in KiB per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
     /// Which template instantiation created this project, and for which of
     /// the template's services, so a resumed instantiation can tell its own
     /// project from one that merely holds the planned slug. The row is

@@ -379,6 +379,7 @@ mod m20261023_000001_add_overlay_network_name;
 mod m20261023_000002_add_serves_own_temps_api_to_projects;
 mod m20261024_000001_reachability;
 mod m20261025_000001_private_audience;
+mod m20261025_000002_add_log_ingest_overrides;
 mod m20261026_000001_create_shield;
 mod m20261026_000001_tailnet_serve;
 mod m20261026_000002_tailnet_principals;
@@ -851,6 +852,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20261024_000001_reachability::Migration),
             // ADR 064 D5: the range, worker and listener that bound a private address.
             Box::new(m20261025_000001_private_audience::Migration),
+            Box::new(m20261025_000002_add_log_ingest_overrides::Migration),
             // ADR 066 phase 2: reputation lists, snapshots and the logged verdict.
             Box::new(m20261026_000001_create_shield::Migration),
             // ADR 065 D1/D4: Tailscale ways in, and the Serve entries workers apply.

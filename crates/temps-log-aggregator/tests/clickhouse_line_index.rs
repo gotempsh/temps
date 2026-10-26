@@ -224,6 +224,18 @@ async fn row_count(idx: &ClickHouseLineIndex, where_clause: &str) -> u64 {
         .n
 }
 
+async fn table_count(idx: &ClickHouseLineIndex, table: &str, where_clause: &str) -> u64 {
+    idx.client()
+        .expect("a local target owns its client")
+        .query(&format!(
+            "SELECT count() AS n FROM {table} FINAL WHERE {where_clause}"
+        ))
+        .fetch_one::<CountRow>()
+        .await
+        .expect("table count query")
+        .n
+}
+
 // ── 1. connect: migration + idempotency ─────────────────────────────────
 
 #[tokio::test]
@@ -406,6 +418,13 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
     // ── Analytics ────────────────────────────────────────────────────
     let query = scoped_query(vec![9101, 9102, 9103]);
 
+    // Attribute-key counts are batched in memory; write them out first.
+    let written = idx.flush_rollups().await.expect("flush_rollups");
+    assert!(
+        written > 0,
+        "indexed lines with attributes must produce key counts"
+    );
+
     let keys = idx
         .attribute_keys(&query, 50)
         .await
@@ -543,6 +562,67 @@ async fn index_chunk_and_analytics_over_real_clickhouse() {
     );
 }
 
+// ── 4a. a tombstone without a chunk-day entry keeps masking ─────────────
+
+/// `log_chunk_days` expires at `day + retention`, before the lines of that
+/// day do (`ts + retention`, and later still under `ttl_only_drop_parts`).
+/// A reclaim pass must not read "no chunk-day entry" as "no rows": it clears
+/// only the tombstones of chunks whose rows it deleted itself.
+#[tokio::test]
+async fn reclaim_keeps_a_tombstone_whose_chunk_day_entry_expired() {
+    let Some(cfg) = shared_config().await else {
+        eprintln!("Skipping: Docker unavailable");
+        return;
+    };
+    let idx = ClickHouseLineIndex::connect(LineIndexTarget::Local(cfg.clone()))
+        .await
+        .expect("connect");
+
+    let chunk_labels = labels(9202, "tmp-svc", "prod", "ch-ttl", 22);
+    let seg = Arc::new(vec![mkline(
+        Utc::now(),
+        LogLevel::Info,
+        "x",
+        "hit",
+        "",
+        200,
+        1.0,
+    )]);
+    idx.index_chunk(602, &chunk_labels, std::slice::from_ref(&seg))
+        .await
+        .expect("index chunk");
+    idx.forget_chunks(&[602]).await.expect("forget_chunks");
+
+    // What the chunk-day TTL does before the lines' TTL catches up.
+    idx.client()
+        .expect("a local target owns its client")
+        .query("DELETE FROM log_chunk_days WHERE chunk_seq = 602")
+        .execute()
+        .await
+        .expect("expire the chunk-day entry");
+
+    idx.reclaim_forgotten().await.expect("reclaim_forgotten");
+
+    assert_eq!(
+        row_count(&idx, "chunk_seq = 602").await,
+        1,
+        "the pass had no partition to reclaim the rows from"
+    );
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 602").await,
+        1,
+        "the tombstone must stay while its rows exist"
+    );
+    let visible = idx
+        .matching_chunks(&scoped_query(vec![9202]), &[], 100)
+        .await
+        .expect("matching chunks");
+    assert!(
+        !visible.contains(&602),
+        "the forgotten chunk must stay invisible: {visible:?}"
+    );
+}
+
 // ── 4. forget_chunks + set_retention_days ────────────────────────────────
 
 #[tokio::test]
@@ -579,10 +659,49 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
     let before = row_count(&idx, "chunk_seq = 601").await;
     assert_eq!(before, 2, "chunk must be indexed before forgetting it");
 
+    // The view filled the chunk -> day-partition map in the same insert.
+    let days = table_count(&idx, "log_chunk_days", "chunk_seq = 601").await;
+    assert!(
+        days >= 1,
+        "indexed chunk must have its day partition recorded"
+    );
+
     idx.forget_chunks(&[601]).await.expect("forget_chunks");
 
+    // A forget is a tombstone, not a table-wide mutation: the rows stay
+    // until the reclaim pass, but no read can see them any more.
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 601").await,
+        1,
+        "forget_chunks must write a tombstone"
+    );
+    let visible = idx
+        .matching_chunks(&scoped_query(vec![9201]), &[], 100)
+        .await
+        .expect("matching chunks");
+    assert!(
+        !visible.contains(&601),
+        "a forgotten chunk must be invisible to reads before it is reclaimed: {visible:?}"
+    );
+
+    // Reclaim deletes the rows partition by partition and then clears both
+    // bookkeeping tables.
+    let reclaimed = idx.reclaim_forgotten().await.expect("reclaim_forgotten");
+    assert!(reclaimed >= 1, "the forgotten chunk must be reclaimed");
     let after = row_count(&idx, "chunk_seq = 601").await;
-    assert_eq!(after, 0, "forget_chunks must remove that chunk's rows");
+    assert_eq!(after, 0, "reclaim must remove the forgotten chunk's rows");
+    assert_eq!(
+        table_count(&idx, "log_chunk_days", "chunk_seq = 601").await,
+        0,
+        "reclaimed chunk days must be cleared"
+    );
+    assert_eq!(
+        table_count(&idx, "log_forgotten_chunks", "chunk_seq = 601").await,
+        0,
+        "a tombstone whose rows are gone must be cleared"
+    );
+    // Rate-limited: a second pass right away does nothing.
+    assert_eq!(idx.reclaim_forgotten().await.expect("second reclaim"), 0);
 
     // A forgotten chunk that never existed is a no-op, not an error.
     idx.forget_chunks(&[999_999])
@@ -617,5 +736,22 @@ async fn forget_chunks_and_retention_over_real_clickhouse() {
         engine.engine_full.contains("toIntervalDay(7)"),
         "TTL must be aligned to the new retention (7 days): {}",
         engine.engine_full
+    );
+    // Tombstones outlive the lines by a day: a forgotten line can survive
+    // until its whole day part expires.
+    let tombstones = idx
+        .client()
+        .expect("a local target owns its client")
+        .query(
+            "SELECT engine_full FROM system.tables \
+             WHERE database = 'temps_test' AND name = 'log_forgotten_chunks'",
+        )
+        .fetch_one::<EngineRow>()
+        .await
+        .expect("query system.tables");
+    assert!(
+        tombstones.engine_full.contains("toIntervalDay(8)"),
+        "tombstone TTL must be retention + 1 day (8 days): {}",
+        tombstones.engine_full
     );
 }

@@ -128,6 +128,13 @@ impl TailnetIdentity {
     /// The LocalAPI to ask, or `None` when the agent may not (no consent,
     /// not root). A change drops every cached answer.
     pub fn set_api(&self, api: Option<Arc<dyn LocalApi>>) {
+        self.replace_api(api, |_| {});
+    }
+
+    /// [`Self::set_api`], with `between` run after the API is replaced and
+    /// before the epoch moves: tests look at the state a concurrent
+    /// [`Self::whois`] can see there.
+    fn replace_api(&self, api: Option<Arc<dyn LocalApi>>, between: impl FnOnce(&Self)) {
         let current = self.api.load();
         let same = match (current.as_ref(), api.as_ref()) {
             (None, None) => true,
@@ -137,20 +144,33 @@ impl TailnetIdentity {
         if same {
             return;
         }
-        self.epoch.fetch_add(1, Ordering::AcqRel);
+        // The new API is in place, and the old answers gone, before the
+        // epoch moves (D11). A `whois` that reads the new epoch (Acquire,
+        // pairing with this Release) therefore also reads the new API; one
+        // that read the old epoch is refused when it rechecks it, or caches
+        // under the old epoch, which nothing uses once it moved.
         self.api.store(api.map(|api| Arc::new(ApiSlot(api))));
         self.cache.store(Arc::new(HashMap::new()));
+        between(self);
+        self.epoch.fetch_add(1, Ordering::Release);
+    }
+
+    /// The epoch, then the API to ask in it, in that order: see
+    /// [`Self::replace_api`].
+    fn snapshot(&self) -> (u64, Option<Arc<ApiSlot>>) {
+        let epoch = self.epoch.load(Ordering::Acquire);
+        (epoch, self.api.load_full())
     }
 
     /// `whois` of `ip`, cached. `Ok(None)` when tailscaled does not know it.
     async fn whois(&self, ip: IpAddr) -> Result<Option<Visitor>, String> {
-        let epoch = self.epoch.load(Ordering::Acquire);
+        let (epoch, api) = self.snapshot();
         if let Some(cached) = self.cache.load().get(&ip) {
             if cached.epoch == epoch && cached.at.elapsed() < WHOIS_TTL {
                 return Ok(cached.visitor.clone());
             }
         }
-        let Some(api) = self.api.load_full() else {
+        let Some(api) = api else {
             return Err("this worker's owner has not allowed asking tailscaled".to_string());
         };
         let who = api
@@ -577,6 +597,34 @@ mod tests {
                 login: Some("carol@example.org".into())
             }
         );
+    }
+
+    /// Every point a `whois` can read the identity at while consent is
+    /// withdrawn: before, between the API and the epoch moving, and after.
+    /// Whatever it reads, an answer it may use (one asked in the epoch that
+    /// is current once withdrawal finished) never comes from the withdrawn
+    /// API. Bumping the epoch first left a point where it read the new epoch
+    /// and the old API.
+    #[tokio::test]
+    async fn no_point_of_a_withdrawal_pairs_the_new_epoch_with_the_old_api() {
+        let (_dir, identity, _) = identity_with(&[]).await;
+        let (_, old) = identity.snapshot();
+        let old = old.expect("consent was given");
+        let before = identity.snapshot();
+        let mut between = None;
+        identity.replace_api(None, |identity| between = Some(identity.snapshot()));
+        let between = between.expect("ran between");
+        let after = identity.snapshot();
+        let final_epoch = after.0;
+        assert_ne!(final_epoch, before.0, "a withdrawal starts a new epoch");
+        for (point, (epoch, api)) in [("before", before), ("between", between), ("after", after)] {
+            if epoch == final_epoch {
+                assert!(
+                    api.as_ref().is_none_or(|api| !Arc::ptr_eq(api, &old)),
+                    "{point}: the current epoch carries the withdrawn API"
+                );
+            }
+        }
     }
 
     /// A whois asked before consent was withdrawn, answered after, is not

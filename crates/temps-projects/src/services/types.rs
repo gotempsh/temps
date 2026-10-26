@@ -133,6 +133,11 @@ pub struct Project {
     /// None = use the system default (336 h / 14 days out of the box, from
     /// `AppSettings.image_retention.default_hours`).
     pub image_retention_hours: Option<i32>,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines/s. None = the platform default; 0 = unlimited.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// Same as `log_ingest_lines_per_sec`, in KiB of log text per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
 }
 
 /// What the caller is allowed to *claim*, as opposed to what it is allowed to
@@ -289,6 +294,10 @@ pub struct UpdateProjectSettingsParams {
     /// Outer `None` leaves the retention window unchanged; `Some(None)` clears
     /// the per-project override back to the system default.
     pub image_retention_hours: Option<Option<i32>>,
+    /// Outer `None` leaves the override unchanged; `Some(None)` returns the
+    /// project to the platform log ingestion budget; `Some(Some(0))` lifts it.
+    pub log_ingest_lines_per_sec: Option<Option<i32>>,
+    pub log_ingest_kib_per_sec: Option<Option<i32>>,
 }
 
 /// A display-name change that actually happened.

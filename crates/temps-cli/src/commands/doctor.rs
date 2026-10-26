@@ -25,7 +25,7 @@ const DOCKER_REMEDIATION: &str = "Start the Docker daemon, or point DOCKER_HOST 
 /// Diagnose the temps installation and check system health
 #[derive(Args)]
 pub struct DoctorCommand {
-    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
     pub database_url: Option<String>,
 

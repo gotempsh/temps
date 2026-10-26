@@ -24,6 +24,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "irreversible data loss or an availability risk; the console shows the user the plan first",
         &[
             "ExternalServiceEnablePgStatStatements",
+            // *Make it reachable*: changes DNS records, tunnels and
+            // certificates for a live address, and can take a Cloudflare token
+            // again on resume. The console shows the plan and asks.
+            "apply_environment_reachability",
+            "decide_reachability_conflict",
+            "resume_reachability_run",
+            "undo_reachability_run",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",

@@ -111,7 +111,7 @@ pub struct ServiceHostsState {
     /// `Err` when they could not be read.
     pub unrecorded: Result<Vec<String>, String>,
     /// Whether the admin approved the worker as a host; `None` when it
-    /// does not advertise the Service (yet).
+    /// does not advertise the Service (yet), or the answer did not say.
     pub approved: Option<bool>,
 }
 

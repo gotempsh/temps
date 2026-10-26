@@ -102,7 +102,13 @@ export function nodeRangeQuery(
   const options =
     scope.kind === 'all'
       ? nodeMetricsGetClusterRangeOptions({
-          query: { ...query, node_ids: scope.ids.join(',') },
+          query: {
+            metric: query.metric,
+            range: query.range,
+            start_time: query.start_time ?? undefined,
+            end_time: query.end_time ?? undefined,
+            node_ids: scope.ids.join(','),
+          },
         })
       : nodeMetricsGetRangeOptions({ path: { id: scope.id }, query })
   return {

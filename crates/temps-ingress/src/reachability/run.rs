@@ -167,6 +167,22 @@ pub fn unrecorded_hosts(
         .collect()
 }
 
+/// Whether the admin approved the worker serving `address_id` as a host of
+/// the Service. `None` when it is not a host yet, and when the answer did
+/// not give an approval level: neither is "not approved", and telling the
+/// admin to approve a worker that may already be approved is wrong.
+pub fn worker_approval(
+    hosts: &[ServiceHost],
+    entries: &[ServiceEntryHost],
+    node_id: i32,
+    address_id: &str,
+) -> Option<bool> {
+    let mine = entries
+        .iter()
+        .find(|e| e.node_id == node_id && e.address_id == address_id)?;
+    hosts.iter().find(|host| mine.hosts(host))?.approved
+}
+
 /// D4's message for hosts no Temps setup configured.
 pub(crate) fn unrecorded_message(service: &str, hosts: &[String]) -> String {
     format!(
@@ -5763,6 +5779,35 @@ mod tests {
             name: Some(name.into()),
             approved,
         }
+    }
+
+    /// An approval level the answer left out stays unknown: the console
+    /// waits instead of telling the admin to approve the worker.
+    #[test]
+    fn an_unknown_approval_level_is_not_read_as_not_approved() {
+        let entries = [homelab_entry()];
+        let approval = |approved: Option<bool>| {
+            worker_approval(
+                &[host("nHOMELAB", "homelab.example.ts.net", approved)],
+                &entries,
+                2,
+                "custom:50",
+            )
+        };
+        assert_eq!(approval(Some(true)), Some(true));
+        assert_eq!(approval(Some(false)), Some(false));
+        assert_eq!(approval(None), None);
+        // Not a host yet, or not this worker's entry: unknown too.
+        assert_eq!(worker_approval(&[], &entries, 2, "custom:50"), None);
+        assert_eq!(
+            worker_approval(
+                &[host("nHOMELAB", "homelab.example.ts.net", Some(true))],
+                &entries,
+                3,
+                "custom:50"
+            ),
+            None
+        );
     }
 
     /// A Service run whose worker is the approved host. Its Serve entry
