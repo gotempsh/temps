@@ -892,6 +892,7 @@ fn attach_failure_problem(
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
         | AgentError::ProjectNotFound { .. }
+        | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }
         | AgentError::CooldownActive { .. }
         | AgentError::AiCliNotInstalled { .. }
