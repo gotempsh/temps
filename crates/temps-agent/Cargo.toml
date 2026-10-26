@@ -44,6 +44,7 @@ temps-dns-resolver = { path = "../temps-dns-resolver" }
 chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
 temps-metrics = { path = "../temps-metrics" }
+temps-shield = { path = "../temps-shield", features = ["tokio"] }
 ipnet = "2.10"
 hickory-resolver = "0.26"
 parking_lot = "0.12"

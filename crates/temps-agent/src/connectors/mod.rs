@@ -280,6 +280,15 @@ impl ConnectorSupervisor {
             self.store.clone(),
             self.shutdown.clone(),
             spec.client_address_header.clone(),
+            spec.client_ja4.as_ref().map(|forwarded| {
+                (
+                    forwarded.header.clone(),
+                    // A source this agent does not know is still a proxy
+                    // on loopback.
+                    temps_shield::ja4::Ja4Source::parse(&forwarded.source)
+                        .unwrap_or(temps_shield::ja4::Ja4Source::Local),
+                )
+            }),
         )
         .await?;
         info!(%addr, "tunnel origin listener started");
@@ -416,6 +425,7 @@ mod tests {
             revision: "r1".into(),
             edge_port,
             client_address_header: None,
+            client_ja4: None,
             drivers: Vec::new(),
             secrets: Default::default(),
         }

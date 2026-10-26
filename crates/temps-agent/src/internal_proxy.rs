@@ -82,6 +82,12 @@ pub(crate) struct PublicAcmeConfig {
 #[derive(Clone, Copy)]
 pub(crate) struct PublicPeer(pub SocketAddr);
 
+/// The visitor's TLS fingerprint (ADR 066, D4): computed by the public
+/// HTTPS listener, or taken from a tunnel connector's header over
+/// loopback. Logged at `debug` until Shield runs on workers (phase 5).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublicClientFingerprint(pub temps_shield::ja4::ClientFingerprint);
+
 #[derive(Clone)]
 pub(crate) struct PublicConnectionPermit(pub Arc<tokio::sync::OwnedSemaphorePermit>);
 
@@ -113,6 +119,13 @@ const HOP_BY_HOP: &[&str] = &[
     "x-real-ip",
     "x-temps-deployment-id",
 ];
+
+/// The JA4 headers of ADR 066 D4. A worker reads none of them from a
+/// visitor, so none reaches an app, where it could pass for one the
+/// platform vouched for.
+fn is_forwarded_ja4_header(name: &str) -> bool {
+    temps_shield::ja4::FORWARDED_JA4_HEADERS.contains(&name)
+}
 
 /// Per-attempt upstream timeout. Internal-zone calls are between
 /// containers on the same overlay; if 30s isn't enough something is
@@ -691,6 +704,14 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
             recorder.mark_project();
         }
+        if let Some(PublicClientFingerprint(fingerprint)) = req.extensions().get() {
+            debug!(
+                host = %host,
+                ja4 = fingerprint.ja4.as_ref().map(|ja4| ja4.as_str()),
+                ja4_source = fingerprint.source.as_str(),
+                "public request"
+            );
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
@@ -792,15 +813,38 @@ pub(crate) fn private_router(
     router_with(store, forwarded_proto, None, true, true, tailnet)
 }
 
+/// Remove a tunnel connector's JA4 header and, when the connection came
+/// from loopback, return what it says (ADR 066, D4). The header is removed
+/// either way, and a value not in the exact JA4 format counts as none.
+fn take_forwarded_ja4(
+    headers: &mut HeaderMap,
+    from_loopback: bool,
+    name: &HeaderName,
+    source: temps_shield::ja4::Ja4Source,
+) -> Option<PublicClientFingerprint> {
+    let ja4 = headers.remove(name).and_then(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(temps_shield::ja4::Ja4::parse_forwarded)
+    });
+    from_loopback.then_some(PublicClientFingerprint(
+        temps_shield::ja4::ClientFingerprint { ja4, source },
+    ))
+}
+
 /// The loopback origin an ingress connector forwards to (ADR 058): serves
 /// the public snapshot like the public HTTPS listener, without a server name
 /// to check, and takes the visitor's address from `client_address_header`
-/// when, and only when, the connection comes from loopback.
+/// when, and only when, the connection comes from loopback. The visitor's
+/// JA4 comes from `client_ja4`'s header the same way (ADR 066, D4): the
+/// connector ended TLS, so nothing else here can know it.
 pub async fn spawn_tunnel_origin(
     address: SocketAddr,
     store: SharedRouteStore,
     shutdown: Arc<Notify>,
     client_address_header: Option<String>,
+    client_ja4: Option<(String, temps_shield::ja4::Ja4Source)>,
 ) -> std::io::Result<SocketAddr> {
     if !address.ip().is_loopback() {
         return Err(std::io::Error::other(
@@ -813,15 +857,29 @@ pub async fn spawn_tunnel_origin(
         .map(|name| HeaderName::from_bytes(name.as_bytes()))
         .transpose()
         .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let ja4_header = client_ja4
+        .map(|(name, source)| {
+            HeaderName::from_bytes(name.as_bytes()).map(|header| (header, source))
+        })
+        .transpose()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
         move |mut req: Request, next: axum::middleware::Next| {
             let header = header.clone();
+            let ja4_header = ja4_header.clone();
             async move {
+                let from_loopback = req
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .is_some_and(|peer| peer.0.ip().is_loopback());
+                if let Some((name, source)) = &ja4_header {
+                    if let Some(fingerprint) =
+                        take_forwarded_ja4(req.headers_mut(), from_loopback, name, *source)
+                    {
+                        req.extensions_mut().insert(fingerprint);
+                    }
+                }
                 if let Some(name) = &header {
-                    let from_loopback = req
-                        .extensions()
-                        .get::<ConnectInfo<SocketAddr>>()
-                        .is_some_and(|peer| peer.0.ip().is_loopback());
                     let visitor = req
                         .headers()
                         .get(name)
@@ -1397,6 +1455,7 @@ async fn proxy_upgrade(
             || name_str.starts_with("x-forwarded-")
             || name_str.starts_with("x-temps-")
             || name_str == "x-real-ip"
+            || is_forwarded_ja4_header(name_str)
         {
             continue;
         }
@@ -1865,6 +1924,7 @@ async fn forward_once(
     for (name, value) in metadata.headers.iter() {
         // Tailnet identity is trusted only from a Serve socket (ADR 065 D3).
         if HOP_BY_HOP.contains(&name.as_str())
+            || is_forwarded_ja4_header(name.as_str())
             || !temps_core::tailnet::forwards_header(name.as_str(), state.serve.is_some())
         {
             continue;
@@ -2051,6 +2111,39 @@ mod tests {
             project_id: Some(project_id),
             environment_id: Some(project_id * 100),
         }
+    }
+
+    #[test]
+    fn tunnel_connector_ja4_is_trusted_from_loopback_only() {
+        use temps_shield::ja4::Ja4Source;
+        const SPEC_JA4: &str = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let name = HeaderName::from_static("cf-ja4");
+        let headers = |value: &'static str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(&name, HeaderValue::from_static(value));
+            headers
+        };
+
+        let mut from_connector = headers(SPEC_JA4);
+        let fingerprint =
+            take_forwarded_ja4(&mut from_connector, true, &name, Ja4Source::Cloudflare)
+                .expect("a loopback connector is trusted");
+        assert_eq!(
+            fingerprint.0.ja4.as_ref().map(|ja4| ja4.as_str()),
+            Some(SPEC_JA4)
+        );
+        assert_eq!(fingerprint.0.source, Ja4Source::Cloudflare);
+        assert!(from_connector.is_empty(), "the header never goes upstream");
+
+        let mut malformed = headers("not a ja4");
+        let fingerprint = take_forwarded_ja4(&mut malformed, true, &name, Ja4Source::Cloudflare)
+            .expect("still the connector's request");
+        assert_eq!(fingerprint.0.ja4, None);
+        assert!(malformed.is_empty());
+
+        let mut elsewhere = headers(SPEC_JA4);
+        assert!(take_forwarded_ja4(&mut elsewhere, false, &name, Ja4Source::Cloudflare).is_none());
+        assert!(elsewhere.is_empty());
     }
 
     #[test]

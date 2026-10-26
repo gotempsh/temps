@@ -286,7 +286,7 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
 
     let response = ingress
         .request(
-            "GET /headers HTTP/1.1\r\nHost: app.example.test:8443\r\nForwarded: for=203.0.113.99;proto=http\r\nX-Forwarded-For: 203.0.113.99\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n",
+            "GET /headers HTTP/1.1\r\nHost: app.example.test:8443\r\nForwarded: for=203.0.113.99;proto=http\r\nX-Forwarded-For: 203.0.113.99\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-Proto: http\r\nCF-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nCDN-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nCloudFront-Viewer-JA4-Fingerprint: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nConnection: close\r\n\r\n",
         )
         .await;
 
@@ -298,6 +298,8 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
         .to_ascii_lowercase();
     assert!(!request.contains("203.0.113.99"), "{request}");
     assert!(!request.contains("attacker.example"), "{request}");
+    // ADR 066 D4: no JA4 header a visitor wrote reaches the app.
+    assert!(!request.contains("ja4"), "{request}");
     assert!(request.contains("x-forwarded-for: 127.0.0.1"), "{request}");
     assert!(
         request.contains("x-forwarded-host: app.example.test:8443"),
@@ -309,6 +311,55 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
             .filter(|line| line.starts_with("host:"))
             .collect::<Vec<_>>(),
         vec!["host: app.example.test:8443"]
+    );
+    backend_shutdown.notify_waiters();
+}
+
+/// A tunnel connector's JA4 header (ADR 066, D4) is read at the tunnel
+/// origin and never reaches the app, whatever its name.
+#[tokio::test]
+async fn test_tunnel_origin_removes_the_connector_ja4_header() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+    let origin = temps_agent::internal_proxy::spawn_tunnel_origin(
+        "127.0.0.1:0".parse().expect("parse loopback address"),
+        Arc::clone(&ingress.store),
+        Arc::clone(&ingress.shutdown),
+        Some("x-connector-client-ip".to_string()),
+        Some((
+            "x-connector-ja4".to_string(),
+            temps_shield::ja4::Ja4Source::Cloudflare,
+        )),
+    )
+    .await
+    .expect("start tunnel origin");
+
+    let mut stream = TcpStream::connect(origin)
+        .await
+        .expect("connect to tunnel origin");
+    stream
+        .write_all(
+            b"GET / HTTP/1.1\r\nHost: app.example.test\r\nX-Connector-Client-IP: 198.51.100.7\r\nX-Connector-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .expect("write request to tunnel origin");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("tunnel origin response timed out")
+        .expect("read tunnel origin response");
+    let response = String::from_utf8_lossy(&response);
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(!request.contains("ja4"), "{request}");
+    assert!(
+        request.contains("x-forwarded-for: 198.51.100.7"),
+        "{request}"
     );
     backend_shutdown.notify_waiters();
 }
@@ -1169,6 +1220,7 @@ async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
         );
         assert!(request.contains("x-forwarded-for: 127.0.0.1"), "{request}");
         assert!(!request.contains("203.0.113.99"), "{request}");
+        assert!(!request.contains("ja4"), "{request}");
         stream
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1191,7 +1243,7 @@ async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
         .expect("connect to public ingress");
     client
         .write_all(
-            b"GET /socket HTTP/1.1\r\nHost: app.example.test:8443\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1vbmx5LWtleQ==\r\nX-Forwarded-For: 203.0.113.99\r\nX-Real-IP: 203.0.113.99\r\n\r\n",
+            b"GET /socket HTTP/1.1\r\nHost: app.example.test:8443\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1vbmx5LWtleQ==\r\nX-Forwarded-For: 203.0.113.99\r\nX-Real-IP: 203.0.113.99\r\nCF-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\n\r\n",
         )
         .await
         .expect("write websocket upgrade request");
