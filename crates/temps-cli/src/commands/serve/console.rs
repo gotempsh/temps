@@ -3090,6 +3090,35 @@ fn ai_read_allowlist() -> Vec<String> {
         // Databases and notifications
         "get_query_container_info",
         "get_notification_delivery_coverage",
+        // ── Workload plane (ADR-055): placement, volumes, node resources,
+        //    workload modes, functions and network policy, read only ──
+        "NodeMetricsGetClusterLatest",
+        "NodeMetricsGetClusterRange",
+        "NodeMetricsGetReporting",
+        "admin_environment_pinning_recommendation",
+        "admin_environment_volume_status",
+        "admin_explain_environment_placement",
+        "admin_get_environment_workload_isolation",
+        "admin_get_environment_workload_mode",
+        "admin_get_node_resources",
+        "admin_list_environment_volumes",
+        "get_capability",
+        "get_effective_policy",
+        "get_function",
+        "get_ingress_settings",
+        "get_rule",
+        "get_workload_mode",
+        "get_workload_pending_changes",
+        "list_functions",
+        "list_node_modes",
+        "list_rules",
+        "node_state_status",
+        // ── Reachability (ADR 064): whether visitors can reach each address,
+        //    the certificate methods that fit, and past runs ──
+        "get_certificate_methods",
+        "get_environment_reachability",
+        "get_reachability_run",
+        "list_reachability_runs",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -3466,6 +3495,12 @@ fn ai_write_allowlist() -> Vec<String> {
         // Revenue configuration
         "revenue_update_config",
         "revenue_delete_integration",
+        // ── Functions (ADR-055 phase 10): create one, or wake / put it to
+        //    sleep, like wake_environment and sleep_environment. Deleting
+        //    one stays in the console. ──
+        "create_function",
+        "wake_function",
+        "sleep_function",
     ]
     .iter()
     .map(|s| s.to_string())
