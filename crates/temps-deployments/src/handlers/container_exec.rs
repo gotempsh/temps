@@ -9,7 +9,7 @@
 
 use axum::{
     extract::{ws::WebSocketUpgrade, Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
 };
@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::websocket_origin::validate_websocket_origin;
 use tracing::info;
 use utoipa::ToSchema;
 
@@ -238,8 +239,10 @@ pub async fn container_terminal(
     State(state): State<Arc<AppState>>,
     Path((project_id, environment_id, container_id)): Path<(i32, i32, String)>,
     RequireAuth(auth): RequireAuth,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    validate_websocket_origin(&headers)?;
     permission_guard!(auth, ContainersExec);
 
     let container_record = verify_container_exec_access(
@@ -277,6 +280,29 @@ pub async fn container_terminal(
 
 #[cfg(test)]
 mod tests {
+
+    /// A cross-origin page must not be able to open this socket with the
+    /// user's cookie (browsers apply no CORS to WebSocket handshakes), so the
+    /// Origin check has to run before any lookup or upgrade work.
+    #[test]
+    fn websocket_handlers_validate_origin_before_any_work() {
+        let source = include_str!("container_exec.rs");
+        for name in ["container_terminal"] {
+            let start = source
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} handler not found in source"));
+            let body_start = start + source[start..].find(") -> ").unwrap_or(0);
+            let body = &source[body_start..];
+            let check = body
+                .find("validate_websocket_origin(&headers)?")
+                .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
+            let first_await = body.find(".await").unwrap_or(usize::MAX);
+            assert!(
+                check < first_await,
+                "{name} must validate the Origin before its first await"
+            );
+        }
+    }
     /// Live mutual-TLS check of the terminal **WebSocket** transport (ADR-020
     /// WS-2.1). The terminal proxy dials the agent with tokio-tungstenite (not
     /// reqwest), so this exercises that distinct stack: a rustls `Connector`

@@ -31,6 +31,7 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
+use temps_core::websocket_origin::validate_websocket_origin;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 use tracing::{error, info};
@@ -4973,6 +4974,7 @@ async fn attach_workspace_terminal(
     metadata: RequestMetadata,
     target: WorkspaceTerminalTarget,
     query: WorkspaceTerminalQuery,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
     let WorkspaceTerminalTarget {
@@ -4994,6 +4996,7 @@ async fn attach_workspace_terminal(
         State(terminal_state),
         Path(sandbox_public_id.clone()),
         Query(params),
+        headers,
         ws,
     )
     .await?;
@@ -5036,8 +5039,10 @@ pub async fn attach_application_workspace_terminal(
     Extension(metadata): Extension<RequestMetadata>,
     Path(application_public_id): Path<String>,
     Query(query): Query<WorkspaceTerminalQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    validate_websocket_origin(&headers)?;
     permission_guard!(auth, ProjectsWrite);
     permission_guard!(auth, SandboxesWrite);
     permission_guard!(auth, SandboxesExec);
@@ -5068,6 +5073,7 @@ pub async fn attach_application_workspace_terminal(
             tab,
         },
         query,
+        headers,
         ws,
     )
     .await
@@ -5094,8 +5100,10 @@ pub async fn attach_global_workspace_terminal(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
     Query(query): Query<WorkspaceTerminalQuery>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    validate_websocket_origin(&headers)?;
     require_global_terminal_permissions(&auth)?;
     deny_deployment_token!(auth);
     let thread = state
@@ -5115,6 +5123,7 @@ pub async fn attach_global_workspace_terminal(
             tab,
         },
         query,
+        headers,
         ws,
     )
     .await
@@ -8071,8 +8080,10 @@ pub async fn conversation_stream(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path((project_id, public_id)): Path<(i32, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, Problem> {
+    validate_websocket_origin(&headers)?;
     permission_guard!(auth, ProjectsRead);
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
@@ -8106,8 +8117,10 @@ pub async fn user_conversation_stream(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
     Path(public_id): Path<String>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, Problem> {
+    validate_websocket_origin(&headers)?;
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let conversation = state
@@ -14736,6 +14749,37 @@ mod user_route_authorization_tests {
             let stored = reload_action(&db, action.id).await;
             assert_eq!(stored.status, "rejected", "round {round}");
             assert_eq!(stored.confirmed_by, Some(owner_id), "round {round}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod websocket_origin_tests {
+    /// A cross-origin page must not be able to open this socket with the
+    /// user's cookie (browsers apply no CORS to WebSocket handshakes), so the
+    /// Origin check has to run before any lookup or upgrade work.
+    #[test]
+    fn websocket_handlers_validate_origin_before_any_work() {
+        let source = include_str!("handlers.rs");
+        for name in [
+            "attach_application_workspace_terminal",
+            "attach_global_workspace_terminal",
+            "conversation_stream",
+            "user_conversation_stream",
+        ] {
+            let start = source
+                .find(&format!("pub async fn {name}("))
+                .unwrap_or_else(|| panic!("{name} handler not found in source"));
+            let body_start = start + source[start..].find(") -> ").unwrap_or(0);
+            let body = &source[body_start..];
+            let check = body
+                .find("validate_websocket_origin(&headers)?")
+                .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
+            let first_await = body.find(".await").unwrap_or(usize::MAX);
+            assert!(
+                check < first_await,
+                "{name} must validate the Origin before its first await"
+            );
         }
     }
 }

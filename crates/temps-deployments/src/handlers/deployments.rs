@@ -52,6 +52,7 @@ use crate::services::{
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
+use temps_core::websocket_origin::validate_websocket_origin;
 
 // Handlers whose path contains a project ID enforce both authorization
 // dimensions: the caller's permission and the credential's project scope.
@@ -277,44 +278,6 @@ async fn deployment_response_with_service_urls(
     )
 )]
 pub struct DeploymentsApiDoc;
-
-fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
-    let Some(origin) = headers.get(header::ORIGIN) else {
-        return Ok(());
-    };
-    let origin = origin.to_str().map_err(|_| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Forbidden")
-            .with_detail("WebSocket Origin header is invalid")
-    })?;
-    let origin = url::Url::parse(origin).map_err(|_| {
-        problemdetails::new(StatusCode::FORBIDDEN)
-            .with_title("Forbidden")
-            .with_detail("WebSocket Origin header is not allowed")
-    })?;
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Forbidden")
-                .with_detail("WebSocket Host header is required when Origin is present")
-        })?;
-    let origin_authority = origin.host_str().map(|name| match origin.port() {
-        Some(port) => format!("{name}:{port}"),
-        None => name.to_string(),
-    });
-    if origin_authority
-        .as_deref()
-        .is_some_and(|authority| authority.eq_ignore_ascii_case(host.trim()))
-    {
-        return Ok(());
-    }
-    warn!(origin = %origin, host = %host, "Rejected cross-origin WebSocket request");
-    Err(problemdetails::new(StatusCode::FORBIDDEN)
-        .with_title("Forbidden")
-        .with_detail("WebSocket Origin header is not allowed"))
-}
 
 pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
     Router::new()
