@@ -359,10 +359,12 @@ pub async fn start_analysis(
         .unwrap_or(serde_json::Value::Null)
     });
 
-    // Create run record
+    // Create run record. The service resolves the error group inside this
+    // project first, so an id the project does not own is a 400 that leaves
+    // no run row behind.
     let run = app_state
-        .run_service
-        .create_autofixer_run(
+        .autofixer_service
+        .start_analysis_run(
             project_id,
             request.error_group_id,
             request.user_context,

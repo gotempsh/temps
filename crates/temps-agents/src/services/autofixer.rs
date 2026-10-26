@@ -333,6 +333,72 @@ impl AutofixerService {
 
     // ── Phase 1: Analysis ──────────────────────────────────────────────────────
 
+    /// Create the run row for an analysis of `error_group_id` in `project_id`.
+    ///
+    /// The error group is resolved inside the project **before** the row is
+    /// inserted, so an id the project does not own is rejected with nothing
+    /// persisted: no orphaned run to read back through
+    /// `GET /projects/{project_id}/autofixer/runs/{run_id}`, and no audit
+    /// entry for work that never started. The analysis phase resolves the
+    /// group again when it builds the prompt, so the guard holds even for a
+    /// run row created by some other path.
+    pub async fn start_analysis_run(
+        &self,
+        project_id: i32,
+        error_group_id: i32,
+        user_context: Option<String>,
+        ai_provider: Option<String>,
+        run_config: Option<serde_json::Value>,
+        triggered_by_user_id: Option<i32>,
+    ) -> Result<temps_entities::agent_runs::Model, AgentError> {
+        self.load_project_error_group(project_id, error_group_id)
+            .await?;
+
+        self.run_service
+            .create_autofixer_run(
+                project_id,
+                error_group_id,
+                user_context,
+                ai_provider,
+                run_config,
+                triggered_by_user_id,
+            )
+            .await
+    }
+
+    /// Load an error group, scoped to the project that asked for it.
+    ///
+    /// Every autofixer path that reads an error group goes through here. A
+    /// group belonging to another project is reported exactly like one that
+    /// does not exist ([`AgentError::InvalidErrorGroup`]): without this
+    /// check a caller with ProjectsWrite on project A could name project B's
+    /// `error_group_id` and read B's error type, message and stack trace
+    /// back out of the analysis the AI writes into A's run. Error group ids
+    /// are sequential, so that is an enumeration, not a lucky guess.
+    pub async fn load_project_error_group(
+        &self,
+        project_id: i32,
+        error_group_id: i32,
+    ) -> Result<error_groups::Model, AgentError> {
+        let group = error_groups::Entity::find_by_id(error_group_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(AgentError::Database)?
+            .ok_or(AgentError::InvalidErrorGroup {
+                error_group_id,
+                project_id,
+            })?;
+
+        if group.project_id != project_id {
+            return Err(AgentError::InvalidErrorGroup {
+                error_group_id,
+                project_id,
+            });
+        }
+
+        Ok(group)
+    }
+
     /// Create a run record, clone the repo, run Claude in analysis-only mode, and
     /// store the root cause analysis.  Returns the newly created run ID immediately
     /// (the caller should spawn this in a background task after creating the record).
@@ -1033,15 +1099,14 @@ impl AutofixerService {
         let error_group_id = run.trigger_source_id.unwrap_or(0);
         let branch_name = format!("fix/autofixer-err-{}-{:x}", error_group_id, run_id);
 
-        // Build PR metadata — use error group title for the PR title
+        // Build PR metadata — the error group title becomes the PR title and
+        // the commit message, so it is read through the same project-scoped
+        // guard as the analysis prompt rather than by id alone.
         let error_group_title = if let Some(group_id) = run.trigger_source_id {
-            error_groups::Entity::find_by_id(group_id)
-                .one(self.db.as_ref())
+            self.load_project_error_group(run.project_id, group_id)
                 .await
-                .ok()
-                .flatten()
                 .map(|g| g.title)
-                .unwrap_or_else(|| "error fix".to_string())
+                .unwrap_or_else(|_| "error fix".to_string())
         } else {
             "error fix".to_string()
         };
@@ -1515,19 +1580,11 @@ impl AutofixerService {
             ),
         })?;
 
-        let group = error_groups::Entity::find_by_id(group_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(AgentError::Database)?
-            .ok_or(AgentError::Validation {
-                message: format!(
-                    "Error group {} not found for project {}",
-                    group_id, project_id
-                ),
-            })?;
+        let group = self.load_project_error_group(project_id, group_id).await?;
 
         let latest_event = error_events::Entity::find()
             .filter(error_events::Column::ErrorGroupId.eq(group_id))
+            .filter(error_events::Column::ProjectId.eq(project_id))
             .order_by(error_events::Column::Timestamp, Order::Desc)
             .one(self.db.as_ref())
             .await
@@ -2335,5 +2392,105 @@ mod tests {
             runs[0].analysis.as_deref(),
             Some("Root cause: null pointer in handler.rs line 42")
         );
+    }
+
+    // ---- Error group project scoping ----
+
+    /// An error group owned by `project_id`, shaped like the rows the
+    /// analysis prompt reads.
+    fn make_error_group(id: i32, project_id: i32) -> error_groups::Model {
+        error_groups::Model {
+            id,
+            title: "Cannot read property 'map' of undefined".to_string(),
+            error_type: "TypeError".to_string(),
+            message_template: None,
+            embedding: None,
+            first_seen: Utc::now(),
+            last_seen: Utc::now(),
+            total_count: 47,
+            status: "unresolved".to_string(),
+            assigned_to: None,
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            visitor_id: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// Starting an analysis for a group another project owns is rejected, and
+    /// no run row is inserted. The mock holds exactly one queued result (the
+    /// group lookup), so an insert running first would have consumed that row
+    /// and surfaced as a `Database` error instead of this one — the assertion
+    /// pins the order, not just the outcome.
+    #[tokio::test]
+    async fn analysis_rejects_an_error_group_from_another_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_error_group(42, 99)]])
+            .into_connection();
+        let (autofixer, _run_service) = make_autofixer(db);
+
+        let result = autofixer
+            .start_analysis_run(10, 42, None, None, None, Some(7))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AgentError::InvalidErrorGroup {
+                    error_group_id: 42,
+                    project_id: 10
+                })
+            ),
+            "a group owned by project 99 must not start a run in project 10"
+        );
+    }
+
+    /// The rejection never reveals that the group exists somewhere else: an
+    /// id that resolves to no row at all produces the identical message.
+    #[tokio::test]
+    async fn a_foreign_error_group_reads_exactly_like_a_missing_one() {
+        let missing_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<error_groups::Model>::new()])
+            .into_connection();
+        let (missing_svc, _) = make_autofixer(missing_db);
+        let foreign_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_error_group(42, 99)]])
+            .into_connection();
+        let (foreign_svc, _) = make_autofixer(foreign_db);
+
+        let missing = match missing_svc.load_project_error_group(10, 42).await {
+            Err(e) => e.to_string(),
+            Ok(group) => panic!("group {} must not resolve in project 10", group.id),
+        };
+        let foreign = match foreign_svc.load_project_error_group(10, 42).await {
+            Err(e) => e.to_string(),
+            Ok(group) => panic!("group {} must not resolve in project 10", group.id),
+        };
+
+        assert_eq!(missing, foreign);
+        assert_eq!(missing, "Error group 42 not found in project 10");
+    }
+
+    /// A group the project owns still starts a run: the guard rejects the
+    /// cross-project case only.
+    #[tokio::test]
+    async fn analysis_starts_for_an_error_group_in_the_same_project() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_error_group(42, 10)]])
+            .append_query_results(vec![vec![make_run(1, 10, "pending", Some("analyzing"))]])
+            .into_connection();
+        let (autofixer, _run_service) = make_autofixer(db);
+
+        let run = autofixer
+            .start_analysis_run(10, 42, None, None, None, Some(7))
+            .await
+            .unwrap();
+
+        assert_eq!(run.id, 1);
+        assert_eq!(run.project_id, 10);
+        assert_eq!(run.trigger_source_id, Some(42));
+        assert_eq!(run.phase.as_deref(), Some("analyzing"));
     }
 }
