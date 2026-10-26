@@ -4172,10 +4172,25 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
 /// appears to the tenant's own IP-based logic (rate limiting, geofencing,
 /// abuse detection). Extend this function, not a second call site, if a
 /// future CDN adds another raw client-IP header to the trust chain.
+///
+/// Tailnet identity (`Tailscale-*`, and Temps' own `x-temps-user-login`) is
+/// removed too (ADR 065 D3): only a worker's Serve socket ever passes it to
+/// an app, so an app that reads `Tailscale-User-Login` cannot be fed one
+/// through a public way in. Collecting the names allocates only when the
+/// request carries one.
 fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
     request.remove_header("forwarded");
     request.remove_header("x-real-ip");
     request.remove_header("cf-connecting-ip");
+    let identity: Vec<header::HeaderName> = request
+        .headers
+        .keys()
+        .filter(|name| temps_core::tailnet::is_identity_header(name.as_str()))
+        .cloned()
+        .collect();
+    for name in identity {
+        request.remove_header(&name);
+    }
 }
 
 /// Collapse every `Cookie` field on the request into a single field before it
@@ -10657,6 +10672,36 @@ mod forwarded_authority_tests {
 
         assert!(!request.headers.contains_key("x-real-ip"));
         assert!(!request.headers.contains_key("cf-connecting-ip"));
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+
+    /// ADR 065 D3: tailnet identity reaches an app only from a worker's Serve
+    /// socket. A client of the control-plane proxy cannot set it.
+    #[test]
+    fn removes_client_supplied_tailnet_identity_headers() {
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        for name in [
+            "tailscale-user-login",
+            "Tailscale-User-Name",
+            "tailscale-user-profile-pic",
+            "tailscale-funnel-request",
+            "x-temps-user-login",
+        ] {
+            request
+                .append_header(name, HeaderValue::from_static("alice@example.com"))
+                .expect("identity test header must be valid");
+        }
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(&mut request);
+
+        assert_eq!(request.headers.len(), 1, "{:?}", request.headers);
         assert_eq!(
             request.headers.get("x-unrelated"),
             Some(&HeaderValue::from_static("preserved"))

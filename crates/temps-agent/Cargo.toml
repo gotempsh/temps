@@ -45,6 +45,7 @@ chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
 temps-metrics = { path = "../temps-metrics" }
 ipnet = "2.10"
+hickory-resolver = "0.26"
 parking_lot = "0.12"
 libc = { workspace = true }
 if-addrs = "0.15"

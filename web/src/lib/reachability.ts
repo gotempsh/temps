@@ -15,6 +15,7 @@ import type {
   RunState,
   RunView,
   SetupField,
+  TailnetPrincipal,
 } from '@/api/client'
 
 export type ReachabilityHeadline =
@@ -114,6 +115,7 @@ export const AUDIENCE_LABELS: Record<AddressReachability['audience'], string> =
     public: 'Anyone',
     private: 'My network',
     signed_in: 'Signed-in people',
+    tailnet_users: 'Listed tailnet users',
     unsupported: 'Set by a newer Temps',
   }
 
@@ -158,6 +160,10 @@ export function conflictSubject(entry: JournalEntry): string {
       return `The ${intent.record_type} record for ${intent.hostname}`
     case 'connector':
       return `Tunnel ${intent.name}`
+    case 'tailscale_serve':
+      return `${intent.hostname} on ${intent.node_name}`
+    case 'tailscale_service':
+      return `Tailscale Service \`${intent.name}\``
     default:
       return 'This step'
   }
@@ -170,7 +176,8 @@ export interface ConflictChoice {
 
 /**
  * The answers to one conflict. Undo never deletes a DNS record this run did
- * not write, so a created record someone changed can only be left.
+ * not write, so a created record someone changed can only be left; nor a
+ * Serve handler on a worker.
  */
 export function conflictChoices(
   entry: JournalEntry,
@@ -188,6 +195,16 @@ export function conflictChoices(
       { decision: 'overwrite', label: 'Remove it anyway' },
     ]
   if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]
+  // ADR 065 D4: Temps never removes Serve configuration it did not write.
+  if (type === 'tailscale_serve')
+    return [{ decision: 'keep', label: 'Leave the worker as it is' }]
+  // ADR 065 D4: a Service is deleted only when a person confirms what undo
+  // showed; deleting it needs a recent password or passkey confirmation.
+  if (type === 'tailscale_service')
+    return [
+      { decision: 'keep', label: 'Keep it' },
+      { decision: 'overwrite', label: 'Delete it' },
+    ]
   return [
     { decision: 'keep', label: 'Keep their value' },
     { decision: 'overwrite', label: 'Restore what was there before' },
@@ -212,6 +229,48 @@ export function resumeNeedsToken(run: RunView): boolean {
       s.status !== 'skipped'
   )
 }
+
+/**
+ * Whether resuming needs the Tailscale OAuth client again (ADR 065 D2): the
+ * run had not saved it, and it is never stored before that.
+ */
+export function resumeNeedsTailscaleCredential(run: RunView): boolean {
+  return run.steps.some(
+    (s) =>
+      s.kind === 'save_tailscale_credential' &&
+      s.status !== 'done' &&
+      s.status !== 'skipped'
+  )
+}
+
+/** What resuming asks for a Tailscale OAuth client, keyed as the server reads it. */
+export const TAILSCALE_RESUME_FIELDS: ReadonlyArray<{
+  key: string
+  label: string
+  secret: boolean
+  required: boolean
+  placeholder?: string
+}> = [
+  {
+    key: 'tailscale_client_id',
+    label: 'Tailscale OAuth client ID',
+    secret: false,
+    required: true,
+  },
+  {
+    key: 'tailscale_client_secret',
+    label: 'Tailscale OAuth client secret',
+    secret: true,
+    required: true,
+  },
+  {
+    key: 'tailscale_tailnet',
+    label: 'Tailnet',
+    secret: false,
+    required: false,
+    placeholder: "- (the OAuth client's own tailnet)",
+  },
+]
 
 /**
  * The new plan a refused apply carries (409, ADR 064 D4): the cluster
@@ -325,4 +384,66 @@ export function certificateChoices({
         ? 'Temps does not see a public listener on port 80. HTTP-01 works only if port 80 reaches this server, for example through port forwarding; otherwise use DNS-01 or a tunnel.'
         : null,
   }
+}
+
+/** The most entries one address may list, as the server bounds it. */
+export const MAX_PRINCIPALS = 64
+
+/**
+ * Who a `tailnet_users` address admits, from what the user typed: entries
+ * separated by commas, spaces or new lines; `tag:<name>` is a tag and
+ * `<user>@<domain>` a login (ADR 065 D6). Values are ASCII-lower-cased,
+ * sorted and deduplicated the way the server stores them; anything that is
+ * neither is returned in `invalid` rather than guessed at. The server
+ * checks the list again.
+ */
+export function parsePrincipals(text: string): {
+  principals: TailnetPrincipal[]
+  invalid: string[]
+} {
+  const seen = new Set<string>()
+  const principals: TailnetPrincipal[] = []
+  const invalid: string[] = []
+  for (const entry of text.split(/[\s,]+/)) {
+    if (!entry) continue
+    const value = entry.replace(/[A-Z]/g, (c) => c.toLowerCase())
+    const principal = principalOf(value)
+    if (!principal) {
+      invalid.push(entry)
+      continue
+    }
+    const key = `${principal.kind}:${principal.value}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    principals.push(principal)
+  }
+  principals.sort((a, b) =>
+    a.kind === b.kind
+      ? a.value < b.value
+        ? -1
+        : a.value > b.value
+          ? 1
+          : 0
+      : a.kind === 'login'
+        ? -1
+        : 1
+  )
+  return { principals, invalid }
+}
+
+function principalOf(value: string): TailnetPrincipal | null {
+  if (value.startsWith('tag:')) {
+    const name = value.slice(4)
+    return name.length <= 64 && /^[a-z0-9][a-z0-9-]*$/.test(name)
+      ? { kind: 'tag', value }
+      : null
+  }
+  const at = value.indexOf('@')
+  const ok =
+    value.length <= 320 &&
+    at > 0 &&
+    at < value.length - 1 &&
+    // eslint-disable-next-line no-control-regex
+    !/[\u0000-\u001f\u007f]/.test(value)
+  return ok ? { kind: 'login', value } : null
 }

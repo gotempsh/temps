@@ -66,6 +66,42 @@ struct SnapshotPublicIngress {
     listen: Option<crate::route_store::PublicListen>,
     #[serde(default)]
     private_routes: Vec<SnapshotPrivateRoute>,
+    #[serde(default)]
+    serve_entries: Vec<SnapshotServeEntry>,
+    /// ADR 065 D6: `tailnet_users` private addresses, sent only because
+    /// this agent declared it checks identity.
+    #[serde(default)]
+    identity_private_routes: Vec<SnapshotPrivateRoute>,
+    /// ADR 065 D6: the routes of `tailnet_users` Serve entries.
+    #[serde(default)]
+    identity_serve_routes: Vec<SnapshotIdentityServeRoute>,
+}
+
+/// Where a `tailnet_users` Serve socket sends requests (ADR 065 D6).
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotIdentityServeRoute {
+    address_id: String,
+    route: SnapshotRoute,
+    principals: Vec<temps_core::tailnet::TailnetPrincipal>,
+}
+
+/// A Serve entry for this worker (ADR 065 D4).
+#[derive(Debug, Clone, Deserialize)]
+struct SnapshotServeEntry {
+    entry_id: i32,
+    address_id: String,
+    hostname: String,
+    via: String,
+    #[serde(default)]
+    service: Option<String>,
+    #[serde(default)]
+    removing: bool,
+    #[serde(default)]
+    applied_etag: Option<String>,
+    #[serde(default)]
+    route: Option<SnapshotRoute>,
+    #[serde(default)]
+    addrs: Vec<String>,
 }
 
 /// A private address for the private listener (ADR 064 D5).
@@ -76,6 +112,9 @@ struct SnapshotPrivateRoute {
     address_id: String,
     range: String,
     listener: String,
+    /// ADR 065 D6: who the listener admits, for `tailnet_users`.
+    #[serde(default)]
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -288,6 +327,12 @@ impl RouteSyncClient {
             .http
             .get(&url)
             .bearer_auth(&self.node_token)
+            // ADR 065 D6: what this binary enforces, on every request, so a
+            // rollback stops `tailnet_users` routes at the next snapshot.
+            .header(
+                temps_core::tailnet::AGENT_CAPABILITIES_HEADER,
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+            )
             .send()
             .await
             .map_err(|e| format!("GET {url}: {e}"))?;
@@ -340,11 +385,39 @@ impl RouteSyncClient {
                 .public_ingress
                 .private_routes
                 .into_iter()
-                .map(|private| crate::route_store::PrivateRouteEntry {
-                    route: snapshot_route_into_entry(private.route),
-                    address_id: private.address_id,
-                    range: private.range,
-                    listener: private.listener,
+                .map(snapshot_private_into_entry)
+                .collect(),
+            identity_private_routes: body
+                .public_ingress
+                .identity_private_routes
+                .into_iter()
+                .map(snapshot_private_into_entry)
+                .collect(),
+            identity_serve_routes: body
+                .public_ingress
+                .identity_serve_routes
+                .into_iter()
+                .map(|identity| crate::route_store::IdentityServeRoute {
+                    address_id: identity.address_id,
+                    route: snapshot_route_into_entry(identity.route),
+                    principals: identity.principals,
+                })
+                .collect(),
+            serve_entries: body
+                .public_ingress
+                .serve_entries
+                .into_iter()
+                .map(|entry| crate::route_store::ServeEntry {
+                    entry_id: entry.entry_id,
+                    address_id: entry.address_id,
+                    hostname: entry.hostname,
+                    via: entry.via,
+                    service: entry.service,
+                    removing: entry.removing,
+                    applied_etag: entry.applied_etag,
+                    route: entry.route.map(snapshot_route_into_entry),
+                    addrs: entry.addrs,
+                    principals: None,
                 })
                 .collect(),
         };
@@ -416,6 +489,18 @@ impl RouteSyncClient {
 
 /// `last_acked` before this process has had any ACK accepted.
 const NOTHING_ACKED: u64 = u64::MAX;
+
+fn snapshot_private_into_entry(
+    private: SnapshotPrivateRoute,
+) -> crate::route_store::PrivateRouteEntry {
+    crate::route_store::PrivateRouteEntry {
+        route: snapshot_route_into_entry(private.route),
+        address_id: private.address_id,
+        range: private.range,
+        listener: private.listener,
+        principals: private.principals,
+    }
+}
 
 fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
     RouteEntry {
@@ -542,6 +627,9 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         }
     }
 
@@ -664,6 +752,9 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
 
         crate::public_ingress::update_snapshot_health(&store);
@@ -749,6 +840,111 @@ mod tests {
         assert_eq!(
             *acked_generations.lock().expect("ack fixture lock"),
             vec![Some(8), Some(8)]
+        );
+        server_shutdown.notify_waiters();
+    }
+
+    /// ADR 065 D6: every snapshot request names what this binary enforces,
+    /// and the `tailnet_users` routes sent back in their own fields are
+    /// served with their lists.
+    #[tokio::test]
+    async fn the_snapshot_request_declares_identity_checks_and_keeps_lists() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind route-sync control-plane fixture");
+        let address = listener.local_addr().expect("read fixture address");
+        let route = |host: &str| serde_json::json!({"host": host, "backends": [{"address": "10.0.0.2:8080"}]});
+        let body = serde_json::json!({
+            "generation": 3,
+            "routes": [],
+            "public_ingress": {
+                "enabled": true,
+                "routes": [],
+                "unsupported_route_count": 0,
+                "unsupported_reasons": [],
+                "identity_private_routes": [{
+                    "host": "users.example.test",
+                    "backends": [{"address": "10.0.0.2:8080"}],
+                    "address_id": "custom:1",
+                    "range": "100.64.0.0/10",
+                    "listener": "100.64.0.3",
+                    "principals": [{"kind": "login", "value": "alice@example.com"}]
+                }],
+                "serve_entries": [{
+                    "entry_id": 1,
+                    "address_id": "custom:2",
+                    "hostname": "users.example.ts.net",
+                    "via": "tailscale_serve"
+                }],
+                "identity_serve_routes": [{
+                    "address_id": "custom:2",
+                    "route": route("users.example.ts.net"),
+                    "principals": [{"kind": "tag", "value": "tag:ci"}]
+                }]
+            }
+        });
+        let app = {
+            let seen = Arc::clone(&seen);
+            axum::Router::new()
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/snapshot",
+                    axum::routing::get(move |headers: axum::http::HeaderMap| {
+                        let seen = Arc::clone(&seen);
+                        let body = body.clone();
+                        async move {
+                            seen.lock().expect("fixture lock").push(
+                                headers
+                                    .get(temps_core::tailnet::AGENT_CAPABILITIES_HEADER)
+                                    .and_then(|v| v.to_str().ok())
+                                    .map(str::to_string),
+                            );
+                            axum::Json(body)
+                        }
+                    }),
+                )
+                .route(
+                    "/api/internal/nodes/{node_id}/routes/ack",
+                    axum::routing::post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+                )
+        };
+        let server_shutdown = Arc::new(Notify::new());
+        let task_shutdown = Arc::clone(&server_shutdown);
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move { task_shutdown.notified().await })
+                .await
+                .expect("serve route-sync fixture");
+        });
+        let snapshot_dir = TempDir::new().expect("create route snapshot directory");
+        let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+        let client = RouteSyncClient::new(
+            format!("http://{address}"),
+            7,
+            "test-token".to_string(),
+            Arc::clone(&store),
+            Arc::new(Notify::new()),
+        )
+        .expect("create route sync client");
+
+        let _ = client.tick_once().await;
+        assert_eq!(
+            *seen.lock().expect("fixture lock"),
+            vec![Some(
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY.to_string()
+            )]
+        );
+        let private = store.lookup_private("users.example.test").expect("served");
+        assert_eq!(
+            private.principals.as_deref().map(|p| p.len()),
+            Some(1),
+            "{private:?}"
+        );
+        let socket = store.lookup_serve("custom:2").expect("served");
+        assert!(socket.route.is_some());
+        assert_eq!(
+            socket.principals.as_deref().map(|p| p[0].value.as_str()),
+            Some("tag:ci")
         );
         server_shutdown.notify_waiters();
     }

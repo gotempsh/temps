@@ -25,6 +25,19 @@
 //! turn private mode on itself; without such a worker the plan names the
 //! command and the worker to run it on.
 //!
+//! A worker whose owner also allowed Tailscale Serve (ADR 065 D1) offers
+//! `tailscale_serve` instead: the worker's own tailnet name, served by
+//! tailscaled, with no DNS record and no ACME. It and the listener are
+//! exclusive on one worker, refused both ways.
+//!
+//! Any other name under the worker's tailnet is a Tailscale Service
+//! (`tailscale_service`): the app's own name, which needs the cluster's
+//! Tailscale OAuth client (`tailscale_service_with_credential` pastes one)
+//! and a tagged worker. With nothing asked for, the plan suggests, in
+//! ADR 065 D1's order: a Service when a usable credential exists, the
+//! machine's name, an address under a zone for the listener, then a Service
+//! after pasting a credential.
+//!
 //! "Would publish" is ADR 058 D9's effective publication state
 //! ([`PublicationIntent`]), not whether a tunnel's domain covers the
 //! hostname: a hostname choice wins over automatic selection, and a tunnel
@@ -39,17 +52,22 @@
 use std::collections::{HashMap, HashSet};
 
 use sha2::{Digest, Sha256};
+use temps_core::tailnet::{messages as tailnet_messages, TailscaleReport};
 use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
 
 use temps_auth::permissions::Permission;
 
-use super::compute::{is_local_only, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND};
+use super::compute::{
+    is_local_only, tailnet_worker_problem, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
+    TAILNET_REPORT_STALE_MINUTES,
+};
 use super::model::{
     ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
     PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
 };
 use crate::registry::{FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
+use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 
 /// Field keys of the apply request.
 pub const FIELD_ADDRESS: &str = "address";
@@ -78,6 +96,50 @@ pub struct PrivateWorkerFact {
     pub tailscale: bool,
     /// Why the listener is not running, as the worker reported it.
     pub error: Option<String>,
+}
+
+/// A worker's tailscaled as its agent last reported it (ADR 065 D2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailnetWorkerFact {
+    pub id: i32,
+    pub name: String,
+    pub report: TailscaleReport,
+    /// How old the report is.
+    pub minutes_ago: i64,
+    /// Its phase 2 private listener, when that is bound on its Tailscale
+    /// address: Serve on 443 there would take its traffic.
+    pub listener_on_tailscale: Option<std::net::IpAddr>,
+}
+
+/// A Serve entry the control plane declared for a worker (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeEntryFact {
+    pub node_id: i32,
+    pub hostname: String,
+    /// `tailscale_serve` or `tailscale_service`.
+    pub via: String,
+    pub service: Option<String>,
+    pub removing: bool,
+}
+
+/// The cluster's Tailscale OAuth client (ADR 065 D2), as planning found it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailscaleCredentialFact {
+    pub id: i32,
+    pub name: String,
+    /// Why a run cannot use it (a scope missing or unproven), when it
+    /// cannot: the Service way in is then unavailable.
+    pub refusal: Option<String>,
+}
+
+/// What the Tailscale API holds at the Service name a plan is for, read
+/// when planning (ADR 065 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServiceSeen {
+    Absent,
+    Found(ServiceDefinition),
+    /// The read failed: nothing is offered on a guess.
+    Unreadable(String),
 }
 
 impl PrivateWorkerFact {
@@ -137,6 +199,25 @@ pub struct PlanFacts {
     pub suggested_private_worker: Option<String>,
     /// The environment's private addresses and the range each is bound to.
     pub private_ranges: Vec<(String, Option<String>)>,
+    /// Workers that report their tailscaled (ADR 065 D2).
+    pub tailnet_workers: Vec<TailnetWorkerFact>,
+    /// The Serve entries declared on those workers.
+    pub serve_entries: Vec<ServeEntryFact>,
+    /// The cluster's Tailscale OAuth client, when it has one (ADR 065 D2).
+    pub tailscale_credential: Option<TailscaleCredentialFact>,
+    /// The Service name the plan is for (`svc:myapp`) and what the API
+    /// holds there, read once the address is known.
+    pub service_seen: Option<(String, ServiceSeen)>,
+    /// ADR 031's install id: a Service whose marker carries it is Temps'.
+    pub install_id: String,
+    /// For `tailnet_users`: who the address is to admit, normalized (ADR
+    /// 065 D6).
+    pub principals: Vec<temps_core::tailnet::TailnetPrincipal>,
+    /// Who the requested address admits now, when it is `tailnet_users`.
+    pub principals_now: Vec<temps_core::tailnet::TailnetPrincipal>,
+    /// Workers whose agent reports `tailnet_identity.v1`: the only ones a
+    /// `tailnet_users` address is sent to.
+    pub identity_workers: Vec<String>,
 }
 
 /// The worker a private plan serves through: the first whose private
@@ -164,7 +245,7 @@ pub fn records_to_read(facts: &PlanFacts, address: &str) -> Vec<(String, String)
         return Vec::new();
     }
     let mut out: Vec<(String, String)> = Vec::new();
-    if facts.audience == Audience::Private {
+    if facts.audience.is_private() {
         if let Some((_, ip)) = private_worker(facts) {
             out.push((address.to_string(), record_type_of(ip).to_string()));
         }
@@ -209,6 +290,16 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
     }
 }
 
+/// The address the plan for `facts.audience` is for: what the stored plan
+/// records and the fingerprint covers.
+pub fn address_for_audience(facts: &PlanFacts) -> Result<Option<String>, String> {
+    if facts.audience.is_private() {
+        planned_private_address(facts)
+    } else {
+        planned_address(facts)
+    }
+}
+
 /// A hash of everything a plan for `address` depends on (ADR 064 D4).
 pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let mut tunnels = facts.tunnels.clone();
@@ -248,16 +339,71 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     private_workers.sort();
     let mut ranges = facts.private_ranges.clone();
     ranges.sort();
+    // ADR 065 D4: the Tailscale facts as last reported, without the inside
+    // checks and entry outcomes, which change on every pass.
+    let mut tailnet: Vec<_> = facts
+        .tailnet_workers
+        .iter()
+        .map(|w| {
+            let r = &w.report;
+            // Tuples over twelve fields have no `Debug`: two halves.
+            (
+                (
+                    w.id,
+                    r.consent,
+                    r.root,
+                    r.state,
+                    r.version.clone(),
+                    r.backend_state.clone(),
+                    r.tags.clone(),
+                ),
+                (
+                    r.magic_dns,
+                    r.https(),
+                    r.dns_name.clone(),
+                    r.port_443_held_by.clone(),
+                    r.port_443_funnel,
+                    w.minutes_ago > TAILNET_REPORT_STALE_MINUTES,
+                    w.listener_on_tailscale,
+                ),
+            )
+        })
+        .collect();
+    tailnet.sort_by_key(|t| t.0 .0);
+    let mut entries: Vec<_> = facts
+        .serve_entries
+        .iter()
+        .map(|e| (e.node_id, &e.hostname, &e.via, &e.service, e.removing))
+        .collect();
+    entries.sort();
+    // ADR 065 D4: the credential, and the Service as read when planning.
+    let credential = facts
+        .tailscale_credential
+        .as_ref()
+        .map(|c| (c.id, c.refusal.is_some()));
+    let seen = &facts.service_seen;
     let canonical = format!(
-        "v3|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
+        "v5|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
          {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
-         {ranges:?}",
+         {ranges:?}|{tailnet:?}|{entries:?}|{credential:?}|{seen:?}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
     );
+    // ADR 065 D6: who it admits, asked for and now, and which agents can
+    // check it. Only for `tailnet_users`, so other plans hash as before.
+    let canonical = if facts.audience == Audience::TailnetUsers {
+        let mut identity = facts.identity_workers.clone();
+        identity.sort();
+        format!(
+            "{canonical}|{:?}|{:?}|{identity:?}",
+            facts.principals, facts.principals_now
+        )
+    } else {
+        canonical
+    };
     hex::encode(Sha256::digest(canonical.as_bytes()))
 }
 
@@ -508,6 +654,14 @@ pub fn permissions_for(kind: PlanOptionKind) -> Vec<Permission> {
         PlanOptionKind::PrivateWorker => {
             vec![Permission::DnsProvidersWrite, Permission::DomainsCreate]
         }
+        // No DNS record, no certificate: the address row only.
+        PlanOptionKind::TailscaleServe | PlanOptionKind::TailscaleService => {
+            vec![Permission::DomainsCreate]
+        }
+        // Saving the OAuth client is a cluster-wide setting.
+        PlanOptionKind::TailscaleServiceWithCredential => {
+            vec![Permission::SettingsWrite, Permission::DomainsCreate]
+        }
     }
 }
 
@@ -616,6 +770,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         address_error,
         options: Vec::new(),
         blocked: Some(blocked),
+        principals: Vec::new(),
     };
 
     if let Some(blocked) = facts
@@ -628,6 +783,9 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     }
     if facts.audience == Audience::Private {
         return plan_private(facts);
+    }
+    if facts.audience == Audience::TailnetUsers {
+        return plan_tailnet_users(facts);
     }
     if facts.audience != Audience::Public {
         return empty(
@@ -1102,6 +1260,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         address_error: None,
         options,
         blocked,
+        principals: Vec::new(),
     }
 }
 
@@ -1152,10 +1311,13 @@ pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
     ))
 }
 
-/// The plan for a private address (ADR 064 D5): one worker's private
-/// listener, DNS in a zone Temps manages, a DNS-01 certificate.
-fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
-    let blocked_plan = |address: Option<String>, address_error, blocked| ReachabilityPlan {
+/// A private plan that offers nothing, and why.
+fn private_blocked(
+    address: Option<String>,
+    address_error: Option<String>,
+    blocked: PlanBlocked,
+) -> ReachabilityPlan {
+    ReachabilityPlan {
         plan_id: None,
         fingerprint: None,
         expires_at: None,
@@ -1164,35 +1326,721 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
         address_error,
         options: Vec::new(),
         blocked: Some(blocked),
-    };
-    let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
+        principals: Vec::new(),
+    }
+}
+
+/// What a private address is as a tailnet name (ADR 065 D1).
+enum TailnetName<'a> {
+    /// A worker's own name.
+    Machine(&'a TailnetWorkerFact),
+    /// Under a tailnet, and no machine's name: only a Service gives it.
+    UnderTailnet,
+    Other,
+}
+
+fn tailnet_name<'a>(facts: &'a PlanFacts, host: &str) -> TailnetName<'a> {
+    let host = temps_core::tailnet::normalize_name(host);
+    if let Some(worker) = facts
+        .tailnet_workers
+        .iter()
+        .find(|w| w.report.dns_name.as_deref() == Some(host.as_str()))
+    {
+        return TailnetName::Machine(worker);
+    }
+    let under = |suffix: &str| host.ends_with(&format!(".{suffix}"));
+    if under("ts.net")
+        || facts
+            .tailnet_workers
+            .iter()
+            .filter_map(|w| w.report.tailnet.as_deref())
+            .any(under)
+    {
+        TailnetName::UnderTailnet
+    } else {
+        TailnetName::Other
+    }
+}
+
+/// Workers whose owner allowed Tailscale Serve, the one the environment
+/// runs on first.
+fn serve_candidates(facts: &PlanFacts) -> Vec<&TailnetWorkerFact> {
+    let mut workers: Vec<&TailnetWorkerFact> = facts
+        .tailnet_workers
+        .iter()
+        .filter(|w| w.report.consent)
+        .collect();
+    workers.sort_by_key(|w| Some(&w.name) != facts.suggested_private_worker.as_ref());
+    workers
+}
+
+/// Why `worker` cannot serve its machine name for this app now, with what
+/// fixes it (ADR 065 D5's messages), in the order the agent decides them.
+pub fn machine_name_problem(
+    facts: &PlanFacts,
+    worker: &TailnetWorkerFact,
+) -> Option<(String, Option<ReachAction>)> {
+    let node = worker.name.as_str();
+    let report = &worker.report;
+    if let Some(problem) = tailnet_worker_problem(node, report, worker.minutes_ago) {
+        return Some(problem);
+    }
+    let name = report.dns_name.clone().unwrap_or_default();
+    let problem = |message: String| Some((message, None));
+    if let Some(listener) = worker.listener_on_tailscale {
+        return problem(format!(
+            "{}.",
+            tailnet_messages::listener_exclusive(node, &listener.to_string())
+        ));
+    }
+    if let Some(held_by) = &report.port_443_held_by {
+        return problem(tailnet_messages::slot_taken(&name, held_by));
+    }
+    if report.port_443_funnel {
+        return problem(tailnet_messages::funnel(node));
+    }
+    if facts
+        .serve_entries
+        .iter()
+        .any(|e| e.node_id == worker.id && e.hostname == name && e.removing)
+    {
+        return problem(format!(
+            "An earlier setup of `{name}` is still being taken off {node}'s Serve config. Try \
+             again in a minute."
+        ));
+    }
+    None
+}
+
+/// Why `worker` cannot host a Tailscale Service now (ADR 065 D5): what
+/// keeps tailscaled from serving at all, then a device with no tag.
+pub fn service_host_problem(worker: &TailnetWorkerFact) -> Option<(String, Option<ReachAction>)> {
+    let node = worker.name.as_str();
+    let report = &worker.report;
+    if let Some(problem) = tailnet_worker_problem(node, report, worker.minutes_ago) {
+        return Some(problem);
+    }
+    if report.tags.is_empty() {
+        let machine = report.dns_name.clone().unwrap_or_default();
+        return Some((
+            tailnet_messages::not_tagged(
+                node,
+                report.login.as_deref().unwrap_or("a user"),
+                &machine,
+            ),
+            Some(
+                ReachAction::new(ActionKind::RunCommand, format!("On {node}, as root, run"))
+                    .with_command(format!(
+                        "sudo tailscale up --advertise-tags={}",
+                        tailscale::DEFAULT_TAG
+                    )),
+            ),
+        ));
+    }
+    None
+}
+
+/// The tag a Service on `worker` is for: `tag:temps` when the worker has
+/// it, else its first (ADR 065 D4).
+pub fn service_tag(worker: &TailnetWorkerFact) -> String {
+    let tags = &worker.report.tags;
+    tags.iter()
+        .find(|t| t.as_str() == tailscale::DEFAULT_TAG)
+        .or_else(|| tags.first())
+        .cloned()
+        .unwrap_or_else(|| tailscale::DEFAULT_TAG.to_string())
+}
+
+/// The Service `host` names, with its tailnet: one valid label directly
+/// under the MagicDNS suffix of a worker that reports one, and not a
+/// machine's name. `myapp.example.ts.net` → `(svc:myapp, example.ts.net)`.
+pub fn service_of(facts: &PlanFacts, host: &str) -> Option<(String, String)> {
+    let host = temps_core::tailnet::normalize_name(host);
+    if facts
+        .tailnet_workers
+        .iter()
+        .any(|w| w.report.dns_name.as_deref() == Some(host.as_str()))
+    {
+        return None;
+    }
+    facts
+        .tailnet_workers
+        .iter()
+        .filter_map(|w| w.report.tailnet.as_deref())
+        .find_map(|tailnet| {
+            let label = host.strip_suffix(&format!(".{tailnet}"))?;
+            temps_core::tailnet::valid_service_label(label)
+                .then(|| (tailscale::service_name(label), tailnet.to_string()))
+        })
+}
+
+/// The worker that hosts a Service on `tailnet`: one whose owner allowed
+/// Serve and that can host one now, the environment's first.
+pub fn service_worker<'a>(facts: &'a PlanFacts, tailnet: &str) -> Option<&'a TailnetWorkerFact> {
+    serve_candidates(facts)
+        .into_iter()
+        .filter(|w| w.report.tailnet.as_deref() == Some(tailnet))
+        .find(|w| service_host_problem(w).is_none())
+}
+
+/// The cluster's credential, when a run can use it.
+fn usable_credential(facts: &PlanFacts) -> Option<&TailscaleCredentialFact> {
+    facts
+        .tailscale_credential
+        .as_ref()
+        .filter(|c| c.refusal.is_none())
+}
+
+/// A Service address for this app on the first tailnet with a worker that
+/// can host one: `<project>-<environment>.<tailnet>` (ADR 065 D1).
+fn suggested_service_address(facts: &PlanFacts) -> Option<String> {
+    let label = suggested_label(facts);
+    if !temps_core::tailnet::valid_service_label(&label) {
+        return None;
+    }
+    serve_candidates(facts)
+        .into_iter()
+        .filter(|w| service_host_problem(w).is_none())
+        .filter_map(|w| w.report.tailnet.as_deref())
+        .map(|tailnet| format!("{label}.{tailnet}"))
+        .find(|c| !facts.taken_elsewhere.contains(c))
+}
+
+/// The address a private plan is for: as asked, else in ADR 065 D1's
+/// order a Service when the cluster has a usable Tailscale credential, the
+/// name of a worker that can serve it through Tailscale Serve, one under a
+/// zone Temps manages (which a listener needs for its record and its DNS-01
+/// certificate), and last a Service after pasting a credential.
+pub fn planned_private_address(facts: &PlanFacts) -> Result<Option<String>, String> {
+    if facts
+        .requested
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+    {
+        return planned_address(facts);
+    }
+    let free = |c: &String| !facts.taken_elsewhere.contains(c);
+    if usable_credential(facts).is_some() {
+        if let Some(address) = suggested_service_address(facts) {
+            return Ok(Some(address));
+        }
+    }
+    if let Some(name) = serve_candidates(facts)
+        .into_iter()
+        .filter(|w| machine_name_problem(facts, w).is_none())
+        .filter_map(|w| w.report.dns_name.clone())
+        .find(free)
+    {
+        return Ok(Some(name));
+    }
+    let label = suggested_label(facts);
+    if let Some(address) = facts
+        .zones
+        .iter()
+        .filter(|z| z.verified)
+        .map(|z| format!("{label}.{}", z.domain.trim_end_matches('.')))
+        .find(|c| free(c) && !facts.attached_here.contains(c))
+    {
+        return Ok(Some(address));
+    }
+    Ok(suggested_service_address(facts))
+}
+
+/// The plan for a private address: a worker's own tailnet name through
+/// Tailscale Serve (ADR 065 D1), or its private listener (ADR 064 D5).
+fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
     let ask_address = facts
         .requested
         .as_deref()
         .is_none_or(|r| r.trim().is_empty());
-    let address = match facts.requested.as_deref().map(str::trim) {
-        Some(r) if !r.is_empty() => match planned_address(facts) {
-            Ok(address) => address,
-            Err(error) => {
-                return blocked_plan(
-                    facts.requested.clone(),
-                    Some(error.clone()),
-                    block(error, None),
-                )
-            }
-        },
-        // A private address is suggested only under a zone Temps manages:
-        // it needs a DNS record and a DNS-01 certificate there.
-        _ => {
-            let label = suggested_label(facts);
-            facts
-                .zones
-                .iter()
-                .filter(|z| z.verified)
-                .map(|z| format!("{label}.{}", z.domain.trim_end_matches('.')))
-                .find(|c| !facts.taken_elsewhere.contains(c) && !facts.attached_here.contains(c))
+    let address = match planned_private_address(facts) {
+        Ok(address) => address,
+        Err(error) => {
+            return private_blocked(
+                facts.requested.clone(),
+                Some(error.clone()),
+                PlanBlocked {
+                    reason: error,
+                    action: None,
+                },
+            )
         }
     };
+    match address.as_deref().map(|a| tailnet_name(facts, a)) {
+        Some(TailnetName::Machine(worker)) => plan_machine_name(facts, worker, address.clone()),
+        Some(TailnetName::UnderTailnet)
+            if address
+                .as_deref()
+                .is_some_and(|a| service_of(facts, a).is_some()) =>
+        {
+            plan_service(facts, address.clone())
+        }
+        Some(TailnetName::UnderTailnet) => {
+            let reason = tailnet_messages::service_only(address.as_deref().unwrap_or_default());
+            private_blocked(
+                address,
+                None,
+                PlanBlocked {
+                    reason,
+                    action: None,
+                },
+            )
+        }
+        Some(TailnetName::Other) | None => {
+            let listener = plan_listener(facts, address, ask_address);
+            // Nothing asked for and no listener fits: a worker that allowed
+            // Serve says what keeps its name from working instead.
+            if listener.options.is_empty() && ask_address {
+                if let Some((reason, action)) = serve_candidates(facts)
+                    .first()
+                    .and_then(|w| machine_name_problem(facts, w))
+                {
+                    return private_blocked(listener.address, None, PlanBlocked { reason, action });
+                }
+            }
+            listener
+        }
+    }
+}
+
+/// The plan for `tailnet_users` (ADR 065 D6): a private plan, kept to the
+/// ways in that can tell who a visitor is, on agents that check it.
+fn plan_tailnet_users(facts: &PlanFacts) -> ReachabilityPlan {
+    let blocked = |address: Option<String>, reason: String, action: Option<ReachAction>| {
+        let mut plan = private_blocked(address, None, PlanBlocked { reason, action });
+        plan.audience = Audience::TailnetUsers;
+        plan.principals = facts.principals.clone();
+        plan
+    };
+    if facts.principals.is_empty() {
+        return blocked(
+            facts.requested.clone(),
+            tailnet_messages::NO_PRINCIPALS.to_string(),
+            None,
+        );
+    }
+    let mut planned = plan_private(facts);
+    planned.audience = Audience::TailnetUsers;
+    planned.principals = facts.principals.clone();
+    let who = AddressAudience {
+        audience: Audience::TailnetUsers,
+        principals: facts.principals.clone(),
+        ..AddressAudience::default()
+    }
+    .describe();
+    let listed = facts
+        .principals
+        .iter()
+        .map(|p| p.value.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let shown = planned
+        .address
+        .clone()
+        .unwrap_or_else(|| "the address".to_string());
+    let mut refusals: Vec<(String, Option<ReachAction>)> = Vec::new();
+    planned.options.retain_mut(|option| {
+        let node = option
+            .way_in
+            .strip_prefix("private:")
+            .unwrap_or_default()
+            .to_string();
+        if option.kind == PlanOptionKind::PrivateWorker {
+            let Some((worker, ip)) = private_worker(facts) else {
+                return false;
+            };
+            // D6: whois answers only for Tailscale peers, and asking it
+            // needs the worker owner's consent.
+            if !worker.tailscale {
+                refusals.push((tailnet_messages::users_need_tailnet(&ip.to_string()), None));
+                return false;
+            }
+            let consent = facts
+                .tailnet_workers
+                .iter()
+                .any(|w| w.id == worker.id && w.report.consent);
+            if !consent {
+                refusals.push((
+                    tailnet_messages::users_need_consent(&worker.name),
+                    Some(
+                        ReachAction::new(
+                            ActionKind::RunCommand,
+                            format!("On {}, as root, run", worker.name),
+                        )
+                        .with_command(temps_core::tailnet::TAILSCALE_SERVE_COMMAND),
+                    ),
+                ));
+                return false;
+            }
+        }
+        if !facts.identity_workers.contains(&node) {
+            refusals.push((
+                format!(
+                    "{shown} admits only listed tailnet users, and the agent on `{node}` cannot \
+                     check who they are. Update the agent on `{node}`, then plan again."
+                ),
+                None,
+            ));
+            return false;
+        }
+        for step in &mut option.steps {
+            if step.kind == StepKind::SetAudience {
+                step.label = format!("Make {shown} private to your tailnet, {who}");
+            }
+        }
+        option.warnings.insert(
+            0,
+            format!(
+                "Only {listed} can open {shown}. Anyone else on your tailnet gets a page that \
+                 says it admits only listed tailnet users. Changing who is listed needs a \
+                 recent password or passkey confirmation."
+            ),
+        );
+        true
+    });
+    for (index, option) in planned.options.iter_mut().enumerate() {
+        option.recommended = index == 0;
+    }
+    if planned.options.is_empty() && planned.blocked.is_none() {
+        let (reason, action) = refusals.into_iter().next().unwrap_or_else(|| {
+            (
+                "No way in that can tell who a tailnet visitor is is available.".to_string(),
+                None,
+            )
+        });
+        return blocked(planned.address.clone(), reason, action);
+    }
+    planned
+}
+
+/// The plan for a worker's own tailnet name (ADR 065 D1 option 3):
+/// tailscaled serves it and gets its certificate, so nothing is written to
+/// DNS or `domains`.
+fn plan_machine_name(
+    facts: &PlanFacts,
+    worker: &TailnetWorkerFact,
+    address: Option<String>,
+) -> ReachabilityPlan {
+    let blocked = |reason: String, action: Option<ReachAction>| {
+        private_blocked(address.clone(), None, PlanBlocked { reason, action })
+    };
+    if facts.deployed && !facts.served_by_workers {
+        return blocked(
+            format!(
+                "{} runs on the control plane, and a tailnet name is served by a worker, which \
+                 only carries what workers serve. Deploy it to a worker first.",
+                facts.environment_name
+            ),
+            None,
+        );
+    }
+    if let Some((reason, action)) = machine_name_problem(facts, worker) {
+        return blocked(reason, action);
+    }
+    let node = worker.name.as_str();
+    let name = address.clone().unwrap_or_default();
+    let attached = facts.attached_here.contains(&name);
+    let mut warnings = vec![
+        tailnet_messages::machine_name_cost(&name, node),
+        format!(
+            "Tailscale's certificate for `{name}` is in public certificate logs, so the name is \
+             no longer secret. Only devices on your tailnet can connect to it."
+        ),
+    ];
+    if attached
+        && facts
+            .audiences
+            .iter()
+            .any(|(a, au)| a == &name && *au == Audience::Public)
+    {
+        warnings.push(format!(
+            "{name} is public now. This makes it private: only devices on your tailnet can open \
+             it, and anyone else who uses it loses access. It needs a recent password or \
+             passkey confirmation."
+        ));
+    }
+    if !facts.deployed {
+        warnings.push(format!(
+            "Nothing is deployed to {} yet: it answers once a deployment runs on a worker.",
+            facts.environment_name
+        ));
+    }
+    let option = PlanOption {
+        kind: PlanOptionKind::TailscaleServe,
+        title: format!("Only my tailnet, at {name}"),
+        description: format!(
+            "{node} serves {name}, its own name in your tailnet, with Tailscale Serve: only \
+             devices on your tailnet can open it, Tailscale gives it its certificate, and no DNS \
+             record is added anywhere."
+        ),
+        actions: 1,
+        recommended: true,
+        way_in: format!("private:{node}"),
+        steps: vec![
+            step(
+                StepKind::AttachDomain,
+                if attached {
+                    format!("{name} is already on {}", facts.environment_name)
+                } else {
+                    format!("Attach {name} to {}", facts.environment_name)
+                },
+            ),
+            step(
+                StepKind::SetAudience,
+                format!("Make {name} private to your tailnet on {node}"),
+            ),
+            step(
+                StepKind::ConfigureTailscaleServe,
+                format!("Have {node} serve {name} with Tailscale Serve"),
+            ),
+            step(
+                StepKind::CheckReachability,
+                format!("Check {name} from {node} and from outside"),
+            ),
+        ],
+        fields: Vec::new(),
+        warnings,
+        confirmation: None,
+        required_permissions: permissions_for(PlanOptionKind::TailscaleServe)
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    ReachabilityPlan {
+        plan_id: None,
+        fingerprint: None,
+        expires_at: None,
+        audience: Audience::Private,
+        address,
+        address_error: None,
+        options: vec![option],
+        blocked: None,
+        principals: Vec::new(),
+    }
+}
+
+/// The plan for the app's own name in the tailnet, a Tailscale Service
+/// (ADR 065 D1 options 1, 2 and 4): tailscaled on a tagged worker serves it
+/// and gets its certificate, the Service is created through the API only
+/// when absent, and the tailnet admin approves the host.
+fn plan_service(facts: &PlanFacts, address: Option<String>) -> ReachabilityPlan {
+    let blocked = |reason: String, action: Option<ReachAction>| {
+        private_blocked(address.clone(), None, PlanBlocked { reason, action })
+    };
+    let name = address.clone().unwrap_or_default();
+    let Some((service, tailnet)) = service_of(facts, &name) else {
+        return blocked(tailnet_messages::service_only(&name), None);
+    };
+    if facts.deployed && !facts.served_by_workers {
+        return blocked(
+            format!(
+                "{} runs on the control plane, and a tailnet name is served by a worker, which \
+                 only carries what workers serve. Deploy it to a worker first.",
+                facts.environment_name
+            ),
+            None,
+        );
+    }
+    let Some(worker) = service_worker(facts, &tailnet) else {
+        // Say what keeps the likeliest worker from hosting it.
+        let on_tailnet: Vec<&TailnetWorkerFact> = serve_candidates(facts)
+            .into_iter()
+            .filter(|w| w.report.tailnet.as_deref() == Some(tailnet.as_str()))
+            .collect();
+        return match on_tailnet.first().and_then(|w| service_host_problem(w)) {
+            Some((reason, action)) => blocked(reason, action),
+            None => blocked(
+                format!(
+                    "No worker on tailnet {tailnet} lets Temps use its Tailscale. Run `{}` on \
+                     the worker that should serve {name}.",
+                    temps_core::tailnet::TAILSCALE_SERVE_COMMAND
+                ),
+                None,
+            ),
+        };
+    };
+    if facts
+        .serve_entries
+        .iter()
+        .any(|e| e.node_id == worker.id && e.hostname == name && e.removing)
+    {
+        return blocked(
+            format!(
+                "An earlier setup of `{name}` is still being taken off {}'s Serve config. Try \
+                 again in a minute.",
+                worker.name
+            ),
+            None,
+        );
+    }
+    let node = worker.name.as_str();
+    let tag = service_tag(worker);
+    let (kind, fields) = match &facts.tailscale_credential {
+        Some(credential) => match &credential.refusal {
+            Some(refusal) => return blocked(refusal.clone(), None),
+            None => (PlanOptionKind::TailscaleService, Vec::new()),
+        },
+        None => (
+            PlanOptionKind::TailscaleServiceWithCredential,
+            TailscaleFactory::fields(),
+        ),
+    };
+    // ADR 065 D4: create only when absent; this install's own is found.
+    let found = match facts.service_seen.as_ref().filter(|(s, _)| *s == service) {
+        Some((_, ServiceSeen::Unreadable(error))) => {
+            return blocked(
+                format!("Temps could not read `{service}` from your tailnet: {error}"),
+                None,
+            )
+        }
+        Some((_, ServiceSeen::Found(definition))) => {
+            match tailscale::ownership(definition, &facts.install_id) {
+                Ownership::Foreign => {
+                    return blocked(tailnet_messages::service_taken(&service), None)
+                }
+                Ownership::Ours { .. } => {
+                    if let Some(why) = definition.differs_from_fixed(&tag) {
+                        return blocked(
+                            format!(
+                                "{why}. Temps never changes a Service, so it cannot use it as it \
+                                 is: put it back, or pick another name."
+                            ),
+                            None,
+                        );
+                    }
+                    true
+                }
+            }
+        }
+        Some((_, ServiceSeen::Absent)) | None => false,
+    };
+    let attached = facts.attached_here.contains(&name);
+    let mut warnings = vec![
+        format!(
+            "The tailnet admin approves {node} as the host of `{service}`, at \
+             login.tailscale.com/admin/services, or once for every setup with this policy entry: \
+             {}. Temps waits for it and never approves hosts itself.",
+            tailscale::auto_approvers_snippet(&service, &tag)
+        ),
+        format!(
+            "Tailscale's certificate for `{name}` is in public certificate logs, so the name is \
+             no longer secret. Only devices on your tailnet can connect to it."
+        ),
+    ];
+    if kind == PlanOptionKind::TailscaleServiceWithCredential {
+        warnings.push(
+            "The OAuth client's `services` scope is tailnet-wide: whoever holds its secret can \
+             create, change and delete every Service in your tailnet. Temps seals it, never shows \
+             it again, and asks for `services` and `devices:core:read` only."
+                .to_string(),
+        );
+    }
+    if attached
+        && facts
+            .audiences
+            .iter()
+            .any(|(a, au)| a == &name && *au == Audience::Public)
+    {
+        warnings.push(format!(
+            "{name} is public now. This makes it private: only devices on your tailnet can open \
+             it, and anyone else who uses it loses access. It needs a recent password or \
+             passkey confirmation."
+        ));
+    }
+    if !facts.deployed {
+        warnings.push(format!(
+            "Nothing is deployed to {} yet: it answers once a deployment runs on a worker.",
+            facts.environment_name
+        ));
+    }
+    let mut steps = Vec::new();
+    if kind == PlanOptionKind::TailscaleServiceWithCredential {
+        steps.push(step(
+            StepKind::SaveTailscaleCredential,
+            "Check the Tailscale OAuth client's scopes and save it",
+        ));
+    }
+    steps.extend([
+        step(
+            StepKind::AttachDomain,
+            if attached {
+                format!("{name} is already on {}", facts.environment_name)
+            } else {
+                format!("Attach {name} to {}", facts.environment_name)
+            },
+        ),
+        step(
+            StepKind::SetAudience,
+            format!("Make {name} private to your tailnet on {node}"),
+        ),
+        step(
+            StepKind::DefineTailscaleService,
+            if found {
+                format!("Use `{service}`, which this Temps install made earlier")
+            } else {
+                format!("Create `{service}` in your tailnet, for hosts tagged {tag}")
+            },
+        ),
+        step(
+            StepKind::ConfigureTailscaleServe,
+            format!("Have {node} serve and advertise `{service}`"),
+        ),
+        step(
+            StepKind::WaitForServiceApproval,
+            format!("Wait for the tailnet admin to approve {node} as its host"),
+        ),
+        step(
+            StepKind::CheckReachability,
+            format!("Check {name} from {node} and from outside"),
+        ),
+    ]);
+    let option = PlanOption {
+        kind,
+        title: format!("Only my tailnet, at {name}"),
+        description: format!(
+            "{node} serves {name}, this app's own name in your tailnet, as the Tailscale Service \
+             `{service}`: only devices on your tailnet can open it, Tailscale gives it its \
+             certificate, the name stays if the app moves to another worker, and no DNS record \
+             is added anywhere."
+        ),
+        actions: if kind == PlanOptionKind::TailscaleServiceWithCredential {
+            3
+        } else {
+            2
+        },
+        recommended: true,
+        way_in: format!("private:{node}"),
+        steps,
+        fields,
+        warnings,
+        confirmation: None,
+        required_permissions: permissions_for(kind)
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+    };
+    ReachabilityPlan {
+        plan_id: None,
+        fingerprint: None,
+        expires_at: None,
+        audience: Audience::Private,
+        address,
+        address_error: None,
+        options: vec![option],
+        blocked: None,
+        principals: Vec::new(),
+    }
+}
+
+/// The plan for a private address on a worker's private listener (ADR 064
+/// D5): DNS in a zone Temps manages, a DNS-01 certificate.
+fn plan_listener(
+    facts: &PlanFacts,
+    address: Option<String>,
+    ask_address: bool,
+) -> ReachabilityPlan {
+    let blocked_plan = private_blocked;
+    let block = |reason: String, action: Option<ReachAction>| PlanBlocked { reason, action };
     let shown = address.clone().unwrap_or_else(|| "the address".to_string());
 
     if facts.deployed && !facts.served_by_workers {
@@ -1252,6 +2100,28 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
         };
         return blocked_plan(address, None, block(reason_action.0, Some(reason_action.1)));
     };
+    // ADR 065 D1: Serve on 443 of the same Tailscale address would take
+    // the listener's traffic.
+    if worker.tailscale {
+        if let Some(entry) = facts.serve_entries.iter().find(|e| {
+            e.node_id == worker.id
+                && e.via == temps_entities::audience::via::TAILSCALE_SERVE
+                && !e.removing
+        }) {
+            return blocked_plan(
+                address,
+                None,
+                block(
+                    tailnet_messages::serve_exclusive(
+                        &worker.name,
+                        &entry.hostname,
+                        &ip.to_string(),
+                    ),
+                    None,
+                ),
+            );
+        }
+    }
     let range = temps_core::worker_ingress::private_block(ip).unwrap_or("its private network");
     let network = if worker.tailscale {
         "Tailscale".to_string()
@@ -1427,6 +2297,7 @@ fn plan_private(facts: &PlanFacts) -> ReachabilityPlan {
         address_error: None,
         options: vec![option],
         blocked: None,
+        principals: Vec::new(),
     }
 }
 
@@ -1501,7 +2372,10 @@ mod tests {
                 audience: requested,
                 requested: Some("app.example.com".into()),
                 attached_here: vec!["app.example.com".into()],
-                audiences: vec![("app.example.com".into(), Audience::parse("tailnet_users"))],
+                audiences: vec![(
+                    "app.example.com".into(),
+                    Audience::parse("a_future_audience"),
+                )],
                 zones: vec![zone("example.com", "cloudflare")],
                 ..base()
             };
@@ -2149,5 +3023,511 @@ mod tests {
             .options
             .iter()
             .all(|o| o.steps.iter().all(|s| s.kind != StepKind::SetAudience)));
+    }
+
+    fn tailnet_report() -> TailscaleReport {
+        TailscaleReport {
+            consent: true,
+            root: true,
+            state: temps_core::tailnet::TailscaleState::Ready,
+            version: Some("1.94.1".into()),
+            backend_state: Some("Running".into()),
+            dns_name: Some("homelab.example.ts.net".into()),
+            tailnet: Some("example.ts.net".into()),
+            magic_dns: true,
+            cert_domains: vec!["homelab.example.ts.net".into()],
+            addresses: vec!["100.101.102.103".into()],
+            ..TailscaleReport::default()
+        }
+    }
+
+    fn tailnet_worker() -> TailnetWorkerFact {
+        TailnetWorkerFact {
+            id: 2,
+            name: "homelab".into(),
+            report: tailnet_report(),
+            minutes_ago: 1,
+            listener_on_tailscale: None,
+        }
+    }
+
+    fn serve_facts() -> PlanFacts {
+        PlanFacts {
+            audience: Audience::Private,
+            requested: None,
+            private_workers: Vec::new(),
+            tailnet_workers: vec![tailnet_worker()],
+            suggested_private_worker: Some("homelab".into()),
+            ..base()
+        }
+    }
+
+    /// ADR 065 D1: with nothing asked for, a worker whose owner allowed
+    /// Serve offers its own name, and nothing goes to DNS or `domains`.
+    #[test]
+    fn a_private_plan_offers_the_machine_name_of_a_consenting_worker() {
+        let facts = serve_facts();
+        assert_eq!(
+            address_for_audience(&facts),
+            Ok(Some("homelab.example.ts.net".into()))
+        );
+        let plan = plan(&facts);
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::TailscaleServe]);
+        assert_eq!(plan.address.as_deref(), Some("homelab.example.ts.net"));
+        let option = &plan.options[0];
+        assert_eq!(option.way_in, "private:homelab");
+        assert_eq!(
+            option.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::ConfigureTailscaleServe,
+                StepKind::CheckReachability
+            ]
+        );
+        assert!(option.warnings[0].contains("Another app on `homelab` needs a Service name"));
+        assert!(option.warnings[1].contains("public certificate logs"));
+
+        // Asked for by name, the same option.
+        let asked = plan_of(&PlanFacts {
+            requested: Some("HOMELAB.example.ts.net.".into()),
+            ..serve_facts()
+        });
+        assert_eq!(kinds(&asked), vec![PlanOptionKind::TailscaleServe]);
+    }
+
+    /// ADR 065 D1/D5: a name under the tailnet that is no machine's needs
+    /// a Service, which only a tagged device can host.
+    #[test]
+    fn a_service_name_on_an_untagged_worker_is_refused_with_d5s_message() {
+        let plan = plan_of(&PlanFacts {
+            requested: Some("myapp.example.ts.net".into()),
+            ..serve_facts()
+        });
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert_eq!(
+            blocked.reason,
+            tailnet_messages::not_tagged("homelab", "a user", "homelab.example.ts.net")
+        );
+        assert_eq!(
+            blocked.action.and_then(|a| a.command).as_deref(),
+            Some("sudo tailscale up --advertise-tags=tag:temps")
+        );
+    }
+
+    fn service_facts() -> PlanFacts {
+        let mut worker = tailnet_worker();
+        worker.report.tags = vec!["tag:temps".into()];
+        PlanFacts {
+            requested: Some("myapp.example.ts.net".into()),
+            tailnet_workers: vec![worker],
+            install_id: "inst1".into(),
+            ..serve_facts()
+        }
+    }
+
+    fn credential(refusal: Option<&str>) -> TailscaleCredentialFact {
+        TailscaleCredentialFact {
+            id: 31,
+            name: "tailscale".into(),
+            refusal: refusal.map(str::to_string),
+        }
+    }
+
+    /// ADR 065 D1/D2/D4: with no credential, the Service way in asks for
+    /// one, says the scope is tailnet-wide, and shows the autoApprovers
+    /// snippet; it never approves.
+    #[test]
+    fn a_service_name_is_offered_with_a_pasted_oauth_client() {
+        let plan = plan_of(&service_facts());
+        assert_eq!(
+            kinds(&plan),
+            vec![PlanOptionKind::TailscaleServiceWithCredential]
+        );
+        let option = &plan.options[0];
+        assert_eq!(
+            option.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::SaveTailscaleCredential,
+                StepKind::AttachDomain,
+                StepKind::SetAudience,
+                StepKind::DefineTailscaleService,
+                StepKind::ConfigureTailscaleServe,
+                StepKind::WaitForServiceApproval,
+                StepKind::CheckReachability,
+            ]
+        );
+        assert_eq!(
+            option
+                .fields
+                .iter()
+                .map(|f| f.key.as_str())
+                .collect::<Vec<_>>(),
+            TailscaleFactory::fields()
+                .iter()
+                .map(|f| f.key.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(option.warnings[0]
+            .contains("\"autoApprovers\": {\"services\": {\"svc:myapp\": [\"tag:temps\"]}}"));
+        assert!(option.warnings[0].contains("never approves hosts itself"));
+        assert!(option.warnings.iter().any(|w| w.contains("tailnet-wide")));
+        assert!(option.steps[3].label.contains("Create `svc:myapp`"));
+    }
+
+    /// ADR 065 D1: with a usable credential the Service is the first
+    /// choice, before the machine name; one whose scopes fail is refused
+    /// with D5's message and is never worked around.
+    #[test]
+    fn a_usable_credential_makes_the_service_the_first_choice() {
+        let facts = PlanFacts {
+            requested: None,
+            tailscale_credential: Some(credential(None)),
+            ..service_facts()
+        };
+        let address = address_for_audience(&facts)
+            .expect("an address")
+            .expect("suggested");
+        assert!(address.ends_with(".example.ts.net"), "{address}");
+        assert_ne!(address, "homelab.example.ts.net");
+        let plan = plan_of(&PlanFacts {
+            requested: Some("myapp.example.ts.net".into()),
+            ..facts.clone()
+        });
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::TailscaleService]);
+        assert!(plan.options[0].fields.is_empty());
+        assert!(!plan.options[0]
+            .steps
+            .iter()
+            .any(|s| s.kind == StepKind::SaveTailscaleCredential));
+
+        let refused = plan_of(&PlanFacts {
+            tailscale_credential: Some(credential(Some(tailnet_messages::CREDENTIAL_SCOPE))),
+            ..service_facts()
+        });
+        assert!(refused.options.is_empty());
+        assert_eq!(
+            refused.blocked.expect("blocked").reason,
+            tailnet_messages::CREDENTIAL_SCOPE
+        );
+    }
+
+    /// ADR 065 D4: a Service at the name that this install did not make
+    /// is never used; this install's own is, only as Temps defines it; an
+    /// unreadable name offers nothing.
+    #[test]
+    fn a_service_temps_did_not_make_is_never_offered() {
+        let seen = |definition: ServiceDefinition| PlanFacts {
+            service_seen: Some(("svc:myapp".into(), ServiceSeen::Found(definition))),
+            tailscale_credential: Some(credential(None)),
+            ..service_facts()
+        };
+        let foreign = plan_of(&seen(ServiceDefinition {
+            name: "svc:myapp".into(),
+            addrs: vec!["100.100.1.9".into()],
+            comment: "the media server".into(),
+            ports: vec!["tcp:443".into()],
+            tags: vec!["tag:media".into()],
+        }));
+        assert!(foreign.options.is_empty());
+        assert_eq!(
+            foreign.blocked.expect("blocked").reason,
+            tailnet_messages::service_taken("svc:myapp")
+        );
+
+        let other_install = plan_of(&seen(ServiceDefinition::fixed(
+            "svc:myapp",
+            "tag:temps",
+            &tailscale::marker("another-install", 3),
+        )));
+        assert!(other_install.options.is_empty());
+
+        let ours = plan_of(&seen(ServiceDefinition::fixed(
+            "svc:myapp",
+            "tag:temps",
+            &tailscale::marker("inst1", 3),
+        )));
+        assert_eq!(kinds(&ours), vec![PlanOptionKind::TailscaleService]);
+        assert!(ours.options[0].steps[2]
+            .label
+            .contains("which this Temps install made"));
+
+        let mut changed =
+            ServiceDefinition::fixed("svc:myapp", "tag:temps", &tailscale::marker("inst1", 3));
+        changed.ports.push("tcp:8443".into());
+        let changed = plan_of(&seen(changed));
+        assert!(changed.options.is_empty());
+        assert!(changed
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("Temps never changes a Service"));
+
+        let unreadable = plan_of(&PlanFacts {
+            service_seen: Some((
+                "svc:myapp".into(),
+                ServiceSeen::Unreadable("403 Forbidden".into()),
+            )),
+            ..service_facts()
+        });
+        assert!(unreadable.options.is_empty());
+        assert!(unreadable
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("403 Forbidden"));
+    }
+
+    /// ADR 065 D5: each reason the worker cannot serve its name, in the
+    /// agent's order, with D5's message.
+    #[test]
+    fn the_machine_name_is_refused_with_d5s_message_for_each_cause() {
+        let refused = |edit: &dyn Fn(&mut TailnetWorkerFact)| {
+            let mut worker = tailnet_worker();
+            edit(&mut worker);
+            let facts = PlanFacts {
+                requested: Some("homelab.example.ts.net".into()),
+                tailnet_workers: vec![worker],
+                ..serve_facts()
+            };
+            let plan = plan_of(&facts);
+            assert!(plan.options.is_empty(), "{:?}", plan.options);
+            plan.blocked.expect("blocked")
+        };
+        let no_consent = refused(&|w| w.report.consent = false);
+        assert_eq!(
+            no_consent.reason,
+            "Run `temps agent ingress private --listen tailscale --tailscale-serve` on `homelab`."
+        );
+        assert_eq!(
+            no_consent.action.and_then(|a| a.command).as_deref(),
+            Some(temps_core::tailnet::TAILSCALE_SERVE_COMMAND)
+        );
+        assert!(refused(&|w| {
+            w.report.root = false;
+            w.report.user = Some("temps".into());
+        })
+        .reason
+        .contains("runs as `temps`"));
+        assert!(
+            refused(&|w| w.report.state = temps_core::tailnet::TailscaleState::NoSocket)
+                .reason
+                .contains("/var/run/tailscale/tailscaled.sock")
+        );
+        assert!(refused(&|w| {
+            w.report.state = temps_core::tailnet::TailscaleState::Unsupported;
+            w.report.version = Some("1.90.2".into());
+        })
+        .reason
+        .contains("Temps needs 1.94 or later"));
+        assert!(
+            refused(&|w| w.report.backend_state = Some("NeedsLogin".into()))
+                .reason
+                .contains("`NeedsLogin`")
+        );
+        assert!(refused(&|w| w.report.magic_dns = false)
+            .reason
+            .starts_with("MagicDNS is off for tailnet `example.ts.net`"));
+        assert!(refused(&|w| w.report.cert_domains.clear())
+            .reason
+            .starts_with("HTTPS certificates are off for tailnet `example.ts.net`"));
+        assert!(
+            refused(&|w| w.report.port_443_held_by = Some("http://127.0.0.1:3000".into()))
+                .reason
+                .contains("already serves `http://127.0.0.1:3000`")
+        );
+        assert!(refused(&|w| w.report.port_443_funnel = true)
+            .reason
+            .contains("Tailscale Funnel"));
+        assert!(refused(&|w| w.minutes_ago = 45)
+            .reason
+            .contains("has not reported for 45 minutes"));
+        // ADR 065 D1: the phase 2 listener on the same Tailscale address.
+        assert!(refused(
+            &|w| w.listener_on_tailscale = Some("100.101.102.103".parse().expect("ip"))
+        )
+        .reason
+        .contains("already serves private addresses on 100.101.102.103:443"));
+    }
+
+    /// ADR 065 D1: the listener and the machine name never share a worker's
+    /// Tailscale address, refused whichever comes second.
+    #[test]
+    fn the_listener_is_refused_where_serve_holds_the_tailscale_address() {
+        let facts = PlanFacts {
+            serve_entries: vec![ServeEntryFact {
+                node_id: 2,
+                hostname: "homelab.example.ts.net".into(),
+                via: "tailscale_serve".into(),
+                service: None,
+                removing: false,
+            }],
+            ..private_facts()
+        };
+        let plan = plan_of(&facts);
+        assert!(plan.options.is_empty());
+        let reason = plan.blocked.expect("blocked").reason;
+        assert!(
+            reason.contains("serves `homelab.example.ts.net` with Tailscale Serve"),
+            "{reason}"
+        );
+        // An entry being removed no longer holds it.
+        let mut removing = facts.clone();
+        removing.serve_entries[0].removing = true;
+        assert_eq!(
+            kinds(&plan_of(&removing)),
+            vec![PlanOptionKind::PrivateWorker]
+        );
+        // ...but the machine name waits for it to go.
+        let waiting = plan_of(&PlanFacts {
+            serve_entries: removing.serve_entries.clone(),
+            ..serve_facts()
+        });
+        assert!(waiting.options.is_empty());
+    }
+
+    /// Nothing asked for, no listener and a worker that cannot serve its
+    /// name: the plan says why that worker cannot.
+    #[test]
+    fn with_no_way_in_the_consenting_workers_problem_is_shown() {
+        let mut worker = tailnet_worker();
+        worker.report.magic_dns = false;
+        let plan = plan_of(&PlanFacts {
+            tailnet_workers: vec![worker],
+            zones: vec![zone("example.com", "cloudflare")],
+            ..serve_facts()
+        });
+        assert!(plan.options.is_empty());
+        assert!(plan
+            .blocked
+            .expect("blocked")
+            .reason
+            .starts_with("MagicDNS is off"));
+    }
+
+    /// The plan is held to what the worker reported (ADR 064 D4).
+    #[test]
+    fn the_fingerprint_follows_the_workers_tailscale_report() {
+        let facts = serve_facts();
+        let mut changed = serve_facts();
+        changed.tailnet_workers[0].report.port_443_held_by = Some("http://127.0.0.1:3000".into());
+        let name = Some("homelab.example.ts.net");
+        assert_ne!(fingerprint(&facts, name), fingerprint(&changed, name));
+        // Inside checks change on every pass and do not stale a plan.
+        let mut checked = serve_facts();
+        checked.tailnet_workers[0].report.checks = vec![temps_core::tailnet::TailnetCheck {
+            address_id: "custom:4".into(),
+            hostname: "homelab.example.ts.net".into(),
+            outcome: temps_core::tailnet::TailnetCheckOutcome::Reachable,
+            message: String::new(),
+        }];
+        assert_eq!(fingerprint(&facts, name), fingerprint(&checked, name));
+    }
+
+    fn alice() -> Vec<temps_core::tailnet::TailnetPrincipal> {
+        vec![temps_core::tailnet::TailnetPrincipal::parse("alice@example.com").expect("a login")]
+    }
+
+    fn users_facts() -> PlanFacts {
+        PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: alice(),
+            identity_workers: vec!["homelab".into()],
+            ..serve_facts()
+        }
+    }
+
+    /// ADR 065 D6: an empty list is refused by the plan; nothing is made
+    /// reachable to nobody.
+    #[test]
+    fn a_tailnet_users_plan_needs_someone_listed() {
+        let plan = plan_of(&PlanFacts {
+            principals: Vec::new(),
+            ..users_facts()
+        });
+        assert!(plan.options.is_empty());
+        assert_eq!(plan.audience, Audience::TailnetUsers);
+        assert_eq!(
+            plan.blocked.expect("blocked").reason,
+            tailnet_messages::NO_PRINCIPALS
+        );
+    }
+
+    #[test]
+    fn a_tailnet_users_plan_serves_the_machine_name_and_says_who_is_admitted() {
+        let plan = plan_of(&users_facts());
+        assert_eq!(kinds(&plan), vec![PlanOptionKind::TailscaleServe]);
+        assert_eq!(plan.audience, Audience::TailnetUsers);
+        assert_eq!(plan.principals, alice());
+        let option = &plan.options[0];
+        assert!(option.recommended);
+        assert!(
+            option.warnings[0]
+                .starts_with("Only alice@example.com can open homelab.example.ts.net"),
+            "{:?}",
+            option.warnings
+        );
+        let audience = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::SetAudience)
+            .expect("an audience step");
+        assert!(
+            audience.label.contains("only for alice@example.com"),
+            "{}",
+            audience.label
+        );
+    }
+
+    /// D6: an agent that cannot check who a visitor is never gets the
+    /// address; the plan says which agent to update.
+    #[test]
+    fn a_tailnet_users_plan_refuses_a_worker_whose_agent_cannot_check_identity() {
+        let plan = plan_of(&PlanFacts {
+            identity_workers: Vec::new(),
+            ..users_facts()
+        });
+        assert!(plan.options.is_empty());
+        let reason = plan.blocked.expect("blocked").reason;
+        assert!(reason.contains("Update the agent on `homelab`"), "{reason}");
+    }
+
+    /// D6: on the private listener whois needs a Tailscale listener and
+    /// the owner's consent; without either the plan says what to do.
+    #[test]
+    fn a_tailnet_users_listener_needs_tailscale_and_the_owners_consent() {
+        let listener = || PlanFacts {
+            audience: Audience::TailnetUsers,
+            principals: alice(),
+            identity_workers: vec!["homelab".into()],
+            ..private_facts()
+        };
+        let plan = plan_of(&listener());
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert_eq!(
+            blocked.reason,
+            tailnet_messages::users_need_consent("homelab")
+        );
+        let action = blocked.action.expect("action");
+        assert_eq!(action.kind, ActionKind::RunCommand);
+        assert_eq!(
+            action.command.as_deref(),
+            Some(temps_core::tailnet::TAILSCALE_SERVE_COMMAND)
+        );
+
+        let mut off_tailnet = private_worker_fact(None);
+        off_tailnet.tailscale = false;
+        off_tailnet.listener = Some("192.168.1.20".parse().expect("ip"));
+        let plan = plan_of(&PlanFacts {
+            private_workers: vec![off_tailnet],
+            ..listener()
+        });
+        assert!(plan.options.is_empty());
+        assert_eq!(
+            plan.blocked.expect("blocked").reason,
+            tailnet_messages::users_need_tailnet("192.168.1.20")
+        );
     }
 }

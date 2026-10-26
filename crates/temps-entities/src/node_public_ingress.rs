@@ -33,6 +33,11 @@ pub struct Model {
     /// D7), `[{address_id, hostname, outcome, message, ...}]`.
     #[serde(default)]
     pub private_checks: Option<Json>,
+    /// The worker's Tailscale facts as it last reported them (ADR 065 D2):
+    /// version, backend state, tags, MagicDNS and HTTPS, machine name, who
+    /// holds its port 443 in Serve, consent and root, and its Serve checks.
+    #[serde(default)]
+    pub tailscale: Option<Json>,
     pub checked_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

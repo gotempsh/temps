@@ -3,6 +3,7 @@
 
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod address_tailnet_principals;
 pub mod ai_application_git_bindings;
 pub mod ai_application_projects;
 pub mod ai_application_workspaces;
@@ -162,6 +163,8 @@ pub mod stateless_control_plane;
 pub mod static_asset_cache;
 pub mod static_bundles;
 pub mod suppressed_recipients;
+pub mod tailnet_serve_entries;
+pub mod tailnet_serve_refs;
 pub mod template_instantiations;
 pub mod tls_acme_certificates;
 pub mod traefik_discovered_routes;

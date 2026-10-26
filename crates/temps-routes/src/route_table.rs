@@ -765,34 +765,72 @@ pub struct PrivateAddress {
     pub node_id: Option<i32>,
     /// The listener address DNS was pointed at.
     pub listener: Option<String>,
+    /// How it is served (ADR 065 D1): `listener`, `tailscale_serve` or
+    /// `tailscale_service`. `None` admits nobody: a private row without it
+    /// is one this version cannot place.
+    pub via: Option<String>,
+    /// For `tailnet_users` (ADR 065 D6): who it admits. `None` is the
+    /// range-only `private`, which never reads identity; `Some` of an empty
+    /// list admits nobody.
+    pub principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
 }
 
-/// How a non-public address is bounded. Only `private` is served, by the
-/// listener and to the range it names. Any other audience (`signed_in`
+impl PrivateAddress {
+    /// Served by the worker's phase 2 private listener (ADR 064 D5).
+    pub fn on_listener(&self) -> bool {
+        self.via.as_deref() == Some(temps_entities::audience::via::LISTENER)
+    }
+
+    /// Served through tailscaled's Serve on the worker (ADR 065 D3).
+    pub fn on_tailscale(&self) -> bool {
+        matches!(
+            self.via.as_deref(),
+            Some(
+                temps_entities::audience::via::TAILSCALE_SERVE
+                    | temps_entities::audience::via::TAILSCALE_SERVICE
+            )
+        )
+    }
+}
+
+/// How a non-public address is bounded. Only `private` and `tailnet_users`
+/// are served, by the way in its `private_via` names; `tailnet_users`
+/// starts with nobody listed, and the loader fills in its list. Any other
+/// audience (`signed_in`
 /// before phase 4, or a value a newer version wrote) admits nobody: it is
 /// never served to the whole private range, so a rolled-back control plane
-/// cannot widen it (ADR 065 D6).
+/// cannot widen it (ADR 065 D6). So does a `private` row with no way in, or
+/// one this version does not know.
 fn private_address(
     audience: &str,
     address_id: String,
     range: Option<String>,
     node_id: Option<i32>,
     listener: Option<String>,
+    via: Option<&str>,
 ) -> PrivateAddress {
-    if audience == temps_entities::audience::PRIVATE {
-        PrivateAddress {
+    let via = via.filter(|via| temps_entities::audience::via::ALL.contains(via));
+    let tailnet_users = audience == temps_entities::audience::TAILNET_USERS;
+    match (
+        audience == temps_entities::audience::PRIVATE || tailnet_users,
+        via,
+    ) {
+        (true, Some(via)) => PrivateAddress {
             address_id,
             range,
             node_id,
             listener,
-        }
-    } else {
-        PrivateAddress {
+            via: Some(via.to_string()),
+            principals: tailnet_users.then(Vec::new),
+        },
+        _ => PrivateAddress {
             address_id,
             range: None,
             node_id: None,
             listener: None,
-        }
+            via: None,
+            principals: None,
+        },
     }
 }
 
@@ -1747,6 +1785,11 @@ impl CachedPeerTable {
 
         debug!("Loading route table from database...");
 
+        // ADR 065 D6: who each `tailnet_users` address admits, read in one
+        // query the first time such an address is found.
+        let mut principals: Option<HashMap<String, Vec<temps_core::tailnet::TailnetPrincipal>>> =
+            None;
+
         // 1. Load environment_domains (e.g., preview-123.temps.dev)
         let env_domains = environment_domains::Entity::find()
             .all(self.db.as_ref())
@@ -1759,16 +1802,24 @@ impl CachedPeerTable {
 
         for env_domain in env_domains {
             if env_domain.audience != temps_entities::audience::PUBLIC {
-                private_meta.insert(
-                    env_domain.domain.clone(),
-                    private_address(
-                        &env_domain.audience,
-                        temps_core::worker_ingress::private_address_id(false, env_domain.id),
-                        env_domain.private_range.clone(),
-                        env_domain.private_node_id,
-                        env_domain.private_listener.clone(),
-                    ),
+                let mut address = private_address(
+                    &env_domain.audience,
+                    temps_core::worker_ingress::private_address_id(false, env_domain.id),
+                    env_domain.private_range.clone(),
+                    env_domain.private_node_id,
+                    env_domain.private_listener.clone(),
+                    env_domain.private_via.as_deref(),
                 );
+                if let Some(list) = address.principals.as_mut() {
+                    if principals.is_none() {
+                        principals = Some(load_tailnet_principals(self.db.as_ref()).await?);
+                    }
+                    *list = principals
+                        .as_mut()
+                        .and_then(|all| all.remove(&address.address_id))
+                        .unwrap_or_default();
+                }
+                private_meta.insert(env_domain.domain.clone(), address);
             }
             // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&env_domain.environment_id) {
@@ -2046,16 +2097,24 @@ impl CachedPeerTable {
 
         for custom_domain in custom_domains {
             if custom_domain.audience != temps_entities::audience::PUBLIC {
-                private_meta.insert(
-                    custom_domain.domain.clone(),
-                    private_address(
-                        &custom_domain.audience,
-                        temps_core::worker_ingress::private_address_id(true, custom_domain.id),
-                        custom_domain.private_range.clone(),
-                        custom_domain.private_node_id,
-                        custom_domain.private_listener.clone(),
-                    ),
+                let mut address = private_address(
+                    &custom_domain.audience,
+                    temps_core::worker_ingress::private_address_id(true, custom_domain.id),
+                    custom_domain.private_range.clone(),
+                    custom_domain.private_node_id,
+                    custom_domain.private_listener.clone(),
+                    custom_domain.private_via.as_deref(),
                 );
+                if let Some(list) = address.principals.as_mut() {
+                    if principals.is_none() {
+                        principals = Some(load_tailnet_principals(self.db.as_ref()).await?);
+                    }
+                    *list = principals
+                        .as_mut()
+                        .and_then(|all| all.remove(&address.address_id))
+                        .unwrap_or_default();
+                }
+                private_meta.insert(custom_domain.domain.clone(), address);
             }
             // Fetch environment if not cached (skip soft-deleted)
             if !environments_cache.contains_key(&custom_domain.environment_id) {
@@ -3658,7 +3717,9 @@ impl CachedPeerTable {
         snapshot
             .private
             .iter()
-            .filter(|(_, private)| private.address.node_id == Some(node_id))
+            .filter(|(_, private)| {
+                private.address.node_id == Some(node_id) && private.address.on_listener()
+            })
             .map(|(host, private)| {
                 (
                     host.clone(),
@@ -3667,6 +3728,24 @@ impl CachedPeerTable {
                 )
             })
             .collect()
+    }
+
+    /// The private address at `host` that `node_id` serves through
+    /// tailscaled (ADR 065 D3), with whether it passes the same rules as a
+    /// public worker route. `None` for any other address: one served by the
+    /// listener, by another worker, or by nobody.
+    pub fn worker_tailnet_route(&self, node_id: i32, host: &str) -> Option<(PrivateRoute, bool)> {
+        let snapshot = self.route_snapshot.load();
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        snapshot
+            .private
+            .iter()
+            .find(|(candidate, private)| {
+                candidate.trim_end_matches('.').eq_ignore_ascii_case(&host)
+                    && private.address.node_id == Some(node_id)
+                    && private.address.on_tailscale()
+            })
+            .map(|(_, private)| (private.clone(), worker_servable(&snapshot, &private.route)))
     }
 
     /// Whether `host` is a private address (ADR 064 D5).
@@ -4099,6 +4178,30 @@ fn resolve_path_routes(
         .collect()
 }
 
+/// Every `tailnet_users` list, by address id (ADR 065 D6). Rows that do not
+/// parse are dropped, so a bad row narrows a list and never widens it.
+async fn load_tailnet_principals(
+    db: &DatabaseConnection,
+) -> Result<HashMap<String, Vec<temps_core::tailnet::TailnetPrincipal>>, sea_orm::DbErr> {
+    let mut by_address: HashMap<String, Vec<temps_entities::address_tailnet_principals::Model>> =
+        HashMap::new();
+    for row in temps_entities::address_tailnet_principals::Entity::find()
+        .all(db)
+        .await?
+    {
+        by_address
+            .entry(row.address_id.clone())
+            .or_default()
+            .push(row);
+    }
+    Ok(by_address
+        .into_iter()
+        .map(|(address_id, rows)| {
+            let list = temps_entities::address_tailnet_principals::principals(&rows);
+            (address_id, list)
+        })
+        .collect())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4721,18 +4824,52 @@ mod tests {
                     Some("100.64.0.0/10".into()),
                     Some(3),
                     Some("100.101.102.103".into()),
+                    Some("listener"),
                 )
             };
             let private = bounded(temps_entities::audience::PRIVATE);
             assert_eq!(private.range.as_deref(), Some("100.64.0.0/10"));
             assert_eq!(private.node_id, Some(3));
-            for audience in [temps_entities::audience::SIGNED_IN, "tailnet_users", ""] {
+            assert!(private.on_listener());
+            assert_eq!(private.principals, None, "`private` never reads identity");
+            // ADR 065 D6: `tailnet_users` is bounded the same way, and
+            // admits nobody until its list is filled in.
+            let users = bounded(temps_entities::audience::TAILNET_USERS);
+            assert_eq!(users.range.as_deref(), Some("100.64.0.0/10"));
+            assert_eq!(users.principals, Some(Vec::new()));
+            for audience in [temps_entities::audience::SIGNED_IN, "tailnet-users", ""] {
                 let nobody = bounded(audience);
                 assert_eq!(nobody.address_id, "custom:7", "{audience}");
                 assert_eq!(nobody.range, None, "{audience}");
                 assert_eq!(nobody.node_id, None, "{audience}");
                 assert_eq!(nobody.listener, None, "{audience}");
             }
+        }
+
+        /// ADR 065 D1: a private row says how it is served. Without a way in,
+        /// or with one this version does not know, it is served by nobody,
+        /// and only a `listener` address reaches the phase 2 listener.
+        #[test]
+        fn a_private_address_is_served_only_by_its_way_in() {
+            let with_via = |via: Option<&str>| {
+                private_address(
+                    temps_entities::audience::PRIVATE,
+                    "custom:7".into(),
+                    Some("100.64.0.0/10".into()),
+                    Some(3),
+                    Some("100.101.102.103".into()),
+                    via,
+                )
+            };
+            for via in [None, Some(""), Some("tailscale_funnel")] {
+                let nobody = with_via(via);
+                assert_eq!(nobody.node_id, None, "{via:?}");
+                assert!(!nobody.on_listener() && !nobody.on_tailscale(), "{via:?}");
+            }
+            let serve = with_via(Some("tailscale_serve"));
+            assert_eq!(serve.node_id, Some(3));
+            assert!(serve.on_tailscale() && !serve.on_listener());
+            assert!(with_via(Some("tailscale_service")).on_tailscale());
         }
 
         /// ADR 064 D5: a private address is served by nobody but the private
@@ -4760,6 +4897,8 @@ mod tests {
                 range: Some("100.64.0.0/10".into()),
                 node_id: Some(3),
                 listener: Some("100.101.102.103".into()),
+                via: Some("listener".into()),
+                principals: None,
             };
             let (private, private_hosts) = withdraw_private_addresses(
                 HashMap::from([("app.internal.example.com".to_string(), address.clone())]),
@@ -5338,6 +5477,8 @@ mod tests {
                             private_range: None,
                             private_node_id: None,
                             private_listener: None,
+                            private_via: None,
+                            private_service: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])

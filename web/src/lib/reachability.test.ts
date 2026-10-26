@@ -16,6 +16,7 @@ import {
   conflictChoices,
   conflictSubject,
   conflictsToDecide,
+  resumeNeedsTailscaleCredential,
   resumeNeedsToken,
   stalePlan,
   certificateChoices,
@@ -25,6 +26,7 @@ import {
   reachabilityHeadline,
   audienceLabel,
   privateDnsWarning,
+  parsePrincipals,
   wayInLabel,
 } from './reachability'
 
@@ -465,6 +467,82 @@ describe('private addresses (ADR 064 D5)', () => {
   })
 })
 
+describe('tailnet names (ADR 065)', () => {
+  test('a Serve entry in conflict on undo can only be left', () => {
+    const entry = {
+      at: '2026-10-25T10:00:00Z',
+      key: 'run-1:tailscale_serve',
+      state: 'conflict' as const,
+      intent: {
+        type: 'tailscale_serve' as const,
+        node_id: 2,
+        node_name: 'homelab',
+        address_id: 'custom:4',
+        hostname: 'homelab.example.ts.net',
+      },
+    }
+    expect(conflictSubject(entry)).toBe('homelab.example.ts.net on homelab')
+    expect(conflictChoices(entry, true)).toEqual([
+      { decision: 'keep', label: 'Leave the worker as it is' },
+    ])
+  })
+
+  test('undo asks before deleting a Tailscale Service', () => {
+    const entry = {
+      at: '2026-10-25T10:00:00Z',
+      key: 'run-1:tailscale_service/example.ts.net/svc:myapp',
+      state: 'conflict' as const,
+      intent: {
+        type: 'tailscale_service' as const,
+        tailnet: 'example.ts.net',
+        name: 'svc:myapp',
+        marker: 'temps:inst1:1',
+      },
+    }
+    expect(conflictSubject(entry)).toBe('Tailscale Service `svc:myapp`')
+    expect(conflictChoices(entry, true)).toEqual([
+      { decision: 'keep', label: 'Keep it' },
+      { decision: 'overwrite', label: 'Delete it' },
+    ])
+  })
+
+  test('resuming asks for the OAuth client again only before it is saved', () => {
+    const run: RunView = {
+      id: 3,
+      audience: 'private',
+      option: 'tailscale_service_with_credential',
+      state: 'interrupted',
+      steps: [
+        {
+          kind: 'save_tailscale_credential',
+          label: 'Save',
+          status: 'pending',
+        },
+        {
+          kind: 'define_tailscale_service',
+          label: 'Define',
+          status: 'pending',
+        },
+      ],
+      created: [],
+      journal: [],
+      undo: [],
+      created_at: '',
+      updated_at: '',
+    }
+    expect(resumeNeedsTailscaleCredential(run)).toBe(true)
+    expect(resumeNeedsToken(run)).toBe(false)
+    expect(
+      resumeNeedsTailscaleCredential({
+        ...run,
+        steps: [
+          { kind: 'save_tailscale_credential', label: 'Save', status: 'done' },
+        ],
+      })
+    ).toBe(false)
+  })
+})
+
 describe('plan for the typed address', () => {
   test('is current once the address settled and its own plan arrived', () => {
     expect(
@@ -494,5 +572,41 @@ describe('plan for the typed address', () => {
         placeholder: true,
       })
     ).toBe(false)
+  })
+})
+
+describe('tailnet users (ADR 065 D6)', () => {
+  test('logins and tags are split, lower-cased, sorted and deduplicated', () => {
+    expect(
+      parsePrincipals(
+        'Bob@Example.com, tag:CI\nalice@example.com  bob@example.com'
+      )
+    ).toEqual({
+      principals: [
+        { kind: 'login', value: 'alice@example.com' },
+        { kind: 'login', value: 'bob@example.com' },
+        { kind: 'tag', value: 'tag:ci' },
+      ],
+      invalid: [],
+    })
+  })
+
+  test('what is neither a login nor a tag is reported, never guessed', () => {
+    expect(
+      parsePrincipals('alice, tag:, tag:-x, tag:a_b, @example.com, a@')
+    ).toEqual({
+      principals: [],
+      invalid: ['alice', 'tag:', 'tag:-x', 'tag:a_b', '@example.com', 'a@'],
+    })
+  })
+
+  test('nothing typed is an empty list', () => {
+    expect(parsePrincipals('  \n ,')).toEqual({ principals: [], invalid: [] })
+  })
+
+  test('the label names who it is for', () => {
+    expect(audienceLabel({ audience: 'tailnet_users', network: null })).toBe(
+      'Listed tailnet users'
+    )
   })
 })

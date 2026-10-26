@@ -7,13 +7,16 @@ use std::time::Duration;
 
 use axum::response::IntoResponse;
 use tempfile::TempDir;
-use temps_agent::internal_proxy::spawn_public_http;
+use temps_agent::internal_proxy::{
+    spawn_public_http, spawn_serve_socket, spawn_tunnel_origin, ServeSocket,
+};
 use temps_agent::public_ingress::{self, PublicIngressConfig};
 use temps_agent::route_store::{
     PrivateRouteEntry, PublicIngressCertBundle, PublicIngressCertificates, PublicIngressSnapshot,
-    RouteBackend, RouteEntry, RouteStore, SharedRouteStore,
+    RouteBackend, RouteEntry, RouteStore, ServeEntry, SharedRouteStore,
 };
 use temps_agent::route_sync_client::RouteSyncClient;
+use temps_agent::tailnet_identity::TailnetIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
@@ -49,6 +52,9 @@ impl IngressHarness {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
 
         let shutdown = Arc::new(Notify::new());
@@ -126,6 +132,7 @@ async fn spawn_acme_test_ingress(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         store,
         Arc::clone(&shutdown),
@@ -145,6 +152,9 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     store
 }
@@ -390,6 +400,9 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            serve_entries: Vec::new(),
+            identity_private_routes: Vec::new(),
+            identity_serve_routes: Vec::new(),
         });
         let mut persisted: serde_json::Value = serde_json::from_slice(
             &std::fs::read(&snapshot_path).expect("read persisted ingress snapshot"),
@@ -588,6 +601,9 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
 
     let shutdown = Arc::new(Notify::new());
@@ -601,6 +617,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         store,
         Arc::clone(&shutdown),
@@ -733,6 +750,9 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     let ingress_shutdown = Arc::new(Notify::new());
     let ingress = public_ingress::spawn(
@@ -745,6 +765,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: false,
+            tailnet: None,
         },
         Arc::clone(&store),
         Arc::clone(&ingress_shutdown),
@@ -1222,6 +1243,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
         address_id: "custom:9".to_string(),
         range: range.to_string(),
         listener: "127.0.0.1".to_string(),
+        principals: None,
     }
 }
 
@@ -1264,6 +1286,9 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             // ...and outside this one.
             private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
         ],
+        serve_entries: Vec::new(),
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
     });
     let shutdown = Arc::new(Notify::new());
     let private = public_ingress::spawn(
@@ -1276,6 +1301,7 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             node_id: 7,
             node_token: "test-node-token".to_string(),
             private: true,
+            tailnet: None,
         },
         Arc::clone(&store),
         Arc::clone(&shutdown),
@@ -1322,5 +1348,355 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
         "nothing reached the backend over plain HTTP"
     );
     shutdown.notify_waiters();
+    backend_shutdown.notify_waiters();
+}
+
+/// Every tailnet identity header a client could forge (ADR 065 D3).
+const FORGED_IDENTITY: &str = "Tailscale-User-Login: alice@example.com\r\nTailscale-User-Name: Alice\r\nTailscale-Headers-Info: forged\r\nTailscale-Funnel-Request: ?0\r\nX-Temps-User-Login: alice@example.com\r\n";
+
+fn assert_no_identity(request: &str) {
+    let request = request.to_ascii_lowercase();
+    for header in [
+        "tailscale-user-login",
+        "tailscale-user-name",
+        "tailscale-headers-info",
+        "tailscale-funnel-request",
+        "x-temps-user-login",
+    ] {
+        assert!(
+            !request.contains(header),
+            "{header} reached the app: {request}"
+        );
+    }
+}
+
+/// ADR 065 D3: only a Serve socket passes tailnet identity on. The direct
+/// listener and the tunnel origin strip every `Tailscale-*` header and
+/// `X-Temps-User-Login` a client sends.
+#[tokio::test]
+async fn test_tailnet_identity_headers_are_stripped_on_every_tcp_listener() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+    let request = format!(
+        "GET /whoami HTTP/1.1\r\nHost: app.example.test\r\n{FORGED_IDENTITY}Connection: close\r\n\r\n"
+    );
+
+    let response = ingress.request(&request).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed");
+    assert_no_identity(&seen);
+
+    let origin = spawn_tunnel_origin(
+        "127.0.0.1:0".parse().expect("loopback"),
+        Arc::clone(&ingress.store),
+        Arc::clone(&ingress.shutdown),
+        None,
+    )
+    .await
+    .expect("start the tunnel origin");
+    let mut stream = TcpStream::connect(origin).await.expect("connect");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("response timed out")
+        .expect("read response");
+    let response = String::from_utf8_lossy(&response).into_owned();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed");
+    assert_no_identity(&seen);
+    backend_shutdown.notify_waiters();
+}
+
+fn serve_store(snapshot_dir: &TempDir, backend: std::net::SocketAddr) -> SharedRouteStore {
+    serve_store_for(snapshot_dir, backend, None)
+}
+
+fn serve_store_for(
+    snapshot_dir: &TempDir,
+    backend: std::net::SocketAddr,
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
+) -> SharedRouteStore {
+    let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+    store.apply_public_snapshot(serve_snapshot(backend, principals));
+    store
+}
+
+fn serve_snapshot(
+    backend: std::net::SocketAddr,
+    principals: Option<Vec<temps_core::tailnet::TailnetPrincipal>>,
+) -> PublicIngressSnapshot {
+    PublicIngressSnapshot {
+        enabled: true,
+        routes: Vec::new(),
+        certificates: None,
+        unsupported_route_count: 0,
+        unsupported_reasons: Vec::new(),
+        listen: None,
+        private_routes: Vec::new(),
+        serve_entries: vec![ServeEntry {
+            entry_id: 70,
+            address_id: "custom:9".to_string(),
+            hostname: "homelab.example.ts.net".to_string(),
+            via: "tailscale_serve".to_string(),
+            service: None,
+            removing: false,
+            applied_etag: None,
+            route: Some(RouteEntry {
+                host: "homelab.example.ts.net".to_string(),
+                backends: vec![RouteBackend {
+                    address: backend.to_string(),
+                    container_id: Some("test-backend".to_string()),
+                    container_name: Some("serve-test-backend".to_string()),
+                }],
+                deployment_id: Some(61),
+                project_id: Some(62),
+                environment_id: Some(63),
+            }),
+            addrs: Vec::new(),
+            principals,
+        }],
+        identity_private_routes: Vec::new(),
+        identity_serve_routes: Vec::new(),
+    }
+}
+
+async fn socket_request(path: &std::path::Path, request: &str) -> String {
+    let mut stream = tokio::net::UnixStream::connect(path)
+        .await
+        .expect("connect to the Serve socket");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write request");
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+        .await
+        .expect("response timed out")
+        .expect("read response");
+    String::from_utf8_lossy(&response).into_owned()
+}
+
+/// ADR 065 D3: the socket names the address. `Host` is rewritten to its
+/// tailnet name and `X-Forwarded-Host` ignored; only a visitor tailscaled
+/// vouched for (a Tailscale `X-Forwarded-For`) is served; Funnel is
+/// refused; tailscaled's `Tailscale-User-Login`/`-Name`/`-Profile-Pic` pass
+/// on, any other `Tailscale-User-*` and Temps' own login header never.
+#[tokio::test]
+async fn test_serve_socket_serves_only_its_address_to_tailnet_visitors() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let dir = TempDir::new().expect("socket dir");
+    let store = serve_store(&dir, backend_address);
+    let path = dir.path().join("custom-9.sock");
+    let socket = Arc::new(ServeSocket::new("custom:9"));
+    let stop = Arc::new(Notify::new());
+    let _task = spawn_serve_socket(
+        &path,
+        Arc::clone(&store),
+        Arc::clone(&socket),
+        Arc::new(TailnetIdentity::new()),
+        Arc::clone(&stop),
+    )
+    .await
+    .expect("bind the Serve socket");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path)
+            .expect("socket")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let response = socket_request(
+        &path,
+        "GET /app HTTP/1.1\r\nHost: other.example.test\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: alice@example.com\r\nTailscale-User-Role: admin\r\nTailscale-User-Groups: group:admins\r\nX-Temps-User-Login: mallory@example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    let seen = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(seen.contains("host: homelab.example.ts.net"), "{seen}");
+    assert!(!seen.contains("other.example.test"), "{seen}");
+    assert!(!seen.contains("attacker.example"), "{seen}");
+    assert!(
+        seen.contains("tailscale-user-login: alice@example.com"),
+        "{seen}"
+    );
+    assert!(!seen.contains("mallory"), "{seen}");
+    // Only the headers tailscaled replaces pass; a `Tailscale-User-*` it
+    // does not set is the client's own and is dropped.
+    assert!(!seen.contains("tailscale-user-role"), "{seen}");
+    assert!(!seen.contains("tailscale-user-groups"), "{seen}");
+
+    // Funnel: refused, and remembered for the agent's report.
+    let funnel = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-Funnel-Request: ?1\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(funnel.starts_with("HTTP/1.1 403"), "{funnel}");
+    assert!(
+        funnel
+            .to_ascii_lowercase()
+            .contains("x-temps-private-ingress: funnel"),
+        "{funnel}"
+    );
+    assert!(socket.funnel_seen.load(Ordering::Acquire));
+
+    // A visitor that is not on the tailnet.
+    let outside = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(outside.starts_with("HTTP/1.1 403"), "{outside}");
+
+    // No visitor: only the agent's own probe is answered, by the socket.
+    let probe = socket_request(
+        &path,
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: homelab.example.ts.net\r\nConnection: close\r\n\r\n",
+            temps_core::tailnet::SERVE_PROBE_PATH
+        ),
+    )
+    .await;
+    assert!(probe.starts_with("HTTP/1.1 200 OK"), "{probe}");
+    assert!(probe.ends_with("custom:9"), "{probe}");
+    let anonymous = socket_request(
+        &path,
+        "GET /app HTTP/1.1\r\nHost: homelab.example.ts.net\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(anonymous.starts_with("HTTP/1.1 400"), "{anonymous}");
+    // ...and a tailnet visitor never reaches the probe: it goes to the app.
+    let _ = socket_request(
+        &path,
+        &format!(
+            "GET {} HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nConnection: close\r\n\r\n",
+            temps_core::tailnet::SERVE_PROBE_PATH
+        ),
+    )
+    .await;
+    assert!(timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .is_ok());
+
+    // With Funnel on for the entry, nothing is served.
+    socket.funnel_on.store(true, Ordering::Release);
+    let refused = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    assert!(
+        timeout(Duration::from_millis(150), requests.recv())
+            .await
+            .is_err(),
+        "nothing else reached the backend"
+    );
+    stop.notify_waiters();
+    backend_shutdown.notify_waiters();
+}
+
+/// ADR 065 D6: a `tailnet_users` address on its Serve socket admits only a
+/// listed login, read from tailscaled's header, and hands it to the app as
+/// `x-temps-user-login` in place of any client copy. Anyone else, an
+/// empty list, and a visitor with no login tailscaled can vouch for are
+/// refused before the app is reached.
+#[tokio::test]
+async fn test_serve_socket_admits_only_listed_tailnet_users() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let dir = TempDir::new().expect("socket dir");
+    let alice = temps_core::tailnet::TailnetPrincipal::parse("Alice@Example.com").expect("a login");
+    let store = serve_store_for(&dir, backend_address, Some(vec![alice]));
+    let path = dir.path().join("custom-9.sock");
+    let stop = Arc::new(Notify::new());
+    // No LocalAPI: whois is unavailable, as without the owner's consent.
+    // The worker knows its own node, as after the Serve manager's first pass.
+    let identity = Arc::new(TailnetIdentity::new());
+    identity.set_self(Some(temps_agent::tailnet_identity::SelfNode {
+        stable_id: "n123CNTRL".to_string(),
+        ips: vec!["100.101.102.103".parse().expect("an IP")],
+    }));
+    let _task = spawn_serve_socket(
+        &path,
+        Arc::clone(&store),
+        Arc::new(ServeSocket::new("custom:9")),
+        identity,
+        Arc::clone(&stop),
+    )
+    .await
+    .expect("bind the Serve socket");
+
+    let admitted = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: ALICE@example.com\r\nX-Temps-User-Login: mallory@example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(admitted.starts_with("HTTP/1.1 200 OK"), "{admitted}");
+    let seen = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(
+        seen.contains("x-temps-user-login: alice@example.com"),
+        "{seen}"
+    );
+    assert!(!seen.contains("mallory"), "{seen}");
+
+    for (who, request) in [
+        (
+            "an unlisted login",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nTailscale-User-Login: bob@example.com\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "a login that cannot be decoded",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nTailscale-User-Login: =?utf-8?b?YWxpY2U=?=\r\nConnection: close\r\n\r\n",
+        ),
+        (
+            "no login and no whois",
+            "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.201\r\nX-Temps-User-Login: alice@example.com\r\nConnection: close\r\n\r\n",
+        ),
+    ] {
+        let refused = socket_request(&path, request).await;
+        assert!(refused.starts_with("HTTP/1.1 403"), "{who}: {refused}");
+        assert!(
+            refused
+                .to_ascii_lowercase()
+                .contains("x-temps-private-ingress: not-allowed"),
+            "{who}: {refused}"
+        );
+    }
+
+    // An empty list admits nobody, even a login that was listed before.
+    store.apply_public_snapshot(serve_snapshot(backend_address, Some(Vec::new())));
+    let refused = socket_request(
+        &path,
+        "GET / HTTP/1.1\r\nHost: homelab.example.ts.net\r\nX-Forwarded-For: 100.101.102.200\r\nTailscale-User-Login: alice@example.com\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 403"), "{refused}");
+    assert!(
+        timeout(Duration::from_millis(150), requests.recv())
+            .await
+            .is_err(),
+        "nothing refused reached the backend"
+    );
+    stop.notify_waiters();
     backend_shutdown.notify_waiters();
 }
