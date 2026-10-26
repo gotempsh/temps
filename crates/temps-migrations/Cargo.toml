@@ -22,3 +22,5 @@ bollard = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# LISTEN for the NOTIFYs route triggers send.
+sqlx = { workspace = true }

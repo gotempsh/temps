@@ -76,6 +76,7 @@ pub mod traces;
 pub mod update_status;
 pub mod ways_in;
 pub mod worker_ingress;
+pub mod worker_shield;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,

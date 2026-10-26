@@ -1088,10 +1088,55 @@ fn withdraw_private_addresses(
     (private_routes, private_hosts)
 }
 
+/// The Shield mode `route`'s environment runs in (ADR 066, D1): its own,
+/// else its project's, with a true `attack_mode` still meaning `attack`.
+/// `log` (the default) for a route without both.
+pub fn route_shield_mode(route: &RouteInfo) -> temps_shield::ShieldMode {
+    match (route.project.as_ref(), route.environment.as_ref()) {
+        (Some(project), Some(environment)) => temps_shield::ShieldMode::effective(
+            environment.shield_mode.as_deref(),
+            &project.shield_mode,
+            environment.attack_mode,
+            project.attack_mode,
+        ),
+        _ => temps_shield::ShieldMode::default(),
+    }
+}
+
+/// Which Shield modes keep a route off a worker (ADR 066, D10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShieldPinning {
+    /// The worker runs Shield itself (`shield-v1`): no mode keeps a route
+    /// on the control plane.
+    None,
+    /// The worker does not run Shield: an environment that acts on verdicts
+    /// (`selective`, `attack`) stays on the control plane, which enforces
+    /// them. `log` and `off` act on nothing, so a worker may serve them.
+    Enforcing,
+    /// Private listeners, which do not run Shield: only `attack` mode is
+    /// held back, as before Shield modes existed.
+    Attack,
+}
+
+impl ShieldPinning {
+    fn allows(self, mode: temps_shield::ShieldMode) -> bool {
+        match self {
+            Self::None => true,
+            Self::Enforcing => !mode.enforces(),
+            Self::Attack => mode != temps_shield::ShieldMode::Attack,
+        }
+    }
+}
+
 /// Whether a worker can serve `route` without bypassing what only the
 /// control-plane proxy enforces: an upstream backend, no redirect, no path
-/// routes (ADR 050), not asleep, no attack mode, no security settings.
-fn worker_servable(snapshot: &RouteTableSnapshot, route: &RouteInfo) -> bool {
+/// routes (ADR 050), not asleep, a Shield mode `shield` allows, no security
+/// settings.
+fn worker_servable(
+    snapshot: &RouteTableSnapshot,
+    route: &RouteInfo,
+    shield: ShieldPinning,
+) -> bool {
     route.redirect_to.is_none()
         && matches!(route.backend, BackendType::Upstream { .. })
         && !route.environment.as_ref().is_some_and(|environment| {
@@ -1102,7 +1147,6 @@ fn worker_servable(snapshot: &RouteTableSnapshot, route: &RouteInfo) -> bool {
         })
         && route.environment.as_ref().is_some_and(|environment| {
             !environment.sleeping
-                && environment.attack_mode != Some(true)
                 && environment
                     .deployment_config
                     .as_ref()
@@ -1110,13 +1154,13 @@ fn worker_servable(snapshot: &RouteTableSnapshot, route: &RouteInfo) -> bool {
                     .is_none()
         })
         && route.project.as_ref().is_some_and(|project| {
-            !project.attack_mode
-                && project
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|config| config.security.as_ref())
-                    .is_none()
+            project
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.security.as_ref())
+                .is_none()
         })
+        && shield.allows(route_shield_mode(route))
 }
 
 /// Minimal, immutable hostname ownership index for wake-on-request gating.
@@ -3920,22 +3964,24 @@ impl CachedPeerTable {
 
     /// Snapshot public container routes which can be served without bypassing
     /// control-plane request policy. Routes requiring redirect, wake-up,
-    /// attack-mode, or per-project security processing stay on the control
-    /// plane until those policies have a worker-side representation.
+    /// or per-project security processing stay on the control plane until
+    /// those policies have a worker-side representation. Routes whose Shield
+    /// mode acts on verdicts stay there too, unless `shield` says the worker
+    /// runs Shield itself (ADR 066, D10).
     ///
     /// Hosts of a source environment that has path routes (ADR 050) are not
     /// exported either: the worker snapshot carries no path rules, so a
     /// worker-side ingress would send `/api` to the frontend instead of the
     /// target service. They stay on control-plane ingress, where the rules
     /// are applied.
-    pub fn snapshot_worker_public_routes(&self) -> Vec<(String, RouteInfo)> {
+    pub fn snapshot_worker_public_routes(&self, shield: ShieldPinning) -> Vec<(String, RouteInfo)> {
         let snapshot = self.route_snapshot.load();
         snapshot
             .legacy
             .exact
             .iter()
             .filter(|(host, route)| {
-                !host.ends_with(".temps.local") && worker_servable(&snapshot, route)
+                !host.ends_with(".temps.local") && worker_servable(&snapshot, route, shield)
             })
             .map(|(host, route)| (host.clone(), route.clone()))
             .collect()
@@ -3960,7 +4006,7 @@ impl CachedPeerTable {
                 (
                     host.clone(),
                     private.clone(),
-                    worker_servable(&snapshot, &private.route),
+                    worker_servable(&snapshot, &private.route, ShieldPinning::Attack),
                 )
             })
             .collect()
@@ -3981,7 +4027,12 @@ impl CachedPeerTable {
                     && private.address.node_id == Some(node_id)
                     && private.address.on_tailscale()
             })
-            .map(|(_, private)| (private.clone(), worker_servable(&snapshot, &private.route)))
+            .map(|(_, private)| {
+                (
+                    private.clone(),
+                    worker_servable(&snapshot, &private.route, ShieldPinning::Attack),
+                )
+            })
     }
 
     /// Whether `host` is a private address (ADR 064 D5).
@@ -4513,7 +4564,8 @@ mod tests {
                 "project_id": project_id, "current_deployment_id": null, "branch": null,
                 "deleted_at": null, "deployment_config": null, "is_preview": false,
                 "protected": false, "sleeping": false, "attack_mode": null,
-                "force_https": null, "last_activity_at": null
+                "force_https": null, "last_activity_at": null,
+                "shield_mode": null, "shield_exempt_paths": []
             }))
             .expect("environment fixture");
             env.current_deployment_id = current;
@@ -5012,6 +5064,58 @@ mod tests {
             })
         }
 
+        /// ADR 066, D10: an environment that acts on verdicts stays on the
+        /// control plane unless the worker runs Shield; `log` goes anywhere.
+        #[test]
+        fn shield_modes_pin_routes_only_for_workers_without_shield() {
+            let with_mode = |id: i32, project_mode: &str, env_attack: Option<bool>| {
+                let mut environment = env(id, id, "production", Some(id * 10));
+                environment.attack_mode = env_attack;
+                let mut route = route(&environment, id * 10, "10.0.0.1:3000");
+                let mut owner = (*project(id)).clone();
+                owner.shield_mode = project_mode.to_string();
+                route.project = Some(Arc::new(owner));
+                route
+            };
+            let routes = HashMap::from([
+                ("log.example.com".to_string(), with_mode(1, "log", None)),
+                (
+                    "selective.example.com".to_string(),
+                    with_mode(2, "selective", None),
+                ),
+                // `attack_mode` still means attack, whatever the mode says.
+                (
+                    "attack.example.com".to_string(),
+                    with_mode(3, "log", Some(true)),
+                ),
+            ]);
+            let table = table_with(routes, HashMap::new());
+            let hosts = |pinning| {
+                let mut hosts: Vec<String> = table
+                    .snapshot_worker_public_routes(pinning)
+                    .into_iter()
+                    .map(|(host, _)| host)
+                    .collect();
+                hosts.sort();
+                hosts
+            };
+            assert_eq!(hosts(ShieldPinning::Enforcing), ["log.example.com"]);
+            assert_eq!(
+                hosts(ShieldPinning::None),
+                [
+                    "attack.example.com",
+                    "log.example.com",
+                    "selective.example.com"
+                ]
+            );
+            assert_eq!(
+                route_shield_mode(&table.get_route("attack.example.com").unwrap()),
+                temps_shield::ShieldMode::Attack
+            );
+            assert!(ShieldPinning::Attack.allows(temps_shield::ShieldMode::Selective));
+            assert!(!ShieldPinning::Attack.allows(temps_shield::ShieldMode::Attack));
+        }
+
         /// Worker public ingress carries no path rules, so a source
         /// environment's hosts must stay on control-plane ingress while
         /// unrelated hosts (including the rule's target) are still exported.
@@ -5032,7 +5136,7 @@ mod tests {
             // Without path rules both hosts are exported.
             let table = table_with(routes.clone(), HashMap::new());
             let mut hosts: Vec<String> = table
-                .snapshot_worker_public_routes()
+                .snapshot_worker_public_routes(ShieldPinning::Enforcing)
                 .into_iter()
                 .map(|(host, _)| host)
                 .collect();
@@ -5051,7 +5155,7 @@ mod tests {
             );
             let table = table_with(routes, resolved);
             let hosts: Vec<String> = table
-                .snapshot_worker_public_routes()
+                .snapshot_worker_public_routes(ShieldPinning::Enforcing)
                 .into_iter()
                 .map(|(host, _)| host)
                 .collect();
@@ -5179,7 +5283,7 @@ mod tests {
             assert!(table.is_private_hostname("App.Internal.Example.com."));
             // Never a public worker route, so never published by a tunnel.
             let public: Vec<String> = table
-                .snapshot_worker_public_routes()
+                .snapshot_worker_public_routes(ShieldPinning::Enforcing)
                 .into_iter()
                 .map(|(host, _)| host)
                 .collect();
@@ -5668,14 +5772,15 @@ mod tests {
             "id": 1, "project_id": 1, "name": "production", "slug": "production",
             "subdomain": "worker-production", "host": "worker.example.com", "upstreams": [],
             "current_deployment_id": 1, "created_at": now, "updated_at": now,
-            "is_preview": false, "protected": false, "sleeping": false
+            "is_preview": false, "protected": false, "sleeping": false,
+            "shield_exempt_paths": []
         }))
         .unwrap();
         let project: projects::Model = serde_json::from_value(serde_json::json!({
             "id": 1, "name": "worker", "slug": "worker", "repo_name": "worker",
             "repo_owner": "example", "directory": ".", "main_branch": "main", "preset": "dockerfile",
             "created_at": now, "updated_at": now, "pull_only_root_directory": false,
-            "is_deleted": false, "is_public_repo": false, "attack_mode": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log",
             "ai_write_actions_enabled": false, "error_source_context_enabled": false,
             "vulnerability_scanning_enabled": false, "enable_preview_environments": false,
             "preview_envs_on_demand": false, "preview_envs_idle_timeout_seconds": 300,
