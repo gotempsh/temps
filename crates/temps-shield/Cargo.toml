@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-shield"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Shield: signed proof-of-work challenges and clearance cookies (ADR 066)"
+
+[dependencies]
+base64 = { workspace = true }
+hmac = "0.13"
+rand = { workspace = true }
+sha2 = "0.11"
+thiserror = { workspace = true }

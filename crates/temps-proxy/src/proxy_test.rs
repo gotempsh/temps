@@ -280,10 +280,7 @@ pub mod proxy_tests {
             ),
         );
 
-        // Create challenge service
-        let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
-            test_db.db.clone(),
-        ));
+        let challenge_gate = Arc::new(crate::shield::test_gate());
 
         // Create cert-host cache (WS3; starts empty, populated on first refresh)
         let cert_host_cache = Arc::new(crate::service::cert_host_cache::CertHostCache::new(
@@ -300,7 +297,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             Arc::new(temps_core::OpenIpGate),
-            challenge_service,
+            challenge_gate,
             cert_host_cache,
             false,
         );
@@ -932,10 +929,7 @@ pub mod proxy_tests {
             crate::service::ip_access_control_service::IpAccessControlService::new(db.clone()),
         );
 
-        // Create challenge service
-        let challenge_service = Arc::new(
-            crate::service::challenge_service::ChallengeService::new(db.clone()),
-        );
+        let challenge_gate = Arc::new(crate::shield::test_gate());
 
         // Create cert-host cache (WS3; starts empty, populated on first refresh)
         let cert_host_cache = Arc::new(
@@ -952,7 +946,7 @@ pub mod proxy_tests {
             config_service,
             ip_access_control_service,
             Arc::new(temps_core::OpenIpGate),
-            challenge_service,
+            challenge_gate,
             cert_host_cache,
             false,
         );

@@ -34,6 +34,7 @@ pub mod redaction;
 pub mod server;
 pub mod service;
 pub mod services;
+pub mod shield;
 mod static_file_serving;
 pub mod storage;
 pub mod tls_cert_loader;

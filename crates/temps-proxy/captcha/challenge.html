@@ -102,7 +102,7 @@
     </style>
 </head>
 <body>
-    <div class="container">
+    <div class="container" id="shield" data-token="{{TOKEN}}" data-difficulty="{{DIFFICULTY}}">
         <div class="shield-icon">
             <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
@@ -125,7 +125,7 @@
 
         <div class="info" style="margin-top: 12px;">
             <div class="info-text" style="font-size: 12px; color: #718096;">
-                Environment ID: {{ENVIRONMENT_ID}} • Your IP: {{IP_ADDRESS}}
+                Your IP: {{IP_ADDRESS}}
             </div>
         </div>
     </div>
@@ -134,11 +134,11 @@
         // Import WASM module for high-performance PoW solving
         import init, { solve_challenge, verify_solution } from '/api/__temps/temps_captcha_wasm.js';
 
-        const ENVIRONMENT_ID = {{ENVIRONMENT_ID}};
-        const CHALLENGE = '{{CHALLENGE}}';
-        const DIFFICULTY = {{DIFFICULTY}};
-        const IDENTIFIER = '{{IDENTIFIER}}';
-        const IDENTIFIER_TYPE = '{{IDENTIFIER_TYPE}}';
+        // The server-signed token is the proof-of-work input. Values come
+        // from escaped data attributes, never from inline script literals.
+        const shield = document.getElementById('shield');
+        const TOKEN = shield.dataset.token;
+        const DIFFICULTY = Number(shield.dataset.difficulty);
 
         // Progress tracking
         let lastProgressTime = 0;
@@ -250,7 +250,9 @@
                 }
 
                 // Solve the challenge
-                const nonce = await solveChallenge(CHALLENGE, DIFFICULTY);
+                const solveStart = Date.now();
+                const nonce = await solveChallenge(TOKEN, DIFFICULTY);
+                const solveMs = Date.now() - solveStart;
                 console.log('✅ Solution found! Nonce:', nonce);
 
                 // Update status
@@ -265,20 +267,16 @@
                         'Content-Type': 'application/json',
                     },
                     body: JSON.stringify({
-                        challenge: CHALLENGE,
+                        token: TOKEN,
                         nonce: nonce,
-                        environment_id: ENVIRONMENT_ID,
-                        identifier: IDENTIFIER,
-                        identifier_type: IDENTIFIER_TYPE,
+                        solve_ms: solveMs,
                     }),
                 });
 
                 if (!verifyResponse.ok) {
-                    throw new Error('Failed to verify solution');
+                    // "Try Again" reloads the page, which brings a new token.
+                    throw new Error('verification failed');
                 }
-
-                const verifyData = await verifyResponse.json();
-                console.log('✅ Verification response:', verifyData);
 
                 // Success! Reload the page
                 const challengeBox = document.querySelector('.challenge-box');
@@ -302,7 +300,7 @@
                 challengeBox.innerHTML = `
                     <div style="text-align: center; color: #f56565;">
                         <p style="font-weight: 600; margin-bottom: 8px;">❌ Verification Failed</p>
-                        <p style="font-size: 13px;">${error.message}</p>
+                        <p style="font-size: 13px;">Please try again.</p>
                         <button onclick="window.location.reload()" style="margin-top: 16px; padding: 8px 16px; background: #667eea; color: white; border: none; border-radius: 6px; cursor: pointer;">
                             Try Again
                         </button>

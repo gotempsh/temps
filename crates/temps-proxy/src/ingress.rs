@@ -18,11 +18,12 @@
 //! never counts a request against a rate limit twice), counting every
 //! disagreement.
 //!
-//! Everything here is synchronous and allocation-free; the one fact that
-//! needs an asynchronous read (whether a captcha was completed) is asked
-//! for by returning [`Step::NeedsCaptcha`], so the caller awaits it and
-//! resumes after the policy that asked. The proxy writes the response for
-//! an outcome; this module only decides it.
+//! Everything here is synchronous and allocation-free; the one fact read
+//! outside the evaluators (whether the request carries an attack-mode
+//! clearance, ADR 066) is asked for by returning [`Step::NeedsCaptcha`],
+//! so the caller checks it only when a policy needs it and resumes after
+//! the policy that asked. The proxy writes the response for an outcome;
+//! this module only decides it.
 
 use std::cell::Cell;
 use std::net::IpAddr;
@@ -164,7 +165,7 @@ pub struct LegacyRequest<'a> {
 pub struct LegacyFacts {
     /// The rate limiter's answer, when the chain asked it.
     pub rate: Option<RateLimitDecision>,
-    /// The captcha cache's answer, when the chain asked it.
+    /// The clearance check's answer, when the chain asked it.
     pub captcha_completed: Option<bool>,
 }
 

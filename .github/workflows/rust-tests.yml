@@ -956,7 +956,8 @@ jobs:
               package(temps-analytics-funnels) or package(temps-webhooks) or
               package(temps-infra) or package(temps-captcha-wasm) or
               package(temps-geo) or package(temps-environments) or
-              package(temps-audit) or package(temps-analytics-performance))
+              package(temps-audit) or package(temps-analytics-performance) or
+              package(temps-shield))
               and kind(=lib)
           - group: unit-b
             # `not (temps-git and *_real_api)`: those tests call the live

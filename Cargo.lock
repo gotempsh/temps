@@ -15493,6 +15493,7 @@ dependencies = [
  "temps-migrations",
  "temps-presets",
  "temps-routes",
+ "temps-shield",
  "temps-workload-activator",
  "temps-workload-ingress",
  "testcontainers",
@@ -15794,6 +15795,17 @@ dependencies = [
  "tracing",
  "url",
  "utoipa",
+]
+
+[[package]]
+name = "temps-shield"
+version = "0.1.0-beta.57"
+dependencies = [
+ "base64 0.23.1",
+ "hmac 0.13.0",
+ "rand 0.10.3",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
