@@ -454,6 +454,27 @@ mod tests {
         service_registry.register(ip_access_control_service);
         service_registry.register(Arc::new(ProjectIpAccessService::new(db_connection.clone())));
         service_registry.register(Arc::new(NoopAuditLogger) as Arc<dyn temps_core::AuditLogger>);
+        // The Shield routes (ADR 066 I10) need their service and the
+        // platform settings, as in the running server.
+        service_registry.register(Arc::new(
+            crate::service::shield_console_service::ShieldConsoleService::new(
+                db_connection.clone(),
+                Arc::new(crate::storage::shield_stats::PostgresShieldStats::new(
+                    db_connection.clone(),
+                )),
+            ),
+        ));
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test".to_string(),
+            None,
+            Some("127.0.0.1:8000".to_string()),
+        )
+        .expect("ServerConfig::new");
+        service_registry.register(Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            db_connection.clone(),
+        )));
 
         let plugin_context = PluginContext::new(service_registry, state_registry);
         let plugin = ProxyPlugin::new();
