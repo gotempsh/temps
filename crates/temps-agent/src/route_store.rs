@@ -1039,6 +1039,101 @@ mod tests {
         assert!(reloaded.lookup_public("nogate.example.test").is_none());
     }
 
+    /// ADR 066 D10: a route whose environment acts on verdicts is never in
+    /// the fields an older agent reads, wherever the snapshot put it, and
+    /// one in `shield_routes` without settings is not served. This agent
+    /// serves each with its settings, after a restart too, and keeps the
+    /// settings out of the entry a request clones.
+    #[test]
+    fn routes_json_holds_no_shield_route_where_an_older_agent_reads() {
+        #[derive(serde::Deserialize)]
+        struct OldDisk {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            routes: Vec<OldEntry>,
+            #[serde(default)]
+            gated_routes: Vec<OldEntry>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldEntry {
+            host: String,
+        }
+
+        let shielded = |host: &str, mode: &str| RouteEntry {
+            shield: Some(temps_core::worker_shield::ShieldRoutePolicy {
+                project_id: 1,
+                environment_id: 2,
+                mode: mode.to_string(),
+                exempt_paths: Vec::new(),
+                bypass_token_hashes: Vec::new(),
+            }),
+            ..entry(host, "10.0.0.1:80")
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("routes.json");
+        let store = RouteStore::new(path.clone());
+        store.apply_public_snapshot(PublicIngressSnapshot {
+            enabled: true,
+            routes: vec![
+                entry("open.example.test", "10.0.0.1:80"),
+                shielded("logged.example.test", "log"),
+                // In the wrong field: moved, never served open.
+                shielded("misplaced.example.test", "attack"),
+                // A mode this agent does not know is taken as enforcing.
+                shielded("future.example.test", "paranoid"),
+            ],
+            shield_routes: vec![
+                shielded("selective.example.test", "selective"),
+                entry("nosettings.example.test", "10.0.0.1:80"),
+            ],
+            shield: Some(temps_core::worker_shield::ShieldRef { revision: 9 }),
+            ..PublicIngressSnapshot::default()
+        });
+        store.apply_snapshot(1, Vec::new());
+
+        let check = |store: &RouteStore| {
+            for (host, mode) in [
+                ("logged.example.test", temps_shield::ShieldMode::Log),
+                ("misplaced.example.test", temps_shield::ShieldMode::Attack),
+                ("future.example.test", temps_shield::ShieldMode::Selective),
+                (
+                    "selective.example.test",
+                    temps_shield::ShieldMode::Selective,
+                ),
+            ] {
+                let route = store.lookup_public(host).expect(host);
+                assert!(route.shield.is_none(), "{host} clones no settings");
+                assert_eq!(store.shield().policy(host).expect(host).mode, mode);
+            }
+            assert!(store.lookup_public("open.example.test").is_some());
+            assert!(store.shield().policy("open.example.test").is_none());
+            assert!(store.lookup_public("nosettings.example.test").is_none());
+        };
+        check(&store);
+        assert_eq!(
+            *store.shield().subscribe().borrow(),
+            Some(temps_core::worker_shield::ShieldRef { revision: 9 })
+        );
+
+        // The agent that predates Shield on workers, reading the same file,
+        // serves only what it can serve as before.
+        let old: OldDisk = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hosts: Vec<&str> = old
+            .public_ingress
+            .routes
+            .iter()
+            .chain(&old.public_ingress.gated_routes)
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["open.example.test", "logged.example.test"]);
+
+        let reloaded = RouteStore::new(path);
+        reloaded.load_from_disk();
+        check(&reloaded);
+    }
+
     /// ADR 065 D6: a `tailnet_users` route given in the fields every agent
     /// reads is moved out of them, so `routes.json` never holds one there.
     /// The 3b agent's own types, reading that file after a rollback, find

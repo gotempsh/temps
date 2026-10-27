@@ -1884,3 +1884,123 @@ async fn test_serve_socket_admits_only_listed_tailnet_users() {
     stop.notify_waiters();
     backend_shutdown.notify_waiters();
 }
+
+/// ADR 066 D10, I5: the public listener runs Shield for a route that comes
+/// with Shield settings, with the visitor's address from the connection and
+/// TLS from the listener, before anything reaches the app. A route that
+/// only records is served, without the header.
+#[tokio::test]
+async fn test_public_ingress_runs_shield_before_the_backend() {
+    use sha2::Digest;
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let snapshot_dir = TempDir::new().expect("create isolated route snapshot directory");
+    let store = Arc::new(RouteStore::new(snapshot_dir.path().join("routes.json")));
+    let shielded = |host: &str, mode: &str, project_id: i32| RouteEntry {
+        host: host.to_string(),
+        backends: vec![RouteBackend {
+            address: backend_address.to_string(),
+            container_id: Some("test-backend".to_string()),
+            container_name: Some("public-ingress-test-backend".to_string()),
+        }],
+        deployment_id: Some(41),
+        project_id: Some(project_id),
+        environment_id: Some(43),
+        gate: None,
+        shield: Some(temps_core::worker_shield::ShieldRoutePolicy {
+            project_id,
+            environment_id: 43,
+            mode: mode.to_string(),
+            exempt_paths: Vec::new(),
+            bypass_token_hashes: Vec::new(),
+        }),
+    };
+    store.apply_public_snapshot(PublicIngressSnapshot {
+        enabled: true,
+        routes: vec![shielded("logged.example.test", "log", 42)],
+        shield_routes: vec![
+            shielded("blocked.example.test", "selective", 42),
+            shielded("attacked.example.test", "attack", 44),
+        ],
+        shield: Some(temps_core::worker_shield::ShieldRef { revision: 3 }),
+        ..PublicIngressSnapshot::default()
+    });
+    let loopback = temps_shield::Network::v4(0x7f00_0000, 8).expect("loopback network");
+    let snapshot = temps_shield::ShieldSnapshot {
+        revision: 3,
+        // Project 42's own rule: the attack-mode route is another project.
+        scoped: vec![temps_shield::ScopedList {
+            project_id: 42,
+            list: temps_shield::SourceList::new(
+                "test_block",
+                temps_shield::ListVerdict::Block,
+                0,
+                None,
+                [loopback],
+            ),
+        }],
+        ..temps_shield::ShieldSnapshot::default()
+    };
+    store.shield().install(
+        3,
+        temps_shield::Index::new(&snapshot),
+        Some(temps_shield::ShieldKeys::derive(|label| {
+            sha2::Sha256::digest(label.as_bytes()).into()
+        })),
+    );
+    let shutdown = Arc::new(Notify::new());
+    let address = spawn_public_http(
+        "127.0.0.1:0".parse().expect("parse loopback address"),
+        Arc::clone(&store),
+        Arc::clone(&shutdown),
+    )
+    .await
+    .expect("start public ingress listener");
+    let request = |host: &'static str| async move {
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(
+                format!(
+                    "GET / HTTP/1.1\r\nHost: {host}\r\nAccept: text/html\r\n\
+                     User-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+            .await
+            .expect("response timed out")
+            .expect("read response");
+        String::from_utf8(response).expect("response is UTF-8")
+    };
+
+    let blocked = request("blocked.example.test").await;
+    assert!(blocked.starts_with("HTTP/1.1 403"), "{blocked}");
+    assert!(
+        blocked
+            .to_ascii_lowercase()
+            .contains("x-temps-shield: block; ref="),
+        "{blocked}"
+    );
+    // A page load in attack mode over plain HTTP cannot be cleared.
+    let attacked = request("attacked.example.test").await;
+    assert!(attacked.starts_with("HTTP/1.1 426"), "{attacked}");
+    assert!(
+        timeout(Duration::from_millis(200), requests.recv())
+            .await
+            .is_err(),
+        "nothing Shield answered reached the app"
+    );
+
+    let logged = request("logged.example.test").await;
+    assert!(logged.starts_with("HTTP/1.1 200 OK"), "{logged}");
+    assert!(
+        !logged.to_ascii_lowercase().contains("x-temps-shield"),
+        "{logged}"
+    );
+    assert!(requests.recv().await.is_some());
+
+    shutdown.notify_waiters();
+    backend_shutdown.notify_waiters();
+}

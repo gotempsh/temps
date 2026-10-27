@@ -126,7 +126,11 @@ struct UploadTask {
 
 impl UploadTask {
     async fn run(mut self, mut events: mpsc::Receiver<ShieldEvent>, shutdown: Arc<Notify>) {
-        let mut ticker = tokio::time::interval(self.settings.interval);
+        // The first tick a whole interval from now, not at once.
+        let mut ticker = tokio::time::interval_at(
+            Instant::now() + self.settings.interval,
+            self.settings.interval,
+        );
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut backoff = self.settings.initial_backoff;
         let mut retry_at: Option<Instant> = None;
