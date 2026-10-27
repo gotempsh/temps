@@ -65,6 +65,7 @@ import {
   GoogleCloudIcon,
   NamecheapIcon,
 } from '@/components/icons/DnsProviderIcons'
+import { Umbrella } from 'lucide-react'
 
 type DnsProviderType = Exclude<ApiDnsProviderType, 'manual' | 'pebble'>
 
@@ -126,6 +127,13 @@ const digitaloceanFormSchema = z.object({
 })
 
 type DigitalOceanFormData = z.infer<typeof digitaloceanFormSchema>
+
+const desecFormSchema = z.object({
+  name: z.string().trim().min(1, 'Name is required'),
+  description: z.string().optional(),
+  api_token: z.string().trim().min(1, 'API token is required'),
+})
+type DeSecFormData = z.infer<typeof desecFormSchema>
 
 // GCP form schema
 const gcpFormSchema = z.object({
@@ -194,6 +202,13 @@ const PROVIDERS: ProviderInfo[] = [
     description: 'DigitalOcean DNS',
     icon: DigitalOceanIcon,
     keywords: ['digitalocean', 'digital ocean', 'do'],
+  },
+  {
+    type: 'desec',
+    name: 'deSEC',
+    description: 'Privacy-focused DNS hosting with DNSSEC',
+    icon: ({ className }) => <Umbrella className={className} />,
+    keywords: ['desec', 'dnssec', 'dns'],
   },
   {
     type: 'namecheap',
@@ -398,6 +413,11 @@ export function AddDnsProvider() {
     },
   })
 
+  const desecForm = useForm<DeSecFormData>({
+    resolver: zodResolver(desecFormSchema),
+    defaultValues: { name: '', description: '', api_token: '' },
+  })
+
   const gcpForm = useForm<GcpFormData>({
     resolver: zodResolver(gcpFormSchema),
     defaultValues: {
@@ -487,6 +507,9 @@ export function AddDnsProvider() {
           break
         case 'digitalocean':
           nameValid = await digitaloceanForm.trigger('name')
+          break
+        case 'desec':
+          nameValid = await desecForm.trigger('name')
           break
         case 'gcp':
           nameValid = await gcpForm.trigger('name')
@@ -586,6 +609,20 @@ export function AddDnsProvider() {
     createProviderMut.mutate(request)
   }
 
+  const onDeSecSubmit = (data: DeSecFormData) => {
+    setError(null)
+    const credentials: DnsProviderCredentials = {
+      type: 'desec',
+      api_token: data.api_token,
+    }
+    createProviderMut.mutate({
+      name: data.name,
+      provider_type: 'desec',
+      description: data.description || null,
+      credentials,
+    })
+  }
+
   const onGcpSubmit = (data: GcpFormData) => {
     setError(null)
     const credentials: DnsProviderCredentials = {
@@ -638,6 +675,9 @@ export function AddDnsProvider() {
         break
       case 'digitalocean':
         digitaloceanForm.handleSubmit(onDigitalOceanSubmit)()
+        break
+      case 'desec':
+        desecForm.handleSubmit(onDeSecSubmit)()
         break
       case 'gcp':
         gcpForm.handleSubmit(onGcpSubmit)()
@@ -903,6 +943,46 @@ export function AddDnsProvider() {
               />
               <FormField
                 control={digitaloceanForm.control}
+                name="description"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Description (optional)</FormLabel>
+                    <FormControl>
+                      <Textarea
+                        placeholder="DNS provider for production domains"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'desec':
+        return (
+          <Form {...desecForm}>
+            <div className="space-y-4">
+              <FormField
+                control={desecForm.control}
+                name="name"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Name</FormLabel>
+                    <FormControl>
+                      <Input placeholder="My deSEC account" {...field} />
+                    </FormControl>
+                    <FormDescription>
+                      A friendly name to identify this provider
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={desecForm.control}
                 name="description"
                 render={({ field }) => (
                   <FormItem>
@@ -1313,6 +1393,47 @@ export function AddDnsProvider() {
                     <FormDescription>
                       Create a token with read and write scope at
                       cloud.digitalocean.com/account/api/tokens
+                    </FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+          </Form>
+        )
+
+      case 'desec':
+        return (
+          <Form {...desecForm}>
+            <div className="space-y-4">
+              <FormField
+                control={desecForm.control}
+                name="api_token"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>deSEC API token</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        autoComplete="off"
+                        placeholder="Enter your deSEC API token"
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormDescription>
+                      Use a token that can list your domains and write the DNS
+                      RRsets Temps should manage. Token policies can limit
+                      access to selected zones. Temps encrypts the token before
+                      saving and uses it for DNS records, including automated
+                      DNS-01 certificate renewals.{' '}
+                      <a
+                        href="https://desec.readthedocs.io/en/latest/auth/tokens.html"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline"
+                      >
+                        View deSEC token setup
+                      </a>
                     </FormDescription>
                     <FormMessage />
                   </FormItem>

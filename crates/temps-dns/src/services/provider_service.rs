@@ -24,9 +24,9 @@ use tracing::{debug, error, info};
 
 use crate::errors::DnsError;
 use crate::providers::{
-    AzureProvider, BunnyProvider, CloudflareCredentials, CloudflareProvider, DigitalOceanProvider,
-    DnsProvider, DnsProviderType, GcpProvider, ManualDnsProvider, NamecheapProvider,
-    PebbleDnsProvider, ProviderCredentials, Route53Provider,
+    AzureProvider, BunnyProvider, CloudflareCredentials, CloudflareProvider, DeSecProvider,
+    DigitalOceanProvider, DnsProvider, DnsProviderType, GcpProvider, ManualDnsProvider,
+    NamecheapProvider, PebbleDnsProvider, ProviderCredentials, Route53Provider,
 };
 use crate::services::hostname_sync::{self, ConflictDecisions, HostnameModeResult};
 use temps_core::{AppSettings, PublicHostnameStrategy};
@@ -229,6 +229,16 @@ impl DnsProviderService {
                 _ => {
                     return Err(DnsError::InvalidCredentials(
                         "Expected DigitalOcean credentials".to_string(),
+                    ))
+                }
+            },
+            DnsProviderType::DeSec => match credentials {
+                ProviderCredentials::DeSec(desec_creds) => {
+                    Box::new(DeSecProvider::new(desec_creds.clone())?)
+                }
+                _ => {
+                    return Err(DnsError::InvalidCredentials(
+                        "Expected deSEC credentials".to_string(),
                     ))
                 }
             },
@@ -636,6 +646,21 @@ impl DnsProviderService {
                     }
                     _ => Err(DnsError::InvalidCredentials(
                         "Expected DigitalOcean credentials".to_string(),
+                    )),
+                }
+            }
+            DnsProviderType::DeSec => {
+                let credentials: ProviderCredentials = serde_json::from_str(&credentials_json)?;
+                match credentials {
+                    ProviderCredentials::DeSec(desec_creds) => {
+                        let desec_provider = DeSecProvider::new(desec_creds).map_err(|e| {
+                            error!("Failed to create deSEC provider: {}", e);
+                            e
+                        })?;
+                        Ok(Box::new(desec_provider))
+                    }
+                    _ => Err(DnsError::InvalidCredentials(
+                        "Expected deSEC credentials".to_string(),
                     )),
                 }
             }

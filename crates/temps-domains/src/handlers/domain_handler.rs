@@ -2821,7 +2821,7 @@ async fn cleanup_dns_txt_records(
     provider: &dyn temps_dns::providers::DnsProvider,
     plan: &DnsCleanupPlan,
 ) -> Result<DnsCleanupOutcome, DnsCleanupError> {
-    // Cloudflare and DigitalOcean expose a distinct ID for each TXT value.
+    // Cloudflare, DigitalOcean, and deSEC expose a distinct ID for each TXT value.
     // Pebble is the explicitly gated, local-test-only exception: its synthetic
     // ID is the challenge FQDN and delete_record calls challtestsrv's
     // post-validation clear-txt endpoint. Azure, GCP, Route53, and Namecheap
@@ -2833,6 +2833,7 @@ async fn cleanup_dns_txt_records(
         provider_type,
         temps_dns::providers::DnsProviderType::Cloudflare
             | temps_dns::providers::DnsProviderType::DigitalOcean
+            | temps_dns::providers::DnsProviderType::DeSec
             | temps_dns::providers::DnsProviderType::Pebble
     ) {
         return Err(DnsCleanupError::SharedRecordSet {
@@ -4014,6 +4015,54 @@ mod tests {
         ));
         assert!(provider.record_names().is_empty());
         assert!(store.saved.lock().unwrap().is_empty());
+        assert_eq!(store.deleted.lock().unwrap().as_slice(), &[order_url]);
+    }
+
+    #[tokio::test]
+    async fn desec_acme_setup_and_cleanup_clears_exact_value_and_receipt() {
+        let provider = MockDnsProvider::new().with_provider_type(DnsProviderType::DeSec);
+        let store = RecordingCleanupReceiptStore::default();
+        let setup_order = test_acme_order(None);
+        let dns_txt_records = vec![(
+            "_acme-challenge.api.example.com".to_string(),
+            "subdomain-challenge-token".to_string(),
+        )];
+
+        let setup = execute_dns_setup(
+            &provider,
+            &store,
+            setup_order,
+            42,
+            "example.com",
+            &dns_txt_records,
+        )
+        .await
+        .expect("deSEC DNS-01 setup should persist exact record IDs");
+        assert_eq!(setup.records_created, 1);
+        assert!(setup.results.iter().all(|record| record.success));
+        assert_eq!(provider.record_names().len(), 1);
+
+        let receipt = store
+            .saved
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("setup should save a cleanup receipt");
+        let plan = load_dns_cleanup_plan(&receipt)
+            .expect("cleanup receipt should decode")
+            .expect("cleanup plan should exist");
+        let order_url = receipt.order_url.clone();
+
+        let resolution = execute_dns_cleanup(&provider, &store, receipt, plan)
+            .await
+            .expect("deSEC cleanup should complete and remove the receipt");
+
+        assert!(matches!(
+            resolution,
+            DnsCleanupResolution::Complete { deleted: 1 }
+        ));
+        assert!(provider.record_names().is_empty());
         assert_eq!(store.deleted.lock().unwrap().as_slice(), &[order_url]);
     }
 
