@@ -620,7 +620,7 @@ fn per_database_layout(service_type: &str) -> Option<PerDatabaseLayout> {
 ///
 /// Postgres: groups `pg_stat_database` and size metrics by `datname` (size,
 /// cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
-/// by schema (data, index and reclaimable size, table count, estimated rows).
+/// by schema (data, index and free-space size, table count, estimated rows).
 /// The UI shows this as a breakdown table instead of collapsing every database
 /// into one value. Engines without per-database series get an empty list.
 #[utoipa::path(

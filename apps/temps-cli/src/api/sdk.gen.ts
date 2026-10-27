@@ -4190,11 +4190,14 @@ export const externalServiceMetricsUpdateAlertRule = <ThrowOnError extends boole
 });
 
 /**
- * Return the latest per-database metric values for a Postgres service.
+ * Return the latest per-database metric values for a Postgres or MariaDB
+ * service.
  *
- * Groups `pg_stat_database` / size metrics by `datname` so the UI can show a
- * breakdown table (each database with its own size, cache-hit ratio, etc.)
- * rather than collapsing every database into one value.
+ * Postgres: groups `pg_stat_database` and size metrics by `datname` (size,
+ * cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
+ * by schema (data, index and free-space size, table count, estimated rows).
+ * The UI shows this as a breakdown table instead of collapsing every database
+ * into one value. Engines without per-database series get an empty list.
  */
 export const externalServiceMetricsByDatabase = <ThrowOnError extends boolean = false>(options: Options<ExternalServiceMetricsByDatabaseData, ThrowOnError>): RequestResult<ExternalServiceMetricsByDatabaseResponses, ExternalServiceMetricsByDatabaseErrors, ThrowOnError> => (options.client ?? client).get<ExternalServiceMetricsByDatabaseResponses, ExternalServiceMetricsByDatabaseErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

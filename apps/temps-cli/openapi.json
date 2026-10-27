@@ -18878,7 +18878,7 @@
         "description": "Response for the per-database metrics breakdown.",
         "properties": {
           "databases": {
-            "description": "One entry per database, sorted by the first metric descending\n(largest first) so the biggest database leads the table.",
+            "description": "One entry per database, largest first by `database_size_bytes`\n(ties broken by name) so the biggest database leads the table. Empty\nwhen the service's engine has no per-database series (for example\nRedis or S3) or nothing has been scraped yet. MariaDB reports at most\nthe 100 largest schemas.",
             "items": {
               "$ref": "#/components/schemas/DatabaseMetricsRow"
             },
@@ -18891,10 +18891,10 @@
         "type": "object"
       },
       "DatabaseMetricsRow": {
-        "description": "Per-database metric values for a Postgres service.\n\nA Postgres instance can host many databases (some unrelated to this\nservice). The collector records per-`datname` series; this groups the\nlatest value of each requested metric by database so the UI can render a\n\"Databases\" breakdown table instead of one collapsed number.",
+        "description": "Per-database metric values for a Postgres or MariaDB service.\n\nA Postgres or MariaDB instance can host many databases (some unrelated to\nthis service). The collector records one series per database — labelled\n`datname` for Postgres, `schema` for MariaDB; this groups the latest value\nof each of the engine's per-database metrics by database so the UI can\nrender a \"Databases\" breakdown table instead of one collapsed number.",
         "properties": {
           "database": {
-            "description": "Database name (`datname`).",
+            "description": "Database name: the `datname` of a Postgres database, or the schema\nname of a MariaDB database.",
             "type": "string"
           },
           "metrics": {
@@ -18902,7 +18902,7 @@
               "format": "double",
               "type": "number"
             },
-            "description": "Latest value of each requested metric for this database\n(e.g. `{\"pg.database_size_bytes\": 7943871, \"pg.cache_hit_ratio\": 0.99}`).",
+            "description": "Latest value of each of the engine's per-database metrics for this\ndatabase, keyed by metric name (e.g. `{\"pg.database_size_bytes\":\n7943871, \"pg.cache_hit_ratio\": 0.99}` for Postgres, or\n`{\"mariadb.database_size_bytes\": 1589248, \"mariadb.tables\": 3}` for\nMariaDB). A metric that has not been reported is absent.",
             "propertyNames": {
               "type": "string"
             },
@@ -101300,7 +101300,7 @@
     },
     "/external-services/{id}/metrics/by-database": {
       "get": {
-        "description": "Groups `pg_stat_database` / size metrics by `datname` so the UI can show a\nbreakdown table (each database with its own size, cache-hit ratio, etc.)\nrather than collapsing every database into one value.",
+        "description": "Postgres: groups `pg_stat_database` and size metrics by `datname` (size,\ncache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics\nby schema (data, index and free-space size, table count, estimated rows).\nThe UI shows this as a breakdown table instead of collapsing every database\ninto one value. Engines without per-database series get an empty list.",
         "operationId": "ExternalServiceMetricsByDatabase",
         "parameters": [
           {
@@ -101323,10 +101323,13 @@
                 }
               }
             },
-            "description": "Per-database metric breakdown"
+            "description": "Per-database metric breakdown; empty for engines without per-database series"
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "404": {
+            "description": "External service not found"
           },
           "500": {
             "description": "Internal server error"
@@ -101340,7 +101343,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Return the latest per-database metric values for a Postgres service.",
+        "summary": "Return the latest per-database metric values for a Postgres or MariaDB\nservice.",
         "tags": [
           "Metrics"
         ]
