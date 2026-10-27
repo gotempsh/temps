@@ -3242,11 +3242,15 @@ mod teardown_tests {
     #[tokio::test]
     async fn health_probe_portless_withdrawal_requires_worker_route_and_enabled_dns_acknowledgements(
     ) {
-        for (dns_enabled, route_ack, dns_ack, success) in [
-            (false, 7, 0, true),
-            (false, 6, 0, false),
-            (true, 7, 9, true),
-            (true, 7, 8, false),
+        // (cluster DNS on, route ACK, DNS ACK, node runs a resolver, succeeds)
+        for (dns_enabled, route_ack, dns_ack, resolver, success) in [
+            (false, 7, 0, true, true),
+            (false, 6, 0, true, false),
+            (true, 7, 9, true, true),
+            (true, 7, 8, true, false),
+            // A node without a running resolver cannot ACK DNS, and its
+            // containers use Docker's DNS: it must not hold the deploy back.
+            (true, 7, 0, false, true),
         ] {
             let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([[BTreeMap::from([("current", Value::BigInt(Some(7)))])]]);
@@ -3256,15 +3260,23 @@ mod teardown_tests {
                     Value::BigInt(Some(9)),
                 )])]]);
             }
-            mock = mock
-                .append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]])
-                .append_query_results([vec![temps_entities::node_route_state::Model {
-                    node_id: 1,
-                    applied_generation: route_ack,
-                    last_sync_at: None,
-                    health: "healthy".into(),
-                }]]);
+            mock = mock.append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]]);
             if dns_enabled {
+                // Active nodes whose heartbeat reports a running resolver.
+                let resolver_nodes: Vec<BTreeMap<&str, Value>> = if resolver {
+                    vec![BTreeMap::from([("id", Value::Int(Some(1)))])]
+                } else {
+                    Vec::new()
+                };
+                mock = mock.append_query_results([resolver_nodes]);
+            }
+            mock = mock.append_query_results([vec![temps_entities::node_route_state::Model {
+                node_id: 1,
+                applied_generation: route_ack,
+                last_sync_at: None,
+                health: "healthy".into(),
+            }]]);
+            if dns_enabled && resolver {
                 mock = mock.append_query_results([vec![temps_entities::node_dns_state::Model {
                     node_id: 1,
                     applied_generation: dns_ack,
