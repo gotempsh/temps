@@ -104,14 +104,7 @@ impl ProxyShield {
             self.engine
                 .decide(&index, local.as_deref(), policy, request, now)
         };
-        if let (
-            Outcome::Challenge {
-                crawler: Some(crawler),
-                ..
-            },
-            Some(ip),
-        ) = (&decision.outcome, request.ip)
-        {
+        if let (Some(crawler), Some(ip)) = (decision.crawler, request.ip) {
             if self.verify_crawler(ip, crawler).await {
                 ShieldEngine::admit_verified_crawler(&mut decision);
             }

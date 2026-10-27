@@ -2684,6 +2684,34 @@ impl LoadBalancer {
         Ok(true)
     }
 
+    /// Answers an ACME HTTP-01 request whose token is stored for this host,
+    /// and nothing else: `Ok(false)` for every other path.
+    async fn answer_stored_acme_challenge(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<bool> {
+        if !ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            return Ok(false);
+        }
+        let Some(key_authorization) = self
+            .handle_acme_http_challenge(&ctx.host, &ctx.path)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let body = Bytes::from(key_authorization);
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header("Content-Type", "text/plain")?;
+        resp.insert_header("Cache-Control", "no-cache")?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        resp.insert_header("Content-Length", body.len().to_string())?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(body), true).await?;
+        ctx.routing_status = "acme_challenge".to_string();
+        Ok(true)
+    }
+
     async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
         if !path.starts_with(ACME_HTTP01_PREFIX) {
             return Ok(None);
@@ -7083,16 +7111,20 @@ impl ProxyHttp for LoadBalancer {
             if self.serve_solver_asset(session, ctx).await? {
                 return Ok(true);
             }
-            if !ctx.path.starts_with(ACME_HTTP01_PREFIX)
-                && self
-                    .enforce_shield(
-                        session,
-                        ctx,
-                        &project_ctx.project,
-                        &project_ctx.environment,
-                        parsed_ip,
-                    )
-                    .await?
+            // Only a challenge stored for this host skips Shield; any other
+            // path under the ACME prefix is decided like the rest.
+            if self.answer_stored_acme_challenge(session, ctx).await? {
+                return Ok(true);
+            }
+            if self
+                .enforce_shield(
+                    session,
+                    ctx,
+                    &project_ctx.project,
+                    &project_ctx.environment,
+                    parsed_ip,
+                )
+                .await?
             {
                 return Ok(true);
             }
@@ -13011,14 +13043,33 @@ mod shield_enforcement_tests {
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert_eq!(header(&head, "content-type"), Some("application/wasm"));
         assert!(header(&head, "etag").is_some(), "{head}");
-        let acme = request("GET", "/.well-known/acme-challenge/missing", "*/*", "");
-        match send(&s.h, acme, CLEAN, false).await?.outcome {
-            Outcome::Forwarded => {}
-            Outcome::Answered { head, .. } => {
-                assert!(!head.starts_with("HTTP/1.1 426"), "{head}");
-                assert!(header(&head, "x-temps-shield").is_none(), "{head}");
+        // A challenge stored for this host is answered over plain HTTP.
+        {
+            use sea_orm::{ActiveModelTrait, Set};
+            let now = chrono::Utc::now();
+            temps_entities::domains::ActiveModel {
+                domain: Set(HOST.to_string()),
+                status: Set("pending".to_string()),
+                http_challenge_token: Set(Some("stored-token".to_string())),
+                http_challenge_key_authorization: Set(Some("stored-token.thumbprint".to_string())),
+                is_wildcard: Set(false),
+                verification_method: Set("http-01".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
             }
+            .insert(s.h._db.connection_arc().as_ref())
+            .await?;
         }
+        let acme = request("GET", "/.well-known/acme-challenge/stored-token", "*/*", "");
+        let (head, body, _) = answered(send(&s.h, acme, CLEAN, false).await?);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, "stored-token.thumbprint");
+        assert!(header(&head, "x-temps-shield").is_none(), "{head}");
+        // Any other path under the prefix is no way past Shield.
+        let probe = request("GET", "/.well-known/acme-challenge/missing", "*/*", "");
+        let (head, _, _) = answered(send(&s.h, probe, CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 429"), "{head}");
         Ok(())
     }
 

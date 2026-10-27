@@ -345,7 +345,7 @@ pub struct CreateShieldTokenRequest {
     pub project_wide: bool,
 }
 
-/// A new bypass token. `token` is shown this once and never again.
+/// A new bypass token. `secret` is shown this once and never again.
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CreatedShieldTokenResponse {
     #[serde(flatten)]

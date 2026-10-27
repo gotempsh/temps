@@ -63,7 +63,19 @@ export function ShieldLookupPanel({ path }: { path: ShieldEnvironmentPath }) {
       description="Check what Shield would decide for a client address or TLS fingerprint in this environment, and why."
     >
       <form
-        onSubmit={handleSubmit((values) => setSubmitted(values))}
+        onSubmit={handleSubmit((values) => {
+          // The same lookup again asks again: an operator entry changed
+          // below should show in the answer.
+          if (
+            submitted &&
+            submitted.ip === values.ip &&
+            submitted.ja4 === values.ja4
+          ) {
+            void lookup.refetch()
+          } else {
+            setSubmitted(values)
+          }
+        })}
         className="grid gap-4 p-4 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] md:items-end"
         noValidate
       >

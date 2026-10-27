@@ -349,6 +349,9 @@ impl AgentCommand {
                             node_token: config.token.clone(),
                             http,
                             private_key_b64: config.public_ingress_private_key.clone(),
+                            // Where the ingress manager saves the key it
+                            // provisions when `temps join` gave none.
+                            key_file: Some(agent_data_dir().join("public-ingress.key")),
                             uploader: Default::default(),
                         },
                         route_store.shield().clone(),

@@ -2832,6 +2832,16 @@ fn ai_read_allowlist() -> Vec<String> {
         "check_ip_blocked",
         "get_ip_access_control",
         "list_ip_access_control",
+        // ── Shield (ADR 066) ──
+        // Verdict counts, events, lookups and operator entries; token rows
+        // carry only names and dates, never the token or its hash.
+        "get_shield_summary",
+        "list_shield_events",
+        "lookup_shield_client",
+        "list_shield_tokens",
+        "list_project_shield_entries",
+        "list_platform_shield_entries",
+        "get_shield_settings",
         // Geolocation lookup for an IP — country/city, no PII beyond what the
         // caller already knows (the IP itself). Gated by AnalyticsRead.
         "get_ip_geolocation",

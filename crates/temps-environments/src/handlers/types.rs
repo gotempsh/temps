@@ -178,6 +178,7 @@ pub struct EnvironmentResponse {
     pub attack_mode: Option<bool>,
     /// This environment's Shield mode (ADR 066 D1). `null` inherits the
     /// project's. Always serialized so the UI can tell `null` from a value.
+    #[schema(required = true, nullable = true)]
     pub shield_mode: Option<ShieldMode>,
     /// Paths Shield never challenges in this environment (ADR 066 D7):
     /// `/api/*` exempts everything under `/api/`, any other entry one exact

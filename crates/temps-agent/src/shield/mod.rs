@@ -768,11 +768,7 @@ pub(crate) async fn guard(
         };
     };
     let mut decision = engine.decide(&index, local.as_deref(), &policy, &shield_request, now);
-    if let Outcome::Challenge {
-        crawler: Some(crawler),
-        ..
-    } = &decision.outcome
-    {
+    if let Some(crawler) = decision.crawler {
         if let Some(ip) = visitor.ip {
             if shield.verified_crawler(ip, crawler).await {
                 ShieldEngine::admit_verified_crawler(&mut decision);
@@ -874,4 +870,689 @@ fn without_gate(
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use axum::body::Body;
+    use axum::extract::{Query, Request, State};
+    use axum::http::{header, StatusCode};
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::{get, post};
+    use axum::Router;
+    use base64::engine::general_purpose::STANDARD as BASE64;
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+    use tempfile::TempDir;
+    use temps_core::worker_shield::{
+        SealedShieldKeys, ShieldKeyEntry, ShieldKeyMaterial, ShieldRoutePolicy,
+        ShieldSnapshotQuery, ShieldSnapshotResponse, SHIELD_KEYS_INFO,
+    };
+    use temps_shield::{
+        bypass, has_leading_zero_bits, EventKind, EventSink, Index, ListVerdict, Network, Outcome,
+        ShieldEvent, ShieldKeys, ShieldSnapshot, SourceList,
+    };
+
+    use super::{env_policy, guard, open_keys, outcome_response, Visitor, WorkerShield};
+
+    pub(super) const HOST: &str = "app.example.test";
+    pub(super) const CLEAN: IpAddr = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
+    pub(super) const LISTED: Ipv4Addr = Ipv4Addr::new(9, 9, 9, 9);
+    pub(super) const BROWSER: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0";
+
+    pub(super) fn listed() -> IpAddr {
+        IpAddr::V4(LISTED)
+    }
+
+    pub(super) fn policy(mode: &str, bypass_hash: Option<[u8; 32]>) -> ShieldRoutePolicy {
+        ShieldRoutePolicy {
+            project_id: 1,
+            environment_id: 2,
+            mode: mode.to_string(),
+            exempt_paths: vec!["/health".to_string()],
+            bypass_token_hashes: bypass_hash.iter().map(bypass::to_hex).collect(),
+        }
+    }
+
+    pub(super) fn test_key(label: &str) -> [u8; 32] {
+        Sha256::digest(label.as_bytes()).into()
+    }
+
+    pub(super) fn block_list_snapshot(revision: u64) -> ShieldSnapshot {
+        let network = Network::v4(u32::from(LISTED) & 0xffff_ff00, 24).unwrap();
+        ShieldSnapshot {
+            revision,
+            lists: vec![SourceList::new(
+                "test_block",
+                ListVerdict::Block,
+                0,
+                None,
+                [network],
+            )],
+            ..ShieldSnapshot::default()
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct Captured(Mutex<Vec<ShieldEvent>>);
+
+    impl Captured {
+        fn all(&self) -> Vec<ShieldEvent> {
+            self.0.lock().unwrap().clone()
+        }
+
+        fn kinds(&self) -> Vec<EventKind> {
+            self.all().iter().map(|event| event.kind).collect()
+        }
+    }
+
+    impl EventSink for Captured {
+        fn submit(&self, events: Vec<ShieldEvent>) {
+            self.0.lock().unwrap().extend(events);
+        }
+    }
+
+    pub(super) struct Fixture {
+        _dir: TempDir,
+        shield: WorkerShield,
+        events: Arc<Captured>,
+    }
+
+    /// A worker with `policy` for [`HOST`], the test block list loaded and,
+    /// when `engine`, the keys open.
+    pub(super) fn fixture(policy: ShieldRoutePolicy, engine: bool) -> Fixture {
+        let dir = TempDir::new().unwrap();
+        let shield = WorkerShield::new(dir.path().join(super::SNAPSHOT_FILE));
+        let events = Arc::new(Captured::default());
+        shield.set_sink(events.clone());
+        shield.set_routes(
+            [(HOST.to_string(), env_policy(&policy))]
+                .into_iter()
+                .collect(),
+            None,
+        );
+        let keys = engine.then(|| ShieldKeys::derive(test_key));
+        shield.install(1, Index::new(&block_list_snapshot(1)), keys);
+        Fixture {
+            _dir: dir,
+            shield,
+            events,
+        }
+    }
+
+    pub(super) fn page(path: &str) -> axum::http::request::Builder {
+        Request::builder()
+            .method("GET")
+            .uri(path)
+            .header(header::HOST, HOST)
+            .header(header::ACCEPT, "text/html,application/xhtml+xml")
+            .header(header::USER_AGENT, BROWSER)
+    }
+
+    pub(super) fn get_page(path: &str) -> Request {
+        page(path).body(Body::empty()).unwrap()
+    }
+
+    pub(super) fn visitor(ip: IpAddr) -> Visitor {
+        Visitor {
+            ip: Some(ip),
+            fingerprint: None,
+            tls: true,
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub(super) async fn run(
+        fixture: &Fixture,
+        request: Request,
+        visitor: Visitor,
+    ) -> Result<Request, Response> {
+        guard(&fixture.shield, HOST, request, visitor)
+            .await
+            .map(|(request, _)| request)
+    }
+
+    pub(super) fn shield_header(response: &Response) -> String {
+        response
+            .headers()
+            .get(temps_shield::RESPONSE_HEADER)
+            .map(|value| value.to_str().unwrap().to_string())
+            .unwrap_or_default()
+    }
+
+    pub(super) async fn body_text(response: Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    pub(super) fn attribute<'a>(html: &'a str, name: &str) -> &'a str {
+        let start = html.find(&format!("{name}=\"")).unwrap() + name.len() + 2;
+        let end = start + html[start..].find('"').unwrap();
+        &html[start..end]
+    }
+
+    #[test]
+    fn each_outcome_gets_the_control_planes_response() {
+        assert!(outcome_response(&Outcome::Pass, None).is_none());
+
+        let block = outcome_response(&Outcome::Block, None).unwrap();
+        assert_eq!(block.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            block.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+
+        let challenge = outcome_response(
+            &Outcome::Challenge {
+                token: "tok".to_string(),
+                difficulty: 14,
+            },
+            Some(CLEAN),
+        )
+        .unwrap();
+        assert_eq!(challenge.status(), StatusCode::FORBIDDEN);
+        assert_eq!(challenge.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(challenge.headers()["x-challenge-required"], "true");
+
+        let too_many = outcome_response(&Outcome::TooManyRequests, None).unwrap();
+        assert_eq!(too_many.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(too_many.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(
+            too_many.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+
+        let https = outcome_response(&Outcome::HttpsRequired, None).unwrap();
+        assert_eq!(https.status(), StatusCode::UPGRADE_REQUIRED);
+        assert!(https.headers().contains_key(header::UPGRADE));
+
+        let unavailable = outcome_response(&Outcome::Unavailable, None).unwrap();
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(unavailable.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn a_host_without_settings_is_served_as_before() {
+        let fixture = fixture(policy("attack", None), true);
+        let request = Request::builder()
+            .uri("/")
+            .header(bypass::HEADER, "kept")
+            .body(Body::empty())
+            .unwrap();
+        let (request, applied) = guard(
+            &fixture.shield,
+            "other.example.test",
+            request,
+            visitor(listed()),
+        )
+        .await
+        .unwrap();
+        assert!(applied.is_none());
+        assert!(request.headers().contains_key(bypass::HEADER));
+        assert!(fixture.events.kinds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn selective_serves_clean_visitors_and_blocks_listed_ones() {
+        let (token, hash) = bypass::generate(42);
+        let fixture = fixture(policy("selective", Some(hash)), true);
+
+        let request = page("/")
+            .header(bypass::HEADER, "not-a-token")
+            .body(Body::empty())
+            .unwrap();
+        let (forwarded, applied) = guard(&fixture.shield, HOST, request, visitor(CLEAN))
+            .await
+            .unwrap();
+        assert!(applied.is_some(), "Shield ran and records the status");
+        assert!(
+            !forwarded.headers().contains_key(bypass::HEADER),
+            "the bypass header is Shield's alone"
+        );
+        assert!(
+            fixture.events.kinds().is_empty(),
+            "a clean pass is no event"
+        );
+
+        let blocked = run(&fixture, get_page("/"), visitor(listed()))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(shield_header(&blocked).starts_with("block; ref="));
+        let events = fixture.events.all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, EventKind::Verdict);
+        assert_eq!(events[0].verdict, "block");
+        assert_eq!(events[0].ip, listed().to_string());
+        assert_eq!((events[0].project_id, events[0].environment_id), (1, 2));
+        assert_eq!(events[0].mode, "selective");
+        assert_eq!(events[0].host, HOST);
+        assert!(!events[0].reasons.is_empty());
+        assert!(
+            shield_header(&blocked).ends_with(&events[0].request_id),
+            "the header's ref is the event's request id"
+        );
+
+        // A bypass token passes even a listed address.
+        let bypassed = page("/")
+            .header(bypass::HEADER, &token)
+            .body(Body::empty())
+            .unwrap();
+        let forwarded = run(&fixture, bypassed, visitor(listed())).await.unwrap();
+        assert!(!forwarded.headers().contains_key(bypass::HEADER));
+    }
+
+    #[tokio::test]
+    async fn log_mode_records_and_serves() {
+        let fixture = fixture(policy("log", None), true);
+        assert!(run(&fixture, get_page("/"), visitor(listed()))
+            .await
+            .is_ok());
+        let events = fixture.events.all();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].verdict, "block");
+        assert_eq!(events[0].mode, "log");
+    }
+
+    #[tokio::test]
+    async fn attack_answers_what_cannot_show_a_page_and_plain_http() {
+        let fixture = fixture(policy("attack", None), true);
+
+        let api = Request::builder()
+            .uri("/api/items")
+            .header(header::ACCEPT, "application/json")
+            .header(header::USER_AGENT, BROWSER)
+            .body(Body::empty())
+            .unwrap();
+        let api = run(&fixture, api, visitor(CLEAN)).await.unwrap_err();
+        assert_eq!(api.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(api.headers().contains_key(header::RETRY_AFTER));
+        assert!(shield_header(&api).starts_with("challenge; ref="));
+
+        let plain = Visitor {
+            tls: false,
+            ..visitor(CLEAN)
+        };
+        let plain = run(&fixture, get_page("/"), plain).await.unwrap_err();
+        assert_eq!(plain.status(), StatusCode::UPGRADE_REQUIRED);
+
+        // An exempt path is served.
+        assert!(run(&fixture, get_page("/health"), visitor(CLEAN))
+            .await
+            .is_ok());
+    }
+
+    pub(super) fn solve(token: &str, difficulty: u8) -> String {
+        (0u64..)
+            .map(|nonce| nonce.to_string())
+            .find(|nonce| {
+                let hash = Sha256::digest(format!("{token}{nonce}").as_bytes());
+                has_leading_zero_bits(&hash, u32::from(difficulty))
+            })
+            .unwrap()
+    }
+
+    pub(super) fn verify_request(body: serde_json::Value) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri(temps_shield::assets::VERIFY_PATH)
+            .header(header::HOST, HOST)
+            .header(header::USER_AGENT, BROWSER)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    /// D10: the worker issues, verifies and admits on its own, end to end.
+    #[tokio::test]
+    async fn attack_challenges_a_page_load_and_admits_it_once_solved() {
+        let fixture = fixture(policy("attack", None), true);
+
+        let challenged = run(&fixture, get_page("/"), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(challenged.status(), StatusCode::FORBIDDEN);
+        assert!(shield_header(&challenged).starts_with("challenge; ref="));
+        let html = body_text(challenged).await;
+        let token = attribute(&html, "data-token").to_string();
+        let difficulty: u8 = attribute(&html, "data-difficulty").parse().unwrap();
+        // One event per decision, as on the control plane.
+        assert_eq!(fixture.events.kinds(), vec![EventKind::ChallengeIssued]);
+
+        let nonce = solve(&token, difficulty);
+        let verified = run(
+            &fixture,
+            verify_request(serde_json::json!({"token": token, "nonce": nonce, "solve_ms": 120})),
+            visitor(CLEAN),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(verified.status(), StatusCode::OK);
+        let cookie = verified.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(cookie.starts_with(&temps_shield::clearance_cookie_name(2)));
+        let solved = fixture.events.all().pop().unwrap();
+        assert_eq!(solved.kind, EventKind::ChallengeSolved);
+        assert_eq!(solved.solve_ms, Some(120));
+
+        let cleared = page("/")
+            .header(header::COOKIE, format!("theme=dark; {cookie}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(run(&fixture, cleared, visitor(CLEAN)).await.is_ok());
+
+        // The same solution again is refused.
+        let replay = run(
+            &fixture,
+            verify_request(serde_json::json!({"token": token, "nonce": nonce})),
+            visitor(CLEAN),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(replay.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            fixture.events.all().pop().unwrap().kind,
+            EventKind::ChallengeFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn the_verify_endpoint_refuses_what_is_not_a_solution() {
+        let verify = |method: &str, body: Body| {
+            Request::builder()
+                .method(method)
+                .uri(temps_shield::assets::VERIFY_PATH)
+                .body(body)
+                .unwrap()
+        };
+        let keyed = fixture(policy("selective", None), true);
+        let get = run(&keyed, verify("GET", Body::empty()), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(get.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let garbage = run(&keyed, verify("POST", Body::from("nope")), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(garbage.status(), StatusCode::BAD_REQUEST);
+        let large = vec![b'x'; temps_shield::assets::MAX_VERIFY_BODY + 1];
+        let large = run(&keyed, verify("POST", Body::from(large)), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(large.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let keyless = fixture(policy("selective", None), false);
+        let keyless = run(&keyless, verify("POST", Body::from("{}")), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(keyless.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn the_solver_is_served_from_the_worker() {
+        let fixture = fixture(policy("attack", None), true);
+        let js = run(
+            &fixture,
+            get_page(temps_shield::assets::SOLVER_JS_PATH),
+            visitor(CLEAN),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(js.status(), StatusCode::OK);
+        let wasm = run(
+            &fixture,
+            get_page(temps_shield::assets::SOLVER_WASM_PATH),
+            visitor(CLEAN),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(wasm.headers()[header::CONTENT_TYPE], "application/wasm");
+    }
+
+    /// Before the keys open nothing can be challenged: what the lists pass is
+    /// served, what they block is blocked, the rest waits with a 503.
+    #[tokio::test]
+    async fn without_keys_only_what_needs_no_challenge_is_decided() {
+        let selective = fixture(policy("selective", None), false);
+        assert!(run(&selective, get_page("/"), visitor(CLEAN)).await.is_ok());
+        let blocked = run(&selective, get_page("/"), visitor(listed()))
+            .await
+            .unwrap_err();
+        assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+        assert!(shield_header(&blocked).starts_with("block; ref="));
+
+        let attack = fixture(policy("attack", None), false);
+        let waiting = run(&attack, get_page("/"), visitor(CLEAN))
+            .await
+            .unwrap_err();
+        assert_eq!(waiting.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(shield_header(&waiting).starts_with("error; ref="));
+        assert!(run(&attack, get_page("/health"), visitor(CLEAN))
+            .await
+            .is_ok());
+
+        let log = fixture(policy("log", None), false);
+        assert!(run(&log, get_page("/"), visitor(listed())).await.is_ok());
+    }
+
+    // --- Keys and snapshots ---------------------------------------------------
+
+    pub(super) fn keypair() -> (String, String) {
+        let secret = temps_core::ecies::generate_x25519_static_secret().unwrap();
+        let public = x25519_dalek::PublicKey::from(&secret);
+        (
+            BASE64.encode(secret.as_bytes()),
+            BASE64.encode(public.as_bytes()),
+        )
+    }
+
+    /// The keys as the control plane seals them, leaving out entry `skip`.
+    pub(super) fn seal(public_key: &str, skip: Option<usize>) -> SealedShieldKeys {
+        let entries = std::cell::RefCell::new(Vec::new());
+        ShieldKeys::derive(|label| {
+            let key = test_key(label);
+            entries.borrow_mut().push(ShieldKeyEntry {
+                label: label.to_string(),
+                key: BASE64.encode(key),
+            });
+            key
+        });
+        let mut keys = entries.into_inner();
+        if let Some(skip) = skip {
+            keys.remove(skip);
+        }
+        let plaintext = serde_json::to_vec(&ShieldKeyMaterial { keys }).unwrap();
+        let session =
+            temps_core::ecies::EncryptionSession::with_info(public_key, SHIELD_KEYS_INFO).unwrap();
+        let bundle = session.encrypt(&plaintext).unwrap();
+        SealedShieldKeys {
+            ephemeral_public_key: session.ephemeral_public_key().to_string(),
+            ciphertext: bundle.ciphertext,
+            nonce: bundle.nonce,
+        }
+    }
+
+    #[test]
+    fn keys_open_only_with_this_nodes_key_and_only_when_complete() {
+        let (private_key, public_key) = keypair();
+        let (other_private, _) = keypair();
+        assert!(open_keys(&private_key, &seal(&public_key, None)).is_ok());
+        assert!(open_keys(&other_private, &seal(&public_key, None)).is_err());
+        let incomplete = open_keys(&private_key, &seal(&public_key, Some(0)));
+        assert!(incomplete.err().unwrap().to_string().contains("no key for"));
+    }
+
+    #[test]
+    fn a_snapshot_that_does_not_match_its_digest_is_refused() {
+        let body = block_list_snapshot(4).encode().unwrap();
+        let mut response = ShieldSnapshotResponse {
+            revision: 4,
+            sha256: Some(hex::encode(Sha256::digest(&body))),
+            body: Some(BASE64.encode(&body)),
+            keys: None,
+        };
+        assert_eq!(
+            super::decode_snapshot(&response).unwrap().unwrap().revision,
+            4
+        );
+        response.sha256 = Some(hex::encode([0u8; 32]));
+        assert!(matches!(
+            super::decode_snapshot(&response),
+            Err(super::ShieldLoadError::Digest { .. })
+        ));
+        response.body = None;
+        assert!(super::decode_snapshot(&response).unwrap().is_none());
+    }
+
+    pub(super) fn stored_response(revision: u64, public_key: &str) -> ShieldSnapshotResponse {
+        let body = block_list_snapshot(revision).encode().unwrap();
+        ShieldSnapshotResponse {
+            revision,
+            sha256: Some(hex::encode(Sha256::digest(&body))),
+            body: Some(BASE64.encode(&body)),
+            keys: Some(seal(public_key, None)),
+        }
+    }
+
+    /// What the test control plane answers to the snapshot endpoint.
+    #[derive(Clone, Copy)]
+    pub(super) enum Answer {
+        Snapshot,
+        NotFound,
+        Failing,
+    }
+
+    pub(super) struct ControlPlane {
+        pub(super) answer: Mutex<Answer>,
+        pub(super) response: ShieldSnapshotResponse,
+        /// The `revision` each snapshot request asked with.
+        pub(super) asked: Mutex<Vec<u64>>,
+        /// Each event post: how many events, and the status it got.
+        pub(super) posts: Mutex<Vec<(usize, StatusCode)>>,
+        /// Statuses for the next event posts; 202 once empty.
+        pub(super) statuses: Mutex<Vec<StatusCode>>,
+        pub(super) received: Mutex<Vec<ShieldEvent>>,
+    }
+
+    impl ControlPlane {
+        pub(super) fn received_ids(&self) -> Vec<String> {
+            self.received
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|event| event.request_id.clone())
+                .collect()
+        }
+    }
+
+    pub(super) async fn snapshot_endpoint(
+        State(plane): State<Arc<ControlPlane>>,
+        Query(query): Query<ShieldSnapshotQuery>,
+    ) -> Response {
+        plane.asked.lock().unwrap().push(query.revision);
+        let answer = *plane.answer.lock().unwrap();
+        match answer {
+            Answer::NotFound => StatusCode::NOT_FOUND.into_response(),
+            Answer::Failing => StatusCode::BAD_GATEWAY.into_response(),
+            Answer::Snapshot
+                if query.revision != 0 && query.revision == plane.response.revision =>
+            {
+                StatusCode::NOT_MODIFIED.into_response()
+            }
+            Answer::Snapshot => axum::Json(plane.response.clone()).into_response(),
+        }
+    }
+
+    pub(super) async fn events_endpoint(
+        State(plane): State<Arc<ControlPlane>>,
+        headers: axum::http::HeaderMap,
+        body: axum::body::Bytes,
+    ) -> Response {
+        use std::io::Read;
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer node-token");
+        let mut json = Vec::new();
+        flate2::read::GzDecoder::new(&body[..])
+            .read_to_end(&mut json)
+            .unwrap();
+        let events: Vec<ShieldEvent> = serde_json::from_slice(&json).unwrap();
+        let status = {
+            let mut statuses = plane.statuses.lock().unwrap();
+            if statuses.is_empty() {
+                StatusCode::ACCEPTED
+            } else {
+                statuses.remove(0)
+            }
+        };
+        plane.posts.lock().unwrap().push((events.len(), status));
+        if status.is_success() {
+            plane.received.lock().unwrap().extend(events);
+        }
+        status.into_response()
+    }
+
+    pub(super) async fn control_plane(
+        response: ShieldSnapshotResponse,
+    ) -> (Arc<ControlPlane>, String) {
+        let plane = Arc::new(ControlPlane {
+            answer: Mutex::new(Answer::Snapshot),
+            response,
+            asked: Mutex::new(Vec::new()),
+            posts: Mutex::new(Vec::new()),
+            statuses: Mutex::new(Vec::new()),
+            received: Mutex::new(Vec::new()),
+        });
+        let router = Router::new()
+            .route(
+                "/api/internal/nodes/7/shield/snapshot",
+                get(snapshot_endpoint),
+            )
+            .route("/api/internal/nodes/7/shield/events", post(events_endpoint))
+            .with_state(plane.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        (plane, format!("http://{address}"))
+    }
+
+    #[tokio::test]
+    async fn netwatch_gets_each_request_with_its_status() {
+        let fixture = fixture(policy("log", None), true);
+        let socket_path = fixture._dir.path().join("requests.sock");
+        let socket = tokio::net::UnixDatagram::bind(&socket_path).unwrap();
+        fixture.shield.start_netwatch(super::NetwatchConfig {
+            enabled: true,
+            // Nobody answers here: the bans reader only backs off.
+            api_url: "http://127.0.0.1:9".to_string(),
+            api_token: None,
+            socket_path,
+        });
+
+        let (_, applied) = guard(&fixture.shield, HOST, get_page("/.env"), visitor(CLEAN))
+            .await
+            .unwrap();
+        applied
+            .expect("Shield ran")
+            .record_status(StatusCode::NOT_FOUND);
+
+        let mut datagram = vec![0u8; 4096];
+        let length = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut datagram))
+            .await
+            .expect("netwatch got a line")
+            .unwrap();
+        let line: serde_json::Value = serde_json::from_slice(&datagram[..length]).unwrap();
+        assert_eq!(line["v"], 1);
+        assert_eq!(line["ip"], CLEAN.to_string());
+        assert_eq!(line["host"], HOST);
+        assert_eq!(line["path"], "/.env");
+        assert_eq!(line["status"], 404);
+    }
+}

@@ -82,14 +82,8 @@ pub enum Outcome {
     Pass,
     /// 403.
     Block,
-    /// Serve the challenge page for `token`. If `crawler` is set, the
-    /// User-Agent claims that crawler: verify the address first, and pass a
-    /// verified one instead (D7).
-    Challenge {
-        token: String,
-        difficulty: u8,
-        crawler: Option<&'static Crawler>,
-    },
+    /// Serve the challenge page for `token`.
+    Challenge { token: String, difficulty: u8 },
     /// A challenge for a request that cannot show a page (D7): 429 with
     /// `Retry-After` and a problem body.
     TooManyRequests,
@@ -138,6 +132,10 @@ pub struct Decision {
     pub outcome: Outcome,
     /// Set when a verdict other than `pass` did not stop the request.
     pub admitted: Option<Admitted>,
+    /// The crawler the User-Agent claims, set when the request would be
+    /// challenged in any form (page, 429, 426 or 503): the ingress
+    /// verifies the address and passes a verified one instead (D7).
+    pub crawler: Option<&'static Crawler>,
 }
 
 impl Decision {
@@ -147,6 +145,7 @@ impl Decision {
             verdict: Verdict::PASS,
             outcome: Outcome::Pass,
             admitted: None,
+            crawler: None,
         }
     }
 
@@ -270,6 +269,7 @@ impl ShieldEngine {
             verdict,
             outcome: Outcome::Pass,
             admitted: None,
+            crawler: None,
         };
         let listed = decision.verdict.action;
         if !mode.enforces() {
@@ -312,6 +312,9 @@ impl ShieldEngine {
             Admission::NotCleared if listed == Action::Challenge => ChallengeCause::Verdict,
             Admission::NotCleared => ChallengeCause::Attack,
         };
+        // Every challenge below, page or not, is lifted for a verified
+        // crawler: a 429 on robots.txt would stop it crawling.
+        decision.crawler = crawlers::claimed(request.user_agent);
         if !request.is_navigation() {
             decision.outcome = Outcome::TooManyRequests;
             return decision;
@@ -326,20 +329,24 @@ impl ShieldEngine {
             self.load.extra_bits(env_id, now),
         );
         decision.outcome = match self.gate.issue(env_id, &identity, difficulty, now) {
-            Ok(token) => Outcome::Challenge {
-                token,
-                difficulty,
-                crawler: crawlers::claimed(request.user_agent),
-            },
+            Ok(token) => Outcome::Challenge { token, difficulty },
             Err(_) => Outcome::Unavailable,
         };
         decision
     }
 
-    /// Turns a challenge for a crawler whose address the ingress verified
-    /// into a pass (D7).
+    /// Turns a challenge, in any form, for a crawler whose address the
+    /// ingress verified into a pass (D7).
     pub fn admit_verified_crawler(decision: &mut Decision) {
-        if matches!(decision.outcome, Outcome::Challenge { .. }) {
+        if decision.crawler.is_some()
+            && matches!(
+                decision.outcome,
+                Outcome::Challenge { .. }
+                    | Outcome::TooManyRequests
+                    | Outcome::HttpsRequired
+                    | Outcome::Unavailable
+            )
+        {
             decision.outcome = Outcome::Pass;
             decision.admitted = Some(Admitted::VerifiedCrawler);
         }
@@ -545,12 +552,9 @@ mod tests {
         let challenge = decide(&engine, ShieldMode::Selective, &page(LISTED_CHALLENGE));
         assert!(matches!(
             challenge.outcome,
-            Outcome::Challenge {
-                difficulty: 18,
-                crawler: None,
-                ..
-            }
+            Outcome::Challenge { difficulty: 18, .. }
         ));
+        assert_eq!(challenge.crawler, None);
         let clean = decide(&engine, ShieldMode::Selective, &page(CLEAN));
         assert_eq!(clean.outcome, Outcome::Pass);
         assert!(!clean.is_event());
@@ -766,17 +770,43 @@ mod tests {
         googlebot.user_agent =
             "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
         let mut decision = decide(&engine, ShieldMode::Selective, &googlebot);
-        let Outcome::Challenge {
-            crawler: Some(crawler),
-            ..
-        } = &decision.outcome
-        else {
-            panic!("expected a challenge naming the crawler");
-        };
-        assert_eq!(crawler.name, "Googlebot");
+        assert!(matches!(decision.outcome, Outcome::Challenge { .. }));
+        assert_eq!(decision.crawler.map(|c| c.name), Some("Googlebot"));
         ShieldEngine::admit_verified_crawler(&mut decision);
         assert_eq!(decision.outcome, Outcome::Pass);
         assert_eq!(decision.admitted, Some(Admitted::VerifiedCrawler));
+    }
+
+    #[test]
+    fn a_crawler_fetching_robots_txt_in_attack_mode_is_named_too() {
+        let engine = engine();
+        let mut robots = page(CLEAN);
+        robots.path = "/robots.txt";
+        robots.path_and_query = "/robots.txt";
+        robots.accept = "*/*";
+        robots.user_agent =
+            "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)";
+        let mut decision = decide(&engine, ShieldMode::Attack, &robots);
+        assert_eq!(decision.outcome, Outcome::TooManyRequests);
+        assert_eq!(decision.crawler.map(|c| c.name), Some("Googlebot"));
+        ShieldEngine::admit_verified_crawler(&mut decision);
+        assert_eq!(decision.outcome, Outcome::Pass);
+        assert_eq!(decision.admitted, Some(Admitted::VerifiedCrawler));
+
+        let mut http = page(CLEAN);
+        http.tls = false;
+        http.user_agent = robots.user_agent;
+        let decision = decide(&engine, ShieldMode::Attack, &http);
+        assert_eq!(decision.outcome, Outcome::HttpsRequired);
+        assert!(decision.crawler.is_some());
+
+        // A block is never lifted for a crawler.
+        let mut listed = page(LISTED_BLOCK);
+        listed.user_agent = robots.user_agent;
+        let mut decision = decide(&engine, ShieldMode::Attack, &listed);
+        assert_eq!(decision.crawler, None);
+        ShieldEngine::admit_verified_crawler(&mut decision);
+        assert_eq!(decision.outcome, Outcome::Block);
     }
 
     #[test]

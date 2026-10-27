@@ -589,7 +589,16 @@ pub fn match_request(data: &[u8]) -> Option<&'static Signature> {
 
 /// The headers [`match_parts`] reads: where the exploits in the table put
 /// their payloads, and few enough to copy on every request.
-pub const MATCHED_HEADERS: [&str; 4] = ["user-agent", "referer", "x-api-version", "content-type"];
+pub const MATCHED_HEADERS: [&str; 8] = [
+    "user-agent",
+    "referer",
+    "x-api-version",
+    "content-type",
+    "x-middleware-subrequest",
+    "x-pan-authcheck",
+    "next-action",
+    "rsc-action-id",
+];
 
 /// The first signature for a web application that a request matches, from
 /// the parts a proxy has parsed: the method, the path with its query, and
@@ -713,6 +722,28 @@ mod tests {
         assert_eq!(
             id("POST /containers/create HTTP/1.1\r\n\r\n"),
             Some("docker-api")
+        );
+    }
+
+    #[test]
+    fn every_header_a_signature_reads_is_matched() {
+        assert_eq!(
+            match_parts(
+                "GET",
+                "/dashboard",
+                &[("x-middleware-subrequest", "middleware")]
+            )
+            .map(|sig| sig.id),
+            Some("nextjs-middleware")
+        );
+        assert_eq!(
+            match_parts("GET", "/php/ztp_gate.php", &[("x-pan-authcheck", "off")])
+                .map(|sig| sig.id),
+            Some("panos-authcheck")
+        );
+        assert_eq!(
+            match_parts("POST", "/?__proto__", &[("next-action", "x")]).map(|sig| sig.id),
+            Some("react2shell")
         );
     }
 

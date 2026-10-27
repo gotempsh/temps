@@ -5,6 +5,10 @@
 //! name must be one of the crawler's domains, and that name must resolve
 //! back to the address. Answers are cached per address for a day, so a
 //! crawler costs two lookups a day on each ingress, not two per request.
+//! Concurrent requests from one address share one check, and at most
+//! [`MAX_CONCURRENT_CHECKS`] addresses are checked at once: a flood of
+//! claimed crawlers from new addresses waits for a slot, and the ingress's
+//! own timeout turns a long wait into "not verified".
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -19,6 +23,8 @@ use crate::crawlers::Crawler;
 pub const VERIFIED_TTL: Duration = Duration::from_secs(24 * 3600);
 const MAX_CACHED: u64 = 100_000;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// Addresses checked at the same time on one ingress.
+pub const MAX_CONCURRENT_CHECKS: usize = 16;
 
 /// The two lookups verification needs.
 #[async_trait]
@@ -77,6 +83,7 @@ pub struct CrawlerVerifier {
     dns: Arc<dyn CrawlerDns>,
     /// The crawler an address was verified as, or `None` once it failed.
     cache: Cache<IpAddr, Option<&'static str>>,
+    checks: tokio::sync::Semaphore,
 }
 
 impl CrawlerVerifier {
@@ -87,6 +94,7 @@ impl CrawlerVerifier {
                 .max_capacity(MAX_CACHED)
                 .time_to_live(VERIFIED_TTL)
                 .build(),
+            checks: tokio::sync::Semaphore::new(MAX_CONCURRENT_CHECKS),
         }
     }
 
@@ -98,14 +106,19 @@ impl CrawlerVerifier {
     /// Whether `ip` really is `crawler`.
     pub async fn verify(&self, ip: IpAddr, crawler: &'static Crawler) -> bool {
         let ip = ip.to_canonical();
-        if let Some(answer) = self.cache.get(&ip).await {
-            return answer == Some(crawler.name);
-        }
-        let verified = self.lookup(ip, crawler).await;
-        self.cache
-            .insert(ip, verified.then_some(crawler.name))
+        // `get_with` runs one check per address however many requests
+        // wait on it; a check dropped by its caller's timeout caches
+        // nothing.
+        let answer = self
+            .cache
+            .get_with(ip, async {
+                let Ok(_slot) = self.checks.acquire().await else {
+                    return None;
+                };
+                self.lookup(ip, crawler).await.then_some(crawler.name)
+            })
             .await;
-        verified
+        answer == Some(crawler.name)
     }
 
     async fn lookup(&self, ip: IpAddr, crawler: &Crawler) -> bool {
@@ -135,12 +148,14 @@ mod tests {
         ptr: HashMap<IpAddr, Vec<String>>,
         a: HashMap<String, Vec<IpAddr>>,
         lookups: AtomicUsize,
+        delay: Duration,
     }
 
     #[async_trait]
     impl CrawlerDns for FakeDns {
         async fn reverse(&self, ip: IpAddr) -> Vec<String> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.delay).await;
             self.ptr.get(&ip).cloned().unwrap_or_default()
         }
         async fn forward(&self, name: &str) -> Vec<IpAddr> {
@@ -183,5 +198,30 @@ mod tests {
         );
         assert!(!verifier.verify(spoofed, google).await);
         assert!(!verifier.verify(ip("198.51.100.1"), google).await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_requests_from_one_address_share_one_check() {
+        let real = ip("66.249.66.1");
+        let mut dns = FakeDns {
+            delay: Duration::from_millis(50),
+            ..FakeDns::default()
+        };
+        dns.ptr
+            .insert(real, vec!["crawl-66-249-66-1.googlebot.com.".into()]);
+        dns.a
+            .insert("crawl-66-249-66-1.googlebot.com.".into(), vec![real]);
+        let dns = Arc::new(dns);
+        let verifier = Arc::new(CrawlerVerifier::new(dns.clone()));
+        let google = claimed("Googlebot").unwrap();
+        let mut checks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let verifier = verifier.clone();
+            checks.spawn(async move { verifier.verify(real, google).await });
+        }
+        while let Some(verified) = checks.join_next().await {
+            assert!(verified.unwrap());
+        }
+        assert_eq!(dns.lookups.load(Ordering::Relaxed), 1);
     }
 }

@@ -42,6 +42,7 @@ function environment(
     project_id: 1,
     protected: false,
     shield_exempt_paths: [],
+    shield_mode: null,
     sleeping: false,
     slug: 'production',
     subdomain: 'app-production',

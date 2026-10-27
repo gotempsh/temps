@@ -16,6 +16,7 @@ function makeEnvironment(overrides: Partial<EnvironmentResponse> = {}): Environm
     is_preview: false,
     protected: false,
     shield_exempt_paths: [],
+    shield_mode: null,
     sleeping: false,
     created_at: 1_700_000_000,
     updated_at: 1_700_000_000,

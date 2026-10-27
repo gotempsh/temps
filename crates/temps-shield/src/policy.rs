@@ -130,8 +130,13 @@ impl ExemptPaths {
         paths
     }
 
-    /// Whether `path` (without its query) is exempt.
+    /// Whether `path` (without its query) is exempt. A path with a `.` or
+    /// `..` segment, as sent or percent-encoded once or twice, never is:
+    /// `/api/../admin` reaches `/admin` once the app normalises it.
     pub fn matches(&self, path: &str) -> bool {
+        if has_dot_segment(path) {
+            return false;
+        }
         self.exact.iter().any(|exact| exact == path)
             || self.prefixes.iter().any(|prefix| {
                 path.strip_prefix(prefix.as_str())
@@ -142,6 +147,37 @@ impl ExemptPaths {
     pub fn is_empty(&self) -> bool {
         self.exact.is_empty() && self.prefixes.is_empty()
     }
+}
+
+/// Whether `path` has a `.` or `..` segment once decoded, counting `\` as
+/// a separator the way some servers do.
+fn has_dot_segment(path: &str) -> bool {
+    let once = percent_decode(path.as_bytes());
+    let twice = percent_decode(&once);
+    let dotted = |bytes: &[u8]| {
+        bytes
+            .split(|&b| b == b'/' || b == b'\\')
+            .any(|segment| segment == b"." || segment == b"..")
+    };
+    dotted(path.as_bytes()) || dotted(&once) || dotted(&twice)
+}
+
+fn percent_decode(bytes: &[u8]) -> Vec<u8> {
+    let hex = |b: u8| (b as char).to_digit(16).map(|d| d as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(high << 4 | low);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    out
 }
 
 /// One environment's Shield settings, as an ingress applies them.
@@ -209,6 +245,21 @@ mod tests {
         for challenged in ["/apix", "/", "/healthz/x", "/hooks/stripex", "/v1/api"] {
             assert!(!paths.matches(challenged), "{challenged}");
         }
+        for traversal in [
+            "/api/../admin",
+            "/api/./x",
+            "/api/%2e%2e/admin",
+            "/api/%2E%2e%2fadmin",
+            "/api/%252e%252e/admin",
+            "/api/..\\admin",
+            "/api/..",
+        ] {
+            assert!(!paths.matches(traversal), "{traversal}");
+        }
+        assert!(
+            paths.matches("/api/v1.2/file.tar.gz"),
+            "dots inside a segment are fine"
+        );
     }
 
     #[test]

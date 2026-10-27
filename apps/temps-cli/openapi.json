@@ -17823,7 +17823,7 @@
             "type": "object"
           }
         ],
-        "description": "A new bypass token. `token` is shown this once and never again."
+        "description": "A new bypass token. `secret` is shown this once and never again."
       },
       "CronExecutionInfo": {
         "properties": {
@@ -25506,6 +25506,7 @@
           "is_preview",
           "protected",
           "sleeping",
+          "shield_mode",
           "shield_exempt_paths"
         ],
         "type": "object"

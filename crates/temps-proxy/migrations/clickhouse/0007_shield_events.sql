@@ -26,5 +26,8 @@ CREATE TABLE IF NOT EXISTS shield_events
     solve_ms Nullable(UInt32)
 )
 ENGINE = MergeTree
+-- Daily partitions let the learning job's last-hour reads, which name no
+-- environment, skip all but the newest partition.
+PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (environment_id, timestamp)
 TTL toDateTime(timestamp) + INTERVAL 30 DAY

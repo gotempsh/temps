@@ -12,7 +12,7 @@
 //! A 404 is a control plane without Shield on workers: nothing is fetched
 //! again until the route snapshot names a revision.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +45,23 @@ pub struct ShieldSyncConfig {
     /// The node's public-ingress private key (base64), which the keys are
     /// sealed to. Without it the lists load but no challenge is issued.
     pub private_key_b64: Option<String>,
+    /// Where the public-ingress manager keeps the key it generates when
+    /// `private_key_b64` is unset; read on every fetch, so a key
+    /// provisioned after startup is picked up.
+    pub key_file: Option<PathBuf>,
     pub uploader: UploaderSettings,
+}
+
+impl ShieldSyncConfig {
+    /// The key to open the sealed keys with: the configured one, else the
+    /// one the ingress manager saved.
+    fn private_key(&self) -> Option<String> {
+        self.private_key_b64.clone().or_else(|| {
+            let saved = std::fs::read_to_string(self.key_file.as_ref()?).ok()?;
+            let saved = saved.trim();
+            (!saved.is_empty()).then(|| saved.to_string())
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +82,12 @@ pub enum ShieldFetchError {
     Load(#[from] ShieldLoadError),
     #[error("decoding the Shield snapshot stopped: {0}")]
     Join(String),
+    #[error(
+        "the control plane has nothing newer than revision {loaded}, but the routes name {wanted}"
+    )]
+    Behind { loaded: u64, wanted: u64 },
+    #[error("Shield lists are loaded, but challenges cannot be issued: {0}")]
+    Keys(ShieldLoadError),
 }
 
 #[derive(Debug, Error)]
@@ -113,7 +135,7 @@ pub fn start(
 
 async fn run(config: ShieldSyncConfig, shield: Arc<WorkerShield>, shutdown: Arc<Notify>) {
     let mut changes = shield.subscribe();
-    match load_from_disk(&shield, config.private_key_b64.as_deref()).await {
+    match load_from_disk(&shield, config.private_key().as_deref()).await {
         Ok(Some(revision)) => info!(revision, "loaded the Shield snapshot from disk"),
         Ok(None) => {}
         Err(error) => warn!(%error, "ignoring the Shield snapshot on disk"),
@@ -195,7 +217,18 @@ pub async fn fetch_once(
         .await
         .map_err(request_error)?;
     match response.status() {
-        StatusCode::NOT_MODIFIED => return Ok(Fetched::Unchanged),
+        // The routes name a revision this control plane says is not newer:
+        // another control plane stored it and this one has not seen it
+        // yet. Retry rather than wait for the next route change.
+        StatusCode::NOT_MODIFIED => {
+            if let Some(wanted) = wanted.filter(|wanted| wanted.revision > loaded) {
+                return Err(ShieldFetchError::Behind {
+                    loaded,
+                    wanted: wanted.revision,
+                });
+            }
+            return Ok(Fetched::Unchanged);
+        }
         StatusCode::NOT_FOUND => return Ok(Fetched::Unsupported),
         status if !status.is_success() => {
             return Err(ShieldFetchError::Status { url, status });
@@ -228,21 +261,16 @@ pub async fn fetch_once(
         })?;
     let revision = snapshot.revision;
     let snapshot = Arc::new(snapshot);
-    let keys = install(
-        shield,
-        Arc::clone(&snapshot),
-        config.private_key_b64.clone(),
-    )
-    .await?;
+    let keys = install(shield, Arc::clone(&snapshot), config.private_key()).await?;
     let path = shield.path().to_path_buf();
-    match tokio::task::spawn_blocking(move || persist(&path, &snapshot)).await {
+    match tokio::task::spawn_blocking(move || persist_keeping_keys(&path, &snapshot)).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(%error, "the Shield snapshot is loaded but not kept on disk"),
         Err(error) => warn!(%error, "the Shield snapshot is loaded but not kept on disk"),
     }
-    if let Err(error) = keys {
-        warn!(%error, "Shield lists are loaded, but challenges cannot be issued");
-    }
+    // Retried with backoff: the ingress key may only be provisioned later,
+    // and a route change need not follow when it is.
+    keys.map_err(ShieldFetchError::Keys)?;
     Ok(Fetched::Installed(revision))
 }
 
@@ -348,6 +376,33 @@ fn read_capped(path: &Path) -> Result<Option<Vec<u8>>, String> {
     Ok(Some(bytes))
 }
 
+/// As [`persist`], keeping the sealed keys already on disk when `response`
+/// carries none: a response without keys says nothing about the ones the
+/// worker has, and a restart must still find them.
+fn persist_keeping_keys(
+    path: &Path,
+    response: &ShieldSnapshotResponse,
+) -> Result<(), ShieldPersistError> {
+    if response.keys.is_some() {
+        return persist(path, response);
+    }
+    let kept = read_capped(path)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<ShieldSnapshotResponse>(&bytes).ok())
+        .and_then(|saved| saved.keys);
+    match kept {
+        Some(keys) => persist(
+            path,
+            &ShieldSnapshotResponse {
+                keys: Some(keys),
+                ..response.clone()
+            },
+        ),
+        None => persist(path, response),
+    }
+}
+
 /// Write `response` to `path` through a temporary file in the same
 /// directory, readable by this user only (the keys in it are sealed, but
 /// the file is still nobody else's business).
@@ -373,4 +428,213 @@ fn persist(path: &Path, response: &ShieldSnapshotResponse) -> Result<(), ShieldP
     file.persist(path)
         .map_err(|error| write_error(error.error))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+
+    use tempfile::TempDir;
+    use temps_core::worker_shield::{ShieldRef, ShieldSnapshotResponse};
+
+    use super::*;
+    use crate::shield::tests::*;
+    use crate::shield::{env_policy, guard, WorkerShield};
+    use axum::http::StatusCode;
+
+    fn sync_config(url: &str, private_key: Option<String>) -> ShieldSyncConfig {
+        ShieldSyncConfig {
+            control_plane_url: url.to_string(),
+            node_id: 7,
+            node_token: "node-token".to_string(),
+            http: reqwest::Client::new(),
+            private_key_b64: private_key,
+            key_file: None,
+            uploader: UploaderSettings::default(),
+        }
+    }
+
+    /// A worker with a `selective` route and nothing loaded.
+    fn routed_shield(dir: &TempDir) -> WorkerShield {
+        let shield = WorkerShield::new(dir.path().join(crate::shield::SNAPSHOT_FILE));
+        shield.set_routes(
+            [(HOST.to_string(), env_policy(&policy("selective", None)))]
+                .into_iter()
+                .collect(),
+            Some(ShieldRef { revision: 5 }),
+        );
+        shield
+    }
+
+    async fn blocks_listed(shield: &WorkerShield) -> bool {
+        guard(shield, HOST, get_page("/"), visitor(listed()))
+            .await
+            .is_err_and(|response| response.status() == StatusCode::FORBIDDEN)
+    }
+
+    #[tokio::test]
+    async fn a_fetched_snapshot_is_swapped_in_kept_on_disk_and_loaded_offline() {
+        let (private_key, public_key) = keypair();
+        let (plane, url) = control_plane(stored_response(5, &public_key)).await;
+        let config = sync_config(&url, Some(private_key.clone()));
+        let dir = TempDir::new().unwrap();
+        let shield = routed_shield(&dir);
+        assert!(
+            !blocks_listed(&shield).await,
+            "the built-in lists do not list it"
+        );
+
+        let wanted = Some(ShieldRef { revision: 5 });
+        assert_eq!(
+            fetch_once(&config, &shield, wanted).await.unwrap(),
+            Fetched::Installed(5)
+        );
+        assert_eq!(shield.revision(), 5);
+        assert!(shield.has_engine());
+        assert!(blocks_listed(&shield).await);
+        // With no engine yet, the worker asks for everything (revision 0).
+        assert_eq!(*plane.asked.lock().unwrap(), vec![0]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.path().join(crate::shield::SNAPSHOT_FILE);
+            let mode = std::fs::metadata(path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+
+        // The revision the routes name is loaded: nothing to ask.
+        assert_eq!(
+            fetch_once(&config, &shield, wanted).await.unwrap(),
+            Fetched::Unchanged
+        );
+        assert_eq!(plane.asked.lock().unwrap().len(), 1);
+        // A newer one named, but this control plane has nothing newer yet: a
+        // 304 that leaves the worker behind is retried, not taken as current.
+        assert!(matches!(
+            fetch_once(&config, &shield, Some(ShieldRef { revision: 6 })).await,
+            Err(ShieldFetchError::Behind {
+                loaded: 5,
+                wanted: 6
+            })
+        ));
+        assert_eq!(*plane.asked.lock().unwrap(), vec![0, 5]);
+
+        // Restarted without the control plane: the same lists and keys.
+        let restarted = routed_shield(&dir);
+        assert_eq!(
+            load_from_disk(&restarted, Some(&private_key))
+                .await
+                .unwrap(),
+            Some(5)
+        );
+        assert!(restarted.has_engine());
+        assert!(blocks_listed(&restarted).await);
+
+        // Nothing on disk is nothing loaded.
+        let empty = TempDir::new().unwrap();
+        let fresh = routed_shield(&empty);
+        assert_eq!(
+            load_from_disk(&fresh, Some(&private_key)).await.unwrap(),
+            None
+        );
+        assert!(!fresh.has_engine());
+    }
+
+    #[tokio::test]
+    async fn an_old_control_plane_or_a_failing_one_leaves_what_is_loaded() {
+        let (private_key, public_key) = keypair();
+        let (plane, url) = control_plane(stored_response(5, &public_key)).await;
+        let config = sync_config(&url, Some(private_key));
+        let dir = TempDir::new().unwrap();
+        let shield = routed_shield(&dir);
+
+        *plane.answer.lock().unwrap() = Answer::NotFound;
+        assert_eq!(
+            fetch_once(&config, &shield, None).await.unwrap(),
+            Fetched::Unsupported
+        );
+        *plane.answer.lock().unwrap() = Answer::Failing;
+        assert!(fetch_once(&config, &shield, None).await.is_err());
+        assert_eq!(shield.revision(), 0);
+        assert!(!shield.has_engine());
+        assert!(!dir.path().join(crate::shield::SNAPSHOT_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn lists_load_even_when_the_keys_are_for_another_node() {
+        let (_, public_key) = keypair();
+        let (other_private, _) = keypair();
+        let (_plane, url) = control_plane(stored_response(5, &public_key)).await;
+        let dir = TempDir::new().unwrap();
+        let shield = routed_shield(&dir);
+        // The keys failing is an error, so the sync retries, but the lists
+        // are in use already.
+        assert!(matches!(
+            fetch_once(&sync_config(&url, Some(other_private)), &shield, None).await,
+            Err(ShieldFetchError::Keys(_))
+        ));
+        assert_eq!(shield.revision(), 5);
+        assert!(!shield.has_engine());
+        assert!(blocks_listed(&shield).await);
+    }
+
+    #[tokio::test]
+    async fn a_key_provisioned_after_startup_opens_the_keys() {
+        let (private_key, public_key) = keypair();
+        let (_plane, url) = control_plane(stored_response(5, &public_key)).await;
+        let dir = TempDir::new().unwrap();
+        let key_file = dir.path().join("public-ingress.key");
+        let config = ShieldSyncConfig {
+            key_file: Some(key_file.clone()),
+            ..sync_config(&url, None)
+        };
+        let shield = routed_shield(&dir);
+        assert!(matches!(
+            fetch_once(&config, &shield, None).await,
+            Err(ShieldFetchError::Keys(_))
+        ));
+        assert!(!shield.has_engine());
+        // The ingress manager saves the key it registered.
+        std::fs::write(&key_file, format!("{private_key}\n")).unwrap();
+        assert_eq!(
+            fetch_once(&config, &shield, None).await.unwrap(),
+            Fetched::Installed(5)
+        );
+        assert!(shield.has_engine());
+    }
+
+    #[tokio::test]
+    async fn a_response_without_keys_keeps_the_ones_on_disk() {
+        let (private_key, public_key) = keypair();
+        let dir = TempDir::new().unwrap();
+        let (_plane, url) = control_plane(stored_response(5, &public_key)).await;
+        let shield = routed_shield(&dir);
+        fetch_once(&sync_config(&url, Some(private_key.clone())), &shield, None)
+            .await
+            .unwrap();
+
+        // A later restart fetches from a control plane that sends no keys.
+        let keyless = ShieldSnapshotResponse {
+            keys: None,
+            ..stored_response(6, &public_key)
+        };
+        let (_plane, url) = control_plane(keyless).await;
+        let restarted = routed_shield(&dir);
+        assert!(fetch_once(
+            &sync_config(&url, Some(private_key.clone())),
+            &restarted,
+            None
+        )
+        .await
+        .is_err());
+        assert_eq!(restarted.revision(), 6);
+
+        // The keys from the first fetch are still on disk for the next start.
+        let again = routed_shield(&dir);
+        assert_eq!(
+            load_from_disk(&again, Some(&private_key)).await.unwrap(),
+            Some(6)
+        );
+        assert!(again.has_engine());
+    }
 }

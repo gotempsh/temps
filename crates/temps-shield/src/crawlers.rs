@@ -45,7 +45,10 @@ pub static CRAWLERS: &[Crawler] = &[
             "mediapartners-google",
             "storebot-google",
         ],
-        domains: &["googlebot.com", "google.com", "googleusercontent.com"],
+        // Google's special-case crawlers resolve under
+        // `gae.googleusercontent.com`; the rest of `googleusercontent.com`
+        // is customers' Cloud VMs, whose owners set their own PTR records.
+        domains: &["googlebot.com", "google.com", "gae.googleusercontent.com"],
     },
     Crawler {
         name: "Bingbot",
@@ -113,6 +116,11 @@ mod tests {
         );
         assert!(!google.owns("crawl-1.googlebot.com.attacker.net"));
         assert!(!google.owns("evilgooglebot.com"));
+        assert!(google.owns("rate-limited-proxy-1.gae.googleusercontent.com"));
+        assert!(
+            !google.owns("1.2.3.4.bc.googleusercontent.com"),
+            "a Google Cloud customer's VM is no crawler"
+        );
         let bing = claimed("bingbot").unwrap();
         assert!(bing.owns("msnbot-157-55-39-1.search.msn.com"));
         assert!(!bing.owns("msnbot.search.msn.com.example"));

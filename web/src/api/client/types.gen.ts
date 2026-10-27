@@ -8627,7 +8627,7 @@ export type CreatedResource = {
 };
 
 /**
- * A new bypass token. `token` is shown this once and never again.
+ * A new bypass token. `secret` is shown this once and never again.
  */
 export type CreatedShieldTokenResponse = ShieldTokenResponse & {
     /**
@@ -12153,7 +12153,7 @@ export type EnvironmentResponse = {
      * path.
      */
     shield_exempt_paths: Array<string>;
-    shield_mode?: ShieldMode | null;
+    shield_mode: ShieldMode | null;
     /**
      * When true, the environment's containers are currently stopped due to
      * inactivity (on-demand mode) and will start on the next request.

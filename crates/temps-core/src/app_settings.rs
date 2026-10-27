@@ -2774,10 +2774,20 @@ impl AppSettings {
                     serde_json::from_value::<OnDemandTlsSettings>(section.clone()).ok()
                 })
                 .unwrap_or_else(legacy_on_demand_tls_settings);
+            // Fleet sharing is an opt-out too: a malformed section reads as
+            // not sharing, never as the sharing default.
+            let shield = match value.get("shield") {
+                None | Some(serde_json::Value::Null) => ShieldSettings::default(),
+                Some(section) => serde_json::from_value::<ShieldSettings>(section.clone())
+                    .unwrap_or(ShieldSettings {
+                        share_observations: false,
+                    }),
+            };
             Self {
                 anonymous_telemetry_enabled,
                 clickhouse,
                 on_demand_tls,
+                shield,
                 ..Self::default()
             }
         })
@@ -4243,6 +4253,33 @@ mod tests {
         });
         let parsed = AppSettings::from_json(legacy);
         assert!(!parsed.multi_node.require_mtls);
+    }
+}
+
+#[cfg(test)]
+mod shield_settings_tests {
+    use super::{AppSettings, ShieldSettings};
+
+    #[test]
+    fn a_malformed_unrelated_section_keeps_the_shield_opt_out() {
+        // `geo` cannot parse, so the whole document takes the fallback.
+        let stored = serde_json::json!({
+            "geo": "not an object",
+            "shield": { "share_observations": false }
+        });
+        assert!(!AppSettings::from_json(stored).shield.share_observations);
+
+        let malformed = serde_json::json!({
+            "geo": "not an object",
+            "shield": { "share_observations": "maybe" }
+        });
+        assert!(!AppSettings::from_json(malformed).shield.share_observations);
+
+        let absent = serde_json::json!({ "geo": "not an object" });
+        assert_eq!(
+            AppSettings::from_json(absent).shield,
+            ShieldSettings::default()
+        );
     }
 }
 

@@ -36,7 +36,7 @@ utoipa = { workspace = true, optional = true }
 # a socket.
 tokio = ["dep:tokio"]
 # `crawler_check`: verifying claimed crawlers by DNS, for the ingresses.
-crawlers = ["tokio", "tokio/time", "dep:async-trait", "dep:hickory-resolver", "dep:moka"]
+crawlers = ["tokio", "tokio/sync", "tokio/time", "dep:async-trait", "dep:hickory-resolver", "dep:moka"]
 # `netwatch`: netwatch's bans as a local list, and request lines sent to
 # it (D12). Off unless the node runs netwatch.
 netwatch = [

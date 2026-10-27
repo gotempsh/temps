@@ -244,3 +244,164 @@ pub(crate) fn gzip_json(events: &[ShieldEvent]) -> std::io::Result<Vec<u8>> {
     encoder.flush()?;
     encoder.finish()
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use axum::http::StatusCode;
+    use temps_shield::{EventKind, ShieldEvent, ShieldMode};
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::shield::tests::*;
+
+    // --- Event uploader -------------------------------------------------------
+
+    fn event(n: usize) -> ShieldEvent {
+        ShieldEvent {
+            timestamp_ms: 1_700_000_000_000 + n as i64,
+            project_id: 1,
+            environment_id: 2,
+            node_id: None,
+            request_id: format!("req-{n}"),
+            kind: EventKind::Verdict,
+            ip: CLEAN.to_string(),
+            ja4: None,
+            verdict: "block".to_string(),
+            mode: ShieldMode::Selective.as_str().to_string(),
+            reasons: vec!["test_block".to_string()],
+            signature: None,
+            host: HOST.to_string(),
+            path: "/".to_string(),
+            user_agent: BROWSER.to_string(),
+            difficulty: None,
+            solve_ms: None,
+        }
+    }
+
+    fn uploader(url: &str, settings: UploaderSettings) -> (Arc<EventUploader>, Arc<Notify>) {
+        let shutdown = Arc::new(Notify::new());
+        let uploader = EventUploader::spawn(
+            reqwest::Client::new(),
+            format!("{url}/api/internal/nodes/7/shield/events"),
+            "node-token".to_string(),
+            settings,
+            shutdown.clone(),
+        );
+        (uploader, shutdown)
+    }
+
+    async fn until(condition: impl Fn() -> bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition not met in time");
+    }
+
+    fn quick(batch: usize, interval: Duration, backoff: Duration) -> UploaderSettings {
+        UploaderSettings {
+            batch,
+            interval,
+            initial_backoff: backoff,
+            max_backoff: backoff,
+            ..UploaderSettings::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_full_batch_is_sent_at_once_and_the_rest_on_the_interval() {
+        let (plane, url) = control_plane(stored_response(1, &keypair().1)).await;
+        let settings = quick(3, Duration::from_millis(300), Duration::from_millis(20));
+        let (uploader, _shutdown) = uploader(&url, settings);
+        uploader.submit((0..4).map(event).collect());
+        until(|| plane.received.lock().unwrap().len() == 4).await;
+        assert_eq!(
+            *plane.posts.lock().unwrap(),
+            vec![(3, StatusCode::ACCEPTED), (1, StatusCode::ACCEPTED)],
+            "the full batch at once, the rest on the interval"
+        );
+        assert_eq!(
+            plane.received_ids(),
+            vec!["req-0", "req-1", "req-2", "req-3"]
+        );
+        assert_eq!(uploader.dropped(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_post_is_retried_and_a_refused_one_dropped() {
+        let (plane, url) = control_plane(stored_response(1, &keypair().1)).await;
+        *plane.statuses.lock().unwrap() = vec![StatusCode::SERVICE_UNAVAILABLE];
+        let settings = quick(2, Duration::from_millis(30), Duration::from_millis(20));
+        let (uploader, _shutdown) = uploader(&url, settings);
+        uploader.submit((0..2).map(event).collect());
+        until(|| plane.received.lock().unwrap().len() == 2).await;
+        assert_eq!(
+            plane.posts.lock().unwrap()[..2],
+            [
+                (2, StatusCode::SERVICE_UNAVAILABLE),
+                (2, StatusCode::ACCEPTED)
+            ]
+        );
+
+        *plane.statuses.lock().unwrap() = vec![StatusCode::BAD_REQUEST];
+        uploader.submit((2..4).map(event).collect());
+        until(|| uploader.dropped() == 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            plane.posts.lock().unwrap().len(),
+            3,
+            "a refusal is not retried"
+        );
+        assert_eq!(plane.received_ids(), vec!["req-0", "req-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_full_queue_drops_events_without_waiting() {
+        let (_plane, url) = control_plane(stored_response(1, &keypair().1)).await;
+        let settings = UploaderSettings {
+            queue: 2,
+            ..quick(500, Duration::from_secs(60), Duration::from_millis(20))
+        };
+        let (uploader, _shutdown) = uploader(&url, settings);
+        // The test runtime has one thread: the uploader task does not run
+        // while `submit` does.
+        uploader.submit((0..5).map(event).collect());
+        assert_eq!(uploader.dropped(), 3);
+    }
+
+    #[tokio::test]
+    async fn the_buffer_keeps_the_newest_while_the_control_plane_is_down() {
+        let (plane, url) = control_plane(stored_response(1, &keypair().1)).await;
+        *plane.statuses.lock().unwrap() = vec![StatusCode::BAD_GATEWAY; 3];
+        let settings = UploaderSettings {
+            buffer: 3,
+            ..quick(1, Duration::from_millis(20), Duration::from_millis(300))
+        };
+        let (uploader, _shutdown) = uploader(&url, settings);
+        uploader.submit(vec![event(0)]);
+        until(|| !plane.posts.lock().unwrap().is_empty()).await;
+        // Within the backoff: four more into a buffer of three.
+        uploader.submit((1..5).map(event).collect());
+        until(|| plane.received.lock().unwrap().len() == 3).await;
+        assert_eq!(plane.received_ids(), vec!["req-2", "req-3", "req-4"]);
+        assert_eq!(uploader.dropped(), 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_sends_what_waits() {
+        let (plane, url) = control_plane(stored_response(1, &keypair().1)).await;
+        let settings = quick(500, Duration::from_secs(60), Duration::from_millis(20));
+        let (uploader, shutdown) = uploader(&url, settings);
+        // Let the task reach its wait, past the interval's first tick.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        uploader.submit((0..2).map(event).collect());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.notify_waiters();
+        until(|| plane.received.lock().unwrap().len() == 2).await;
+    }
+}
