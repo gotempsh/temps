@@ -3,17 +3,19 @@
 
 import {
   getShieldSettingsOptions,
+  listShieldProposalsOptions,
   getShieldSettingsQueryKey,
   updateShieldSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
-import { ShieldProposalsPanel } from '@/components/shield/ShieldProposalsPanel'
+import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 
 /**
@@ -95,7 +97,7 @@ export function ShieldPlatformSettings() {
 
       <div className="space-y-3">
         <h3 className="text-sm font-medium">Proposals</h3>
-        <ShieldProposalsPanel learning={sharing} />
+        <ShieldProposalsSummary />
       </div>
 
       <Separator />
@@ -104,6 +106,33 @@ export function ShieldPlatformSettings() {
         <h3 className="text-sm font-medium">Platform entries</h3>
         <ShieldEntriesPanel scope={{ kind: 'platform' }} />
       </div>
+    </div>
+  )
+}
+
+/**
+ * How many proposals wait for review, with the way to the page that
+ * decides them. Only the count is read here.
+ */
+function ShieldProposalsSummary() {
+  const pending = useQuery({
+    ...listShieldProposalsOptions({
+      query: { status: 'pending', page: 1, page_size: 1 },
+    }),
+  })
+  const count = pending.data?.total
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3">
+      <p className="max-w-3xl text-sm text-muted-foreground">
+        {count === undefined
+          ? 'What Shield learned waits for your approval before it applies.'
+          : count === 0
+            ? 'Nothing waits for review. What Shield learns waits for your approval before it applies.'
+            : `${count.toLocaleString()} ${count === 1 ? 'proposal waits' : 'proposals wait'} for review. Nothing Shield learns applies until you approve it.`}
+      </p>
+      <Button asChild size="sm" variant={count ? 'default' : 'outline'}>
+        <Link to="/settings/shield-proposals">Review proposals</Link>
+      </Button>
     </div>
   )
 }

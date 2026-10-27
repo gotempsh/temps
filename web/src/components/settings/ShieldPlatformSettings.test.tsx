@@ -4,6 +4,7 @@
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { ShieldPlatformSettings } from './ShieldPlatformSettings'
@@ -20,14 +21,17 @@ test('turning fleet learning off saves it at once', async () => {
       return jsonResponse({ share_observations: false })
     },
     'GET /settings/shield/entries': () => jsonResponse([]),
-    'GET /settings/shield/proposals': () => jsonResponse([]),
+    'GET /settings/shield/proposals': () =>
+      jsonResponse({ items: [], total: 3, page: 1, page_size: 1 }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   const view = render(
     <QueryClientProvider client={client}>
-      <ShieldPlatformSettings />
+      <MemoryRouter>
+        <ShieldPlatformSettings />
+      </MemoryRouter>
     </QueryClientProvider>
   )
 
@@ -40,6 +44,10 @@ test('turning fleet learning off saves it at once', async () => {
   await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
   expect(sentBody).toEqual({ share_observations: false })
   await view.findByText('No operator entries yet')
-  await view.findByText('No proposals to review')
+  // The proposals are decided on their own page; here only the count.
+  await view.findByText(/^3 proposals wait for review/)
+  expect(
+    view.getByRole('link', { name: 'Review proposals' }).getAttribute('href')
+  ).toBe('/settings/shield-proposals')
   api.restore()
 })

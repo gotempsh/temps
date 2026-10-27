@@ -23782,6 +23782,39 @@ export const listShieldProposalsOptions = (options?: Options<ListShieldProposals
     queryKey: listShieldProposalsQueryKey(options)
 });
 
+export const listShieldProposalsInfiniteQueryKey = (options?: Options<ListShieldProposalsData>): QueryKey<Options<ListShieldProposalsData>> => createQueryKey('listShieldProposals', options, true);
+
+/**
+ * List fleet learning's proposals
+ *
+ * Addresses and fingerprints learning proposes to challenge or block. None
+ * applies until an instance admin approves it.
+ */
+export const listShieldProposalsInfiniteOptions = (options?: Options<ListShieldProposalsData>) => {
+    const opts = infiniteQueryOptions<ListShieldProposalsResponse, ListShieldProposalsError, InfiniteData<ListShieldProposalsResponse>, QueryKey<Options<ListShieldProposalsData>>, number | Pick<QueryKey<Options<ListShieldProposalsData>>[0], 'body' | 'headers' | 'path' | 'query'>>(
+    // @ts-ignore
+    {
+        queryFn: async ({ pageParam, queryKey, signal }) => {
+            // @ts-ignore
+            const page: Pick<QueryKey<Options<ListShieldProposalsData>>[0], 'body' | 'headers' | 'path' | 'query'> = typeof pageParam === 'object' ? pageParam : {
+                query: {
+                    page: pageParam
+                }
+            };
+            const params = createInfiniteParams(queryKey, page);
+            const { data } = await listShieldProposals({
+                ...options,
+                ...params,
+                signal,
+                throwOnError: true
+            });
+            return data;
+        },
+        queryKey: listShieldProposalsInfiniteQueryKey(options)
+    });
+    return opts as Omit<typeof opts, 'initialData'>;
+};
+
 /**
  * Approve a proposal
  *

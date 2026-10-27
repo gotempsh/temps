@@ -93,6 +93,7 @@ import {
   Settings,
   Settings2,
   Shield,
+  ShieldCheck,
   Sparkles,
   SquareTerminal,
   SunMoon,
@@ -722,6 +723,12 @@ const settingsNavItems: NavigationItem[] = [
     url: '/settings/security',
     icon: Shield,
     keywords: ['security', 'headers', 'csp', 'cors', 'protection'],
+  },
+  {
+    title: 'Shield proposals',
+    url: '/settings/shield-proposals',
+    icon: ShieldCheck,
+    keywords: ['shield', 'learning', 'attackers', 'approve', 'block', 'review'],
   },
   {
     title: 'Rate Limiting',

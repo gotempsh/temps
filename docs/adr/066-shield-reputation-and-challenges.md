@@ -447,7 +447,7 @@ control plane proposes:
 | One JA4 with exploit hits from 20 or more addresses, not on the browser list | fingerprint → `challenge` | 24 hours |
 
 A proposal applies only once an instance admin approves it (Settings →
-Shield → Proposals, or `POST /settings/shield/proposals/{id}/approve`);
+Shield proposals, or `POST /settings/shield/proposals/{id}/approve`);
 nothing learned blocks anyone by default. Once approved, an address that
 probed `/.env` on one ingress is blocked on all of them within about a
 minute, until the proposal expires. A rejection is kept until then too, so
