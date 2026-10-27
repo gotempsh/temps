@@ -224,7 +224,7 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 # API Documentation (OpenAPI/Swagger)
 # ============================================================================
 utoipa = { version = "6.0.0", features = ["axum_extras", "debug"] }
-utoipa-swagger-ui = { version = "10.0.1", features = ["axum", "vendored"], default-features = false }
+utoipa-swagger-ui = { version = "10.0.2", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
 jsonschema = { version = "0.58.4", default-features = false }
 
@@ -509,15 +509,15 @@ debug = false
 # 6. RUSTSEC-2026-0367 / -0368 / -0369: zip 8.6.0 (extract() SUID/SGID + symlink handling)
 #    - Fix: zip >= 9.0.0. The workspace `zip` dependency is already 9.x; the 8.6.0
 #      entry in Cargo.lock comes only from headless_chrome 1.0.22 (temps-screenshots,
-#      `fetch` feature) and utoipa-swagger-ui 10.0.1 (build-dependency), both of
-#      which require `zip ^8` in their latest releases (checked 2026-10-17). A
-#      [patch.crates-io] to 9.x is semver-incompatible and rejected.
-#    - Reachability: neither crate calls `ZipArchive::extract()` or
-#      `ZipStreamReader::extract()`. headless_chrome unpacks via `by_index()` +
-#      its own file writes (Chromium builds it downloads itself; `unzip` on macOS);
-#      utoipa-swagger-ui only reads the pinned Swagger UI archive in build.rs.
-#    - Ignored in .github/workflows/dependency-scan.yml; remove once both crates
-#      release against zip 9.
+#      `fetch` feature), whose latest release still requires `zip ^8` (checked
+#      2026-10-27). utoipa-swagger-ui moved to zip 9 in 10.0.2, the minimum required
+#      above. A [patch.crates-io] to 9.x is semver-incompatible and rejected.
+#    - Reachability: headless_chrome calls neither `ZipArchive::extract()` nor
+#      `ZipStreamReader::extract()`; it unpacks via `by_index()` + its own file
+#      writes (Chromium builds it downloads itself; `unzip` on macOS).
+#    - Ignored in .github/workflows/dependency-scan.yml; remove once headless_chrome
+#      releases against zip 9. This copy also locks zstd 0.13.3 (see the zstd entry
+#      in that workflow).
 #
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
