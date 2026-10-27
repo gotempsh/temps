@@ -546,8 +546,8 @@ pub struct DatabaseMetricsRow {
 /// Response for the per-database metrics breakdown.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsResponse {
-    /// One entry per database, largest first by `database_size_bytes`
-    /// (ties broken by name) so the biggest database leads the table. Empty
+    /// One entry per database, largest first by the engine's
+    /// `*.database_size_bytes` metric (ties broken by name) so the biggest database leads the table. Empty
     /// when the service's engine has no per-database series (for example
     /// Redis or S3) or nothing has been scraped yet. MariaDB reports at most
     /// the 100 largest schemas.
@@ -622,7 +622,8 @@ fn per_database_layout(service_type: &str) -> Option<PerDatabaseLayout> {
 /// cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
 /// by schema (data, index and free-space size, table count, estimated rows).
 /// The UI shows this as a breakdown table instead of collapsing every database
-/// into one value. Engines without per-database series get an empty list.
+/// into one value. Engines without per-database series get an empty list
+/// while the metrics store is available; without it the endpoint returns 503.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/metrics/by-database",

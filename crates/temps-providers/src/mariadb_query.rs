@@ -63,6 +63,10 @@ fn database_size_metadata(
     metadata
 }
 
+/// Ceiling on the optional size read, enforced by the server and, as a
+/// backstop, by a client-side deadline slightly past it.
+const DATABASE_SIZES_TIMEOUT_MS: u64 = 5_000;
+
 /// Table count and size of `name` from the grouped size read.
 ///
 /// `sizes` is `None` when that read failed, so the numbers are unknown. When
@@ -87,6 +91,64 @@ pub struct MariaDbSource {
 }
 
 impl MariaDbSource {
+    /// Table count and size per database, or `None` when they cannot be read
+    /// within [`DATABASE_SIZES_TIMEOUT_MS`].
+    ///
+    /// The read scans every visible base table, so it must not delay or fail
+    /// the database list it decorates: it runs only once a server-side
+    /// ceiling is in place on the same connection, and any failure just means
+    /// the list is returned without sizes.
+    async fn read_database_sizes(&self) -> Option<HashMap<String, (i64, u64)>> {
+        let mut conn = match self.pool.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    database = %self.database_name,
+                    "Failed to acquire a MariaDB connection for database sizes: {}", e
+                );
+                return None;
+            }
+        };
+        if !apply_statement_timeout(&mut conn, DATABASE_SIZES_TIMEOUT_MS, &self.database_name).await
+        {
+            return None;
+        }
+        let deadline = std::time::Duration::from_millis(DATABASE_SIZES_TIMEOUT_MS + 1_000);
+        let rows = match tokio::time::timeout(
+            deadline,
+            sqlx::query(DATABASE_SIZES_QUERY).fetch_all(&mut *conn),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                warn!(
+                    database = %self.database_name,
+                    "Failed to read MariaDB database sizes: {}", e
+                );
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    database = %self.database_name,
+                    "Reading MariaDB database sizes exceeded {} ms; listing databases without sizes",
+                    deadline.as_millis()
+                );
+                return None;
+            }
+        };
+        Some(
+            rows.iter()
+                .filter_map(|row| {
+                    let schema = row.try_get::<String, _>("TABLE_SCHEMA").ok()?;
+                    let tables = row.try_get::<i64, _>("table_count").ok()?;
+                    let size = row.try_get::<u64, _>("size_bytes").ok()?;
+                    Some((schema, (tables, size)))
+                })
+                .collect(),
+        )
+    }
+
     /// Above this many estimated rows, report `information_schema.TABLE_ROWS`
     /// rather than running an exact `COUNT(*)`.
     ///
@@ -265,26 +327,7 @@ impl DataSource for MariaDbSource {
 
                 // Sizes make the database list show which database is the
                 // heavy one, but listing must not fail without them.
-                let sizes: Option<HashMap<String, (i64, u64)>> =
-                    match sqlx::query(DATABASE_SIZES_QUERY)
-                        .fetch_all(&self.pool)
-                        .await
-                    {
-                        Ok(rows) => Some(
-                            rows.iter()
-                                .filter_map(|row| {
-                                    let schema = row.try_get::<String, _>("TABLE_SCHEMA").ok()?;
-                                    let tables = row.try_get::<i64, _>("table_count").ok()?;
-                                    let size = row.try_get::<u64, _>("size_bytes").ok()?;
-                                    Some((schema, (tables, size)))
-                                })
-                                .collect(),
-                        ),
-                        Err(e) => {
-                            warn!("Failed to read MariaDB database sizes: {}", e);
-                            None
-                        }
-                    };
+                let sizes = self.read_database_sizes().await;
 
                 Ok(names
                     .iter()
@@ -1357,11 +1400,13 @@ const COUNT_TIMEOUT_MS: u64 = 10_000;
 /// Best-effort by design: failing to set a ceiling should not fail the query,
 /// but it must be visible, because it means only the control-plane deadline is
 /// in play and the server will keep working after the client gives up.
+/// Returns whether a ceiling was applied, for callers that would rather skip
+/// an optional query than run it unbounded.
 async fn apply_statement_timeout(
     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
     timeout_ms: u64,
     database_name: &str,
-) {
+) -> bool {
     let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
         .execute(&mut **conn)
         .await
@@ -1381,6 +1426,7 @@ async fn apply_statement_timeout(
              data browser statements are bounded only by the control-plane deadline"
         );
     }
+    mysql_set || mariadb_set
 }
 
 #[cfg(test)]

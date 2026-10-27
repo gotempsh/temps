@@ -92,6 +92,7 @@ import {
 } from '@/lib/service-metrics-engine'
 import {
   MARIADB_FLAG_METRICS,
+  formatFlagValue,
   MARIADB_METRIC_GROUPS,
   MARIADB_METRIC_LABELS,
   MARIADB_PER_DATABASE_GROUPS,
@@ -490,7 +491,10 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
-  if (MARIADB_FLAG_METRICS.has(name)) return value >= 1 ? 'Yes' : 'No'
+  if (MARIADB_FLAG_METRICS.has(name)) {
+    const flag = formatFlagValue(value)
+    if (flag !== null) return flag
+  }
   if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
     return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`

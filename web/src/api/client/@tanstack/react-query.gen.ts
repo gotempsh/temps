@@ -8290,7 +8290,8 @@ export const externalServiceMetricsByDatabaseQueryKey = (options: Options<Extern
  * cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
  * by schema (data, index and free-space size, table count, estimated rows).
  * The UI shows this as a breakdown table instead of collapsing every database
- * into one value. Engines without per-database series get an empty list.
+ * into one value. Engines without per-database series get an empty list
+ * while the metrics store is available; without it the endpoint returns 503.
  */
 export const externalServiceMetricsByDatabaseOptions = (options: Options<ExternalServiceMetricsByDatabaseData>) => queryOptions<ExternalServiceMetricsByDatabaseResponse, DefaultError, ExternalServiceMetricsByDatabaseResponse, ReturnType<typeof externalServiceMetricsByDatabaseQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

@@ -18878,7 +18878,7 @@
         "description": "Response for the per-database metrics breakdown.",
         "properties": {
           "databases": {
-            "description": "One entry per database, largest first by `database_size_bytes`\n(ties broken by name) so the biggest database leads the table. Empty\nwhen the service's engine has no per-database series (for example\nRedis or S3) or nothing has been scraped yet. MariaDB reports at most\nthe 100 largest schemas.",
+            "description": "One entry per database, largest first by the engine's\n`*.database_size_bytes` metric (ties broken by name) so the biggest database leads the table. Empty\nwhen the service's engine has no per-database series (for example\nRedis or S3) or nothing has been scraped yet. MariaDB reports at most\nthe 100 largest schemas.",
             "items": {
               "$ref": "#/components/schemas/DatabaseMetricsRow"
             },
@@ -101300,7 +101300,7 @@
     },
     "/external-services/{id}/metrics/by-database": {
       "get": {
-        "description": "Postgres: groups `pg_stat_database` and size metrics by `datname` (size,\ncache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics\nby schema (data, index and free-space size, table count, estimated rows).\nThe UI shows this as a breakdown table instead of collapsing every database\ninto one value. Engines without per-database series get an empty list.",
+        "description": "Postgres: groups `pg_stat_database` and size metrics by `datname` (size,\ncache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics\nby schema (data, index and free-space size, table count, estimated rows).\nThe UI shows this as a breakdown table instead of collapsing every database\ninto one value. Engines without per-database series get an empty list\nwhile the metrics store is available; without it the endpoint returns 503.",
         "operationId": "ExternalServiceMetricsByDatabase",
         "parameters": [
           {

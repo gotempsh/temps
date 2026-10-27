@@ -9058,8 +9058,8 @@ export type DatabaseChoice = {
  */
 export type DatabaseMetricsResponse = {
     /**
-     * One entry per database, largest first by `database_size_bytes`
-     * (ties broken by name) so the biggest database leads the table. Empty
+     * One entry per database, largest first by the engine's
+     * `*.database_size_bytes` metric (ties broken by name) so the biggest database leads the table. Empty
      * when the service's engine has no per-database series (for example
      * Redis or S3) or nothing has been scraped yet. MariaDB reports at most
      * the 100 largest schemas.

@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   MARIADB_FLAG_METRICS,
+  formatFlagValue,
   MARIADB_METRIC_GROUPS,
   MARIADB_METRIC_LABELS,
   MARIADB_METRICS,
@@ -32,5 +33,17 @@ describe('MariaDB metric groups', () => {
     ]) {
       expect(known.has(metric)).toBe(true)
     }
+  })
+})
+
+describe('formatFlagValue', () => {
+  test('names exact 1 and 0 as Yes and No', () => {
+    expect(formatFlagValue(1)).toBe('Yes')
+    expect(formatFlagValue(0)).toBe('No')
+  })
+
+  test('leaves averaged values to numeric formatting', () => {
+    expect(formatFlagValue(0.5)).toBeNull()
+    expect(formatFlagValue(0.99)).toBeNull()
   })
 })

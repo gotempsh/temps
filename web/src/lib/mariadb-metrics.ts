@@ -161,6 +161,17 @@ export const MARIADB_FLAG_METRICS: ReadonlySet<string> = new Set([
   'mariadb.replica_sql_running',
 ])
 
+/**
+ * "Yes"/"No" for an exact 1/0 flag, `null` otherwise. Range queries average
+ * gauges, so a bucket spanning both states reads 0.5; that must be shown as a
+ * number, not rounded to a state it was not.
+ */
+export function formatFlagValue(value: number): string | null {
+  if (value === 1) return 'Yes'
+  if (value === 0) return 'No'
+  return null
+}
+
 /** Display names where the generic `snake_case` → Title Case is unclear. */
 export const MARIADB_METRIC_LABELS: Record<string, string> = {
   'mariadb.connections': 'Connections',
@@ -189,7 +200,7 @@ export const MARIADB_METRIC_LABELS: Record<string, string> = {
   'mariadb.database_size_bytes': 'Database Size',
   'mariadb.data_size_bytes': 'Data Size',
   'mariadb.index_size_bytes': 'Index Size',
-  'mariadb.data_free_bytes': 'Free Space in Tablespaces',
+  'mariadb.data_free_bytes': 'Free Space (estimated)',
   'mariadb.rows_estimated': 'Rows (estimated)',
   'mariadb.replica_io_running': 'Replica I/O Thread',
   'mariadb.replica_sql_running': 'Replica SQL Thread',
