@@ -1306,6 +1306,11 @@ pub const REDIS_HIT_RATIO_MIN_LOOKUPS: f64 = 10_000.0;
 /// disk, so its ratio starts low and only becomes meaningful with volume.
 pub const PG_CACHE_HIT_RATIO_MIN_BLOCKS: f64 = 100_000.0;
 
+/// Lifetime InnoDB buffer pool read requests before the MariaDB buffer pool
+/// hit ratio is evaluated, for the same reason as
+/// [`PG_CACHE_HIT_RATIO_MIN_BLOCKS`].
+pub const MARIADB_BUFFER_POOL_MIN_READ_REQUESTS: f64 = 100_000.0;
+
 /// Requests in one proxy sample interval before error-rate and latency
 /// percentiles are evaluated. On an idle host a single 502 is a 100% error
 /// rate and a single slow request is the p99.
@@ -1333,6 +1338,10 @@ pub fn volume_gate(metric_name: &str) -> Option<VolumeGate> {
         ),
         "redis.keyspace_hit_ratio" => ("redis.keyspace_lookups", REDIS_HIT_RATIO_MIN_LOOKUPS),
         "pg.cache_hit_ratio" => ("pg.cache_blocks_accessed", PG_CACHE_HIT_RATIO_MIN_BLOCKS),
+        "mariadb.buffer_pool_hit_ratio" => (
+            "mariadb.buffer_pool_read_requests",
+            MARIADB_BUFFER_POOL_MIN_READ_REQUESTS,
+        ),
         "proxy.error_rate_percent" | "proxy.request_duration_p99_ms" => {
             ("proxy.requests", PROXY_MIN_REQUESTS_PER_SAMPLE)
         }
@@ -1352,6 +1361,7 @@ fn default_volume_gate(rule: &monitoring_alert_rules::Model) -> Option<VolumeGat
     postgres_default_seeds()
         .into_iter()
         .chain(redis_default_seeds())
+        .chain(mariadb_default_seeds())
         .chain(proxy_default_seeds())
         .any(|seed| {
             seed.name == rule.name
@@ -1433,6 +1443,10 @@ pub use temps_metrics::MetricsError;
 ///   client count and keyspace hit ratio. The two ratio rules are only
 ///   evaluated once the instance has real volume (see [`volume_gate`]), so an
 ///   empty instance does not alert.
+/// - `"mariadb"` — 10 default rules covering connection capacity and refused
+///   connections, buffer pool hit ratio, replication lag and stopped
+///   replication threads, deadlocks, long-running transactions, redo log waits
+///   and open file exhaustion.
 /// - `"mongodb"` — 6 default rules covering connections, queued operations,
 ///   WiredTiger cache pressure, replication buffer pressure, and asserts.
 /// - `"rustfs"` — 3 default rules covering offline nodes and free-capacity
@@ -1466,6 +1480,7 @@ pub async fn seed_default_rules(
         "postgres" => postgres_default_seeds(),
         "redis" => redis_default_seeds(),
         "mongodb" => mongodb_default_seeds(),
+        "mariadb" => mariadb_default_seeds(),
         "rustfs" => rustfs_default_seeds(),
         _ => {
             debug!(
@@ -1971,6 +1986,97 @@ fn mongodb_default_seeds() -> Vec<RuleSeed> {
             comparator: ">",
             severity: "warning",
             for_duration_secs: 0,
+        },
+    ]
+}
+
+fn mariadb_default_seeds() -> Vec<RuleSeed> {
+    // Metric names mirror `temps_metrics::collector::mariadb`. One rule per
+    // metric: `(service_id, metric_name)` is a unique index, so a second
+    // severity on the same metric would be a silent ON CONFLICT no-op.
+    // Capacity rules use ratios against the server's own limits, so they hold
+    // for any `max_connections` / `open_files_limit`. Replica rules only ever
+    // see data on a replica: a primary emits no replica metrics.
+    vec![
+        RuleSeed {
+            name: "Connections near max_connections",
+            metric_name: "mariadb.connections_used_ratio",
+            threshold: 0.80,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 120,
+        },
+        RuleSeed {
+            name: "Connections refused at max_connections",
+            metric_name: "mariadb.connections_refused_total",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 0,
+        },
+        RuleSeed {
+            name: "Low buffer pool hit ratio",
+            metric_name: "mariadb.buffer_pool_hit_ratio",
+            threshold: 0.90,
+            comparator: "<",
+            severity: "warning",
+            for_duration_secs: 300,
+        },
+        RuleSeed {
+            name: "Replication lag",
+            metric_name: "mariadb.replication_lag_seconds",
+            threshold: 60.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Replication stopped (SQL thread)",
+            metric_name: "mariadb.replica_sql_running",
+            threshold: 1.0,
+            comparator: "<",
+            severity: "critical",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Replica disconnected from primary (I/O thread)",
+            metric_name: "mariadb.replica_io_running",
+            threshold: 1.0,
+            comparator: "<",
+            severity: "critical",
+            for_duration_secs: 120,
+        },
+        RuleSeed {
+            name: "Deadlocks detected",
+            metric_name: "mariadb.deadlocks_total",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 0,
+        },
+        RuleSeed {
+            name: "Long-running transaction",
+            metric_name: "mariadb.oldest_transaction_seconds",
+            threshold: 600.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 60,
+        },
+        RuleSeed {
+            name: "Redo log waits (log buffer too small)",
+            metric_name: "mariadb.redo_log_waits_total",
+            threshold: 0.0,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 0,
+        },
+        RuleSeed {
+            name: "Open files near open_files_limit",
+            metric_name: "mariadb.open_files_usage_ratio",
+            threshold: 0.85,
+            comparator: ">",
+            severity: "warning",
+            for_duration_secs: 300,
         },
     ]
 }
@@ -2497,6 +2603,47 @@ mod tests {
             .map(|s| s.metric_name)
             .collect();
         assert!(seeds.iter().all(|s| !fd.contains(&s.metric_name)));
+    }
+
+    #[test]
+    fn mariadb_default_seeds_are_unique_per_metric_and_collected() {
+        let seeds = mariadb_default_seeds();
+        assert_eq!(seeds.len(), 10);
+        let mut names = std::collections::HashSet::new();
+        for s in &seeds {
+            assert!(s.metric_name.starts_with("mariadb."), "{}", s.metric_name);
+            assert!(is_known_comparator(s.comparator), "{}", s.metric_name);
+            // One rule per metric: (service_id, metric_name) is a unique
+            // index, a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(
+                names.insert(s.metric_name),
+                "duplicate seed metric {}",
+                s.metric_name
+            );
+        }
+        // Thread-state rules fire when the flag drops from 1 to 0.
+        for metric in ["mariadb.replica_sql_running", "mariadb.replica_io_running"] {
+            let seed = seeds
+                .iter()
+                .find(|s| s.metric_name == metric)
+                .unwrap_or_else(|| panic!("{metric} is not seeded"));
+            assert!(compare(0.0, seed.threshold, seed.comparator));
+            assert!(!compare(1.0, seed.threshold, seed.comparator));
+        }
+    }
+
+    #[test]
+    fn mariadb_hit_ratio_waits_for_buffer_pool_volume() {
+        let mut values = HashMap::new();
+        values.insert("mariadb.buffer_pool_hit_ratio".to_string(), 0.2);
+        assert!(!meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
+        values.insert("mariadb.buffer_pool_read_requests".to_string(), 99.0);
+        assert!(!meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
+        values.insert(
+            "mariadb.buffer_pool_read_requests".to_string(),
+            MARIADB_BUFFER_POOL_MIN_READ_REQUESTS,
+        );
+        assert!(meets_volume_gate("mariadb.buffer_pool_hit_ratio", &values));
     }
 
     #[test]
@@ -3489,6 +3636,7 @@ mod tests {
         let seeded: Vec<&str> = postgres_default_seeds()
             .iter()
             .chain(redis_default_seeds().iter())
+            .chain(mariadb_default_seeds().iter())
             .chain(proxy_default_seeds().iter())
             .map(|s| s.metric_name)
             .collect();
@@ -3496,6 +3644,7 @@ mod tests {
             "redis.memory_fragmentation_ratio",
             "redis.keyspace_hit_ratio",
             "pg.cache_hit_ratio",
+            "mariadb.buffer_pool_hit_ratio",
             "proxy.error_rate_percent",
             "proxy.request_duration_p99_ms",
         ] {
