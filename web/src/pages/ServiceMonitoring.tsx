@@ -1016,24 +1016,35 @@ function DatabasesSection({
   // A request that is still loading, or failed, says nothing about whether
   // there are databases, so neither may fall through to the "none" case below.
   if (isLoading) return <Skeleton className="h-40 w-full" />
+  // Failed request: say why, and offer a retry. With earlier data the values
+  // stay on screen under the same notice, so a failed refresh neither hides
+  // the failure nor throws the user's place away.
+  const failure = isError ? (
+    <div className="space-y-2 rounded-lg border border-border p-4">
+      <p className="text-sm text-muted-foreground">
+        {data
+          ? 'Could not refresh per-database metrics'
+          : 'Could not load per-database metrics'}
+        : {metricsErrorText(error)}
+      </p>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => refetch()}
+        disabled={isFetching}
+      >
+        <RefreshCw className="mr-2 size-4" />
+        Retry
+      </Button>
+    </div>
+  ) : null
   if (isError && !data) {
     return (
-      <div className="space-y-2 rounded-lg border border-border p-4">
+      <div className="space-y-2">
         <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
           Databases
         </h2>
-        <p className="text-sm text-muted-foreground">
-          Could not load per-database metrics: {error.message}
-        </p>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => refetch()}
-          disabled={isFetching}
-        >
-          <RefreshCw className="mr-2 size-4" />
-          Retry
-        </Button>
+        {failure}
       </div>
     )
   }
@@ -1073,6 +1084,8 @@ function DatabasesSection({
           </SelectContent>
         </Select>
       </div>
+
+      {failure}
 
       {groups.map((group) => (
         <div key={group.title}>
