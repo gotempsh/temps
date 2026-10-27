@@ -159,8 +159,17 @@ interface TreeNode {
   entityCountHint?: 'small' | 'large' | null // Hint about entity count
   /** Backend-supplied facts (size_bytes, owner, encoding, entity_count…). */
   metadata?: Record<string, unknown>
-  /** On-disk size for an entity, when the backend reports one. */
+  /** On-disk size of an entity or container, when the backend reports one. */
   sizeBytes?: number
+}
+
+/** A container's on-disk size from its backend metadata (`size_bytes`), shown
+ *  next to it in the tree like a table's size. */
+function containerSizeBytes(
+  metadata: Record<string, unknown> | null | undefined
+): number | undefined {
+  const size = metadata?.size_bytes
+  return typeof size === 'number' && Number.isFinite(size) ? size : undefined
 }
 
 export function ServiceDataBrowser() {
@@ -798,6 +807,9 @@ export function ServiceDataBrowser() {
           (container.entity_count_hint as 'small' | 'large' | null) || null,
         metadata: (container.metadata ?? undefined) as
           Record<string, unknown> | undefined,
+        sizeBytes: containerSizeBytes(
+          container.metadata as Record<string, unknown> | null | undefined
+        ),
       }))
     )
   }
@@ -1257,6 +1269,10 @@ export function ServiceDataBrowser() {
                   null,
                 metadata: (container.metadata ?? undefined) as
                   Record<string, unknown> | undefined,
+                sizeBytes: containerSizeBytes(
+                  container.metadata as
+                    Record<string, unknown> | null | undefined
+                ),
               })
             })
 

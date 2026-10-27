@@ -14,6 +14,43 @@ use temps_query::{
 };
 use tracing::{debug, error, warn};
 
+/// Every user database with its on-disk size (data + indexes) and table count.
+const DATABASES_WITH_SIZES_QUERY: &str = r#"
+    SELECT s.SCHEMA_NAME,
+           COUNT(t.TABLE_NAME) AS table_count,
+           CAST(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
+    FROM information_schema.SCHEMATA s
+    LEFT JOIN information_schema.TABLES t
+           ON t.TABLE_SCHEMA = s.SCHEMA_NAME AND t.TABLE_TYPE = 'BASE TABLE'
+    WHERE s.SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+    GROUP BY s.SCHEMA_NAME
+    ORDER BY s.SCHEMA_NAME
+"#;
+
+/// On-disk size and table count of one database.
+const DATABASE_SIZE_QUERY: &str = r#"
+    SELECT COUNT(TABLE_NAME) AS table_count,
+           CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
+    FROM information_schema.TABLES
+    WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
+"#;
+
+/// Container metadata for a database's size, under the keys the data browser
+/// renders (`size_bytes`, `entity_count`) — the same ones Postgres reports.
+fn database_size_metadata(
+    size_bytes: Option<u64>,
+    table_count: Option<i64>,
+) -> HashMap<String, serde_json::Value> {
+    let mut metadata = HashMap::new();
+    if let Some(size) = size_bytes {
+        metadata.insert("size_bytes".to_string(), serde_json::json!(size));
+    }
+    if let Some(count) = table_count {
+        metadata.insert("entity_count".to_string(), serde_json::json!(count));
+    }
+    metadata
+}
+
 pub struct MariaDbSource {
     pool: MySqlPool,
     database_name: String,
@@ -189,32 +226,34 @@ impl DataSource for MariaDbSource {
     async fn list_containers(&self, path: &ContainerPath) -> Result<Vec<ContainerInfo>> {
         match path.depth() {
             0 => {
-                let rows = sqlx::query(
-                    r#"
-                    SELECT SCHEMA_NAME
-                    FROM information_schema.SCHEMATA
-                    WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-                    ORDER BY SCHEMA_NAME
-                    "#,
-                )
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| DataError::QueryFailed(format!("Failed to list databases: {}", e)))?;
+                // Size and table count come from the same catalog read as the
+                // names (one grouped query, not one per database), so the
+                // database list can show which database is the heavy one.
+                let rows = sqlx::query(DATABASES_WITH_SIZES_QUERY)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        DataError::QueryFailed(format!("Failed to list databases: {}", e))
+                    })?;
 
                 Ok(rows
                     .iter()
-                    .filter_map(|row| row.try_get::<String, _>("SCHEMA_NAME").ok())
-                    .map(|name| ContainerInfo {
-                        name,
-                        container_type: ContainerType::Database,
-                        capabilities: ContainerCapabilities {
-                            can_contain_containers: false,
-                            can_contain_entities: true,
-                            child_container_type: None,
-                            entity_type_label: Some("table".to_string()),
-                            entity_count_hint: Some(EntityCountHint::Small),
-                        },
-                        metadata: HashMap::new(),
+                    .filter_map(|row| {
+                        let name = row.try_get::<String, _>("SCHEMA_NAME").ok()?;
+                        let size_bytes = row.try_get::<u64, _>("size_bytes").ok();
+                        let table_count = row.try_get::<i64, _>("table_count").ok();
+                        Some(ContainerInfo {
+                            name,
+                            container_type: ContainerType::Database,
+                            capabilities: ContainerCapabilities {
+                                can_contain_containers: false,
+                                can_contain_entities: true,
+                                child_container_type: None,
+                                entity_type_label: Some("table".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Small),
+                            },
+                            metadata: database_size_metadata(size_bytes, table_count),
+                        })
                     })
                     .collect())
             }
@@ -257,8 +296,30 @@ impl DataSource for MariaDbSource {
         let charset: Option<String> = row.try_get("DEFAULT_CHARACTER_SET_NAME").ok();
         let collation: Option<String> = row.try_get("DEFAULT_COLLATION_NAME").ok();
 
-        let mut metadata = HashMap::new();
+        // Best effort: a database whose sizes cannot be read still opens.
+        let (size_bytes, table_count) = match sqlx::query(DATABASE_SIZE_QUERY)
+            .bind(database_name)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(row) => (
+                row.try_get::<u64, _>("size_bytes").ok(),
+                row.try_get::<i64, _>("table_count").ok(),
+            ),
+            Err(e) => {
+                warn!(
+                    "Failed to read size of MariaDB database '{}': {}",
+                    database_name, e
+                );
+                (None, None)
+            }
+        };
+
+        let mut metadata = database_size_metadata(size_bytes, table_count);
         if let Some(value) = charset {
+            // `encoding` is the key the data browser shows; `charset` is kept
+            // for existing API consumers.
+            metadata.insert("encoding".to_string(), serde_json::json!(value));
             metadata.insert("charset".to_string(), serde_json::json!(value));
         }
         if let Some(value) = collation {
@@ -1775,7 +1836,42 @@ mod tests {
             .is_some_and(|encoded| !encoded.is_empty()));
         assert_eq!(compatible.rows[0]["flags"], serde_json::json!(10));
 
+        // The database list and the database detail both report the
+        // database's on-disk size and table count.
+        let databases = source.list_containers(&ContainerPath::root()).await?;
+        let app = databases
+            .iter()
+            .find(|db| db.name == "app")
+            .expect("the app database is listed");
+        assert_eq!(
+            app.metadata.get("entity_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert!(app
+            .metadata
+            .get("size_bytes")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|size| size > 0));
+        let detail = source.get_container_info(&path).await?;
+        assert_eq!(
+            detail.metadata.get("entity_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            detail.metadata.get("size_bytes"),
+            app.metadata.get("size_bytes")
+        );
+        assert!(detail.metadata.contains_key("encoding"));
+
         Ok(())
+    }
+
+    #[test]
+    fn database_size_metadata_uses_the_data_browser_keys() {
+        let metadata = database_size_metadata(Some(32_768), Some(3));
+        assert_eq!(metadata.get("size_bytes"), Some(&serde_json::json!(32_768)));
+        assert_eq!(metadata.get("entity_count"), Some(&serde_json::json!(3)));
+        assert!(database_size_metadata(None, None).is_empty());
     }
 
     fn assert_where_rejected(clause: &str) {
