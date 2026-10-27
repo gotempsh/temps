@@ -7,14 +7,18 @@ FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2
 # listed below, so upgrade first: otherwise packages baked into the base image
 # (libpcre2, libc, ...) stay at whatever patch level the pinned digest shipped
 # with, and Debian security fixes never reach the published image.
+# Debian backports CVE-2026-111497 without changing the upstream version.
+# Fail closed if a mirror cannot supply the fixed Brotli decoder.
 RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     git \
+    libbrotli1 \
     tzdata \
     wget \
     zlib1g \
     libgcc-s1 && \
+    dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge '1.0.9-2+deb12u1' && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user

@@ -50,6 +50,8 @@ fi
 
 ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" "$e2e_workflow" "$rust_tests_workflow" <<'RUBY'
 require "yaml"
+require "open3"
+require "tmpdir"
 
 repository_root = ARGV[0]
 nightly = YAML.safe_load(File.read(ARGV[1]), aliases: true)
@@ -156,6 +158,122 @@ abort "the test gate bypass must be an explicit, default-off dispatch input" unl
 end
 abort "the server image can be pushed before the test gate passes" unless
   Array(release.dig("jobs", "build-and-push-docker", "needs")).include?("create-release")
+
+# Mutable package repositories must be refreshed even if the pinned base and
+# Dockerfile haven't changed. Scan each published candidate by digest before
+# either architecture can reach a floating channel tag.
+server_image = release.dig("jobs", "build-and-push-docker")
+image_steps = server_image.fetch("steps")
+build = image_steps.find { |step| step["id"] == "release_image" }
+abort "release images can reuse stale OS packages" unless
+  build && build.dig("with", "pull") == true && build.dig("with", "no-cache") == true
+abort "unscanned candidates must not update channel tags" unless
+  build.dig("with", "tags").lines.map(&:strip) ==
+    ['ghcr.io/${{ github.repository_owner }}/temps:${{ steps.version.outputs.version }}-${{ steps.platform_tag.outputs.tag }}']
+scan = image_steps.find { |step| step.fetch("uses", "").start_with?("aquasecurity/trivy-action@") }
+abort "release image vulnerability gate is missing or scans a mutable tag" unless
+  scan && image_steps.index(scan) > image_steps.index(build) &&
+  scan["if"] == build.dig("with", "push") &&
+  scan.dig("with", "image-ref") == 'ghcr.io/${{ github.repository_owner }}/temps@${{ steps.release_image.outputs.digest }}' &&
+  scan.dig("with", "format") == "table" &&
+  scan.dig("with", "scanners") == "vuln" &&
+  scan.dig("with", "severity") == "CRITICAL,HIGH" &&
+  scan.dig("with", "exit-code").to_s == "1" &&
+  scan.dig("with", "ignore-unfixed") == true &&
+  scan.dig("env", "TRIVY_PLATFORM") == '${{ matrix.platform }}' &&
+  scan.dig("env", "TRIVY_IMAGE_SRC") == "remote" &&
+  !scan.key?("continue-on-error") && !server_image.key?("continue-on-error")
+abort "release scan matrix must cover both supported architectures" unless
+  server_image.dig("strategy", "matrix", "include").map { |entry| entry["platform"] }.sort ==
+    %w[linux/amd64 linux/arm64]
+manifest_job = release.dig("jobs", "create-docker-manifest")
+abort "channel promotion can bypass the architecture scans" unless
+  manifest_job.fetch("needs").include?("build-and-push-docker") &&
+  manifest_job["if"] == scan["if"] && !manifest_job.key?("continue-on-error")
+record = image_steps.find { |step| step["name"] == "Record scanned server image digest" }
+upload = image_steps.find { |step| step["name"] == "Upload scanned server image digest" }
+abort "scanned digests must only be recorded after a successful scan" unless
+  record && upload && image_steps.index(record) > image_steps.index(scan) &&
+  image_steps.index(upload) > image_steps.index(record) &&
+  [record, upload].all? { |step| step["if"] == scan["if"] && !step.key?("continue-on-error") } &&
+  record.dig("env", "IMAGE_DIGEST") == '${{ steps.release_image.outputs.digest }}' &&
+  record.dig("env", "PLATFORM_TAG") == '${{ steps.platform_tag.outputs.tag }}' &&
+  upload.fetch("uses").start_with?("actions/upload-artifact@") &&
+  upload.dig("with", "name") == 'scanned-server-${{ steps.platform_tag.outputs.tag }}' &&
+  upload.dig("with", "path") == "scanned-images/*" &&
+  upload.dig("with", "if-no-files-found") == "error"
+manifest_steps = manifest_job.fetch("steps")
+download = manifest_steps.find { |step| step["name"] == "Download scanned server image digests" }
+validate = manifest_steps.find { |step| step["id"] == "scanned_images" }
+abort "promotion must download and validate this run's scanned digests" unless
+  download && validate && manifest_steps.index(validate) > manifest_steps.index(download) &&
+  download.fetch("uses").start_with?("actions/download-artifact@") &&
+  download.dig("with", "pattern") == "scanned-server-linux-*" &&
+  download.dig("with", "merge-multiple") == true &&
+  download.dig("with", "path") == "scanned-images" &&
+  !download.fetch("with").key?("run-id") && !download.fetch("with").key?("repository") &&
+  [download, validate].none? { |step| step.key?("if") || step.key?("continue-on-error") }
+merge_steps = manifest_steps.select { |step| ["Create and push manifest for channel", "Create and push manifest for version"].include?(step["name"]) }
+abort "version and channel promotion must both follow digest validation" unless
+  merge_steps.length == 2 && merge_steps.all? { |step|
+    manifest_steps.index(step) > manifest_steps.index(validate) &&
+    step.dig("env", "AMD64_IMAGE") == '${{ steps.scanned_images.outputs.amd64_ref }}' &&
+    step.dig("env", "ARM64_IMAGE") == '${{ steps.scanned_images.outputs.arm64_ref }}'
+  }
+
+# Execute the workflow scripts: malformed/missing digests fail closed, and
+# changing a versioned architecture tag after scanning cannot change a merge.
+Dir.mktmpdir("scanned-server-test-") do |directory|
+  output = File.join(directory, "outputs")
+  environment = {"IMAGE_REPOSITORY" => "ghcr.io/example/temps", "GITHUB_OUTPUT" => output}
+  digests = {"amd64" => "sha256:" + "a" * 64, "arm64" => "sha256:" + "b" * 64}
+  digests.each do |arch, digest|
+    _, error, status = Open3.capture3(environment.merge("IMAGE_DIGEST" => digest, "PLATFORM_TAG" => "linux-#{arch}"), "bash", "-euc", record.fetch("run"), chdir: directory)
+    abort "cannot record scanned digest: #{error}" unless status.success?
+  end
+  ["", "latest", "sha256:abc", "sha256:" + "g" * 64].each do |invalid|
+    _, _, status = Open3.capture3(environment.merge("IMAGE_DIGEST" => invalid, "PLATFORM_TAG" => "linux-invalid"), "bash", "-euc", record.fetch("run"), chdir: directory)
+    abort "accepted malformed build digest" if status.success? || File.exist?(File.join(directory, "scanned-images/linux-invalid"))
+  end
+  _, error, status = Open3.capture3(environment, "bash", "-euc", validate.fetch("run"), chdir: directory)
+  abort "cannot validate scanned digests: #{error}" unless status.success?
+  refs = File.readlines(output, chomp: true).map { |line| line.split("=", 2) }.to_h
+  digests.each { |arch, digest| abort "wrong scanned reference" unless refs["#{arch}_ref"] == "ghcr.io/example/temps@#{digest}" }
+  [nil, "", "latest", "sha256:abc", "sha256:" + "g" * 64, digests["arm64"] + "\nlatest"].each do |invalid|
+    file = File.join(directory, "scanned-images/linux-arm64")
+    invalid.nil? ? File.delete(file) : File.write(file, invalid)
+    _, _, status = Open3.capture3(environment, "bash", "-euc", validate.fetch("run"), chdir: directory)
+    abort "accepted missing/malformed architecture digest" if status.success?
+  end
+  File.write(File.join(directory, "docker"), <<~SH)
+    #!/bin/sh
+    for reference in "$@"; do
+      case "$reference" in
+        ghcr.io/example/temps@*) printf '%s\\n' "$reference" ;;
+        ghcr.io/example/temps:*-linux-*) printf '%s\\n' "$REPLACEMENT_REF" ;;
+      esac
+    done > "$PROMOTED"
+  SH
+  File.chmod(0700, File.join(directory, "docker"))
+  environment.merge!("PATH" => directory + File::PATH_SEPARATOR + ENV.fetch("PATH"),
+    "AMD64_IMAGE" => refs["amd64_ref"], "ARM64_IMAGE" => refs["arm64_ref"], "CHANNEL" => "beta",
+    "REPLACEMENT_REF" => "ghcr.io/example/temps@sha256:" + "c" * 64, "PROMOTED" => File.join(directory, "promoted"))
+  merge_steps.each do |step|
+    script = step.fetch("run").gsub('${{ github.repository_owner }}', 'example').gsub('${{ steps.version.outputs.version }}', '1.0.0')
+    _, error, status = Open3.capture3(environment, "bash", "-euc", script, chdir: directory)
+    abort "manifest merge failed: #{error}" unless status.success?
+    abort "manifest promoted a replacement tag instead of scanned digests" unless
+      File.readlines(environment["PROMOTED"], chomp: true) == [refs["amd64_ref"], refs["arm64_ref"]]
+  end
+end
+dependency_scan = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/dependency-scan.yml")), aliases: true)
+channels = dependency_scan.dig("jobs", "container-scan", "strategy", "matrix", "include")
+abort "published channel scans must retain existing SARIF categories and cover nightly" unless
+  channels == [
+    {"channel" => "latest", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan"},
+    {"channel" => "beta", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan-beta"},
+    {"channel" => "nightly", "sarif-category" => ".github/workflows/dependency-scan.yml:container-scan-nightly"},
+  ]
 promotion = release.dig("jobs", "promote-runtime-images")
 abort "runtime aliases can move before binaries pass" unless
   (%w[build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64] - promotion["needs"]).empty? &&
