@@ -214,20 +214,30 @@ const USAGE_RATIOS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// Size, tables and estimated rows per schema. `SCHEMATA` drives the join so
-/// a schema without tables (a new application database) still reports 0
-/// rather than disappearing. Views have no storage and are excluded.
-const SCHEMA_STATS_QUERY: &str = "SELECT s.SCHEMA_NAME, \
-        CAST(COALESCE(SUM(t.DATA_LENGTH), 0) AS UNSIGNED), \
-        CAST(COALESCE(SUM(t.INDEX_LENGTH), 0) AS UNSIGNED), \
-        CAST(COALESCE(SUM(t.DATA_FREE), 0) AS UNSIGNED), \
-        COUNT(t.TABLE_NAME), \
-        CAST(COALESCE(SUM(t.TABLE_ROWS), 0) AS UNSIGNED) \
-     FROM information_schema.SCHEMATA s \
-     LEFT JOIN information_schema.TABLES t \
-       ON t.TABLE_SCHEMA = s.SCHEMA_NAME AND t.TABLE_TYPE = 'BASE TABLE' \
-     WHERE s.SCHEMA_NAME NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
-     GROUP BY s.SCHEMA_NAME";
+/// Size, tables and estimated rows per schema that has at least one base
+/// table. Views have no storage and are excluded.
+///
+/// Deliberately not a `SCHEMATA LEFT JOIN TABLES`: that join opens every table
+/// of every schema once per schema and made each scrape create ~120 temporary
+/// tables (20 on disk) and ~75 commits, which the server's own
+/// `Created_tmp_*` and `Handler_*` counters then reported as workload. Two
+/// plain reads cost a handful, whatever the schema count.
+const SCHEMA_STATS_QUERY: &str = "SELECT TABLE_SCHEMA, \
+        CAST(COALESCE(SUM(DATA_LENGTH), 0) AS UNSIGNED), \
+        CAST(COALESCE(SUM(INDEX_LENGTH), 0) AS UNSIGNED), \
+        CAST(COALESCE(SUM(DATA_FREE), 0) AS UNSIGNED), \
+        COUNT(*), \
+        CAST(COALESCE(SUM(TABLE_ROWS), 0) AS UNSIGNED) \
+     FROM information_schema.TABLES \
+     WHERE TABLE_TYPE = 'BASE TABLE' \
+       AND TABLE_SCHEMA NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys') \
+     GROUP BY TABLE_SCHEMA";
+
+/// Every user schema, so one without tables (a new application database) is
+/// still reported, with zeros, rather than missing.
+const SCHEMA_NAMES_QUERY: &str = "SELECT SCHEMA_NAME \
+     FROM information_schema.SCHEMATA \
+     WHERE SCHEMA_NAME NOT IN ('information_schema', 'performance_schema', 'mysql', 'sys')";
 
 /// Whether the connected account holds `PROCESS` directly. `CURRENT_USER()`
 /// is `user@host`; `GRANTEE` is `'user'@'host'`.
@@ -523,18 +533,7 @@ async fn read_snapshot(conn: &mut MySqlConnection, source_id: i32) -> Option<Mar
         }
     };
 
-    let schemas = match conn.fetch_all(SCHEMA_STATS_QUERY).await {
-        Ok(rows) => rows.iter().filter_map(schema_stats).collect(),
-        Err(e) => {
-            warn!(
-                source_id,
-                engine = ENGINE,
-                error = %describe_error(&e),
-                "mariadb schema statistics query failed; skipping database sizes"
-            );
-            Vec::new()
-        }
-    };
+    let schemas = read_schemas(conn, source_id).await;
 
     let activity = read_activity(conn, source_id).await;
     let replica = read_replica_status(conn, source_id).await;
@@ -546,6 +545,54 @@ async fn read_snapshot(conn: &mut MySqlConnection, source_id: i32) -> Option<Mar
         activity,
         replica,
     })
+}
+
+/// Storage per schema. The size query is the mandatory half; if only the name
+/// list fails, schemas without tables are simply not listed.
+async fn read_schemas(conn: &mut MySqlConnection, source_id: i32) -> Vec<SchemaStats> {
+    let measured: Vec<SchemaStats> = match conn.fetch_all(SCHEMA_STATS_QUERY).await {
+        Ok(rows) => rows.iter().filter_map(schema_stats).collect(),
+        Err(e) => {
+            warn!(
+                source_id,
+                engine = ENGINE,
+                error = %describe_error(&e),
+                "mariadb schema statistics query failed; skipping database sizes"
+            );
+            return Vec::new();
+        }
+    };
+    let names: Vec<String> = match conn.fetch_all(SCHEMA_NAMES_QUERY).await {
+        Ok(rows) => rows.iter().filter_map(|row| column_text(row, 0)).collect(),
+        Err(e) => {
+            debug!(
+                source_id,
+                engine = ENGINE,
+                error = %describe_error(&e),
+                "mariadb schema list query failed; schemas without tables are not reported"
+            );
+            Vec::new()
+        }
+    };
+    with_empty_schemas(measured, names)
+}
+
+/// Add a zeroed entry for every name in `names` that `measured` lacks.
+pub(crate) fn with_empty_schemas(
+    mut measured: Vec<SchemaStats>,
+    names: impl IntoIterator<Item = String>,
+) -> Vec<SchemaStats> {
+    let mut known: std::collections::HashSet<String> =
+        measured.iter().map(|schema| schema.name.clone()).collect();
+    for name in names {
+        if known.insert(name.clone()) {
+            measured.push(SchemaStats {
+                name,
+                ..Default::default()
+            });
+        }
+    }
+    measured
 }
 
 fn schema_stats(row: &MySqlRow) -> Option<SchemaStats> {
@@ -1444,6 +1491,31 @@ mod tests {
     }
 
     #[test]
+    fn schemas_without_tables_are_added_with_zeros() {
+        let measured = vec![SchemaStats {
+            name: "app".to_string(),
+            data_bytes: 10,
+            tables: 2,
+            ..Default::default()
+        }];
+        let merged = with_empty_schemas(
+            measured,
+            ["app".to_string(), "fresh".to_string(), "fresh".to_string()],
+        );
+        let names: Vec<&str> = merged.iter().map(|s| s.name.as_str()).collect();
+        // `app` keeps its measured values; neither name is duplicated.
+        assert_eq!(names, vec!["app", "fresh"]);
+        assert_eq!(merged[0].data_bytes, 10);
+        assert_eq!(
+            merged[1],
+            SchemaStats {
+                name: "fresh".to_string(),
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
     fn schema_series_are_capped_but_the_totals_cover_every_schema() {
         let schemas: Vec<SchemaStats> = (0..(MAX_SCHEMA_SERIES as u64 + 20))
             .map(|i| schema(&format!("tenant_{i:04}"), i + 1))
@@ -1508,6 +1580,21 @@ mod tests {
         let result = MariaDbCollector::new().collect(&config).await;
         assert!(matches!(result, Ok(points) if points.is_empty()));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Server counters a scrape could inflate, keyed by lowercase name.
+    async fn status_counters(conn: &mut MySqlConnection) -> HashMap<String, i64> {
+        let rows = conn
+            .fetch_all(
+                "SHOW GLOBAL STATUS WHERE Variable_name IN \
+                 ('Created_tmp_tables', 'Created_tmp_disk_tables', 'Handler_commit')",
+            )
+            .await
+            .expect("read status counters");
+        rows.iter()
+            .filter_map(name_value)
+            .filter_map(|(name, value)| Some((name.to_ascii_lowercase(), value.parse().ok()?)))
+            .collect()
     }
 
     /// Scrapes a real `mariadb` container: as root, and as the application
@@ -1585,12 +1672,31 @@ mod tests {
             .await
             .expect("update in open transaction");
 
-        let config = CollectorConfig::new(77, SourceKind::Database, root_url)
+        let config = CollectorConfig::new(77, SourceKind::Database, root_url.clone())
             .with_timeout(Duration::from_secs(10));
+        let mut probe = open_connection(&root_url).await.expect("root probe");
+        let before = status_counters(&mut probe).await;
         let points = MariaDbCollector::new()
             .collect(&config)
             .await
             .expect("collect never errors");
+        let after = status_counters(&mut probe).await;
+        let _ = probe.close().await;
+        // The server's own counters are charted as workload, so a scrape must
+        // not inflate them: the schema statistics once joined SCHEMATA to
+        // TABLES and cost ~120 temporary tables (~20 on disk) and ~75 commits
+        // each time.
+        for (name, limit) in [
+            ("created_tmp_tables", 25),
+            ("created_tmp_disk_tables", 5),
+            ("handler_commit", 10),
+        ] {
+            let spent = after[name] - before[name];
+            assert!(
+                spent <= limit,
+                "one scrape cost {spent} {name} (limit {limit})"
+            );
+        }
         let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
         for expected in [
             "mariadb.connections",
