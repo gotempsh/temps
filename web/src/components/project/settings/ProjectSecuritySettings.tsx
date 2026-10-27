@@ -9,6 +9,8 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { SHIELD_MODES } from '@/lib/shield'
+import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
+import { useOpenSectionFromHash } from '@/hooks/useOpenSectionFromHash'
 import { ShieldWouldHaveCounts } from './ShieldWouldHaveCounts'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -27,6 +29,7 @@ import { Switch } from '@/components/ui/switch'
 import {
   Bot,
   InfoIcon,
+  ListChecks,
   ScanSearch,
   Shield,
   ShieldCheck,
@@ -36,6 +39,9 @@ import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
+
+/** Sections other pages link to, such as an environment's Shield tab. */
+const SHIELD_SECTIONS = ['shield', 'shield-entries'] as const
 
 interface ProjectSecuritySettingsProps {
   project: ProjectResponse
@@ -75,6 +81,7 @@ export function ProjectSecuritySettings({
   project,
   refetch,
 }: ProjectSecuritySettingsProps) {
+  useOpenSectionFromHash(SHIELD_SECTIONS)
   const updateDeploymentConfig = useMutation({
     ...updateProjectDeploymentConfigMutation(),
     meta: {
@@ -343,6 +350,7 @@ export function ProjectSecuritySettings({
 
       {/* Shield Card (ADR 066): replaces the Attack Mode card */}
       <SettingsSection
+        id="shield"
         title="Shield"
         description="How this service acts on Shield's verdicts. Environments follow this mode unless they set their own."
         icon={Shield}
@@ -379,7 +387,10 @@ export function ProjectSecuritySettings({
             )}
           />
           <Separator />
-          <ShieldWouldHaveCounts projectId={project.id} />
+          <ShieldWouldHaveCounts
+            projectId={project.id}
+            projectSlug={project.slug}
+          />
         </div>
         <div className="mt-6">
           <Button
@@ -394,6 +405,18 @@ export function ProjectSecuritySettings({
             Save Shield settings
           </Button>
         </div>
+      </SettingsSection>
+
+      {/* Saved as they change, apart from the form's Save buttons. */}
+      <SettingsSection
+        id="shield-entries"
+        title="Shield entries"
+        description="Allow, block or challenge specific addresses and fingerprints in every environment"
+        icon={ListChecks}
+      >
+        <ShieldEntriesPanel
+          scope={{ kind: 'project', projectId: project.id }}
+        />
       </SettingsSection>
 
       {/* AI Assistance Card */}

@@ -153,8 +153,13 @@ function EventRow({ event }: { event: ShieldEventResponse }) {
           {event.difficulty != null && ` · difficulty ${event.difficulty}`}
         </p>
       </TableCell>
-      <TableCell className="font-mono text-xs break-all">{event.ip}</TableCell>
-      <TableCell className="hidden max-w-[22rem] md:table-cell">
+      {/* IPv4 fits on one line; only an IPv6 address may wrap. */}
+      <TableCell
+        className={`font-mono text-xs ${event.ip.includes(':') ? 'break-all' : 'whitespace-nowrap'}`}
+      >
+        {event.ip}
+      </TableCell>
+      <TableCell className="hidden max-w-[18rem] md:table-cell">
         <p className="truncate text-sm" title={`${event.host}${event.path}`}>
           <span className="text-muted-foreground">{event.host}</span>
           {event.path}
@@ -168,16 +173,25 @@ function EventRow({ event }: { event: ShieldEventResponse }) {
           </p>
         )}
       </TableCell>
-      <TableCell className="hidden lg:table-cell">
+      <TableCell className="hidden min-w-[14rem] lg:table-cell">
         <ul className="space-y-0.5">
           {event.reasons.map((reason) => (
-            <li key={reason} className="font-mono text-xs break-all">
+            <li
+              key={reason}
+              className="font-mono text-xs [overflow-wrap:anywhere]"
+            >
               {reason}
             </li>
           ))}
-          {event.signature && (
-            <li className="font-mono text-xs break-all">{event.signature}</li>
-          )}
+          {/* A signature match is usually a reason already ("CVE-… on /…"). */}
+          {event.signature &&
+            !event.reasons.some((reason) =>
+              reason.startsWith(event.signature ?? '')
+            ) && (
+              <li className="font-mono text-xs [overflow-wrap:anywhere]">
+                {event.signature}
+              </li>
+            )}
         </ul>
       </TableCell>
     </TableRow>

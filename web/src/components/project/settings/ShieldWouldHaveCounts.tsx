@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/table'
 import { shieldModeLabel } from '@/lib/shield'
 import { useQueries, useQuery } from '@tanstack/react-query'
+import { Link } from 'react-router'
 
 const numberFormat = new Intl.NumberFormat()
 
@@ -25,7 +26,13 @@ const numberFormat = new Intl.NumberFormat()
  * blocked or challenged in selective mode (ADR 066 D11), so the switch is
  * made knowing its effect.
  */
-export function ShieldWouldHaveCounts({ projectId }: { projectId: number }) {
+export function ShieldWouldHaveCounts({
+  projectId,
+  projectSlug,
+}: {
+  projectId: number
+  projectSlug: string
+}) {
   const environments = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: projectId } }),
   })
@@ -45,7 +52,7 @@ export function ShieldWouldHaveCounts({ projectId }: { projectId: number }) {
         <h3 className="text-sm font-medium">Last 24 hours</h3>
         <p className="text-sm text-muted-foreground">
           Requests that would have been blocked or challenged in selective mode.
-          Each environment&apos;s Shield tab has the detail.
+          Open an environment to see each request and why.
         </p>
       </div>
       {environments.error ? (
@@ -85,7 +92,12 @@ export function ShieldWouldHaveCounts({ projectId }: { projectId: number }) {
               return (
                 <TableRow key={environment.id}>
                   <TableCell className="font-medium">
-                    {environment.name}
+                    <Link
+                      className="underline-offset-4 hover:underline"
+                      to={`/projects/${projectSlug}/environments?environment=${environment.id}&view=shield`}
+                    >
+                      {environment.name}
+                    </Link>
                   </TableCell>
                   <TableCell className="text-sm text-muted-foreground">
                     {summary?.data
