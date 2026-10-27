@@ -187,6 +187,8 @@ export const MARIADB_METRIC_LABELS: Record<string, string> = {
   'mariadb.network_received_bytes_total': 'Received',
   'mariadb.network_sent_bytes_total': 'Sent',
   'mariadb.database_size_bytes': 'Database Size',
+  'mariadb.data_size_bytes': 'Data Size',
+  'mariadb.index_size_bytes': 'Index Size',
   'mariadb.data_free_bytes': 'Free Space in Tablespaces',
   'mariadb.rows_estimated': 'Rows (estimated)',
   'mariadb.replica_io_running': 'Replica I/O Thread',
