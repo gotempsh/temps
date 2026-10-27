@@ -1396,8 +1396,21 @@ pub async fn create_sandbox(
         req.from_snapshot_artifact = Some(artifact);
     }
 
-    let row = state.sandbox_service.create_sandbox(user_id, req).await?;
-    drop(artifact_lifecycle_guard);
+    // Detached: a client or proxy that gives up must not cancel the create
+    // halfway (see `spawn_create`).
+    let row = state
+        .sandbox_service
+        .spawn_create(user_id, req, artifact_lifecycle_guard)
+        .await
+        .map_err(|join_error| {
+            tracing::error!(user_id, error = %join_error, "sandbox create task stopped unexpectedly");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Sandbox Create Failed")
+                .detail(format!(
+                    "The sandbox create for user {user_id} stopped unexpectedly: {join_error}"
+                ))
+                .build()
+        })??;
     let resp = build_response(&state, row).await;
     Ok((StatusCode::CREATED, Json(resp)))
 }

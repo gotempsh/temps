@@ -129,10 +129,9 @@ export function CreateSandboxSheet({
   return (
     <Sheet
       open={open}
-      onOpenChange={(next) => {
-        if (create.isPending) return
-        onOpenChange(next)
-      }}
+      // Closing while a create is in flight is safe: the server finishes it
+      // whether or not anyone is still waiting, and it shows up in the list.
+      onOpenChange={onOpenChange}
     >
       <SheetContent className="flex w-full flex-col gap-0 overflow-y-auto sm:max-w-lg">
         <SheetHeader>
@@ -385,6 +384,17 @@ export function CreateSandboxSheet({
               )}
             />
 
+            {create.isPending && (
+              <Alert>
+                <AlertDescription>
+                  Starting the sandbox. The first one on a node builds its
+                  image, which can take several minutes. You can close this
+                  panel: it keeps starting and appears in the sandbox list
+                  when it is ready.
+                </AlertDescription>
+              </Alert>
+            )}
+
             {create.isError && (
               <Alert variant="destructive">
                 <AlertDescription>
@@ -401,9 +411,8 @@ export function CreateSandboxSheet({
                 type="button"
                 variant="outline"
                 onClick={() => onOpenChange(false)}
-                disabled={create.isPending}
               >
-                Cancel
+                {create.isPending ? 'Close' : 'Cancel'}
               </Button>
               <Button type="submit" disabled={create.isPending || !available}>
                 {create.isPending && (

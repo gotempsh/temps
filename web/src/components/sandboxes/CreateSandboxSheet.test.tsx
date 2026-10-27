@@ -131,6 +131,26 @@ test('a refused create keeps the sheet open and shows the reason', async () => {
   api.restore()
 })
 
+test('a slow create explains the wait and can be closed', async () => {
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT),
+    // Never answers, like a first create that is still building its image.
+    'POST /v1/sandboxes': () => new Promise<Response>(() => {}),
+  })
+  const view = renderSheet()
+
+  fireEvent.click(await view.findByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText(/builds its image, which can take several minutes/)
+  // The footer button and the sheet's own close control both stay usable.
+  const closers = view.getAllByRole('button', { name: 'Close' })
+  expect(closers.length).toBeGreaterThan(0)
+  for (const closer of closers) {
+    expect((closer as HTMLButtonElement).disabled).toBe(false)
+  }
+  api.restore()
+})
+
 test('says so, and cannot submit, when sandboxes are unavailable', async () => {
   const api = mockApi({})
   const view = renderSheet(false)

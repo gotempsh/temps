@@ -2187,6 +2187,29 @@ impl SandboxService {
     /// the internal ID the provider indexes by), then asks the provider
     /// to create the container. On provider failure the DB row is marked
     /// "destroyed" so list doesn't show zombie entries.
+    /// [`Self::create_sandbox`] in a task of its own, so it always reaches its
+    /// success or cleanup path, even when the caller stops waiting.
+    ///
+    /// The first sandbox on a node can spend minutes building its image. An
+    /// HTTP client or proxy that gives up drops the request's future, and a
+    /// create cancelled there left the row "running" with no backend while
+    /// the worker tore down the container it had just made, because the
+    /// control plane stopped waiting. `hold` is dropped when the create ends:
+    /// a lock the caller must keep for exactly that long.
+    pub fn spawn_create<H: Send + 'static>(
+        self: &Arc<Self>,
+        user_id: i32,
+        req: CreateSandboxRequest,
+        hold: H,
+    ) -> tokio::task::JoinHandle<Result<sandboxes::Model, SandboxError>> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = service.create_sandbox(user_id, req).await;
+            drop(hold);
+            result
+        })
+    }
+
     pub async fn create_sandbox(
         &self,
         user_id: i32,
@@ -7761,6 +7784,8 @@ mod storage_cleanup_tests {
         egress_calls: Arc<Mutex<Vec<temps_agents::sandbox::SandboxEgressPolicy>>>,
         /// Refuse restricted policies, like a backend without allow-lists.
         fail_egress: bool,
+        /// `create` takes this long, like a first image build.
+        create_delay: Option<Duration>,
     }
 
     impl FakeProvider {
@@ -7781,6 +7806,7 @@ mod storage_cleanup_tests {
                 alive_check_fails: Arc::new(AtomicBool::new(false)),
                 egress_calls: Arc::new(Mutex::new(Vec::new())),
                 fail_egress: false,
+                create_delay: None,
             }
         }
     }
@@ -7800,6 +7826,9 @@ mod storage_cleanup_tests {
     #[async_trait]
     impl SandboxProvider for FakeProvider {
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            if let Some(delay) = self.create_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.fail_create {
                 return Err(AgentError::SandboxCreationFailed {
                     run_id: config.run_id,
@@ -10956,6 +10985,50 @@ mod storage_cleanup_tests {
         assert!(
             leftovers.is_empty(),
             "a failed create must not strand a work dir; found {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// A caller that stops waiting (a proxy timing out during a first image
+    /// build) must not cancel the create: it still reaches its cleanup path,
+    /// so no work dir or "running" row is stranded.
+    #[tokio::test]
+    async fn spawned_create_finishes_after_the_caller_stops_waiting() {
+        let data_root = unique_data_root("create-detached");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // mark_destroyed update, reached only if the create was not cancelled
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_create = true;
+        provider.create_delay = Some(Duration::from_millis(200));
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (held, hold) = tokio::sync::oneshot::channel::<()>();
+        let waiting = service.spawn_create(1, CreateSandboxRequest::default(), held);
+        // The caller gives up while the provider is still creating.
+        let gave_up = tokio::time::timeout(Duration::from_millis(20), waiting).await;
+        assert!(gave_up.is_err(), "the create should still be running");
+        // `hold` is released only when the create has ended.
+        tokio::time::timeout(Duration::from_secs(5), hold)
+            .await
+            .expect("the create must finish without a caller")
+            .expect_err("the held value is dropped, never sent");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&data_root)
+            .expect("read data root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a create nobody waited for must still clean up; found {:?}",
             leftovers
         );
         let _ = std::fs::remove_dir_all(&data_root);
