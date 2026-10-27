@@ -62173,6 +62173,40 @@
         ],
         "type": "string"
       },
+      "ShieldProposalPage": {
+        "description": "One page of proposals, newest evidence first.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ShieldProposalResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Proposals that match, on every page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "type": "object"
+      },
       "ShieldProposalResponse": {
         "description": "An address or fingerprint fleet learning proposes to challenge or block.",
         "properties": {
@@ -152908,6 +152942,39 @@
             "schema": {
               "$ref": "#/components/schemas/ShieldProposalStatus"
             }
+          },
+          {
+            "description": "Only proposals whose address or fingerprint contains this text,\nignoring case.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number, from 1 (the default).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Proposals per page: 25 by default, at most 100.",
+            "example": 25,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
           }
         ],
         "responses": {
@@ -152915,14 +152982,21 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/ShieldProposalResponse"
-                  },
-                  "type": "array"
+                  "$ref": "#/components/schemas/ShieldProposalPage"
                 }
               }
             },
-            "description": "Proposals that have not expired, newest evidence first"
+            "description": "A page of proposals that have not expired, newest evidence first"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Search too long"
           },
           "401": {
             "content": {

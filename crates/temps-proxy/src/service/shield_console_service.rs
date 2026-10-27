@@ -40,9 +40,12 @@ pub const MAX_TOKENS_PER_PROJECT: u64 = 100;
 /// Most operator entries one project, or the platform, may hold. The list
 /// is returned whole, so it stays one screen of rules, not a feed.
 pub const MAX_ENTRIES_PER_SCOPE: u64 = 500;
-/// Most proposals one list returns, newest first. Learning keeps a row
-/// only while its evidence lasts, so the live set stays this size or less.
-pub const MAX_PROPOSALS: u64 = 500;
+/// Proposals per page when the caller does not say, and at most. A botnet
+/// can leave thousands live at once, so the list pages rather than caps.
+pub const DEFAULT_PROPOSALS_PAGE_SIZE: u64 = 25;
+pub const MAX_PROPOSALS_PAGE_SIZE: u64 = 100;
+/// The longest search: a subject is at most 64 characters.
+const MAX_PROPOSAL_SEARCH_CHARS: usize = 64;
 const MAX_TOKEN_NAME_CHARS: usize = 128;
 const MAX_NOTE_CHARS: usize = 500;
 /// The broadest network an entry may name: a typo of `/0` must not block
@@ -490,6 +493,25 @@ pub struct ShieldProposalsQuery {
     /// Only proposals in this state; all of them when omitted.
     #[param(value_type = Option<ShieldProposalStatus>)]
     pub status: Option<ShieldProposalStatus>,
+    /// Only proposals whose address or fingerprint contains this text,
+    /// ignoring case.
+    pub q: Option<String>,
+    /// Page number, from 1 (the default).
+    #[param(example = 1)]
+    pub page: Option<u64>,
+    /// Proposals per page: 25 by default, at most 100.
+    #[param(example = 25)]
+    pub page_size: Option<u64>,
+}
+
+/// One page of proposals, newest evidence first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ShieldProposalPage {
+    pub items: Vec<ShieldProposalResponse>,
+    pub page: u64,
+    pub page_size: u64,
+    /// Proposals that match, on every page.
+    pub total: u64,
 }
 
 /// What a proposal names.
@@ -1192,26 +1214,71 @@ impl ShieldConsoleService {
         ShieldEntryResponse::from_model(row)
     }
 
-    /// Proposals that have not expired, newest evidence first.
+    /// Proposals that have not expired, newest evidence first, a page at a
+    /// time.
     pub async fn list_proposals(
         &self,
-        status: Option<ShieldProposalStatus>,
-    ) -> Result<Vec<ShieldProposalResponse>, ShieldConsoleError> {
+        query: ShieldProposalsQuery,
+    ) -> Result<ShieldProposalPage, ShieldConsoleError> {
+        let page = query.page.unwrap_or(1).max(1);
+        let page_size = query
+            .page_size
+            .unwrap_or(DEFAULT_PROPOSALS_PAGE_SIZE)
+            .clamp(1, MAX_PROPOSALS_PAGE_SIZE);
+        let search = query
+            .q
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty());
+        if search
+            .as_ref()
+            .is_some_and(|text| text.chars().count() > MAX_PROPOSAL_SEARCH_CHARS)
+        {
+            return Err(invalid(format!(
+                "A search holds at most {MAX_PROPOSAL_SEARCH_CHARS} characters"
+            )));
+        }
+        let status = query.status.map(|status| status.as_str().to_string());
+        // `strpos` rather than LIKE, so `%` and `_` in a search are plain text.
+        const MATCHES: &str = "expires_at > now() AND ($1::text IS NULL OR status = $1) \
+             AND ($2::text IS NULL OR strpos(lower(subject), lower($2)) > 0)";
+        let offset = (page - 1).saturating_mul(page_size);
+        let txn = self.db.begin().await?;
+        let total: i64 = txn
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("SELECT COUNT(*)::bigint AS total FROM shield_observed WHERE {MATCHES}"),
+                [status.clone().into(), search.clone().into()],
+            ))
+            .await?
+            .map(|row| row.try_get("", "total"))
+            .transpose()?
+            .unwrap_or(0);
         let rows = shield_observed::Entity::find()
             .from_raw_sql(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 format!(
-                    "SELECT * FROM shield_observed \
-                     WHERE expires_at > now() AND ($1::text IS NULL OR status = $1) \
-                     ORDER BY last_seen DESC, id DESC LIMIT {MAX_PROPOSALS}"
+                    "SELECT * FROM shield_observed WHERE {MATCHES} \
+                     ORDER BY last_seen DESC, id DESC LIMIT $3 OFFSET $4"
                 ),
-                [status.map(|status| status.as_str().to_string()).into()],
+                [
+                    status.into(),
+                    search.into(),
+                    (page_size as i64).into(),
+                    i64::try_from(offset).unwrap_or(i64::MAX).into(),
+                ],
             ))
-            .all(self.db.as_ref())
+            .all(&txn)
             .await?;
-        rows.into_iter()
-            .map(ShieldProposalResponse::from_model)
-            .collect()
+        txn.commit().await?;
+        Ok(ShieldProposalPage {
+            items: rows
+                .into_iter()
+                .map(ShieldProposalResponse::from_model)
+                .collect::<Result<_, _>>()?,
+            page,
+            page_size,
+            total: u64::try_from(total).unwrap_or(0),
+        })
     }
 
     /// Approves or rejects a proposal, or changes an earlier decision. The
@@ -2090,7 +2157,12 @@ mod tests {
         let service = service(&test_db);
 
         // Newest evidence first; the expired one is gone; all start pending.
-        let all = service.list_proposals(None).await.unwrap();
+        let all = service
+            .list_proposals(ShieldProposalsQuery::default())
+            .await
+            .unwrap();
+        assert_eq!((all.total, all.page, all.page_size), (2, 1, 25));
+        let all = all.items;
         assert_eq!(all.iter().map(|p| p.id).collect::<Vec<_>>(), [9102, 9101]);
         assert!(all
             .iter()
@@ -2105,9 +2177,10 @@ mod tests {
         assert_eq!(approved.status, ShieldProposalStatus::Approved);
         assert!(approved.decided_at.is_some());
         let pending = service
-            .list_proposals(Some(ShieldProposalStatus::Pending))
+            .list_proposals(with_status(ShieldProposalStatus::Pending))
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(pending.iter().map(|p| p.id).collect::<Vec<_>>(), [9102]);
 
         // An approval can be withdrawn.
@@ -2116,9 +2189,10 @@ mod tests {
             .await
             .unwrap();
         let rejected = service
-            .list_proposals(Some(ShieldProposalStatus::Rejected))
+            .list_proposals(with_status(ShieldProposalStatus::Rejected))
             .await
-            .unwrap();
+            .unwrap()
+            .items;
         assert_eq!(rejected.iter().map(|p| p.id).collect::<Vec<_>>(), [9101]);
 
         for missing in [9103, 9999] {
@@ -2133,6 +2207,133 @@ mod tests {
             service
                 .decide_proposal(9102, ShieldProposalStatus::Pending, None)
                 .await,
+            Err(ShieldConsoleError::Validation { .. })
+        ));
+    }
+
+    fn with_status(status: ShieldProposalStatus) -> ShieldProposalsQuery {
+        ShieldProposalsQuery {
+            status: Some(status),
+            ..ShieldProposalsQuery::default()
+        }
+    }
+
+    /// More proposals than one page: each page holds the next newest, the
+    /// total counts them all, and the filters, the search and the page
+    /// size apply together. A search is plain text, not a pattern.
+    #[tokio::test]
+    async fn proposals_page_newest_first_and_search_by_subject() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        // 130 addresses, 198.51.100.1 seen most recently; every tenth rejected.
+        exec(
+            &db,
+            "INSERT INTO shield_observed (kind, subject, verdict, reason, first_seen, last_seen, \
+             hits, expires_at, status) \
+             SELECT 'ip', '198.51.100.' || n, 'block', 'exploit CVE-2021-41773', \
+                 now() - interval '1 day', now() - n * interval '1 minute', 1, \
+                 now() + interval '7 days', \
+                 CASE WHEN n % 10 = 0 THEN 'rejected' ELSE 'pending' END \
+             FROM generate_series(1, 130) AS n",
+            vec![],
+        )
+        .await;
+        let service = service(&test_db);
+        let subjects = |page: &ShieldProposalPage| {
+            page.items
+                .iter()
+                .map(|p| p.subject.clone())
+                .collect::<Vec<_>>()
+        };
+        let query = |page: Option<u64>, page_size: Option<u64>| ShieldProposalsQuery {
+            page,
+            page_size,
+            ..ShieldProposalsQuery::default()
+        };
+
+        let first = service.list_proposals(query(None, None)).await.unwrap();
+        assert_eq!((first.total, first.page, first.page_size), (130, 1, 25));
+        assert_eq!(first.items.len(), 25);
+        assert_eq!(first.items[0].subject, "198.51.100.1");
+        assert!(first
+            .items
+            .windows(2)
+            .all(|pair| pair[0].last_seen >= pair[1].last_seen));
+
+        let second = service.list_proposals(query(Some(2), None)).await.unwrap();
+        assert_eq!(second.items[0].subject, "198.51.100.26");
+        let last = service.list_proposals(query(Some(6), None)).await.unwrap();
+        assert_eq!(subjects(&last).len(), 5);
+        assert_eq!(
+            subjects(&last).last().map(String::as_str),
+            Some("198.51.100.130")
+        );
+        let past = service.list_proposals(query(Some(9), None)).await.unwrap();
+        assert!(past.items.is_empty());
+        assert_eq!(past.total, 130);
+
+        // Every proposal turns up exactly once across the pages.
+        let mut seen = Vec::new();
+        for page in 1..=2 {
+            let page = service
+                .list_proposals(query(Some(page), Some(100)))
+                .await
+                .unwrap();
+            seen.extend(subjects(&page));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 130);
+
+        // The page size is bounded; page 0 reads as the first.
+        let clamped = service
+            .list_proposals(query(Some(0), Some(10_000)))
+            .await
+            .unwrap();
+        assert_eq!(
+            (clamped.page, clamped.page_size, clamped.items.len()),
+            (1, 100, 100)
+        );
+
+        let rejected = service
+            .list_proposals(with_status(ShieldProposalStatus::Rejected))
+            .await
+            .unwrap();
+        assert_eq!(rejected.total, 13);
+        assert_eq!(rejected.items[0].subject, "198.51.100.10");
+
+        let search = |q: &str, status: Option<ShieldProposalStatus>| ShieldProposalsQuery {
+            q: Some(q.to_string()),
+            status,
+            ..ShieldProposalsQuery::default()
+        };
+        // 198.51.100.12 and 120 to 129, newest first.
+        let found = service
+            .list_proposals(search(" 100.12 ", None))
+            .await
+            .unwrap();
+        assert_eq!(found.total, 11);
+        assert_eq!(found.items[0].subject, "198.51.100.12");
+        let found = service
+            .list_proposals(search("100.12", Some(ShieldProposalStatus::Rejected)))
+            .await
+            .unwrap();
+        assert_eq!(subjects(&found), ["198.51.100.120"]);
+        for pattern in ["%", "_", "198.51.100.1_"] {
+            assert_eq!(
+                service
+                    .list_proposals(search(pattern, None))
+                    .await
+                    .unwrap()
+                    .total,
+                0,
+                "{pattern}"
+            );
+        }
+        assert!(matches!(
+            service.list_proposals(search(&"a".repeat(65), None)).await,
             Err(ShieldConsoleError::Validation { .. })
         ));
     }

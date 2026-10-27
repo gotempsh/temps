@@ -1387,6 +1387,7 @@ mod tests {
 
     // ── Against the databases ───────────────────────────────────────────
 
+    use crate::service::shield_console_service::{ShieldConsoleService, ShieldProposalStatus};
     use crate::shield::ShieldSources;
     use sea_orm::{EntityTrait, QueryOrder};
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
@@ -1591,6 +1592,29 @@ mod tests {
         })
     }
 
+    /// Decides `subject`'s proposal the way the console does.
+    async fn decide(db: &Arc<DatabaseConnection>, subject: &str, status: ShieldProposalStatus) {
+        let id: i64 = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT id FROM shield_observed WHERE subject = $1",
+                [subject.into()],
+            ))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no proposal for {subject}"))
+            .try_get("", "id")
+            .unwrap();
+        let console = ShieldConsoleService::new(
+            db.clone(),
+            Arc::new(crate::storage::shield_stats::PostgresShieldStats::new(
+                db.clone(),
+            )),
+        );
+        let decided = console.decide_proposal(id, status, None).await.unwrap();
+        assert_eq!(decided.status, status, "{subject}");
+    }
+
     async fn observed_status(db: &DatabaseConnection, subject: &str) -> String {
         db.query_one(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
@@ -1697,9 +1721,20 @@ mod tests {
         assert_eq!(action(&index, "45.33.40.7", None), Action::Pass);
         assert_eq!(action(&index, "8.8.4.4", Some(SCANNER_JA4)), Action::Pass);
 
-        // Approved, every ingress acts on them.
-        db.execute_unprepared("UPDATE shield_observed SET status = 'approved', decided_at = now()")
-            .await?;
+        // Approved through the console, every ingress acts on them.
+        let pending: Vec<String> = db
+            .query_all(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT subject FROM shield_observed WHERE status = 'pending'",
+            ))
+            .await?
+            .iter()
+            .map(|row| row.try_get("", "subject"))
+            .collect::<Result<_, _>>()?;
+        assert!(pending.len() >= 3, "{pending:?}");
+        for subject in &pending {
+            decide(&db, subject, ShieldProposalStatus::Approved).await;
+        }
         assert!(sources.compile_with(true).await?.is_some());
         let index = latest_index(&db).await;
         assert_eq!(action(&index, "45.33.40.7", None), Action::Block);
@@ -1717,10 +1752,7 @@ mod tests {
         assert_eq!(sources.compile_with(true).await?, None);
 
         // A rejection withdraws it, and new evidence keeps the decision.
-        db.execute_unprepared(
-            "UPDATE shield_observed SET status = 'rejected' WHERE subject = '45.33.40.7'",
-        )
-        .await?;
+        decide(&db, "45.33.40.7", ShieldProposalStatus::Rejected).await;
         assert!(sources.compile_with(true).await?.is_some());
         assert_eq!(
             action(&latest_index(&db).await, "45.33.40.7", None),
@@ -1730,10 +1762,7 @@ mod tests {
         assert_eq!(learning.promote().await?.unwrap().written, 1);
         assert_eq!(observed_status(&db, "45.33.40.7").await, "rejected");
         assert_eq!(sources.compile_with(true).await?, None);
-        db.execute_unprepared(
-            "UPDATE shield_observed SET status = 'approved' WHERE subject = '45.33.40.7'",
-        )
-        .await?;
+        decide(&db, "45.33.40.7", ShieldProposalStatus::Approved).await;
         assert!(sources.compile_with(true).await?.is_some());
 
         // An operator allow, platform-wide, wins; removing it is a change.

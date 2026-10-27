@@ -28,10 +28,10 @@ use crate::service::shield_console_service::{
     ShieldChallengeCounts, ShieldConsoleError, ShieldConsoleService, ShieldEntryResponse,
     ShieldEntryScope, ShieldEntryVerdict, ShieldEventResponse, ShieldEventsQuery,
     ShieldEventsResponse, ShieldLookupQuery, ShieldLookupResponse, ShieldModeSource,
-    ShieldProposalKind, ShieldProposalResponse, ShieldProposalStatus, ShieldProposalsQuery,
-    ShieldSolveTimes, ShieldSourceCount, ShieldSummaryQuery, ShieldSummaryResponse,
-    ShieldTokenResponse, ShieldTokenScope, ShieldVerdictCounts, ShieldWindow, ShieldWouldHave,
-    UpdateShieldEntryRequest,
+    ShieldProposalKind, ShieldProposalPage, ShieldProposalResponse, ShieldProposalStatus,
+    ShieldProposalsQuery, ShieldSolveTimes, ShieldSourceCount, ShieldSummaryQuery,
+    ShieldSummaryResponse, ShieldTokenResponse, ShieldTokenScope, ShieldVerdictCounts,
+    ShieldWindow, ShieldWouldHave, UpdateShieldEntryRequest,
 };
 
 pub struct ShieldConsoleState {
@@ -880,7 +880,8 @@ pub async fn delete_platform_shield_entry(
     path = "/settings/shield/proposals",
     params(ShieldProposalsQuery),
     responses(
-        (status = 200, description = "Proposals that have not expired, newest evidence first", body = Vec<ShieldProposalResponse>),
+        (status = 200, description = "A page of proposals that have not expired, newest evidence first", body = ShieldProposalPage),
+        (status = 400, description = "Search too long", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
@@ -893,7 +894,7 @@ pub async fn list_shield_proposals(
     Query(query): Query<ShieldProposalsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
-    Ok(Json(state.service.list_proposals(query.status).await?))
+    Ok(Json(state.service.list_proposals(query).await?))
 }
 
 /// Approve a proposal
@@ -1088,6 +1089,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             ShieldEntryVerdict,
             CreateShieldEntryRequest,
             UpdateShieldEntryRequest,
+            ShieldProposalPage,
             ShieldProposalResponse,
             ShieldProposalKind,
             ShieldProposalStatus,
@@ -1480,8 +1482,9 @@ mod tests {
 
         let pending = call("GET", "/settings/shield/proposals?status=pending").await;
         assert_eq!(pending.0, StatusCode::OK, "body: {}", pending.2);
-        assert_eq!(pending.2[0]["subject"], "203.0.113.7");
-        assert_eq!(pending.2[0]["status"], "pending");
+        assert_eq!(pending.2["total"], 1);
+        assert_eq!(pending.2["items"][0]["subject"], "203.0.113.7");
+        assert_eq!(pending.2["items"][0]["status"], "pending");
 
         let approved = call("POST", "/settings/shield/proposals/3/approve").await;
         assert_eq!(approved.0, StatusCode::OK, "body: {}", approved.2);
@@ -1494,7 +1497,7 @@ mod tests {
         assert_eq!(rejected.2["status"], "rejected");
         let listed = call("GET", "/settings/shield/proposals?status=rejected").await;
         assert_eq!(
-            listed.2.as_array().map(Vec::len),
+            listed.2["items"].as_array().map(Vec::len),
             Some(1),
             "body: {}",
             listed.2

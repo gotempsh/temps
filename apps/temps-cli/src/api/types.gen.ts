@@ -28914,6 +28914,19 @@ export type ShieldModeSource = 'environment' | 'project';
 export type ShieldProposalKind = 'ip' | 'ja4';
 
 /**
+ * One page of proposals, newest evidence first.
+ */
+export type ShieldProposalPage = {
+    items: Array<ShieldProposalResponse>;
+    page: number;
+    page_size: number;
+    /**
+     * Proposals that match, on every page.
+     */
+    total: number;
+};
+
+/**
  * An address or fingerprint fleet learning proposes to challenge or block.
  */
 export type ShieldProposalResponse = {
@@ -81478,11 +81491,28 @@ export type ListShieldProposalsData = {
          * Only proposals in this state; all of them when omitted.
          */
         status?: ShieldProposalStatus;
+        /**
+         * Only proposals whose address or fingerprint contains this text,
+         * ignoring case.
+         */
+        q?: string;
+        /**
+         * Page number, from 1 (the default).
+         */
+        page?: number;
+        /**
+         * Proposals per page: 25 by default, at most 100.
+         */
+        page_size?: number;
     };
     url: '/settings/shield/proposals';
 };
 
 export type ListShieldProposalsErrors = {
+    /**
+     * Search too long
+     */
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
@@ -81501,9 +81531,9 @@ export type ListShieldProposalsError = ListShieldProposalsErrors[keyof ListShiel
 
 export type ListShieldProposalsResponses = {
     /**
-     * Proposals that have not expired, newest evidence first
+     * A page of proposals that have not expired, newest evidence first
      */
-    200: Array<ShieldProposalResponse>;
+    200: ShieldProposalPage;
 };
 
 export type ListShieldProposalsResponse = ListShieldProposalsResponses[keyof ListShieldProposalsResponses];
