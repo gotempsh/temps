@@ -22,13 +22,21 @@
 //!    connections, long-running queries and open transactions. Read only with
 //!    the `PROCESS` privilege: without it the server lists the user's own
 //!    threads, which would silently under-report.
-//! 5. `SHOW REPLICA STATUS` (falling back to `SHOW SLAVE STATUS`) — replication
-//!    lag and replication thread state, only when the server is a replica.
+//! 5. `SHOW ALL REPLICAS STATUS` (falling back through the older and MySQL
+//!    spellings, see [`REPLICA_STATUS_QUERIES`]) — replication lag and thread
+//!    state, only when the server is a replica. A server replicating from
+//!    several primaries reports its worst connection.
 //!
 //! The global status read is the only mandatory step. Every other step is
 //! skipped on its own when it fails — typically a missing privilege, e.g. the
 //! application user may not run `SHOW REPLICA STATUS` — so one denied query
 //! never empties the whole batch.
+//!
+//! Limitation: the processlist and transaction metrics are gated on the
+//! `PROCESS` privilege read from `information_schema.USER_PRIVILEGES`, which
+//! lists privileges granted to the user directly. A `PROCESS` grant obtained
+//! only through a role is not seen, so those metrics are omitted rather than
+//! reported partially.
 //!
 //! Connection and query failures are logged and produce an empty batch, so a
 //! slow or unreachable server never blocks the scraper loop.
@@ -222,6 +230,11 @@ const USAGE_RATIOS: &[(&str, &str, &str)] = &[
 /// tables (20 on disk) and ~75 commits, which the server's own
 /// `Created_tmp_*` and `Handler_*` counters then reported as workload. Two
 /// plain reads cost a handful, whatever the schema count.
+///
+/// `DATA_FREE` is summed per table. InnoDB tables in the shared system
+/// tablespace report that tablespace's whole free space, so it can be counted
+/// once per such table; file-per-table tablespaces (the default) report their
+/// own. Treat it as an upper bound on reclaimable space, not an exact figure.
 const SCHEMA_STATS_QUERY: &str = "SELECT TABLE_SCHEMA, \
         CAST(COALESCE(SUM(DATA_LENGTH), 0) AS UNSIGNED), \
         CAST(COALESCE(SUM(INDEX_LENGTH), 0) AS UNSIGNED), \
@@ -671,28 +684,46 @@ async fn read_activity(conn: &mut MySqlConnection, source_id: i32) -> Option<Act
     Some(activity)
 }
 
-/// `SHOW REPLICA STATUS` exists since MariaDB 10.5.1 and MySQL 8.0.22; older
-/// servers only know `SHOW SLAVE STATUS`, which MySQL 8.4 removed. A server
-/// that is not a replica returns no row.
+/// Statements that list replication state, most specific first.
+///
+/// MariaDB can replicate from several primaries at once, one named connection
+/// each; plain `SHOW REPLICA STATUS` only reports the default connection, so
+/// the `ALL` forms (MariaDB 10.5.1+ / older spelling) come first. MySQL has no
+/// `ALL` form and reports its channels in `SHOW REPLICA STATUS` (8.0.22+) or
+/// `SHOW SLAVE STATUS` (removed in 8.4). A server that is not a replica
+/// returns no row.
+const REPLICA_STATUS_QUERIES: [&str; 4] = [
+    "SHOW ALL REPLICAS STATUS",
+    "SHOW ALL SLAVES STATUS",
+    "SHOW REPLICA STATUS",
+    "SHOW SLAVE STATUS",
+];
+
 async fn read_replica_status(conn: &mut MySqlConnection, source_id: i32) -> Option<ReplicaStatus> {
-    let rows = match conn.fetch_all("SHOW REPLICA STATUS").await {
-        Ok(rows) => rows,
-        Err(_) => match conn.fetch_all("SHOW SLAVE STATUS").await {
-            Ok(rows) => rows,
-            Err(e) => {
-                // Usually a missing REPLICA MONITOR / REPLICATION CLIENT
-                // privilege when connected as the application user.
-                debug!(
-                    source_id,
-                    engine = ENGINE,
-                    error = %describe_error(&e),
-                    "mariadb replication status unavailable; skipping replication metrics"
-                );
-                return None;
+    let mut last_error = None;
+    for statement in REPLICA_STATUS_QUERIES {
+        match conn.fetch_all(statement).await {
+            Ok(rows) => {
+                let sources: Vec<ReplicaStatus> = rows.iter().map(replica_from_row).collect();
+                return aggregate_replicas(&sources);
             }
-        },
-    };
-    let row = rows.first()?;
+            Err(e) => last_error = Some(e),
+        }
+    }
+    if let Some(e) = last_error {
+        // Usually a missing REPLICA MONITOR / REPLICATION CLIENT privilege
+        // when connected as the application user.
+        debug!(
+            source_id,
+            engine = ENGINE,
+            error = %describe_error(&e),
+            "mariadb replication status unavailable; skipping replication metrics"
+        );
+    }
+    None
+}
+
+fn replica_from_row(row: &MySqlRow) -> ReplicaStatus {
     // Column names changed from Slave/Master to Replica/Source over time.
     let running = |names: [&str; 2]| {
         names
@@ -700,11 +731,29 @@ async fn read_replica_status(conn: &mut MySqlConnection, source_id: i32) -> Opti
             .find_map(|name| column_text(row, name))
             .is_some_and(|state| state.trim().eq_ignore_ascii_case("yes"))
     };
-    Some(ReplicaStatus {
+    ReplicaStatus {
         lag_seconds: column_f64(row, "Seconds_Behind_Master")
             .or_else(|| column_f64(row, "Seconds_Behind_Source")),
         io_running: running(["Slave_IO_Running", "Replica_IO_Running"]),
         sql_running: running(["Slave_SQL_Running", "Replica_SQL_Running"]),
+    }
+}
+
+/// One status for a server replicating from several primaries: it is only as
+/// healthy as its worst connection, so the lag is the largest known lag and a
+/// thread counts as running only if it runs on every connection. `None` when
+/// the server is not a replica.
+fn aggregate_replicas(sources: &[ReplicaStatus]) -> Option<ReplicaStatus> {
+    if sources.is_empty() {
+        return None;
+    }
+    Some(ReplicaStatus {
+        lag_seconds: sources
+            .iter()
+            .filter_map(|source| source.lag_seconds)
+            .reduce(f64::max),
+        io_running: sources.iter().all(|source| source.io_running),
+        sql_running: sources.iter().all(|source| source.sql_running),
     })
 }
 
@@ -994,6 +1043,41 @@ fn push_schema_points(out: &mut Points<'_>, schemas: &[SchemaStats]) {
 
 #[cfg(test)]
 mod tests {
+    fn replica(lag: Option<f64>, io: bool, sql: bool) -> ReplicaStatus {
+        ReplicaStatus {
+            lag_seconds: lag,
+            io_running: io,
+            sql_running: sql,
+        }
+    }
+
+    #[test]
+    fn aggregate_replicas_is_none_for_a_server_that_is_not_a_replica() {
+        assert_eq!(aggregate_replicas(&[]), None);
+    }
+
+    #[test]
+    fn aggregate_replicas_passes_a_single_source_through() {
+        let source = replica(Some(3.0), true, true);
+        assert_eq!(aggregate_replicas(&[source]), Some(source));
+    }
+
+    #[test]
+    fn aggregate_replicas_reports_the_worst_of_several_sources() {
+        let merged = aggregate_replicas(&[
+            replica(Some(2.0), true, true),
+            replica(Some(40.0), true, false),
+            replica(None, false, true),
+        ]);
+        assert_eq!(merged, Some(replica(Some(40.0), false, false)));
+    }
+
+    #[test]
+    fn aggregate_replicas_has_no_lag_while_every_source_is_stopped() {
+        let merged = aggregate_replicas(&[replica(None, false, false), replica(None, true, false)]);
+        assert_eq!(merged, Some(replica(None, false, false)));
+    }
+
     use super::*;
     use crate::store::SourceKind;
     use std::time::Duration;

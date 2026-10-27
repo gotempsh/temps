@@ -224,7 +224,10 @@ impl MetricsScraper {
 
         // Where each worker node publishes its services, loaded once for the
         // whole cycle rather than once per service.
-        let worker_addresses = Arc::new(self.load_worker_data_addresses(&services).await);
+        let (worker_addresses, node_lookup_error) =
+            self.load_worker_data_addresses(&services).await;
+        let worker_addresses = Arc::new(worker_addresses);
+        let node_lookup_error = Arc::new(node_lookup_error);
 
         // Semaphore caps concurrent collector tasks to avoid thundering-herd on
         // the DB pool and TimescaleDB chunk locks.
@@ -250,6 +253,7 @@ impl MetricsScraper {
 
             let encryption = Arc::clone(&self.encryption_service);
             let worker_addresses = Arc::clone(&worker_addresses);
+            let node_lookup_error = Arc::clone(&node_lookup_error);
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
@@ -322,13 +326,22 @@ impl MetricsScraper {
                             // Dialling the stored loopback host would reach
                             // the control plane, and possibly an unrelated
                             // service there on the same port.
-                            warn!(
-                                service_id,
-                                service_type,
-                                node_id,
-                                "MetricsScraper: service is placed on node {node_id}, which \
-                                 has no node record; skipping scrape"
-                            );
+                            match node_lookup_error.as_deref() {
+                                Some(lookup_error) => warn!(
+                                    service_id,
+                                    service_type,
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id} but \
+                                     the node lookup failed ({lookup_error}); skipping scrape"
+                                ),
+                                None => warn!(
+                                    service_id,
+                                    service_type,
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id}, \
+                                     which has no node record; skipping scrape"
+                                ),
+                            }
                             return Err(());
                         }
                     }
@@ -417,37 +430,40 @@ impl MetricsScraper {
 impl MetricsScraper {
     /// `data_address` of every worker node hosting one of `services`.
     ///
-    /// A failed lookup is logged and yields an empty map: worker-placed
-    /// services then skip this cycle, while control-plane services are still
-    /// scraped.
+    /// A failed lookup is logged and returned alongside an empty map, so each
+    /// worker-placed service can report "lookup failed" rather than "no such
+    /// node"; those services skip this cycle while control-plane services are
+    /// still scraped.
     async fn load_worker_data_addresses(
         &self,
         services: &[external_services::Model],
-    ) -> HashMap<i32, String> {
+    ) -> (HashMap<i32, String>, Option<String>) {
         let node_ids: HashSet<i32> = services
             .iter()
             .filter_map(|s| s.node_id)
             .filter(|id| *id != CONTROL_PLANE_NODE_ID)
             .collect();
         if node_ids.is_empty() {
-            return HashMap::new();
+            return (HashMap::new(), None);
         }
         match nodes::Entity::find()
             .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
             .all(self.db.as_ref())
             .await
         {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|node| (node.id, node.data_address().to_string()))
-                .collect(),
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|node| (node.id, node.data_address().to_string()))
+                    .collect(),
+                None,
+            ),
             Err(e) => {
                 warn!(
                     node_ids = ?node_ids,
                     "MetricsScraper: failed to load worker node addresses; services on \
                      worker nodes are skipped this cycle: {e}"
                 );
-                HashMap::new()
+                (HashMap::new(), Some(e.to_string()))
             }
         }
     }
