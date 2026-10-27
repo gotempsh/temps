@@ -957,21 +957,20 @@ mod tests {
     #[test]
     fn websocket_handlers_validate_origin_before_any_work() {
         let source = include_str!("terminal.rs");
-        for name in ["terminal"] {
-            let start = source
-                .find(&format!("pub async fn {name}("))
-                .unwrap_or_else(|| panic!("{name} handler not found in source"));
-            let body_start = start + source[start..].find(") -> ").unwrap_or(0);
-            let body = &source[body_start..];
-            let check = body
-                .find("validate_websocket_origin(&headers)?")
-                .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
-            let first_await = body.find(".await").unwrap_or(usize::MAX);
-            assert!(
-                check < first_await,
-                "{name} must validate the Origin before its first await"
-            );
-        }
+        let name = "terminal";
+        let start = source
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} handler not found in source"));
+        let body_start = start + source[start..].find(") -> ").unwrap_or(0);
+        let body = &source[body_start..];
+        let check = body
+            .find("validate_websocket_origin(&headers)?")
+            .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
+        let first_await = body.find(".await").unwrap_or(usize::MAX);
+        assert!(
+            check < first_await,
+            "{name} must validate the Origin before its first await"
+        );
     }
 
     #[test]
