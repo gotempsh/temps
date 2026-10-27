@@ -50,6 +50,15 @@ function sourceName(
   return `${source.service} (${owner})${node}`
 }
 
+/** `?settings=` value that opens a managed service's log settings on its
+    Logs page. */
+export const SERVICE_LOG_SETTINGS_PARAM = 'log-ingestion'
+
+/** A managed service's log settings, on its Logs page. */
+export function serviceLogSettingsPath(serviceId: number): string {
+  return `/storage/${serviceId}/logs?settings=${SERVICE_LOG_SETTINGS_PARAM}`
+}
+
 export type LogIngestScope =
   | { projectId: number; externalServiceId?: undefined }
   | { externalServiceId: number; projectId?: undefined }
@@ -133,17 +142,30 @@ export function LogIngestBudgetNotice({
         ))}
       </ul>
       {hidden > 0 ? <p className="mt-1 text-xs">and {hidden} more.</p> : null}
-      <p className="mt-2 text-xs">
-        Make the container log less, or{' '}
-        <Link
-          to={budget.setup_path}
-          className="underline underline-offset-2 hover:text-foreground"
-        >
-          change the ingestion budget in Settings
-        </Link>
-        . A project or managed service with its own budget changes it in its own
-        settings.
-      </p>
+      {scope?.externalServiceId != null ? (
+        <p className="mt-2 text-xs">
+          Make the container log less, or{' '}
+          <Link
+            to={serviceLogSettingsPath(scope.externalServiceId)}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            change this service&apos;s ingestion budget
+          </Link>
+          .
+        </p>
+      ) : (
+        <p className="mt-2 text-xs">
+          Make the container log less, or{' '}
+          <Link
+            to={budget.setup_path}
+            className="underline underline-offset-2 hover:text-foreground"
+          >
+            change the ingestion budget in Settings
+          </Link>
+          . A project or managed service with its own budget changes it in its
+          own settings.
+        </p>
+      )}
     </Callout>
   )
 }

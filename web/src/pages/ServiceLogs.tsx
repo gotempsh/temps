@@ -12,7 +12,12 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { ServiceHealthBadge } from '@/components/storage/ServiceHealthCard'
-import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
+import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
+import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
+import {
+  LogIngestBudgetWarning,
+  SERVICE_LOG_SETTINGS_PARAM,
+} from '@/components/observability/LogIngestBudgetNotice'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -34,10 +39,11 @@ import {
   RefreshCw,
   ScrollText,
   Server,
+  Settings2,
 } from 'lucide-react'
 import type { DateRange } from 'react-day-picker'
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useUrlSearchText } from '@temps-sdk/ds'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
@@ -132,6 +138,21 @@ export function ServiceLogs() {
   })
 
   const [text, setText] = useUrlSearchText('q')
+  // Log settings are a rarely changed knob, so they stay folded away on this
+  // page until asked for. Kept in the URL so a notice can deep-link to them.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const settingsOpen =
+    searchParams.get('settings') === SERVICE_LOG_SETTINGS_PARAM
+  const setSettingsOpen = (open: boolean) =>
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        if (open) next.set('settings', SERVICE_LOG_SETTINGS_PARAM)
+        else next.delete('settings')
+        return next
+      },
+      { replace: true }
+    )
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -379,6 +400,17 @@ export function ServiceLogs() {
               </Button>
             </Link>
             <Button
+              variant={settingsOpen ? 'secondary' : 'outline'}
+              size="sm"
+              className="gap-2"
+              aria-expanded={settingsOpen}
+              aria-controls="service-log-settings"
+              onClick={() => setSettingsOpen(!settingsOpen)}
+            >
+              <Settings2 className="h-4 w-4" />
+              <span className="max-sm:sr-only">Log settings</span>
+            </Button>
+            <Button
               variant="outline"
               size="sm"
               className="gap-2"
@@ -395,6 +427,12 @@ export function ServiceLogs() {
             </Button>
           </div>
         </div>
+
+        <Collapsible open={settingsOpen} onOpenChange={setSettingsOpen}>
+          <CollapsibleContent id="service-log-settings">
+            <ServiceLogIngestionCard serviceId={serviceId} />
+          </CollapsibleContent>
+        </Collapsible>
 
         <LogIngestBudgetWarning scope={{ externalServiceId: serviceId }} />
 

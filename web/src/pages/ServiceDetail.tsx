@@ -29,7 +29,6 @@ import {
 } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
-import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
@@ -1103,9 +1102,6 @@ export function ServiceDetail() {
                 onMonitoringChange={() => refetch()}
               />
             )}
-
-            {/* Always shown: the budget applies whether or not it is running. */}
-            <ServiceLogIngestionCard serviceId={service.service.id} />
 
             {/* Cluster Creation Progress */}
             {service.service.topology === 'cluster' &&
