@@ -14,6 +14,7 @@
  */
 
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   TOOLTIP_CONTENT_STYLE,
   TOOLTIP_LABEL_STYLE,
@@ -614,14 +615,16 @@ function storeRefreshInterval(value: number | null): void {
 }
 
 // ---------------------------------------------------------------------------
-// MetricTile — a single clickable stat item rendered inside a <dl> grid
+// MetricTile — a single stat item rendered inside a <dl> grid; clickable when
+// it has an `onClick`, plain otherwise
 // ---------------------------------------------------------------------------
 
 type MetricTileProps = {
   name: string
   value: number | undefined
   selected: boolean
-  onClick: () => void
+  /** Omit for a tile with no action, so it is not rendered as a button. */
+  onClick?: () => void
   alert?: 'warning' | 'critical'
   size?: 'hero' | 'group'
 }
@@ -635,19 +638,18 @@ function MetricTile({
   size = 'group',
 }: MetricTileProps) {
   const isHero = size === 'hero'
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        'flex flex-col text-left transition-colors',
-        isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
-        'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary',
-        selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
-      ]
-        .filter(Boolean)
-        .join(' ')}
-    >
+  const className = [
+    'flex flex-col text-left transition-colors',
+    isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
+    onClick
+      ? 'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary'
+      : '',
+    selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const content = (
+    <>
       <dt
         className={[
           'flex items-center gap-1.5 truncate font-medium text-muted-foreground',
@@ -670,6 +672,12 @@ function MetricTile({
       >
         {value != null ? formatMetricValue(name, value) : '—'}
       </dd>
+    </>
+  )
+  if (!onClick) return <div className={className}>{content}</div>
+  return (
+    <button type="button" onClick={onClick} className={className}>
+      {content}
     </button>
   )
 }
@@ -998,15 +1006,40 @@ function DatabasesSection({
   const refetchInterval = useRefreshInterval()
   const [selected, setSelected] = useState<string>(ALL_DATABASES)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     ...externalServiceMetricsByDatabaseOptions({ path: { id: serviceId } }),
     refetchInterval,
   })
 
   const databases = data?.databases ?? []
 
-  // Don't render until at least one database has reported per-db metrics.
-  if (!isLoading && databases.length === 0) return null
+  // A request that is still loading, or failed, says nothing about whether
+  // there are databases, so neither may fall through to the "none" case below.
+  if (isLoading) return <Skeleton className="h-40 w-full" />
+  if (isError && !data) {
+    return (
+      <div className="space-y-2 rounded-lg border border-border p-4">
+        <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+          Databases
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          Could not load per-database metrics: {error.message}
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => refetch()}
+          disabled={isFetching}
+        >
+          <RefreshCw className="mr-2 size-4" />
+          Retry
+        </Button>
+      </div>
+    )
+  }
+
+  // Nothing to break down until at least one database has reported.
+  if (databases.length === 0) return null
 
   // Resolve the value map for the current selection.
   const valuesForSelection = (): Map<string, number> => {
@@ -1055,7 +1088,6 @@ function DatabasesSection({
                 name={name}
                 value={values.get(name)}
                 selected={false}
-                onClick={() => {}}
               />
             ))}
           </dl>

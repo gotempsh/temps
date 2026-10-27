@@ -18878,7 +18878,7 @@
         "description": "Response for the per-database metrics breakdown.",
         "properties": {
           "databases": {
-            "description": "One entry per database, largest first by the engine's\n`*.database_size_bytes` metric (ties broken by name) so the biggest database leads the table. Empty\nwhen the service's engine has no per-database series (for example\nRedis or S3) or nothing has been scraped yet. MariaDB reports at most\nthe 100 largest schemas.",
+            "description": "One entry per database, largest first by the engine's\n`*.database_size_bytes` metric (ties broken by name) so the biggest\ndatabase leads the table. Empty when the service's engine has no\nper-database series (for example Redis or S3) or nothing has been\nscraped yet. The MariaDB collector labels at most the 100 largest\nschemas per scrape; the response covers the latest lookback window, so\nduring schema churn it can briefly include schemas from an earlier\nscrape as well.",
             "items": {
               "$ref": "#/components/schemas/DatabaseMetricsRow"
             },

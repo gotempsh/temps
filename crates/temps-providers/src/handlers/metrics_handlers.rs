@@ -547,10 +547,13 @@ pub struct DatabaseMetricsRow {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsResponse {
     /// One entry per database, largest first by the engine's
-    /// `*.database_size_bytes` metric (ties broken by name) so the biggest database leads the table. Empty
-    /// when the service's engine has no per-database series (for example
-    /// Redis or S3) or nothing has been scraped yet. MariaDB reports at most
-    /// the 100 largest schemas.
+    /// `*.database_size_bytes` metric (ties broken by name) so the biggest
+    /// database leads the table. Empty when the service's engine has no
+    /// per-database series (for example Redis or S3) or nothing has been
+    /// scraped yet. The MariaDB collector labels at most the 100 largest
+    /// schemas per scrape; the response covers the latest lookback window, so
+    /// during schema churn it can briefly include schemas from an earlier
+    /// scrape as well.
     pub databases: Vec<DatabaseMetricsRow>,
 }
 
