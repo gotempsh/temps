@@ -1791,6 +1791,61 @@ mod tests {
         Ok(())
     }
 
+    /// A decision lasts as long as its proposal: once it expires, new
+    /// evidence proposes the subject again for review, without the old
+    /// approval and without applying meanwhile.
+    #[tokio::test]
+    async fn an_expired_decision_is_proposed_again_for_review() -> anyhow::Result<()> {
+        let database = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!(
+                    "Skipping Shield proposal expiry integration: Docker runtime unavailable"
+                );
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let db = database.connection_arc();
+        let sources = Arc::new(ShieldSources::with_feeds(db.clone(), &[]).unwrap());
+        let learning = ShieldLearning::new(db.clone(), EvidenceStore::Postgres, sources.clone());
+        db.execute_unprepared(
+            "INSERT INTO users (id, name, email, created_at, updated_at) VALUES \
+                 (1, 'Test User', 'user1@example.test', now(), now()); \
+             INSERT INTO shield_observed (kind, subject, verdict, reason, first_seen, last_seen, \
+                 hits, expires_at, status, decided_at, decided_by) \
+             VALUES ('ip', '45.33.40.50', 'challenge', '3 failed or abandoned challenges', \
+                 now() - interval '2 days', now() - interval '2 days', 3, \
+                 now() - interval '1 second', 'approved', now() - interval '2 days', 1)",
+        )
+        .await?;
+
+        insert_postgres(&db, &[exploit(5, "45.33.40.50", None)]).await;
+        assert_eq!(learning.promote().await?.unwrap().written, 1);
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT status, verdict, decided_at IS NULL AS undecided, \
+                     decided_by IS NULL AS no_decider, expires_at > now() AS live \
+                 FROM shield_observed WHERE subject = '45.33.40.50'",
+            ))
+            .await?
+            .unwrap();
+        assert_eq!(row.try_get::<String>("", "status")?, "pending");
+        // A pending proposal takes the new evidence's verdict.
+        assert_eq!(row.try_get::<String>("", "verdict")?, "block");
+        assert!(row.try_get::<bool>("", "undecided")?);
+        assert!(row.try_get::<bool>("", "no_decider")?);
+        assert!(row.try_get::<bool>("", "live")?);
+
+        assert!(sources.compile_with(true).await?.is_some());
+        assert_eq!(
+            action(&latest_index(&db).await, "45.33.40.50", None),
+            Action::Pass
+        );
+        Ok(())
+    }
+
     /// The ClickHouse queries count what the Postgres ones do.
     #[tokio::test]
     async fn clickhouse_evidence_matches_the_rules() -> anyhow::Result<()> {

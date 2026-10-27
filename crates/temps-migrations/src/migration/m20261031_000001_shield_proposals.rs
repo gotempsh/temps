@@ -49,3 +49,80 @@ impl MigrationTrait for Migration {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{Database, DatabaseBackend, Statement};
+    use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+
+    /// The learned row's status, and whether it has no decision.
+    async fn proposal(db: &sea_orm::DatabaseConnection) -> Result<(String, bool), DbErr> {
+        let row = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT status, decided_at IS NULL AS undecided FROM shield_observed \
+                 WHERE subject = '203.0.113.7'",
+            ))
+            .await?
+            .ok_or_else(|| DbErr::RecordNotFound("shield_observed".into()))?;
+        Ok((row.try_get("", "status")?, row.try_get("", "undecided")?))
+    }
+
+    /// Rows learned before the migration wait for review instead of
+    /// applying, an unknown status is refused, and `down` then `up` again
+    /// is clean.
+    #[tokio::test]
+    async fn learned_rows_become_pending_proposals() -> Result<(), Box<dyn std::error::Error>> {
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            eprintln!("Docker unavailable; skipping Shield proposals migration integration");
+            return Ok(());
+        };
+        if docker.ping().await.is_err() {
+            eprintln!("Docker unavailable; skipping Shield proposals migration integration");
+            return Ok(());
+        }
+        let container = GenericImage::new("postgres", "17-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_PASSWORD", "shield-proposals-test")
+            .start()
+            .await?;
+        let port = container.get_host_port_ipv4(5432).await?;
+        let db = Database::connect(format!(
+            "postgres://postgres:shield-proposals-test@127.0.0.1:{port}/postgres"
+        ))
+        .await?;
+        // The table as the previous migration left it, with a learned row.
+        db.execute_unprepared(
+            "CREATE TABLE users(id SERIAL PRIMARY KEY); \
+             CREATE TABLE shield_observed ( \
+                 id BIGSERIAL PRIMARY KEY, kind VARCHAR(8) NOT NULL, \
+                 subject VARCHAR(64) NOT NULL, verdict VARCHAR(16) NOT NULL, \
+                 reason TEXT NOT NULL, first_seen TIMESTAMPTZ NOT NULL, \
+                 last_seen TIMESTAMPTZ NOT NULL, hits BIGINT NOT NULL DEFAULT 0, \
+                 expires_at TIMESTAMPTZ NOT NULL, UNIQUE (kind, subject)); \
+             INSERT INTO shield_observed (kind, subject, verdict, reason, first_seen, \
+                 last_seen, hits, expires_at) \
+             VALUES ('ip', '203.0.113.7', 'block', 'exploit CVE-2021-41773', now(), now(), 1, \
+                 now() + interval '7 days');",
+        )
+        .await?;
+
+        let manager = SchemaManager::new(&db);
+        Migration.up(&manager).await?;
+        assert_eq!(proposal(&db).await?, ("pending".to_string(), true));
+        assert!(
+            db.execute_unprepared("UPDATE shield_observed SET status = 'applied'")
+                .await
+                .is_err(),
+            "only pending, approved and rejected are stored"
+        );
+
+        Migration.down(&manager).await?;
+        Migration.up(&manager).await?;
+        assert_eq!(proposal(&db).await?, ("pending".to_string(), true));
+        Ok(())
+    }
+}

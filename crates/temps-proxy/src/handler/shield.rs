@@ -1285,13 +1285,16 @@ mod tests {
         ("PUT", "/projects/5/shield/entries/3"),
         ("DELETE", "/projects/5/shield/entries/3"),
     ];
-    const PLATFORM_ROUTES: [(&str, &str); 6] = [
+    const PLATFORM_ROUTES: [(&str, &str); 9] = [
         ("GET", "/settings/shield"),
         ("PUT", "/settings/shield"),
         ("GET", "/settings/shield/entries"),
         ("POST", "/settings/shield/entries"),
         ("PUT", "/settings/shield/entries/3"),
         ("DELETE", "/settings/shield/entries/3"),
+        ("GET", "/settings/shield/proposals?status=pending"),
+        ("POST", "/settings/shield/proposals/3/approve"),
+        ("POST", "/settings/shield/proposals/3/reject"),
     ];
 
     fn assert_problem(
@@ -1355,6 +1358,33 @@ mod tests {
         }
     }
 
+    /// Proposals carry visitors' addresses and deciding one blocks traffic
+    /// everywhere, so neither a project member nor a reader reaches them.
+    #[tokio::test]
+    async fn only_instance_admins_read_or_decide_proposals() {
+        for role in [Role::User, Role::Reader] {
+            for uri in [
+                "/settings/shield/proposals",
+                "/settings/shield/proposals?status=approved",
+            ] {
+                let audit = Arc::new(RecordingAudit::default());
+                // Nothing is queued: the database must not be reached.
+                let outcome = send(
+                    app(
+                        mock(),
+                        Some(AuthContext::new_session(user(), role.clone())),
+                        None,
+                        audit.clone(),
+                    ),
+                    request("GET", uri),
+                )
+                .await;
+                assert_problem(&outcome, StatusCode::FORBIDDEN, "Insufficient Permissions");
+                assert!(audit.recorded().is_empty(), "{uri}");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn a_user_outside_the_project_team_is_refused_everywhere() {
         let checker: Arc<dyn temps_core::ProjectAccessChecker> = Arc::new(DenyEveryProject);
@@ -1385,6 +1415,12 @@ mod tests {
             }),
             StatusCode::NOT_FOUND
         );
+        let missing = Problem::from(ShieldConsoleError::ProposalNotFound { proposal_id: 7 });
+        assert_eq!(missing.status_code, StatusCode::NOT_FOUND);
+        assert_eq!(
+            missing.body.get("title").and_then(|title| title.as_str()),
+            Some("Shield Proposal Not Found")
+        );
         assert_eq!(
             status(ShieldConsoleError::Validation {
                 message: "bad".into()
@@ -1404,6 +1440,84 @@ mod tests {
                 "boom".into()
             ))),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// An admin approves and rejects over HTTP: each decision is stored with
+    /// who made it and audited with the proposal; a missing one is a 404
+    /// that leaves no audit record.
+    #[tokio::test]
+    async fn an_admin_decides_a_proposal_and_each_decision_is_audited() {
+        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker not available, skipping Shield proposal route test");
+                return;
+            }
+            Err(error) => panic!("test database: {error}"),
+        };
+        let db = test_db.connection_arc();
+        sea_orm::ConnectionTrait::execute_unprepared(
+            db.as_ref(),
+            "INSERT INTO users (id, name, email, created_at, updated_at) VALUES \
+             (1, 'Test User', 'user1@example.test', now(), now()); \
+             INSERT INTO shield_observed (id, kind, subject, verdict, reason, first_seen, \
+             last_seen, hits, expires_at) VALUES \
+             (3, 'ip', '203.0.113.7', 'block', 'exploit CVE-2021-41773', now(), now(), 1, \
+              now() + interval '7 days')",
+        )
+        .await
+        .expect("seed user and proposal");
+        let audit = Arc::new(RecordingAudit::default());
+        let admin = AuthContext::new_session(user(), Role::Admin);
+        let call = |method: &'static str, uri: &'static str| {
+            send(
+                app(db.clone(), Some(admin.clone()), None, audit.clone()),
+                request(method, uri),
+            )
+        };
+
+        let pending = call("GET", "/settings/shield/proposals?status=pending").await;
+        assert_eq!(pending.0, StatusCode::OK, "body: {}", pending.2);
+        assert_eq!(pending.2[0]["subject"], "203.0.113.7");
+        assert_eq!(pending.2[0]["status"], "pending");
+
+        let approved = call("POST", "/settings/shield/proposals/3/approve").await;
+        assert_eq!(approved.0, StatusCode::OK, "body: {}", approved.2);
+        assert_eq!(approved.2["status"], "approved");
+        assert_eq!(approved.2["decided_by"], 1);
+        assert!(approved.2["decided_at"].is_string());
+
+        let rejected = call("POST", "/settings/shield/proposals/3/reject").await;
+        assert_eq!(rejected.0, StatusCode::OK, "body: {}", rejected.2);
+        assert_eq!(rejected.2["status"], "rejected");
+        let listed = call("GET", "/settings/shield/proposals?status=rejected").await;
+        assert_eq!(
+            listed.2.as_array().map(Vec::len),
+            Some(1),
+            "body: {}",
+            listed.2
+        );
+
+        let missing = call("POST", "/settings/shield/proposals/99/approve").await;
+        assert_problem(&missing, StatusCode::NOT_FOUND, "Shield Proposal Not Found");
+
+        let recorded = audit.recorded();
+        let names: Vec<&str> = recorded.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["SHIELD_PROPOSAL_APPROVED", "SHIELD_PROPOSAL_REJECTED"]
+        );
+        assert!(
+            recorded[0].1.contains(r#""subject":"203.0.113.7""#),
+            "{}",
+            recorded[0].1
+        );
+        assert!(
+            recorded[0].1.contains(r#""status":"approved""#),
+            "{}",
+            recorded[0].1
         );
     }
 
