@@ -619,7 +619,8 @@ pub(crate) struct OperatorEntry {
     pub expires_at: Option<i64>,
 }
 
-/// An unexpired `shield_observed` row.
+/// An unexpired, approved `shield_observed` row: learning only proposes,
+/// so a row applies once an instance admin approves it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObservedEntry {
     /// `ip` or `ja4`.
@@ -663,7 +664,7 @@ async fn load_entries<C: ConnectionTrait>(
         .query_all(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             "SELECT kind, subject, verdict, extract(epoch FROM expires_at)::bigint AS expires_at \
-             FROM shield_observed WHERE expires_at > now() \
+             FROM shield_observed WHERE expires_at > now() AND status = 'approved' \
              ORDER BY last_seen DESC LIMIT $1",
             [MAX_OBSERVED.into()],
         ))

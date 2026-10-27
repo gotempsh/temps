@@ -279,6 +279,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "changes who can access the platform; a prompt injection could escalate privilege",
         &[
             "add_team_member",
+            "approve_shield_proposal",
             "create_ip_access_control",
             "create_platform_shield_entry",
             "create_project_shield_entry",
@@ -288,6 +289,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_project_shield_entry",
             "delete_team",
             "grant_project_access",
+            "reject_shield_proposal",
             "remove_team_member",
             "revoke_project_access",
             "update_compose_security",
@@ -326,6 +328,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "list_all_runs",
             "list_data_imports",
             "list_shield_events",
+            "list_shield_proposals",
             "observability_full_event",
             "observability_list_events",
             "revenue_global_events",

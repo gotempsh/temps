@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use temps_core::UtcDateTime;
 use temps_entities::{
-    environments, projects, shield_bypass_tokens, shield_operator_entries, shield_snapshots,
+    environments, projects, shield_bypass_tokens, shield_observed, shield_operator_entries,
+    shield_snapshots,
 };
 use temps_shield::{Index, ListVerdict, Network, ShieldMode, ShieldSnapshot};
 use tracing::{error, info};
@@ -39,6 +40,9 @@ pub const MAX_TOKENS_PER_PROJECT: u64 = 100;
 /// Most operator entries one project, or the platform, may hold. The list
 /// is returned whole, so it stays one screen of rules, not a feed.
 pub const MAX_ENTRIES_PER_SCOPE: u64 = 500;
+/// Most proposals one list returns, newest first. Learning keeps a row
+/// only while its evidence lasts, so the live set stays this size or less.
+pub const MAX_PROPOSALS: u64 = 500;
 const MAX_TOKEN_NAME_CHARS: usize = 128;
 const MAX_NOTE_CHARS: usize = 500;
 /// The broadest network an entry may name: a typo of `/0` must not block
@@ -67,6 +71,8 @@ pub enum ShieldConsoleError {
     },
     #[error("Shield entry {entry_id} not found in {scope}")]
     EntryNotFound { scope: String, entry_id: i64 },
+    #[error("Shield proposal {proposal_id} not found, or it has expired")]
+    ProposalNotFound { proposal_id: i64 },
     #[error("{message}")]
     Validation { message: String },
     #[error("{scope} already has {limit} {what}; remove one before adding another")]
@@ -445,6 +451,116 @@ pub struct ShieldEntryResponse {
     /// After this the entry no longer applies; `null` for never.
     #[schema(value_type = Option<String>, format = DateTime)]
     pub expires_at: Option<UtcDateTime>,
+}
+
+/// Where a learned proposal stands. Only `approved` ones apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShieldProposalStatus {
+    /// Waiting for an instance admin.
+    Pending,
+    /// Applies on every ingress until it expires.
+    Approved,
+    /// Kept so learning does not propose it again before it expires.
+    Rejected,
+}
+
+impl ShieldProposalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Self> {
+        match text {
+            "pending" => Some(Self::Pending),
+            "approved" => Some(Self::Approved),
+            "rejected" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ShieldProposalsQuery {
+    /// Only proposals in this state; all of them when omitted.
+    #[param(value_type = Option<ShieldProposalStatus>)]
+    pub status: Option<ShieldProposalStatus>,
+}
+
+/// What a proposal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ShieldProposalKind {
+    /// One address.
+    Ip,
+    /// A JA4 fingerprint.
+    Ja4,
+}
+
+/// An address or fingerprint fleet learning proposes to challenge or block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ShieldProposalResponse {
+    pub id: i64,
+    pub kind: ShieldProposalKind,
+    /// The address or the fingerprint.
+    #[schema(example = "203.0.113.7")]
+    pub subject: String,
+    /// `challenge` or `block`.
+    pub verdict: ShieldEntryVerdict,
+    /// The evidence, as learning summarised it.
+    pub reason: String,
+    /// Events behind it in the last learning window.
+    pub hits: i64,
+    #[schema(value_type = String, format = DateTime)]
+    pub first_seen: UtcDateTime,
+    #[schema(value_type = String, format = DateTime)]
+    pub last_seen: UtcDateTime,
+    /// After this the proposal, and an approval of it, no longer apply.
+    #[schema(value_type = String, format = DateTime)]
+    pub expires_at: UtcDateTime,
+    pub status: ShieldProposalStatus,
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub decided_at: Option<UtcDateTime>,
+    pub decided_by: Option<i32>,
+}
+
+impl ShieldProposalResponse {
+    fn from_model(row: shield_observed::Model) -> Result<Self, ShieldConsoleError> {
+        let unknown = |column: &str, value: &str| {
+            ShieldConsoleError::Database(DbErr::Custom(format!(
+                "shield_observed {} has an unknown {column} `{value}`",
+                row.id
+            )))
+        };
+        let kind = match row.kind.as_str() {
+            "ip" => ShieldProposalKind::Ip,
+            "ja4" => ShieldProposalKind::Ja4,
+            other => return Err(unknown("kind", other)),
+        };
+        let verdict = ShieldEntryVerdict::parse(&row.verdict)
+            .ok_or_else(|| unknown("verdict", &row.verdict))?;
+        let status = ShieldProposalStatus::parse(&row.status)
+            .ok_or_else(|| unknown("status", &row.status))?;
+        Ok(Self {
+            id: row.id,
+            kind,
+            subject: row.subject,
+            verdict,
+            reason: row.reason,
+            hits: row.hits,
+            first_seen: row.first_seen,
+            last_seen: row.last_seen,
+            expires_at: row.expires_at,
+            status,
+            decided_at: row.decided_at,
+            decided_by: row.decided_by,
+        })
+    }
 }
 
 impl ShieldEntryResponse {
@@ -1074,6 +1190,66 @@ impl ShieldConsoleService {
                 entry_id,
             })?;
         ShieldEntryResponse::from_model(row)
+    }
+
+    /// Proposals that have not expired, newest evidence first.
+    pub async fn list_proposals(
+        &self,
+        status: Option<ShieldProposalStatus>,
+    ) -> Result<Vec<ShieldProposalResponse>, ShieldConsoleError> {
+        let rows = shield_observed::Entity::find()
+            .from_raw_sql(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT * FROM shield_observed \
+                     WHERE expires_at > now() AND ($1::text IS NULL OR status = $1) \
+                     ORDER BY last_seen DESC, id DESC LIMIT {MAX_PROPOSALS}"
+                ),
+                [status.map(|status| status.as_str().to_string()).into()],
+            ))
+            .all(self.db.as_ref())
+            .await?;
+        rows.into_iter()
+            .map(ShieldProposalResponse::from_model)
+            .collect()
+    }
+
+    /// Approves or rejects a proposal, or changes an earlier decision. The
+    /// snapshot compile picks the change up on its next pass.
+    pub async fn decide_proposal(
+        &self,
+        proposal_id: i64,
+        status: ShieldProposalStatus,
+        decided_by: Option<i32>,
+    ) -> Result<ShieldProposalResponse, ShieldConsoleError> {
+        if status == ShieldProposalStatus::Pending {
+            return Err(invalid(
+                "A proposal is approved or rejected, not set back to pending",
+            ));
+        }
+        let row = shield_observed::Entity::find()
+            .from_raw_sql(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE shield_observed \
+                 SET status = $2, decided_at = now(), decided_by = $3 \
+                 WHERE id = $1 AND expires_at > now() \
+                 RETURNING *",
+                [
+                    proposal_id.into(),
+                    status.as_str().into(),
+                    decided_by.into(),
+                ],
+            ))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(ShieldConsoleError::ProposalNotFound { proposal_id })?;
+        info!(
+            proposal_id,
+            status = status.as_str(),
+            subject = %row.subject,
+            "Shield proposal decided"
+        );
+        ShieldProposalResponse::from_model(row)
     }
 
     /// Entries in `owner` for the same subject, and in all.
@@ -1884,6 +2060,78 @@ mod tests {
         assert!(matches!(
             service
                 .lookup(7101, 7201, ShieldLookupQuery::default())
+                .await,
+            Err(ShieldConsoleError::Validation { .. })
+        ));
+    }
+
+    /// Proposals list by state, a decision can be changed, and an expired
+    /// or missing one cannot be decided.
+    #[tokio::test]
+    async fn proposals_are_listed_and_decided_against_postgres() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        exec(
+            &db,
+            "INSERT INTO shield_observed (id, kind, subject, verdict, reason, first_seen, \
+             last_seen, hits, expires_at) VALUES \
+             (9101, 'ip', '203.0.113.7', 'block', 'exploit CVE-2021-41773', \
+              now() - interval '2 hours', now() - interval '1 hour', 1, now() + interval '6 days'), \
+             (9102, 'ja4', 't13d1516h2_8daaf6152771_02713d6af862', 'challenge', \
+              'exploits from 20 addresses', now() - interval '2 hours', now(), 20, \
+              now() + interval '1 day'), \
+             (9103, 'ip', '203.0.113.8', 'challenge', '3 failed challenges', \
+              now() - interval '2 days', now() - interval '2 days', 3, now() - interval '1 second')",
+            vec![],
+        )
+        .await;
+        let service = service(&test_db);
+
+        // Newest evidence first; the expired one is gone; all start pending.
+        let all = service.list_proposals(None).await.unwrap();
+        assert_eq!(all.iter().map(|p| p.id).collect::<Vec<_>>(), [9102, 9101]);
+        assert!(all
+            .iter()
+            .all(|p| p.status == ShieldProposalStatus::Pending && p.decided_at.is_none()));
+        assert_eq!(all[0].kind, ShieldProposalKind::Ja4);
+        assert_eq!(all[1].verdict, ShieldEntryVerdict::Block);
+
+        let approved = service
+            .decide_proposal(9101, ShieldProposalStatus::Approved, None)
+            .await
+            .unwrap();
+        assert_eq!(approved.status, ShieldProposalStatus::Approved);
+        assert!(approved.decided_at.is_some());
+        let pending = service
+            .list_proposals(Some(ShieldProposalStatus::Pending))
+            .await
+            .unwrap();
+        assert_eq!(pending.iter().map(|p| p.id).collect::<Vec<_>>(), [9102]);
+
+        // An approval can be withdrawn.
+        service
+            .decide_proposal(9101, ShieldProposalStatus::Rejected, None)
+            .await
+            .unwrap();
+        let rejected = service
+            .list_proposals(Some(ShieldProposalStatus::Rejected))
+            .await
+            .unwrap();
+        assert_eq!(rejected.iter().map(|p| p.id).collect::<Vec<_>>(), [9101]);
+
+        for missing in [9103, 9999] {
+            assert!(matches!(
+                service
+                    .decide_proposal(missing, ShieldProposalStatus::Approved, None)
+                    .await,
+                Err(ShieldConsoleError::ProposalNotFound { proposal_id }) if proposal_id == missing
+            ));
+        }
+        assert!(matches!(
+            service
+                .decide_proposal(9102, ShieldProposalStatus::Pending, None)
                 .await,
             Err(ShieldConsoleError::Validation { .. })
         ));

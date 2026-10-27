@@ -62165,12 +62165,102 @@
         ],
         "type": "string"
       },
+      "ShieldProposalKind": {
+        "description": "What a proposal names.",
+        "enum": [
+          "ip",
+          "ja4"
+        ],
+        "type": "string"
+      },
+      "ShieldProposalResponse": {
+        "description": "An address or fingerprint fleet learning proposes to challenge or block.",
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "description": "After this the proposal, and an approval of it, no longer apply.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "first_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hits": {
+            "description": "Events behind it in the last learning window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ShieldProposalKind"
+          },
+          "last_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason": {
+            "description": "The evidence, as learning summarised it.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ShieldProposalStatus"
+          },
+          "subject": {
+            "description": "The address or the fingerprint.",
+            "example": "203.0.113.7",
+            "type": "string"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ShieldEntryVerdict",
+            "description": "`challenge` or `block`."
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "subject",
+          "verdict",
+          "reason",
+          "hits",
+          "first_seen",
+          "last_seen",
+          "expires_at",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ShieldProposalStatus": {
+        "description": "Where a learned proposal stands. Only `approved` ones apply.",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
       "ShieldSettings": {
         "description": "Platform-wide Shield settings (ADR 066, I10).",
         "properties": {
           "share_observations": {
             "default": true,
-            "description": "Whether what one environment's visitors did counts for every\nenvironment (D9): addresses and fingerprints promoted from events\napply fleet-wide. Off, nothing is promoted.",
+            "description": "Whether what one environment's visitors did counts for every\nenvironment (D9): addresses and fingerprints learned from events are\nproposed, and an approved proposal applies fleet-wide. Nothing\napplies without an approval. Off, nothing is proposed or applied.",
             "type": "boolean"
           }
         },
@@ -152800,6 +152890,235 @@
           }
         ],
         "summary": "Change a platform Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals": {
+      "get": {
+        "description": "Addresses and fingerprints learning proposes to challenge or block. None\napplies until an instance admin approves it.",
+        "operationId": "list_shield_proposals",
+        "parameters": [
+          {
+            "description": "Only proposals in this state; all of them when omitted.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ShieldProposalStatus"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ShieldProposalResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Proposals that have not expired, newest evidence first"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List fleet learning's proposals",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals/{proposal_id}/approve": {
+      "post": {
+        "description": "The address or fingerprint is challenged or blocked on every ingress\nuntil the proposal expires. Also changes an earlier rejection.",
+        "operationId": "approve_shield_proposal",
+        "parameters": [
+          {
+            "description": "Proposal ID",
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldProposalResponse"
+                }
+              }
+            },
+            "description": "Proposal approved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Proposal not found or expired"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Approve a proposal",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals/{proposal_id}/reject": {
+      "post": {
+        "description": "Learning keeps the rejection until the proposal expires, so it is not\nproposed again meanwhile. Also withdraws an earlier approval.",
+        "operationId": "reject_shield_proposal",
+        "parameters": [
+          {
+            "description": "Proposal ID",
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldProposalResponse"
+                }
+              }
+            },
+            "description": "Proposal rejected"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Proposal not found or expired"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reject a proposal",
         "tags": [
           "Shield"
         ]

@@ -4322,8 +4322,9 @@ mod cloudflare_new_project_tests {
 #[serde(default)]
 pub struct ShieldSettings {
     /// Whether what one environment's visitors did counts for every
-    /// environment (D9): addresses and fingerprints promoted from events
-    /// apply fleet-wide. Off, nothing is promoted.
+    /// environment (D9): addresses and fingerprints learned from events are
+    /// proposed, and an approved proposal applies fleet-wide. Nothing
+    /// applies without an approval. Off, nothing is proposed or applied.
     pub share_observations: bool,
 }
 

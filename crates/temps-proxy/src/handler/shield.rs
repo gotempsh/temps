@@ -28,6 +28,7 @@ use crate::service::shield_console_service::{
     ShieldChallengeCounts, ShieldConsoleError, ShieldConsoleService, ShieldEntryResponse,
     ShieldEntryScope, ShieldEntryVerdict, ShieldEventResponse, ShieldEventsQuery,
     ShieldEventsResponse, ShieldLookupQuery, ShieldLookupResponse, ShieldModeSource,
+    ShieldProposalKind, ShieldProposalResponse, ShieldProposalStatus, ShieldProposalsQuery,
     ShieldSolveTimes, ShieldSourceCount, ShieldSummaryQuery, ShieldSummaryResponse,
     ShieldTokenResponse, ShieldTokenScope, ShieldVerdictCounts, ShieldWindow, ShieldWouldHave,
     UpdateShieldEntryRequest,
@@ -59,6 +60,11 @@ impl From<ShieldConsoleError> for Problem {
             ShieldConsoleError::EntryNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Shield Entry Not Found")
                 .with_detail(error.to_string()),
+            ShieldConsoleError::ProposalNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Shield Proposal Not Found")
+                    .with_detail(error.to_string())
+            }
             ShieldConsoleError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid Shield Request")
                 .with_detail(error.to_string()),
@@ -111,6 +117,12 @@ struct ShieldTokenAudit {
 struct ShieldEntryAudit {
     context: ShieldAuditContext,
     entry: ShieldEntryResponse,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ShieldProposalAudit {
+    context: ShieldAuditContext,
+    proposal: ShieldProposalResponse,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -858,8 +870,132 @@ pub async fn delete_platform_shield_entry(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// List fleet learning's proposals
+///
+/// Addresses and fingerprints learning proposes to challenge or block. None
+/// applies until an instance admin approves it.
+#[utoipa::path(
+    tag = "Shield",
+    get,
+    path = "/settings/shield/proposals",
+    params(ShieldProposalsQuery),
+    responses(
+        (status = 200, description = "Proposals that have not expired, newest evidence first", body = Vec<ShieldProposalResponse>),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_shield_proposals(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ShieldConsoleState>>,
+    Query(query): Query<ShieldProposalsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+    Ok(Json(state.service.list_proposals(query.status).await?))
+}
+
+/// Approve a proposal
+///
+/// The address or fingerprint is challenged or blocked on every ingress
+/// until the proposal expires. Also changes an earlier rejection.
+#[utoipa::path(
+    tag = "Shield",
+    post,
+    path = "/settings/shield/proposals/{proposal_id}/approve",
+    params(("proposal_id" = i64, Path, description = "Proposal ID")),
+    responses(
+        (status = 200, description = "Proposal approved", body = ShieldProposalResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Proposal not found or expired", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn approve_shield_proposal(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ShieldConsoleState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(proposal_id): Path<i64>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    decide_proposal(
+        &state,
+        auth.user_id_opt(),
+        &metadata,
+        proposal_id,
+        ShieldProposalStatus::Approved,
+    )
+    .await
+}
+
+/// Reject a proposal
+///
+/// Learning keeps the rejection until the proposal expires, so it is not
+/// proposed again meanwhile. Also withdraws an earlier approval.
+#[utoipa::path(
+    tag = "Shield",
+    post,
+    path = "/settings/shield/proposals/{proposal_id}/reject",
+    params(("proposal_id" = i64, Path, description = "Proposal ID")),
+    responses(
+        (status = 200, description = "Proposal rejected", body = ShieldProposalResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Proposal not found or expired", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn reject_shield_proposal(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ShieldConsoleState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(proposal_id): Path<i64>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    decide_proposal(
+        &state,
+        auth.user_id_opt(),
+        &metadata,
+        proposal_id,
+        ShieldProposalStatus::Rejected,
+    )
+    .await
+}
+
+async fn decide_proposal(
+    state: &ShieldConsoleState,
+    user_id: Option<i32>,
+    metadata: &RequestMetadata,
+    proposal_id: i64,
+    status: ShieldProposalStatus,
+) -> Result<Json<ShieldProposalResponse>, Problem> {
+    let proposal = state
+        .service
+        .decide_proposal(proposal_id, status, user_id)
+        .await?;
+    let name = match status {
+        ShieldProposalStatus::Approved => "SHIELD_PROPOSAL_APPROVED",
+        _ => "SHIELD_PROPOSAL_REJECTED",
+    };
+    write_audit(
+        state,
+        name,
+        audit_context(user_id, metadata),
+        ShieldProposalAudit {
+            context: audit_context(user_id, metadata),
+            proposal: proposal.clone(),
+        },
+    )
+    .await;
+    Ok(Json(proposal))
+}
+
 pub fn create_routes() -> axum::Router<Arc<ShieldConsoleState>> {
-    use axum::routing::{delete, get, put};
+    use axum::routing::{delete, get, post, put};
 
     const ENV: &str = "/projects/{project_id}/environments/{environment_id}/shield";
     axum::Router::new()
@@ -894,6 +1030,15 @@ pub fn create_routes() -> axum::Router<Arc<ShieldConsoleState>> {
             "/settings/shield/entries/{entry_id}",
             put(update_platform_shield_entry).delete(delete_platform_shield_entry),
         )
+        .route("/settings/shield/proposals", get(list_shield_proposals))
+        .route(
+            "/settings/shield/proposals/{proposal_id}/approve",
+            post(approve_shield_proposal),
+        )
+        .route(
+            "/settings/shield/proposals/{proposal_id}/reject",
+            post(reject_shield_proposal),
+        )
 }
 
 pub fn openapi() -> utoipa::openapi::OpenApi {
@@ -918,6 +1063,9 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             create_platform_shield_entry,
             update_platform_shield_entry,
             delete_platform_shield_entry,
+            list_shield_proposals,
+            approve_shield_proposal,
+            reject_shield_proposal,
         ),
         components(schemas(
             ShieldSummaryResponse,
@@ -940,6 +1088,9 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             ShieldEntryVerdict,
             CreateShieldEntryRequest,
             UpdateShieldEntryRequest,
+            ShieldProposalResponse,
+            ShieldProposalKind,
+            ShieldProposalStatus,
             ShieldSettings,
             temps_shield::ShieldMode,
         )),

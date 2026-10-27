@@ -20,6 +20,7 @@ test('turning fleet learning off saves it at once', async () => {
       return jsonResponse({ share_observations: false })
     },
     'GET /settings/shield/entries': () => jsonResponse([]),
+    'GET /settings/shield/proposals': () => jsonResponse([]),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -39,5 +40,6 @@ test('turning fleet learning off saves it at once', async () => {
   await waitFor(() => expect(toggle.getAttribute('aria-checked')).toBe('false'))
   expect(sentBody).toEqual({ share_observations: false })
   await view.findByText('No operator entries yet')
+  await view.findByText('No proposals to review')
   api.restore()
 })

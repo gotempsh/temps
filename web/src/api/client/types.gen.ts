@@ -29251,13 +29251,57 @@ export type ShieldMode = 'off' | 'log' | 'selective' | 'attack';
 export type ShieldModeSource = 'environment' | 'project';
 
 /**
+ * What a proposal names.
+ */
+export type ShieldProposalKind = 'ip' | 'ja4';
+
+/**
+ * An address or fingerprint fleet learning proposes to challenge or block.
+ */
+export type ShieldProposalResponse = {
+    decided_at?: string | null;
+    decided_by?: number | null;
+    /**
+     * After this the proposal, and an approval of it, no longer apply.
+     */
+    expires_at: string;
+    first_seen: string;
+    /**
+     * Events behind it in the last learning window.
+     */
+    hits: number;
+    id: number;
+    kind: ShieldProposalKind;
+    last_seen: string;
+    /**
+     * The evidence, as learning summarised it.
+     */
+    reason: string;
+    status: ShieldProposalStatus;
+    /**
+     * The address or the fingerprint.
+     */
+    subject: string;
+    /**
+     * `challenge` or `block`.
+     */
+    verdict: ShieldEntryVerdict;
+};
+
+/**
+ * Where a learned proposal stands. Only `approved` ones apply.
+ */
+export type ShieldProposalStatus = 'pending' | 'approved' | 'rejected';
+
+/**
  * Platform-wide Shield settings (ADR 066, I10).
  */
 export type ShieldSettings = {
     /**
      * Whether what one environment's visitors did counts for every
-     * environment (D9): addresses and fingerprints promoted from events
-     * apply fleet-wide. Off, nothing is promoted.
+     * environment (D9): addresses and fingerprints learned from events are
+     * proposed, and an approved proposal applies fleet-wide. Nothing
+     * applies without an approval. Off, nothing is proposed or applied.
      */
     share_observations?: boolean;
 };
@@ -81740,6 +81784,128 @@ export type UpdatePlatformShieldEntryResponses = {
 };
 
 export type UpdatePlatformShieldEntryResponse = UpdatePlatformShieldEntryResponses[keyof UpdatePlatformShieldEntryResponses];
+
+export type ListShieldProposalsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only proposals in this state; all of them when omitted.
+         */
+        status?: ShieldProposalStatus;
+    };
+    url: '/settings/shield/proposals';
+};
+
+export type ListShieldProposalsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListShieldProposalsError = ListShieldProposalsErrors[keyof ListShieldProposalsErrors];
+
+export type ListShieldProposalsResponses = {
+    /**
+     * Proposals that have not expired, newest evidence first
+     */
+    200: Array<ShieldProposalResponse>;
+};
+
+export type ListShieldProposalsResponse = ListShieldProposalsResponses[keyof ListShieldProposalsResponses];
+
+export type ApproveShieldProposalData = {
+    body?: never;
+    path: {
+        /**
+         * Proposal ID
+         */
+        proposal_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/proposals/{proposal_id}/approve';
+};
+
+export type ApproveShieldProposalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Proposal not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ApproveShieldProposalError = ApproveShieldProposalErrors[keyof ApproveShieldProposalErrors];
+
+export type ApproveShieldProposalResponses = {
+    /**
+     * Proposal approved
+     */
+    200: ShieldProposalResponse;
+};
+
+export type ApproveShieldProposalResponse = ApproveShieldProposalResponses[keyof ApproveShieldProposalResponses];
+
+export type RejectShieldProposalData = {
+    body?: never;
+    path: {
+        /**
+         * Proposal ID
+         */
+        proposal_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/proposals/{proposal_id}/reject';
+};
+
+export type RejectShieldProposalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Proposal not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RejectShieldProposalError = RejectShieldProposalErrors[keyof RejectShieldProposalErrors];
+
+export type RejectShieldProposalResponses = {
+    /**
+     * Proposal rejected
+     */
+    200: ShieldProposalResponse;
+};
+
+export type RejectShieldProposalResponse = RejectShieldProposalResponses[keyof RejectShieldProposalResponses];
 
 export type ListGlobalSkillsData = {
     body?: never;

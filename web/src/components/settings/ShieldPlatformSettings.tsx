@@ -7,6 +7,7 @@ import {
   updateShieldSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
+import { ShieldProposalsPanel } from '@/components/shield/ShieldProposalsPanel'
 import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { Separator } from '@/components/ui/separator'
@@ -30,7 +31,7 @@ export function ShieldPlatformSettings() {
       queryClient.setQueryData(getShieldSettingsQueryKey(), saved)
       toast.success(
         saved.share_observations
-          ? 'Shield now learns from attacks across all services'
+          ? 'Shield now proposes blocks from attacks across all services'
           : 'Shield no longer learns from attacks'
       )
     },
@@ -70,10 +71,12 @@ export function ShieldPlatformSettings() {
                 Learn from attacks across all services
               </Label>
               <p className="text-sm text-muted-foreground">
-                An address that sends exploit probes to one service is blocked
-                on every service for 7 days; one that fails or abandons three
-                challenges within an hour is challenged everywhere for 24 hours.
-                Off, Shield acts only on the lists and your entries.
+                Shield proposes blocking an address that sends exploit probes to
+                one service, for 7 days, and challenging one that fails or
+                abandons three challenges within an hour, for 24 hours. A
+                proposal applies on every service only once you approve it. Off,
+                Shield proposes nothing and acts only on the lists and your
+                entries.
               </p>
             </div>
             <Switch
@@ -86,6 +89,13 @@ export function ShieldPlatformSettings() {
             />
           </div>
         )}
+      </div>
+
+      <Separator />
+
+      <div className="space-y-3">
+        <h3 className="text-sm font-medium">Proposals</h3>
+        <ShieldProposalsPanel learning={sharing} />
       </div>
 
       <Separator />

@@ -9,11 +9,14 @@
 //! last [`WINDOW`] of `shield_events`, from ClickHouse when it is configured
 //! and from Postgres otherwise, and upserts `shield_observed`:
 //!
-//! | Evidence in the last hour | Promoted | For |
+//! | Evidence in the last hour | Proposed | For |
 //! |---|---|---|
 //! | 1 or more exploit hits from an address | address → `block` | 7 days |
 //! | 3 or more failed or abandoned challenges from an address | address → `challenge` | 24 hours |
 //! | One JA4 with exploit hits from 20 or more addresses, not a browser's | fingerprint → `challenge` | 24 hours |
+//!
+//! Learning only proposes: a row is `pending` until an instance admin
+//! approves or rejects it, and only approved rows go into a snapshot.
 //!
 //! An exploit hit is any event with a signature (D8), probes for leaked
 //! secrets included. A challenge is abandoned when no solution followed it
@@ -22,9 +25,8 @@
 //!
 //! The rules are [`promotions`], a pure function of per-subject aggregates;
 //! the SQL only counts. Every pass then runs the compiler, which builds a new
-//! snapshot revision if the observed rows or the operator's rules changed,
-//! so a scanner blocked on one ingress is blocked on all of them within
-//! about a minute.
+//! snapshot revision if the approved rows or the operator's rules changed,
+//! so an approved proposal applies on every ingress within about a minute.
 //!
 //! Every [`PRUNE_INTERVAL`], under its own lock, expired observed rows,
 //! Postgres events older than [`EVENT_RETENTION`], snapshot revisions past
@@ -742,8 +744,11 @@ struct UpsertRow<'a> {
     expires_at: i64,
 }
 
-/// Insert or extend the rows. An unexpired `block` is never turned into a
-/// `challenge`, and keeps its reason; an expired row starts over.
+/// Insert or extend the rows. New rows are pending proposals. An unexpired
+/// `block` is never turned into a `challenge`, and keeps its reason; a
+/// decided row keeps its verdict and reason, so an approval or rejection is
+/// never of something other than what the admin saw, and only its evidence
+/// grows. An expired row starts over as a new pending proposal.
 async fn upsert(txn: &DatabaseTransaction, promotions: &[&Promotion]) -> Result<(), DbErr> {
     let rows: Vec<UpsertRow<'_>> = promotions
         .iter()
@@ -771,10 +776,16 @@ async fn upsert(txn: &DatabaseTransaction, promotions: &[&Promotion]) -> Result<
          FROM jsonb_to_recordset($1::jsonb) AS p(kind text, subject text, verdict text, \
              reason text, first_seen bigint, last_seen bigint, hits bigint, expires_at bigint) \
          ON CONFLICT (kind, subject) DO UPDATE SET \
-             verdict = CASE WHEN o.expires_at > now() AND o.verdict = 'block' \
+             verdict = CASE WHEN o.expires_at > now() \
+                 AND (o.verdict = 'block' OR o.status <> 'pending') \
                  THEN o.verdict ELSE EXCLUDED.verdict END, \
-             reason = CASE WHEN o.expires_at > now() AND o.verdict = 'block' \
-                 AND EXCLUDED.verdict <> 'block' THEN o.reason ELSE EXCLUDED.reason END, \
+             reason = CASE WHEN o.expires_at > now() \
+                 AND ((o.verdict = 'block' AND EXCLUDED.verdict <> 'block') \
+                     OR o.status <> 'pending') \
+                 THEN o.reason ELSE EXCLUDED.reason END, \
+             status = CASE WHEN o.expires_at > now() THEN o.status ELSE 'pending' END, \
+             decided_at = CASE WHEN o.expires_at > now() THEN o.decided_at END, \
+             decided_by = CASE WHEN o.expires_at > now() THEN o.decided_by END, \
              first_seen = CASE WHEN o.expires_at > now() \
                  THEN LEAST(o.first_seen, EXCLUDED.first_seen) ELSE EXCLUDED.first_seen END, \
              last_seen = CASE WHEN o.expires_at > now() \
@@ -1580,6 +1591,19 @@ mod tests {
         })
     }
 
+    async fn observed_status(db: &DatabaseConnection, subject: &str) -> String {
+        db.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT status FROM shield_observed WHERE subject = $1",
+            [subject.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "status")
+        .unwrap()
+    }
+
     /// Events become observed rows, the rows become a revision every
     /// ingress acts on, and operator rules, expiry, the sharing setting
     /// and pruning all reach it.
@@ -1666,7 +1690,16 @@ mod tests {
         );
         assert!(expires_in > 5 * 86_400, "{expires_in}");
 
-        // Compiled, every ingress acts on them.
+        // Learning only proposes: nothing applies while it waits for review.
+        assert_eq!(observed_status(&db, "45.33.40.7").await, "pending");
+        assert!(sources.compile_with(true).await?.is_some());
+        let index = latest_index(&db).await;
+        assert_eq!(action(&index, "45.33.40.7", None), Action::Pass);
+        assert_eq!(action(&index, "8.8.4.4", Some(SCANNER_JA4)), Action::Pass);
+
+        // Approved, every ingress acts on them.
+        db.execute_unprepared("UPDATE shield_observed SET status = 'approved', decided_at = now()")
+            .await?;
         assert!(sources.compile_with(true).await?.is_some());
         let index = latest_index(&db).await;
         assert_eq!(action(&index, "45.33.40.7", None), Action::Block);
@@ -1682,6 +1715,26 @@ mod tests {
         // Nothing new: no revision.
         assert_eq!(learning.promote().await?.unwrap().written, 0);
         assert_eq!(sources.compile_with(true).await?, None);
+
+        // A rejection withdraws it, and new evidence keeps the decision.
+        db.execute_unprepared(
+            "UPDATE shield_observed SET status = 'rejected' WHERE subject = '45.33.40.7'",
+        )
+        .await?;
+        assert!(sources.compile_with(true).await?.is_some());
+        assert_eq!(
+            action(&latest_index(&db).await, "45.33.40.7", None),
+            Action::Pass
+        );
+        insert_postgres(&db, &[exploit(4, "45.33.40.7", None)]).await;
+        assert_eq!(learning.promote().await?.unwrap().written, 1);
+        assert_eq!(observed_status(&db, "45.33.40.7").await, "rejected");
+        assert_eq!(sources.compile_with(true).await?, None);
+        db.execute_unprepared(
+            "UPDATE shield_observed SET status = 'approved' WHERE subject = '45.33.40.7'",
+        )
+        .await?;
+        assert!(sources.compile_with(true).await?.is_some());
 
         // An operator allow, platform-wide, wins; removing it is a change.
         db.execute_unprepared(
@@ -1734,7 +1787,7 @@ mod tests {
             .await?
             .unwrap()
             .try_get("", "left")?;
-        assert_eq!(left, scenario().len() as i64 + 4);
+        assert_eq!(left, scenario().len() as i64 + 5);
         Ok(())
     }
 

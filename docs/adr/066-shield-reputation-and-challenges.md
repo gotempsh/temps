@@ -438,17 +438,27 @@ when the address is also listed. Request bodies are not read in this ADR.
 ### D9. The fleet learns from every ingress
 
 Every decision other than `pass` is an event (D11). Every 30 seconds the
-control plane promotes:
+control plane proposes:
 
-| Evidence in the last hour | Promoted | For |
+| Evidence in the last hour | Proposed | For |
 |---|---|---|
 | 1 or more exploit hits from an address | address → `block` | 7 days |
 | 3 or more failed or abandoned challenges from an address | address → `challenge` | 24 hours |
 | One JA4 with exploit hits from 20 or more addresses, not on the browser list | fingerprint → `challenge` | 24 hours |
 
-An address that probes `/.env` on one ingress is blocked on all of them
-within about a minute. Only addresses, fingerprints and reasons cross
-tenants; paths and hosts stay with the environment that saw them.
+A proposal applies only once an instance admin approves it (Settings →
+Shield → Proposals, or `POST /settings/shield/proposals/{id}/approve`);
+nothing learned blocks anyone by default. Once approved, an address that
+probed `/.env` on one ingress is blocked on all of them within about a
+minute, until the proposal expires. A rejection is kept until then too, so
+the same evidence does not propose it again; new evidence on a pending
+proposal can raise `challenge` to `block`, never the other way, and a
+decided one keeps its verdict and reason. An expired row starts over as
+pending. Only addresses, fingerprints and reasons cross tenants; paths and
+hosts stay with the environment that saw them.
+
+Applying proposals automatically, for the rules that earn the trust, is
+left for later: the review data is what that decision needs.
 
 ### D10. Workers run Shield too
 
@@ -548,7 +558,9 @@ Migration `mYYYYMMDD_000001_create_shield.rs`:
 - `shield_operator_entries (id, scope, project_id NULL, network CIDR or
   ja4 TEXT, verdict, note, created_by, created_at, expires_at NULL)`.
 - `shield_observed (subject TEXT, kind ip|ja4, verdict, reason,
-  first_seen, last_seen, hits, expires_at)`, unique on `(kind, subject)`.
+  first_seen, last_seen, hits, expires_at, status pending|approved|rejected,
+  decided_at, decided_by)`, unique on `(kind, subject)`. Only `approved`
+  rows reach the snapshot.
 - `shield_snapshots (revision BIGSERIAL, created_at, sha256, body BYTEA,
   sources_updated_at)`, zstd-compressed, keep the last 10 (phase 2).
   `sources_updated_at` is the newest source change a revision was built
@@ -874,7 +886,7 @@ which every control plane registers:
 | Task | Every | Does |
 |---|---|---|
 | fetch sources | 1 h | Download feeds with ETag; CrowdSec if enrolled. Each source is claimed by the `UPDATE` that stamps `last_attempt_at`, so no lock is held across a download. A document that is mostly not networks, or a network broader than /8 (IPv6 /16) on a list that acts, is refused and the last good copy kept |
-| promote | 30 s | Query the last hour of `shield_events`, upsert `shield_observed`, expire old rows |
+| promote | 30 s | Query the last hour of `shield_events`, upsert `shield_observed` as proposals, expire old rows |
 | compile | on change, and daily | Build and store a new snapshot revision when a source changed since the newest one; daily so lists dated by their fetch stay fresh. Bump the route generation (phase 5) |
 | prune | hourly | Expired observed rows, old snapshots; `challenge_sessions` until it is dropped |
 
@@ -1049,7 +1061,7 @@ which every control plane registers:
   challenges; an exempt path, a clearance and a verified crawler skip only
   challenges. A `block` verdict is never cleared by solving.
 - **Sharing.** `AppSettings.shield.share_observations` (on by default)
-  turns promotion off for the whole plane. Receiving others' observations is
+  turns proposals, and approved ones applying, off for the whole plane. Receiving others' observations is
   not separable from sharing within one plane, so there is no second switch.
 - **Workers' policy.** Per-environment policy (mode, exempt paths, bypass
   token hashes) rides in the route data workers already receive, not in the

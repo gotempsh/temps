@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! What the fleet learned (ADR 066, D9): addresses and fingerprints
-//! promoted from events, each until `expires_at`.
+//! promoted from events, each until `expires_at`. A row is a proposal: it
+//! applies only once an instance admin approves it.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,10 @@ pub struct Model {
     pub last_seen: DBDateTime,
     pub hits: i64,
     pub expires_at: DBDateTime,
+    /// `pending`, `approved` or `rejected`. Only `approved` rows apply.
+    pub status: String,
+    pub decided_at: Option<DBDateTime>,
+    pub decided_by: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
