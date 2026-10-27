@@ -76564,6 +76564,10 @@
       "WireguardMeshStatusResponse": {
         "description": "Response of `GET /nodes/wireguard`.",
         "properties": {
+          "ca_rotation_required": {
+            "description": "Whether the cluster CA must be rotated before the mesh can be turned\non: it predates certificate address history, so no pool can be\nproven free of its worker certificates. Always `false` once the mesh\nis on.",
+            "type": "boolean"
+          },
           "can_enable": {
             "description": "Whether `POST /nodes/wireguard` can turn the mesh on here.",
             "type": "boolean"
@@ -76640,6 +76644,10 @@
             },
             "type": "array"
           },
+          "pool_cidr": {
+            "description": "The pool the mesh uses, or would use if turned on now: nodes get\ntheir mesh addresses from it. Unrelated to the compute pool.",
+            "type": "string"
+          },
           "reason": {
             "description": "Why the mesh is not ready, when it is not. Rendered verbatim.",
             "type": [
@@ -76653,6 +76661,8 @@
         },
         "required": [
           "state",
+          "pool_cidr",
+          "ca_rotation_required",
           "listen_port",
           "can_enable",
           "enable_command",

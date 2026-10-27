@@ -19,6 +19,8 @@ import {
 } from '@/lib/cluster-network'
 import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { RotateClusterCaDialog } from '@/components/nodes/RotateClusterCaDialog'
+import { useClusterCaFingerprint } from '@/hooks/useClusterCaFingerprint'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -125,7 +127,6 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isForbiddenRead, isVerifiedNotFound } from '@/lib/read-failure'
 import { refetchUnlessRefused } from '@/lib/query-retry'
-import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -1661,73 +1662,9 @@ function NodeDetail({
   )
 }
 
-const ROTATE_CLUSTER_CA_CONFIRMATION = 'ROTATE CLUSTER CA'
-
 function ClusterTrustCard() {
-  const queryClient = useQueryClient()
   const [dialogOpen, setDialogOpen] = useState(false)
-  const [confirmation, setConfirmation] = useState('')
-  const [rotationPending, setRotationPending] = useState(false)
-  const { handleSensitiveActionError, verificationDialog } =
-    useSensitiveActionVerification()
-  const settingsQuery = useQuery(getSettingsOptions())
-  const fingerprint =
-    settingsQuery.data?.multi_node.cluster_ca_fingerprint ?? null
-
-  const closeDialog = () => {
-    setDialogOpen(false)
-    setConfirmation('')
-  }
-
-  const rotateClusterCa = async () => {
-    if (!fingerprint || confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION) return
-
-    setRotationPending(true)
-    try {
-      const response = await client.post({
-        url: '/settings/cluster-ca/rotate' as never,
-        body: {
-          expected_fingerprint: fingerprint,
-          confirmation,
-        } as never,
-      })
-      if (response.error) {
-        if (
-          handleSensitiveActionError(response.error, () => {
-            void rotateClusterCa()
-          })
-        ) {
-          // Avoid stacking two modal focus traps while the MFA step-up dialog
-          // is active. Keep the typed confirmation for the one-shot retry.
-          setDialogOpen(false)
-          return
-        }
-        const problem = response.error as {
-          detail?: string
-          title?: string
-        }
-        toast.error(
-          problem.detail ?? problem.title ?? 'Failed to rotate the cluster CA'
-        )
-        return
-      }
-
-      const result = response.data as
-        | { new_fingerprint?: string; revoked_enrollment_tokens?: number }
-        | undefined
-      toast.success(
-        `Cluster CA rotated. ${result?.revoked_enrollment_tokens ?? 0} enrollment token(s) revoked.`
-      )
-      closeDialog()
-      await queryClient.invalidateQueries({
-        queryKey: getSettingsOptions().queryKey,
-      })
-    } catch {
-      toast.error('Failed to rotate the cluster CA')
-    } finally {
-      setRotationPending(false)
-    }
-  }
+  const { fingerprint, isLoading } = useClusterCaFingerprint()
 
   return (
     <>
@@ -1746,7 +1683,7 @@ function ClusterTrustCard() {
           <div className="rounded-md border bg-muted/30 p-4">
             <p className="text-sm font-medium">Active CA fingerprint</p>
             <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
-              {settingsQuery.isLoading
+              {isLoading
                 ? 'Loading…'
                 : (fingerprint ??
                   'Initializing cluster trust… restart the control plane if this persists.')}
@@ -1758,78 +1695,25 @@ function ClusterTrustCard() {
             <AlertDescription>
               Rotation immediately invalidates worker trust and outstanding
               enrollment tokens. Every worker must be re-enrolled. Only a full
-              Admin using a fresh MFA-verified browser session can proceed.
+              Admin in a browser session can proceed, and an Admin with MFA
+              re-verifies it first.
             </AlertDescription>
           </Alert>
           <Button
             variant="destructive"
             onClick={() => setDialogOpen(true)}
-            disabled={!fingerprint || settingsQuery.isLoading}
+            disabled={!fingerprint || isLoading}
           >
             Rotate cluster CA
           </Button>
         </CardContent>
       </Card>
 
-      <AlertDialog
+      <RotateClusterCaDialog
         open={dialogOpen}
-        onOpenChange={(open) => {
-          setDialogOpen(open)
-          if (!open) setConfirmation('')
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Rotate the cluster CA?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This disconnects every existing worker until it is re-enrolled
-              against the new fingerprint. Verify the fingerprint below through
-              a trusted operator channel before continuing.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3">
-            <p className="break-all rounded-md border bg-muted/30 p-3 font-mono text-xs">
-              {fingerprint}
-            </p>
-            <label className="space-y-2 text-sm font-medium">
-              <span>
-                Type{' '}
-                <span className="font-mono">
-                  {ROTATE_CLUSTER_CA_CONFIRMATION}
-                </span>
-              </span>
-              <Input
-                autoComplete="off"
-                value={confirmation}
-                onChange={(event) => setConfirmation(event.target.value)}
-                placeholder={ROTATE_CLUSTER_CA_CONFIRMATION}
-              />
-            </label>
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={rotationPending} onClick={closeDialog}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-white hover:bg-destructive/90"
-              disabled={
-                rotationPending ||
-                confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION
-              }
-              onClick={(event) => {
-                event.preventDefault()
-                void rotateClusterCa()
-              }}
-            >
-              {rotationPending && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              )}
-              Rotate and disconnect workers
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-      {verificationDialog}
+        onOpenChange={setDialogOpen}
+        description="This disconnects every existing worker until it is re-enrolled against the new fingerprint. Verify the fingerprint below through a trusted operator channel before continuing."
+      />
     </>
   )
 }

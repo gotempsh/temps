@@ -1612,6 +1612,9 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
         return;
     };
     certificate_history_ca(&f.db).await;
+    assert!(!mesh::ca_predates_certificate_history(f.db.as_ref())
+        .await
+        .unwrap());
     mesh::reserve_certificate_addresses(&f.db, "test-ca", &["10.203.0.1".into()], None)
         .await
         .unwrap();
@@ -1630,11 +1633,12 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
     f.db.execute_unprepared("DELETE FROM cluster_certificate_history")
         .await
         .unwrap();
+    assert!(mesh::ca_predates_certificate_history(f.db.as_ref())
+        .await
+        .unwrap());
     let error = mesh::enable(&f.db, None, None, None).await.unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("predates certificate address history"),
+        matches!(error, mesh::MeshError::CaPredatesCertificateHistory { .. }),
         "{error}"
     );
     // An unchanged, already active pool introduces no new identity. Ordinary
@@ -1647,9 +1651,7 @@ async fn certificate_history_blocks_deleted_nodes_and_unknown_old_cas() {
         .await
         .unwrap_err();
     assert!(
-        error
-            .to_string()
-            .contains("predates certificate address history"),
+        matches!(error, mesh::MeshError::CaPredatesCertificateHistory { .. }),
         "{error}"
     );
 }

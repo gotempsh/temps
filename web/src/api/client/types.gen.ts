@@ -35830,6 +35830,13 @@ export type WireguardMeshState = 'disabled' | 'starting' | 'ready';
  */
 export type WireguardMeshStatusResponse = {
     /**
+     * Whether the cluster CA must be rotated before the mesh can be turned
+     * on: it predates certificate address history, so no pool can be
+     * proven free of its worker certificates. Always `false` once the mesh
+     * is on.
+     */
+    ca_rotation_required: boolean;
+    /**
      * Whether `POST /nodes/wireguard` can turn the mesh on here.
      */
     can_enable: boolean;
@@ -35867,6 +35874,11 @@ export type WireguardMeshStatusResponse = {
      */
     listen_port: number;
     nodes: Array<WireguardMeshNodeStatus>;
+    /**
+     * The pool the mesh uses, or would use if turned on now: nodes get
+     * their mesh addresses from it. Unrelated to the compute pool.
+     */
+    pool_cidr: string;
     /**
      * Why the mesh is not ready, when it is not. Rendered verbatim.
      */

@@ -64,6 +64,8 @@ function mesh(
     state: 'disabled',
     reason: null,
     cidr: null,
+    pool_cidr: '10.201.0.0/16',
+    ca_rotation_required: false,
     listen_port: 51820,
     control_plane: null,
     can_enable: true,

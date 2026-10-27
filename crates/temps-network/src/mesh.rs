@@ -153,6 +153,10 @@ pub enum MeshError {
     Disabled,
     #[error("wireguard_cidr {value:?} is invalid: {reason}")]
     InvalidCidr { value: String, reason: String },
+    /// The cluster CA was created before Temps recorded the addresses its
+    /// worker certificates name, so no pool can be proven free of them.
+    #[error("the mesh cannot use {pool} yet: this cluster's CA was created before Temps recorded which addresses its worker certificates name, and those certificates are never revoked (deleted nodes keep theirs), so Temps cannot prove none of them covers the pool. The pool is fine. Rotate the cluster CA (Settings > Worker Nodes > Cluster trust), re-enroll any workers, then turn the mesh on")]
+    CaPredatesCertificateHistory { pool: Ipv4Net },
     #[error("wireguard_cidr {mesh} overlaps the compute pool {pool}")]
     OverlapsComputePool { mesh: Ipv4Net, pool: Ipv4Net },
     #[error("wireguard_cidr {cidr} has no free address left for another node")]
@@ -725,18 +729,9 @@ mod db {
         db: &C,
     ) -> Result<std::collections::HashSet<Ipv4Addr>, MeshError> {
         use sea_orm::{FromQueryResult, Statement};
-        let settings = temps_entities::settings::Entity::find_by_id(1)
-            .one(db)
-            .await?;
-        let Some(ca) = settings
-            .as_ref()
-            .and_then(|row| row.data.get("multi_node"))
-            .and_then(|value| value.get("cluster_ca_cert_pem"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(ca_key) = current_ca_key(db).await? else {
             return Ok(Default::default());
         };
-        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
         #[derive(FromQueryResult)]
         struct Address {
             address: String,
@@ -753,6 +748,50 @@ mod db {
         .collect())
     }
 
+    /// Key of the current cluster CA in the certificate history tables, or
+    /// `None` while no CA exists (nothing has been issued).
+    async fn current_ca_key<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<Option<String>, MeshError> {
+        let settings = temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await?;
+        Ok(settings
+            .as_ref()
+            .and_then(|row| row.data.get("multi_node"))
+            .and_then(|value| value.get("cluster_ca_cert_pem"))
+            .and_then(|value| value.as_str())
+            .map(|ca| hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()))))
+    }
+
+    async fn ca_has_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        ca_key: &str,
+    ) -> Result<bool, MeshError> {
+        use sea_orm::Statement;
+        Ok(db
+            .query_one(Statement::from_sql_and_values(
+                db.get_database_backend(),
+                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
+                [ca_key.into()],
+            ))
+            .await?
+            .is_some())
+    }
+
+    /// Whether the cluster CA was created before Temps recorded the addresses
+    /// its leaves name. Such a CA blocks turning the mesh on or moving it
+    /// until it is rotated, whatever the pool: see
+    /// [`MeshError::CaPredatesCertificateHistory`].
+    pub async fn ca_predates_certificate_history<C: sea_orm::ConnectionTrait>(
+        db: &C,
+    ) -> Result<bool, MeshError> {
+        match current_ca_key(db).await? {
+            Some(ca_key) => Ok(!ca_has_history(db, &ca_key).await?),
+            None => Ok(false),
+        }
+    }
+
     /// A pre-history CA may have issued certificates for deleted or renamed
     /// nodes. Current rows cannot prove safety; rotate that CA explicitly.
     async fn check_certificate_history<C: sea_orm::ConnectionTrait>(
@@ -760,33 +799,13 @@ mod db {
         pool: Ipv4Net,
     ) -> Result<(), MeshError> {
         use sea_orm::{FromQueryResult, Statement};
-        let settings = temps_entities::settings::Entity::find_by_id(1)
-            .one(txn)
-            .await?;
-        let Some(ca) = settings
-            .as_ref()
-            .and_then(|row| row.data.get("multi_node"))
-            .and_then(|value| value.get("cluster_ca_cert_pem"))
-            .and_then(|value| value.as_str())
-        else {
+        let Some(ca_key) = current_ca_key(txn).await? else {
             return Ok(());
         };
-        let ca_key = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(ca.as_bytes()));
-        let backend = txn.get_database_backend();
-        if txn
-            .query_one(Statement::from_sql_and_values(
-                backend,
-                "SELECT ca_key FROM cluster_certificate_history WHERE ca_key = $1",
-                [ca_key.clone().into()],
-            ))
-            .await?
-            .is_none()
-        {
-            return Err(MeshError::InvalidCidr {
-                value: pool.to_string(),
-                reason: "the cluster CA predates certificate address history; deleted nodes may still hold certificates for this pool. Rotate the cluster CA in Settings > Worker Nodes and re-enroll workers before enabling or changing the mesh".into(),
-            });
+        if !ca_has_history(txn, &ca_key).await? {
+            return Err(MeshError::CaPredatesCertificateHistory { pool });
         }
+        let backend = txn.get_database_backend();
         #[derive(FromQueryResult)]
         struct Address {
             address: String,
@@ -1091,6 +1110,12 @@ mod db {
     pub async fn configured_port(db: &DatabaseConnection) -> Result<u16, MeshError> {
         let cfg = load_config(db).await?;
         parse_mesh_port(cfg.wireguard_port)
+    }
+
+    /// The pool turning the mesh on would use when no other is asked for.
+    pub async fn configured_pool(db: &DatabaseConnection) -> Result<Ipv4Net, MeshError> {
+        let cfg = load_config(db).await?;
+        Ok(reserved_mesh_pool(&cfg.wireguard_cidr))
     }
 
     /// What a node needs to bring its end of the mesh up.

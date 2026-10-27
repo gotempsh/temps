@@ -118,6 +118,8 @@ function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): Wiregua
     state: 'disabled',
     reason: null,
     cidr: null,
+    ca_rotation_required: false,
+    pool_cidr: '10.201.0.0/24',
     listen_port: 51820,
     control_plane: null,
     can_enable: true,

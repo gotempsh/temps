@@ -42,6 +42,7 @@ import { useClusterNetwork } from '@/hooks/useClusterNetwork'
 import { type ClusterNetworkStatus } from '@/lib/cluster-network'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { useWireguardMesh } from '@/components/nodes/WorkerJoinGuide'
+import { MeshCaRotationRequired } from '@/components/nodes/RotateClusterCaDialog'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
@@ -405,6 +406,10 @@ function PrivateNetworkStep({ mesh }: { mesh: WireguardMeshStatusResponse }) {
     )
   }
 
+  if (mesh.ca_rotation_required) {
+    return <MeshCaRotationRequired mesh={mesh} />
+  }
+
   if (mesh.enable_blocker) {
     return (
       <Alert className="border-amber-500/30 bg-amber-500/5">
@@ -422,7 +427,8 @@ function PrivateNetworkStep({ mesh }: { mesh: WireguardMeshStatusResponse }) {
   return (
     <div className="space-y-2">
       <p className="text-sm text-muted-foreground">
-        Gives this server and every worker a private address on an encrypted
+        Gives this server and every worker a private address from{' '}
+        <code className="font-mono">{mesh.pool_cidr}</code> on an encrypted
         WireGuard network. This server must accept UDP{' '}
         <code>{mesh.listen_port}</code> from the internet. Once on, it stays on.
       </p>
