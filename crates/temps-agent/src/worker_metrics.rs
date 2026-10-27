@@ -265,7 +265,8 @@ pub fn router(config: &AgentConfig, auth: Arc<AgentAuth>) -> Router {
         Arc::new(ReportSource {
             instance_id: counters.instance_id.clone(),
             proxy: counters.proxy.clone(),
-            host: NodeMetricsCollector::with_scope(NodeMetricsScope::Host),
+            // Disk health goes out in the heartbeat (`server.rs`), not here.
+            host: NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health(),
             data_dir: data_dir(config),
         }),
         auth,
@@ -313,7 +314,7 @@ mod tests {
         Arc::new(ReportSource {
             instance_id: "fixture-instance".to_string(),
             proxy,
-            host: NodeMetricsCollector::with_scope(NodeMetricsScope::Host),
+            host: NodeMetricsCollector::with_scope(NodeMetricsScope::Host).without_disk_health(),
             data_dir: std::env::temp_dir().display().to_string(),
         })
     }

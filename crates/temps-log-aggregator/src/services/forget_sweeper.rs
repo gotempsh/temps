@@ -40,6 +40,10 @@ pub struct ForgetSweepReport {
     pub failed: u64,
     /// True when the batch was full, i.e. more work is likely waiting.
     pub more: bool,
+    /// Masked chunk entries the index physically removed this pass (see
+    /// `LineIndexSink::reclaim_forgotten`; usually `0`, the index
+    /// rate-limits itself).
+    pub reclaimed: u64,
 }
 
 pub struct ForgetSweeper {
@@ -64,6 +68,21 @@ impl ForgetSweeper {
         let mut report = ForgetSweepReport::default();
         if self.line_index.unavailable_reason().is_some() {
             return report;
+        }
+
+        // Rows already forgotten are masked from every read; reclaiming
+        // their space is the index's own rate-limited business, and a
+        // failure only delays it, so it never blocks the backlog below.
+        match self.line_index.reclaim_forgotten().await {
+            Ok(n) => report.reclaimed = n,
+            Err(e) => {
+                warn!(error = %e, "forget sweep: reclaiming forgotten index rows failed; retried next interval")
+            }
+        }
+        // Counts the index batches in memory between inserts (attribute-key
+        // ranking) must not wait on the next insert when ingest goes quiet.
+        if let Err(e) = self.line_index.flush_rollups().await {
+            warn!(error = %e, "forget sweep: writing index rollups failed; retried next interval");
         }
 
         let seqs = match self.manifests.pending_forgets(batch).await {
@@ -177,6 +196,67 @@ mod tests {
         assert_eq!(report.resolved, 0);
         assert_eq!(report.failed, 0);
         assert!(!report.more);
+        assert_eq!(report.reclaimed, 0);
+    }
+
+    /// A sink that counts reclaim calls and fails each one when `fail` is set.
+    struct ReclaimSink {
+        calls: AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LineIndexSink for ReclaimSink {
+        async fn index_chunk(
+            &self,
+            _seq: i64,
+            _labels: &ChunkLabels,
+            _segments: &[Arc<Vec<LogLine>>],
+        ) -> Result<IndexOutcome, LogAggregatorError> {
+            Ok(IndexOutcome::Indexed)
+        }
+
+        async fn reclaim_forgotten(&self) -> Result<u64, LogAggregatorError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(LogAggregatorError::LineIndex {
+                    reason: "reclaim sink: simulated failure".into(),
+                });
+            }
+            Ok(3)
+        }
+    }
+
+    fn mock_manifests() -> Arc<ManifestRepo> {
+        // No query results queued: listing the backlog fails, which the
+        // sweeper treats as "nothing to do this pass".
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        Arc::new(ManifestRepo::new(Arc::new(db)))
+    }
+
+    #[tokio::test]
+    async fn every_pass_gives_the_index_a_chance_to_reclaim() {
+        let sink = Arc::new(ReclaimSink {
+            calls: AtomicUsize::new(0),
+            fail: false,
+        });
+        let sweeper = ForgetSweeper::new(mock_manifests(), sink.clone());
+        let report = sweeper.run_once(10).await;
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.reclaimed, 3);
+    }
+
+    #[tokio::test]
+    async fn a_failed_reclaim_does_not_fail_the_pass() {
+        let sink = Arc::new(ReclaimSink {
+            calls: AtomicUsize::new(0),
+            fail: true,
+        });
+        let sweeper = ForgetSweeper::new(mock_manifests(), sink.clone());
+        let report = sweeper.run_once(10).await;
+        assert_eq!(sink.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(report.reclaimed, 0);
+        assert_eq!(report.failed, 0);
     }
 
     /// The behaviour this sweeper exists for: an entry that fails the first

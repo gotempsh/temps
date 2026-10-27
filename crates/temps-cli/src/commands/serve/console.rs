@@ -2201,7 +2201,13 @@ fn build_ch_metrics_store(
         },
     );
 
-    Some(store as Arc<dyn MetricsStore>)
+    // Every producer (scraper, samplers, health monitors, OTLP) writes a few
+    // dozen points per tick; buffering turns those into a few large inserts
+    // instead of one ClickHouse part each.
+    Some(temps_metrics::BufferedMetricsStore::wrap(
+        store as Arc<dyn MetricsStore>,
+        temps_metrics::BufferConfig::default(),
+    ))
 }
 
 /// Build the console health/readiness router.
@@ -2502,6 +2508,18 @@ fn ai_read_allowlist() -> Vec<String> {
         "DeploymentMetricsGetLatest",
         "NodeMetricsGetRange",
         "NodeMetricsGetLatest",
+        "NodeMetricsGetClusterRange",
+        "NodeMetricsGetClusterLatest",
+        "NodeMetricsGetReporting",
+        "NodeMetricsGetDiskHealth",
+        // A managed service's own log ingestion budget: two numbers.
+        "get_service_log_ingestion",
+        // ── Reachability: plans, runs and their journals (no tokens; the
+        // journal `key` names a step, it is not a credential) ──
+        "get_certificate_methods",
+        "get_environment_reachability",
+        "list_reachability_runs",
+        "get_reachability_run",
         // ── Domains: metadata (no challenge tokens) ──
         "list_domains",
         "get_domain",
@@ -3092,9 +3110,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_notification_delivery_coverage",
         // ── Workload plane (ADR-055): placement, volumes, node resources,
         //    workload modes, functions and network policy, read only ──
-        "NodeMetricsGetClusterLatest",
-        "NodeMetricsGetClusterRange",
-        "NodeMetricsGetReporting",
         "admin_environment_pinning_recommendation",
         "admin_environment_volume_status",
         "admin_explain_environment_placement",
@@ -3113,12 +3128,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_node_modes",
         "list_rules",
         "node_state_status",
-        // ── Reachability (ADR 064): whether visitors can reach each address,
-        //    the certificate methods that fit, and past runs ──
-        "get_certificate_methods",
-        "get_environment_reachability",
-        "get_reachability_run",
-        "list_reachability_runs",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -3398,6 +3407,7 @@ fn ai_write_allowlist() -> Vec<String> {
         "ExternalServiceMetricsUpdateAlertRule",
         "NodeMetricsCreateAlertRule",
         "NodeMetricsUpdateAlertRule",
+        "update_service_log_ingestion",
         "kv_enable",
         "kv_update",
         "blob_update",
@@ -3547,6 +3557,13 @@ fn ai_read_safe_posts() -> Vec<String> {
         "get_repository_compose_preview",
         "get_public_compose_preview",
         "generate_preset_dockerfile",
+        // Read-only POST: *Make it reachable* plans change nothing; a plan is
+        // only kept for `apply`, which stays with the operator.
+        "plan_environment_reachability",
+        // Read-only POST: which permissions a Cloudflare token has. Nothing is
+        // created or stored; the token is a `SecretString`, so the assistant
+        // passes it through a secret slot.
+        "check_cloudflare_token",
     ]
     .iter()
     .map(|s| s.to_string())

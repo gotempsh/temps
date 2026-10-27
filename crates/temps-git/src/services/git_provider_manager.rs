@@ -7737,6 +7737,8 @@ mod tests {
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 

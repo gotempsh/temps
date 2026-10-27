@@ -3,6 +3,7 @@
 
 //! Plugin registration for the OTel subsystem.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -993,8 +994,7 @@ impl TempsPlugin for OtelPlugin {
             // backend: a multi-row `INSERT … ON CONFLICT DO NOTHING` into the
             // Postgres control table, or a batched insert into the compressed
             // ClickHouse `cross_project_trace_refs` table when CH is enabled.
-            let (trace_hint_tx, mut trace_hint_rx) =
-                tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
+            let (trace_hint_tx, trace_hint_rx) = tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
 
             // ── OtelRelay extension point ────────────────────────────────────
             //
@@ -1479,23 +1479,28 @@ impl TempsPlugin for OtelPlugin {
 
             // 1c. ADR-027 Phase 0: cross-project trace hint writer consumer.
             //
-            // Drains `trace_hint_rx` and calls `CrossProjectTraceService::record_hint`
-            // for each message, issuing a single multi-row INSERT ON CONFLICT DO NOTHING.
-            // Errors are warned and the loop continues — hint loss is tolerable.
+            // Drains `trace_hint_rx` and coalesces hints for up to
+            // `TRACE_HINT_FLUSH_INTERVAL` (or `TRACE_HINT_FLUSH_REFS` refs)
+            // before writing them with one `record_hints` call. Each OTLP
+            // batch carries 1-3 trace ids, so writing per message meant one
+            // tiny insert — and on ClickHouse one new part — per ingested
+            // batch. Memory is bounded by the flush threshold. Errors are
+            // warned and the loop continues — hint loss is tolerable, and the
+            // next ingest of the same trace re-records it.
             {
                 let hint_svc = cross_project_service.clone();
                 tokio::spawn(async move {
                     info!("Cross-project trace hint writer consumer started");
-                    while let Some(msg) = trace_hint_rx.recv().await {
-                        if let Err(e) = hint_svc.record_hint(msg.trace_ids, msg.project_id).await {
-                            tracing::warn!(
-                                project_id = msg.project_id,
-                                error = %e,
-                                "Cross-project trace hint write failed (non-fatal); \
-                                 subsequent ingests will re-populate via ON CONFLICT DO NOTHING"
-                            );
-                        }
-                    }
+                    run_trace_hint_writer(
+                        trace_hint_rx,
+                        TRACE_HINT_FLUSH_INTERVAL,
+                        TRACE_HINT_FLUSH_REFS,
+                        |hints| {
+                            let hint_svc = hint_svc.clone();
+                            async move { hint_svc.record_hints(hints).await }
+                        },
+                    )
+                    .await;
                     info!("Cross-project trace hint writer consumer stopped (channel closed)");
                 });
             }
@@ -1562,7 +1567,6 @@ impl TempsPlugin for OtelPlugin {
                 let stats_ingest_limit = config.max_concurrent_ingest_requests;
                 tokio::spawn(async move {
                     use chrono::Utc;
-                    use std::collections::HashMap;
                     use temps_metrics::{MetricKind, MetricPoint, SourceKind};
 
                     info!(
@@ -1815,6 +1819,72 @@ impl TempsPlugin for OtelPlugin {
 /// reachable server finishes well within this.
 const CLICKHOUSE_MIGRATION_STARTUP_WAIT: Duration = Duration::from_secs(30);
 
+/// Longest a cross-project trace hint waits before it is written.
+const TRACE_HINT_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Distinct pending `(project, trace_id)` refs that trigger an early flush.
+const TRACE_HINT_FLUSH_REFS: usize = 5_000;
+
+/// The cross-project trace hint writer loop: coalesce hints per project
+/// (deduplicating trace ids) and hand them to `record` every
+/// `flush_interval`, as soon as `flush_refs` distinct refs are pending, and
+/// once more when the channel closes. A failed write is warned about and
+/// dropped; the loop carries on.
+async fn run_trace_hint_writer<F, Fut, E>(
+    mut receiver: tokio::sync::mpsc::Receiver<TraceHintMsg>,
+    flush_interval: Duration,
+    flush_refs: usize,
+    mut record: F,
+) where
+    F: FnMut(HashMap<i32, HashSet<String>>) -> Fut,
+    Fut: Future<Output = Result<u64, E>>,
+    E: std::fmt::Display,
+{
+    let mut pending: HashMap<i32, HashSet<String>> = HashMap::new();
+    let mut pending_refs = 0usize;
+    // Starts one interval out: `interval`'s immediate first tick would flush
+    // whatever had arrived by then, ahead of both the timer and threshold.
+    let mut ticker =
+        tokio::time::interval_at(tokio::time::Instant::now() + flush_interval, flush_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        let closed = tokio::select! {
+            msg = receiver.recv() => match msg {
+                Some(msg) => {
+                    let ids = pending.entry(msg.project_id).or_default();
+                    for id in msg.trace_ids {
+                        if ids.insert(id) {
+                            pending_refs += 1;
+                        }
+                    }
+                    if pending_refs < flush_refs {
+                        continue;
+                    }
+                    false
+                }
+                None => true,
+            },
+            _ = ticker.tick() => false,
+        };
+        if pending_refs > 0 {
+            let projects = pending.len();
+            if let Err(e) = record(std::mem::take(&mut pending)).await {
+                tracing::warn!(
+                    projects,
+                    refs = pending_refs,
+                    error = %e,
+                    "Cross-project trace hint write failed (non-fatal); \
+                     subsequent ingests will re-record these traces"
+                );
+            }
+            pending_refs = 0;
+        }
+        if closed {
+            break;
+        }
+    }
+}
+
 /// Handler state for both route hooks, with the ADR-028 project access checker
 /// injected (it is registered by a later plugin, so it is only available once
 /// routes are configured). The same checker feeds the `tk_`-key ingest auth
@@ -1964,6 +2034,118 @@ async fn apply_retention_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Cross-project trace hint writer ─────────────────────────────────
+
+    type Flushes = Arc<std::sync::Mutex<Vec<HashMap<i32, HashSet<String>>>>>;
+
+    fn hint(project_id: i32, ids: &[&str]) -> TraceHintMsg {
+        TraceHintMsg {
+            project_id,
+            trace_ids: ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    /// Spawn the writer with a recording sink; the first `failures` flushes
+    /// fail.
+    fn spawn_writer(
+        flush_interval: Duration,
+        flush_refs: usize,
+        failures: usize,
+    ) -> (
+        tokio::sync::mpsc::Sender<TraceHintMsg>,
+        Flushes,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let flushes: Flushes = Arc::default();
+        let recorded = flushes.clone();
+        let failures = Arc::new(std::sync::Mutex::new(failures));
+        let task = tokio::spawn(run_trace_hint_writer(
+            rx,
+            flush_interval,
+            flush_refs,
+            move |hints| {
+                let recorded = recorded.clone();
+                let failures = failures.clone();
+                async move {
+                    recorded.lock().expect("flush log").push(hints);
+                    let failing = {
+                        let mut left = failures.lock().expect("failure budget");
+                        let failing = *left > 0;
+                        *left = left.saturating_sub(1);
+                        failing
+                    };
+                    if failing {
+                        Err("hint store unavailable")
+                    } else {
+                        Ok(0u64)
+                    }
+                }
+            },
+        ));
+        (tx, flushes, task)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trace_hints_are_deduplicated_per_project_and_flushed_on_close() {
+        let (tx, flushes, task) = spawn_writer(Duration::from_secs(5), 100, 0);
+        tx.send(hint(1, &["a", "b"])).await.expect("send");
+        tx.send(hint(1, &["a"])).await.expect("send");
+        // The same trace id in another project is its own ref.
+        tx.send(hint(2, &["a"])).await.expect("send");
+        drop(tx);
+        task.await.expect("writer exits once the channel closes");
+
+        let flushes = flushes.lock().expect("flush log");
+        assert_eq!(flushes.len(), 1, "{flushes:?}");
+        assert_eq!(flushes[0].get(&1), Some(&set(&["a", "b"])));
+        assert_eq!(flushes[0].get(&2), Some(&set(&["a"])));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trace_hints_flush_early_at_the_ref_threshold() {
+        let (tx, flushes, _task) = spawn_writer(Duration::from_secs(3600), 3, 0);
+        tx.send(hint(1, &["a", "b"])).await.expect("send");
+        // A duplicate does not count towards the threshold.
+        tx.send(hint(1, &["b"])).await.expect("send");
+        tokio::task::yield_now().await;
+        assert!(flushes.lock().expect("flush log").is_empty());
+
+        tx.send(hint(1, &["c"])).await.expect("send");
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        let flushes = flushes.lock().expect("flush log");
+        assert_eq!(flushes.len(), 1, "flushed without waiting for the timer");
+        assert_eq!(flushes[0].get(&1), Some(&set(&["a", "b", "c"])));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn trace_hints_flush_on_the_timer_and_survive_a_failed_write() {
+        let (tx, flushes, _task) = spawn_writer(Duration::from_secs(5), 100, 1);
+        tx.send(hint(1, &["a"])).await.expect("send");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert_eq!(
+            flushes.lock().expect("flush log").len(),
+            1,
+            "one interval flushes what is pending"
+        );
+
+        // That write failed; the writer keeps going and flushes the next one.
+        tx.send(hint(2, &["b"])).await.expect("send");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        let flushes = flushes.lock().expect("flush log");
+        assert_eq!(flushes.len(), 2, "{flushes:?}");
+        assert_eq!(flushes[1].get(&2), Some(&set(&["b"])));
+        assert!(
+            !flushes[1].contains_key(&1),
+            "a failed batch is not retried"
+        );
+    }
 
     #[test]
     fn test_otel_plugin_name() {

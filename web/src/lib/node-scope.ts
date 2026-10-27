@@ -103,8 +103,8 @@ export function nodeRangeQuery(
     scope.kind === 'all'
       ? nodeMetricsGetClusterRangeOptions({
           query: {
-            ...query,
-            // The cluster endpoint types absent bounds as undefined, not null.
+            metric: query.metric,
+            range: query.range,
             start_time: query.start_time ?? undefined,
             end_time: query.end_time ?? undefined,
             node_ids: scope.ids.join(','),

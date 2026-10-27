@@ -341,6 +341,8 @@ fn row(id: i32, name: &str, node_id: Option<i32>) -> external_services::Model {
         continuous_archive_s3_source_id: None,
         continuous_archive_pinned_at: None,
         workload_mode: ServiceWorkloadMode::Shadow,
+        log_ingest_lines_per_sec: None,
+        log_ingest_kib_per_sec: None,
     }
 }
 

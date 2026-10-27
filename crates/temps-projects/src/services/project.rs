@@ -3283,6 +3283,8 @@ impl ProjectService {
             error_source_root,
             ai_api_traffic_summary_enabled,
             image_retention_hours,
+            log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec,
         } = params;
 
         // Validate preview env on-demand timeouts before touching the DB.
@@ -3312,6 +3314,13 @@ impl ProjectService {
                 )));
             }
         }
+        temps_core::ContainerLogSettings::validate_ingest_override(
+            log_ingest_lines_per_sec.flatten(),
+            log_ingest_kib_per_sec.flatten(),
+        )
+        .map_err(|reason| {
+            ProjectError::InvalidInput(format!("Project {}: {}", project_id, reason))
+        })?;
         // Normalize the display name up-front with the other validations so an
         // unusable name is rejected before anything is written, then persist it
         // only at the end (see below) — a rename must not survive a request that
@@ -3720,7 +3729,9 @@ impl ProjectService {
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
             || preview_envs_wake_timeout_seconds.is_some()
-            || image_retention_hours.is_some();
+            || image_retention_hours.is_some()
+            || log_ingest_lines_per_sec.is_some()
+            || log_ingest_kib_per_sec.is_some();
 
         if needs_project_row_update {
             let txn = self.db.begin().await?;
@@ -3757,6 +3768,12 @@ impl ProjectService {
             }
             if let Some(hours) = image_retention_hours {
                 active_project.image_retention_hours = Set(hours);
+            }
+            if let Some(lines) = log_ingest_lines_per_sec {
+                active_project.log_ingest_lines_per_sec = Set(lines);
+            }
+            if let Some(kib) = log_ingest_kib_per_sec {
+                active_project.log_ingest_kib_per_sec = Set(kib);
             }
 
             active_project.update(&txn).await?;
@@ -6981,6 +6998,8 @@ impl ProjectService {
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
             serves_own_temps_api: db_project.serves_own_temps_api,
             image_retention_hours: db_project.image_retention_hours,
+            log_ingest_lines_per_sec: db_project.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: db_project.log_ingest_kib_per_sec,
         }
     }
 
@@ -15152,6 +15171,8 @@ templates:
             main_branch: "main".to_string(),
             // Stored before normalization existed.
             directory: "./apps/api".to_string(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             ..project_for_hosting_lock_test("directory-check")
         };
         let same = SourceDirectoryTarget {
@@ -15477,6 +15498,97 @@ templates:
         assert_eq!(
             stored.image_retention_hours, None,
             "a rejected update must never reach the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_update_project_settings_log_ingest_override_set_lift_reset_and_reject() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Ingest Override Project".to_string()),
+            slug: Set("ingest-override-project".to_string()),
+            repo_name: Set("ingest-override-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let id = inserted_project.id;
+        let stored = || async {
+            let p = temps_entities::projects::Entity::find_by_id(id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            (p.log_ingest_lines_per_sec, p.log_ingest_kib_per_sec)
+        };
+
+        project_service
+            .update_project_settings(
+                id,
+                UpdateProjectSettingsParams {
+                    log_ingest_lines_per_sec: Some(Some(2_000)),
+                    log_ingest_kib_per_sec: Some(Some(0)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            stored().await,
+            (Some(2_000), Some(0)),
+            "0 = unlimited is stored"
+        );
+
+        // Omitting a key leaves it; an explicit null returns to the default.
+        project_service
+            .update_project_settings(
+                id,
+                UpdateProjectSettingsParams {
+                    log_ingest_lines_per_sec: Some(None),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stored().await, (None, Some(0)));
+
+        for (lines, kib) in [(Some(Some(-1)), None), (None, Some(Some(1_048_577)))] {
+            let rejected = project_service
+                .update_project_settings(
+                    id,
+                    UpdateProjectSettingsParams {
+                        log_ingest_lines_per_sec: lines,
+                        log_ingest_kib_per_sec: kib,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match rejected {
+                Err(ProjectError::InvalidInput(msg)) => {
+                    assert!(msg.contains(&format!("Project {id}")), "{msg}")
+                }
+                Err(other) => panic!("expected InvalidInput, got {other:?}"),
+                Ok(_) => panic!("out-of-range override must be rejected"),
+            }
+        }
+        assert_eq!(
+            stored().await,
+            (None, Some(0)),
+            "rejected updates never write"
         );
     }
 

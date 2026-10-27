@@ -3899,6 +3899,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,
@@ -4358,6 +4360,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
         .into_active_model()
         .insert(&db)
@@ -4649,6 +4653,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
         .into_active_model()
         .insert(db)
@@ -5974,6 +5980,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
 
         assert_eq!(
@@ -6788,6 +6796,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
         .into_active_model()
         .insert(&db)

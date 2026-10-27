@@ -3886,6 +3886,8 @@
           "build_limits": {
             "$ref": "#/components/schemas/BuildLimitsSettings",
             "default": {
+              "build_cache_max_gb": 10,
+              "build_cache_max_unused_days": 7,
               "cpu_limit_cores": 0,
               "max_concurrent": 2,
               "memory_limit_mb": 0
@@ -7462,6 +7464,23 @@
       "BuildLimitsSettings": {
         "description": "Control-plane build resource limits.\n\nCaps how many builds run concurrently AND how much CPU/memory each build\nis allowed to consume. A single global gate in the deployer crate\nadmits at most `max_concurrent` `DockerRuntime::build_image` calls at a\ntime. When the gate is full, additional builds queue and wait — they do\nnot fail. Per-build CPU/memory caps are forwarded to Docker via\n`BuildImageOptions { memory, cpuquota, cpuperiod }`.\n\nChanges apply live, with no restart. Builds already running finish with the\nlimits they started with; queued and new builds use the new ones. Lowering\n`max_concurrent` never stops a running build: new builds wait until enough\nof them finish to get under the new limit.\n\n`cpu_limit_cores = 0.0` or `memory_limit_mb = 0` means \"no explicit cap\"\n— fall back to the legacy 50%-of-host heuristic for backwards\ncompatibility with operators who never visit the settings page.",
         "properties": {
+          "build_cache_max_gb": {
+            "default": 10,
+            "description": "Upper bound for Docker's build cache, in gigabytes. The nightly\ncleanup removes the least recently used cache records that no build\nis using until the total is at or below this size. 0 disables the\nsize cap (only `build_cache_max_unused_days` applies). Re-read on\nevery nightly run. Applies to this host's Docker daemon; worker nodes\nuse the default.",
+            "example": 10,
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "build_cache_max_unused_days": {
+            "default": 7,
+            "description": "Build cache records unused for longer than this many days are removed\nby the nightly cleanup, whatever the total size. Valid range 1..=365.",
+            "example": 7,
+            "format": "int32",
+            "maximum": 365,
+            "minimum": 1,
+            "type": "integer"
+          },
           "cpu_limit_cores": {
             "default": 0,
             "description": "CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half\na core). 0 means \"use the legacy 50%-of-host default\". Applied only\nby Docker's legacy builder: BuildKit, the default since Docker 18.09,\nignores the CPU and memory options of the image build API, so on\nBuildKit hosts this has no effect. Applies live to builds that start\nafter the change; a running build keeps the cap it started with.",
@@ -13174,7 +13193,7 @@
           },
           "ingest_kib_per_sec": {
             "default": 256,
-            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit.",
+            "description": "Per-container ingestion budget, in KiB per second, enforced alongside\n`ingest_lines_per_sec`. `0` disables the byte limit. A project or\nmanaged service can override it (`log_ingest_kib_per_sec`).",
             "example": 256,
             "format": "int32",
             "maximum": 1048576,
@@ -13183,7 +13202,7 @@
           },
           "ingest_lines_per_sec": {
             "default": 250,
-            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving.",
+            "description": "Per-container ingestion budget, in lines per second. A container\nover budget has its excess lines dropped (not stored or indexed),\na notice written into its log, and is listed as throttled in the log\nexplorer. Up to 10 seconds of budget may arrive at once. `0` disables\nthe line limit. Applied within a minute of saving. A project or\nmanaged service can override it (`log_ingest_lines_per_sec`).",
             "example": 250,
             "format": "int32",
             "maximum": 1000000,
@@ -23545,6 +23564,45 @@
         ],
         "type": "object"
       },
+      "DriveHealthRow": {
+        "description": "SMART health of one drive on a node.",
+        "properties": {
+          "bytes_written": {
+            "description": "Bytes written over the drive's lifetime.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "device": {
+            "description": "Device name, e.g. `nvme0` or `sda`.",
+            "type": "string"
+          },
+          "media_errors": {
+            "description": "Media / reallocated-sector errors the drive has recorded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "wear_percent": {
+            "description": "Percentage of rated endurance used (can exceed 100).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "device"
+        ],
+        "type": "object"
+      },
       "DropArchiveUpload": {
         "properties": {
           "file": {
@@ -33419,6 +33477,13 @@
               "null"
             ]
           },
+          "disk_health": {
+            "description": "Software RAID and drive SMART health read by the agent\n(`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw\nJSON here and parsed after the heartbeat is recorded, so a malformed\nreport from a mismatched agent version costs only the disk metrics,\nnever the heartbeat that keeps the node online.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "dns_resolver": {
             "oneOf": [
               {
@@ -42091,7 +42156,7 @@
         "type": "object"
       },
       "NodeCreateAlertRuleRequest": {
-        "description": "Request body for creating a resource alert on a node.\n\nOnly the usage percentages can be alerted on: `node.cpu_percent`,\n`node.memory_percent` and `node.disk_percent`. `threshold` is a percentage\n(0-100). A node has at most one rule per metric.",
+        "description": "Request body for creating a resource alert on a node.\n\nA rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,\n`node.disk_percent`; `threshold` 0-100) or a disk-health metric\n(`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;\n`threshold` 0 or more). A node has at most one rule per metric.",
         "properties": {
           "comparator": {
             "description": "One of `>`, `<`, `>=`, `<=`.",
@@ -42106,7 +42171,7 @@
             "type": "integer"
           },
           "metric_name": {
-            "description": "One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.",
+            "description": "One of the usage percentages or disk-health metrics listed above.",
             "type": "string"
           },
           "name": {
@@ -42117,7 +42182,7 @@
             "type": "string"
           },
           "threshold": {
-            "description": "Percentage between 0 and 100.",
+            "description": "0-100 for a usage percentage; 0 or more for a disk-health metric.",
             "format": "double",
             "type": "number"
           }
@@ -42128,6 +42193,64 @@
           "threshold",
           "comparator",
           "severity"
+        ],
+        "type": "object"
+      },
+      "NodeDiskHealthResponse": {
+        "description": "Latest disk-array and drive health for a node.",
+        "properties": {
+          "drives": {
+            "items": {
+              "$ref": "#/components/schemas/DriveHealthRow"
+            },
+            "type": "array"
+          },
+          "drives_detected": {
+            "description": "Physical drives found on the node.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "drives_read": {
+            "description": "Drives whose SMART data could be read.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "raid_arrays": {
+            "items": {
+              "$ref": "#/components/schemas/RaidArrayHealth"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "description": "Why some or all drive health is missing, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported": {
+            "description": "`false` when the node has never reported disk health.",
+            "type": "boolean"
+          },
+          "setup_path": {
+            "description": "Console path that shows this node's disk health.",
+            "type": "string"
+          },
+          "stale": {
+            "description": "`true` when the node has not reported recently: the arrays and\ndrives above are the last values it sent, not its current state, so\nthey must not be presented as the node's health now.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "reported",
+          "raid_arrays",
+          "drives",
+          "drives_detected",
+          "drives_read",
+          "stale",
+          "setup_path"
         ],
         "type": "object"
       },
@@ -49800,6 +49923,22 @@
               "null"
             ]
           },
+          "log_ingest_kib_per_sec": {
+            "description": "This project's container log ingestion budget in KiB/s. Absent = the\nplatform default; 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "This project's container log ingestion budget in lines/s. Absent =\nthe platform default (Settings → Monitoring); 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "main_branch": {
             "type": "string"
           },
@@ -52839,6 +52978,31 @@
         },
         "required": [
           "quota"
+        ],
+        "type": "object"
+      },
+      "RaidArrayHealth": {
+        "description": "One software RAID array on a node.",
+        "properties": {
+          "degraded": {
+            "description": "Fewer members are active than the array was configured with.",
+            "type": "boolean"
+          },
+          "devices_failed": {
+            "description": "Members missing or marked failed.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "description": "md device name, e.g. `md0`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "degraded",
+          "devices_failed"
         ],
         "type": "object"
       },
@@ -60295,6 +60459,63 @@
         ],
         "type": "object"
       },
+      "ServiceLogIngestion": {
+        "description": "A managed service's own container log ingestion budget. `None` inherits\nthe platform budget (Settings → Monitoring → Container log ingestion);\n`Some(0)` lifts that limit for this service's containers.",
+        "properties": {
+          "log_ingest_kib_per_sec": {
+            "description": "KiB of log text per second per container (0–1,048,576). null =\nplatform default.",
+            "example": 4096,
+            "format": "int32",
+            "maximum": 1048576,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Lines per second per container (0–1,000,000). null = platform default.",
+            "example": 2000,
+            "format": "int32",
+            "maximum": 1000000,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ServiceLogIngestionResponse": {
+        "description": "A managed service's container log ingestion budget.",
+        "properties": {
+          "log_ingest_kib_per_sec": {
+            "description": "KiB/s per container; absent/null = platform default, 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Lines/s per container; absent/null = platform default, 0 = unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "service_id"
+        ],
+        "type": "object"
+      },
       "ServiceMemberInfo": {
         "description": "Public info about a cluster member.",
         "properties": {
@@ -67021,6 +67242,11 @@
       "ThrottledLogSource": {
         "description": "A container that is dropping lines because it exceeds its budget.",
         "properties": {
+          "bytes_per_sec_limit": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "container_id": {
             "type": "string"
           },
@@ -67055,6 +67281,16 @@
           "last_dropped_at": {
             "format": "date-time",
             "type": "string"
+          },
+          "limit_overridden": {
+            "description": "Whether a project or service override sets those limits instead of\nthe platform-wide budget.",
+            "type": "boolean"
+          },
+          "lines_per_sec_limit": {
+            "description": "Limits this container is held to (`0` = no limit), with any project\nor service override applied.",
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
           },
           "node_id": {
             "description": "Worker node, for containers collected from a remote node.",
@@ -67111,6 +67347,9 @@
           "dropped_lines",
           "dropped_bytes",
           "reason",
+          "lines_per_sec_limit",
+          "bytes_per_sec_limit",
+          "limit_overridden",
           "throttled_since",
           "last_dropped_at"
         ],
@@ -71319,6 +71558,22 @@
           },
           "image_retention_hours": {
             "description": "How long (hours) to retain built Docker images before nightly cleanup removes them.\nSet to null to use the system default. Valid range: 1–8760.\n\nOmitting the key leaves the current value unchanged; sending an explicit\n`null` clears the per-project override. `skip_serializing_if` keeps the\nround-trip honest — re-serializing a request that omitted the key must\nnot emit `\"image_retention_hours\": null`, which would mean \"reset\".",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_kib_per_sec": {
+            "description": "Same as `log_ingest_lines_per_sec`, in KiB per second (0–1,048,576).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "log_ingest_lines_per_sec": {
+            "description": "Container log ingestion budget for this project's containers, in\nlines per second (0–1,000,000). `0` lifts the limit; explicit `null`\nreturns to the platform default; omit to leave unchanged.",
             "format": "int32",
             "type": [
               "integer",
@@ -101202,6 +101457,119 @@
         ]
       }
     },
+    "/external-services/{id}/log-ingestion": {
+      "get": {
+        "description": "Both fields null means the service uses the platform budget from\nSettings → Monitoring → Container log ingestion.",
+        "operationId": "get_service_log_ingestion",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogIngestionResponse"
+                }
+              }
+            },
+            "description": "Current override"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get this service's own container log ingestion budget.",
+        "tags": [
+          "External Services"
+        ]
+      },
+      "put": {
+        "description": "Send null for a field to return to the platform default, 0 to lift the\nlimit. Applied to running containers within a minute; nothing restarts.",
+        "operationId": "update_service_log_ingestion",
+        "parameters": [
+          {
+            "description": "External service ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceLogIngestion"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceLogIngestionResponse"
+                }
+              }
+            },
+            "description": "Override saved"
+          },
+          "400": {
+            "description": "Value out of range"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace this service's container log ingestion budget.",
+        "tags": [
+          "External Services"
+        ]
+      }
+    },
     "/external-services/{id}/members": {
       "post": {
         "description": "Currently only `replica` members can be added at runtime. The\nresponse is **202 Accepted** as soon as the validation passes and\nthe placeholder `service_members` row is inserted. The actual\ncontainer provisioning + DNS registration runs in the background;\npoll `GET /external-services/{id}/members/{member_id}` to watch\n`provisioning_step` advance through the phases.",
@@ -116604,6 +116972,58 @@
           }
         ],
         "summary": "Update a node-scoped monitoring alert rule.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/disk-health": {
+      "get": {
+        "description": "Backs the disk-health panel on the server monitoring page. The headline\nvalues are also plain node metrics (`node.raid_degraded`,\n`node.disk_wear_percent`, `node.disk_media_errors`) that alert rules read.",
+        "operationId": "NodeMetricsGetDiskHealth",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeDiskHealthResponse"
+                }
+              }
+            },
+            "description": "Disk health"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "503": {
+            "description": "Metrics store not available"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Latest software RAID and drive SMART health for a node.",
         "tags": [
           "Metrics"
         ],

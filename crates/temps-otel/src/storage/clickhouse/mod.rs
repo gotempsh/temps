@@ -1526,6 +1526,69 @@ impl ClickHouseOtelStorage {
     }
 }
 
+impl ClickHouseOtelStorage {
+    /// Insert `(trace_id, project_id)` rows for every `(project_id,
+    /// trace_ids)` pair in one ClickHouse insert. Shared by
+    /// `record_trace_refs` and `record_trace_refs_batch`.
+    async fn insert_trace_refs(
+        &self,
+        refs: &[(i32, &[String])],
+        operation: &str,
+    ) -> StorageResult<u64> {
+        let total: usize = refs.iter().map(|(_, ids)| ids.len()).sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        self.ensure_migrated(WriteTable::TraceRefs, operation)?;
+
+        let first_seen_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+
+        let mut inserter = self
+            .ch
+            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+            .await
+            .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
+                message: format!(
+                    "ClickHouse cross_project_trace_refs inserter setup failed ({operation}, {total} refs): {e}"
+                ),
+            })?;
+        for (project_id, trace_ids) in refs {
+            let retention_days = self
+                .resolver
+                .resolve(*project_id, temps_core::RetentionTable::Spans);
+            for trace_id in trace_ids.iter() {
+                inserter
+                    .write(&ChTraceRefRow {
+                        trace_id: trace_id.clone(),
+                        project_id: *project_id,
+                        first_seen: first_seen_ms,
+                        retention_days,
+                        _version: trace_ref_version(first_seen_ms),
+                    })
+                    .await
+                    .map_err(|e| OtelError::Storage {
+                        kind: ch_err_kind(&e),
+                        message: format!(
+                            "ClickHouse cross_project_trace_refs write failed ({operation}, project {project_id}): {e}"
+                        ),
+                    })?;
+            }
+        }
+        inserter.end().await.map_err(|e| OtelError::Storage {
+            kind: ch_err_kind(&e),
+            message: format!(
+                "ClickHouse cross_project_trace_refs insert failed ({operation}, {total} refs): {e}"
+            ),
+        })?;
+
+        Ok(total as u64)
+    }
+}
+
 #[async_trait]
 impl OtelStorage for ClickHouseOtelStorage {
     async fn global_trace_stream(
@@ -3525,48 +3588,20 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// `first_seen` — the CH equivalent of the Postgres table's
     /// `ON CONFLICT DO NOTHING`.
     async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
-        if trace_ids.is_empty() {
-            return Ok(0);
-        }
-        self.ensure_migrated(WriteTable::TraceRefs, "record_trace_refs")?;
-
-        let first_seen_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
-        let retention_days = self
-            .resolver
-            .resolve(project_id, temps_core::RetentionTable::Spans);
-
-        let mut inserter = self
-            .ch
-            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+        self.insert_trace_refs(&[(project_id, trace_ids)], "record_trace_refs")
             .await
-            .map_err(|e| OtelError::Storage {
-                kind: ch_err_kind(&e),
-                message: format!("ClickHouse cross_project_trace_refs inserter setup failed: {e}"),
-            })?;
-        for trace_id in trace_ids {
-            inserter
-                .write(&ChTraceRefRow {
-                    trace_id: trace_id.clone(),
-                    project_id,
-                    first_seen: first_seen_ms,
-                    retention_days,
-                    _version: trace_ref_version(first_seen_ms),
-                })
-                .await
-                .map_err(|e| OtelError::Storage {
-                    kind: ch_err_kind(&e),
-                    message: format!("ClickHouse cross_project_trace_refs write failed: {e}"),
-                })?;
-        }
-        inserter.end().await.map_err(|e| OtelError::Storage {
-            kind: ch_err_kind(&e),
-            message: format!("ClickHouse cross_project_trace_refs insert failed: {e}"),
-        })?;
+    }
 
-        Ok(trace_ids.len() as u64)
+    /// One insert for every project's refs: the hint writer coalesces a few
+    /// seconds of OTLP batches (typically 1-3 trace ids each) into a single
+    /// call, so this table no longer takes an insert per ingested batch.
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        let refs: Vec<(i32, &[String])> = refs
+            .iter()
+            .map(|(project_id, ids)| (*project_id, ids.as_slice()))
+            .collect();
+        self.insert_trace_refs(&refs, "record_trace_refs_batch")
+            .await
     }
 
     /// Union of the native ClickHouse rows and any legacy rows still in the

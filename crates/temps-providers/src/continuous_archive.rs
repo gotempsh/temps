@@ -147,6 +147,8 @@ mod tests {
             continuous_archive_s3_source_id,
             continuous_archive_pinned_at: continuous_archive_s3_source_id.map(|_| now),
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 

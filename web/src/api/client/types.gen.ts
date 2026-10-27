@@ -3529,6 +3529,20 @@ export type BuildLimits = {
  */
 export type BuildLimitsSettings = {
     /**
+     * Upper bound for Docker's build cache, in gigabytes. The nightly
+     * cleanup removes the least recently used cache records that no build
+     * is using until the total is at or below this size. 0 disables the
+     * size cap (only `build_cache_max_unused_days` applies). Re-read on
+     * every nightly run. Applies to this host's Docker daemon; worker nodes
+     * use the default.
+     */
+    build_cache_max_gb?: number;
+    /**
+     * Build cache records unused for longer than this many days are removed
+     * by the nightly cleanup, whatever the total size. Valid range 1..=365.
+     */
+    build_cache_max_unused_days?: number;
+    /**
      * CPU cores allowed per build (float, e.g. 2.0 = 2 cores, 0.5 = half
      * a core). 0 means "use the legacy 50%-of-host default". Applied only
      * by Docker's legacy builder: BuildKit, the default since Docker 18.09,
@@ -6354,7 +6368,8 @@ export type ContainerLogSettings = {
     head_buffer_mb?: number;
     /**
      * Per-container ingestion budget, in KiB per second, enforced alongside
-     * `ingest_lines_per_sec`. `0` disables the byte limit.
+     * `ingest_lines_per_sec`. `0` disables the byte limit. A project or
+     * managed service can override it (`log_ingest_kib_per_sec`).
      */
     ingest_kib_per_sec?: number;
     /**
@@ -6362,7 +6377,8 @@ export type ContainerLogSettings = {
      * over budget has its excess lines dropped (not stored or indexed),
      * a notice written into its log, and is listed as throttled in the log
      * explorer. Up to 10 seconds of budget may arrive at once. `0` disables
-     * the line limit. Applied within a minute of saving.
+     * the line limit. Applied within a minute of saving. A project or
+     * managed service can override it (`log_ingest_lines_per_sec`).
      */
     ingest_lines_per_sec?: number;
     /**
@@ -11325,6 +11341,28 @@ export type DrainStatusResponse = {
     status: string;
 };
 
+/**
+ * SMART health of one drive on a node.
+ */
+export type DriveHealthRow = {
+    /**
+     * Bytes written over the drive's lifetime.
+     */
+    bytes_written?: number | null;
+    /**
+     * Device name, e.g. `nvme0` or `sda`.
+     */
+    device: string;
+    /**
+     * Media / reallocated-sector errors the drive has recorded.
+     */
+    media_errors?: number | null;
+    /**
+     * Percentage of rated endurance used (can exceed 100).
+     */
+    wear_percent?: number | null;
+};
+
 export type DropArchiveUpload = {
     file: Blob | File;
 };
@@ -15673,6 +15711,16 @@ export type HeartbeatApiRequest = {
      * Each entry has `container_id` and `container_name` of temps-managed containers.
      */
     containers?: Array<ContainerInventoryItem> | null;
+    /**
+     * Software RAID and drive SMART health read by the agent
+     * (`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw
+     * JSON here and parsed after the heartbeat is recorded, so a malformed
+     * report from a mismatched agent version costs only the disk metrics,
+     * never the heartbeat that keeps the node online.
+     */
+    disk_health?: {
+        [key: string]: unknown;
+    } | null;
     dns_resolver?: DnsResolverHeartbeat | null;
     /**
      * Project slugs this node grants host Docker access to (ADR 045), read
@@ -19649,9 +19697,10 @@ export type NodeCostInfo = {
 /**
  * Request body for creating a resource alert on a node.
  *
- * Only the usage percentages can be alerted on: `node.cpu_percent`,
- * `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
- * (0-100). A node has at most one rule per metric.
+ * A rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,
+ * `node.disk_percent`; `threshold` 0-100) or a disk-health metric
+ * (`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;
+ * `threshold` 0 or more). A node has at most one rule per metric.
  */
 export type NodeCreateAlertRuleRequest = {
     /**
@@ -19664,7 +19713,7 @@ export type NodeCreateAlertRuleRequest = {
      */
     for_duration_secs?: number;
     /**
-     * One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+     * One of the usage percentages or disk-health metrics listed above.
      */
     metric_name: string;
     name: string;
@@ -19673,9 +19722,43 @@ export type NodeCreateAlertRuleRequest = {
      */
     severity: string;
     /**
-     * Percentage between 0 and 100.
+     * 0-100 for a usage percentage; 0 or more for a disk-health metric.
      */
     threshold: number;
+};
+
+/**
+ * Latest disk-array and drive health for a node.
+ */
+export type NodeDiskHealthResponse = {
+    drives: Array<DriveHealthRow>;
+    /**
+     * Physical drives found on the node.
+     */
+    drives_detected: number;
+    /**
+     * Drives whose SMART data could be read.
+     */
+    drives_read: number;
+    raid_arrays: Array<RaidArrayHealth>;
+    /**
+     * Why some or all drive health is missing, when it is.
+     */
+    reason?: string | null;
+    /**
+     * `false` when the node has never reported disk health.
+     */
+    reported: boolean;
+    /**
+     * Console path that shows this node's disk health.
+     */
+    setup_path: string;
+    /**
+     * `true` when the node has not reported recently: the arrays and
+     * drives above are the last values it sent, not its current state, so
+     * they must not be presented as the node's health now.
+     */
+    stale: boolean;
 };
 
 /**
@@ -23524,6 +23607,16 @@ export type ProjectResponse = {
      */
     is_public_repo: boolean;
     last_deployment?: number | null;
+    /**
+     * This project's container log ingestion budget in KiB/s. Absent = the
+     * platform default; 0 = unlimited.
+     */
+    log_ingest_kib_per_sec?: number | null;
+    /**
+     * This project's container log ingestion budget in lines/s. Absent =
+     * the platform default (Settings → Monitoring); 0 = unlimited.
+     */
+    log_ingest_lines_per_sec?: number | null;
     main_branch: string;
     name: string;
     preset?: string | null;
@@ -24894,6 +24987,24 @@ export type QueryDataResponse = {
 
 export type QuotaResponse = {
     quota: StorageQuota;
+};
+
+/**
+ * One software RAID array on a node.
+ */
+export type RaidArrayHealth = {
+    /**
+     * Fewer members are active than the array was configured with.
+     */
+    degraded: boolean;
+    /**
+     * Members missing or marked failed.
+     */
+    devices_failed: number;
+    /**
+     * md device name, e.g. `md0`.
+     */
+    name: string;
 };
 
 /**
@@ -28504,6 +28615,38 @@ export type ServiceHealthStatusEntryResponse = {
 };
 
 /**
+ * A managed service's own container log ingestion budget. `None` inherits
+ * the platform budget (Settings → Monitoring → Container log ingestion);
+ * `Some(0)` lifts that limit for this service's containers.
+ */
+export type ServiceLogIngestion = {
+    /**
+     * KiB of log text per second per container (0–1,048,576). null =
+     * platform default.
+     */
+    log_ingest_kib_per_sec?: number | null;
+    /**
+     * Lines per second per container (0–1,000,000). null = platform default.
+     */
+    log_ingest_lines_per_sec?: number | null;
+};
+
+/**
+ * A managed service's container log ingestion budget.
+ */
+export type ServiceLogIngestionResponse = {
+    /**
+     * KiB/s per container; absent/null = platform default, 0 = unlimited.
+     */
+    log_ingest_kib_per_sec?: number | null;
+    /**
+     * Lines/s per container; absent/null = platform default, 0 = unlimited.
+     */
+    log_ingest_lines_per_sec?: number | null;
+    service_id: number;
+};
+
+/**
  * Public info about a cluster member.
  */
 export type ServiceMemberInfo = {
@@ -31638,6 +31781,7 @@ export type ThreadArtifactResponse = {
  * A container that is dropping lines because it exceeds its budget.
  */
 export type ThrottledLogSource = {
+    bytes_per_sec_limit: number;
     container_id: string;
     deploy_id?: number | null;
     dropped_bytes: number;
@@ -31648,6 +31792,16 @@ export type ThrottledLogSource = {
     env: string;
     external_service_id?: number | null;
     last_dropped_at: string;
+    /**
+     * Whether a project or service override sets those limits instead of
+     * the platform-wide budget.
+     */
+    limit_overridden: boolean;
+    /**
+     * Limits this container is held to (`0` = no limit), with any project
+     * or service override applied.
+     */
+    lines_per_sec_limit: number;
     /**
      * Worker node, for containers collected from a remote node.
      */
@@ -33650,6 +33804,16 @@ export type UpdateProjectSettingsRequest = {
      * not emit `"image_retention_hours": null`, which would mean "reset".
      */
     image_retention_hours?: number | null;
+    /**
+     * Same as `log_ingest_lines_per_sec`, in KiB per second (0–1,048,576).
+     */
+    log_ingest_kib_per_sec?: number | null;
+    /**
+     * Container log ingestion budget for this project's containers, in
+     * lines per second (0–1,000,000). `0` lifts the limit; explicit `null`
+     * returns to the platform default; omit to leave unchanged.
+     */
+    log_ingest_lines_per_sec?: number | null;
     main_branch?: string | null;
     /**
      * Human-facing project display name. Unlike `slug` this is not part of any
@@ -50157,6 +50321,90 @@ export type GetServiceHealthStatusResponses = {
 
 export type GetServiceHealthStatusResponse = GetServiceHealthStatusResponses[keyof GetServiceHealthStatusResponses];
 
+export type GetServiceLogIngestionData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/log-ingestion';
+};
+
+export type GetServiceLogIngestionErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetServiceLogIngestionResponses = {
+    /**
+     * Current override
+     */
+    200: ServiceLogIngestionResponse;
+};
+
+export type GetServiceLogIngestionResponse = GetServiceLogIngestionResponses[keyof GetServiceLogIngestionResponses];
+
+export type UpdateServiceLogIngestionData = {
+    body: ServiceLogIngestion;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/log-ingestion';
+};
+
+export type UpdateServiceLogIngestionErrors = {
+    /**
+     * Value out of range
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Service not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateServiceLogIngestionResponses = {
+    /**
+     * Override saved
+     */
+    200: ServiceLogIngestionResponse;
+};
+
+export type UpdateServiceLogIngestionResponse = UpdateServiceLogIngestionResponses[keyof UpdateServiceLogIngestionResponses];
+
 export type AddClusterMemberData = {
     body: AddClusterMemberRequest;
     path: {
@@ -59922,6 +60170,46 @@ export type NodeMetricsUpdateAlertRuleResponses = {
 };
 
 export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
+
+export type NodeMetricsGetDiskHealthData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/disk-health';
+};
+
+export type NodeMetricsGetDiskHealthErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * Metrics store not available
+     */
+    503: unknown;
+};
+
+export type NodeMetricsGetDiskHealthResponses = {
+    /**
+     * Disk health
+     */
+    200: NodeDiskHealthResponse;
+};
+
+export type NodeMetricsGetDiskHealthResponse = NodeMetricsGetDiskHealthResponses[keyof NodeMetricsGetDiskHealthResponses];
 
 export type NodeMetricsGetLatestData = {
     body?: never;

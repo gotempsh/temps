@@ -158,14 +158,47 @@ where
 /// target database to the username, so any service where `database !=
 /// username` would log a FATAL on every healthcheck tick.
 ///
+/// `exec` replaces the `/bin/sh -c` wrapper Docker starts for a `CMD-SHELL`
+/// healthcheck, so `pg_isready` is the process Docker kills when the probe
+/// exceeds its timeout. Without it the image's `dash` forks `pg_isready` as a
+/// child, the kill takes only the shell, and the orphan is adopted by PID 1
+/// -- the postmaster. When it then gives up with exit code 2 ("no response"),
+/// PostgreSQL 18 logs `untracked child process ... exited with exit code 2`
+/// and treats it as a crashed backend: every connection is terminated and
+/// the server runs crash recovery. One slow probe therefore became a full
+/// connection reset. `POSTGRES_CONTAINER_INIT` is the second guard against
+/// the same failure from any other exec'd command.
+///
 /// Shared with `postgres_lifecycle` so both container-creation sites build
 /// the exact same healthcheck command.
 pub(crate) fn postgres_healthcheck_cmd(username: &str, database: &str) -> String {
     format!(
-        "pg_isready -U {} -d {}",
+        "exec pg_isready -U {} -d {}",
         shell_escape(username),
         shell_escape(database)
     )
+}
+
+/// `HostConfig.init` for a standalone PostgreSQL container: always on.
+///
+/// Docker's init (tini) becomes PID 1 and reaps every process orphaned
+/// inside the container -- a timed-out healthcheck, a `docker exec` whose
+/// shell died first, a helper left behind by `archive_command`. Without it
+/// those are reparented to the postmaster, which does not recognise them and
+/// (from PostgreSQL 18, for any exit code other than 0 or 1) answers with a
+/// crash restart that drops every client connection, including a running
+/// WAL-G backup's. Signals are forwarded unchanged, so `docker stop` still
+/// produces the image's fast shutdown.
+///
+/// Shared with `postgres_lifecycle` so both container-creation sites agree.
+pub(crate) const POSTGRES_CONTAINER_INIT: Option<bool> = Some(true);
+
+/// Whether a container was created without the init process
+/// `POSTGRES_CONTAINER_INIT` now requires. `start()` recreates such a
+/// container: `HostConfig.Init` and the healthcheck command are fixed at
+/// creation, so a plain restart can never apply them.
+fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
+    host_config.init != POSTGRES_CONTAINER_INIT
 }
 
 fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
@@ -924,6 +957,7 @@ impl PostgresService {
             // Security hardening for service containers
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(512),
+            init: POSTGRES_CONTAINER_INIT,
             ..Default::default()
         };
         resource_limits.apply_to_host_config(&mut host_config);
@@ -2092,6 +2126,30 @@ impl PostgresService {
         }
     }
 
+    /// Whether the container predates `POSTGRES_CONTAINER_INIT` and still
+    /// runs the postmaster as PID 1. Returns false when it can't be
+    /// determined, like the CMD drift checks above.
+    async fn container_missing_init(&self, container: &bollard::models::ContainerSummary) -> bool {
+        let id = match container.id.as_deref() {
+            Some(id) => id,
+            None => return false,
+        };
+        match self
+            .docker
+            .inspect_container(
+                id,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await
+        {
+            Ok(info) => info
+                .host_config
+                .as_ref()
+                .is_some_and(host_config_missing_init),
+            Err(_) => false,
+        }
+    }
+
     async fn wait_for_container_health(&self, docker: &Docker, container_id: &str) -> Result<()> {
         let mut delay = Duration::from_millis(500);
         let mut total_wait = Duration::from_secs(0);
@@ -2633,7 +2691,7 @@ impl PostgresService {
         let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
 
         // Step 1: Fetch backup to a temporary directory while PostgreSQL is still running.
-        // We cannot stop PostgreSQL first because it's PID 1 in the container — stopping it
+        // We cannot stop PostgreSQL first because it's the container's main process — stopping it
         // would stop the container entirely or leave shared memory blocks behind.
         //
         // IMPORTANT: The temp directory MUST be on the shared volume (/var/lib/postgresql),
@@ -2843,7 +2901,7 @@ impl PostgresService {
             return Err(cancelled.into());
         }
 
-        // Step 3: Stop the container. This cleanly shuts down PostgreSQL (PID 1)
+        // Step 3: Stop the container. This cleanly shuts down PostgreSQL (the container's main process)
         // and releases all shared memory. The container's writable layer is preserved.
         //
         // IMPORTANT: Disable the restart policy first. The container has
@@ -4392,13 +4450,21 @@ impl ExternalService for PostgresService {
                 }
                 None => false,
             };
-            let drift = archive_drift || preload_drift;
+            // A container created before `POSTGRES_CONTAINER_INIT` runs the
+            // postmaster as PID 1 with the old healthcheck; both are fixed
+            // at creation, so only a recreate applies them.
+            let init_drift = self.container_missing_init(container).await;
+            let drift = archive_drift || preload_drift || init_drift;
             if drift {
                 info!(
-                    "Container {} has CMD drift (archive_mode drift={}, \
-                     shared_preload_libraries drift={}, desired archive_mode={}). \
-                     Recreating to apply correct config.",
-                    container_name, archive_drift, preload_drift, desired_enable_archiving
+                    "Container {} has config drift (archive_mode drift={}, \
+                     shared_preload_libraries drift={}, init process drift={}, \
+                     desired archive_mode={}). Recreating to apply correct config.",
+                    container_name,
+                    archive_drift,
+                    preload_drift,
+                    init_drift,
+                    desired_enable_archiving
                 );
                 // Without a hydrated config there is nothing to rebuild the
                 // container from; leave the existing one alone.
@@ -6194,13 +6260,34 @@ mod tests {
     #[test]
     fn healthcheck_cmd_pins_database_when_it_differs_from_username() {
         let cmd = postgres_healthcheck_cmd("appuser", "appdb");
-        assert_eq!(cmd, "pg_isready -U 'appuser' -d 'appdb'");
+        assert_eq!(cmd, "exec pg_isready -U 'appuser' -d 'appdb'");
     }
 
     #[test]
     fn healthcheck_cmd_escapes_single_quotes_in_username_and_database() {
         let cmd = postgres_healthcheck_cmd("a'user", "a'db");
-        assert_eq!(cmd, "pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+        assert_eq!(cmd, "exec pg_isready -U 'a'\\''user' -d 'a'\\''db'");
+    }
+
+    #[test]
+    fn host_config_without_init_is_reported_as_missing_init() {
+        // Created before the init process was required: Docker reports
+        // `Init: null`.
+        assert!(host_config_missing_init(
+            &bollard::models::HostConfig::default()
+        ));
+        assert!(host_config_missing_init(&bollard::models::HostConfig {
+            init: Some(false),
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn host_config_with_init_is_not_reported_as_missing_init() {
+        assert!(!host_config_missing_init(&bollard::models::HostConfig {
+            init: POSTGRES_CONTAINER_INIT,
+            ..Default::default()
+        }));
     }
 
     #[test]
@@ -6793,6 +6880,201 @@ mod tests {
         );
 
         let _ = service.cleanup().await;
+    }
+
+    /// Regression test for a standalone service that reset every client
+    /// connection every few minutes. The postmaster ran as PID 1, so any
+    /// process orphaned inside the container was reparented to it; when one
+    /// exited with code 2 PostgreSQL 18 logged `untracked child process ...
+    /// exited with exit code 2` and ran crash recovery. The usual source was
+    /// the healthcheck itself: Docker kills only the `sh -c` wrapper of a
+    /// probe that exceeds its timeout, leaving `pg_isready` behind.
+    ///
+    /// Covers both halves: a new container gets an init process that absorbs
+    /// such an orphan, and `start()` recreates a container that predates it.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn test_orphaned_process_does_not_crash_restart_postgres() {
+        use futures::StreamExt;
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        let port = find_available_port(5432).expect("an OS-bindable port should exist");
+        let docker = Arc::new(docker);
+        let service = PostgresService::new("test-orphan-reaping".to_string(), docker.clone());
+        let config = ServiceConfig {
+            name: "test-postgres-orphan".to_string(),
+            service_type: super::ServiceType::Postgres,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": port.to_string(),
+                "database": "testdb",
+                "username": "testuser",
+                "password": "testpass123",
+                "max_connections": 100,
+                "ssl_mode": "disable",
+                "docker_image": "gotempsh/postgres-walg:18-bookworm"
+            }),
+        };
+        service.init(config).await.expect("init should succeed");
+        let container_name = service.get_container_name();
+
+        let inspect = docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .expect("container should exist");
+        assert!(
+            inspect
+                .host_config
+                .as_ref()
+                .is_some_and(|host_config| !host_config_missing_init(host_config)),
+            "a new PostgreSQL container must run under an init process"
+        );
+        let healthcheck = inspect
+            .config
+            .and_then(|c| c.healthcheck)
+            .and_then(|h| h.test)
+            .unwrap_or_default();
+        assert_eq!(
+            healthcheck.last().map(String::as_str),
+            Some("exec pg_isready -U 'testuser' -d 'testdb'")
+        );
+
+        // The exec'd shell returns at once; its child outlives it and then
+        // exits with the code that made the postmaster treat it as a crash.
+        let exec = docker
+            .create_exec(
+                &container_name,
+                bollard::exec::CreateExecOptions {
+                    cmd: Some(vec!["sh", "-c", "(sleep 1; exit 2) >/dev/null 2>&1 &"]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("exec should be created");
+        docker
+            .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
+            .await
+            .expect("exec should start");
+        tokio::time::sleep(Duration::from_secs(4)).await;
+
+        let mut logs = String::new();
+        let mut stream = docker.logs(
+            &container_name,
+            Some(bollard::query_parameters::LogsOptions {
+                stdout: true,
+                stderr: true,
+                ..Default::default()
+            }),
+        );
+        while let Some(Ok(chunk)) = stream.next().await {
+            logs.push_str(&chunk.to_string());
+        }
+        assert!(
+            !logs.contains("untracked child process")
+                && !logs.contains("terminating any other active server processes"),
+            "an orphaned process must be reaped by init, not by the postmaster:\n{logs}"
+        );
+
+        // Swap in a container shaped like one created before the init
+        // process was required, then let `start()` reconcile it.
+        docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("container should be removable");
+        docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some("gotempsh/postgres-walg:18-bookworm".to_string()),
+                    cmd: Some(vec![
+                        "postgres".to_string(),
+                        "-c".to_string(),
+                        "archive_mode=off".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "shared_preload_libraries={}",
+                            PostgresService::shared_preload_libraries_for_image(
+                                "gotempsh/postgres-walg:18-bookworm"
+                            )
+                        ),
+                    ]),
+                    // Same data volume and PGDATA as the real container: the
+                    // recreate guard refuses to replace a container whose
+                    // data lives anywhere else (e.g. an anonymous volume),
+                    // and then `start()` would keep it as it is.
+                    env: Some(vec![format!(
+                        "PGDATA={}",
+                        PostgresService::get_pgdata_path("gotempsh/postgres-walg:18-bookworm")
+                            .expect("PGDATA path for the test image")
+                    )]),
+                    host_config: Some(bollard::models::HostConfig {
+                        mounts: Some(vec![bollard::models::Mount {
+                            target: Some("/var/lib/postgresql".to_string()),
+                            source: Some(format!("{container_name}_data")),
+                            typ: Some(bollard::models::MountTypeEnum::VOLUME),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("legacy-shaped container should be created");
+
+        service.start().await.expect("start should reconcile");
+
+        let inspect = docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .expect("container should exist after reconcile");
+        assert!(
+            inspect
+                .host_config
+                .as_ref()
+                .is_some_and(|host_config| !host_config_missing_init(host_config)),
+            "start() must recreate a container that was created without an init process"
+        );
+
+        // `cleanup()` is a no-op, so remove what this test created.
+        let _ = docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &format!("{container_name}_data"),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
     }
 
     #[test]
@@ -8417,6 +8699,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         // Build a MockDatabase for the `pool` slot — restore_pitr for
         // Postgres doesn't touch it in the legacy-reject path.

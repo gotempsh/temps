@@ -437,9 +437,16 @@ On first run, Temps automatically:
 
 ### Systemd Service
 
-Create a systemd service for production:
+Create a systemd service for production. The database URL contains the
+database password, so keep it out of the unit file and the command line: store
+it in a root-owned `0600` environment file that only the service reads.
 
 ```bash
+sudo install -d -m 0755 /etc/temps
+sudo install -m 0600 /dev/null /etc/temps/temps.env
+echo 'TEMPS_DATABASE_URL=postgresql://temps:password@localhost/temps' \
+  | sudo tee /etc/temps/temps.env > /dev/null
+
 sudo tee /etc/systemd/system/temps.service > /dev/null <<EOF
 [Unit]
 Description=Temps Platform
@@ -449,7 +456,7 @@ After=network.target postgresql.service
 Type=simple
 User=temps
 WorkingDirectory=/opt/temps
-Environment="TEMPS_DATABASE_URL=postgresql://temps:password@localhost/temps"
+EnvironmentFile=/etc/temps/temps.env
 Environment="TEMPS_ADDRESS=0.0.0.0:8080"
 Environment="TEMPS_TLS_ADDRESS=0.0.0.0:8443"
 ExecStart=/usr/local/bin/temps serve
@@ -468,6 +475,22 @@ sudo systemctl start temps
 # Check status
 sudo systemctl status temps
 ```
+
+Never pass `--database-url` on `ExecStart`: the flag still works, but it puts
+the password in `ps` output and in `systemctl cat temps`, and Temps logs a
+warning at startup when it is used.
+
+For stronger isolation, use a systemd credential instead of an environment
+file. Store the bare URL (no `TEMPS_DATABASE_URL=` prefix) in a `0600` file and
+replace the `EnvironmentFile=` line with:
+
+```ini
+LoadCredential=temps_database_url:/etc/temps/database-url
+```
+
+Temps reads `$CREDENTIALS_DIRECTORY/temps_database_url` when
+`TEMPS_DATABASE_URL` is not set. Outside systemd, point
+`TEMPS_DATABASE_URL_FILE` at the same file.
 
 ### Reverse Proxy (nginx)
 

@@ -129,17 +129,23 @@ pub async fn build_metrics_store(
     match kind {
         MetricsStoreKind::ClickHouse if config_service.is_clickhouse_enabled() => {
             // is_clickhouse_enabled() guarantees the fields are Some.
-            Arc::new(ClickhouseMetricsStore::new(
-                ClickHouseMetricsConfig::new(
-                    config.clickhouse_url.clone().unwrap_or_default(),
-                    config.clickhouse_database.clone().unwrap_or_default(),
-                    config.clickhouse_user.clone().unwrap_or_default(),
-                    config.clickhouse_password.clone().unwrap_or_default(),
-                )
-                // Same wire-compression mode as every other ClickHouse client of
-                // this process (the stored `clickhouse.compression` setting).
-                .with_compression(config_service.clickhouse_compression()),
-            ))
+            // Buffered like the console's store: one insert per flush
+            // interval instead of one ClickHouse part per sample tick.
+            temps_metrics::BufferedMetricsStore::wrap(
+                Arc::new(ClickhouseMetricsStore::new(
+                    ClickHouseMetricsConfig::new(
+                        config.clickhouse_url.clone().unwrap_or_default(),
+                        config.clickhouse_database.clone().unwrap_or_default(),
+                        config.clickhouse_user.clone().unwrap_or_default(),
+                        config.clickhouse_password.clone().unwrap_or_default(),
+                    )
+                    // Same wire-compression mode as every other ClickHouse
+                    // client of this process (the stored
+                    // `clickhouse.compression` setting).
+                    .with_compression(config_service.clickhouse_compression()),
+                )),
+                temps_metrics::BufferConfig::default(),
+            )
         }
         MetricsStoreKind::ClickHouse | MetricsStoreKind::TimescaleDb => {
             Arc::new(TimescaleMetricsStore::new(db))

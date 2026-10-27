@@ -135,6 +135,25 @@ export function canDeleteNodeRules(nodeId: number): boolean {
   return nodeId !== 0
 }
 
+/**
+ * Default disk-health rules every worker gets. A worker with none of them
+ * left is seeded again, so the server refuses to delete them; they are
+ * disabled instead.
+ */
+export const DEFAULT_DISK_HEALTH_METRICS = [
+  'node.raid_degraded',
+  'node.disk_wear_percent',
+  'node.disk_media_errors',
+] as const
+
+/** Whether this rule can be deleted (rather than only disabled). */
+export function canDeleteNodeRule(nodeId: number, metricName: string): boolean {
+  return (
+    canDeleteNodeRules(nodeId) &&
+    !(DEFAULT_DISK_HEALTH_METRICS as readonly string[]).includes(metricName)
+  )
+}
+
 export function toCreateRequest(
   values: NodeAlertRuleFormValues
 ): NodeCreateAlertRuleRequest {

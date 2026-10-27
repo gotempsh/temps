@@ -1938,6 +1938,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         };
         assert!(matches!(
             ensure_running(&service),
@@ -1973,6 +1975,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 

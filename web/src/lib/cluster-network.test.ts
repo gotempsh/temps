@@ -12,7 +12,7 @@ import {
 const node = (overrides: Partial<ClusterNetworkNode>): ClusterNetworkNode => ({
   id: 1,
   name: 'worker-1',
-  overlay_network_name: 'temps-overlay',
+  overlay_network_name: 'temps',
   compute_cidr: '10.202.0.0/24',
   overlay_status: null,
   overlay_last_error: null,

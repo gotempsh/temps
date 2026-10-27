@@ -577,6 +577,7 @@ impl RedisService {
             // Security hardening for service containers
             security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             pids_limit: Some(512),
+            init: crate::utils::MANAGED_SERVICE_CONTAINER_INIT,
             ..Default::default()
         };
         resource_limits.apply_to_host_config(&mut host_config);

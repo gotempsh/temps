@@ -19,8 +19,10 @@ pub trait DockerClient: Send + Sync {
     /// Remove unused Docker images
     async fn prune_images(&self, force: bool) -> Result<PruneStats, String>;
 
-    /// Remove unused Docker build cache
-    async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String>;
+    /// Remove build cache unused for longer than the policy's age limit,
+    /// then evict the least recently used records until the cache fits the
+    /// policy's size cap.
+    async fn prune_builder_cache(&self, policy: BuildCachePolicy) -> Result<String, String>;
 
     /// Remove the named images, returning a per-image outcome in the same
     /// order. Takes the whole batch (rather than one image per call) so the
@@ -61,6 +63,90 @@ pub struct ImageRemovalOutcome {
     /// because a container still references the image, which is the intended
     /// safety net rather than a real failure).
     pub error: Option<String>,
+}
+
+/// What the nightly build cache prune keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildCachePolicy {
+    /// Records unused for longer than this are removed regardless of size.
+    pub max_unused_days: i64,
+    /// Total cache size to evict down to (least recently used first);
+    /// `None` disables the size cap.
+    pub max_size_bytes: Option<u64>,
+}
+
+impl Default for BuildCachePolicy {
+    fn default() -> Self {
+        Self::from(&temps_core::BuildLimitsSettings::default())
+    }
+}
+
+impl From<&temps_core::BuildLimitsSettings> for BuildCachePolicy {
+    fn from(settings: &temps_core::BuildLimitsSettings) -> Self {
+        Self {
+            max_unused_days: i64::from(settings.effective_build_cache_max_unused_days()),
+            max_size_bytes: settings.build_cache_max_bytes(),
+        }
+    }
+}
+
+/// How to bring an over-cap build cache back under the cap with BuildKit's
+/// only age-based knob: the `until` prune filter, which removes every
+/// unused record whose last activity is older than the given duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildCacheEviction {
+    /// Value for the `until` filter, in whole seconds.
+    pub keep_secs: i64,
+    pub total_bytes: u64,
+    /// Bytes the eviction is expected to free.
+    pub evicted_bytes: u64,
+}
+
+/// Pick the `until` duration that evicts the least recently used, unused
+/// build cache records until the total fits in `max_bytes`.
+///
+/// This is computed here rather than left to the daemon because Docker
+/// before API 1.48 (Docker 27 and older) has no size-bounded prune that
+/// works with `all`, and the newer `max-used-space` option is silently
+/// ignored by those daemons. The `until` filter is understood by every
+/// BuildKit-enabled daemon. Records a build is using are never counted as
+/// evictable; records with no timestamp cannot be targeted by age.
+/// Returns `None` when the cache already fits or nothing evictable exists.
+pub fn plan_build_cache_eviction(
+    records: &[crate::services::BuildCacheRecord],
+    max_bytes: u64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<BuildCacheEviction> {
+    let total_bytes: u64 = records.iter().map(|r| r.size_bytes).sum();
+    if total_bytes <= max_bytes {
+        return None;
+    }
+    let mut evictable: Vec<(chrono::DateTime<chrono::Utc>, u64)> = records
+        .iter()
+        .filter(|r| !r.in_use)
+        .filter_map(|r| r.last_activity().map(|t| (t, r.size_bytes)))
+        .collect();
+    evictable.sort_by_key(|(t, _)| *t);
+
+    let mut remaining = total_bytes;
+    let mut cutoff = None;
+    for (last_activity, size) in &evictable {
+        // Everything at or before the cutoff goes, so include ties.
+        if remaining <= max_bytes && cutoff.is_some_and(|c| c < *last_activity) {
+            break;
+        }
+        remaining = remaining.saturating_sub(*size);
+        cutoff = Some(*last_activity);
+    }
+    let cutoff = cutoff?;
+    // `until` keeps records newer than now - keep; a second less than the
+    // cutoff's age makes the cutoff record itself fall on the evict side.
+    let keep_secs = ((now - cutoff).num_seconds() - 1).max(1);
+    Some(BuildCacheEviction {
+        keep_secs,
+        total_bytes,
+        evicted_bytes: total_bytes - remaining,
+    })
 }
 
 /// Statistics from Docker prune operations
@@ -172,49 +258,109 @@ impl DockerClient for DefaultDockerClient {
             .collect())
     }
 
-    async fn prune_builder_cache(&self, max_unused_days: i64) -> Result<String, String> {
-        use bollard::query_parameters::PruneBuildOptionsBuilder;
+    async fn prune_builder_cache(&self, policy: BuildCachePolicy) -> Result<String, String> {
         use bollard::Docker;
-        use std::collections::HashMap;
 
         let docker = Docker::connect_with_unix_defaults()
             .map_err(|e| format!("Failed to connect to Docker daemon: {}", e))?;
 
-        // Calculate duration filter (e.g., "168h" for 7 days)
-        let duration = format!("{}h", max_unused_days * 24);
+        // Age limit first: cheap, and often enough on its own.
+        let age_duration = format!("{}h", policy.max_unused_days.max(1) * 24);
+        let mut summary = prune_build_cache_until(&docker, &age_duration)
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to prune build cache unused for {} day(s): {}",
+                    policy.max_unused_days, e
+                )
+            })?;
 
-        // Build filters with "until" to prune cache older than the specified duration
-        let mut filters: HashMap<String, Vec<String>> = HashMap::new();
-        filters.insert("until".to_string(), vec![duration]);
-
-        let options = PruneBuildOptionsBuilder::default()
-            // Without `all`, the Build/prune API only removes cache marked
-            // "dangling" (not shared by any remaining build lineage) --
-            // the same distinction as `docker image prune` vs `-a`. Most
-            // build cache (e.g. per-build COPY/RUN layers with unique
-            // content) is never dangling, so leaving this unset meant the
-            // nightly cleanup reclaimed almost none of it regardless of
-            // the `until` age filter, letting the cache grow unbounded.
-            .all(true)
-            .filters(&filters)
-            .build();
-
-        match docker.prune_build(Some(options)).await {
-            Ok(result) => {
-                let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
-                let caches_deleted = result.caches_deleted.map(|v| v.len()).unwrap_or(0);
-
-                if caches_deleted > 0 || space_mb > 0 {
-                    Ok(format!(
-                        "removed {} build cache entries, freed {} MB",
-                        caches_deleted, space_mb
-                    ))
-                } else {
-                    Ok(String::new())
-                }
-            }
-            Err(e) => Err(format!("Failed to prune build cache: {}", e)),
+        let Some(max_bytes) = policy.max_size_bytes else {
+            return Ok(summary);
+        };
+        let records = crate::services::DockerDiskUsageService::local()
+            .build_cache_records()
+            .await
+            .map_err(|e| {
+                format!(
+                    "{}; could not measure the build cache for the {} MB cap: {}",
+                    if summary.is_empty() {
+                        "age prune found nothing"
+                    } else {
+                        summary.as_str()
+                    },
+                    max_bytes / (1024 * 1024),
+                    e
+                )
+            })?;
+        let Some(eviction) = plan_build_cache_eviction(&records, max_bytes, chrono::Utc::now())
+        else {
+            return Ok(summary);
+        };
+        info!(
+            total_mb = eviction.total_bytes / (1024 * 1024),
+            cap_mb = max_bytes / (1024 * 1024),
+            evict_mb = eviction.evicted_bytes / (1024 * 1024),
+            keep_secs = eviction.keep_secs,
+            "Docker build cache is over its size cap; evicting least recently used records"
+        );
+        let capped = prune_build_cache_until(&docker, &format!("{}s", eviction.keep_secs))
+            .await
+            .map_err(|e| {
+                format!(
+                    "Failed to prune build cache down to the {} MB cap: {}",
+                    max_bytes / (1024 * 1024),
+                    e
+                )
+            })?;
+        if !capped.is_empty() {
+            let capped = format!("size cap: {capped}");
+            summary = if summary.is_empty() {
+                capped
+            } else {
+                format!("{summary}; {capped}")
+            };
         }
+        Ok(summary)
+    }
+}
+
+/// One `POST /build/prune` with `all=true` and an `until` age filter. Returns
+/// a human summary, empty when nothing was removed.
+async fn prune_build_cache_until(
+    docker: &bollard::Docker,
+    duration: &str,
+) -> Result<String, bollard::errors::Error> {
+    use bollard::query_parameters::PruneBuildOptionsBuilder;
+    use std::collections::HashMap;
+
+    // Build filters with "until" to prune cache older than the specified duration
+    let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+    filters.insert("until".to_string(), vec![duration.to_string()]);
+
+    let options = PruneBuildOptionsBuilder::default()
+        // Without `all`, the Build/prune API only removes cache marked
+        // "dangling" (not shared by any remaining build lineage) --
+        // the same distinction as `docker image prune` vs `-a`. Most
+        // build cache (e.g. per-build COPY/RUN layers with unique
+        // content) is never dangling, so leaving this unset meant the
+        // nightly cleanup reclaimed almost none of it regardless of
+        // the `until` age filter, letting the cache grow unbounded.
+        .all(true)
+        .filters(&filters)
+        .build();
+
+    let result = docker.prune_build(Some(options)).await?;
+    let space_mb = result.space_reclaimed.unwrap_or(0) / (1024 * 1024);
+    let caches_deleted = result.caches_deleted.map(|v| v.len()).unwrap_or(0);
+
+    if caches_deleted > 0 || space_mb > 0 {
+        Ok(format!(
+            "removed {} build cache entries, freed {} MB",
+            caches_deleted, space_mb
+        ))
+    } else {
+        Ok(String::new())
     }
 }
 
@@ -261,7 +407,10 @@ fn seconds_until_next_cleanup(cleanup_hour: u32) -> u64 {
 /// Shared by `DockerCleanupService` (console, which also cleans up the
 /// DB-backed static asset cache) and `DockerOnlyCleanupScheduler` (worker
 /// agents, which have no database connection).
-async fn perform_docker_prune(docker_client: &Arc<dyn DockerClient>, max_cache_age_days: i64) {
+async fn perform_docker_prune(
+    docker_client: &Arc<dyn DockerClient>,
+    build_cache_policy: BuildCachePolicy,
+) {
     // Cleanup unused images
     match docker_client.prune_images(true).await {
         Ok(stats) => {
@@ -280,7 +429,7 @@ async fn perform_docker_prune(docker_client: &Arc<dyn DockerClient>, max_cache_a
     }
 
     // Cleanup old build cache
-    match docker_client.prune_builder_cache(max_cache_age_days).await {
+    match docker_client.prune_builder_cache(build_cache_policy).await {
         Ok(output) => {
             // Parse output for statistics
             if output.contains("freed") || output.contains("removed") {
@@ -312,8 +461,10 @@ pub struct DockerOnlyCleanupScheduler {
     docker_client: Arc<dyn DockerClient>,
     /// Hour of day (UTC) to run cleanup (default: 2 AM)
     cleanup_hour: u32,
-    /// Maximum number of days build cache can be unused before deletion (default: 7)
-    max_cache_age_days: i64,
+    /// Build cache age limit and size cap. Worker agents have no database to
+    /// read the operator's `build_limits` from, so they apply the defaults
+    /// (7 days unused, 10 GB).
+    build_cache_policy: BuildCachePolicy,
 }
 
 impl DockerOnlyCleanupScheduler {
@@ -321,7 +472,7 @@ impl DockerOnlyCleanupScheduler {
         Self {
             docker_client,
             cleanup_hour: 2, // 2 AM UTC
-            max_cache_age_days: 7,
+            build_cache_policy: BuildCachePolicy::default(),
         }
     }
 
@@ -331,7 +482,12 @@ impl DockerOnlyCleanupScheduler {
     }
 
     pub fn with_max_cache_age_days(mut self, days: i64) -> Self {
-        self.max_cache_age_days = days;
+        self.build_cache_policy.max_unused_days = days;
+        self
+    }
+
+    pub fn with_build_cache_policy(mut self, policy: BuildCachePolicy) -> Self {
+        self.build_cache_policy = policy;
         self
     }
 
@@ -355,7 +511,7 @@ impl DockerOnlyCleanupScheduler {
             sleep(Duration::from_secs(seconds_until_cleanup)).await;
 
             info!("🧹 Starting nightly Docker cleanup (agent node)");
-            perform_docker_prune(&self.docker_client, self.max_cache_age_days).await;
+            perform_docker_prune(&self.docker_client, self.build_cache_policy).await;
             info!("Nightly Docker cleanup completed (agent node)");
 
             // Sleep for 1 minute to avoid running cleanup multiple times in the same minute
@@ -371,8 +527,10 @@ pub struct DockerCleanupService {
     file_store: Arc<dyn temps_file_store::FileStore>,
     /// Hour of day (UTC) to run cleanup (default: 2 AM)
     cleanup_hour: u32,
-    /// Maximum number of days build cache can be unused before deletion (default: 7)
-    max_cache_age_days: i64,
+    /// Build cache age limit and size cap used when no `ConfigService` is
+    /// wired up or the settings row cannot be read. With a `ConfigService`,
+    /// every run re-reads `AppSettings.build_limits` instead.
+    build_cache_policy: BuildCachePolicy,
     /// Base directory for static files (for persisted chunks cleanup)
     static_dir: Option<PathBuf>,
     /// Maximum age of persisted chunk directories in hours (default: 24)
@@ -425,7 +583,7 @@ impl DockerCleanupService {
             db,
             file_store,
             cleanup_hour: 2, // 2 AM UTC
-            max_cache_age_days: 7,
+            build_cache_policy: BuildCachePolicy::default(),
             static_dir: None,
             max_chunk_age_hours: 24,
             max_asset_cache_age_days: 7,
@@ -452,7 +610,12 @@ impl DockerCleanupService {
     }
 
     pub fn with_max_cache_age_days(mut self, days: i64) -> Self {
-        self.max_cache_age_days = days;
+        self.build_cache_policy.max_unused_days = days;
+        self
+    }
+
+    pub fn with_build_cache_policy(mut self, policy: BuildCachePolicy) -> Self {
+        self.build_cache_policy = policy;
         self
     }
 
@@ -529,6 +692,29 @@ impl DockerCleanupService {
                     "Could not read image retention settings; using last-known values"
                 );
                 last_known
+            }
+        }
+    }
+
+    /// Build cache policy for this run: the operator's current
+    /// `build_limits` when a `ConfigService` is wired up, otherwise (or on a
+    /// read error) the constructor/builder value. Unlike image retention, a
+    /// stale value here is harmless: the cache is rebuildable, so the worst
+    /// case is one night pruned to the default cap.
+    async fn current_build_cache_policy(&self) -> BuildCachePolicy {
+        let Some(config_service) = &self.config_service else {
+            return self.build_cache_policy;
+        };
+        match config_service.get_settings().await {
+            Ok(settings) => BuildCachePolicy::from(&settings.build_limits),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Could not read build cache limits; using {} day(s) / {:?} bytes",
+                    self.build_cache_policy.max_unused_days,
+                    self.build_cache_policy.max_size_bytes
+                );
+                self.build_cache_policy
             }
         }
     }
@@ -1103,7 +1289,8 @@ impl DockerCleanupService {
     async fn perform_cleanup(&self) {
         info!("🧹 Starting nightly Docker cleanup");
 
-        perform_docker_prune(&self.docker_client, self.max_cache_age_days).await;
+        let build_cache_policy = self.current_build_cache_policy().await;
+        perform_docker_prune(&self.docker_client, build_cache_policy).await;
 
         // Remove old deployment images per project retention policy
         self.prune_old_deployment_images().await;
@@ -1345,7 +1532,7 @@ mod tests {
             self.prune_images_result.clone()
         }
 
-        async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
+        async fn prune_builder_cache(&self, _policy: BuildCachePolicy) -> Result<String, String> {
             self.prune_cache_result.clone()
         }
 
@@ -1405,7 +1592,7 @@ mod tests {
             })
         }
 
-        async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
+        async fn prune_builder_cache(&self, _policy: BuildCachePolicy) -> Result<String, String> {
             Ok(String::new())
         }
 
@@ -1446,7 +1633,7 @@ mod tests {
             })
         }
 
-        async fn prune_builder_cache(&self, _max_unused_days: i64) -> Result<String, String> {
+        async fn prune_builder_cache(&self, _policy: BuildCachePolicy) -> Result<String, String> {
             Ok(String::new())
         }
 
@@ -1512,7 +1699,88 @@ mod tests {
             DockerCleanupService::new(Arc::new(DefaultDockerClient), mock_db(), mock_file_store())
                 .with_max_cache_age_days(14);
 
-        assert_eq!(service.max_cache_age_days, 14);
+        assert_eq!(service.build_cache_policy.max_unused_days, 14);
+    }
+
+    fn cache_record(
+        size_bytes: u64,
+        in_use: bool,
+        last_activity_secs_ago: Option<i64>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> crate::services::BuildCacheRecord {
+        crate::services::BuildCacheRecord {
+            size_bytes,
+            in_use,
+            last_used_at: last_activity_secs_ago.map(|s| now - chrono::Duration::seconds(s)),
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn build_cache_policy_defaults_to_seven_days_and_ten_gigabytes() {
+        let policy = BuildCachePolicy::default();
+        assert_eq!(policy.max_unused_days, 7);
+        assert_eq!(policy.max_size_bytes, Some(10 * 1024 * 1024 * 1024));
+        let uncapped = BuildCachePolicy::from(&temps_core::BuildLimitsSettings {
+            build_cache_max_gb: 0,
+            build_cache_max_unused_days: 3,
+            ..Default::default()
+        });
+        assert_eq!(uncapped.max_size_bytes, None);
+        assert_eq!(uncapped.max_unused_days, 3);
+    }
+
+    #[test]
+    fn eviction_not_needed_when_the_cache_fits() {
+        let now = chrono::Utc::now();
+        let records = vec![cache_record(40, false, Some(100), now)];
+        assert_eq!(plan_build_cache_eviction(&records, 40, now), None);
+        assert_eq!(plan_build_cache_eviction(&[], 0, now), None);
+    }
+
+    #[test]
+    fn eviction_removes_least_recently_used_until_under_the_cap() {
+        let now = chrono::Utc::now();
+        // 100 bytes total, cap 50: evicting the two oldest (30 + 25) suffices.
+        let records = vec![
+            cache_record(25, false, Some(5_000), now),
+            cache_record(30, false, Some(9_000), now),
+            cache_record(20, false, Some(1_000), now),
+            cache_record(25, false, Some(100), now),
+        ];
+        let plan = plan_build_cache_eviction(&records, 50, now).unwrap();
+        assert_eq!(plan.total_bytes, 100);
+        assert_eq!(plan.evicted_bytes, 55);
+        // Must cover the 5_000s-old record but not the 1_000s-old one.
+        assert!(plan.keep_secs < 5_000, "{plan:?}");
+        assert!(plan.keep_secs >= 1_000, "{plan:?}");
+    }
+
+    #[test]
+    fn eviction_never_counts_in_use_or_undated_records() {
+        let now = chrono::Utc::now();
+        let records = vec![
+            cache_record(80, true, Some(90_000), now),
+            cache_record(10, false, None, now),
+            cache_record(15, false, Some(60), now),
+        ];
+        let plan = plan_build_cache_eviction(&records, 50, now).unwrap();
+        assert_eq!(plan.evicted_bytes, 15, "only the dated, unused record");
+
+        let only_in_use = vec![cache_record(80, true, Some(90_000), now)];
+        assert_eq!(plan_build_cache_eviction(&only_in_use, 50, now), None);
+    }
+
+    #[test]
+    fn eviction_takes_records_tied_with_the_cutoff_since_until_removes_them_too() {
+        let now = chrono::Utc::now();
+        let records = vec![
+            cache_record(30, false, Some(500), now),
+            cache_record(30, false, Some(500), now),
+            cache_record(30, false, Some(10), now),
+        ];
+        let plan = plan_build_cache_eviction(&records, 70, now).unwrap();
+        assert_eq!(plan.evicted_bytes, 60);
     }
 
     #[test]
@@ -1520,7 +1788,7 @@ mod tests {
         let scheduler = DockerOnlyCleanupScheduler::new(Arc::new(DefaultDockerClient));
 
         assert_eq!(scheduler.cleanup_hour, 2);
-        assert_eq!(scheduler.max_cache_age_days, 7);
+        assert_eq!(scheduler.build_cache_policy.max_unused_days, 7);
     }
 
     #[test]
@@ -1536,7 +1804,7 @@ mod tests {
         let scheduler = DockerOnlyCleanupScheduler::new(Arc::new(DefaultDockerClient))
             .with_max_cache_age_days(14);
 
-        assert_eq!(scheduler.max_cache_age_days, 14);
+        assert_eq!(scheduler.build_cache_policy.max_unused_days, 14);
     }
 
     #[tokio::test]
@@ -1552,7 +1820,7 @@ mod tests {
         // Exercises the shared free function directly — success is "did
         // not panic and produced no error path" since prune_images/
         // prune_builder_cache results are only logged, not returned.
-        perform_docker_prune(&client, 7).await;
+        perform_docker_prune(&client, BuildCachePolicy::default()).await;
     }
 
     #[tokio::test]
@@ -1565,7 +1833,7 @@ mod tests {
         // Both prune calls fail; the shared helper must not panic — errors
         // are logged and cleanup continues (e.g. images prune failing must
         // not skip the build-cache prune).
-        perform_docker_prune(&client, 7).await;
+        perform_docker_prune(&client, BuildCachePolicy::default()).await;
     }
 
     #[test]

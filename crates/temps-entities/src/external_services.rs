@@ -97,6 +97,12 @@ pub struct Model {
     /// `legacy`. Added by `m20261022_000004_external_services_workload_mode`.
     #[serde(default)]
     pub workload_mode: super::external_service_workload_mode::ServiceWorkloadMode,
+    /// Container log ingestion budget for this service's containers, in
+    /// lines per second. NULL inherits the platform budget
+    /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// As `log_ingest_lines_per_sec`, in KiB per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

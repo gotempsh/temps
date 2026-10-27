@@ -1099,7 +1099,9 @@ export function MonitoringSettingsPage() {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   Applied to running containers within a minute of saving. 0
-                  disables that limit; defaults 250 lines/s and 256 KiB/s.
+                  disables that limit; defaults 250 lines/s and 256 KiB/s. A
+                  project or managed service can override it in its own
+                  settings.
                 </p>
                 {errors.container_logs?.ingest_lines_per_sec && (
                   <p className="text-xs text-destructive">

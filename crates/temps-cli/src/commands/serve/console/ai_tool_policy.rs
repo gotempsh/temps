@@ -26,6 +26,13 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "ExternalServiceEnablePgStatStatements",
             "admin_delete_environment_volume",
             "admin_detach_environment_volume",
+            // *Make it reachable*: changes DNS records, tunnels and
+            // certificates for a live address, and can take a Cloudflare token
+            // again on resume. The console shows the plan and asks.
+            "apply_environment_reachability",
+            "decide_reachability_conflict",
+            "resume_reachability_run",
+            "undo_reachability_run",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",
@@ -70,7 +77,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "start_restore",
             "teardown_deployment",
             "teardown_environment",
-            "undo_reachability_run",
             "unpublish_status_page",
             "update_ingress_connector",
             "upgrade_project_service_template",
@@ -455,7 +461,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
-            "check_cloudflare_token",
             "createHttpCheck",
             "create_agent",
             "create_bitbucket_provider",
@@ -776,15 +781,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_runtime_health",
             "update_status_page",
             "verify_status_page_domain",
-        ],
-    ),
-    (
-        "makes an address reachable by changing DNS records, certificates and tunnels; the console walks the user through the plan",
-        &[
-            "apply_environment_reachability",
-            "decide_reachability_conflict",
-            "plan_environment_reachability",
-            "resume_reachability_run",
         ],
     ),
 ];

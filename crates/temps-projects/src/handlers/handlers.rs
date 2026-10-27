@@ -2015,6 +2015,8 @@ pub async fn update_project_settings(
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
         image_retention_hours: settings.image_retention_hours,
         previous_image_retention_hours,
+        log_ingest_lines_per_sec: settings.log_ingest_lines_per_sec,
+        log_ingest_kib_per_sec: settings.log_ingest_kib_per_sec,
         serves_own_temps_api: settings.serves_own_temps_api,
     };
 

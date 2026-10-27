@@ -2571,6 +2571,42 @@ pub struct ResourceLimitsUpdateResponse {
     pub shm_not_applied: Option<String>,
 }
 
+/// A managed service's own container log ingestion budget. `None` inherits
+/// the platform budget (Settings → Monitoring → Container log ingestion);
+/// `Some(0)` lifts that limit for this service's containers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ServiceLogIngestion {
+    /// Lines per second per container (0–1,000,000). null = platform default.
+    #[schema(minimum = 0, maximum = 1000000, example = 2000)]
+    #[serde(default)]
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// KiB of log text per second per container (0–1,048,576). null =
+    /// platform default.
+    #[schema(minimum = 0, maximum = 1048576, example = 4096)]
+    #[serde(default)]
+    pub log_ingest_kib_per_sec: Option<i32>,
+}
+
+impl ServiceLogIngestion {
+    pub fn of(service: &external_services::Model) -> Self {
+        Self {
+            log_ingest_lines_per_sec: service.log_ingest_lines_per_sec,
+            log_ingest_kib_per_sec: service.log_ingest_kib_per_sec,
+        }
+    }
+}
+
+/// What [`ExternalServiceManager::set_log_ingestion`] changed, read under the
+/// row lock that carried the write so the audit trail pairs a real before
+/// with a real after.
+#[derive(Debug, Clone)]
+pub struct ServiceLogIngestionUpdate {
+    pub service_id: i32,
+    pub service_name: String,
+    pub previous: ServiceLogIngestion,
+    pub current: ServiceLogIngestion,
+}
+
 /// TTL for the `<service>.temps.local` A record of a standalone managed
 /// service. Matches the Tier-2 cluster-member TTL: a standalone container's
 /// overlay IP only changes when the container is recreated, and 30s bounds
@@ -16487,6 +16523,90 @@ echo "[restore] Pre-seed complete"
         Ok(())
     }
 
+    /// This service's log ingestion override (both `None` = inherit).
+    pub async fn get_log_ingestion(
+        &self,
+        service_id: i32,
+    ) -> Result<ServiceLogIngestion, ExternalServiceError> {
+        Ok(ServiceLogIngestion::of(
+            &self.get_service(service_id).await?,
+        ))
+    }
+
+    /// Replace this service's log ingestion override. Takes effect on its
+    /// running containers within a minute (the log aggregator's budget sync)
+    /// without recreating anything.
+    pub async fn set_log_ingestion(
+        &self,
+        service_id: i32,
+        settings: ServiceLogIngestion,
+    ) -> Result<ServiceLogIngestionUpdate, ExternalServiceError> {
+        temps_core::ContainerLogSettings::validate_ingest_override(
+            settings.log_ingest_lines_per_sec,
+            settings.log_ingest_kib_per_sec,
+        )
+        .map_err(|reason| ExternalServiceError::ParameterValidationFailed { service_id, reason })?;
+
+        const OPERATION: &str = "saving the log ingestion budget of";
+        let txn = begin_bounded_transaction(&self.db, service_id, OPERATION, SERVICE_LOCK_TIMEOUT)
+            .await?;
+        let (previous, service_name) =
+            match Self::write_log_ingestion(&txn, service_id, &settings).await {
+                Ok(saved) => saved,
+                Err(error) => {
+                    // Roll back now so the row lock is not held until the
+                    // pooled connection is recycled.
+                    let error = lock_timeout_or_database_error(
+                        service_id,
+                        OPERATION,
+                        SERVICE_LOCK_TIMEOUT,
+                        error,
+                    );
+                    return Err(rollback_before_error(txn, error).await);
+                }
+            };
+        txn.commit().await?;
+
+        info!(
+            service_id,
+            lines_per_sec = ?settings.log_ingest_lines_per_sec,
+            kib_per_sec = ?settings.log_ingest_kib_per_sec,
+            "log ingestion override saved for external service {} ({})",
+            service_id,
+            service_name
+        );
+        Ok(ServiceLogIngestionUpdate {
+            service_id,
+            service_name,
+            previous,
+            current: settings,
+        })
+    }
+
+    /// The locked read-compare-write behind [`Self::set_log_ingestion`].
+    /// Returns the previous override and the service name.
+    async fn write_log_ingestion(
+        txn: &sea_orm::DatabaseTransaction,
+        service_id: i32,
+        settings: &ServiceLogIngestion,
+    ) -> Result<(ServiceLogIngestion, String), ExternalServiceError> {
+        let service = external_services::Entity::find_by_id(service_id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .ok_or(ExternalServiceError::ServiceNotFound { id: service_id })?;
+        let previous = ServiceLogIngestion::of(&service);
+        let service_name = service.name.clone();
+        if previous != *settings {
+            let mut active: external_services::ActiveModel = service.into();
+            active.log_ingest_lines_per_sec = Set(settings.log_ingest_lines_per_sec);
+            active.log_ingest_kib_per_sec = Set(settings.log_ingest_kib_per_sec);
+            active.updated_at = Set(Utc::now());
+            active.update(txn).await?;
+        }
+        Ok((previous, service_name))
+    }
+
     pub async fn update_service_resource_limits(
         &self,
         service_id: i32,
@@ -17876,6 +17996,138 @@ mod tests {
             Arc::new(docker),
             Arc::new(temps_dns::DnsRegistry::new(db)),
         )))
+    }
+
+    #[tokio::test]
+    async fn set_log_ingestion_rejects_out_of_range_before_touching_the_db() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let Some(manager) = mock_manager(db.clone()) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let err = manager
+            .set_log_ingestion(
+                7,
+                ServiceLogIngestion {
+                    log_ingest_lines_per_sec: Some(-5),
+                    log_ingest_kib_per_sec: None,
+                },
+            )
+            .await
+            .expect_err("negative budget must be rejected");
+        assert!(
+            matches!(&err, ExternalServiceError::ParameterValidationFailed { service_id: 7, reason } if reason.contains("log_ingest_lines_per_sec -5")),
+            "{err:?}"
+        );
+        drop(manager);
+        let db = Arc::try_unwrap(db).expect("manager released the database");
+        assert!(
+            db.into_transaction_log().is_empty(),
+            "nothing may be queried"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_log_ingestion_reports_missing_service_by_id() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
+                .append_query_results([Vec::<external_services::Model>::new()])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let err = manager
+            .set_log_ingestion(42, ServiceLogIngestion::default())
+            .await
+            .expect_err("missing row");
+        assert!(
+            matches!(err, ExternalServiceError::ServiceNotFound { id: 42 }),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_log_ingestion_returns_previous_and_new_values() {
+        let mut before = encrypted_service_model(7, serde_json::json!({}));
+        before.log_ingest_lines_per_sec = Some(100);
+        let mut after = before.clone();
+        after.log_ingest_lines_per_sec = None;
+        after.log_ingest_kib_per_sec = Some(0);
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
+                .append_query_results([vec![before]])
+                .append_query_results([vec![after]])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let wanted = ServiceLogIngestion {
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: Some(0),
+        };
+        let update = manager.set_log_ingestion(7, wanted).await.expect("saved");
+        assert_eq!(update.previous.log_ingest_lines_per_sec, Some(100));
+        assert_eq!(update.current, wanted);
+        assert_eq!(update.service_name, "postgres-test");
+    }
+
+    /// The mock result for `begin_bounded_transaction`'s `SET LOCAL`.
+    fn lock_timeout_set() -> sea_orm::MockExecResult {
+        sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    /// A save that cannot get the service row's lock gives up after
+    /// `SERVICE_LOCK_TIMEOUT` with a typed "service busy" error naming the
+    /// service, instead of waiting on the row forever.
+    #[tokio::test]
+    async fn set_log_ingestion_gives_up_on_a_held_row_lock() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([lock_timeout_set()])
+                .append_query_errors([sea_orm::DbErr::Custom(
+                    "canceling statement due to lock timeout".to_owned(),
+                )])
+                .into_connection(),
+        );
+        let Some(manager) = mock_manager(db.clone()) else {
+            println!("Docker client configuration unavailable, skipping");
+            return;
+        };
+        let err = manager
+            .set_log_ingestion(7, ServiceLogIngestion::default())
+            .await
+            .expect_err("a held lock must not be waited on forever");
+        assert!(
+            matches!(
+                err,
+                ExternalServiceError::LockTimeout {
+                    service_id: 7,
+                    operation: "saving the log ingestion budget of",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+
+        drop(manager);
+        let db = Arc::try_unwrap(db).expect("manager released the database");
+        let log = format!("{:?}", db.into_transaction_log());
+        let bounded = log
+            .find("SET LOCAL lock_timeout")
+            .expect("the lock wait must be bounded");
+        let locked = log.find("FOR UPDATE").expect("the row is locked");
+        assert!(bounded < locked, "the bound must precede the lock: {log}");
     }
 
     /// #1385: the provisioning task claims each irreversible step on the
@@ -22563,6 +22815,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 
@@ -22617,6 +22871,8 @@ mod tests {
             serves_own_temps_api: false,
             ai_api_traffic_summary_enabled: None,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity: Default::default(),
             cloud_telemetry_attribute_allowlist: Vec::new(),
             cloud_telemetry_write_mode: Default::default(),
@@ -25777,6 +26033,8 @@ mod tests {
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
             workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
         }
     }
 

@@ -29,6 +29,7 @@ import {
 } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
+import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
 import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
@@ -161,6 +162,7 @@ import { Link, useLocation, useNavigate, useParams } from 'react-router'
 import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
+import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
 
 /**
  * Pick the role label to render for a cluster member.
@@ -1047,6 +1049,11 @@ export function ServiceDetail() {
 
             <ActiveRestoreBanner serviceId={service.service.id} />
 
+            {/* This service's containers over the log ingestion budget. */}
+            <LogIngestBudgetWarning
+              scope={{ externalServiceId: service.service.id }}
+            />
+
             {/*
               Why a service is still starting, or why it failed to
               initialize and what to do next. Renders nothing otherwise.
@@ -1096,6 +1103,9 @@ export function ServiceDetail() {
                 onMonitoringChange={() => refetch()}
               />
             )}
+
+            {/* Always shown: the budget applies whether or not it is running. */}
+            <ServiceLogIngestionCard serviceId={service.service.id} />
 
             {/* Cluster Creation Progress */}
             {service.service.topology === 'cluster' &&

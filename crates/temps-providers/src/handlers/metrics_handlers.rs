@@ -24,6 +24,7 @@
 //! PATCH /deployments/{id}/metrics/enable
 //!
 //! GET  /nodes/{id}/metrics
+//! GET  /nodes/{id}/metrics/disk-health
 //! ```
 //!
 //! The `range` query param accepts `"1h"` | `"6h"` | `"24h"` | `"7d"`.
@@ -43,7 +44,6 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
 use temps_auth::Permission;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
@@ -301,16 +301,17 @@ pub struct UpdateAlertRuleRequest {
 
 /// Request body for creating a resource alert on a node.
 ///
-/// Only the usage percentages can be alerted on: `node.cpu_percent`,
-/// `node.memory_percent` and `node.disk_percent`. `threshold` is a percentage
-/// (0-100). A node has at most one rule per metric.
+/// A rule watches a usage percentage (`node.cpu_percent`, `node.memory_percent`,
+/// `node.disk_percent`; `threshold` 0-100) or a disk-health metric
+/// (`node.raid_degraded`, `node.disk_wear_percent`, `node.disk_media_errors`;
+/// `threshold` 0 or more). A node has at most one rule per metric.
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(as = NodeCreateAlertRuleRequest)]
 pub struct CreateNodeAlertRuleRequest {
     pub name: String,
-    /// One of `node.cpu_percent`, `node.memory_percent`, `node.disk_percent`.
+    /// One of the usage percentages or disk-health metrics listed above.
     pub metric_name: String,
-    /// Percentage between 0 and 100.
+    /// 0-100 for a usage percentage; 0 or more for a disk-health metric.
     pub threshold: f64,
     /// One of `>`, `<`, `>=`, `<=`.
     pub comparator: String,
@@ -1421,6 +1422,198 @@ async fn get_node_metrics_latest(
     Ok((StatusCode::OK, Json(values)))
 }
 
+/// Console path where a node's disk health is shown: the server monitoring
+/// page for the control plane (node 0), the node's own page for a worker.
+fn disk_health_setup_path(node_id: i32) -> String {
+    if node_id == 0 {
+        "/monitoring/server".to_string()
+    } else {
+        format!("/settings/nodes/{node_id}")
+    }
+}
+
+/// One software RAID array on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct RaidArrayHealth {
+    /// md device name, e.g. `md0`.
+    pub name: String,
+    /// Fewer members are active than the array was configured with.
+    pub degraded: bool,
+    /// Members missing or marked failed.
+    pub devices_failed: u32,
+}
+
+/// SMART health of one drive on a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DriveHealthRow {
+    /// Device name, e.g. `nvme0` or `sda`.
+    pub device: String,
+    /// Percentage of rated endurance used (can exceed 100).
+    pub wear_percent: Option<f64>,
+    /// Media / reallocated-sector errors the drive has recorded.
+    pub media_errors: Option<u64>,
+    /// Bytes written over the drive's lifetime.
+    pub bytes_written: Option<u64>,
+}
+
+/// Latest disk-array and drive health for a node.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct NodeDiskHealthResponse {
+    /// `false` when the node has never reported disk health.
+    pub reported: bool,
+    pub raid_arrays: Vec<RaidArrayHealth>,
+    pub drives: Vec<DriveHealthRow>,
+    /// Physical drives found on the node.
+    pub drives_detected: u32,
+    /// Drives whose SMART data could be read.
+    pub drives_read: u32,
+    /// `true` when the node has not reported recently: the arrays and
+    /// drives above are the last values it sent, not its current state, so
+    /// they must not be presented as the node's health now.
+    pub stale: bool,
+    /// Why some or all drive health is missing, when it is.
+    pub reason: Option<String>,
+    /// Console path that shows this node's disk health.
+    pub setup_path: String,
+}
+
+/// Disk health from a node whose newest sample is older than this is
+/// reported as stale: it is the last thing the node said, not its state now.
+const DISK_HEALTH_MAX_AGE_MINUTES: i64 = 10;
+
+/// When the node last reported, if that is too long ago to call its disk
+/// health current.
+fn disk_health_stale_since(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    health
+        .reported_at
+        .filter(|at| now - *at > Duration::minutes(DISK_HEALTH_MAX_AGE_MINUTES))
+}
+
+fn disk_health_reason(
+    health: &temps_metrics::collector::disk_health::NodeDiskHealth,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if !health.reported {
+        return Some(
+            "This node has not reported disk health. It is read on Linux hosts: by the \
+             control plane for itself, and by `temps agent` on a worker node, which sends \
+             it with every heartbeat. A worker running an older agent does not report it \
+             until the agent is upgraded."
+                .into(),
+        );
+    }
+    if let Some(reported_at) = disk_health_stale_since(health, now) {
+        return Some(format!(
+            "This node has not reported metrics since {}. The disk health shown is \
+             from then, not its current state: check that the node is online and, \
+             on a worker, that `temps agent` is running.",
+            reported_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ));
+    }
+    if health.drives_detected > health.drives_read {
+        let missing = health.drives_detected - health.drives_read;
+        return Some(format!(
+            "SMART data could not be read for {missing} of {} drive(s). NVMe drives need \
+             temps (the server, or the agent on a worker) to run as root; SATA/SAS \
+             drives also need smartmontools (`smartctl`) installed.",
+            health.drives_detected
+        ));
+    }
+    None
+}
+
+impl NodeDiskHealthResponse {
+    fn new(
+        node_id: i32,
+        health: temps_metrics::collector::disk_health::NodeDiskHealth,
+        now: DateTime<Utc>,
+    ) -> Self {
+        let reason = disk_health_reason(&health, now);
+        let stale = health.reported && disk_health_stale_since(&health, now).is_some();
+        Self {
+            reported: health.reported,
+            raid_arrays: health
+                .raid_arrays
+                .into_iter()
+                .map(|a| RaidArrayHealth {
+                    name: a.name,
+                    degraded: a.degraded,
+                    devices_failed: a.devices_failed,
+                })
+                .collect(),
+            drives: health
+                .drives
+                .into_iter()
+                .map(|d| DriveHealthRow {
+                    device: d.device,
+                    wear_percent: d.wear_percent,
+                    media_errors: d.media_errors,
+                    bytes_written: d.bytes_written,
+                })
+                .collect(),
+            drives_detected: health.drives_detected,
+            drives_read: health.drives_read,
+            stale,
+            reason,
+            setup_path: disk_health_setup_path(node_id),
+        }
+    }
+}
+
+/// Latest software RAID and drive SMART health for a node.
+///
+/// Backs the disk-health panel on the server monitoring page. The headline
+/// values are also plain node metrics (`node.raid_degraded`,
+/// `node.disk_wear_percent`, `node.disk_media_errors`) that alert rules read.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/disk-health",
+    operation_id = "NodeMetricsGetDiskHealth",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "Disk health", body = NodeDiskHealthResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 503, description = "Metrics store not available"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_node_disk_health(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+            .title("Metrics Unavailable")
+            .detail("Metric collection is not enabled on this server")
+            .build()
+    })?;
+
+    let health = temps_metrics::collector::disk_health::read_node_disk_health(store.as_ref(), id)
+        .await
+        .map_err(|e| {
+            error!(node_id = id, error = %e, "Failed to query node disk health");
+            internal_server_error()
+                .detail(format!("Failed to query disk health for node {id}: {e}"))
+                .build()
+        })?;
+
+    Ok((
+        StatusCode::OK,
+        Json(NodeDiskHealthResponse::new(id, health, Utc::now())),
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Nodes — all nodes at once (ADR 061)
 // ---------------------------------------------------------------------------
@@ -2009,6 +2202,7 @@ fn log_and_convert(node_id: i32, error: NodeAlertRuleError) -> Problem {
         | NodeAlertRuleError::RuleNotFound { .. }
         | NodeAlertRuleError::AlreadyExists { .. }
         | NodeAlertRuleError::ControlPlaneRuleProtected { .. }
+        | NodeAlertRuleError::DefaultRuleProtected { .. }
         | NodeAlertRuleError::Validation { .. } => {
             info!(node_id, "Rejected node alert rule operation: {}", error)
         }
@@ -2036,6 +2230,13 @@ impl From<NodeAlertRuleError> for Problem {
                 ErrorBuilder::new(StatusCode::CONFLICT)
                     .type_("https://temps.sh/probs/control-plane-alert-rule-protected")
                     .title("Control-Plane Rule Cannot Be Deleted")
+                    .detail(error.to_string())
+                    .build()
+            }
+            NodeAlertRuleError::DefaultRuleProtected { .. } => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .type_("https://temps.sh/probs/default-alert-rule-protected")
+                    .title("Default Rule Cannot Be Deleted")
                     .detail(error.to_string())
                     .build()
             }
@@ -2109,6 +2310,29 @@ pub(crate) async fn assert_service_owned_by_caller(
     auth: &temps_auth::AuthContext,
     state: &AppState,
 ) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, None).await
+}
+
+/// [`assert_service_owned_by_caller`], plus: when project-scoped roles are
+/// configured, a session/API-key/CLI caller must hold `required` *within* a
+/// project the service is linked to, not just be a member of one. The
+/// instance-level `permission_guard!` alone would let a member whose project
+/// role is read-only change a service of that project.
+pub(crate) async fn assert_service_permission_for_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Permission,
+) -> Result<(), Problem> {
+    authorize_service_caller(service_id, auth, state, Some(required)).await
+}
+
+async fn authorize_service_caller(
+    service_id: i32,
+    auth: &temps_auth::AuthContext,
+    state: &AppState,
+    required: Option<Permission>,
+) -> Result<(), Problem> {
     use temps_entities::project_services;
 
     // For deployment tokens, check against the token's bound project.
@@ -2177,12 +2401,14 @@ pub(crate) async fn assert_service_owned_by_caller(
         return Ok(());
     }
 
-    session_caller_may_access_linked_projects(
-        auth,
-        &project_ids,
-        state.project_access_checker.as_deref(),
-    )
-    .await
+    let checker = state.project_access_checker.as_deref();
+    match required {
+        None => session_caller_may_access_linked_projects(auth, &project_ids, checker).await,
+        Some(required) => {
+            session_caller_has_permission_on_linked_projects(auth, &project_ids, checker, &required)
+                .await
+        }
+    }
 }
 
 fn unlinked_service_creator_may_access(
@@ -2231,7 +2457,10 @@ async fn session_caller_may_access_linked_projects(
 /// service. Installations without scoped project roles retain the existing
 /// membership behavior, while configured roles cannot use an instance-level
 /// permission to mutate a service outside their effective project grants.
-#[cfg(test)]
+///
+/// Per linked project: `Some(perms)` decides on its own (holds `required` or
+/// not); `None` (no scoped opinion) falls back to membership. Both lookups
+/// are batched, and any checker error or omitted project denies.
 async fn session_caller_has_permission_on_linked_projects(
     auth: &temps_auth::AuthContext,
     project_ids: &[i32],
@@ -2246,37 +2475,55 @@ async fn session_caller_has_permission_on_linked_projects(
         return Ok(());
     };
     let required = required.to_string();
-    for &project_id in project_ids {
-        let effective = checker
-            .effective_project_permissions(auth.user_id(), project_id)
+    let effective = checker
+        .effective_project_permissions_batch(auth.user_id(), project_ids)
+        .await
+        .map_err(|error| {
+            error!(
+                project_ids = ?project_ids,
+                error = %error,
+                "external service permission resolution failed closed"
+            );
+            internal_server_error()
+                .detail(format!(
+                    "Could not verify project permissions for external service access: {error}"
+                ))
+                .build()
+        })?;
+    if effective.values().any(
+        |permissions| matches!(permissions, Some(permissions) if permissions.contains(&required)),
+    ) {
+        return Ok(());
+    }
+
+    // Projects the checker returned no scoped opinion for. A project it
+    // omitted is not in this list, so it can only deny.
+    let membership_only: Vec<i32> = effective
+        .iter()
+        .filter(|(_, permissions)| permissions.is_none())
+        .map(|(project_id, _)| *project_id)
+        .collect();
+    if !membership_only.is_empty() {
+        let access = checker
+            .user_can_access_projects(auth.user_id(), &membership_only)
             .await
             .map_err(|error| {
+                error!(
+                    project_ids = ?membership_only,
+                    error = %error,
+                    "external service membership resolution failed closed"
+                );
                 internal_server_error()
                     .detail(format!(
-                        "Could not verify project permissions for external service access: {error}"
+                        "Could not verify project access for external service: {error}"
                     ))
                     .build()
             })?;
-        match effective {
-            Some(permissions) if permissions.iter().any(|permission| permission == &required) => {
-                return Ok(());
-            }
-            Some(_) => {}
-            None => {
-                let is_member = checker
-                    .user_can_access_project(auth.user_id(), project_id)
-                    .await
-                    .map_err(|error| {
-                        internal_server_error()
-                            .detail(format!(
-                                "Could not verify project access for external service: {error}"
-                            ))
-                            .build()
-                    })?;
-                if is_member {
-                    return Ok(());
-                }
-            }
+        if membership_only
+            .iter()
+            .any(|project_id| access.get(project_id).copied().unwrap_or(false))
+        {
+            return Ok(());
         }
     }
 
@@ -2468,6 +2715,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         .route("/nodes/metrics/reporting", get(get_node_metrics_reporting))
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
         .route("/nodes/{id}/metrics/latest", get(get_node_metrics_latest))
+        .route("/nodes/{id}/metrics/disk-health", get(get_node_disk_health))
         .route(
             "/nodes/{id}/metrics/alert-rules",
             get(list_node_alert_rules).post(create_node_alert_rule),
@@ -2499,6 +2747,7 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         toggle_deployment_metrics,
         get_node_metrics_range,
         get_node_metrics_latest,
+        get_node_disk_health,
         get_cluster_metrics_range,
         get_cluster_metrics_latest,
         get_node_metrics_reporting,
@@ -2522,6 +2771,9 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         CreateNodeAlertRuleRequest,
         ToggleServiceMetricsRequest,
         ToggleDeploymentMetricsRequest,
+        NodeDiskHealthResponse,
+        RaidArrayHealth,
+        DriveHealthRow,
     )),
     info(
         title = "Metrics API",
@@ -3018,6 +3270,77 @@ mod tests {
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
     }
 
+    /// Project 10 has scoped roles (read only); project 11 has none, so its
+    /// membership decides. Failing to resolve permissions denies.
+    struct MixedServicePermissionChecker {
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for MixedServicePermissionChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_id == 11)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            if self.fail {
+                return Err("permission store unavailable".into());
+            }
+            Ok((project_id == 10).then(|| vec![Permission::ExternalServicesRead.to_string()]))
+        }
+    }
+
+    #[tokio::test]
+    async fn service_mutation_uses_membership_only_where_no_scoped_role_applies() {
+        let auth = test_session_auth(temps_auth::Role::User);
+        let checker = MixedServicePermissionChecker { fail: false };
+        let required = Permission::ExternalServicesWrite;
+
+        session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10, 11],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect("membership of the unscoped project 11 authorizes");
+
+        let problem = session_caller_has_permission_on_linked_projects(
+            &auth,
+            &[10],
+            Some(&checker),
+            &required,
+        )
+        .await
+        .expect_err("project 10's read-only role must not authorize a write");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn service_mutation_fails_closed_when_permissions_cannot_be_resolved() {
+        let checker = MixedServicePermissionChecker { fail: true };
+        let problem = session_caller_has_permission_on_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[11],
+            Some(&checker),
+            &Permission::ExternalServicesWrite,
+        )
+        .await
+        .expect_err("an unverifiable permission must deny");
+        assert_eq!(
+            problem.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
     #[tokio::test]
     async fn service_mutation_falls_back_to_membership_without_scoped_permissions() {
         let checker = EffectiveServicePermissionChecker {
@@ -3118,6 +3441,109 @@ mod tests {
                  declared operations: {served:?}"
             );
         }
+    }
+
+    #[test]
+    fn disk_health_response_explains_unread_drives() {
+        use temps_metrics::collector::disk_health::{DriveHealth, NodeDiskHealth};
+
+        let now = Utc::now();
+        let none = NodeDiskHealthResponse::new(0, NodeDiskHealth::default(), now);
+        assert_eq!(none.setup_path, "/monitoring/server");
+        assert_eq!(
+            NodeDiskHealthResponse::new(4, NodeDiskHealth::default(), now).setup_path,
+            "/settings/nodes/4"
+        );
+        assert!(!none.reported);
+        assert!(none
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("not reported"));
+
+        let partial = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives: vec![DriveHealth {
+                    device: "nvme0".into(),
+                    wear_percent: Some(12.0),
+                    ..Default::default()
+                }],
+                drives_detected: 3,
+                drives_read: 1,
+                reported_at: Some(now - Duration::minutes(1)),
+                ..Default::default()
+            },
+            now,
+        );
+        let reason = partial.reason.expect("two drives were not read");
+        assert!(reason.contains("2 of 3"), "{reason}");
+        assert!(reason.contains("smartctl"), "{reason}");
+        assert_eq!(partial.drives[0].wear_percent, Some(12.0));
+
+        let complete = NodeDiskHealthResponse::new(
+            0,
+            NodeDiskHealth {
+                reported: true,
+                drives_detected: 1,
+                drives_read: 1,
+                ..Default::default()
+            },
+            now,
+        );
+        assert!(complete.reason.is_none());
+    }
+
+    /// The store keeps returning the last values a node sent after it stops
+    /// reporting, so old health must be called out instead of passing as
+    /// current.
+    #[test]
+    fn disk_health_from_a_node_that_stopped_reporting_is_marked_stale() {
+        use temps_metrics::collector::disk_health::{NodeDiskHealth, RaidArrayStatus};
+
+        let now = Utc::now();
+        let health = |age_minutes: i64| NodeDiskHealth {
+            reported: true,
+            raid_arrays: vec![RaidArrayStatus {
+                name: "md0".into(),
+                degraded: false,
+                devices_failed: 0,
+            }],
+            drives_detected: 1,
+            drives_read: 1,
+            reported_at: Some(now - Duration::minutes(age_minutes)),
+            ..Default::default()
+        };
+
+        let stale = NodeDiskHealthResponse::new(3, health(DISK_HEALTH_MAX_AGE_MINUTES + 50), now);
+        assert!(
+            stale.stale,
+            "old health must be flagged, not only explained"
+        );
+        let reason = stale.reason.expect("old health must be explained");
+        assert!(reason.contains("not reported metrics since"), "{reason}");
+        assert!(reason.contains("not its current state"), "{reason}");
+        assert_eq!(
+            stale.raid_arrays.len(),
+            1,
+            "the last values are still shown"
+        );
+
+        let fresh = NodeDiskHealthResponse::new(3, health(2), now);
+        assert!(!fresh.stale);
+        assert!(fresh.reason.is_none(), "{:?}", fresh.reason);
+    }
+
+    #[test]
+    fn disk_health_endpoint_is_in_the_served_openapi_doc() {
+        use utoipa::OpenApi as _;
+
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+        assert!(
+            served.contains("NodeMetricsGetDiskHealth (/nodes/{id}/metrics/disk-health)"),
+            "disk-health endpoint missing from the served OpenAPI document: {served:?}"
+        );
     }
 
     #[tokio::test]
