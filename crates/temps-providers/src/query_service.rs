@@ -54,6 +54,29 @@ impl PostgresConnectionPolicy {
     }
 }
 
+/// Replace a worker-placed service's loopback `host` with its node's data
+/// address. Every engine but Postgres embeds the host in a URL, where an IPv6
+/// literal must be bracketed; the Postgres source takes a bare host. A host
+/// the operator set explicitly is kept.
+fn use_worker_host(
+    parameters: &mut serde_json::Value,
+    service_type: &crate::externalsvc::ServiceType,
+    data_address: &str,
+) {
+    let Some(params) = parameters.as_object_mut() else {
+        return;
+    };
+    let stored = params.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    if !temps_core::node_address::is_local_service_host(stored) {
+        return;
+    }
+    let host = match service_type {
+        crate::externalsvc::ServiceType::Postgres => data_address.to_string(),
+        _ => temps_core::node_address::url_host(data_address),
+    };
+    params.insert("host".to_string(), serde_json::Value::String(host));
+}
+
 fn postgres_connection_target(
     cluster_primary: Option<(String, u16)>,
     standalone_host: String,
@@ -326,11 +349,35 @@ impl QueryService {
         );
 
         // Get service configuration
-        let service = self
+        let mut service = self
             .external_service_manager
             .get_service_config(service_id)
             .await
             .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
+
+        // A standalone service on a worker node is stored with a loopback
+        // host, which is the wrong machine from here: dial the worker's data
+        // address instead. Cluster services resolve their primary below.
+        let placement = self
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
+        if placement.topology != "cluster" {
+            let worker_address = self
+                .external_service_manager
+                .worker_data_address(&placement)
+                .await
+                .map_err(|e| {
+                    DataError::ConnectionFailed(format!(
+                        "Cannot resolve the node hosting service {}: {}",
+                        service_id, e
+                    ))
+                })?;
+            if let Some(address) = worker_address {
+                use_worker_host(&mut service.parameters, &service.service_type, &address);
+            }
+        }
 
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
@@ -1261,6 +1308,43 @@ impl QueryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::externalsvc::ServiceType;
+
+    /// Regression: a MariaDB service placed on a worker node is stored with
+    /// host `localhost`, so the data explorer dialled the control plane and
+    /// could not open it.
+    #[test]
+    fn worker_placed_mariadb_is_browsed_at_its_node_address() {
+        let mut parameters = serde_json::json!({ "host": "localhost", "port": "33061" });
+        use_worker_host(&mut parameters, &ServiceType::Mariadb, "10.100.0.7");
+        assert_eq!(parameters["host"], "10.100.0.7");
+        assert_eq!(
+            parameters["port"], "33061",
+            "the published host port is kept"
+        );
+    }
+
+    #[test]
+    fn worker_host_is_bracketed_for_url_engines_but_not_postgres() {
+        let mut redis = serde_json::json!({ "host": "127.0.0.1" });
+        use_worker_host(&mut redis, &ServiceType::Redis, "fd00::7");
+        assert_eq!(redis["host"], "[fd00::7]");
+
+        let mut postgres = serde_json::json!({ "host": "localhost" });
+        use_worker_host(&mut postgres, &ServiceType::Postgres, "fd00::7");
+        assert_eq!(postgres["host"], "fd00::7");
+    }
+
+    #[test]
+    fn explicit_service_host_is_kept_on_a_worker() {
+        let mut parameters = serde_json::json!({ "host": "db.internal" });
+        use_worker_host(&mut parameters, &ServiceType::Mariadb, "10.100.0.7");
+        assert_eq!(parameters["host"], "db.internal");
+
+        let mut missing = serde_json::json!({ "port": "3306" });
+        use_worker_host(&mut missing, &ServiceType::Mariadb, "10.100.0.7");
+        assert_eq!(missing["host"], "10.100.0.7", "a missing host means local");
+    }
 
     #[tokio::test]
     async fn vet_query_target_allows_explicit_loopback_for_managed_services() {

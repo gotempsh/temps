@@ -483,23 +483,14 @@ fn worker_data_address(
 /// with a public one — `nodes::Model::data_address`), so that is where the
 /// scraper must dial. A host the operator set explicitly is kept.
 fn use_worker_host(params: &mut ServiceParams, data_address: &str) {
-    let stored = param_str(params, "host");
-    let is_loopback = stored.is_empty()
-        || stored.eq_ignore_ascii_case("localhost")
-        || stored
-            .trim_matches(|c| c == '[' || c == ']')
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
-    if !is_loopback {
+    if !temps_core::node_address::is_local_service_host(&param_str(params, "host")) {
         return;
     }
-    // Every connection string embeds the host in a URL authority, where an
-    // IPv6 literal must be bracketed.
-    let host = match data_address.parse::<std::net::Ipv6Addr>() {
-        Ok(_) => format!("[{data_address}]"),
-        Err(_) => data_address.to_string(),
-    };
-    params.insert("host".to_string(), serde_json::Value::String(host));
+    // Every connection string embeds the host in a URL authority.
+    params.insert(
+        "host".to_string(),
+        serde_json::Value::String(temps_core::node_address::url_host(data_address)),
+    );
 }
 
 /// Scrape an HA (cluster-topology) service at its current primary.

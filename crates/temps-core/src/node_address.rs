@@ -186,9 +186,65 @@ fn registered_host(address: &str) -> Option<String> {
     }
 }
 
+/// Whether a managed service's stored `host` means "the machine the service
+/// runs on" rather than a specific address: empty, `localhost`, a loopback
+/// IP, or the unspecified address (`0.0.0.0`, `::`).
+///
+/// A service placed on a worker node is stored with such a host. The worker's
+/// agent publishes the service's port on the node's data address
+/// (`nodes::Model::data_address`), so anything on the control plane that dials
+/// the service must replace a host like this with that address — dialling it
+/// as-is reaches the control plane instead.
+pub fn is_local_service_host(host: &str) -> bool {
+    let host = host.trim();
+    host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified())
+}
+
+/// `host` ready to embed in a URL authority (`scheme://user@HOST:port`): an
+/// IPv6 literal is bracketed, anything else is returned unchanged.
+pub fn url_host(host: &str) -> String {
+    match host.parse::<std::net::Ipv6Addr>() {
+        Ok(_) => format!("[{host}]"),
+        Err(_) => host.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_service_hosts_are_recognised() {
+        for local in [
+            "",
+            " ",
+            "localhost",
+            "LOCALHOST",
+            "127.0.0.1",
+            "::1",
+            "[::1]",
+            "0.0.0.0",
+            "::",
+        ] {
+            assert!(is_local_service_host(local), "{local:?}");
+        }
+        for remote in ["10.100.0.7", "db.internal", "fd00::7", "mariadb-app"] {
+            assert!(!is_local_service_host(remote), "{remote:?}");
+        }
+    }
+
+    #[test]
+    fn ipv6_hosts_are_bracketed_for_urls() {
+        assert_eq!(url_host("fd00::7"), "[fd00::7]");
+        assert_eq!(url_host("10.100.0.7"), "10.100.0.7");
+        assert_eq!(url_host("db.internal"), "db.internal");
+    }
 
     #[test]
     fn only_rfc1918_and_unique_local_addresses_are_private() {
