@@ -21,6 +21,16 @@
 //! exponential backoff — never a tight loop, never a panic, never a blocking
 //! call on any other path.
 //!
+//! An *established* connection that drops is different: proxies in front of
+//! the backend close idle-looking WebSockets now and then, and the console
+//! marks an instance degraded once heartbeats stop for a few minutes. So a
+//! connection that stayed up for [`STABLE_CONNECTION_INTERVAL`] resets the
+//! backoff and reconnects after [`RECONNECT_AFTER_DROP`], instead of carrying
+//! an old outage's doubled delay forward. The drop is logged at warn level
+//! and the recovery at info level, with how long it took, so a flapping
+//! channel is visible in the instance's own logs rather than only in the
+//! console.
+//!
 //! # Protocol
 //!
 //! `GET {backend}/v1/management`, upgraded to a WebSocket and authenticated
@@ -123,6 +133,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// so recovery — or enrollment — is noticed without a restart.
 const MAX_RECONNECT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// First retry after an established connection drops. Far below
+/// [`HEARTBEAT_INTERVAL`]: the backend is very likely still up (a proxy closed
+/// the socket), and every second spent waiting is a second without
+/// heartbeats. Further failures double from here, as for any other outage.
+const RECONNECT_AFTER_DROP: Duration = Duration::from_secs(5);
+
+/// A handshake alone does not show the backend has recovered: a connection
+/// must stay up this long before its drop resets the backoff. Otherwise a
+/// backend that accepts and immediately closes would be retried every
+/// [`RECONNECT_AFTER_DROP`] forever. Matches `console_proxy`'s threshold.
+const STABLE_CONNECTION_INTERVAL: Duration = Duration::from_secs(30);
+
 /// What a connection cycle did, so the caller knows how to schedule the next
 /// attempt. Mirrors the shape of `temps-cloud::backup_mirror`'s
 /// `SweepOutcome`/`next_sweep_interval`: a fresh instance starts at the base
@@ -135,6 +157,10 @@ enum CycleOutcome {
     /// A connection attempt, the handshake, or an established connection
     /// ended (or never started) for a reason retrying can plausibly fix.
     Disconnected,
+    /// A connection that stayed up for [`STABLE_CONNECTION_INTERVAL`] ended.
+    /// The backend was healthy until moments ago, so the outage backoff
+    /// starts over.
+    Connected,
     /// Shutdown was requested. The caller must stop, not reconnect.
     Cancelled,
 }
@@ -142,6 +168,7 @@ enum CycleOutcome {
 fn next_reconnect_interval(current: Duration, outcome: CycleOutcome) -> Duration {
     match outcome {
         CycleOutcome::Cancelled => Duration::ZERO,
+        CycleOutcome::Connected => RECONNECT_AFTER_DROP,
         CycleOutcome::NotLinked | CycleOutcome::Disconnected if current.is_zero() => {
             HEARTBEAT_INTERVAL
         }
@@ -176,6 +203,7 @@ pub async fn run(
     // process-start timestamp just for this one field.
     let started_at = Instant::now();
     let mut retry_in = Duration::ZERO;
+    let mut outage = Outage::default();
     loop {
         tokio::select! {
             biased;
@@ -192,7 +220,7 @@ pub async fn run(
                     continue;
                 }
                 tracing::debug!("Cloud heartbeat connection cycle starting");
-                let outcome = connection_cycle(&link, &mut cancel, status_provider.as_ref(), started_at).await;
+                let outcome = connection_cycle(&link, &mut cancel, status_provider.as_ref(), started_at, &mut outage).await;
                 tracing::debug!(outcome = ?outcome, "Cloud heartbeat connection cycle finished");
                 if outcome == CycleOutcome::Cancelled {
                     tracing::info!("Cloud heartbeat sender stopped after shutdown request");
@@ -204,6 +232,45 @@ pub async fn run(
     }
 }
 
+/// A lost connection, carried across connection cycles so its recovery is
+/// reported once, with how long it took and how many attempts failed.
+#[derive(Debug, Default)]
+struct Outage {
+    /// When the last established connection dropped (or the first attempt
+    /// failed). `None` while connected or before any attempt.
+    since: Option<Instant>,
+    failed_attempts: u32,
+}
+
+impl Outage {
+    fn attempt_failed(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+    }
+
+    fn connection_dropped(&mut self) {
+        self.since = Some(Instant::now());
+        self.failed_attempts = 0;
+    }
+
+    /// Clear the outage, returning how long it lasted and how many attempts
+    /// failed, or `None` if there was none to recover from.
+    fn recovered(&mut self) -> Option<(Duration, u32)> {
+        let since = self.since.take()?;
+        Some((since.elapsed(), std::mem::take(&mut self.failed_attempts)))
+    }
+}
+
+/// Promote the drop of a long-lived connection to [`CycleOutcome::Connected`]
+/// so the next attempt is not delayed by an earlier outage's backoff.
+fn connection_outcome(outcome: CycleOutcome, connected_for: Duration) -> CycleOutcome {
+    if outcome == CycleOutcome::Disconnected && connected_for >= STABLE_CONNECTION_INTERVAL {
+        CycleOutcome::Connected
+    } else {
+        outcome
+    }
+}
+
 /// Connect, negotiate, then send heartbeats until the connection drops or
 /// shutdown is requested.
 async fn connection_cycle(
@@ -211,6 +278,7 @@ async fn connection_cycle(
     cancel: &mut watch::Receiver<bool>,
     status_provider: Option<&Arc<dyn StatusProvider>>,
     started_at: Instant,
+    outage: &mut Outage,
 ) -> CycleOutcome {
     let (base_url, token) = match link.linked_credential() {
         Ok(credential) => credential,
@@ -227,6 +295,7 @@ async fn connection_cycle(
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(%error, "Cloud heartbeat sender could not parse the managed backend URL");
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
@@ -238,6 +307,7 @@ async fn connection_cycle(
                 %error,
                 "Cloud heartbeat connection failed; local operation is unaffected"
             );
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
@@ -247,15 +317,27 @@ async fn connection_cycle(
         Err(error) => {
             tracing::warn!(%error, "Cloud heartbeat handshake failed; will retry");
             let _ = write.close().await;
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
-    tracing::info!(
-        instance_status_reporting = negotiated.contains(&Capability::InstanceStatusReporting),
-        "Cloud heartbeat connection established and negotiated"
-    );
+    let instance_status_reporting = negotiated.contains(&Capability::InstanceStatusReporting);
+    match outage.recovered() {
+        Some((down_for, failed_attempts)) => tracing::info!(
+            instance_status_reporting,
+            down_for_secs = down_for.as_secs(),
+            failed_attempts,
+            "Cloud heartbeat connection recovered after {}s and {failed_attempts} failed attempt(s)",
+            down_for.as_secs()
+        ),
+        None => tracing::info!(
+            instance_status_reporting,
+            "Cloud heartbeat connection established and negotiated"
+        ),
+    }
 
-    heartbeat_loop(
+    let connected_at = Instant::now();
+    let outcome = heartbeat_loop(
         link,
         instance_id,
         &negotiated,
@@ -265,7 +347,17 @@ async fn connection_cycle(
         &mut read,
         cancel,
     )
-    .await
+    .await;
+    let connected_for = connected_at.elapsed();
+    if outcome == CycleOutcome::Disconnected {
+        outage.connection_dropped();
+        tracing::warn!(
+            connected_for_secs = connected_for.as_secs(),
+            "Cloud heartbeat connection dropped after {}s; reconnecting. Local operation is unaffected",
+            connected_for.as_secs()
+        );
+    }
+    connection_outcome(outcome, connected_for)
 }
 
 async fn connect(backend: &BackendUrl, token: &str) -> Result<(WsWrite, WsRead), HeartbeatError> {
@@ -672,6 +764,63 @@ mod tests {
     }
 
     #[test]
+    fn a_stable_connection_resets_the_backoff() {
+        // An outage has already pushed the delay to the ceiling...
+        let d = next_reconnect_interval(MAX_RECONNECT_INTERVAL, CycleOutcome::Disconnected);
+        assert_eq!(d, MAX_RECONNECT_INTERVAL);
+        // ...then a connection stayed up and a proxy closed it.
+        let outcome = connection_outcome(CycleOutcome::Disconnected, STABLE_CONNECTION_INTERVAL);
+        assert_eq!(outcome, CycleOutcome::Connected);
+        let d = next_reconnect_interval(d, outcome);
+        assert_eq!(
+            d, RECONNECT_AFTER_DROP,
+            "the old outage must not delay this reconnect"
+        );
+        // A failed attempt from here backs off again, starting low.
+        assert_eq!(
+            next_reconnect_interval(d, CycleOutcome::Disconnected),
+            RECONNECT_AFTER_DROP * 2
+        );
+    }
+
+    #[test]
+    fn a_short_lived_connection_keeps_backing_off() {
+        // A backend that accepts and closes straight away must not be
+        // retried every few seconds forever.
+        let mut d = HEARTBEAT_INTERVAL;
+        for _ in 0..20 {
+            let outcome = connection_outcome(CycleOutcome::Disconnected, Duration::from_secs(1));
+            assert_eq!(outcome, CycleOutcome::Disconnected);
+            d = next_reconnect_interval(d, outcome);
+        }
+        assert_eq!(d, MAX_RECONNECT_INTERVAL);
+    }
+
+    #[test]
+    fn only_a_disconnect_is_promoted_to_connected() {
+        for outcome in [CycleOutcome::Cancelled, CycleOutcome::NotLinked] {
+            assert_eq!(connection_outcome(outcome, MAX_RECONNECT_INTERVAL), outcome);
+        }
+    }
+
+    #[test]
+    fn an_outage_reports_its_recovery_once() {
+        let mut outage = Outage::default();
+        assert!(outage.recovered().is_none(), "nothing to recover from yet");
+
+        outage.connection_dropped();
+        outage.attempt_failed();
+        outage.attempt_failed();
+        let (_, failed_attempts) = outage.recovered().expect("an outage was recorded");
+        assert_eq!(failed_attempts, 2);
+        assert!(outage.recovered().is_none(), "recovery is reported once");
+
+        // A first connection that never succeeded is an outage too.
+        outage.attempt_failed();
+        assert_eq!(outage.recovered().map(|(_, n)| n), Some(1));
+    }
+
+    #[test]
     fn cancellation_never_schedules_a_reconnect() {
         assert_eq!(
             next_reconnect_interval(MAX_RECONNECT_INTERVAL, CycleOutcome::Cancelled),
@@ -871,7 +1020,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -920,7 +1076,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -955,7 +1118,13 @@ mod tests {
         let mut cancel = cancel_rx;
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            connection_cycle(&link, &mut cancel, None, Instant::now()),
+            connection_cycle(
+                &link,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            ),
         )
         .await
         .expect("the cycle must end once the server closes the socket");
@@ -978,7 +1147,14 @@ mod tests {
         // Never configured or enrolled.
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut cancel = cancel_rx;
-        let outcome = connection_cycle(&link, &mut cancel, None, Instant::now()).await;
+        let outcome = connection_cycle(
+            &link,
+            &mut cancel,
+            None,
+            Instant::now(),
+            &mut Outage::default(),
+        )
+        .await;
         assert_eq!(outcome, CycleOutcome::NotLinked);
     }
 
@@ -1061,6 +1237,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1109,7 +1286,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1160,6 +1344,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1220,6 +1405,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1339,6 +1525,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1412,6 +1599,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
