@@ -5103,6 +5103,13 @@ export type ClusterDnsSettings = {
      * `*.temps.local` FQDNs resolve inside containers.
      */
     enabled?: boolean;
+    /**
+     * Whether an operator has ever changed `enabled` themselves. Until then,
+     * the control plane turns cluster DNS on when the first worker joins,
+     * since cross-node links need `*.temps.local`. Set by the server when a
+     * save changes `enabled`; a client cannot clear it.
+     */
+    operator_chosen?: boolean;
 };
 
 /**
@@ -5116,6 +5123,19 @@ export type ClusterDnsStatusResponse = {
      * Some(false)` (or `None` if a node has never reported).
      */
     cluster_dns_enabled: boolean;
+    /**
+     * Applications whose running containers were created without the
+     * cluster resolver, so they cannot resolve `*.temps.local` names until
+     * redeployed: a container's nameservers are fixed when it is created.
+     * Empty while cluster DNS is off. Databases are not listed; they do not
+     * look up other services by name.
+     */
+    deployments_without_resolver: Array<DeploymentWithoutResolver>;
+    /**
+     * Set when the list above could not be computed; the rest of the
+     * response is still accurate.
+     */
+    deployments_without_resolver_error?: string | null;
     /**
      * Names refused because another owner holds them. Empty on a healthy
      * cluster; each entry needs one side renamed or removed.
@@ -10089,6 +10109,23 @@ export type DeploymentTokenResponse = {
     permissions?: Array<string> | null;
     project_id: number;
     token_prefix: string;
+};
+
+/**
+ * An application whose running containers were created without the
+ * cluster resolver. Redeploying it gives the new containers the resolver.
+ */
+export type DeploymentWithoutResolver = {
+    deployment_id: number;
+    environment_id: number;
+    environment_name: string;
+    /**
+     * Hosts running one of its containers without the resolver.
+     */
+    hosts: Array<ResolverCoverageHost>;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
 };
 
 /**
@@ -15712,6 +15749,13 @@ export type HeartbeatApiRequest = {
      */
     containers?: Array<ContainerInventoryItem> | null;
     /**
+     * Deployment ids with a container on this node created without the
+     * node's cluster resolver, so it cannot resolve `*.temps.local` until
+     * redeployed. Empty while cluster DNS is off; absent from older agents,
+     * which leaves the stored value untouched.
+     */
+    deployments_without_resolver?: Array<number> | null;
+    /**
      * Software RAID and drive SMART health read by the agent
      * (`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw
      * JSON here and parsed after the heartbeat is recorded, so a malformed
@@ -19907,9 +19951,10 @@ export type NodeNetworkPolicyModeResponse = {
     role: string;
     status: string;
     /**
-     * Whether this node can run `shadow` or `enforce`. False on workers:
-     * no enforcer runs there yet, and a stored non-legacy mode on a worker
-     * is never counted as enforcing.
+     * Whether this node can run `shadow` or `enforce`: always on the
+     * control plane, on a worker while its agent reports an enforcer. A
+     * stored non-legacy mode on a node without one is never counted as
+     * enforcing.
      */
     supports_enforcement: boolean;
 };
@@ -25786,6 +25831,17 @@ export type ResolvedEnvVarSource = {
 } | {
     service: EnvVarIntegrationInfo;
     type: 'integration';
+};
+
+/**
+ * Where a stale deployment runs: the control plane or a worker.
+ */
+export type ResolverCoverageHost = {
+    /**
+     * `None` for the control plane, which has no node row.
+     */
+    node_id?: number | null;
+    node_name: string;
 };
 
 /**

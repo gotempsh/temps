@@ -3497,6 +3497,13 @@ async fn update_settings(
         cloud_fields_sent,
     );
 
+    // An operator who flips cluster DNS has decided; a worker joining later
+    // must not turn it back on.
+    settings.cluster_dns = temps_core::ClusterDnsSettings::after_operator_save(
+        &stored_settings.cluster_dns,
+        &settings.cluster_dns,
+    );
+
     // Checked on the merged document so a partial save that turns on one
     // provider while the other is stored as on is still caught.
     validate_delivery_defaults(&app_state.config_service, &stored_settings, &settings).await?;

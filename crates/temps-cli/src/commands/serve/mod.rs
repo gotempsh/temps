@@ -1254,6 +1254,10 @@ impl ServeCommand {
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
         let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        // Node 0's network policy view: the enforcer (NetworkPolicyPlugin)
+        // writes it, the proxy-owned resolver answers restricted workloads
+        // from it. Both run in this process.
+        let dns_policy_slot = temps_dns::open_dns_policy_slot();
 
         // Resolve proxy enforcement before console startup. These builders are
         // the same extension boundary used by standalone `temps proxy`; they
@@ -1314,6 +1318,7 @@ impl ServeCommand {
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             request_policy_gate_slot: request_policy_gate_slot.clone(),
             overlay_dns_slot: overlay_dns_slot.clone(),
+            dns_policy_slot: dns_policy_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
@@ -1466,6 +1471,7 @@ impl ServeCommand {
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
             overlay_dns_slot,
+            Some(dns_policy_slot),
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,

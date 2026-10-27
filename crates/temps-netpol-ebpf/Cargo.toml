@@ -1,0 +1,39 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# The network policy eBPF programs (network access plan, §4.15). Built for
+# `bpfel-unknown-none` with nightly Rust and `bpf-linker`, so it is its own
+# workspace: the main workspace never compiles it for the host. The loader in
+# `temps-workload-netpol` builds it from its build script when the `ebpf`
+# feature is on, and embeds the object in the binary.
+[package]
+name = "temps-netpol-ebpf"
+description = "Network policy eBPF programs: cgroup socket and skb hooks keyed by workload identity"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Temps Contributors"]
+repository = "https://github.com/gotempsh/temps"
+homepage = "https://github.com/gotempsh/temps"
+publish = false
+
+[workspace]
+
+[dependencies]
+aya-ebpf = "0.2"
+temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common" }
+
+[[bin]]
+name = "temps-netpol-ebpf"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+debug = 2
+panic = "abort"
+codegen-units = 1
+lto = true
+
+[profile.dev]
+panic = "abort"
+opt-level = 3

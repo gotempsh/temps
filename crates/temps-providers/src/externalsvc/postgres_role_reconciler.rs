@@ -40,7 +40,7 @@ use std::time::Duration;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_dns::{DnsRegistry, EndpointDraft, InternalOwnerKind, InternalRecordType};
-use temps_entities::service_members;
+use temps_entities::{service_endpoints, service_members};
 use thiserror::Error;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -128,6 +128,12 @@ pub struct MonitorNode {
     /// `primary`, `single`, `secondary`, `wait_primary`, `catchingup`,
     /// `apply_settings`, `draining`, `demoted`, …
     pub reported_state: String,
+    /// What the monitor wants the node to become. A node that stopped keeps
+    /// its last `reported_state` forever; the goal is where the monitor's
+    /// decision to demote it shows.
+    pub goal_state: String,
+    /// The monitor's health check: -1 not checked yet, 0 failing, 1 ok.
+    pub health: i32,
 }
 
 impl MonitorNode {
@@ -138,16 +144,40 @@ impl MonitorNode {
         self.reported_state.parse().expect("Infallible")
     }
 
-    fn is_primary(&self) -> bool {
-        self.state().is_primary()
+    /// Parsed view of `goal_state`.
+    pub fn goal(&self) -> super::PgAutoFailoverState {
+        self.goal_state.parse().expect("Infallible")
     }
 
+    /// A failing health check: -1 (not checked yet) is not a failure.
+    fn unhealthy(&self) -> bool {
+        self.health == 0
+    }
+
+    /// Writable now: it says it is primary, the monitor still wants it to
+    /// be, and it answers. A primary that crashed keeps reporting `primary`
+    /// after the monitor promoted another node and set its goal to
+    /// `demoted`; judging by the report alone, the lower node id would keep
+    /// `primary.<svc>` on a node that is gone.
+    fn is_primary(&self) -> bool {
+        self.state().is_primary() && self.goal().is_primary() && !self.unhealthy()
+    }
+
+    /// Readable now, and not being taken out by the monitor.
     fn is_secondary(&self) -> bool {
         self.state().is_secondary()
+            && !self.unhealthy()
+            && !matches!(
+                self.goal(),
+                super::PgAutoFailoverState::Draining
+                    | super::PgAutoFailoverState::Demoted
+                    | super::PgAutoFailoverState::DemoteTimeout
+                    | super::PgAutoFailoverState::DropNode
+            )
     }
 
     fn is_data_member(&self) -> bool {
-        self.state().is_data_member()
+        self.is_primary() || self.is_secondary()
     }
 }
 
@@ -299,36 +329,21 @@ pub async fn reconcile_once(
         .find(|m| super::ClusterRole::from_str(&m.role).ok() == Some(super::ClusterRole::Monitor))
         .ok_or(ReconcilerError::MonitorMissing { service_id })?;
 
-    // The monitor must be reachable from the control plane. Resolution
-    // priority:
-    //   1. `compute_ip` (overlay IP) — only useful if the control plane
-    //      itself is on the overlay, which it isn't in the dev cluster
-    //      and typically isn't in production either.
-    //   2. `nodes.private_address` — the worker's underlay IP, always
-    //      reachable from the control plane.
-    //   3. IPv4 loopback — single-host clusters where the monitor runs on
-    //      the control-plane host and binds the host port. Do not use
-    //      `localhost`: Ubuntu may resolve it to ::1 while Docker publishes
-    //      this port only on 127.0.0.1.
-    //
-    // We deliberately do NOT fall back to `member.hostname` (the FQDN)
-    // because it only resolves on hosts running the per-node Hickory
-    // resolver — and the control plane doesn't run one.
-    let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
-        ip.to_string()
-    } else if let Some(node_id) = monitor.node_id {
-        match temps_entities::nodes::Entity::find_by_id(node_id)
-            .one(db)
-            .await
-        {
-            Ok(Some(n)) => n.data_address().to_string(),
-            _ => {
-                return Err(ReconcilerError::MonitorNotReady { service_id });
-            }
-        }
-    } else {
-        crate::services::LOCAL_CLUSTER_HOST.to_string()
-    };
+    // The monitor must be reachable from the control plane: the worker's data
+    // address (or loopback for a control-plane monitor) plus its published
+    // port. Not `compute_ip`, which only routes on the workload overlay, and
+    // not `member.hostname` (the FQDN), which only resolves on hosts running
+    // the per-node resolver.
+    let monitor_host = crate::services::control_plane_member_dial_host(
+        db,
+        monitor.node_id,
+        &monitor.container_name,
+    )
+    .await
+    .map_err(|reason| {
+        warn!(service_id, reason = %reason, "Cluster monitor address is not known yet");
+        ReconcilerError::MonitorNotReady { service_id }
+    })?;
     let monitor_port = monitor.port.unwrap_or(5432);
 
     // Build {nodehost → compute_ip} for the role-record DNS targets.
@@ -409,6 +424,15 @@ pub async fn reconcile_once(
         let _ = registry
             .delete_by_owner(InternalOwnerKind::ServiceRole, service_id as i64)
             .await;
+        return Ok(());
+    }
+
+    // Every write bumps the zone generation, which wakes every node's
+    // resolver sync. A steady cluster must not do that every tick.
+    let current = registry
+        .list_by_owner(InternalOwnerKind::ServiceRole, service_id as i64)
+        .await?;
+    if already_published(&current, &drafts) {
         return Ok(());
     }
 
@@ -525,13 +549,13 @@ async fn query_monitor(
 
     let rows = client
         .query(
-            // Cast `reportedstate` to text — pg_auto_failover stores it as
+            // Cast the states to text — pg_auto_failover stores them as
             // a typed enum (`pgautofailover.replication_state`) that
             // tokio-postgres can't auto-deserialize to String, leading to
             // "error retrieving column reportedstate: error deserializing
             // column 4". The cast forces wire-format text.
             "SELECT nodeid::bigint, nodename, nodehost, \
-                    nodeport::int, reportedstate::text \
+                    nodeport::int, reportedstate::text, goalstate::text, health::int \
              FROM pgautofailover.node",
             &[],
         )
@@ -556,12 +580,16 @@ async fn query_monitor(
         let nodehost: String = row.get("nodehost");
         let nodeport: i32 = row.get("nodeport");
         let reported_state: String = row.get("reportedstate");
+        let goal_state: String = row.get("goalstate");
+        let health: i32 = row.get("health");
         out.push(MonitorNode {
             nodeid,
             nodename,
             nodehost,
             nodeport,
             reported_state,
+            goal_state,
+            health,
         });
     }
     Ok(out)
@@ -639,9 +667,99 @@ async fn run_loop<F, Fut>(
     }
 }
 
+/// Whether `current` holds exactly the records `drafts` would write.
+fn already_published(current: &[service_endpoints::Model], drafts: &[EndpointDraft]) -> bool {
+    type Key = (
+        String,
+        String,
+        Option<String>,
+        Option<i32>,
+        i32,
+        Option<i32>,
+    );
+    let fqdn = |name: &str| name.trim().trim_end_matches('.').to_ascii_lowercase();
+    let mut have: Vec<Key> = current
+        .iter()
+        .map(|row| {
+            (
+                fqdn(&row.fqdn),
+                row.record_type.clone(),
+                row.target_ip.clone(),
+                row.target_port,
+                row.ttl,
+                row.node_id,
+            )
+        })
+        .collect();
+    let mut want: Vec<Key> = drafts
+        .iter()
+        .map(|draft| {
+            (
+                fqdn(&draft.fqdn),
+                draft.record_type.as_str().to_string(),
+                draft.target_ip.clone(),
+                draft.target_port,
+                draft.ttl,
+                draft.node_id,
+            )
+        })
+        .collect();
+    have.sort();
+    want.sort();
+    have == want
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn published(draft: &EndpointDraft) -> service_endpoints::Model {
+        let now = chrono::Utc::now();
+        service_endpoints::Model {
+            id: 1,
+            fqdn: format!("{}.", draft.fqdn.to_uppercase()),
+            record_type: draft.record_type.as_str().to_string(),
+            target_ip: draft.target_ip.clone(),
+            target_port: draft.target_port,
+            ttl: draft.ttl,
+            owner_kind: draft.owner_kind.as_str().to_string(),
+            owner_id: draft.owner_id,
+            node_id: draft.node_id,
+            generation: 9,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn unchanged_records_are_not_written_again() {
+        let drafts = drafts_for_snapshot(
+            7,
+            "orders",
+            &[
+                node(1, "10.0.0.1", 6061, "primary"),
+                node(2, "10.0.0.2", 6062, "secondary"),
+            ],
+            &ip_map(&[("10.0.0.1", "172.20.5.10"), ("10.0.0.2", "172.20.5.11")]),
+        );
+        let mut current: Vec<_> = drafts.iter().map(published).collect();
+        current.reverse();
+        assert!(
+            already_published(&current, &drafts),
+            "same records, any order or case"
+        );
+
+        current[0].target_ip = Some("172.20.5.99".into());
+        assert!(
+            !already_published(&current, &drafts),
+            "a moved address is written"
+        );
+        assert!(
+            !already_published(&current[1..], &drafts),
+            "a missing record is written"
+        );
+        assert!(!already_published(&[], &drafts));
+    }
 
     fn node(id: i64, host: &str, port: i32, state: &str) -> MonitorNode {
         MonitorNode {
@@ -650,7 +768,68 @@ mod tests {
             nodehost: host.to_string(),
             nodeport: port,
             reported_state: state.to_string(),
+            goal_state: state.to_string(),
+            health: 1,
         }
+    }
+
+    /// The state the monitor shows after the primary's container stopped:
+    /// the old primary still reports `primary` but its goal is `demoted`,
+    /// and the standby it promoted is `wait_primary`.
+    #[test]
+    fn a_crashed_primary_loses_the_primary_record_to_the_promoted_node() {
+        let mut crashed = node(1, "10.0.0.1", 6061, "primary");
+        crashed.goal_state = "demoted".into();
+        let promoted = node(2, "10.0.0.2", 6062, "wait_primary");
+        assert!(!crashed.is_primary());
+        assert!(!crashed.is_data_member());
+        assert!(promoted.is_primary());
+
+        let drafts = drafts_for_snapshot(
+            7,
+            "orders",
+            &[crashed, promoted],
+            &ip_map(&[("10.0.0.1", "172.20.5.10"), ("10.0.0.2", "172.20.5.11")]),
+        );
+        let primary: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.fqdn == "primary.orders.temps.local")
+            .map(|d| (d.target_ip.as_deref(), d.target_port))
+            .collect();
+        assert_eq!(primary, vec![(Some("172.20.5.11"), Some(6062))]);
+        let vip: Vec<_> = drafts
+            .iter()
+            .filter(|d| d.fqdn == "orders.temps.local")
+            .filter_map(|d| d.target_ip.as_deref())
+            .collect();
+        assert_eq!(
+            vip,
+            vec!["172.20.5.11"],
+            "the stopped node leaves the VIP too"
+        );
+    }
+
+    #[test]
+    fn a_failing_health_check_disqualifies_a_node() {
+        let mut primary = node(1, "h", 1, "primary");
+        primary.health = 0;
+        assert!(
+            !primary.is_primary(),
+            "every node died: no writable primary"
+        );
+        let mut replica = node(2, "h", 2, "secondary");
+        replica.health = 0;
+        assert!(!replica.is_secondary());
+        let mut unchecked = node(3, "h", 3, "secondary");
+        unchecked.health = -1;
+        assert!(unchecked.is_secondary(), "not checked yet is not failing");
+    }
+
+    #[test]
+    fn a_draining_replica_is_not_offered_for_reads() {
+        let mut draining = node(2, "h", 2, "secondary");
+        draining.goal_state = "drop_node".into();
+        assert!(!draining.is_secondary());
     }
 
     fn ip_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {

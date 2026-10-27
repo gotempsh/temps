@@ -18,12 +18,14 @@
 pub mod error;
 pub mod handlers;
 pub mod model;
+pub mod node_api;
 pub mod plugin;
 pub mod service;
 pub mod source;
 
 pub use error::NetworkPolicyError;
 pub use handlers::NetworkPolicyApiDoc;
+pub use node_api::{node_routes, NetworkPolicyNodeState};
 pub use plugin::NetworkPolicyPlugin;
 pub use service::NetworkPolicyService;
 pub use source::DbPolicySource;

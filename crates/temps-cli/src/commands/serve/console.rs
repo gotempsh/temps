@@ -2001,6 +2001,10 @@ pub struct ConsoleApiParams {
     /// deployer reads this slot for each new container and never assumes that
     /// an enabled setting means a listener actually started.
     pub overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    /// Node 0's network policy view. `NetworkPolicyPlugin`'s enforcer
+    /// stores a snapshot after each pass; the proxy-owned resolver answers
+    /// restricted workloads from the same slot.
+    pub dns_policy_slot: temps_dns::DnsPolicySlot,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -3592,6 +3596,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         project_ip_gate_slot,
         request_policy_gate_slot,
         overlay_dns_slot,
+        dns_policy_slot,
         update_status,
         self_updater,
         traefik_discovery,
@@ -3771,6 +3776,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(project_ip_gate_slot.clone());
     service_context.register_service(request_policy_gate_slot.clone());
     service_context.register_service(overlay_dns_slot);
+    service_context.register_service(dns_policy_slot);
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.
@@ -5208,6 +5214,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 .require_service::<temps_ingress::IngressConnectorService>(),
         }));
 
+    // Node-token endpoint for worker network policy enforcers.
+    let network_policy_node_routes =
+        temps_network_policy::node_routes(Arc::new(temps_network_policy::NetworkPolicyNodeState {
+            db: db.clone(),
+            service: plugin_manager
+                .service_context()
+                .require_service::<temps_network_policy::NetworkPolicyService>(),
+        }));
+
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
     let split = plugin_manager
@@ -5345,7 +5360,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .public
         .merge(node_routes)
         .merge(route_sync_routes)
-        .merge(ingress_node_routes);
+        .merge(ingress_node_routes)
+        .merge(network_policy_node_routes);
 
     // Use the caller-supplied admin-gate when present (so the proxy and the
     // console share one source of truth) and otherwise build a fresh one.

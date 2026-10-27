@@ -15,6 +15,7 @@ mod exec_timeout;
 pub mod handlers;
 pub mod internal_proxy;
 pub mod mesh_listener;
+pub mod network_policy;
 pub mod network_sync;
 pub mod node_runtime;
 mod output_buffer;

@@ -17,6 +17,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bollard::models::{
@@ -220,6 +221,10 @@ pub struct DockerDriver {
     /// Where per-instance secret directories live (`<root>/<instance>`).
     /// `None`: specs with secret files are refused.
     secrets_root: Option<PathBuf>,
+    /// Whether the daemon places containers with systemd on cgroup v2, so a
+    /// workload slice can be their cgroup parent. Asked once, on the first
+    /// create.
+    slices: Arc<tokio::sync::OnceCell<bool>>,
 }
 
 impl DockerDriver {
@@ -228,6 +233,7 @@ impl DockerDriver {
             docker,
             capabilities: capabilities(),
             secrets_root: None,
+            slices: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -313,11 +319,54 @@ impl DockerDriver {
         self.create_from_body(spec, body).await
     }
 
+    /// Whether the daemon uses the systemd cgroup driver on cgroup v2: then
+    /// a slice name as cgroup parent nests the container's scope under it,
+    /// and systemd creates the slice when the first container starts.
+    async fn supports_slices(&self) -> bool {
+        *self
+            .slices
+            .get_or_init(|| async {
+                match self.docker.info().await {
+                    Ok(info) => {
+                        let systemd = matches!(
+                            info.cgroup_driver,
+                            Some(bollard::models::SystemInfoCgroupDriverEnum::SYSTEMD)
+                        );
+                        let v2 = matches!(
+                            info.cgroup_version,
+                            Some(bollard::models::SystemInfoCgroupVersionEnum::_2)
+                        );
+                        tracing::info!(
+                            systemd,
+                            cgroup_v2 = v2,
+                            "workload slices {}",
+                            if systemd && v2 { "enabled" } else { "unavailable on this daemon" }
+                        );
+                        systemd && v2
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "could not read the Docker daemon's cgroup driver; workload slices disabled");
+                        false
+                    }
+                }
+            })
+            .await
+    }
+
     async fn create_from_body(
         &self,
         spec: &InstanceSpec,
-        body: ContainerCreateBody,
+        mut body: ContainerCreateBody,
     ) -> Result<InstanceHandle, DriverError> {
+        // Each workload's containers share a slice, so network policy can
+        // identify them by cgroup from their first instruction (network
+        // access plan, §4.15).
+        if let Some(subject) = temps_workload::labels::policy_subject(spec.owner, &spec.labels) {
+            let host = body.host_config.get_or_insert_with(Default::default);
+            if host.cgroup_parent.is_none() && self.supports_slices().await {
+                host.cgroup_parent = Some(temps_workload::labels::workload_slice(subject));
+            }
+        }
         let mut options = CreateContainerOptionsBuilder::new().name(&spec.name);
         if let Some(platform) = &spec.platform {
             options = options.platform(platform);

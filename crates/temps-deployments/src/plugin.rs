@@ -108,33 +108,19 @@ impl DeploymentsPlugin {
         let mut config = temps_workload_plane::PlaneConfig::new("temps");
         config.network = Some(temps_core::NETWORK_NAME.clone());
         config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
-        // ADR-024: the same opt-in and proxy-owned resolver slot the legacy
-        // deployer injects, so a replica the plane starts here resolves
-        // `*.temps.local` exactly as a legacy one does. Off (Docker's
-        // embedded DNS) unless the operator enabled cluster DNS.
+        // ADR-024: the same proxy-owned resolver slot the legacy deployer
+        // injects, so a replica the plane starts here resolves `*.temps.local`
+        // exactly as a legacy one does. The slot holds an address only while
+        // cluster DNS is enabled and the resolver answers, so turning the
+        // setting on or off needs no restart; while it is empty, replicas
+        // keep Docker's embedded DNS.
         if local_workloads.local_workloads_enabled() {
-            let enabled = match context
-                .require_service::<temps_config::ConfigService>()
-                .get_settings()
-                .await
-            {
-                Ok(settings) => settings.cluster_dns.enabled,
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not read settings ({e}); workloads the plane starts on this \
-                         host keep Docker's embedded DNS until restart"
-                    );
-                    false
-                }
-            };
-            if enabled {
-                match context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>() {
-                    Some(slot) => config.cluster_dns = Some(cluster_dns_resolver(slot)),
-                    None => tracing::warn!(
-                        "cluster DNS enabled but no proxy resolver slot is registered; \
-                         workloads the plane starts keep Docker's embedded DNS"
-                    ),
-                }
+            match context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>() {
+                Some(slot) => config.cluster_dns = Some(cluster_dns_resolver(slot)),
+                None => tracing::warn!(
+                    "no proxy resolver slot is registered; workloads the plane starts keep \
+                     Docker's embedded DNS even when cluster DNS is enabled"
+                ),
             }
         }
         let placement = context.get_service::<crate::services::WorkloadPlacementService>();
@@ -1214,6 +1200,24 @@ impl TempsPlugin for DeploymentsPlugin {
         // control-plane process (no local daemon) never panics at boot.
         let docker_for_exec = context.require_service::<temps_core::DockerHandle>();
 
+        // ADR-024: which applications still run without the cluster resolver.
+        // The proxy's resolver slot exists only in a process that runs
+        // workloads; without it, only workers' heartbeat reports are listed.
+        let resolver_slot = if temps_core::policy_or_default(
+            context.get_service::<temps_core::LocalWorkloadPolicy>(),
+        )
+        .local_workloads_enabled()
+        {
+            context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
+        } else {
+            None
+        };
+        let resolver_coverage = Arc::new(crate::services::ResolverCoverageService::new(
+            db.clone(),
+            docker_for_exec.clone(),
+            resolver_slot,
+        ));
+
         // Resolves the per-managed-domain public hostname strategy. Falls back to
         // the Standard resolver when no DNS provider plugin registered one.
         let hostname_resolver = context
@@ -1305,6 +1309,7 @@ impl TempsPlugin for DeploymentsPlugin {
             config_service: config_service.clone(),
             docker: docker_for_exec,
             docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
+            resolver_coverage,
             deployment_gate,
             project_access_checker,
             hostname_resolver,

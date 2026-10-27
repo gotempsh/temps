@@ -9166,7 +9166,11 @@ ORDER BY a.opened_at DESC
             .map_err(|source| super::BackupCapabilityError::LoadService { service_id, source })?
             .ok_or(super::BackupCapabilityError::ServiceNotFound { service_id })?;
 
-        Ok(super::capability::probe_external_service_backup_capability(&service).await)
+        Ok(super::capability::probe_external_service_backup_capability(
+            &service,
+            &self.external_service_manager,
+        )
+        .await)
     }
 
     pub async fn backup_external_service(

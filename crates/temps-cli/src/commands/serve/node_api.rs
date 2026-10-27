@@ -418,6 +418,9 @@ fn is_node_route(path: &str) -> bool {
                 | "ingress/status"
                 | "public-ingress/key"
                 | "public-ingress/report"
+                | "network-policy"
+                | "dns/changes"
+                | "dns/ack"
         ) || route.strip_prefix("s3-credentials/").is_some_and(is_id))
 }
 
@@ -779,6 +782,9 @@ mod tests {
             "/api/internal/nodes/7/routes/ack",
             "/api/internal/nodes/7/acme-challenge",
             "/api/internal/nodes/7/s3-credentials/2",
+            "/api/internal/nodes/7/network-policy",
+            "/api/internal/nodes/7/dns/changes",
+            "/api/internal/nodes/7/dns/ack",
         ] {
             assert!(is_node_route(allowed), "{allowed}");
         }
@@ -788,6 +794,9 @@ mod tests {
             "/api/internal/nodes/7/drain",
             "/api/internal/nodes/7/containers",
             "/api/internal/nodes/abc/heartbeat",
+            "/api/internal/nodes/7/network-policy/x",
+            "/api/internal/nodes/7/dns",
+            "/api/internal/nodes/7/dns/changes/x",
             "/api/nodes/pairings",
             "/api/settings",
             "/",

@@ -360,6 +360,12 @@ pub struct HeartbeatApiRequest {
     /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
     #[serde(default)]
     pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
+    /// Deployment ids with a container on this node created without the
+    /// node's cluster resolver, so it cannot resolve `*.temps.local` until
+    /// redeployed. Empty while cluster DNS is off; absent from older agents,
+    /// which leaves the stored value untouched.
+    #[serde(default)]
+    pub deployments_without_resolver: Option<Vec<i64>>,
 }
 
 /// Read `instances`, dropping entries this version cannot decode (a newer
@@ -744,6 +750,15 @@ pub struct ClusterDnsStatusResponse {
     /// Names refused because another owner holds them. Empty on a healthy
     /// cluster; each entry needs one side renamed or removed.
     pub name_conflicts: Vec<DnsNameConflictEntry>,
+    /// Applications whose running containers were created without the
+    /// cluster resolver, so they cannot resolve `*.temps.local` names until
+    /// redeployed: a container's nameservers are fixed when it is created.
+    /// Empty while cluster DNS is off. Databases are not listed; they do not
+    /// look up other services by name.
+    pub deployments_without_resolver: Vec<crate::services::DeploymentWithoutResolver>,
+    /// Set when the list above could not be computed; the rest of the
+    /// response is still accurate.
+    pub deployments_without_resolver_error: Option<String>,
 }
 
 #[derive(OpenApi)]
@@ -818,6 +833,8 @@ pub struct ClusterDnsStatusResponse {
         NodeDnsStatusEntry,
         DnsNameConflictEntry,
         ClusterDnsStatusResponse,
+        crate::services::DeploymentWithoutResolver,
+        crate::services::ResolverCoverageHost,
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
@@ -1650,6 +1667,51 @@ async fn authorize_enrollment<'a>(
     }
 }
 
+/// Turn cluster DNS on now that the cluster has a worker, unless an operator
+/// has decided either way. Best-effort, like the overlay setup above: a
+/// failure is logged and the join goes on; the operator can still turn it on
+/// in Settings.
+async fn enable_cluster_dns_for_worker(
+    app_state: &NodeAppState,
+    node: &temps_entities::nodes::Model,
+    peer: std::net::SocketAddr,
+) {
+    match app_state
+        .config_service
+        .enable_cluster_dns_for_worker()
+        .await
+    {
+        Ok(false) => {}
+        Ok(true) => {
+            info!(
+                node_id = node.id,
+                node = %node.name,
+                "Turned cluster DNS on: the cluster has a worker, and no operator had set it"
+            );
+            let audit = crate::handlers::audit::ClusterDnsEnabledForWorkerAudit {
+                context: AuditContext {
+                    // No user made this change; `0` is the convention for an
+                    // actor that isn't one.
+                    user_id: 0,
+                    ip_address: Some(peer.ip().to_string()),
+                    user_agent: format!("temps-agent/node-{}", node.id),
+                },
+                node_id: node.id,
+                node_name: node.name.clone(),
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(node_id = node.id, "Failed to create audit log: {}", error);
+            }
+        }
+        Err(error) => warn!(
+            node_id = node.id,
+            node = %node.name,
+            %error,
+            "Could not turn cluster DNS on for the new worker; it stays off until an operator enables it in Settings"
+        ),
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1929,6 +1991,7 @@ async fn register_node_inner(
         .node_service
         .remediate_overlay_allocation(node.id)
         .await;
+    enable_cluster_dns_for_worker(&app_state, &node, addr).await;
 
     Ok((
         StatusCode::CREATED,
@@ -2593,6 +2656,7 @@ async fn node_heartbeat(
         occupied_ranges: request
             .occupied_ranges
             .map(|reports| occupied_ranges_from_report(Some(node_id), reports)),
+        deployments_without_resolver: request.deployments_without_resolver,
     };
 
     let architecture_change = app_state
@@ -3577,6 +3641,25 @@ async fn cluster_dns_status(
         .await
         .map_err(Problem::from)?;
 
+    // Best-effort like the setting read above: a Docker or lookup failure
+    // costs this list, not the resolver health the page exists for.
+    let (deployments_without_resolver, deployments_without_resolver_error) = if cluster_dns_enabled
+    {
+        match app_state
+            .resolver_coverage
+            .deployments_without_resolver(&nodes)
+            .await
+        {
+            Ok(list) => (list, None),
+            Err(error) => {
+                warn!("{}", error);
+                (Vec::new(), Some(error.to_string()))
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
+
     let now = chrono::Utc::now();
     let node_entries = nodes
         .into_iter()
@@ -3608,6 +3691,8 @@ async fn cluster_dns_status(
         total_record_count,
         nodes: node_entries,
         name_conflicts,
+        deployments_without_resolver,
+        deployments_without_resolver_error,
     }))
 }
 
@@ -5931,6 +6016,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

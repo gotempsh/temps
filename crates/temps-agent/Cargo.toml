@@ -10,6 +10,11 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = []
+# Embeds the network policy eBPF programs; see temps-workload-netpol.
+ebpf = ["temps-workload-netpol/ebpf"]
+
 [dependencies]
 temps-runtime-health = { path = "../temps-runtime-health" }
 arc-swap = { workspace = true }
@@ -47,6 +52,7 @@ temps-providers = { path = "../temps-providers" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-node = { path = "../temps-workload-node" }
 temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
 temps-metrics = { path = "../temps-metrics" }
 ipnet = "2.10"
 hickory-resolver = "0.26"

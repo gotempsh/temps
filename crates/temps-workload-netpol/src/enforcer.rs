@@ -42,6 +42,11 @@ use tracing::{debug, info, warn};
 
 use crate::binding::{compile_bindings, node_removal_ruleset, BindingError, PortBinding};
 use crate::dns::{Alias, DnsPolicy, NamedWorkload};
+use crate::ebpf::{
+    cgroup_target, compile_datapath, describe_identity, CgroupDatapath, CgroupHost, CgroupTarget,
+    DatapathCompileError, DatapathConfig, DatapathError, DatapathInput, DatapathOpener,
+    LocalCgroupHost, CGROUP_ROOT,
+};
 use crate::egress::{EgressPolicy, EgressTable};
 use crate::executor::{NftError, NftExecutor};
 use crate::identity::IdentityMap;
@@ -52,7 +57,7 @@ use crate::rule::{
 };
 
 /// The legacy label deployment containers carry: the environment id.
-pub const ENVIRONMENT_LABEL: &str = "sh.temps.environment";
+pub const ENVIRONMENT_LABEL: &str = labels::ENVIRONMENT;
 
 /// `nodes.network_policy_mode`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -131,6 +136,18 @@ pub enum EnforcerError {
         #[source]
         source: NftError,
     },
+    #[error("node {node}: compiling the eBPF datapath plan failed: {source}")]
+    DatapathCompile {
+        node: String,
+        #[source]
+        source: DatapathCompileError,
+    },
+    #[error("node {node}: the eBPF datapath failed: {source}")]
+    Datapath {
+        node: String,
+        #[source]
+        source: DatapathError,
+    },
 }
 
 /// One network endpoint of a container.
@@ -164,7 +181,7 @@ pub trait InstanceSource: Send + Sync {
 
 /// An address every restricted workload may reach regardless of its
 /// rules: the node resolver and the egress proxy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemPeer {
     pub cidr: Cidr,
     pub ports: Option<PortRange>,
@@ -176,15 +193,17 @@ pub struct SystemPeer {
 /// stay in place until the shared proxy replaces them. Their addresses are
 /// taken from the same observation as everything else, so a restarted
 /// sidecar is followed on the next pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemContainer {
     pub name_prefix: String,
     pub ports: Option<PortRange>,
     pub protocol: L4Protocol,
 }
 
-/// What the control plane says this node enforces.
-#[derive(Debug, Clone, Default)]
+/// What the control plane says this node enforces. Workers receive it
+/// as JSON ([`NodePolicy`]).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PolicySnapshot {
     /// Policies of workloads with something to enforce. Workloads not on
     /// this node are ignored.
@@ -200,6 +219,33 @@ pub struct PolicySnapshot {
     pub container_names: HashMap<String, WorkloadRef>,
     pub system_peers: Vec<SystemPeer>,
     pub system_containers: Vec<SystemContainer>,
+    /// Sources every workload accepts whatever its ingress rules: the
+    /// proxies and health checkers of other nodes. The node's own addresses
+    /// are added by the node.
+    pub system_ingress: Vec<Cidr>,
+}
+
+/// A node's mode and, outside `legacy`, its snapshot: the answer to
+/// `POST /internal/nodes/{node_id}/network-policy`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodePolicy {
+    pub mode: NodeMode,
+    #[serde(default)]
+    pub snapshot: Option<PolicySnapshot>,
+}
+
+/// What a worker's enforcer tells the control plane on every pass: the
+/// body of `POST /internal/nodes/{node_id}/network-policy`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NodePolicyReport {
+    /// The datapath it enforces with: `ebpf` or `nftables`.
+    pub backend: String,
+    /// The workloads it observed on its last pass outside `legacy`, with
+    /// their addresses. The control plane keeps the ones inside the node's
+    /// own compute subnet and hands them to every other node as remote
+    /// peers. Empty in `legacy`, where the node observes nothing.
+    #[serde(default)]
+    pub identities: IdentityMap,
 }
 
 #[async_trait]
@@ -208,6 +254,10 @@ pub trait PolicySource: Send + Sync {
     async fn mode(&self) -> Result<NodeMode, EnforcerError>;
     /// Only called outside `legacy`.
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError>;
+    /// The workloads this node observed on a pass, before remote peers are
+    /// merged in: what other nodes need to know about this one. Called on
+    /// every pass outside `legacy`.
+    fn observed(&self, _local: &IdentityMap) {}
 }
 
 /// The workload a container is an instance of.
@@ -302,6 +352,35 @@ pub struct NodeEnforcer {
     /// restarts, so a hit is always current.
     port_cache: HashMap<String, String>,
     installed: Installed,
+    datapath: Option<DatapathSlot>,
+    wake: Option<Arc<tokio::sync::Notify>>,
+}
+
+/// The eBPF datapath, opened on the first pass that needs it.
+struct DatapathSlot {
+    opener: DatapathOpener,
+    pin_dir: std::path::PathBuf,
+    cgroup_root: std::path::PathBuf,
+    host: Arc<dyn CgroupHost>,
+    open: Option<Box<dyn CgroupDatapath>>,
+    /// Container id → init PID, so a steady node reads `/proc` instead of
+    /// inspecting every container each pass.
+    pids: HashMap<String, i64>,
+    /// Mode and digest last applied.
+    applied: Option<(NodeMode, u64)>,
+    /// nftables tables of an earlier version were cleared (once per
+    /// process), so the two backends never both enforce.
+    nft_cleared: bool,
+}
+
+/// What a pass observed on this node, before any backend compiles it.
+struct Observed {
+    containers: Vec<ObservedContainer>,
+    identities: IdentityMap,
+    local: BTreeSet<WorkloadRef>,
+    /// Indexes into `containers` of identified ones, with their workload.
+    owned: Vec<(WorkloadRef, usize)>,
+    system_peers: Vec<SystemPeer>,
 }
 
 impl NodeEnforcer {
@@ -327,7 +406,46 @@ impl NodeEnforcer {
             egress,
             port_cache: HashMap::new(),
             installed: Installed::Unknown,
+            datapath: None,
+            wake: None,
         }
+    }
+
+    /// Enforces through the eBPF datapath instead of nftables. `opener` is
+    /// called by the first pass outside `legacy`, or by a `legacy` pass
+    /// that finds pins under `pin_dir` (a previous process enforced).
+    pub fn with_datapath(mut self, opener: DatapathOpener, config: &DatapathConfig) -> Self {
+        self.datapath = Some(DatapathSlot {
+            opener,
+            pin_dir: config.pin_dir.clone(),
+            cgroup_root: std::path::PathBuf::from(CGROUP_ROOT),
+            host: Arc::new(LocalCgroupHost),
+            open: None,
+            pids: HashMap::new(),
+            applied: None,
+            nft_cleared: false,
+        });
+        self
+    }
+
+    /// Reads cgroups and host addresses through `host` instead of `/proc`.
+    pub fn with_cgroup_host(mut self, host: Arc<dyn CgroupHost>) -> Self {
+        if let Some(slot) = self.datapath.as_mut() {
+            slot.host = host;
+        }
+        self
+    }
+
+    /// Runs a pass as soon as `wake` is notified (a container started or
+    /// stopped), besides the regular interval.
+    pub fn with_wake(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.wake = Some(wake);
+        self
+    }
+
+    /// Whether passes go through the eBPF datapath.
+    pub fn uses_datapath(&self) -> bool {
+        self.datapath.is_some()
     }
 
     pub fn table(&self) -> &TableName {
@@ -337,6 +455,9 @@ impl NodeEnforcer {
     /// One pass. See the module documentation.
     pub async fn reconcile(&mut self) -> Result<PassOutcome, EnforcerError> {
         let mode = self.policies.mode().await?;
+        if self.datapath.is_some() {
+            return self.reconcile_datapath(mode).await;
+        }
         if mode == NodeMode::Legacy {
             match self.installed {
                 Installed::Enforced(_) => {
@@ -430,6 +551,253 @@ impl NodeEnforcer {
         }
     }
 
+    /// One pass through the eBPF datapath.
+    ///
+    /// `legacy` opens nothing unless a previous process left pins, in which
+    /// case the programs are switched to let everything through. Outside
+    /// `legacy` the maps are made to hold the compiled plan and the mode is
+    /// set, both only when something changed.
+    async fn reconcile_datapath(&mut self, mode: NodeMode) -> Result<PassOutcome, EnforcerError> {
+        let node = self.node.clone();
+        let dp_err = |source: DatapathError| EnforcerError::Datapath {
+            node: node.clone(),
+            source,
+        };
+        if mode == NodeMode::Legacy {
+            let Some(slot) = self.datapath.as_mut() else {
+                return Ok(PassOutcome::Legacy);
+            };
+            if slot.applied.map(|(m, _)| m) == Some(NodeMode::Legacy) {
+                return Ok(PassOutcome::Legacy);
+            }
+            if slot.open.is_none() && !slot.pin_dir.exists() {
+                slot.applied = Some((NodeMode::Legacy, 0));
+                return Ok(PassOutcome::Legacy);
+            }
+            let datapath = open_slot(slot).map_err(dp_err)?;
+            datapath.set_mode(NodeMode::Legacy).map_err(dp_err)?;
+            info!(node = %self.node, "network policy datapath switched to legacy: nothing is filtered");
+            slot.applied = Some((NodeMode::Legacy, 0));
+            self.dns.store(Arc::new(DnsPolicy::open()));
+            self.egress.store(Arc::new(EgressTable::default()));
+            return Ok(PassOutcome::Removed { mode });
+        }
+
+        self.clear_nft_once().await;
+        let snapshot = self.policies.snapshot().await?;
+        let observed = self.observe(&snapshot).await?;
+        let (targets, mut warnings) = self.cgroup_targets(&observed).await?;
+        let policies: Vec<WorkloadPolicy> = snapshot
+            .policies
+            .iter()
+            .filter(|p| observed.local.contains(&p.subject))
+            .cloned()
+            .collect();
+        let host = self
+            .datapath
+            .as_ref()
+            .map(|s| s.host.addresses())
+            .unwrap_or_default();
+        let mut system_egress = observed.system_peers.clone();
+        // The node itself (its resolver, its proxy) is always reachable,
+        // as it is with nftables, which only filters forwarded traffic.
+        system_egress.extend(host.iter().map(|addr| SystemPeer {
+            cidr: Cidr::host(*addr),
+            ports: None,
+            protocol: L4Protocol::Any,
+        }));
+        let mut system_ingress: Vec<Cidr> = host.iter().map(|a| Cidr::host(*a)).collect();
+        system_ingress.extend(snapshot.system_ingress.iter().copied());
+        let none = BTreeSet::new();
+        let plan = compile_datapath(DatapathInput {
+            policies: &policies,
+            identities: &observed.identities,
+            local: &observed.local,
+            internet: &none,
+            trial: &none,
+            system_egress: &system_egress,
+            system_ingress: &system_ingress,
+        })
+        .map_err(|source| EnforcerError::DatapathCompile {
+            node: self.node.clone(),
+            source,
+        })?;
+        warnings.extend(plan.warnings.iter().cloned());
+        let mut hasher = DefaultHasher::new();
+        plan.digest().hash(&mut hasher);
+        targets.hash(&mut hasher);
+        let digest = hasher.finish();
+        let summary = PassSummary {
+            digest,
+            local_workloads: observed.local.len(),
+            enforced_policies: policies.iter().filter(|p| !p.is_noop()).count(),
+            bindings: targets.len(),
+            warnings,
+        };
+        let identities = observed.identities.clone();
+        if mode == NodeMode::Enforce {
+            let local_egress: Vec<EgressPolicy> = snapshot
+                .egress
+                .iter()
+                .filter(|p| observed.local.contains(&p.subject))
+                .cloned()
+                .collect();
+            self.dns.store(Arc::new(DnsPolicy::build(
+                &policies,
+                &identities,
+                &snapshot.names,
+                &snapshot.aliases,
+            )));
+            self.egress
+                .store(Arc::new(EgressTable::build(&local_egress, &identities)));
+        } else {
+            self.dns.store(Arc::new(DnsPolicy::open()));
+            self.egress.store(Arc::new(EgressTable::default()));
+        }
+
+        let Some(slot) = self.datapath.as_mut() else {
+            return Ok(PassOutcome::Legacy);
+        };
+        if slot.applied == Some((mode, digest)) {
+            log_samples(&self.node, slot);
+            return Ok(PassOutcome::Unchanged { mode, digest });
+        }
+        let datapath = open_slot(slot).map_err(dp_err)?;
+        let stats = datapath.apply(&plan, &targets).map_err(dp_err)?;
+        datapath.set_mode(mode).map_err(dp_err)?;
+        slot.applied = Some((mode, digest));
+        info!(
+            node = %self.node,
+            %mode,
+            digest,
+            local_workloads = summary.local_workloads,
+            enforced_policies = summary.enforced_policies,
+            cgroups = targets.len(),
+            endpoints_set = stats.endpoints_set,
+            endpoints_removed = stats.endpoints_removed,
+            addresses_set = stats.addresses_set,
+            addresses_removed = stats.addresses_removed,
+            policy_entries = stats.policy_entries,
+            scopes_attached = stats.scopes_attached,
+            scopes_released = stats.scopes_released,
+            "network policy datapath applied"
+        );
+        if !stats.without_cgroup.is_empty() {
+            debug!(node = %self.node, workloads = ?stats.without_cgroup, "local workloads without a running cgroup yet");
+        }
+        for warning in &summary.warnings {
+            warn!(node = %self.node, %warning, "network policy rule has no full effect");
+        }
+        log_samples(&self.node, slot);
+        Ok(match mode {
+            NodeMode::Enforce => PassOutcome::Applied(summary),
+            _ => PassOutcome::Shadowed(summary),
+        })
+    }
+
+    /// Removes nftables tables an earlier version left, once per process.
+    /// A host without `nft` has none, so a failure is only logged.
+    async fn clear_nft_once(&mut self) {
+        let Some(slot) = self.datapath.as_mut() else {
+            return;
+        };
+        if slot.nft_cleared {
+            return;
+        }
+        slot.nft_cleared = true;
+        if let Err(e) = self.executor.clear_leftover_tables(&self.table).await {
+            debug!(node = %self.node, error = %e, "no nftables network policy tables to clear");
+        }
+    }
+
+    /// The cgroup of every identified container. A cgroup claimed by two
+    /// different workloads identifies neither, so both stay unknown, which
+    /// `enforce` refuses.
+    async fn cgroup_targets(
+        &mut self,
+        observed: &Observed,
+    ) -> Result<(Vec<CgroupTarget>, Vec<String>), EnforcerError> {
+        let mut warnings = Vec::new();
+        let Some((root, host)) = self
+            .datapath
+            .as_ref()
+            .map(|s| (s.cgroup_root.clone(), s.host.clone()))
+        else {
+            return Ok((Vec::new(), warnings));
+        };
+        let live: BTreeSet<&str> = observed
+            .owned
+            .iter()
+            .map(|(_, i)| observed.containers[*i].id.as_str())
+            .collect();
+        if let Some(slot) = self.datapath.as_mut() {
+            slot.pids.retain(|id, _| live.contains(id.as_str()));
+        }
+        let mut by_id: HashMap<u64, (WorkloadRef, Option<std::path::PathBuf>)> = HashMap::new();
+        let mut conflicted: BTreeSet<u64> = BTreeSet::new();
+        for (workload, index) in &observed.owned {
+            let container = &observed.containers[*index];
+            let Some(cgroup) = self.container_cgroup(&container.id).await? else {
+                continue;
+            };
+            let Some((dir, attach)) = cgroup_target(&root, &cgroup) else {
+                continue;
+            };
+            let Some(id) = host.cgroup_id(&dir) else {
+                continue;
+            };
+            match by_id.get(&id) {
+                Some((other, _)) if other != workload => {
+                    if conflicted.insert(id) {
+                        warnings.push(format!(
+                            "cgroup {} holds instances of both {other} and {workload}; neither is identified there",
+                            dir.display()
+                        ));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    by_id.insert(id, (*workload, attach.then_some(dir)));
+                }
+            }
+        }
+        let mut targets: Vec<CgroupTarget> = by_id
+            .into_iter()
+            .filter(|(id, _)| !conflicted.contains(id))
+            .map(|(id, (workload, attach))| CgroupTarget {
+                id,
+                workload,
+                attach,
+            })
+            .collect();
+        targets.sort();
+        Ok((targets, warnings))
+    }
+
+    /// The unified cgroup path of a container's init process. The PID is
+    /// cached; a stale one (the container restarted) is looked up again.
+    async fn container_cgroup(
+        &mut self,
+        container_id: &str,
+    ) -> Result<Option<String>, EnforcerError> {
+        let Some(slot) = self.datapath.as_ref() else {
+            return Ok(None);
+        };
+        let host = slot.host.clone();
+        if let Some(pid) = slot.pids.get(container_id).copied() {
+            if let Some(cgroup) = host.cgroup_of(pid) {
+                return Ok(Some(cgroup));
+            }
+        }
+        let Some(pid) = self.instances.pid(container_id).await? else {
+            return Ok(None);
+        };
+        if let Some(slot) = self.datapath.as_mut() {
+            slot.pids.insert(container_id.to_string(), pid);
+        }
+        Ok(host.cgroup_of(pid))
+    }
+
     fn publish(&self, plan: &NodePlan, snapshot: &PolicySnapshot) {
         let local_egress: Vec<EgressPolicy> = snapshot
             .egress
@@ -482,16 +850,16 @@ impl NodeEnforcer {
         Ok(())
     }
 
-    /// Computes the transaction for the current instances and policies.
-    pub async fn plan(&mut self, snapshot: &PolicySnapshot) -> Result<NodePlan, EnforcerError> {
+    /// Observes this node's containers and identifies them.
+    async fn observe(&self, snapshot: &PolicySnapshot) -> Result<Observed, EnforcerError> {
         let containers = self.instances.observe().await?;
         let mut identities = IdentityMap::new();
         let mut local = BTreeSet::new();
-        let mut owned: Vec<(WorkloadRef, &ObservedContainer)> = Vec::new();
+        let mut owned: Vec<(WorkloadRef, usize)> = Vec::new();
         // Every address a container on this node holds, with the workload
         // it is an instance of (`None` when unidentified).
         let mut local_holders: HashMap<IpAddr, Option<WorkloadRef>> = HashMap::new();
-        for container in &containers {
+        for (index, container) in containers.iter().enumerate() {
             let workload = identify(container, &snapshot.container_names);
             for addr in container_addresses(container) {
                 local_holders
@@ -511,8 +879,9 @@ impl NodeEnforcer {
             for addr in container_addresses(container) {
                 identities.insert(workload, addr);
             }
-            owned.push((workload, container));
+            owned.push((workload, index));
         }
+        self.policies.observed(&identities);
         merge_remote(
             &self.node,
             &mut identities,
@@ -529,21 +898,36 @@ impl NodeEnforcer {
             else {
                 continue;
             };
-            for endpoint in &container.endpoints {
-                let addresses = endpoint
-                    .ipv4
-                    .map(IpAddr::V4)
-                    .into_iter()
-                    .chain(endpoint.ipv6.map(IpAddr::V6));
-                for addr in addresses {
-                    system_peers.push(SystemPeer {
-                        cidr: Cidr::host(addr),
-                        ports: system.ports,
-                        protocol: system.protocol,
-                    });
-                }
+            for addr in container_addresses(container) {
+                system_peers.push(SystemPeer {
+                    cidr: Cidr::host(addr),
+                    ports: system.ports,
+                    protocol: system.protocol,
+                });
             }
         }
+        Ok(Observed {
+            containers,
+            identities,
+            local,
+            owned,
+            system_peers,
+        })
+    }
+
+    /// Computes the transaction for the current instances and policies.
+    pub async fn plan(&mut self, snapshot: &PolicySnapshot) -> Result<NodePlan, EnforcerError> {
+        let Observed {
+            containers,
+            identities,
+            local,
+            owned,
+            system_peers,
+        } = self.observe(snapshot).await?;
+        let owned: Vec<(WorkloadRef, &ObservedContainer)> = owned
+            .into_iter()
+            .map(|(workload, index)| (workload, &containers[index]))
+            .collect();
 
         let mut policies: Vec<WorkloadPolicy> = snapshot
             .policies
@@ -676,14 +1060,79 @@ impl NodeEnforcer {
     pub async fn run(mut self, interval: Duration) {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let wake = self.wake.clone();
         loop {
-            ticker.tick().await;
+            match &wake {
+                Some(wake) => {
+                    tokio::select! {
+                        _ = ticker.tick() => {}
+                        _ = wake.notified() => {
+                            // A burst of container events (a rollout) is
+                            // one pass.
+                            tokio::time::sleep(WAKE_DEBOUNCE).await;
+                            ticker.reset();
+                        }
+                    }
+                }
+                None => {
+                    ticker.tick().await;
+                }
+            }
             match self.reconcile().await {
                 Ok(PassOutcome::Legacy) | Ok(PassOutcome::Unchanged { .. }) => {}
                 Ok(outcome) => debug!(node = %self.node, ?outcome, "network policy pass"),
                 Err(e) => warn!(node = %self.node, error = %e, "network policy pass failed"),
             }
         }
+    }
+}
+
+/// How long a pass waits after a wake-up, so a burst of events is one pass.
+const WAKE_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Most blocked-flow samples logged per pass.
+const SAMPLES_PER_PASS: usize = 32;
+
+fn open_slot(slot: &mut DatapathSlot) -> Result<&mut Box<dyn CgroupDatapath>, DatapathError> {
+    if slot.open.is_none() {
+        slot.open = Some((slot.opener)()?);
+    }
+    slot.open.as_mut().ok_or(DatapathError::NotBuiltIn)
+}
+
+/// Logs the flows the programs refused (or would have) since the last pass.
+fn log_samples(node: &str, slot: &mut DatapathSlot) {
+    let Some(datapath) = slot.open.as_mut() else {
+        return;
+    };
+    for sample in datapath.drain_samples(SAMPLES_PER_PASS) {
+        let addr: IpAddr = if sample.family == temps_netpol_ebpf_common::AF_INET {
+            IpAddr::V4(Ipv4Addr::new(
+                sample.addr[0],
+                sample.addr[1],
+                sample.addr[2],
+                sample.addr[3],
+            ))
+        } else {
+            IpAddr::V6(Ipv6Addr::from(sample.addr))
+        };
+        let direction = if sample.dir == temps_netpol_ebpf_common::DIR_EGRESS {
+            "egress"
+        } else {
+            "ingress"
+        };
+        info!(
+            node = %node,
+            subject = %describe_identity(sample.subject),
+            peer = %describe_identity(sample.peer),
+            %addr,
+            port = sample.port,
+            protocol = sample.proto,
+            direction,
+            rule = sample.rule,
+            would_block = sample.would_block == 1,
+            "network policy refused a flow"
+        );
     }
 }
 
@@ -820,11 +1269,83 @@ impl InstanceSource for DockerInstanceSource {
     }
 }
 
+/// Picks the node's datapath: eBPF when this build embeds the programs, the
+/// Docker daemon is on this host and the host meets the requirements;
+/// nftables otherwise. The choice and the reason are logged once.
+pub fn with_best_datapath(enforcer: NodeEnforcer, daemon_is_local: bool) -> NodeEnforcer {
+    if !daemon_is_local {
+        info!(
+            node = %enforcer.node,
+            "network policy backend: nftables (the Docker daemon is not on this host, so its containers' cgroups are not visible)"
+        );
+        return enforcer;
+    }
+    let config = DatapathConfig::default();
+    match crate::ebpf::available_datapath(config.clone()) {
+        Ok(opener) => {
+            info!(
+                node = %enforcer.node,
+                pin_dir = %config.pin_dir.display(),
+                "network policy backend: eBPF (loaded on the first pass outside legacy)"
+            );
+            enforcer.with_datapath(opener, &config)
+        }
+        Err(reason) => {
+            info!(node = %enforcer.node, %reason, "network policy backend: nftables");
+            enforcer
+        }
+    }
+}
+
+/// Container events that change what a node enforces.
+const WAKE_EVENTS: [&str; 4] = ["start", "die", "connect", "disconnect"];
+
+/// Notifies the returned handle whenever a container starts, stops or
+/// changes networks on the local daemon, so the enforcer identifies a new
+/// container within a pass instead of an interval. The watch reconnects
+/// with a growing delay when the stream ends.
+pub fn spawn_container_wake(node: String, docker: Docker) -> Arc<tokio::sync::Notify> {
+    use futures::StreamExt;
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let notify = wake.clone();
+    tokio::spawn(async move {
+        let mut delay = Duration::from_secs(1);
+        loop {
+            let mut filters: HashMap<String, Vec<String>> = HashMap::new();
+            filters.insert("type".to_string(), vec!["container".to_string()]);
+            filters.insert(
+                "event".to_string(),
+                WAKE_EVENTS.iter().map(|e| e.to_string()).collect(),
+            );
+            let mut stream = docker.events(Some(bollard::query_parameters::EventsOptions {
+                filters: Some(filters),
+                ..Default::default()
+            }));
+            while let Some(event) = stream.next().await {
+                match event {
+                    Ok(_) => {
+                        delay = Duration::from_secs(1);
+                        notify.notify_one();
+                    }
+                    Err(e) => {
+                        debug!(node = %node, error = %e, "container event stream failed; reconnecting");
+                        break;
+                    }
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(Duration::from_secs(30));
+        }
+    });
+    wake
+}
+
 /// A fixed snapshot, for tests and for nodes whose policy is pushed
 /// rather than read.
 pub struct StaticPolicySource {
     mode: ArcSwap<NodeMode>,
     snapshot: ArcSwap<PolicySnapshot>,
+    observed: ArcSwap<IdentityMap>,
 }
 
 impl StaticPolicySource {
@@ -832,7 +1353,13 @@ impl StaticPolicySource {
         Self {
             mode: ArcSwap::from_pointee(mode),
             snapshot: ArcSwap::from_pointee(snapshot),
+            observed: ArcSwap::from_pointee(IdentityMap::new()),
         }
+    }
+
+    /// The local workloads the last pass observed.
+    pub fn last_observed(&self) -> IdentityMap {
+        (**self.observed.load()).clone()
     }
 
     pub fn set_mode(&self, mode: NodeMode) {
@@ -852,6 +1379,10 @@ impl PolicySource for StaticPolicySource {
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
         Ok((**self.snapshot.load()).clone())
+    }
+
+    fn observed(&self, local: &IdentityMap) {
+        self.observed.store(Arc::new(local.clone()));
     }
 }
 
@@ -965,21 +1496,8 @@ mod tests {
         egress: Arc<ArcSwap<EgressTable>>,
     }
 
-    fn harness(mode: NodeMode) -> Harness {
-        let executor = Arc::new(RecordingExecutor::default());
-        let instances = Arc::new(FixedInstances {
-            containers: std::sync::Mutex::new(vec![
-                container(
-                    1,
-                    &[(labels::KIND, "sandbox"), (labels::OWNER_ID, "1")],
-                    "10.237.1.2",
-                ),
-                container(2, &[], "10.237.1.3"),
-                container(3, &[(ENVIRONMENT_LABEL, "7")], "10.237.1.4"),
-            ]),
-            observed: AtomicUsize::new(0),
-        });
-        let snapshot = PolicySnapshot {
+    fn harness_snapshot() -> PolicySnapshot {
+        PolicySnapshot {
             policies: vec![WorkloadPolicy {
                 subject: sandbox(1),
                 egress: Profile::Restricted,
@@ -1005,7 +1523,24 @@ mod tests {
                 owner: service(5),
             }],
             ..Default::default()
-        };
+        }
+    }
+
+    fn harness(mode: NodeMode) -> Harness {
+        let executor = Arc::new(RecordingExecutor::default());
+        let instances = Arc::new(FixedInstances {
+            containers: std::sync::Mutex::new(vec![
+                container(
+                    1,
+                    &[(labels::KIND, "sandbox"), (labels::OWNER_ID, "1")],
+                    "10.237.1.2",
+                ),
+                container(2, &[], "10.237.1.3"),
+                container(3, &[(ENVIRONMENT_LABEL, "7")], "10.237.1.4"),
+            ]),
+            observed: AtomicUsize::new(0),
+        });
+        let snapshot = harness_snapshot();
         let policies = Arc::new(StaticPolicySource::new(mode, snapshot));
         let ports = Arc::new(CountingPorts {
             calls: AtomicUsize::new(0),
@@ -1421,5 +1956,318 @@ mod tests {
             !plan.ruleset.contains("10.237.1.9"),
             "and not without the entry"
         );
+    }
+
+    #[derive(Default)]
+    struct DatapathRecord {
+        opened: usize,
+        applies: Vec<(crate::ebpf::DatapathPlan, Vec<CgroupTarget>)>,
+        modes: Vec<NodeMode>,
+    }
+
+    struct RecordingDatapath(Arc<std::sync::Mutex<DatapathRecord>>);
+
+    impl CgroupDatapath for RecordingDatapath {
+        fn set_mode(&mut self, mode: NodeMode) -> Result<(), DatapathError> {
+            self.0.lock().unwrap().modes.push(mode);
+            Ok(())
+        }
+        fn apply(
+            &mut self,
+            plan: &crate::ebpf::DatapathPlan,
+            targets: &[CgroupTarget],
+        ) -> Result<crate::ebpf::ApplyStats, DatapathError> {
+            self.0
+                .lock()
+                .unwrap()
+                .applies
+                .push((plan.clone(), targets.to_vec()));
+            Ok(crate::ebpf::ApplyStats::default())
+        }
+        fn counters(&self) -> Result<crate::ebpf::Counters, DatapathError> {
+            Ok(Default::default())
+        }
+        fn drain_samples(&mut self, _max: usize) -> Vec<temps_netpol_ebpf_common::Sample> {
+            Vec::new()
+        }
+    }
+
+    /// pid → cgroup path; a directory's id is a hash of its path.
+    struct FakeHost {
+        cgroups: std::sync::Mutex<HashMap<i64, String>>,
+    }
+
+    impl CgroupHost for FakeHost {
+        fn cgroup_of(&self, pid: i64) -> Option<String> {
+            self.cgroups.lock().unwrap().get(&pid).cloned()
+        }
+        fn cgroup_id(&self, dir: &std::path::Path) -> Option<u64> {
+            let mut hasher = DefaultHasher::new();
+            dir.hash(&mut hasher);
+            Some(hasher.finish())
+        }
+        fn addresses(&self) -> Vec<IpAddr> {
+            vec!["10.77.0.10".parse().unwrap()]
+        }
+    }
+
+    const SERVICE_SLICE: &str = "/temps.slice/temps-service.slice/temps-service-5.slice";
+
+    fn with_datapath(
+        h: Harness,
+        pin_dir: &str,
+    ) -> (
+        Harness,
+        Arc<std::sync::Mutex<DatapathRecord>>,
+        Arc<FakeHost>,
+    ) {
+        let record = Arc::new(std::sync::Mutex::new(DatapathRecord::default()));
+        let host = Arc::new(FakeHost {
+            cgroups: std::sync::Mutex::new(HashMap::from([
+                (1, "/system.slice/docker-c1.scope".to_string()),
+                (2, format!("{SERVICE_SLICE}/docker-c2.scope")),
+                (3, "/system.slice/docker-c3.scope".to_string()),
+            ])),
+        });
+        let opener_record = record.clone();
+        let opener: DatapathOpener = Box::new(move || {
+            opener_record.lock().unwrap().opened += 1;
+            Ok(Box::new(RecordingDatapath(opener_record.clone())) as Box<dyn CgroupDatapath>)
+        });
+        let config = DatapathConfig {
+            pin_dir: pin_dir.into(),
+            ..Default::default()
+        };
+        let Harness {
+            enforcer,
+            executor,
+            policies,
+            instances,
+            ports,
+            dns,
+            egress,
+        } = h;
+        let enforcer = enforcer
+            .with_datapath(opener, &config)
+            .with_cgroup_host(host.clone());
+        (
+            Harness {
+                enforcer,
+                executor,
+                policies,
+                instances,
+                ports,
+                dns,
+                egress,
+            },
+            record,
+            host,
+        )
+    }
+
+    const NO_PINS: &str = "/nonexistent/temps-netpol-test-pins";
+
+    #[tokio::test]
+    async fn a_pass_reports_only_the_workloads_it_observed_locally() {
+        let mut h = harness(NodeMode::Shadow);
+        let remote = WorkloadRef::new(WorkloadKind::Deployment, 40);
+        let mut snapshot = harness_snapshot();
+        snapshot.remote = IdentityMap::new().with(remote, "10.202.9.2".parse().unwrap());
+        h.policies.set_snapshot(snapshot);
+        h.enforcer.reconcile().await.unwrap();
+        let observed = h.policies.last_observed();
+        let mut workloads: Vec<WorkloadRef> = observed.workloads().copied().collect();
+        workloads.sort();
+        let mut expected = vec![
+            sandbox(1),
+            service(5),
+            WorkloadRef::new(WorkloadKind::Deployment, 7),
+        ];
+        expected.sort();
+        assert_eq!(workloads, expected, "remote peers are never reported back");
+        assert_eq!(
+            observed.addresses(&sandbox(1)).collect::<Vec<_>>(),
+            ["10.237.1.2".parse::<IpAddr>().unwrap()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_datapath_identifies_scopes_and_slices_and_skips_an_unchanged_pass() {
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Enforce), NO_PINS);
+        assert!(h.enforcer.uses_datapath());
+        let outcome = h.enforcer.reconcile().await.unwrap();
+        assert!(matches!(outcome, PassOutcome::Applied(_)), "{outcome:?}");
+        {
+            let record = record.lock().unwrap();
+            assert_eq!(record.opened, 1);
+            assert_eq!(record.modes, vec![NodeMode::Enforce]);
+            let (plan, targets) = &record.applies[0];
+            let by_workload: HashMap<WorkloadRef, &CgroupTarget> =
+                targets.iter().map(|t| (t.workload, t)).collect();
+            assert_eq!(
+                by_workload[&sandbox(1)].attach.as_deref(),
+                Some(std::path::Path::new(
+                    "/sys/fs/cgroup/system.slice/docker-c1.scope"
+                )),
+                "a container outside temps.slice gets the programs on its scope"
+            );
+            assert_eq!(
+                by_workload[&service(5)].attach,
+                None,
+                "a workload slice is covered by the temps.slice attachment"
+            );
+            assert!(by_workload.contains_key(&WorkloadRef::new(WorkloadKind::Deployment, 7)));
+            assert!(
+                plan.ipcache
+                    .contains_key(&Cidr::host("10.77.0.10".parse().unwrap())),
+                "the node's own address is a system peer"
+            );
+        }
+        {
+            let applied = h.executor.applied.lock().await;
+            assert_eq!(
+                applied.as_slice(),
+                [node_removal_ruleset(h.enforcer.table())],
+                "nftables only gets the one-time removal of an earlier version's tables"
+            );
+        }
+        assert!(
+            h.dns.load().restricted_sources() > 0,
+            "enforce publishes the DNS policy"
+        );
+
+        let outcome = h.enforcer.reconcile().await.unwrap();
+        assert!(
+            matches!(outcome, PassOutcome::Unchanged { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(record.lock().unwrap().applies.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_never_opens_the_datapath_unless_a_previous_process_left_pins() {
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Legacy), NO_PINS);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(record.lock().unwrap().opened, 0);
+        assert_eq!(h.instances.observed.load(Ordering::Relaxed), 0);
+
+        // Pins exist: a previous process enforced, so legacy is set once.
+        let pins = std::env::temp_dir().join(format!("temps-netpol-pins-{}", std::process::id()));
+        std::fs::create_dir_all(&pins).unwrap();
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Legacy), pins.to_str().unwrap());
+        let outcome = h.enforcer.reconcile().await.unwrap();
+        let _ = std::fs::remove_dir_all(&pins);
+        assert_eq!(
+            outcome,
+            PassOutcome::Removed {
+                mode: NodeMode::Legacy
+            }
+        );
+        assert_eq!(record.lock().unwrap().modes, vec![NodeMode::Legacy]);
+        assert_eq!(h.enforcer.reconcile().await.unwrap(), PassOutcome::Legacy);
+        assert_eq!(record.lock().unwrap().modes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn leaving_enforce_switches_the_datapath_to_legacy_and_shadow_reapplies() {
+        let (mut h, record, _) = with_datapath(harness(NodeMode::Enforce), NO_PINS);
+        h.enforcer.reconcile().await.unwrap();
+        h.policies.set_mode(NodeMode::Shadow);
+        let outcome = h.enforcer.reconcile().await.unwrap();
+        assert!(matches!(outcome, PassOutcome::Shadowed(_)), "{outcome:?}");
+        assert_eq!(
+            h.dns.load().restricted_sources(),
+            0,
+            "shadow keeps DNS open"
+        );
+        h.policies.set_mode(NodeMode::Legacy);
+        assert_eq!(
+            h.enforcer.reconcile().await.unwrap(),
+            PassOutcome::Removed {
+                mode: NodeMode::Legacy
+            }
+        );
+        assert_eq!(
+            record.lock().unwrap().modes,
+            vec![NodeMode::Enforce, NodeMode::Shadow, NodeMode::Legacy]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cgroup_shared_by_two_workloads_identifies_neither() {
+        let (mut h, record, host) = with_datapath(harness(NodeMode::Enforce), NO_PINS);
+        host.cgroups
+            .lock()
+            .unwrap()
+            .insert(3, format!("{SERVICE_SLICE}/docker-c3.scope"));
+        let outcome = h.enforcer.reconcile().await.unwrap();
+        let PassOutcome::Applied(summary) = outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|w| w.contains("neither is identified")),
+            "{:?}",
+            summary.warnings
+        );
+        let record = record.lock().unwrap();
+        let (_, targets) = &record.applies[0];
+        assert!(
+            targets.iter().all(|t| t.workload == sandbox(1)),
+            "{targets:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restarted_container_is_found_again_through_a_new_pid() {
+        let (mut h, record, host) = with_datapath(harness(NodeMode::Enforce), NO_PINS);
+        h.enforcer.reconcile().await.unwrap();
+        // The scope of c1 is recreated: the cached PID now reads nothing,
+        // and the new one points at a new scope.
+        {
+            let mut cgroups = host.cgroups.lock().unwrap();
+            cgroups.remove(&1);
+            cgroups.insert(1, "/system.slice/docker-c1b.scope".to_string());
+        }
+        h.enforcer.reconcile().await.unwrap();
+        let record = record.lock().unwrap();
+        let (_, targets) = record.applies.last().unwrap();
+        assert!(targets.iter().any(|t| t.attach.as_deref()
+            == Some(std::path::Path::new(
+                "/sys/fs/cgroup/system.slice/docker-c1b.scope"
+            ))));
+    }
+
+    #[test]
+    fn a_node_policy_survives_json() {
+        let mut snapshot = harness_snapshot();
+        snapshot
+            .remote
+            .insert(service(9), "10.202.3.4".parse().unwrap());
+        snapshot
+            .system_ingress
+            .push("10.201.0.0/16".parse().unwrap());
+        let policy = NodePolicy {
+            mode: NodeMode::Enforce,
+            snapshot: Some(snapshot.clone()),
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: NodePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.mode, NodeMode::Enforce);
+        let back = back.snapshot.unwrap();
+        assert_eq!(back.remote, snapshot.remote);
+        assert_eq!(back.policies, snapshot.policies);
+        assert_eq!(back.system_peers, snapshot.system_peers);
+        assert_eq!(back.system_ingress, snapshot.system_ingress);
+        assert_eq!(back.container_names, snapshot.container_names);
+        // Fields a newer control plane adds are tolerated, missing ones
+        // default.
+        let minimal: NodePolicy =
+            serde_json::from_str(r#"{"mode":"shadow","snapshot":{}}"#).unwrap();
+        assert_eq!(minimal.mode, NodeMode::Shadow);
+        assert!(minimal.snapshot.unwrap().policies.is_empty());
     }
 }

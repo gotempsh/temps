@@ -704,6 +704,10 @@ pub struct HeartbeatRequest {
     /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
     /// `None` leaves the stored ranges untouched; already validated.
     pub occupied_ranges: Option<Vec<temps_network::occupied::OccupiedRange>>,
+    /// Deployment ids running on the node without its cluster resolver,
+    /// already bounded. `None` from an older agent leaves the stored value
+    /// untouched; an empty list clears it.
+    pub deployments_without_resolver: Option<Vec<i64>>,
 }
 
 /// What the agent last saw of its cross-node overlay (ADR 056).
@@ -1008,6 +1012,15 @@ fn truncate_dns_error(reason: &str) -> String {
         end -= 1;
     }
     format!("{}... (truncated)", &reason[..end])
+}
+
+/// Sorted, deduplicated and capped like the agent's own report, so an older
+/// or misbehaving agent cannot write an unbounded list into the column.
+fn bounded_deployment_ids(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(temps_deployer::resolver_coverage::MAX_REPORTED_DEPLOYMENTS);
+    ids
 }
 
 /// Extract the host from a validated node agent URL or private address for use
@@ -1798,6 +1811,10 @@ impl NodeService {
             active.dns_resolver_last_error =
                 Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
             active.dns_resolver_record_count = Set(Some(dns.record_count));
+        }
+        if let Some(deployments) = request.deployments_without_resolver {
+            active.deployments_without_resolver =
+                Set(Some(serde_json::json!(bounded_deployment_ids(deployments))));
         }
         if let Some(ingress) = request.public_ingress {
             active.public_ingress_running = Set(Some(ingress.running));
@@ -3776,6 +3793,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -4087,6 +4105,7 @@ mod tests {
             |overlay: Option<OverlayHeartbeatUpdate>,
              occupied: Option<Vec<temps_network::occupied::OccupiedRange>>| {
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({}),
                     labels: None,
@@ -5529,6 +5548,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5561,6 +5581,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5595,6 +5616,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5662,6 +5684,7 @@ mod tests {
                 .heartbeat(
                     1,
                     HeartbeatRequest {
+                        deployments_without_resolver: None,
                         architecture: None,
                         capacity: serde_json::json!({}),
                         labels: None,
@@ -5722,6 +5745,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5765,6 +5789,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_reported_deployment_list_is_capped() {
+        let limit = temps_deployer::resolver_coverage::MAX_REPORTED_DEPLOYMENTS;
+        let reported: Vec<i64> = (0..(limit as i64 * 2)).rev().collect();
+
+        let stored = bounded_deployment_ids(reported);
+
+        assert_eq!(stored.len(), limit);
+        assert_eq!(stored.first(), Some(&0));
+    }
+
+    /// The deployments a node runs without its resolver are stored bounded
+    /// and sorted when reported, and left alone when an older agent omits
+    /// them.
+    #[tokio::test]
+    async fn test_heartbeat_stores_deployments_without_resolver_only_when_reported() {
+        async fn heartbeat_update(reported: Option<Vec<i64>>) -> (String, Vec<sea_orm::Value>) {
+            let node = sample_node();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![node.clone()]])
+                    .append_query_results(vec![vec![node]])
+                    .into_connection(),
+            );
+            let service = NodeService::new(db.clone());
+            service
+                .heartbeat(
+                    1,
+                    HeartbeatRequest {
+                        deployments_without_resolver: reported,
+                        architecture: None,
+                        capacity: serde_json::json!({}),
+                        labels: None,
+                        dns_resolver: None,
+                        docker_socket_projects: None,
+                        overlay: None,
+                        occupied_ranges: None,
+                        public_ingress: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("heartbeat failed: {error}"));
+            drop(service);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = db.into_transaction_log();
+            let statement = log
+                .last()
+                .expect("heartbeat must issue an UPDATE")
+                .statements()[0]
+                .clone();
+            let values = statement.values.map(|values| values.0).unwrap_or_default();
+            (statement.sql, values)
+        }
+
+        let (sql, values) = heartbeat_update(Some(vec![9, 3, 9])).await;
+        assert!(sql.contains("\"deployments_without_resolver\" ="), "{sql}");
+        let stored = serde_json::json!([3, 9]);
+        assert!(
+            values.iter().any(|value| matches!(
+                value,
+                sea_orm::Value::Json(Some(json)) if **json == stored
+            )),
+            "the list is stored sorted and deduplicated: {values:?}"
+        );
+
+        let (sql, _) = heartbeat_update(None).await;
+        assert!(!sql.contains("\"deployments_without_resolver\" ="), "{sql}");
+    }
+
     /// A resolver that just self-healed after a crash reports `running:
     /// true` but `last_sync_success_at: None` (it hasn't completed its
     /// first sync tick yet). This must NOT regress a previously stored,
@@ -5791,6 +5884,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -7175,6 +7269,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NodeService::new(Arc::new(db));
         let request = HeartbeatRequest {
+            deployments_without_resolver: None,
             capacity: serde_json::json!({}),
             labels: None,
             architecture: None,

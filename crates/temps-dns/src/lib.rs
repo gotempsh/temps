@@ -70,3 +70,4 @@ pub use services::{
     OwnerKind as InternalOwnerKind, OwnershipScope, RecordOwnership, RecordSnapshot,
     RecordType as InternalRecordType, ResolverHealth, StaleResolver, ZoneSnapshot,
 };
+pub use temps_dns_resolver::{open_dns_policy_slot, DnsPolicySlot};

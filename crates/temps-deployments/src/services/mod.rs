@@ -118,6 +118,10 @@ pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
 pub mod workload_volumes;
 pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
 pub mod node_state;
+pub mod resolver_coverage;
+pub use resolver_coverage::{
+    DeploymentWithoutResolver, ResolverCoverageError, ResolverCoverageHost, ResolverCoverageService,
+};
 pub mod plane_deployer;
 pub use node_state::{
     AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,

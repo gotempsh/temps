@@ -415,18 +415,9 @@ async fn bootstrap_creates_all_kernel_state() {
         "nftables table must exist"
     );
     assert!(
-        nft_table_contains(
-            "inet",
-            "temps_network",
-            &[
-                &env.peer_cidr.to_string(),
-                &env.local_cidr.to_string(),
-                &env.local_bridge_ip.to_string(),
-                "snat",
-            ]
-        )
-        .await,
-        "remote overlay traffic must be SNATed to the local bridge so a dual-network service replies over VXLAN"
+        !nft_table_contains("inet", "temps_network", &["snat"]).await,
+        "remote overlay traffic keeps its source address (its network policy identity); \
+         dual-network containers reply over VXLAN through their injected peer routes"
     );
     assert!(
         iptables_chain_contains(

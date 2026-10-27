@@ -33,10 +33,10 @@ pub enum NetworkPolicyError {
     HostRuleNotEnforceable { subject: String, host: String },
 
     #[error(
-        "Cannot set node {node_id} to '{mode}': no network policy enforcer runs on worker nodes \
-         yet, so the mode would be reported without any policy being computed or applied there. \
-         Only the control plane (node 0) supports 'shadow' and 'enforce'; set worker nodes to \
-         'legacy'"
+        "Cannot set node {node_id} to '{mode}': no network policy enforcer has reported from it \
+         recently, so the mode would be reported without any policy being computed or applied \
+         there. Upgrade and restart `temps agent` on the node, wait for it to report, then retry; \
+         'legacy' is always accepted"
     )]
     WorkerEnforcementUnavailable { node_id: i32, mode: String },
 

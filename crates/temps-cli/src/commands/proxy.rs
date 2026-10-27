@@ -372,17 +372,16 @@ impl ProxyCommand {
 
         // Fetch settings once: needed for `preview_domain`, ADR-017 version-skew
         // detection, and the ADR-018 on-demand TLS decision.
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(temps_config::ServerConfig::new(
+                address.clone(),
+                self.database_url.clone(),
+                tls_address.clone(),
+                Some(console_address.clone()),
+            )?),
+            db.clone(),
+        ));
         let settings = rt.block_on(async {
-            let config_service = temps_config::ConfigService::new(
-                Arc::new(temps_config::ServerConfig::new(
-                    address.clone(),
-                    self.database_url.clone(),
-                    tls_address.clone(),
-                    Some(console_address.clone()),
-                )?),
-                db.clone(),
-            );
-
             match config_service.get_settings().await {
                 Ok(settings) => {
                     // ADR-017 Phase 3: version-skew detection. The console records
@@ -434,29 +433,29 @@ impl ProxyCommand {
                 .map(|s| s.preview_domain.clone())
                 .unwrap_or_else(|| "localhost".to_string()),
         );
-        let internal_dns_sync_address = match settings.as_ref() {
-            Some(settings) if settings.cluster_dns.enabled => {
-                match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
-                    Ok(address) => Some(address.to_string()),
-                    Err(error) => {
-                        warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-        if settings
-            .as_ref()
-            .is_some_and(|settings| settings.cluster_dns.enabled)
+        // Started whatever the cluster DNS setting says, so turning it on
+        // later needs no restart; the handlers authenticate every node.
+        let internal_dns_sync_address = match rt
+            .block_on(temps_dns::start_proxy_dns_sync_service(db.clone()))
         {
-            super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
-                rt.handle(),
-                db.clone(),
-                data_dir.join("dns"),
-                Arc::new(std::sync::RwLock::new(None)),
-            );
-        }
+            Ok(address) => Some(address.to_string()),
+            Err(error) => {
+                warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                None
+            }
+        };
+        // Follows the setting on every pass. Node 0's network policy
+        // enforcer runs in the console process, so this resolver has no
+        // policy view and answers every source as unrestricted; restricted
+        // workloads are still held to their rules by the datapath.
+        super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
+            rt.handle(),
+            db.clone(),
+            data_dir.join("dns"),
+            Arc::new(std::sync::RwLock::new(None)),
+            None,
+            config_service.clone(),
+        );
 
         info!(
             "Starting proxy server with preview_domain: {:?}",

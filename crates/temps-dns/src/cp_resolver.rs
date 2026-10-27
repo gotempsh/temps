@@ -14,19 +14,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{
-    atomic::{AtomicU16, Ordering},
-    OnceLock,
-};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use hickory_proto::{
-    op::{Message, MessageType, OpCode, Query, ResponseCode},
-    rr::{DNSClass, Name, RData, RecordType},
-};
 use sea_orm::DatabaseConnection;
-use temps_dns_resolver::{ResolverConfig, ResolverHandle, ZoneRecord};
+use temps_dns_resolver::{DnsPolicySlot, ResolverConfig, ResolverHandle, ZoneRecord};
 use temps_entities::service_endpoints;
 use tracing::{info, warn};
 
@@ -70,76 +62,10 @@ impl ControlPlaneResolver {
     }
 }
 
+/// Whether a resolver answers its readiness marker at `address`. See
+/// [`temps_dns_resolver::probe::probe_resolver`].
 pub async fn probe_control_plane_resolver(address: SocketAddr) -> bool {
-    let bind_address = if address.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = match tokio::net::UdpSocket::bind(bind_address).await {
-        Ok(socket) => socket,
-        Err(_) => return false,
-    };
-    if socket.connect(address).await.is_err() {
-        return false;
-    }
-    static NEXT_ID: OnceLock<AtomicU16> = OnceLock::new();
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            (duration.as_nanos() as u16) ^ std::process::id() as u16
-        });
-    let id = NEXT_ID
-        .get_or_init(|| AtomicU16::new(seed))
-        .fetch_add(1, Ordering::Relaxed);
-    let mut marker_name = match Name::from_ascii(temps_dns_resolver::RESOLVER_MARKER_NAME) {
-        Ok(name) => name,
-        Err(_) => return false,
-    };
-    // Wire-decoded names are absolute; compare against an absolute question.
-    marker_name.set_fqdn(true);
-    let mut query = Message::new(id, MessageType::Query, OpCode::Query);
-    query.add_query(Query::query(marker_name.clone(), RecordType::TXT));
-    let wire = match query.to_vec() {
-        Ok(wire) => wire,
-        Err(_) => return false,
-    };
-    if socket.send(&wire).await.is_err() {
-        return false;
-    }
-    let mut response = [0u8; 512];
-    let received =
-        match tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut response)).await {
-            Ok(Ok(received)) => received,
-            _ => return false,
-        };
-    let Ok(response) = Message::from_vec(&response[..received]) else {
-        return false;
-    };
-    let metadata = response.metadata;
-    let question_matches = response.queries.as_slice().first().is_some_and(|question| {
-        response.queries.len() == 1
-            && question.name() == &marker_name
-            && question.query_type() == RecordType::TXT
-            && question.query_class() == DNSClass::IN
-    });
-    let answer_matches = response.answers.as_slice().first().is_some_and(|answer| {
-        response.answers.len() == 1
-            && answer.name == marker_name
-            && answer.record_type() == RecordType::TXT
-            && answer.dns_class == DNSClass::IN
-            && matches!(&answer.data, RData::TXT(txt) if txt.txt_data.len() == 1 && txt.txt_data[0].as_ref() == temps_dns_resolver::RESOLVER_MARKER_VALUE.as_bytes())
-    });
-    metadata.id == id
-        && metadata.message_type == MessageType::Response
-        && metadata.op_code == OpCode::Query
-        && metadata.authoritative
-        && !metadata.truncation
-        && metadata.response_code == ResponseCode::NoError
-        && response.authorities.is_empty()
-        && response.additionals.is_empty()
-        && question_matches
-        && answer_matches
+    temps_dns_resolver::probe::probe_resolver(address).await
 }
 
 /// `service_endpoints::Model` is field-identical to the resolver's wire
@@ -162,17 +88,21 @@ fn to_zone_record(m: service_endpoints::Model) -> ZoneRecord {
 /// Start the control-plane DNS resolver bound on `bridge_gateway:53`, fed
 /// directly from `service_endpoints`. The caller owns the returned listener
 /// and must shut it down before binding a replacement gateway.
+///
+/// `policy` is node 0's network policy view, kept current by its enforcer;
+/// with it, restricted workloads only resolve the names their rules allow.
 pub async fn start_control_plane_resolver(
     db: Arc<DatabaseConnection>,
     bridge_gateway: IpAddr,
     snapshot_dir: PathBuf,
+    policy: Option<DnsPolicySlot>,
 ) -> Option<ControlPlaneResolver> {
     // node_id 0 is conventional for the control plane; the DB-direct feeder
     // ignores it (it serves the full zone, not a per-node slice). `new_local_feed`
     // binds ONLY the bridge gateway (not 127.0.0.53, which systemd-resolved owns)
     // and disables the HTTP sync loop.
     let config = ResolverConfig::new_local_feed(0, bridge_gateway, snapshot_dir);
-    start_control_plane_resolver_with_config(db, config).await
+    start_resolver(db, config, policy).await
 }
 
 /// Configurable entrypoint used by integration tests and alternate proxy
@@ -182,9 +112,17 @@ pub async fn start_control_plane_resolver_with_config(
     db: Arc<DatabaseConnection>,
     config: ResolverConfig,
 ) -> Option<ControlPlaneResolver> {
+    start_resolver(db, config, None).await
+}
+
+async fn start_resolver(
+    db: Arc<DatabaseConnection>,
+    config: ResolverConfig,
+    policy: Option<DnsPolicySlot>,
+) -> Option<ControlPlaneResolver> {
     let listen_address = *config.listen_addrs.first()?;
     let bridge_gateway = listen_address.ip();
-    let handle = match ResolverHandle::start(config).await {
+    let handle = match ResolverHandle::start_with_policy(config, policy).await {
         Ok(h) => h,
         Err(e) => {
             warn!(
@@ -274,6 +212,85 @@ mod tests {
             .await
             .expect("resolver restarts after shutdown");
         restarted.shutdown().await;
+    }
+
+    /// The resolver must answer from the very slot it was started with,
+    /// which is the one the node's enforcer writes: a restriction stored
+    /// there after start changes the next answer.
+    #[tokio::test]
+    async fn the_resolver_answers_from_the_policy_slot_it_was_given() {
+        use hickory_resolver::config::{
+            NameServerConfig, ResolveHosts, ResolverConfig as ClientConfig, ResolverOpts,
+        };
+        use hickory_resolver::net::runtime::TokioRuntimeProvider;
+        use temps_workload::{WorkloadKind, WorkloadRef};
+        use temps_workload_netpol::{DnsPolicy, IdentityMap, Profile, WorkloadPolicy};
+
+        let reservation = std::net::UdpSocket::bind("127.0.0.1:0").expect("reserve test port");
+        let address = reservation.local_addr().expect("test address");
+        drop(reservation);
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let mut config = ResolverConfig::new_local_feed(
+            0,
+            address.ip(),
+            std::env::temp_dir().join(format!("temps-cp-dns-policy-{}", uuid::Uuid::new_v4())),
+        );
+        config.listen_addrs = vec![address];
+        config.upstream_resolvers.clear();
+
+        let slot = temps_dns_resolver::open_dns_policy_slot();
+        let resolver = start_resolver(db, config, Some(slot.clone()))
+            .await
+            .expect("resolver starts");
+        // The mock database has no rows, so the feeder never replaces this.
+        let handle = resolver.handle.as_ref().expect("running resolver");
+        handle.zone.replace(
+            1,
+            vec![to_zone_record(model("A", Some("10.202.0.9"), None))],
+        );
+
+        let mut client_config = ClientConfig::default();
+        let mut name_server = NameServerConfig::udp(address.ip());
+        if let Some(connection) = name_server.connections.first_mut() {
+            connection.port = address.port();
+        }
+        client_config.add_name_server(name_server);
+        let mut options = ResolverOpts::default();
+        options.use_hosts_file = ResolveHosts::Never;
+        options.attempts = 1;
+        options.timeout = std::time::Duration::from_secs(2);
+        options.cache_size = 0;
+        let client = hickory_resolver::TokioResolver::builder_with_config(
+            client_config,
+            TokioRuntimeProvider::default(),
+        )
+        .with_options(options)
+        .build()
+        .expect("test DNS client");
+
+        let open = client.lookup_ip("api.production.temps.local.").await;
+        assert!(open.is_ok(), "an open source resolves the name: {open:?}");
+
+        // The client asks from 127.0.0.1: make that a restricted workload
+        // with no rules, so it may resolve nothing.
+        let sandbox = WorkloadRef::new(WorkloadKind::Sandbox, 1);
+        slot.store(Arc::new(DnsPolicy::build(
+            &[WorkloadPolicy {
+                subject: sandbox,
+                egress: Profile::Restricted,
+                ingress: Profile::Open,
+                rules: vec![],
+            }],
+            &IdentityMap::new().with(sandbox, std::net::Ipv4Addr::LOCALHOST.into()),
+            &[],
+            &[],
+        )));
+        let restricted = client.lookup_ip("api.production.temps.local.").await;
+        assert!(
+            restricted.is_err(),
+            "a restricted source with no rules gets no answer: {restricted:?}"
+        );
+        resolver.shutdown().await;
     }
 
     fn model(

@@ -87,6 +87,46 @@ fn url_host(ip: IpAddr) -> String {
     }
 }
 
+/// Whether `host` names this machine: `localhost` or a loopback literal.
+pub(crate) fn is_loopback_host(host: &str) -> bool {
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+/// The host to put in a data-browser connection string.
+///
+/// A managed service on a worker keeps `localhost` in its parameters but is
+/// published on the worker's data address, which Temps itself recorded at
+/// enrollment, so that address is dialled without the user-input SSRF policy.
+/// Every other host goes through [`vet_query_target`].
+async fn query_dial_host(
+    service_id: i32,
+    host: &str,
+    port: u16,
+    worker_host: Option<&str>,
+) -> Result<String> {
+    match worker_host {
+        Some(worker) if is_loopback_host(host) => Ok(worker
+            .parse::<IpAddr>()
+            .map(url_host)
+            .unwrap_or_else(|_| worker.to_string())),
+        _ => vet_query_target(service_id, host, port).await,
+    }
+}
+
 /// SSRF guard for data-browser connections, mirroring the data-import guard
 /// (`data_import::source::pin_source_hosts`).
 ///
@@ -98,7 +138,8 @@ fn url_host(ip: IpAddr) -> String {
 /// * an explicit loopback host (`localhost`, `127.0.0.0/8`, `::1`) is
 ///   returned unchanged: Temps-managed service containers publish their port
 ///   on the Temps host, so this is the default and only way the control plane
-///   reaches a standalone managed service;
+///   reaches a standalone managed service it hosts itself (a worker-hosted
+///   one is dialled at its worker's address, see [`query_dial_host`]);
 /// * any other IP literal must pass [`validate_outbound_ip`] (public, or
 ///   inside the operator's trusted private networks; cloud metadata never);
 /// * a name is resolved with [`resolve_and_validate_domain`] -- every address
@@ -332,6 +373,19 @@ impl QueryService {
             .await
             .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
 
+        // A service on a worker is published on that worker's data address;
+        // its stored `localhost` would point the control plane at itself.
+        let worker_host = self
+            .external_service_manager
+            .worker_data_address(service_id)
+            .await
+            .map_err(|e| {
+                DataError::ConnectionFailed(format!(
+                    "Failed to resolve the node hosting service {}: {}",
+                    service_id, e
+                ))
+            })?;
+
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
             crate::externalsvc::ServiceType::Mariadb => {
@@ -351,7 +405,8 @@ impl QueryService {
                         DataError::InvalidConfiguration(format!("Invalid port number: {}", e))
                     })?;
                 let password = config.password.unwrap_or_default();
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
 
                 let source =
                     MariaDbSource::connect(&dial_host, port, &config.username, &password, database)
@@ -427,8 +482,19 @@ impl QueryService {
                         // passed on: the Postgres TLS ladder needs it for
                         // certificate verification and pins the addresses
                         // it resolves itself (`resolve_host_once`).
-                        vet_query_target(service_id, &config.host, port).await?;
-                        postgres_connection_target(None, config.host.clone(), port)
+                        match worker_host.as_deref() {
+                            // Temps-managed and on the private network, like a
+                            // cluster member: same connection policy.
+                            Some(worker) if is_loopback_host(&config.host) => (
+                                worker.to_string(),
+                                port,
+                                PostgresConnectionPolicy::ManagedPrivate,
+                            ),
+                            _ => {
+                                vet_query_target(service_id, &config.host, port).await?;
+                                postgres_connection_target(None, config.host.clone(), port)
+                            }
+                        }
                     }
                     Err(e) => {
                         return Err(DataError::ConnectionFailed(format!(
@@ -488,7 +554,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -517,7 +584,8 @@ impl QueryService {
 
                 // Build connection string with URL-encoded credentials
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("27017"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let password = config.password.unwrap_or_default();
 
                 // URL-encode username and password to handle special characters
@@ -564,7 +632,8 @@ impl QueryService {
 
                 // Build connection string with URL-encoded password
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
@@ -594,7 +663,8 @@ impl QueryService {
                 })?;
 
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
@@ -623,7 +693,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -651,7 +722,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -680,7 +752,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("9000"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    query_dial_host(service_id, &config.host, port, worker_host.as_deref()).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let access_key = config.access_key.ok_or_else(|| {
@@ -1276,6 +1349,68 @@ mod tests {
         assert_eq!(
             vet_query_target(1, "::ffff:127.0.0.1", 6379).await.unwrap(),
             "127.0.0.1"
+        );
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_in_every_spelling() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            " localhost ",
+            "127.0.0.1",
+            "127.3.2.1",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_loopback_host(host), "{host} should be loopback");
+        }
+        for host in [
+            "10.42.0.22",
+            "db.example.com",
+            "my-localhost",
+            "",
+            "0.0.0.0",
+        ] {
+            assert!(!is_loopback_host(host), "{host} should not be loopback");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_worker_hosted_service_is_dialled_at_its_worker_address() {
+        assert_eq!(
+            query_dial_host(3, "localhost", 5432, Some("10.42.0.22"))
+                .await
+                .unwrap(),
+            "10.42.0.22"
+        );
+        assert_eq!(
+            query_dial_host(3, "127.0.0.1", 6379, Some("fd00::22"))
+                .await
+                .unwrap(),
+            "[fd00::22]"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_worker_address_never_replaces_a_host_the_user_chose() {
+        // A user-supplied host keeps the SSRF policy even on a worker.
+        assert_eq!(
+            query_dial_host(3, "8.8.8.8", 5432, Some("10.42.0.22"))
+                .await
+                .unwrap(),
+            "8.8.8.8"
+        );
+        assert!(
+            query_dial_host(3, "169.254.169.254", 5432, Some("10.42.0.22"))
+                .await
+                .is_err()
+        );
+        // A control-plane service keeps dialling loopback.
+        assert_eq!(
+            query_dial_host(3, "localhost", 5432, None).await.unwrap(),
+            "localhost"
         );
     }
 

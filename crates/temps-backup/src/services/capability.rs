@@ -3,7 +3,9 @@
 
 use crate::engines::dispatch::{
     container_has_mariadb_pitr_tools, container_has_walg, service_container_name,
+    MARIADB_PITR_TOOLS_PROBE,
 };
+use crate::engines::workload_job::worker_node;
 use bollard::query_parameters::InspectContainerOptions;
 use std::time::Duration;
 use temps_entities::external_services;
@@ -56,10 +58,18 @@ const TOOL_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 /// an unverified capability instead of silently becoming a local-only engine.
 pub async fn probe_external_service_backup_capability(
     service: &external_services::Model,
+    manager: &temps_providers::ExternalServiceManager,
 ) -> ExternalServiceBackupCapability {
     let service_type = service.service_type.to_ascii_lowercase();
     if !requires_live_tool_probe(&service_type, &service.topology) {
         return classify_capability(service, ToolProbe::Available);
+    }
+    // A worker-hosted service's container is on that worker's Docker, not
+    // this host's: ask its agent, or a running WAL-G service would read as
+    // "container unavailable".
+    if let Some(node_id) = worker_node(service) {
+        let probe = probe_on_worker(service, &service_type, node_id, manager).await;
+        return classify_capability(service, probe);
     }
 
     let docker = match bollard::Docker::connect_with_local_defaults() {
@@ -142,6 +152,69 @@ pub async fn probe_external_service_backup_capability(
             ToolProbe::Missing
         },
     )
+}
+
+/// The tool probe of [`probe_external_service_backup_capability`], run in
+/// the service's container on worker `node_id` through its agent.
+async fn probe_on_worker(
+    service: &external_services::Model,
+    service_type: &str,
+    node_id: i32,
+    manager: &temps_providers::ExternalServiceManager,
+) -> ToolProbe {
+    let container_name = service_container_name(service);
+    let running = tokio::time::timeout(
+        DOCKER_PROBE_TIMEOUT,
+        manager.worker_service_running(node_id, &container_name),
+    )
+    .await;
+    let running = match running {
+        Ok(Ok(running)) => running,
+        Ok(Err(_)) => return ToolProbe::Unverified(UnverifiedCause::Unavailable),
+        Err(_) => {
+            return ToolProbe::Unverified(UnverifiedCause::TimedOut {
+                stage: "container inspection on its node",
+            })
+        }
+    };
+    if !running {
+        return ToolProbe::Unverified(UnverifiedCause::Unavailable);
+    }
+    let exit_code = tokio::time::timeout(
+        TOOL_PROBE_TIMEOUT,
+        manager.exec_in_worker_service(node_id, &container_name, tool_probe_command(service_type)),
+    )
+    .await;
+    match exit_code {
+        Ok(Ok(code)) => tool_probe_from_exit_code(code),
+        Ok(Err(_)) => ToolProbe::Unverified(UnverifiedCause::Unavailable),
+        Err(_) => ToolProbe::Unverified(UnverifiedCause::TimedOut {
+            stage: "backup tool check",
+        }),
+    }
+}
+
+/// The command whose exit status tells whether the backup tools exist in a
+/// container; the same checks `container_has_walg` and
+/// `container_has_mariadb_pitr_tools` run locally.
+fn tool_probe_command(service_type: &str) -> Vec<String> {
+    if service_type == "mariadb" {
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            MARIADB_PITR_TOOLS_PROBE.to_string(),
+        ]
+    } else {
+        vec!["which".to_string(), "wal-g".to_string()]
+    }
+}
+
+fn tool_probe_from_exit_code(exit_code: i64) -> ToolProbe {
+    if exit_code == 0 {
+        ToolProbe::Available
+    } else {
+        ToolProbe::Missing
+    }
 }
 
 fn requires_live_tool_probe(service_type: &str, topology: &str) -> bool {
@@ -328,6 +401,23 @@ fn recommended_image(service_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_worker_probe_reads_the_tool_check_exit_code() {
+        assert_eq!(tool_probe_from_exit_code(0), ToolProbe::Available);
+        assert_eq!(tool_probe_from_exit_code(1), ToolProbe::Missing);
+        assert_eq!(tool_probe_from_exit_code(127), ToolProbe::Missing);
+    }
+
+    #[test]
+    fn a_worker_probe_runs_the_same_tool_checks_as_a_local_one() {
+        assert_eq!(tool_probe_command("postgres"), vec!["which", "wal-g"]);
+        assert_eq!(tool_probe_command("redis"), vec!["which", "wal-g"]);
+        assert_eq!(
+            tool_probe_command("mariadb"),
+            vec!["sh", "-c", MARIADB_PITR_TOOLS_PROBE]
+        );
+    }
+
     use super::*;
 
     fn service(service_type: &str, topology: &str) -> external_services::Model {

@@ -213,6 +213,16 @@ pub struct NodeArchitectureChangedAudit {
     pub to: String,
 }
 
+/// Cluster DNS was turned on because a worker joined and no operator had
+/// decided either way. A settings change no user made, so it is recorded with
+/// the node that caused it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterDnsEnabledForWorkerAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePublicIngressChangedAudit {
     pub context: AuditContext,
@@ -564,6 +574,10 @@ impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
+impl_audit_operation!(
+    ClusterDnsEnabledForWorkerAudit,
+    "CLUSTER_DNS_ENABLED_FOR_WORKER"
+);
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
 impl_audit_operation!(
     NodePublicIngressSettingsChangedAudit,

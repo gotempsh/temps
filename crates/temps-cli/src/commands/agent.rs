@@ -335,6 +335,36 @@ impl AgentCommand {
                 }
             }
 
+            // Network policy: the same enforcer as node 0, fed by the
+            // control plane. In `legacy` (the default) a pass is one
+            // request and nothing else. Its DNS view is shared with the
+            // node resolver (started by the network sync loop), which
+            // answers restricted workloads from it.
+            let dns_policy = temps_dns::open_dns_policy_slot();
+            match temps_agent::with_control_plane_trust(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+                temps_agent::control_plane_ca(&config),
+            )
+            .build()
+            {
+                Ok(http) => {
+                    if let Err(e) = temps_agent::network_policy::spawn_worker_enforcer(
+                        http,
+                        &config.control_plane_url,
+                        config.node_id,
+                        config.token.clone(),
+                        docker.clone(),
+                        dns_policy.clone(),
+                    ) {
+                        tracing::warn!(error = %e, "network policy enforcer could not start");
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "network policy enforcer could not start: building its HTTP client failed"
+                ),
+            }
+
             // Direct worker ingress (ADR 058 D7): the worker's own mode
             // (`temps agent ingress`) decides whether and where it listens.
             temps_agent::public_ingress_manager::start(
@@ -444,6 +474,7 @@ impl AgentCommand {
                     overlay_bridge_address,
                     overlay_peers,
                     host_bind_address: host_bind_slot,
+                    dns_policy,
                 },
                 docker_socket_grant,
                 temps_agent::server::AgentServerOptions {

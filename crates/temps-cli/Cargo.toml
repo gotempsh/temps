@@ -25,6 +25,9 @@ path = "src/lib.rs"
 default = []
 # Run WASM functions in-process (ADR-055 phase 10). See the dependency.
 wasm = ["dep:temps-workload-wasm"]
+# Embed the network policy eBPF programs (needs nightly Rust with rust-src
+# and bpf-linker at build time). Without it nodes enforce with nftables.
+ebpf = ["temps-network-policy/ebpf", "temps-agent/ebpf"]
 
 [dependencies]
 # All library crates

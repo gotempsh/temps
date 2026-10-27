@@ -65,13 +65,22 @@ impl TempsPlugin for ProvidersPlugin {
             let local_workloads = temps_core::policy_or_default(
                 context.get_service::<temps_core::LocalWorkloadPolicy>(),
             );
-            let external_service_manager = Arc::new(ExternalServiceManager::new_with_handle(
+            let mut external_service_manager = ExternalServiceManager::new_with_handle(
                 db.clone(),
                 encryption_service.clone(),
                 docker_handle.clone(),
                 local_workloads.local_workloads_enabled(),
                 dns_registry,
-            ));
+            );
+            // The control plane's cluster resolver slot (ADR-024). Registered
+            // by `temps serve`; filled only while cluster DNS is enabled and
+            // the resolver answers, so an unregistered or empty slot simply
+            // leaves local cluster members on Docker's embedded DNS.
+            if let Some(slot) = context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
+            {
+                external_service_manager = external_service_manager.with_cluster_dns_slot(slot);
+            }
+            let external_service_manager = Arc::new(external_service_manager);
             context.register_service(external_service_manager.clone());
 
             // Imports of external databases into managed services. Registered

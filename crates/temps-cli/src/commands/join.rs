@@ -444,6 +444,32 @@ fn outbound_enroll_client(enroll_url: &str) -> anyhow::Result<reqwest::Client> {
         .build()?)
 }
 
+/// The client for a direct join (`--private-address`). The join token goes to
+/// the URL the operator typed, and the control plane answers every current
+/// CLI with a per-node mTLS identity, which the agent only accepts alongside
+/// an `https://` control plane. Plain HTTP is refused before anything is
+/// sent, loopback included: it would leak the token on the way and leave an
+/// agent that cannot start.
+fn direct_control_plane_client(control_plane_url: &str) -> anyhow::Result<ControlPlaneClient> {
+    let url = url::Url::parse(control_plane_url).map_err(|error| {
+        anyhow::anyhow!("'{control_plane_url}' is not a valid control plane URL: {error}")
+    })?;
+    if url.scheme() != "https" {
+        anyhow::bail!(
+            "Joining with --private-address needs an https:// control plane URL (got {}://): \
+             the join token is sent to it, and the agent refuses a control plane it cannot reach \
+             over TLS. Use the https:// URL shown in the console, or, when the control plane has \
+             no certificate, join over the WireGuard mesh with --pair <code> from the Worker \
+             Nodes page.",
+            url.scheme()
+        );
+    }
+    Ok(ControlPlaneClient {
+        client: reqwest::Client::builder().https_only(true).build()?,
+        trust: temps_agent::ControlPlaneTrust::PublicRoots,
+    })
+}
+
 /// Bounds on the outbound enrollment request: a control plane that accepts
 /// the connection but never answers must not hold `temps join` forever.
 const OUTBOUND_ENROLL_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -913,10 +939,7 @@ impl JoinCommand {
             JoinMode::Direct(private_addr) => {
                 // A public control-plane URL: public roots only, now and for
                 // the agent afterwards.
-                let control_plane = ControlPlaneClient {
-                    client: reqwest::Client::builder().build()?,
-                    trust: temps_agent::ControlPlaneTrust::PublicRoots,
-                };
+                let control_plane = direct_control_plane_client(self.target())?;
                 self.join_direct(
                     &node_name,
                     &private_addr,
@@ -2168,7 +2191,32 @@ async fn detect_public_endpoint(wg_port: u16) -> Option<String> {
 mod tests {
     #[cfg(unix)]
     use super::write_private_key;
-    use super::{outbound_enroll_client, problem_detail, JoinCommand, JoinMode};
+    use super::{
+        direct_control_plane_client, outbound_enroll_client, problem_detail, JoinCommand, JoinMode,
+    };
+
+    /// A direct join sends the token to the typed URL and leaves an agent
+    /// that requires an HTTPS control plane, so plain HTTP is refused before
+    /// anything is sent, loopback included, with the two ways forward.
+    #[test]
+    fn a_direct_join_needs_an_https_control_plane() {
+        assert!(direct_control_plane_client("https://cp.example.com").is_ok());
+        assert!(direct_control_plane_client("https://10.0.0.1:8443/").is_ok());
+        for refused in [
+            "http://10.0.0.1:8081",
+            "http://cp.example.com",
+            "http://127.0.0.1:8081",
+            "ftp://cp.example.com",
+        ] {
+            let error = direct_control_plane_client(refused)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            assert!(error.contains("https://"), "{refused}: {error}");
+            assert!(error.contains("--pair"), "{refused}: {error}");
+        }
+        assert!(direct_control_plane_client("not a url").is_err());
+    }
 
     /// The outbound enrollment's answer is the join's trust anchor: plain
     /// HTTP is refused except to loopback, so no one on the path can read the

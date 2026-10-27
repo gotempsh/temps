@@ -95,14 +95,9 @@ impl ResolverConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             http_timeout: Duration::from_secs(10),
-            // Cloudflare 1.1.1.1 / 1.0.0.1 + Google 8.8.8.8. Operators
-            // who need a private upstream (corporate split-horizon) can
-            // override via `with_upstream_resolvers`.
-            upstream_resolvers: vec![
-                SocketAddr::new("1.1.1.1".parse().expect("static ipv4"), 53),
-                SocketAddr::new("1.0.0.1".parse().expect("static ipv4"), 53),
-                SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
-            ],
+            // The host's own servers, then public fallbacks (see
+            // `crate::host_dns`). `with_upstream_resolvers` overrides.
+            upstream_resolvers: crate::host_dns::host_upstream_resolvers(&[bridge_gateway]),
             disable_sync: false,
             control_plane_ca_pem: None,
             control_plane_legacy_cert_pem: None,
@@ -125,11 +120,7 @@ impl ResolverConfig {
             initial_backoff: Duration::from_secs(1),
             max_backoff: Duration::from_secs(30),
             http_timeout: Duration::from_secs(10),
-            upstream_resolvers: vec![
-                SocketAddr::new("1.1.1.1".parse().expect("static ipv4"), 53),
-                SocketAddr::new("1.0.0.1".parse().expect("static ipv4"), 53),
-                SocketAddr::new("8.8.8.8".parse().expect("static ipv4"), 53),
-            ],
+            upstream_resolvers: crate::host_dns::host_upstream_resolvers(&[bridge_gateway]),
             disable_sync: true,
             control_plane_ca_pem: None,
             control_plane_legacy_cert_pem: None,

@@ -95,6 +95,12 @@ pub struct Model {
     /// heartbeat (from its last successful sync, or its on-disk snapshot if
     /// it hasn't synced yet). `None` means never reported.
     pub dns_resolver_record_count: Option<i32>,
+    /// Deployment ids with a container on this node that was created without
+    /// the node's cluster resolver, as of the last heartbeat: a JSON array of
+    /// integers. Those containers cannot resolve `*.temps.local` until they
+    /// are redeployed. `None` means never reported; read it through
+    /// [`Model::deployments_without_resolver`].
+    pub deployments_without_resolver: Option<Json>,
     /// When this node's workloads were failed over for the current outage.
     /// `None` means they have not been: the node is healthy, or it is offline
     /// but still inside the failover grace period (or a failover pass failed
@@ -181,19 +187,26 @@ impl Model {
     }
 
     /// Where the control plane opens connections to this node's agent API, and
-    /// the name the agent's certificate is verified for. A node whose
-    /// workloads are reached on its mesh address ([`Self::data_address`]) has
-    /// its agent reached there too, once the agent reports it listens on it;
+    /// the name the agent's certificate is verified for: its mesh address once
+    /// the agent reports it listens there, otherwise the registered address;
     /// see `temps_core::node_address::node_agent_endpoint`.
     pub fn agent_endpoint(&self) -> temps_core::node_address::NodeAgentEndpoint {
         temps_core::node_address::node_agent_endpoint(
             &self.address,
-            &self.private_address,
             self.mesh_wg_address.as_deref(),
             self.capacity
                 .get(temps_core::node_address::AGENT_MESH_LISTENER_KEY)
                 .and_then(serde_json::Value::as_str),
         )
+    }
+
+    /// Deployment ids this node last reported running without its cluster
+    /// resolver; empty when it has not reported or the value is malformed.
+    pub fn deployments_without_resolver(&self) -> Vec<i64> {
+        self.deployments_without_resolver
+            .as_ref()
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -253,6 +266,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             failover_at: None,
             build_limits: None,
             public_ingress_enabled: false,

@@ -399,6 +399,7 @@ mod m20261025_000002_add_log_ingest_overrides;
 mod m20261026_000001_create_shield;
 mod m20261026_000001_tailnet_serve;
 mod m20261026_000002_tailnet_principals;
+mod m20261027_000001_nodes_deployments_without_resolver;
 
 pub struct Migrator;
 
@@ -890,6 +891,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20261026_000001_tailnet_serve::Migration),
             // ADR 065 D6: `tailnet_users` and who it admits.
             Box::new(m20261026_000002_tailnet_principals::Migration),
+            // Deployments a node runs without the cluster resolver.
+            Box::new(m20261027_000001_nodes_deployments_without_resolver::Migration),
         ]
     }
 }

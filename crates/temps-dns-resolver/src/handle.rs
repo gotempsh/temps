@@ -81,7 +81,7 @@ impl ResolverHandle {
     /// `policy` (see [`ZoneAuthority::with_policy`]).
     pub async fn start_with_policy(
         config: ResolverConfig,
-        policy: Option<Arc<arc_swap::ArcSwap<temps_workload_netpol::DnsPolicy>>>,
+        policy: Option<crate::DnsPolicySlot>,
     ) -> Result<Self, ResolverError> {
         let zone = Arc::new(ZoneStore::new(config.snapshot_path()));
         zone.load_from_disk();

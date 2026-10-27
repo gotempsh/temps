@@ -3929,7 +3929,8 @@
           "cluster_dns": {
             "$ref": "#/components/schemas/ClusterDnsSettings",
             "default": {
-              "enabled": false
+              "enabled": false,
+              "operator_chosen": false
             },
             "description": "Cluster-DNS resolver settings (ADR-024, experimental beta). Off by\ndefault — see `ClusterDnsSettings` for the incident background and\ntrade-offs. Must be explicitly enabled by operators who need\n`*.temps.local` service-to-service resolution inside containers."
           },
@@ -10527,6 +10528,12 @@
             "description": "Master switch. When `false` (default), no custom DNS is injected into\ncontainers — they use Docker's embedded DNS which forwards to the host's\nown `resolv.conf`. When `true`, the control-plane Hickory resolver is\nstarted and its bridge IP is injected as the first nameserver so\n`*.temps.local` FQDNs resolve inside containers.",
             "example": false,
             "type": "boolean"
+          },
+          "operator_chosen": {
+            "default": false,
+            "description": "Whether an operator has ever changed `enabled` themselves. Until then,\nthe control plane turns cluster DNS on when the first worker joins,\nsince cross-node links need `*.temps.local`. Set by the server when a\nsave changes `enabled`; a client cannot clear it.",
+            "example": false,
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -10537,6 +10544,20 @@
           "cluster_dns_enabled": {
             "description": "Whether cluster DNS is currently enabled cluster-wide\n(`AppSettings.cluster_dns.enabled`). When `false`, every node's\nper-node values below are expected to show `dns_resolver_running:\nSome(false)` (or `None` if a node has never reported).",
             "type": "boolean"
+          },
+          "deployments_without_resolver": {
+            "description": "Applications whose running containers were created without the\ncluster resolver, so they cannot resolve `*.temps.local` names until\nredeployed: a container's nameservers are fixed when it is created.\nEmpty while cluster DNS is off. Databases are not listed; they do not\nlook up other services by name.",
+            "items": {
+              "$ref": "#/components/schemas/DeploymentWithoutResolver"
+            },
+            "type": "array"
+          },
+          "deployments_without_resolver_error": {
+            "description": "Set when the list above could not be computed; the rest of the\nresponse is still accurate.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "name_conflicts": {
             "description": "Names refused because another owner holds them. Empty on a healthy\ncluster; each entry needs one side renamed or removed.",
@@ -10561,7 +10582,8 @@
           "cluster_dns_enabled",
           "total_record_count",
           "nodes",
-          "name_conflicts"
+          "name_conflicts",
+          "deployments_without_resolver"
         ],
         "type": "object"
       },
@@ -20893,6 +20915,49 @@
           "token_prefix",
           "is_active",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "DeploymentWithoutResolver": {
+        "description": "An application whose running containers were created without the\ncluster resolver. Redeploying it gives the new containers the resolver.",
+        "properties": {
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "hosts": {
+            "description": "Hosts running one of its containers without the resolver.",
+            "items": {
+              "$ref": "#/components/schemas/ResolverCoverageHost"
+            },
+            "type": "array"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "deployment_id",
+          "project_id",
+          "project_name",
+          "project_slug",
+          "environment_id",
+          "environment_name",
+          "hosts"
         ],
         "type": "object"
       },
@@ -33477,6 +33542,17 @@
               "null"
             ]
           },
+          "deployments_without_resolver": {
+            "description": "Deployment ids with a container on this node created without the\nnode's cluster resolver, so it cannot resolve `*.temps.local` until\nredeployed. Empty while cluster DNS is off; absent from older agents,\nwhich leaves the stored value untouched.",
+            "items": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "disk_health": {
             "description": "Software RAID and drive SMART health read by the agent\n(`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw\nJSON here and parsed after the heartbeat is recorded, so a malformed\nreport from a mismatched agent version costs only the disk metrics,\nnever the heartbeat that keeps the node online.",
             "type": [
@@ -42678,7 +42754,7 @@
             "type": "string"
           },
           "supports_enforcement": {
-            "description": "Whether this node can run `shadow` or `enforce`. False on workers:\nno enforcer runs there yet, and a stored non-legacy mode on a worker\nis never counted as enforcing.",
+            "description": "Whether this node can run `shadow` or `enforce`: always on the\ncontrol plane, on a worker while its agent reports an enforcer. A\nstored non-legacy mode on a node without one is never counted as\nenforcing.",
             "type": "boolean"
           }
         },
@@ -55120,6 +55196,26 @@
             "type": "object"
           }
         ]
+      },
+      "ResolverCoverageHost": {
+        "description": "Where a stale deployment runs: the control plane or a worker.",
+        "properties": {
+          "node_id": {
+            "description": "`None` for the control plane, which has no node row.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "node_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "node_name"
+        ],
+        "type": "object"
       },
       "ResourceCounts": {
         "description": "Quick count of resources involved in the migration",

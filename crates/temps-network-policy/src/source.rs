@@ -10,8 +10,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use temps_workload_netpol::{
-    choose_executor, choose_port_resolver, DnsPolicy, DockerInstanceSource, EgressTable,
-    EnforcerError, NodeEnforcer, NodeMode, PolicySnapshot, PolicySource, TableName,
+    choose_executor, choose_port_resolver, spawn_container_wake, with_best_datapath, DnsPolicy,
+    DockerInstanceSource, EgressTable, EnforcerError, IdentityMap, NodeEnforcer, NodeMode,
+    PolicySnapshot, PolicySource, TableName,
 };
 use tracing::info;
 
@@ -48,13 +49,20 @@ impl DbPolicySource {
 #[async_trait]
 impl PolicySource for DbPolicySource {
     async fn mode(&self) -> Result<NodeMode, EnforcerError> {
-        self.service
-            .node_mode(self.node_id)
-            .await
-            .map_err(|e| EnforcerError::Source {
-                node: self.node(),
-                reason: e.to_string(),
-            })
+        let mode =
+            self.service
+                .node_mode(self.node_id)
+                .await
+                .map_err(|e| EnforcerError::Source {
+                    node: self.node(),
+                    reason: e.to_string(),
+                })?;
+        if mode == NodeMode::Legacy {
+            // Nothing is observed in `legacy`; stop advertising what was.
+            self.service
+                .record_observed(self.node_id, IdentityMap::new());
+        }
+        Ok(mode)
     }
 
     async fn snapshot(&self) -> Result<PolicySnapshot, EnforcerError> {
@@ -65,6 +73,12 @@ impl PolicySource for DbPolicySource {
                 node: self.node(),
                 reason: e.to_string(),
             })
+    }
+
+    /// Node 0's workloads, for the workers: the same record a worker's
+    /// report makes.
+    fn observed(&self, local: &IdentityMap) {
+        self.service.record_observed(self.node_id, local.clone());
     }
 }
 
@@ -78,10 +92,14 @@ pub fn control_plane_table() -> Result<TableName, EnforcerError> {
 
 /// Starts node 0's enforcer. In `legacy` (the default) each pass reads the
 /// mode and does nothing else: no Docker call, no nftables.
+///
+/// `dns` is the slot node 0's resolver answers restricted workloads from;
+/// each pass stores its snapshot there.
 pub fn spawn_control_plane_enforcer(
     service: Arc<NetworkPolicyService>,
     docker: bollard::Docker,
     daemon_is_local: bool,
+    dns: Arc<ArcSwap<DnsPolicy>>,
 ) -> Result<tokio::task::JoinHandle<()>, EnforcerError> {
     let node = format!("node-{CONTROL_PLANE_NODE_ID}");
     let table = control_plane_table()?;
@@ -90,11 +108,17 @@ pub fn spawn_control_plane_enforcer(
         table,
         Arc::from(choose_executor(docker.clone(), daemon_is_local)),
         Arc::from(choose_port_resolver(docker.clone(), daemon_is_local)),
-        Arc::new(DockerInstanceSource::new(node.clone(), docker)),
+        Arc::new(DockerInstanceSource::new(node.clone(), docker.clone())),
         Arc::new(DbPolicySource::new(service, CONTROL_PLANE_NODE_ID)),
-        Arc::new(ArcSwap::from_pointee(DnsPolicy::open())),
+        dns,
         Arc::new(ArcSwap::from_pointee(EgressTable::default())),
     );
+    let enforcer = with_best_datapath(enforcer, daemon_is_local);
+    let enforcer = if enforcer.uses_datapath() {
+        enforcer.with_wake(spawn_container_wake(node.clone(), docker))
+    } else {
+        enforcer
+    };
     info!(
         node = %node,
         interval_secs = PASS_INTERVAL.as_secs(),

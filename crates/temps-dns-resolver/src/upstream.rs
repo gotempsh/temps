@@ -38,6 +38,17 @@ use tracing::{trace, warn};
 
 type TokioResolver = Resolver<TokioRuntimeProvider>;
 
+/// How long one upstream server gets before the pool tries the next one.
+const UPSTREAM_SERVER_TIMEOUT: Duration = Duration::from_millis(800);
+
+/// The whole forwarded lookup, across every upstream. Docker's embedded DNS,
+/// which sits in front of us in every container, waits about 4 s per
+/// upstream before trying the next one in the container's list (the host's
+/// own servers). Answering SERVFAIL well inside that window makes a slow or
+/// unreachable upstream cost a container ~2 s once, instead of the 20 s+
+/// stalls a 3 s x 2-attempt timeout stacked with glibc's retries produced.
+pub const UPSTREAM_LOOKUP_BUDGET: Duration = Duration::from_millis(2_000);
+
 /// Forwards queries that fall outside the internal `temps.local` zone
 /// to the upstream pool. Construct once per agent process and share via
 /// `Arc` — the underlying `Resolver` is itself cheap-to-clone and uses
@@ -65,8 +76,10 @@ impl UpstreamResolver {
         }
 
         let mut opts = ResolverOpts::default();
-        opts.timeout = Duration::from_secs(3);
-        opts.attempts = 2;
+        // Short per-server timeout: the overall budget below decides when to
+        // give up, and the pool moves on to the next upstream quickly.
+        opts.timeout = UPSTREAM_SERVER_TIMEOUT;
+        opts.attempts = 1;
         // Modest cache so we don't hammer upstreams during burst
         // traffic from a freshly-booted pod. 512 entries ≈ a few KB.
         opts.cache_size = 512;
@@ -102,36 +115,54 @@ impl UpstreamResolver {
         let qname: Name = info.query.name().into();
         let qtype = info.query.query_type();
 
-        let lookup_result = self.resolver.lookup(qname.clone(), qtype).await;
+        let lookup_result = tokio::time::timeout(
+            UPSTREAM_LOOKUP_BUDGET,
+            self.resolver.lookup(qname.clone(), qtype),
+        )
+        .await;
 
         let (records, response_code) = match lookup_result {
-            Ok(lookup) => {
-                let recs: Vec<Record> = lookup.answers().to_vec();
-                trace!(qname = %qname, qtype = ?qtype, answers = recs.len(), "upstream answer");
-                (recs, ResponseCode::NoError)
+            Err(_elapsed) => {
+                // Out of budget: SERVFAIL now, so Docker's embedded DNS
+                // moves on to the host's own server listed after us instead
+                // of waiting out its own per-server timeout.
+                warn!(
+                    qname = %qname,
+                    qtype = ?qtype,
+                    budget_ms = UPSTREAM_LOOKUP_BUDGET.as_millis() as u64,
+                    "upstream lookup exceeded its budget; answering SERVFAIL"
+                );
+                (Vec::new(), ResponseCode::ServFail)
             }
-            Err(e) => {
-                // hickory-resolver reports both NODATA (the name exists but
-                // has no record of *this* type) and NXDOMAIN (the name does
-                // not exist at all) as the same `NoRecordsFound` error. The
-                // true distinction lives in `NoRecords.response_code`, and it
-                // is load-bearing: glibc and busybox `getaddrinfo` treat an
-                // NXDOMAIN on *either* the A or the AAAA query as "host does
-                // not exist" and abandon the whole lookup. So an AAAA query
-                // for an IPv4-only host (e.g. `api.github.com`) that we answer
-                // with NXDOMAIN instead of NODATA silently breaks every
-                // outbound connection to that host — the good A answer is
-                // thrown away. We therefore forward the real response code and
-                // reserve SERVFAIL for genuine transport failures (timeout,
-                // refused, malformed) so the client retries another server.
-                let code = upstream_error_response_code(&e);
-                if code == ResponseCode::ServFail {
-                    warn!(qname = %qname, qtype = ?qtype, error = %e, "upstream lookup failed");
-                } else {
-                    trace!(qname = %qname, qtype = ?qtype, ?code, "upstream negative answer");
+            Ok(lookup_result) => match lookup_result {
+                Ok(lookup) => {
+                    let recs: Vec<Record> = lookup.answers().to_vec();
+                    trace!(qname = %qname, qtype = ?qtype, answers = recs.len(), "upstream answer");
+                    (recs, ResponseCode::NoError)
                 }
-                (Vec::new(), code)
-            }
+                Err(e) => {
+                    // hickory-resolver reports both NODATA (the name exists but
+                    // has no record of *this* type) and NXDOMAIN (the name does
+                    // not exist at all) as the same `NoRecordsFound` error. The
+                    // true distinction lives in `NoRecords.response_code`, and it
+                    // is load-bearing: glibc and busybox `getaddrinfo` treat an
+                    // NXDOMAIN on *either* the A or the AAAA query as "host does
+                    // not exist" and abandon the whole lookup. So an AAAA query
+                    // for an IPv4-only host (e.g. `api.github.com`) that we answer
+                    // with NXDOMAIN instead of NODATA silently breaks every
+                    // outbound connection to that host — the good A answer is
+                    // thrown away. We therefore forward the real response code and
+                    // reserve SERVFAIL for genuine transport failures (timeout,
+                    // refused, malformed) so the client retries another server.
+                    let code = upstream_error_response_code(&e);
+                    if code == ResponseCode::ServFail {
+                        warn!(qname = %qname, qtype = ?qtype, error = %e, "upstream lookup failed");
+                    } else {
+                        trace!(qname = %qname, qtype = ?qtype, ?code, "upstream negative answer");
+                    }
+                    (Vec::new(), code)
+                }
+            },
         };
 
         // Hickory's `lookup` already returns the answer set the

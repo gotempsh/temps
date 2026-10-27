@@ -303,8 +303,12 @@ docker exec "$NODE_A" docker run --rm --network "$EXISTING_APP_NETWORK" \
 
 # Production database services are attached to temps-app-network first and to
 # the multi-node overlay second. Their default route therefore remains on the
-# app network. Without the scoped cross-node SNAT rule their reply to a worker
-# leaves through that wrong default route and the connection times out.
+# app network, and their reply to a worker would leave through it and time
+# out. The control plane's overlay reconcile gives every overlay-attached
+# container a route to each peer subnet through the overlay
+# (overlay_routes::sweep_container_routes); this harness runs no control
+# plane, so it installs that same route. Cross-node traffic is not SNATed:
+# the service must see the worker container's own address.
 docker exec "$NODE_A" docker network connect \
   --ip 10.240.1.20 temps-overlay "$EXISTING_APP_CONTAINER"
 
@@ -312,6 +316,12 @@ docker exec "$NODE_A" docker exec "$EXISTING_APP_CONTAINER" \
   awk '$2 == "00000000" { print $1 }' /proc/net/route \
   | grep -q '^eth0$' \
   || fail "dual-network fixture no longer reproduces app-network default routing"
+
+docker exec "$NODE_A" sh -ec '
+  pid=$(docker inspect -f "{{.State.Pid}}" '"'$EXISTING_APP_CONTAINER'"')
+  dev=$(nsenter -t "$pid" -n ip -o -4 addr show | awk "/10\.240\.1\.20\// { print \$2 }")
+  nsenter -t "$pid" -n ip route replace 10.240.2.0/24 via 10.240.1.1 dev "$dev"
+' || fail "could not give the dual-network service its overlay peer route"
 
 log "both nodes bootstrapped — running container ping"
 
@@ -349,5 +359,9 @@ docker exec "$NODE_B" docker run --rm --network temps-overlay --ip 10.240.2.20 a
   echo "expected dual-network nginx response was not received after 30 attempts" >&2
   exit 1
 ' || fail "worker could not reach dual-network control-plane service"
+
+docker exec "$NODE_A" docker logs "$EXISTING_APP_CONTAINER" 2>&1 \
+  | grep -q '^10\.240\.2\.20 ' \
+  || fail "dual-network service did not see the worker container's own address (cross-node traffic was rewritten)"
 
 log "✅ cross-host overlay verified"

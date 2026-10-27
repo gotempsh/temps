@@ -26,6 +26,12 @@ use crate::allocator::{AllocatorError, PostgresAllocator};
 use crate::{NetworkConfig, NetworkError, NetworkManager, NodeAlloc, Peer, Transport};
 
 const PEER_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+/// Every reconcile tick gives containers newly attached to the overlay their
+/// routes (one container listing, nothing spawned when there are none).
+/// Every container is refreshed when the peers change and otherwise every
+/// this many ticks (30 s), which repairs restarted containers: each refresh
+/// spawns a process per overlay-attached container.
+const ROUTE_SWEEP_EVERY_TICKS: u32 = 6;
 
 /// Why the last attempt to bring up this process's control-plane overlay
 /// failed, if it did. Set by whoever drives [`setup`] in the background (the
@@ -167,6 +173,8 @@ impl ControlPlaneOverlay {
         tokio::spawn(async move {
             let allocator = PostgresAllocator::new(db.clone());
             let mut tick: u32 = 0;
+            // Containers already given their overlay routes.
+            let mut routed = std::collections::HashSet::new();
             // Set when the mesh interface was recreated or reconfigured: the
             // overlay must be bootstrapped again, not just reconciled.
             let mut rebootstrap = false;
@@ -210,6 +218,7 @@ impl ControlPlaneOverlay {
                                 allowed
                             })
                             .collect();
+                        let sweep_peers = peers.clone();
                         let result = if rebootstrap {
                             manager
                                 .bootstrap(alloc.clone(), peers)
@@ -221,6 +230,12 @@ impl ControlPlaneOverlay {
                         } else {
                             reconcile_peer_snapshot(&manager, &docker, &config, &alloc, peers).await
                         };
+                        if matches!(result, Ok(true))
+                            || tick.is_multiple_of(ROUTE_SWEEP_EVERY_TICKS)
+                        {
+                            routed.clear();
+                        }
+                        sweep_routes(&docker, &config, &alloc, &sweep_peers, &mut routed).await;
                         match result {
                             Ok(_) => rebootstrap = false,
                             Err(error) => {
@@ -395,6 +410,32 @@ pub async fn reconcile_peer_snapshot(
     crate::preflight_compute_routes(config, &routed).await?;
     crate::docker::ensure_network_for_subnets(docker, config, alloc, &routed).await?;
     manager.reconcile_peers(peers).await
+}
+
+/// Gives every overlay-attached container on the control plane a route to
+/// each peer's subnet, as worker agents do on theirs: a managed service is
+/// attached to `temps-app-network` first, so without these its replies to
+/// a worker would leave by its default route. Best-effort, retried on the
+/// next tick.
+pub async fn sweep_routes(
+    docker: &Docker,
+    config: &NetworkConfig,
+    alloc: &NodeAlloc,
+    peers: &[Peer],
+    routed: &mut std::collections::HashSet<String>,
+) {
+    let gateway = alloc.bridge_address.to_string();
+    if let Err(error) = crate::overlay_routes::sweep_container_routes(
+        docker,
+        &config.docker_network_name,
+        &gateway,
+        peers,
+        routed,
+    )
+    .await
+    {
+        warn!(%error, "could not refresh overlay routes in control-plane containers; retrying next tick");
+    }
 }
 
 /// The overlay subnets a host routes: its own and every peer's (ADR 056).

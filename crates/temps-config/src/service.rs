@@ -2181,6 +2181,24 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.update_settings_section("blob", update_fn).await
     }
 
+    /// Turn cluster DNS on because a worker joined, unless an operator has
+    /// already decided either way (see
+    /// [`ClusterDnsSettings::should_enable_for_worker`]). Cross-node links
+    /// need `*.temps.local`, so a cluster that gains a worker would otherwise
+    /// refuse them until someone found the setting. Runs under the
+    /// settings-row lock; returns whether it changed anything.
+    pub async fn enable_cluster_dns_for_worker(&self) -> Result<bool, ConfigServiceError> {
+        let mut changed = false;
+        self.update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
+            if dns.should_enable_for_worker() {
+                dns.enabled = true;
+                changed = true;
+            }
+        })
+        .await?;
+        Ok(changed)
+    }
+
     /// Read-modify-write one top-level section of the settings document under
     /// the settings-row lock. A missing section starts from its default; a
     /// stored section that does not parse is reported rather than replaced, so
@@ -4412,6 +4430,65 @@ mod tests {
             .iter()
             .flat_map(|transaction| transaction.statements())
             .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn a_worker_turns_cluster_dns_on_once_unless_an_operator_decided() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping cluster DNS integration test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("cluster DNS test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+
+        assert!(service
+            .enable_cluster_dns_for_worker()
+            .await
+            .expect("first worker"));
+        assert!(
+            service
+                .get_settings()
+                .await
+                .expect("settings after first worker")
+                .cluster_dns
+                .enabled
+        );
+        assert!(!service
+            .enable_cluster_dns_for_worker()
+            .await
+            .expect("second worker"));
+
+        // An operator turns it off; the next worker leaves it off.
+        service
+            .update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
+                *dns = temps_core::ClusterDnsSettings::after_operator_save(
+                    &dns.clone(),
+                    &temps_core::ClusterDnsSettings {
+                        enabled: false,
+                        operator_chosen: false,
+                    },
+                );
+            })
+            .await
+            .expect("operator turns cluster DNS off");
+        assert!(!service
+            .enable_cluster_dns_for_worker()
+            .await
+            .expect("worker after the operator's choice"));
+        let stored = service
+            .get_settings()
+            .await
+            .expect("settings after the operator's choice")
+            .cluster_dns;
+        assert!(!stored.enabled);
+        assert!(stored.operator_chosen);
     }
 
     #[tokio::test]

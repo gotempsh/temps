@@ -966,78 +966,12 @@ fn extract_bounded_static_archive(
     process_bounded_static_archive(archive_path, Some(destination), image_name, source_path)
 }
 
-/// Extracts `nameserver` entries from resolv.conf-formatted text, excluding
-/// loopback addresses — meaningless inside a container's own network
-/// namespace, and the classic case for systemd-resolved's `127.0.0.53`
-/// stub. Pure/deterministic so it's unit-testable without touching the
-/// filesystem; see [`host_default_dns_servers`] for the I/O side.
-fn parse_non_loopback_nameservers(resolv_conf: &str) -> Vec<String> {
-    resolv_conf
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("nameserver"))
-        .map(str::trim)
-        .filter(|ip| {
-            ip.parse::<std::net::IpAddr>()
-                .map(|addr| !addr.is_loopback())
-                .unwrap_or(false)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-/// Best-effort read of the host's own already-configured DNS servers, so
-/// they — not a hardcoded public resolver — can be appended as a fallback
-/// after the per-node Hickory resolver. Air-gapped/on-prem installs often
-/// route DNS to an internal-only server; assuming 1.1.1.1/8.8.8.8 would be
-/// unreachable there, and would leak queries externally for operators who
-/// specifically kept resolution internal.
-///
-/// Checks `/etc/resolv.conf` first. On systemd-resolved hosts that file is
-/// usually just the loopback stub (`127.0.0.53`, unreachable from inside a
-/// container's own netns), so this falls through to
-/// `/run/systemd/resolve/resolv.conf`, which systemd-resolved maintains
-/// specifically to expose the *real* upstream servers to tools — Docker's
-/// own embedded-DNS "ExtServers" detection reads the same file for the same
-/// reason.
-fn host_default_dns_servers() -> Vec<String> {
-    for path in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"] {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            let servers = parse_non_loopback_nameservers(&contents);
-            if !servers.is_empty() {
-                return servers;
-            }
-        }
-    }
-    Vec::new()
-}
-
-/// Appends entries from `fallback_pool` to `primary`, deduplicated and
-/// capped at 3 total entries — glibc and musl both fail over to the next
-/// `nameserver` line once the current one times out, but both also ignore
-/// anything past the third line in `/etc/resolv.conf`.
-fn merge_dns_with_fallback(mut primary: Vec<String>, fallback_pool: &[String]) -> Vec<String> {
-    for fallback in fallback_pool {
-        if primary.len() >= 3 {
-            break;
-        }
-        if !primary.contains(fallback) {
-            primary.push(fallback.clone());
-        }
-    }
-    primary
-}
-
-/// Appends the host's own already-configured DNS servers (see
-/// [`host_default_dns_servers`]) to `primary`, so `temps-dns-resolver` is
-/// never a single point of failure for outbound DNS.
-///
-/// Shared by the app-container path ([`DockerRuntime::dns_for_container`])
-/// and the managed-service path (`temps_agent::service_handlers`) so
-/// neither one can silently regress into wiring the Hickory resolver as the
-/// sole nameserver.
-pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
-    merge_dns_with_fallback(primary, &host_default_dns_servers())
-}
+/// Appends the host's own DNS servers to the cluster resolver, so it is never
+/// a container's only nameserver. Shared by the app-container path
+/// ([`DockerRuntime::dns_for_container`]), the workload plane and managed
+/// services; lives in `temps-dns-resolver` next to the resolver's own
+/// upstream selection.
+pub use temps_dns_resolver::host_dns::dns_with_fallback;
 
 /// The one bind a project granted host Docker access receives, or `None`.
 ///
@@ -5812,75 +5746,6 @@ mod docker_tests {
         assert!(dns.len() <= 3);
     }
 
-    // --- parse_non_loopback_nameservers: pure parsing, deterministic ---
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_skips_systemd_resolved_stub() {
-        let resolv_conf = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
-        assert!(parse_non_loopback_nameservers(resolv_conf).is_empty());
-    }
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_keeps_real_servers() {
-        let resolv_conf = "nameserver 10.0.0.53\nnameserver 8.8.8.8\nsearch example.com\n";
-        assert_eq!(
-            parse_non_loopback_nameservers(resolv_conf),
-            vec!["10.0.0.53", "8.8.8.8"]
-        );
-    }
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_skips_ipv6_loopback_and_malformed() {
-        let resolv_conf = "nameserver ::1\nnameserver not-an-ip\nnameserver 2001:4860:4860::8888\n";
-        assert_eq!(
-            parse_non_loopback_nameservers(resolv_conf),
-            vec!["2001:4860:4860::8888"]
-        );
-    }
-
-    // --- merge_dns_with_fallback: pure merge, deterministic ---
-
-    #[test]
-    fn test_merge_dns_with_fallback_appends_pool_after_primary() {
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string()],
-            &["10.0.0.53".to_string(), "10.0.0.54".to_string()],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_caps_at_three() {
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string()],
-            &[
-                "10.0.0.53".to_string(),
-                "10.0.0.54".to_string(),
-                "10.0.0.55".to_string(),
-            ],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_dedupes_against_primary() {
-        // Primary already equals the host's configured server (single-host
-        // setup where the resolver IP happens to match) — must not repeat it.
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string(), "10.0.0.53".to_string()],
-            &["10.0.0.53".to_string()],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_empty_pool_leaves_primary_untouched() {
-        // Host default DNS undiscoverable (e.g. no readable resolv.conf) —
-        // must not panic or invent servers, just keep the primary resolver.
-        let merged = merge_dns_with_fallback(vec!["172.18.0.1".to_string()], &[]);
-        assert_eq!(merged, vec!["172.18.0.1"]);
-    }
-
     /// Runs `cmd` inside `container_id` and returns combined stdout+stderr,
     /// bounded so a hung DNS query (the exact failure mode this crate
     /// exists to prevent) can't hang the test suite.
@@ -5925,7 +5790,7 @@ mod docker_tests {
     /// against the local Docker daemon — no mocks — because the bug lived
     /// in what Docker actually writes to `/etc/resolv.conf`, not in our
     /// in-memory list-building logic (already covered by the pure
-    /// `dns_for_container` / `merge_dns_with_fallback` tests above).
+    /// `dns_for_container` tests above and `temps_dns_resolver::host_dns`).
     /// The worker side of static extraction: a path is streamed out of a
     /// local image as a container-archive tar the control plane can unpack.
     #[tokio::test]

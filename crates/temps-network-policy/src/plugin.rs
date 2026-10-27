@@ -5,10 +5,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use sea_orm::DatabaseConnection;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use temps_workload_netpol::DnsPolicy;
 use tracing::{debug, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
@@ -66,6 +68,8 @@ impl TempsPlugin for NetworkPolicyPlugin {
             let service = context.require_service::<NetworkPolicyService>();
             let workloads = context.require_service::<temps_core::LocalWorkloadPolicy>();
             let docker = context.require_service::<temps_core::DockerHandle>();
+            // Shared with the proxy-owned resolver (`temps serve`).
+            let dns = context.require_service::<ArcSwap<DnsPolicy>>();
             if !workloads.local_workloads_enabled() {
                 info!(
                     profile = workloads.profile(),
@@ -77,9 +81,12 @@ impl TempsPlugin for NetworkPolicyPlugin {
                 warn!("network policy: Docker is unavailable, node 0 enforcer not started");
                 return Ok(());
             };
-            if let Err(e) =
-                spawn_control_plane_enforcer(service, client.as_ref().clone(), daemon_is_local())
-            {
+            if let Err(e) = spawn_control_plane_enforcer(
+                service,
+                client.as_ref().clone(),
+                daemon_is_local(),
+                dns,
+            ) {
                 warn!(error = %e, "network policy: node 0 enforcer could not start");
             }
             Ok(())

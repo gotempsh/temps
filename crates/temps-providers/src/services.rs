@@ -62,6 +62,34 @@ const NONCE_LENGTH: usize = 12;
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
 
+/// The address the control plane dials to reach a cluster member's published
+/// port: the worker's data address for a member on a worker, the IPv4
+/// loopback for a member on the control plane.
+///
+/// Never the member's overlay `compute_ip`. The control plane is not on the
+/// workload overlay, so that address routes only between workloads; a monitor
+/// probe sent there times out, which left every worker-hosted cluster reading
+/// as Down with no known primary. Workers publish member ports on their data
+/// address, which is what this returns.
+pub(crate) async fn control_plane_member_dial_host<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    node_id: Option<i32>,
+    container_name: &str,
+) -> Result<String, String> {
+    let Some(node_id) = node_id.filter(|id| *id != 0) else {
+        return Ok(LOCAL_CLUSTER_HOST.to_string());
+    };
+    match nodes::Entity::find_by_id(node_id).one(db).await {
+        Ok(Some(node)) => Ok(node.data_address().to_string()),
+        Ok(None) => Err(format!(
+            "node {node_id} of cluster member '{container_name}' was not found in the nodes table"
+        )),
+        Err(error) => Err(format!(
+            "failed to load node {node_id} of cluster member '{container_name}': {error}"
+        )),
+    }
+}
+
 /// Outcome of copying one managed S3 service's buckets into another.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct S3MigrationReport {
@@ -2656,6 +2684,11 @@ pub struct ExternalServiceManager {
             HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
         >,
     >,
+    /// The control plane's cluster resolver address (ADR-024), published by
+    /// the deployer's probe only while cluster DNS is enabled and the
+    /// resolver answers. Empty otherwise, and on processes that run no
+    /// resolver: local cluster members then keep Docker's embedded DNS.
+    cluster_dns_slot: temps_dns::OverlayDnsSlot,
 }
 
 impl ExternalServiceManager {
@@ -2738,6 +2771,7 @@ impl ExternalServiceManager {
             local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2758,7 +2792,28 @@ impl ExternalServiceManager {
             local_workloads_enabled,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Follow the control plane's cluster resolver slot, so local cluster
+    /// members resolve `*.temps.local` while the resolver is up.
+    pub fn with_cluster_dns_slot(mut self, slot: temps_dns::OverlayDnsSlot) -> Self {
+        self.cluster_dns_slot = slot;
+        self
+    }
+
+    /// Nameservers for a container this process creates: the cluster
+    /// resolver followed by the host's own servers, or `None` (Docker's
+    /// embedded DNS) while the resolver is not published.
+    fn cluster_dns_servers(&self) -> Option<Vec<String>> {
+        let resolver = match self.cluster_dns_slot.read() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }?;
+        Some(temps_dns_resolver::host_dns::dns_with_fallback(vec![
+            resolver.to_string(),
+        ]))
     }
 
     /// Stop every restore helper container that may still be writing into
@@ -6215,27 +6270,21 @@ impl ExternalServiceManager {
             }
         };
 
-        // Resolve the monitor host: prefer overlay IP, fall back to the
-        // node's underlay address, then the IPv4 loopback address. The monitor's host port
-        // is `service_id * 10 + 6000` for the dev cluster; in general
-        // `monitor.port` is what the lifecycle hook stored.
-        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
-            ip.to_string()
-        } else if let Some(node_id) = monitor.node_id {
-            match nodes::Entity::find_by_id(node_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(n)) => n.data_address().to_string(),
-                _ => {
-                    return ClusterProbeResult::down(format!(
-                        "Monitor's node {} not found in nodes table",
-                        node_id
-                    ))
-                }
+        // `monitor.port` is the host port the lifecycle hook published.
+        let monitor_host = match control_plane_member_dial_host(
+            self.db.as_ref(),
+            monitor.node_id,
+            &monitor.container_name,
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(reason) => {
+                return ClusterProbeResult::down(format!(
+                    "Cannot reach the monitor of cluster service {}: {reason}",
+                    service.id
+                ))
             }
-        } else {
-            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -6411,29 +6460,26 @@ impl ExternalServiceManager {
             }
         };
 
-        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
-            ip.to_string()
-        } else if let Some(node_id) = monitor.node_id {
-            match nodes::Entity::find_by_id(node_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(n)) => n.data_address().to_string(),
-                _ => {
-                    return ClusterHealthReport {
-                        configured_standbys: 0,
-                        checked_at: chrono::Utc::now(),
-                        monitor_response_ms: 0,
-                        members: vec![],
-                        monitor_error: Some(format!(
-                            "Monitor's node {} not found in nodes table",
-                            node_id
-                        )),
-                    };
-                }
+        let monitor_host = match control_plane_member_dial_host(
+            self.db.as_ref(),
+            monitor.node_id,
+            &monitor.container_name,
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(reason) => {
+                return ClusterHealthReport {
+                    configured_standbys: 0,
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: 0,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Cannot reach the monitor of cluster service {}: {reason}",
+                        service.id
+                    )),
+                };
             }
-        } else {
-            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -7657,6 +7703,84 @@ echo "[restore] Pre-seed complete"
                 reason: "Restore helper finished but no status code was returned".to_string(),
             }),
         }
+    }
+
+    /// Whether `container_name` runs on worker `node_id`, asked of that
+    /// node's agent (the container is not on this host's Docker).
+    pub async fn worker_service_running(
+        &self,
+        node_id: i32,
+        container_name: &str,
+    ) -> Result<bool, ExternalServiceError> {
+        let client = self.get_remote_client(node_id).await?;
+        let status = client.service_status(container_name).await?;
+        Ok(status.running)
+    }
+
+    /// Run `command` inside `container_name` on worker `node_id` through its
+    /// agent and return the exit code.
+    pub async fn exec_in_worker_service(
+        &self,
+        node_id: i32,
+        container_name: &str,
+        command: Vec<String>,
+    ) -> Result<i64, ExternalServiceError> {
+        let client = self.get_remote_client(node_id).await?;
+        let result = client
+            .exec_in_service(crate::remote_service_client::RemoteExecParams {
+                container_name: container_name.to_string(),
+                command,
+                environment: HashMap::new(),
+                user: None,
+                detach: false,
+            })
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Remote exec failed in '{}' on node {}: {}",
+                    container_name, node_id, e
+                ),
+            })?;
+        Ok(result.exit_code)
+    }
+
+    /// The address the control plane dials to reach a standalone service that
+    /// runs on a worker node.
+    ///
+    /// A worker publishes a managed service's port on its own data address
+    /// (never on all interfaces), while the stored connection parameters keep
+    /// the host the service was created with, `localhost`. From the control
+    /// plane that loopback address is its own host, where nothing listens.
+    /// Returns `None` for services on the control plane (no node, or node 0)
+    /// and for clusters, whose members carry their own endpoints.
+    pub async fn worker_data_address(
+        &self,
+        service_id: i32,
+    ) -> Result<Option<String>, ExternalServiceError> {
+        let service = self.get_service(service_id).await?;
+        // Node 0 is the control plane itself, like no node at all.
+        let Some(node_id) = service
+            .node_id
+            .filter(|node_id| *node_id != 0 && service.topology != "cluster")
+        else {
+            return Ok(None);
+        };
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| ExternalServiceError::DatabaseError {
+                reason: format!(
+                    "Failed to resolve node {} hosting service {} '{}': {}",
+                    node_id, service_id, service.name, error
+                ),
+            })?
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Service {} '{}' is placed on node {}, which was not found",
+                    service_id, service.name, node_id
+                ),
+            })?;
+        Ok(Some(node.data_address().to_string()))
     }
 
     /// Get the primary data node's connection address for a cluster service.
@@ -11886,58 +12010,6 @@ echo "[restore] Pre-seed complete"
         ))
     }
 
-    /// Look up the gateway IP of the multi-host overlay docker network
-    /// (`temps0`). The per-host Hickory resolver listens there on :53 —
-    /// every container we create gets it as `--dns` so they can resolve
-    /// `*.temps.local` natively (ADR-011).
-    ///
-    /// Returns `None` when the overlay isn't bootstrapped on this host
-    /// (single-host setups). Callers fall back to Docker's default DNS
-    /// in that case.
-    async fn lookup_overlay_bridge_gateway(&self) -> Option<Vec<String>> {
-        // The overlay this process reconciles (`temps0` unless the cluster
-        // names another, ADR 059). If it does not exist on this host, the
-        // fallback (None → no DNS) keeps clusters functional, just without
-        // FQDN resolution inside containers.
-        let overlay_network = temps_network::overlay_name::current().docker_network;
-
-        let docker = match self.docker.get() {
-            Some(d) => d,
-            None => return None,
-        };
-        let inspected = match docker
-            .inspect_network(
-                &overlay_network,
-                None::<bollard::query_parameters::InspectNetworkOptions>,
-            )
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                debug!(
-                    error = %e,
-                    network = %overlay_network,
-                    "Overlay docker network not present; skipping DNS injection"
-                );
-                return None;
-            }
-        };
-
-        // The IPAM config has the gateway we set when creating the
-        // network in `temps-network/src/docker.rs`.
-        let gateway = inspected
-            .ipam
-            .as_ref()
-            .and_then(|ipam| ipam.config.as_ref())
-            .and_then(|configs| {
-                configs
-                    .iter()
-                    .find_map(|c| c.gateway.as_deref().filter(|s| !s.is_empty()))
-            });
-
-        gateway.map(|gw| vec![gw.to_string()])
-    }
-
     /// Create a cluster member container on the local Docker daemon.
     ///
     /// Returns `(container_id, host_port, compute_ip)`:
@@ -12005,14 +12077,11 @@ echo "[restore] Pre-seed complete"
             );
         }
 
-        // Wire the per-host Hickory resolver into the container's
-        // resolv.conf so it can resolve `*.temps.local` natively
-        // (ADR-011). The resolver listens on the bridge gateway IP of
-        // the multi-host overlay (`temps0`); we look that up by
-        // inspecting the network. Fails open: if the overlay isn't up
-        // yet (single-host setups) we just don't set `dns` and fall
-        // back to Docker's default resolver.
-        let dns_servers = self.lookup_overlay_bridge_gateway().await;
+        // The control plane's cluster resolver, so the member resolves
+        // `*.temps.local` (ADR-024), with the host's servers after it. Only
+        // while cluster DNS is enabled and the resolver answers; otherwise
+        // Docker's embedded DNS, as for every other container here.
+        let dns_servers = self.cluster_dns_servers();
 
         // Create container
         let mut cluster_host_config = HostConfig {
@@ -19002,6 +19071,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -19276,6 +19346,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn control_plane_dials_a_worker_member_on_its_data_address_not_its_overlay_ip() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![nodes_test_model(2)]])
+            .into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.node_id = Some(2);
+        monitor.compute_ip = Some("172.20.1.3".to_string());
+
+        let host = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+            .await
+            .unwrap();
+
+        assert_eq!(host, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn control_plane_dials_its_own_members_on_loopback() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.compute_ip = Some("172.18.0.5".to_string());
+        assert_eq!(
+            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+                .await
+                .unwrap(),
+            LOCAL_CLUSTER_HOST
+        );
+        monitor.node_id = Some(0);
+        assert_eq!(
+            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+                .await
+                .unwrap(),
+            LOCAL_CLUSTER_HOST
+        );
+    }
+
+    #[tokio::test]
+    async fn control_plane_member_dial_host_names_a_missing_node() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<nodes::Model>::new()])
+            .into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.node_id = Some(9);
+
+        let reason = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+            .await
+            .unwrap_err();
+
+        assert!(reason.contains("node 9"), "{reason}");
+        assert!(reason.contains("cluster-member-0"), "{reason}");
+    }
+
     fn nodes_test_model(id: i32) -> nodes::Model {
         nodes::Model {
             id,
@@ -19305,6 +19427,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

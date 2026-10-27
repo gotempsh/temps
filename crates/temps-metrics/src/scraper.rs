@@ -43,7 +43,7 @@ use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
 use temps_core::EncryptionService;
-use temps_entities::external_services;
+use temps_entities::{external_services, nodes};
 
 use crate::collector::mongodb::MongoCollector;
 use crate::collector::postgres::PostgresCollector;
@@ -193,6 +193,37 @@ impl MetricsScraper {
         }
     }
 
+    /// The data address of every node hosting one of `services` standalone,
+    /// keyed by node id. A failed lookup is logged and yields no entries, so
+    /// those services are scraped at their stored host as before.
+    async fn worker_hosts(&self, services: &[external_services::Model]) -> HashMap<i32, String> {
+        let node_ids: HashSet<i32> = services
+            .iter()
+            .filter(|service| service.topology != "cluster")
+            .filter_map(|service| service.node_id)
+            .collect();
+        if node_ids.is_empty() {
+            return HashMap::new();
+        }
+        match nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|node| (node.id, node.data_address().to_string()))
+                .collect(),
+            Err(e) => {
+                warn!(
+                    node_ids = ?node_ids,
+                    "MetricsScraper: failed to resolve the nodes hosting scraped services: {e}"
+                );
+                HashMap::new()
+            }
+        }
+    }
+
     /// Run one complete scrape cycle over all enabled services.
     async fn run_cycle(&self) -> Result<(), String> {
         // Query external_services with metrics_enabled = true and status = 'running'
@@ -217,6 +248,11 @@ impl MetricsScraper {
         }
 
         debug!("MetricsScraper: scraping {} service(s)", services.len());
+
+        // Worker-hosted standalone services publish their port on the
+        // worker's data address, not on this host: one lookup per cycle for
+        // every node that hosts one.
+        let worker_hosts = self.worker_hosts(&services).await;
 
         // Collect the active service ID set for stale-entry pruning after the cycle.
         let active_ids: HashSet<i32> = services.iter().map(|s| s.id).collect();
@@ -244,6 +280,9 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
+            let worker_host = service
+                .node_id
+                .and_then(|node_id| worker_hosts.get(&node_id).cloned());
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
@@ -302,13 +341,15 @@ impl MetricsScraper {
                     }
 
                     // Build a connection string from the encrypted service config.
-                    let connection_string = build_connection_string(&service, &encryption)
-                        .map_err(|e| {
-                            warn!(
-                                service_id,
-                                service_type, "MetricsScraper: cannot build connection string: {e}"
-                            );
-                        })?;
+                    let connection_string =
+                        build_connection_string(&service, &encryption, worker_host.as_deref())
+                            .map_err(|e| {
+                                warn!(
+                                    service_id,
+                                    service_type,
+                                    "MetricsScraper: cannot build connection string: {e}"
+                                );
+                            })?;
 
                     let config =
                         CollectorConfig::new(service_id, SourceKind::Database, connection_string)
@@ -378,6 +419,23 @@ impl MetricsScraper {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Whether `host` names this machine: `localhost` or a loopback literal.
+fn is_loopback_host(host: &str) -> bool {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    bare.eq_ignore_ascii_case("localhost")
+        || bare
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `host` as a URL authority needs it: IPv6 literals bracketed.
+fn url_host(host: &str) -> String {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
+        _ => host.to_string(),
+    }
+}
 
 /// Scrape an HA (cluster-topology) service at its current primary.
 ///
@@ -573,6 +631,7 @@ async fn apply_delta(
 fn build_connection_string(
     service: &external_services::Model,
     encryption: &EncryptionService,
+    worker_host: Option<&str>,
 ) -> Result<String, String> {
     let encrypted_config = service
         .config
@@ -601,6 +660,12 @@ fn build_connection_string(
         } else {
             h
         }
+    };
+    // A managed service on a worker keeps `localhost` in its parameters,
+    // which from here is this host; dial the worker it runs on instead.
+    let host = match worker_host {
+        Some(worker) if is_loopback_host(&host) => url_host(worker),
+        _ => host,
     };
 
     match service.service_type.to_lowercase().as_str() {
@@ -787,6 +852,61 @@ impl CollectorConfigExt for CollectorConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── worker-hosted standalone services ──────────────────────────────────
+
+    fn standalone_postgres(
+        encryption: &EncryptionService,
+        host: &str,
+        node_id: Option<i32>,
+    ) -> external_services::Model {
+        let params = serde_json::json!({
+            "host": host,
+            "port": "5432",
+            "username": "postgres",
+            "password": "pw",
+            "database": "postgres",
+        });
+        let mut service = cluster_service(3, "postgres");
+        service.topology = "standalone".to_string();
+        service.node_id = node_id;
+        service.config = Some(encryption.encrypt_string(&params.to_string()).unwrap());
+        service
+    }
+
+    #[test]
+    fn a_worker_hosted_service_is_scraped_at_its_worker_address() {
+        let encryption = EncryptionService::new_from_password("scraper-test");
+        let service = standalone_postgres(&encryption, "localhost", Some(1));
+        let dsn = build_connection_string(&service, &encryption, Some("10.42.0.22")).unwrap();
+        assert_eq!(dsn, "postgresql://postgres:pw@10.42.0.22:5432/postgres");
+
+        let dsn = build_connection_string(&service, &encryption, Some("fd00::22")).unwrap();
+        assert_eq!(dsn, "postgresql://postgres:pw@[fd00::22]:5432/postgres");
+    }
+
+    #[test]
+    fn the_worker_address_never_replaces_a_host_the_user_chose() {
+        let encryption = EncryptionService::new_from_password("scraper-test");
+        let service = standalone_postgres(&encryption, "db.example.com", Some(1));
+        let dsn = build_connection_string(&service, &encryption, Some("10.42.0.22")).unwrap();
+        assert_eq!(dsn, "postgresql://postgres:pw@db.example.com:5432/postgres");
+
+        // A service on this host keeps dialling loopback.
+        let local = standalone_postgres(&encryption, "localhost", None);
+        let dsn = build_connection_string(&local, &encryption, None).unwrap();
+        assert_eq!(dsn, "postgresql://postgres:pw@localhost:5432/postgres");
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised() {
+        for host in ["localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]"] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in ["10.42.0.22", "db.example.com", ""] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
 
     // ── scrape_cluster ─────────────────────────────────────────────────────
 

@@ -27,6 +27,7 @@ members = [
     "crates/temps-workload",
     "crates/temps-workload-env",
     "crates/temps-workload-netpol",
+    "crates/temps-netpol-ebpf-common",
     "crates/temps-workload-ingress",
     "crates/temps-workload-volumes",
     "crates/temps-workload-docker",

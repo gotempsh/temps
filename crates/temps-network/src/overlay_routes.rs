@@ -206,3 +206,121 @@ async fn add_route(
     }
     Ok(())
 }
+
+/// Walk every container currently attached to `overlay_network` and
+/// re-install the per-peer routes inside their netns. Run on every overlay
+/// reconcile tick, by worker agents and by the control plane alike, to
+/// cover containers attached since the last tick, routes lost across
+/// container restarts, and peers that joined since.
+///
+/// These routes are what gives a container attached to another network
+/// first (whose default route is not the overlay) a return path to remote
+/// overlay subnets. Cross-node traffic is therefore never SNATed, and a
+/// remote workload reaches a local one under its own address, which is
+/// its identity to network policy.
+///
+/// `routed` holds the containers already given their routes: they are
+/// skipped, newly routed ones are added, and gone ones dropped. Pass an
+/// empty set for a full pass (needed after the peers change, and
+/// periodically, since a restarted container keeps its id but loses its
+/// routes); keep it between calls for a cheap pass that only enters new
+/// containers.
+///
+/// Best-effort: any container that fails individually is logged and
+/// skipped, and retried on the next pass. The sweep itself only errors
+/// when we can't even talk to the local Docker daemon.
+pub async fn sweep_container_routes(
+    docker: &bollard::Docker,
+    overlay_network: &str,
+    bridge_gateway: &str,
+    peers: &[Peer],
+    routed: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
+
+    if peers.is_empty() {
+        return Ok(());
+    }
+
+    // network=temps0 filter narrows the list to containers that are
+    // actually on the overlay. Includes stopped containers (filters
+    // are OR'd on status by default), but `inspect.state.pid > 0` will
+    // skip those before we try to nsenter.
+    let overlay_name = overlay_network.to_string();
+    let mut filters = std::collections::HashMap::new();
+    filters.insert("network".to_string(), vec![overlay_name.clone()]);
+    let opts = ListContainersOptions {
+        all: false,
+        filters: Some(filters),
+        ..Default::default()
+    };
+
+    let containers = docker
+        .list_containers(Some(opts))
+        .await
+        .map_err(|e| format!("list_containers: {}", e))?;
+
+    let listed: std::collections::HashSet<String> =
+        containers.iter().filter_map(|c| c.id.clone()).collect();
+    routed.retain(|id| listed.contains(id));
+    for c in containers {
+        let Some(id) = c.id.as_deref() else {
+            continue;
+        };
+        if routed.contains(id) {
+            continue;
+        }
+        let inspect = match docker
+            .inspect_container(id, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                debug!(container = %id, error = %e, "Inspect failed during route sweep");
+                continue;
+            }
+        };
+        let pid = match inspect
+            .state
+            .as_ref()
+            .and_then(|s| s.pid)
+            .filter(|p| *p > 0)
+        {
+            Some(p) => p as i32,
+            None => continue,
+        };
+        // Only attempt for containers that actually have an overlay
+        // gateway recorded — stopped/half-attached containers may
+        // have a network entry without a gateway IP.
+        let has_overlay_gw = inspect
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .and_then(|nets| nets.get(&overlay_name))
+            .and_then(|n| n.gateway.as_deref())
+            .filter(|g| !g.is_empty())
+            .is_some();
+        if !has_overlay_gw {
+            continue;
+        }
+
+        match install_peer_routes_in_container(
+            pid,
+            "eth1", // hint only; actual iface is discovered by IP match
+            bridge_gateway,
+            peers,
+        )
+        .await
+        {
+            Ok(()) => {
+                routed.insert(id.to_string());
+            }
+            Err(e) => debug!(
+                container = %id,
+                error = %e,
+                "Failed to (re)install overlay peer routes; will retry next tick"
+            ),
+        }
+    }
+    Ok(())
+}

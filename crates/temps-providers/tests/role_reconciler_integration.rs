@@ -65,6 +65,8 @@ fn node(id: i64, host: &str, state: &str) -> MonitorNode {
         nodehost: host.into(),
         nodeport: 6001,
         reported_state: state.into(),
+        goal_state: state.into(),
+        health: 1,
     }
 }
 

@@ -49,6 +49,10 @@ pub struct SharedNetwork {
     pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     pub overlay_peers: crate::network_sync::SharedPeers,
     pub host_bind_address: crate::network_sync::SharedBindAddress,
+    /// The network policy enforcer's DNS view, which the node resolver
+    /// answers restricted workloads from. The same slot must be given to
+    /// [`crate::network_policy::spawn_worker_enforcer`].
+    pub dns_policy: temps_dns_resolver::DnsPolicySlot,
 }
 
 /// Build the agent Axum router with authentication middleware.
@@ -424,6 +428,7 @@ const PLATFORM_RECHECK_BEATS: u32 = 20;
 ///
 /// The first successful heartbeat includes a full container inventory so the control
 /// plane can reconcile stale DB records against actual Docker state (e.g., after a crash).
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_loop(
     config: &AgentConfig,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
@@ -432,6 +437,7 @@ fn spawn_heartbeat_loop(
     health: crate::network_sync::HealthSlots,
     docker_socket_grant: DockerSocketGrant,
     wakers: HeartbeatWakers,
+    resolver_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) {
     let HeartbeatWakers {
         mesh_listener,
@@ -482,6 +488,7 @@ fn spawn_heartbeat_loop(
         // they are sent only when they differ.
         let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
         let mut capacity_sampler = CapacitySampler::new();
+        let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
 
         let mut last_beat: Option<tokio::time::Instant> = None;
 
@@ -632,6 +639,37 @@ fn spawn_heartbeat_loop(
                         error = %e,
                         "Failed to serialize DNS resolver health for heartbeat"
                     ),
+                }
+            }
+
+            // Deployments whose containers were created before this node's
+            // cluster resolver was up, and so cannot resolve
+            // `*.temps.local` until they are redeployed. Sent on every beat,
+            // empty while the resolver is down or cluster DNS is off, so the
+            // control plane never keeps a stale list.
+            if let Some(docker) = docker.as_ref() {
+                let resolver = resolver_address.read().ok().and_then(|slot| *slot);
+                let without = match resolver {
+                    Some(resolver) => {
+                        match resolver_coverage
+                            .deployments_without(docker, resolver)
+                            .await
+                        {
+                            Ok(ids) => Some(ids),
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id,
+                                    error = %e,
+                                    "Could not check which deployments have the cluster resolver"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => Some(Vec::new()),
+                };
+                if let Some(ids) = without {
+                    body["deployments_without_resolver"] = serde_json::json!(ids);
                 }
             }
 
@@ -1128,6 +1166,7 @@ pub async fn start_agent_server_with(
             mesh_listener: mesh_listener.clone(),
             node_runtime,
         },
+        network.overlay_bridge_address.clone(),
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -1143,6 +1182,7 @@ pub async fn start_agent_server_with(
         network.host_bind_address,
         container_deployer,
         mesh_address_tx,
+        network.dns_policy,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)

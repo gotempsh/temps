@@ -52,6 +52,7 @@ fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> node
         dns_resolver_consecutive_failures: 0,
         dns_resolver_last_error: None,
         dns_resolver_record_count: None,
+        deployments_without_resolver: None,
         build_limits: None,
         public_ingress_enabled: false,
         public_ingress_running: None,
@@ -447,6 +448,7 @@ async fn test_heartbeat_reactivates_offline_node() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
@@ -477,6 +479,7 @@ async fn test_heartbeat_preserves_draining_status() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 25}),
                 labels: None,
@@ -563,6 +566,7 @@ async fn test_heartbeat_records_reported_architecture() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: Some("linux/arm64".to_string()),
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,
@@ -600,6 +604,7 @@ async fn test_heartbeat_without_architecture_keeps_the_stored_one() {
         .heartbeat(
             1,
             HeartbeatRequest {
+                deployments_without_resolver: None,
                 architecture: None,
                 capacity: serde_json::json!({"cpu_percent": 10}),
                 labels: None,

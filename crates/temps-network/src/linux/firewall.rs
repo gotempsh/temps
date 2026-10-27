@@ -1212,19 +1212,13 @@ fn render_baseline(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) ->
         Transport::Vxlan { vni, port } => render_vxlan_ingress(config, alloc, peers, vni, port),
         Transport::Native => String::new(),
     };
-    // A service may already be attached to `temps-app-network` before it is
-    // attached to the overlay. Linux then keeps that first network as the
-    // container's default route, so replies to a remote overlay CIDR leave via
-    // the wrong interface and never traverse VXLAN. SNAT remote-node traffic
-    // to this node's overlay gateway. Conntrack reverses it on return, while
-    // local same-node traffic keeps its original source address.
-    let mut cross_node_snat = String::new();
-    for peer in peers {
-        cross_node_snat.push_str(&format!(
-            "add rule inet {TABLE} postrouting ip saddr {} ip daddr {cidr} snat to {}\n",
-            peer.compute_cidr, alloc.bridge_address
-        ));
-    }
+    // Cross-node traffic keeps its source address: a workload's overlay
+    // address is its identity to the receiving node's network policy (and
+    // the client address its logs show). The return path that address needs
+    // comes from the per-peer routes injected into every overlay-attached
+    // container on both workers and the control plane
+    // (`overlay_routes::sweep_container_routes`), not from SNAT to the local
+    // bridge, which would make every remote client look like this node.
     let marker = baseline_marker(config, alloc, peers);
     format!(
         "
@@ -1252,20 +1246,18 @@ add chain inet {table} input {{ type filter hook input priority -100; policy acc
 add rule inet {table} input counter comment \"{marker}\"
 
 add chain inet {table} postrouting {{ type nat hook postrouting priority 100; policy accept; }}
-{cross_node_snat}
 add rule inet {table} postrouting ip saddr {cidr} oifname != \"{bridge}\" masquerade
 ",
         table = TABLE,
         bridge = bridge,
         cidr = cidr,
         vxlan_ingress = vxlan_ingress,
-        cross_node_snat = cross_node_snat,
         marker = marker,
     )
 }
 
 fn baseline_marker(config: &NetworkConfig, alloc: &NodeAlloc, peers: &[Peer]) -> String {
-    const BASELINE_SCHEMA_VERSION: &str = "v7";
+    const BASELINE_SCHEMA_VERSION: &str = "v8";
 
     let mut peers = peers.to_vec();
     peers.sort_by_key(|peer| (peer.compute_cidr, peer.underlay_address, peer.node_id));
@@ -1982,11 +1974,11 @@ mod tests {
             baseline_marker(&cfg, &alloc, &[a.clone(), b.clone()]),
             baseline_marker(&cfg, &alloc, &[b, a])
         );
-        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v7-"));
+        assert!(baseline_marker(&cfg, &alloc, &[]).starts_with("temps-baseline-v8-"));
     }
 
     #[test]
-    fn baseline_snat_gives_dual_network_services_a_symmetric_return_path() {
+    fn baseline_keeps_the_source_address_of_cross_node_traffic() {
         let cfg = NetworkConfig::default();
         let alloc = NodeAlloc {
             node_id: Uuid::nil(),
@@ -2001,9 +1993,12 @@ mod tests {
         };
 
         let script = render_baseline(&cfg, &alloc, &[peer]);
-        assert!(script.contains(
-            "postrouting ip saddr 172.20.0.0/24 ip daddr 172.20.255.0/24 snat to 172.20.255.1"
-        ));
+        assert!(
+            !script.contains("snat"),
+            "a remote workload must reach local ones under its own address: {script}"
+        );
+        assert!(script
+            .contains("postrouting ip saddr 172.20.255.0/24 oifname != \"br-temps0\" masquerade"));
     }
 
     #[test]

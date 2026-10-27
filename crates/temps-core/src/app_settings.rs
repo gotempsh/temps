@@ -656,6 +656,30 @@ pub struct ClusterDnsSettings {
     /// `*.temps.local` FQDNs resolve inside containers.
     #[schema(example = false)]
     pub enabled: bool,
+    /// Whether an operator has ever changed `enabled` themselves. Until then,
+    /// the control plane turns cluster DNS on when the first worker joins,
+    /// since cross-node links need `*.temps.local`. Set by the server when a
+    /// save changes `enabled`; a client cannot clear it.
+    #[schema(example = false)]
+    pub operator_chosen: bool,
+}
+
+impl ClusterDnsSettings {
+    /// The settings to store after a save that asked for `requested`, given
+    /// what was stored before. Changing `enabled` is an operator choice, and
+    /// once made it stays made, whatever the client sent for the marker.
+    pub fn after_operator_save(stored: &Self, requested: &Self) -> Self {
+        Self {
+            enabled: requested.enabled,
+            operator_chosen: stored.operator_chosen || requested.enabled != stored.enabled,
+        }
+    }
+
+    /// Whether a worker joining should turn cluster DNS on: only while it is
+    /// off and no operator has decided either way.
+    pub fn should_enable_for_worker(&self) -> bool {
+        !self.enabled && !self.operator_chosen
+    }
 }
 
 /// Bounds on one AI chat turn.
@@ -2933,6 +2957,53 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_worker_turns_cluster_dns_on_only_until_an_operator_decides() {
+        let untouched = ClusterDnsSettings::default();
+        assert!(untouched.should_enable_for_worker());
+
+        // Already on: nothing to do.
+        let on = ClusterDnsSettings {
+            enabled: true,
+            operator_chosen: false,
+        };
+        assert!(!on.should_enable_for_worker());
+
+        // An operator turned it off: a later worker must not override that.
+        let turned_off = ClusterDnsSettings::after_operator_save(
+            &on,
+            &ClusterDnsSettings {
+                enabled: false,
+                operator_chosen: false,
+            },
+        );
+        assert!(!turned_off.enabled);
+        assert!(turned_off.operator_chosen);
+        assert!(!turned_off.should_enable_for_worker());
+    }
+
+    #[test]
+    fn saving_cluster_dns_unchanged_is_not_a_choice_and_a_choice_sticks() {
+        let stored = ClusterDnsSettings::default();
+        // A save that resends the stored value decides nothing.
+        let resent = ClusterDnsSettings::after_operator_save(&stored, &stored);
+        assert!(!resent.operator_chosen);
+
+        // Once chosen, a client sending `operator_chosen: false` cannot clear it.
+        let chosen = ClusterDnsSettings {
+            enabled: true,
+            operator_chosen: true,
+        };
+        let cleared = ClusterDnsSettings::after_operator_save(
+            &chosen,
+            &ClusterDnsSettings {
+                enabled: true,
+                operator_chosen: false,
+            },
+        );
+        assert!(cleared.operator_chosen);
+    }
 
     #[test]
     fn ingest_override_validation_accepts_inherit_zero_and_max_only() {

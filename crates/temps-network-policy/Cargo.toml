@@ -15,6 +15,7 @@ description = "Network policy rules for every workload kind, per-node modes, and
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
+temps-routes = { path = "../temps-routes" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
 
@@ -31,6 +32,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 utoipa = { workspace = true, features = ["chrono"] }
+
+[features]
+default = []
+# Embeds the eBPF datapath programs; see temps-workload-netpol.
+ebpf = ["temps-workload-netpol/ebpf"]
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }

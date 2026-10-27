@@ -21,6 +21,7 @@
 
 pub mod binding;
 pub mod dns;
+pub mod ebpf;
 pub mod egress;
 pub mod enforcer;
 pub mod executor;
@@ -34,16 +35,20 @@ pub use binding::{
     compile_bindings, node_removal_ruleset, BindingError, PortBinding, BINDING_PRIORITY,
 };
 pub use dns::{DnsDecision, DnsPolicy};
+pub use ebpf::{
+    available_datapath, CgroupDatapath, CgroupTarget, DatapathConfig, DatapathError, DatapathOpener,
+};
 pub use egress::{
     EgressPolicy, EgressProxy, EgressProxyConfig, EgressRule, EgressStats, EgressTable,
     EgressTarget, HostPattern, RelayUpstream,
 };
 pub use enforcer::{
-    identify, DockerInstanceSource, EnforcerError, InstanceSource, NodeEnforcer, NodeMode,
-    PassOutcome, PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
+    identify, spawn_container_wake, with_best_datapath, DockerInstanceSource, EnforcerError,
+    InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome,
+    PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
 };
 pub use executor::{choose_executor, DockerVmNft, HostNft, NftError, NftExecutor};
-pub use identity::IdentityMap;
+pub use identity::{IdentityEntry, IdentityMap};
 pub use microsandbox::{to_sdk_policy, SdkNetworkPolicy, Translated};
 pub use nft::{compile, removal_ruleset, CompileError, Compiled, TableName};
 pub use ports::{choose_port_resolver, PortQuery, PortResolver};

@@ -301,16 +301,22 @@ pub async fn list_peers(
 
     // Reflect the cluster-DNS feature flag into the wire response so workers
     // can gate their per-node resolver consistently with the control plane.
-    // Best-effort: when settings can't be read (transient DB hiccup), default
-    // to `false` — the safe side that never accidentally enables DNS injection.
+    // When settings can't be read, fail the poll instead of guessing: an
+    // answer of `false` would make every worker shut its resolver down on a
+    // transient DB hiccup, while a failed poll leaves each worker exactly as
+    // it was until the next one.
     let cluster_dns_enabled = match app_state.config_service.get_settings().await {
         Ok(settings) => settings.cluster_dns.enabled,
         Err(e) => {
             warn!(
                 node_id,
-                "could not read cluster_dns setting: {}; defaulting to disabled", e
+                "could not read the cluster_dns setting for node {}'s peer poll: {}", node_id, e
             );
-            false
+            return Err(problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Settings Unavailable")
+                .with_detail(format!(
+                    "Could not read the cluster DNS setting for node {node_id}'s peer list: {e}"
+                )));
         }
     };
 

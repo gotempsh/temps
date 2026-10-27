@@ -18,8 +18,8 @@ use temps_entities::{
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::NamedWorkload;
 use temps_workload_netpol::{
-    Action, Direction, IdentityMap, L4Protocol, NodeMode, PolicySnapshot, PortRange, Profile,
-    SystemContainer,
+    Action, Cidr, Direction, IdentityMap, L4Protocol, NodeMode, NodePolicy, NodePolicyReport,
+    PolicySnapshot, PortRange, Profile, SystemContainer,
 };
 
 use crate::error::NetworkPolicyError;
@@ -80,23 +80,29 @@ pub struct NodeModeEntry {
     pub name: String,
     pub role: String,
     pub status: String,
-    /// The stored mode. On a worker anything but `legacy` is stale (see
-    /// [`node_supports_enforcement`]) and is never counted as enforcing.
+    /// The stored mode. On a node without a live enforcer anything but
+    /// `legacy` is stale and is never counted as enforcing.
     pub mode: NodeMode,
+    /// Whether the node runs an enforcer: always on node 0, on a worker
+    /// when its agent reported one within [`ENFORCER_REPORT_TTL`].
+    pub supports_enforcement: bool,
+    /// Why `shadow`/`enforce` is unavailable, when it is.
+    pub enforcement_unavailable_reason: Option<String>,
+    /// The datapath the node enforces with (`ebpf` or `nftables`), when
+    /// known.
+    pub backend: Option<String>,
 }
 
-/// Whether a node runs a network policy enforcer. Only the control plane
-/// does today: nothing delivers policies to workers or applies them there.
-pub fn node_supports_enforcement(node_id: i32) -> bool {
-    node_id == CONTROL_PLANE_NODE_ID
-}
+/// How long a worker's enforcer report counts. Agents fetch their policy
+/// every pass (15 s), so a live one is never close to it.
+pub const ENFORCER_REPORT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Why `shadow`/`enforce` is unavailable on a node, for the console.
-pub fn enforcement_unavailable_reason(node_id: i32) -> Option<&'static str> {
-    (!node_supports_enforcement(node_id)).then_some(
-        "No network policy enforcer runs on worker nodes yet; only the control plane \
-         (node 0) can compute or apply policies.",
-    )
+/// What a worker's agent said about its enforcer on its last policy fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnforcerReport {
+    /// `ebpf` or `nftables`.
+    pub backend: String,
+    pub seen: std::time::Instant,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -118,8 +124,8 @@ struct MemberRow {
     container_name: String,
 }
 
-/// An address of a workload instance on another node, recorded by the
-/// control plane (overlay IPs of service members, A/AAAA name records).
+/// An address of a service member on another node, recorded by the
+/// control plane (its overlay IP and its A/AAAA name records).
 #[derive(Debug, FromQueryResult)]
 struct RemoteAddressRow {
     kind: String,
@@ -127,27 +133,46 @@ struct RemoteAddressRow {
     ip: String,
 }
 
-/// Every worker-hosted address the database knows, in one query: service
-/// members' overlay IPs and the A/AAAA records of members and environments
-/// pinned to a worker. Stopped or failed members are left out, since their
+/// Every service member address the database knows on nodes other than
+/// `$1`, in one query: overlay IPs and A/AAAA records (a `NULL` node is the
+/// control plane). Stopped or failed members are left out, since their
 /// addresses may already belong to someone else.
+///
+/// Environments are not here: their name records point at each node's
+/// internal edge proxy (the bridge gateway, shared by every environment),
+/// not at a replica. Replica addresses come from the nodes themselves
+/// ([`NetworkPolicyService::record_observed`]).
 const REMOTE_ADDRESSES_SQL: &str = "\
     SELECT 'service' AS kind, sm.service_id::bigint AS owner_id, sm.compute_ip AS ip \
     FROM service_members sm \
-    WHERE sm.node_id IS NOT NULL AND sm.node_id <> 0 \
+    WHERE COALESCE(sm.node_id, 0) <> $1 \
       AND sm.compute_ip IS NOT NULL AND sm.status NOT IN ('stopped', 'failed') \
     UNION ALL \
-    SELECT CASE WHEN se.owner_kind = 'environment' THEN 'deployment' ELSE 'service' END AS kind, \
-           CASE WHEN se.owner_kind = 'environment' THEN se.owner_id ELSE sm.service_id::bigint END AS owner_id, \
-           se.target_ip AS ip \
+    SELECT 'service' AS kind, sm.service_id::bigint AS owner_id, se.target_ip AS ip \
     FROM service_endpoints se \
-    LEFT JOIN service_members sm \
-      ON se.owner_kind = 'service_member' AND sm.id = se.owner_id \
-    WHERE se.node_id IS NOT NULL AND se.node_id <> 0 \
+    JOIN service_members sm ON sm.id = se.owner_id \
+    WHERE se.owner_kind = 'service_member' AND COALESCE(se.node_id, 0) <> $1 \
       AND se.record_type IN ('A', 'AAAA') AND se.target_ip IS NOT NULL \
-      AND (se.owner_kind = 'environment' \
-           OR (se.owner_kind = 'service_member' AND sm.id IS NOT NULL \
-               AND sm.status NOT IN ('stopped', 'failed')))";
+      AND sm.status NOT IN ('stopped', 'failed')";
+
+/// A node's compute subnet: the only addresses its reported workloads may
+/// hold as far as other nodes are concerned.
+#[derive(Debug, FromQueryResult)]
+struct ComputeSubnetRow {
+    id: i32,
+    compute_cidr: Option<String>,
+}
+
+/// Most addresses one node may report; a node never runs more than its
+/// `max_workloads` (110 by default) containers, each with a few addresses.
+pub const MAX_REPORTED_ADDRESSES: usize = 4096;
+
+/// The workloads a node observed on its last pass outside `legacy`.
+#[derive(Debug, Clone)]
+struct ObservedReport {
+    identities: IdentityMap,
+    seen: std::time::Instant,
+}
 
 #[derive(Debug, FromQueryResult)]
 struct NameRow {
@@ -157,8 +182,40 @@ struct NameRow {
     service_id: Option<i32>,
 }
 
+impl NameRow {
+    /// The workload a published name belongs to, so a restricted workload
+    /// may resolve the names of what its rules allow. A standalone service
+    /// publishes as `service_role` (owner: the service), a cluster member as
+    /// `service_member` (owner: the member row, joined to its service), an
+    /// environment as `environment`. Node and static names belong to no
+    /// workload.
+    fn named_workload(self) -> Option<NamedWorkload> {
+        let owner = match (self.owner_kind.as_str(), self.service_id) {
+            ("environment", _) => WorkloadRef::new(WorkloadKind::Deployment, self.owner_id),
+            ("service_role", _) => WorkloadRef::new(WorkloadKind::Service, self.owner_id),
+            ("service_member", Some(service_id)) => {
+                WorkloadRef::new(WorkloadKind::Service, i64::from(service_id))
+            }
+            _ => return None,
+        };
+        Some(NamedWorkload {
+            fqdn: self.fqdn.trim_end_matches('.').to_ascii_lowercase(),
+            owner,
+        })
+    }
+}
+
 pub struct NetworkPolicyService {
     db: Arc<DatabaseConnection>,
+    /// Worker id → its agent's last enforcer report. In memory: agents
+    /// report on every pass, so a restarted control plane relearns them
+    /// within one.
+    reports: std::sync::Mutex<HashMap<i32, EnforcerReport>>,
+    /// Node id (0 included) → the workloads it observed, with their
+    /// addresses. In memory for the same reason as `reports`; until a node
+    /// reports again after a control plane restart, other nodes treat its
+    /// workloads' addresses as unknown.
+    observed: std::sync::Mutex<HashMap<i32, ObservedReport>>,
 }
 
 fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
@@ -171,7 +228,111 @@ fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError>
 
 impl NetworkPolicyService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            reports: std::sync::Mutex::new(HashMap::new()),
+            observed: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Records that `node_id`'s agent runs an enforcer with `backend`.
+    pub fn record_enforcer_report(&self, node_id: i32, backend: &str) {
+        let backend = match backend {
+            "ebpf" | "nftables" => backend.to_string(),
+            _ => "unknown".to_string(),
+        };
+        let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports.insert(
+            node_id,
+            EnforcerReport {
+                backend,
+                seen: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// Records the workloads `node_id` observed on its last pass, which
+    /// become remote peers of every other node (only the addresses inside
+    /// `node_id`'s compute subnet, see [`Self::node_snapshot`]). A report
+    /// over [`MAX_REPORTED_ADDRESSES`] is refused with a warning, so one
+    /// broken node cannot grow every other node's maps.
+    pub fn record_observed(&self, node_id: i32, identities: IdentityMap) {
+        let count = identities.address_count();
+        if count > MAX_REPORTED_ADDRESSES {
+            tracing::warn!(
+                node_id,
+                addresses = count,
+                limit = MAX_REPORTED_ADDRESSES,
+                "node reported more workload addresses than any node can hold; report ignored"
+            );
+            return;
+        }
+        let mut observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        observed.insert(
+            node_id,
+            ObservedReport {
+                identities,
+                seen: std::time::Instant::now(),
+            },
+        );
+    }
+
+    /// What every node but `node_id` observed within
+    /// [`ENFORCER_REPORT_TTL`], by node.
+    fn observed_elsewhere(&self, node_id: i32) -> Vec<(i32, IdentityMap)> {
+        let observed = self.observed.lock().unwrap_or_else(|e| e.into_inner());
+        observed
+            .iter()
+            .filter(|(id, report)| **id != node_id && report.seen.elapsed() <= ENFORCER_REPORT_TTL)
+            .map(|(id, report)| (*id, report.identities.clone()))
+            .collect()
+    }
+
+    /// The node's live enforcer report; node 0's enforcer runs in this
+    /// process and needs none.
+    fn live_report(&self, node_id: i32) -> Option<EnforcerReport> {
+        let reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports
+            .get(&node_id)
+            .filter(|r| r.seen.elapsed() <= ENFORCER_REPORT_TTL)
+            .cloned()
+    }
+
+    /// Whether a node runs a network policy enforcer.
+    pub fn supports_enforcement(&self, node_id: i32) -> bool {
+        node_id == CONTROL_PLANE_NODE_ID || self.live_report(node_id).is_some()
+    }
+
+    /// Why `shadow`/`enforce` is unavailable on a node, for the console.
+    pub fn enforcement_unavailable_reason(&self, node_id: i32) -> Option<String> {
+        (!self.supports_enforcement(node_id)).then(|| {
+            format!(
+                "No network policy enforcer has reported from node {node_id} in the last {} \
+                 seconds: its agent is offline or predates worker enforcement. Upgrade and \
+                 restart `temps agent` on the node.",
+                ENFORCER_REPORT_TTL.as_secs()
+            )
+        })
+    }
+
+    fn mode_entry(
+        &self,
+        node_id: i32,
+        name: String,
+        role: String,
+        status: String,
+        mode: NodeMode,
+    ) -> NodeModeEntry {
+        NodeModeEntry {
+            supports_enforcement: self.supports_enforcement(node_id),
+            enforcement_unavailable_reason: self.enforcement_unavailable_reason(node_id),
+            backend: self.live_report(node_id).map(|r| r.backend),
+            node_id,
+            name,
+            role,
+            status,
+            mode,
+        }
     }
 
     pub async fn list_rules(
@@ -492,12 +653,12 @@ impl NetworkPolicyService {
             .map_err(NetworkPolicyError::db(
                 "read the links that point at a subject",
             ))?;
-        // A worker's stored `enforce` is never real: no enforcer runs there.
+        // A stored `enforce` on a node without a live enforcer is not real.
         let enforcing_nodes = self
             .node_modes()
             .await?
             .into_iter()
-            .filter(|n| n.mode == NodeMode::Enforce && node_supports_enforcement(n.node_id))
+            .filter(|n| n.mode == NodeMode::Enforce && n.supports_enforcement)
             .map(|n| n.node_id)
             .collect();
         Ok(EffectivePolicy {
@@ -538,26 +699,21 @@ impl NetworkPolicyService {
     /// Node 0 first, then every `nodes` row by id.
     pub async fn node_modes(&self) -> Result<Vec<NodeModeEntry>, NetworkPolicyError> {
         let control = self.control_plane_mode().await?;
-        let mut entries = vec![NodeModeEntry {
-            node_id: CONTROL_PLANE_NODE_ID,
-            name: "control-plane".to_string(),
-            role: "control".to_string(),
-            status: "active".to_string(),
-            mode: parse_mode(CONTROL_PLANE_NODE_ID, &control.network_policy_mode)?,
-        }];
+        let mut entries = vec![self.mode_entry(
+            CONTROL_PLANE_NODE_ID,
+            "control-plane".to_string(),
+            "control".to_string(),
+            "active".to_string(),
+            parse_mode(CONTROL_PLANE_NODE_ID, &control.network_policy_mode)?,
+        )];
         let nodes = node_network_policy_modes::Entity::find()
             .order_by_asc(node_network_policy_modes::Column::Id)
             .all(self.db.as_ref())
             .await
             .map_err(NetworkPolicyError::db("list node network policy modes"))?;
         for node in nodes {
-            entries.push(NodeModeEntry {
-                node_id: node.id,
-                mode: parse_mode(node.id, &node.network_policy_mode)?,
-                name: node.name,
-                role: node.role,
-                status: node.status,
-            });
+            let mode = parse_mode(node.id, &node.network_policy_mode)?;
+            entries.push(self.mode_entry(node.id, node.name, node.role, node.status, mode));
         }
         Ok(entries)
     }
@@ -608,7 +764,7 @@ impl NetworkPolicyService {
             .map_err(NetworkPolicyError::db("read a node's network policy mode"))?
             .ok_or(NetworkPolicyError::NodeNotFound { node_id })?;
         // `legacy` stays accepted so a stale stored mode can be cleared.
-        if mode != NodeMode::Legacy && !node_supports_enforcement(node_id) {
+        if mode != NodeMode::Legacy && !self.supports_enforcement(node_id) {
             return Err(NetworkPolicyError::WorkerEnforcementUnavailable {
                 node_id,
                 mode: mode.as_str().to_string(),
@@ -622,15 +778,10 @@ impl NetworkPolicyService {
             .update(self.db.as_ref())
             .await
             .map_err(NetworkPolicyError::db("set a node's network policy mode"))?;
+        let stored = parse_mode(node.id, &node.network_policy_mode)?;
         Ok((
             previous,
-            NodeModeEntry {
-                node_id: node.id,
-                mode: parse_mode(node.id, &node.network_policy_mode)?,
-                name: node.name,
-                role: node.role,
-                status: node.status,
-            },
+            self.mode_entry(node.id, node.name, node.role, node.status, stored),
         ))
     }
 
@@ -655,9 +806,34 @@ impl NetworkPolicyService {
             .map_err(NetworkPolicyError::db(operation))
     }
 
-    /// Everything a node needs to enforce, for every workload. A node keeps
-    /// only the workloads it observes locally.
+    /// Node 0's snapshot.
     pub async fn snapshot(&self) -> Result<PolicySnapshot, NetworkPolicyError> {
+        self.node_snapshot(CONTROL_PLANE_NODE_ID).await
+    }
+
+    /// What `node_id` returns to its agent: its mode, and outside `legacy`
+    /// its snapshot. Calling it is the agent's enforcer report.
+    pub async fn node_policy(
+        &self,
+        node_id: i32,
+        report: NodePolicyReport,
+    ) -> Result<NodePolicy, NetworkPolicyError> {
+        let mode = self.node_mode(node_id).await?;
+        self.record_enforcer_report(node_id, &report.backend);
+        self.record_observed(node_id, report.identities);
+        let snapshot = match mode {
+            NodeMode::Legacy => None,
+            NodeMode::Shadow | NodeMode::Enforce => Some(self.node_snapshot(node_id).await?),
+        };
+        Ok(NodePolicy { mode, snapshot })
+    }
+
+    /// Everything `node_id` needs to enforce, for every workload. A node
+    /// keeps only the workloads it observes locally. Addresses recorded for
+    /// other nodes are its remote peers, and other nodes' host addresses
+    /// (their proxies and health checks) are sources every workload
+    /// accepts.
+    pub async fn node_snapshot(&self, node_id: i32) -> Result<PolicySnapshot, NetworkPolicyError> {
         let rows = network_policy_rules::Entity::find()
             .order_by_asc(network_policy_rules::Column::Id)
             .all(self.db.as_ref())
@@ -696,7 +872,7 @@ impl NetworkPolicyService {
                  FROM service_endpoints se \
                  LEFT JOIN service_members sm \
                    ON se.owner_kind = 'service_member' AND sm.id = se.owner_id \
-                 WHERE se.owner_kind IN ('service_member', 'environment')",
+                 WHERE se.owner_kind IN ('service_member', 'service_role', 'environment')",
             )
             .await?;
 
@@ -723,28 +899,35 @@ impl NetworkPolicyService {
                 WorkloadRef::new(WorkloadKind::Service, i64::from(member.service_id)),
             );
         }
-        let remote_rows: Vec<RemoteAddressRow> = self
-            .query(
-                "list worker-hosted workload addresses",
+        let remote_rows: Vec<RemoteAddressRow> =
+            RemoteAddressRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
                 REMOTE_ADDRESSES_SQL,
-            )
-            .await?;
-        let remote = remote_identities(remote_rows);
+                [node_id.into()],
+            ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db(
+                "list workload addresses on other nodes",
+            ))?;
+        let system_ingress = if node_id == CONTROL_PLANE_NODE_ID {
+            Vec::new()
+        } else {
+            let mut sources = self.other_node_addresses(node_id).await?;
+            sources.extend(self.control_plane_sources_toward(node_id).await?);
+            sources.sort();
+            sources.dedup();
+            sources
+        };
+        let mut remote = remote_identities(remote_rows);
+        let elsewhere = self.observed_elsewhere(node_id);
+        if !elsewhere.is_empty() {
+            let subnets = self.compute_subnets().await?;
+            merge_observed(&mut remote, elsewhere, &subnets);
+        }
         let named = names
             .into_iter()
-            .filter_map(|row| {
-                let owner = match (row.owner_kind.as_str(), row.service_id) {
-                    ("environment", _) => WorkloadRef::new(WorkloadKind::Deployment, row.owner_id),
-                    ("service_member", Some(service_id)) => {
-                        WorkloadRef::new(WorkloadKind::Service, i64::from(service_id))
-                    }
-                    _ => return None,
-                };
-                Some(NamedWorkload {
-                    fqdn: row.fqdn.trim_end_matches('.').to_ascii_lowercase(),
-                    owner,
-                })
-            })
+            .filter_map(NameRow::named_workload)
             .collect();
 
         let compiled = compile_policies(
@@ -765,8 +948,234 @@ impl NetworkPolicyService {
                 ports: Some(PortRange::single(SANDBOX_SIDECAR_PORT)),
                 protocol: L4Protocol::Tcp,
             }],
+            system_ingress,
             ..Default::default()
         })
+    }
+
+    /// Every node's compute subnet, node 0's from the cluster network
+    /// config.
+    async fn compute_subnets(&self) -> Result<HashMap<i32, Cidr>, NetworkPolicyError> {
+        let rows: Vec<ComputeSubnetRow> = self
+            .query(
+                "list node compute subnets",
+                "SELECT id, compute_cidr FROM nodes WHERE status <> 'removed'",
+            )
+            .await?;
+        let mut subnets: HashMap<i32, Cidr> = rows
+            .into_iter()
+            .filter_map(|row| Some((row.id, row.compute_cidr?.trim().parse().ok()?)))
+            .collect();
+        let config = temps_entities::network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db("read the cluster network config"))?;
+        if let Some(cidr) = config
+            .and_then(|c| c.control_plane_compute_cidr)
+            .and_then(|c| c.trim().parse().ok())
+        {
+            subnets.insert(CONTROL_PLANE_NODE_ID, cidr);
+        }
+        Ok(subnets)
+    }
+
+    /// Host addresses of every node but `node_id`, the control plane
+    /// included: their private, underlay and mesh addresses and the gateway
+    /// of their workload subnet, plus the whole mesh range. None of these is
+    /// ever a workload's, so admitting them never admits a workload.
+    async fn other_node_addresses(&self, node_id: i32) -> Result<Vec<Cidr>, NetworkPolicyError> {
+        let rows: Vec<NodeAddressRow> =
+            NodeAddressRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                OTHER_NODE_ADDRESSES_SQL,
+                [node_id.into()],
+            ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db("list other nodes' host addresses"))?;
+        let mut out: Vec<Cidr> = Vec::new();
+        for row in rows {
+            for value in [
+                row.private_address,
+                row.underlay_address,
+                row.mesh_wg_address,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if let Some(addr) = host_of(&value) {
+                    out.push(Cidr::host(addr));
+                }
+            }
+            if let Some(gateway) = row.compute_cidr.as_deref().and_then(subnet_gateway) {
+                out.push(Cidr::host(gateway));
+            }
+        }
+        let config = temps_entities::network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db("read the cluster network config"))?;
+        if let Some(config) = config {
+            if let Some(gateway) = config
+                .control_plane_compute_cidr
+                .as_deref()
+                .and_then(subnet_gateway)
+            {
+                out.push(Cidr::host(gateway));
+            }
+            if let Some(addr) = config
+                .control_plane_underlay_address
+                .as_deref()
+                .and_then(host_of)
+            {
+                out.push(Cidr::host(addr));
+            }
+            if config.wireguard_enabled {
+                if let Ok(mesh) = config.wireguard_cidr.parse::<Cidr>() {
+                    out.push(mesh);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+}
+
+impl NetworkPolicyService {
+    /// The addresses this host sends from when it connects to node `node_id`.
+    ///
+    /// The control plane is not a row in `nodes`, so `other_node_addresses`
+    /// only knows its mesh and underlay addresses. When it reaches a worker on
+    /// that worker's private address (the edge proxy and deployment health
+    /// checks dialing a published port), the kernel picks the source address,
+    /// usually one on the shared private network that is recorded nowhere.
+    /// Asking the kernel for that source, per address the worker registered,
+    /// lets the control plane's own traffic into workloads whose ingress is
+    /// restricted. Only this host's own addresses come out of it, whatever
+    /// the worker registered.
+    async fn control_plane_sources_toward(
+        &self,
+        node_id: i32,
+    ) -> Result<Vec<Cidr>, NetworkPolicyError> {
+        let row: Option<NodeAddressRow> =
+            NodeAddressRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                NODE_ADDRESSES_SQL,
+                [node_id.into()],
+            ))
+            .one(self.db.as_ref())
+            .await
+            .map_err(NetworkPolicyError::db("read the node's own addresses"))?;
+        let Some(row) = row else {
+            return Ok(Vec::new());
+        };
+        let peers = [
+            row.private_address,
+            row.underlay_address,
+            row.mesh_wg_address,
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| host_of(&value));
+        Ok(local_sources(peers, source_address_toward))
+    }
+}
+
+/// The source address the kernel picks for a connection from this host to
+/// `peer`. Connecting a UDP socket only consults the routing table; no
+/// packet is sent.
+fn source_address_toward(peer: std::net::IpAddr) -> Option<std::net::IpAddr> {
+    let bind: std::net::SocketAddr = match peer {
+        std::net::IpAddr::V4(_) => (std::net::Ipv4Addr::UNSPECIFIED, 0).into(),
+        std::net::IpAddr::V6(_) => (std::net::Ipv6Addr::UNSPECIFIED, 0).into(),
+    };
+    let socket = std::net::UdpSocket::bind(bind).ok()?;
+    socket.connect((peer, 9)).ok()?;
+    socket.local_addr().ok().map(|local| local.ip())
+}
+
+/// The sources `pick` returns for `peers`, as host CIDRs. Loopback and
+/// unspecified answers never reach another host and are dropped.
+fn local_sources(
+    peers: impl Iterator<Item = std::net::IpAddr>,
+    pick: impl Fn(std::net::IpAddr) -> Option<std::net::IpAddr>,
+) -> Vec<Cidr> {
+    let mut out: Vec<Cidr> = peers
+        .filter_map(pick)
+        .filter(|source| !source.is_loopback() && !source.is_unspecified())
+        .map(Cidr::host)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The address in `value`: an IP literal, `ip:port`, `[ip]:port` or a URL
+/// with an IP host. `None` for hostnames.
+fn host_of(value: &str) -> Option<std::net::IpAddr> {
+    let value = value.trim();
+    let value = value
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(value);
+    let value = value.split('/').next().unwrap_or(value);
+    if let Ok(addr) = value.parse() {
+        return Some(addr);
+    }
+    if let Ok(socket) = value.parse::<std::net::SocketAddr>() {
+        return Some(socket.ip());
+    }
+    let host = value.rsplit_once(':').map(|(h, _)| h).unwrap_or(value);
+    host.trim_matches(|c| c == '[' || c == ']').parse().ok()
+}
+
+/// The first host of an IPv4 subnet (its bridge gateway): `10.202.5.1`
+/// for `10.202.5.0/24`.
+fn subnet_gateway(cidr: &str) -> Option<std::net::IpAddr> {
+    let (addr, _) = cidr.trim().split_once('/')?;
+    let addr: std::net::Ipv4Addr = addr.parse().ok()?;
+    Some(std::net::IpAddr::V4(std::net::Ipv4Addr::from(
+        u32::from(addr).checked_add(1)?,
+    )))
+}
+
+#[derive(Debug, FromQueryResult)]
+struct NodeAddressRow {
+    private_address: Option<String>,
+    underlay_address: Option<String>,
+    mesh_wg_address: Option<String>,
+    compute_cidr: Option<String>,
+}
+
+const NODE_ADDRESSES_SQL: &str = "\
+    SELECT NULLIF(private_address, '') AS private_address, underlay_address, \
+           mesh_wg_address, compute_cidr \
+    FROM nodes WHERE id = $1 AND status <> 'removed'";
+
+const OTHER_NODE_ADDRESSES_SQL: &str = "\
+    SELECT NULLIF(private_address, '') AS private_address, underlay_address, \
+           mesh_wg_address, compute_cidr \
+    FROM nodes WHERE id <> $1 AND status <> 'removed'";
+
+/// Adds what other nodes observed to `remote`, keeping only addresses
+/// inside the reporting node's own compute subnet. That drops node-local
+/// addresses (a container's address on a local Docker bridge, which the
+/// same address on another node may also be), and it means a node can only
+/// ever name addresses it allocates: a compromised worker cannot claim
+/// another node's workloads. A node without a known subnet contributes
+/// nothing.
+fn merge_observed(
+    remote: &mut IdentityMap,
+    observed: Vec<(i32, IdentityMap)>,
+    subnets: &HashMap<i32, Cidr>,
+) {
+    for (node_id, mut identities) in observed {
+        let Some(subnet) = subnets.get(&node_id).copied() else {
+            continue;
+        };
+        identities.retain_addresses(|addr| subnet.contains(addr));
+        remote.extend(&identities);
     }
 }
 
@@ -838,11 +1247,172 @@ mod remote_tests {
     }
 
     #[test]
-    fn only_the_control_plane_supports_enforcement() {
-        assert!(node_supports_enforcement(CONTROL_PLANE_NODE_ID));
-        assert!(enforcement_unavailable_reason(CONTROL_PLANE_NODE_ID).is_none());
-        assert!(!node_supports_enforcement(3));
-        assert!(enforcement_unavailable_reason(3).is_some_and(|r| r.contains("worker")));
+    fn a_worker_supports_enforcement_only_while_its_agent_reports() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        assert!(service.supports_enforcement(CONTROL_PLANE_NODE_ID));
+        assert!(service
+            .enforcement_unavailable_reason(CONTROL_PLANE_NODE_ID)
+            .is_none());
+        assert!(!service.supports_enforcement(3));
+        assert!(service
+            .enforcement_unavailable_reason(3)
+            .is_some_and(|r| r.contains("node 3")));
+        service.record_enforcer_report(3, "ebpf");
+        assert!(service.supports_enforcement(3));
+        assert_eq!(
+            service.live_report(3).map(|r| r.backend),
+            Some("ebpf".into())
+        );
+        service.record_enforcer_report(3, "<script>");
+        assert_eq!(
+            service.live_report(3).map(|r| r.backend),
+            Some("unknown".into()),
+            "a reported backend is never echoed verbatim"
+        );
+        // A stale report no longer counts.
+        service.reports.lock().unwrap().insert(
+            3,
+            EnforcerReport {
+                backend: "ebpf".into(),
+                seen: std::time::Instant::now()
+                    - ENFORCER_REPORT_TTL
+                    - std::time::Duration::from_secs(1),
+            },
+        );
+        assert!(!service.supports_enforcement(3));
+    }
+
+    fn ip(value: &str) -> std::net::IpAddr {
+        value.parse().unwrap()
+    }
+
+    /// A node's report reaches the other nodes, never itself, and only
+    /// while it is fresh; an oversized one is ignored.
+    #[test]
+    fn observed_workloads_are_shared_with_the_other_nodes_while_fresh() {
+        let db = sea_orm::MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = NetworkPolicyService::new(Arc::new(db));
+        let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
+        service.record_observed(3, IdentityMap::new().with(alpha, ip("10.202.0.2")));
+
+        let seen_by = |node| {
+            service
+                .observed_elsewhere(node)
+                .into_iter()
+                .map(|(id, map)| (id, map.address_count()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seen_by(4), [(3, 1)]);
+        assert!(seen_by(3).is_empty(), "a node is never its own remote peer");
+
+        service.observed.lock().unwrap().get_mut(&3).unwrap().seen =
+            std::time::Instant::now() - ENFORCER_REPORT_TTL - std::time::Duration::from_secs(1);
+        assert!(seen_by(4).is_empty(), "a stale report no longer counts");
+
+        let mut flood = IdentityMap::new();
+        for n in 0..=MAX_REPORTED_ADDRESSES as u32 {
+            flood.insert(alpha, std::net::IpAddr::V4(std::net::Ipv4Addr::from(n)));
+        }
+        service.record_observed(4, flood);
+        assert!(seen_by(3).is_empty(), "an oversized report is ignored");
+    }
+
+    /// Only addresses inside the reporting node's own compute subnet are
+    /// shared: a container's node-local bridge address is not, and a node
+    /// cannot claim an address another node allocates.
+    #[test]
+    fn control_plane_sources_keep_this_hosts_addresses_and_drop_loopback() {
+        let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
+        let routes: HashMap<std::net::IpAddr, std::net::IpAddr> = [
+            // The worker's private address, reached on the shared network.
+            (ip("10.77.0.12"), ip("10.77.0.10")),
+            // Its mesh address, reached over WireGuard.
+            (ip("10.201.0.3"), ip("10.201.0.1")),
+            // A second registered address on the same network: same source.
+            (ip("10.77.0.13"), ip("10.77.0.10")),
+            // A worker registered under a loopback address.
+            (ip("127.0.0.1"), ip("127.0.0.1")),
+        ]
+        .into_iter()
+        .collect();
+        let peers = [
+            ip("10.77.0.12"),
+            ip("10.201.0.3"),
+            ip("10.77.0.13"),
+            ip("127.0.0.1"),
+            // No route: contributes nothing.
+            ip("192.0.2.9"),
+        ];
+
+        let sources = local_sources(peers.into_iter(), |peer| routes.get(&peer).copied());
+
+        assert_eq!(
+            sources,
+            vec![Cidr::host(ip("10.77.0.10")), Cidr::host(ip("10.201.0.1"))]
+        );
+    }
+
+    #[test]
+    fn the_kernel_names_the_source_address_without_sending_anything() {
+        let loopback: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(source_address_toward(loopback), Some(loopback));
+    }
+
+    #[test]
+    fn observed_addresses_are_kept_only_inside_the_reporting_nodes_subnet() {
+        let alpha = WorkloadRef::new(WorkloadKind::Deployment, 1);
+        let gamma = WorkloadRef::new(WorkloadKind::Deployment, 3);
+        let mallory = WorkloadRef::new(WorkloadKind::Deployment, 9);
+        let subnets = HashMap::from([
+            (3, "10.202.0.0/24".parse::<Cidr>().unwrap()),
+            (CONTROL_PLANE_NODE_ID, "10.202.255.0/24".parse().unwrap()),
+        ]);
+        let observed = vec![
+            (
+                3,
+                IdentityMap::new()
+                    .with(alpha, ip("10.202.0.2"))
+                    .with(alpha, ip("172.18.0.3"))
+                    // node 4's address, claimed by node 3
+                    .with(mallory, ip("10.202.1.2")),
+            ),
+            (
+                CONTROL_PLANE_NODE_ID,
+                IdentityMap::new().with(gamma, ip("172.20.0.2")),
+            ),
+            // no known subnet: contributes nothing
+            (7, IdentityMap::new().with(mallory, ip("10.202.7.2"))),
+        ];
+        let mut remote = IdentityMap::new();
+        merge_observed(&mut remote, observed, &subnets);
+        assert_eq!(remote.workloads().copied().collect::<Vec<_>>(), [alpha]);
+        assert_eq!(
+            remote.addresses(&alpha).collect::<Vec<_>>(),
+            [ip("10.202.0.2")]
+        );
+    }
+
+    #[test]
+    fn host_addresses_are_read_from_every_stored_shape() {
+        for (value, expected) in [
+            ("10.201.0.9", Some("10.201.0.9")),
+            ("10.201.0.9:3100", Some("10.201.0.9")),
+            ("https://10.201.0.9:3100", Some("10.201.0.9")),
+            ("[fd00::9]:3100", Some("fd00::9")),
+            ("worker.example.internal", None),
+        ] {
+            assert_eq!(
+                host_of(value).map(|a| a.to_string()),
+                expected.map(str::to_string),
+                "{value}"
+            );
+        }
+        assert_eq!(
+            subnet_gateway("10.202.5.0/24").map(|a| a.to_string()),
+            Some("10.202.5.1".to_string())
+        );
+        assert_eq!(subnet_gateway("fd00::/64"), None);
     }
 }
 
@@ -850,6 +1420,59 @@ mod remote_tests {
 mod tests {
     use super::*;
     use crate::source::DbPolicySource;
+
+    fn name_row(fqdn: &str, owner_kind: &str, owner_id: i64, service_id: Option<i32>) -> NameRow {
+        NameRow {
+            fqdn: fqdn.into(),
+            owner_kind: owner_kind.into(),
+            owner_id,
+            service_id,
+        }
+    }
+
+    #[test]
+    fn every_workload_name_kind_maps_to_its_owner() {
+        let owner = |row: NameRow| row.named_workload().map(|named| (named.fqdn, named.owner));
+        assert_eq!(
+            owner(name_row("MariaW2.temps.local.", "service_role", 3, None)),
+            Some((
+                "mariaw2.temps.local".into(),
+                WorkloadRef::new(WorkloadKind::Service, 3)
+            )),
+            "a standalone service is named by its service id"
+        );
+        assert_eq!(
+            owner(name_row(
+                "primary.pg.temps.local",
+                "service_member",
+                41,
+                Some(5)
+            )),
+            Some((
+                "primary.pg.temps.local".into(),
+                WorkloadRef::new(WorkloadKind::Service, 5)
+            )),
+            "a cluster member is named by its service, not its member row"
+        );
+        assert_eq!(
+            owner(name_row(
+                "production.alpha.temps.local",
+                "environment",
+                1,
+                None
+            )),
+            Some((
+                "production.alpha.temps.local".into(),
+                WorkloadRef::new(WorkloadKind::Deployment, 1)
+            ))
+        );
+        assert_eq!(owner(name_row("w1.temps.local", "node", 3, None)), None);
+        assert_eq!(
+            owner(name_row("orphan.temps.local", "service_member", 9, None)),
+            None,
+            "a member whose row is gone names nothing"
+        );
+    }
     use temps_database::test_utils::TestDatabase;
     use temps_workload_netpol::{Peer, PolicySource};
 

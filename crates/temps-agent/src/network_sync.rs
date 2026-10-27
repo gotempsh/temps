@@ -27,7 +27,7 @@ use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use temps_deployer::{ContainerDeployer, ContainerInfo};
 use temps_dns_resolver::{
-    ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
+    DnsPolicySlot, ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
 use temps_network::{overlay_name, NetworkConfig, NetworkManager, NodeAlloc, OverlayNames, Peer};
 use temps_wireguard::mesh::{MeshInterface, MeshKey, MeshPeer};
@@ -420,6 +420,10 @@ pub fn initial_bind_address(private_address: Option<&str>) -> String {
 /// `mesh_address` receives this node's mesh address once its end of the
 /// mesh is up, and `None` when the cluster has no mesh (see
 /// [`crate::mesh_listener`]).
+///
+/// `dns_policy` is the slot the worker's network policy enforcer stores its
+/// DNS view in; the resolver answers restricted workloads from it.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
@@ -428,6 +432,7 @@ pub fn spawn(
     bind_address: SharedBindAddress,
     containers: Arc<dyn ContainerDeployer>,
     mesh_address: crate::mesh_listener::MeshAddressSender,
+    dns_policy: DnsPolicySlot,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
@@ -439,6 +444,7 @@ pub fn spawn(
             bind_address,
             containers,
             mesh_address,
+            dns_policy,
         )
         .await
         {
@@ -504,6 +510,7 @@ async fn detect_underlay_device(private_address: Option<&str>) -> Option<String>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     config: AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
@@ -512,6 +519,7 @@ async fn run(
     bind_address: SharedBindAddress,
     containers: Arc<dyn ContainerDeployer>,
     mesh_address: crate::mesh_listener::MeshAddressSender,
+    dns_policy: DnsPolicySlot,
 ) -> Result<(), SyncError> {
     let HealthSlots {
         dns: dns_health,
@@ -555,6 +563,7 @@ async fn run(
         overlay_bridge_address: &overlay_bridge_address,
         shared_peers: &shared_peers,
         dns_health: &dns_health,
+        dns_policy: &dns_policy,
     };
 
     let mesh_url = format!(
@@ -1900,6 +1909,7 @@ struct SharedSlots<'a> {
     overlay_bridge_address: &'a Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: &'a SharedPeers,
     dns_health: &'a SharedDnsHealth,
+    dns_policy: &'a DnsPolicySlot,
 }
 
 async fn apply(
@@ -2039,6 +2049,7 @@ async fn apply(
         config,
         slots.overlay_bridge_address,
         slots.dns_health,
+        slots.dns_policy,
     )
     .await;
 
@@ -2048,7 +2059,21 @@ async fn apply(
     // update), so a sync-loop sweep is the simplest way to heal
     // automatically. `ip route replace` is idempotent — re-running
     // when nothing changed is a no-op.
-    if let Err(e) = sweep_overlay_container_routes(&bridge_v4, &peers).await {
+    let swept = match Docker::connect_with_local_defaults() {
+        Ok(docker) => {
+            temps_network::overlay_routes::sweep_container_routes(
+                &docker,
+                &overlay_name::current().docker_network,
+                &bridge_v4,
+                &peers,
+                // A full pass every sync, as before.
+                &mut std::collections::HashSet::new(),
+            )
+            .await
+        }
+        Err(e) => Err(format!("connect_with_local_defaults: {e}")),
+    };
+    if let Err(e) = swept {
         debug!(
             error = %e,
             "Container route sweep skipped (will retry next tick)"
@@ -2135,100 +2160,6 @@ fn routed_subnets(alloc: &NodeAlloc, peers: &[Peer]) -> Vec<Ipv4Net> {
         .collect()
 }
 
-/// Walk every container currently attached to `temps0` and re-install
-/// the per-peer routes inside their netns. Used by the sync loop to
-/// repair routes lost across container restarts.
-///
-/// Best-effort: any container that fails individually is logged and
-/// skipped. The sweep itself only errors when we can't even talk to
-/// the local Docker daemon.
-async fn sweep_overlay_container_routes(
-    bridge_gateway: &str,
-    peers: &[Peer],
-) -> Result<(), String> {
-    use bollard::query_parameters::{InspectContainerOptions, ListContainersOptions};
-
-    if peers.is_empty() {
-        return Ok(());
-    }
-
-    let docker = Docker::connect_with_local_defaults()
-        .map_err(|e| format!("connect_with_local_defaults: {}", e))?;
-
-    // network=temps0 filter narrows the list to containers that are
-    // actually on the overlay. Includes stopped containers (filters
-    // are OR'd on status by default), but `inspect.state.pid > 0` will
-    // skip those before we try to nsenter.
-    let overlay_name = overlay_name::current().docker_network;
-    let mut filters = std::collections::HashMap::new();
-    filters.insert("network".to_string(), vec![overlay_name.clone()]);
-    let opts = ListContainersOptions {
-        all: false,
-        filters: Some(filters),
-        ..Default::default()
-    };
-
-    let containers = docker
-        .list_containers(Some(opts))
-        .await
-        .map_err(|e| format!("list_containers: {}", e))?;
-
-    for c in containers {
-        let Some(id) = c.id.as_deref() else {
-            continue;
-        };
-        let inspect = match docker
-            .inspect_container(id, None::<InspectContainerOptions>)
-            .await
-        {
-            Ok(i) => i,
-            Err(e) => {
-                debug!(container = %id, error = %e, "Inspect failed during route sweep");
-                continue;
-            }
-        };
-        let pid = match inspect
-            .state
-            .as_ref()
-            .and_then(|s| s.pid)
-            .filter(|p| *p > 0)
-        {
-            Some(p) => p as i32,
-            None => continue,
-        };
-        // Only attempt for containers that actually have an overlay
-        // gateway recorded — stopped/half-attached containers may
-        // have a network entry without a gateway IP.
-        let has_overlay_gw = inspect
-            .network_settings
-            .as_ref()
-            .and_then(|ns| ns.networks.as_ref())
-            .and_then(|nets| nets.get(&overlay_name))
-            .and_then(|n| n.gateway.as_deref())
-            .filter(|g| !g.is_empty())
-            .is_some();
-        if !has_overlay_gw {
-            continue;
-        }
-
-        if let Err(e) = temps_network::overlay_routes::install_peer_routes_in_container(
-            pid,
-            "eth1", // hint only; actual iface is discovered by IP match
-            bridge_gateway,
-            peers,
-        )
-        .await
-        {
-            debug!(
-                container = %id,
-                error = %e,
-                "Failed to (re)install overlay peer routes; will retry next tick"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Reconcile the per-node DNS resolver against the control plane's current
 /// `cluster_dns_enabled` setting and the resolver's own task health. Called
 /// on every sync tick (ADR-024's original design only ran this once, at
@@ -2289,6 +2220,7 @@ async fn reconcile_resolver(
     config: &AgentConfig,
     overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
     dns_health: &SharedDnsHealth,
+    dns_policy: &DnsPolicySlot,
 ) {
     if !cluster_dns_enabled {
         if let Some(handle) = resolver.take() {
@@ -2308,7 +2240,24 @@ async fn reconcile_resolver(
     if let Some(handle) = resolver.as_ref() {
         let status = handle.status();
         if status.tasks_alive {
-            publish_dns_health(dns_health, true, Some(&status), None);
+            // Alive is not the same as answering: re-check every tick and
+            // withdraw the address from new containers while it does not
+            // answer, so they keep Docker's embedded DNS instead of paying a
+            // timeout per lookup.
+            let answering = resolver_answers(bridge_address).await;
+            publish_resolver_address(overlay_bridge_address, answering.then_some(bridge_address));
+            let probe_error = (!answering).then(|| {
+                format!(
+                    "resolver on {bridge_address}:53 is running but did not answer its readiness probe"
+                )
+            });
+            if let Some(error) = &probe_error {
+                warn!(
+                    bridge = %bridge_address,
+                    "{error}; new containers use Docker's embedded DNS until it answers"
+                );
+            }
+            publish_dns_health(dns_health, answering, Some(&status), probe_error);
             return;
         }
         warn!(
@@ -2334,7 +2283,7 @@ async fn reconcile_resolver(
     apply_dns_control_plane_trust(config, &mut dns_cfg).await;
     let snapshot_path = dns_cfg.snapshot_path();
     let mut start_error = None;
-    match DnsResolverHandle::start(dns_cfg).await {
+    match DnsResolverHandle::start_with_policy(dns_cfg, Some(dns_policy.clone())).await {
         Ok(handle) => {
             info!(
                 snapshot = %snapshot_path.display(),
@@ -2344,11 +2293,15 @@ async fn reconcile_resolver(
             *resolver = Some(handle);
 
             // Publish the bridge address so `service_handlers::create_service`
-            // can wire it into every container's `--dns`. Done right after the
-            // resolver is up so the slot is never advertised before the
-            // resolver is actually accepting queries.
-            if let Ok(mut slot) = overlay_bridge_address.write() {
-                *slot = Some(bridge_address);
+            // can wire it into every container's `--dns` -- only once the
+            // resolver actually answers, never merely because it started.
+            if resolver_answers(bridge_address).await {
+                publish_resolver_address(overlay_bridge_address, Some(bridge_address));
+            } else {
+                publish_resolver_address(overlay_bridge_address, None);
+                start_error = Some(format!(
+                    "resolver on {bridge_address}:53 started but did not answer its readiness probe"
+                ));
             }
         }
         Err(e) => {
@@ -2374,7 +2327,24 @@ async fn reconcile_resolver(
     }
 
     let status = resolver.as_ref().map(|h| h.status());
-    publish_dns_health(dns_health, resolver.is_some(), status.as_ref(), start_error);
+    let running = resolver.is_some() && start_error.is_none();
+    publish_dns_health(dns_health, running, status.as_ref(), start_error);
+}
+
+/// Whether the resolver on `bridge_address` answers its readiness marker.
+async fn resolver_answers(bridge_address: IpAddr) -> bool {
+    temps_dns_resolver::probe::probe_resolver(std::net::SocketAddr::new(bridge_address, 53)).await
+}
+
+/// Set (or clear) the resolver address handed to new containers.
+fn publish_resolver_address(
+    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
+    address: Option<IpAddr>,
+) {
+    match overlay_bridge_address.write() {
+        Ok(mut slot) => *slot = address,
+        Err(poisoned) => *poisoned.into_inner() = address,
+    }
 }
 
 /// Build a [`DnsResolverHeartbeat`] snapshot and publish it to `dns_health`.

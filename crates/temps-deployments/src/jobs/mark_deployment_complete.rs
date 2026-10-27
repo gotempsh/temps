@@ -1513,6 +1513,33 @@ WHERE project.id = $2
             return Ok(());
         }
 
+        // Only nodes whose last heartbeat reports a running, answering
+        // resolver can ACK a DNS generation. A node without one (an old
+        // agent, port 53 taken) serves its containers through Docker's
+        // embedded DNS, so waiting on it would roll back every deployment
+        // without making anything resolve.
+        let dns_nodes: Vec<i32> = if cluster_dns_enabled {
+            nodes::Entity::find()
+                .select_only()
+                .column(nodes::Column::Id)
+                .filter(nodes::Column::Id.is_in(active_nodes.clone()))
+                .filter(nodes::Column::DnsResolverRunning.eq(true))
+                .into_tuple::<i32>()
+                .all(db)
+                .await
+                .map_err(|e| format!("listing nodes with a running DNS resolver: {e}"))?
+        } else {
+            Vec::new()
+        };
+        if cluster_dns_enabled && dns_nodes.len() < active_nodes.len() {
+            warn!(
+                active_nodes = active_nodes.len(),
+                resolver_nodes = dns_nodes.len(),
+                "not waiting for DNS ACKs from active nodes whose resolver is not running; \
+                 their containers use Docker's embedded DNS"
+            );
+        }
+
         let deadline = tokio::time::Instant::now() + timeout;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -1532,9 +1559,9 @@ WHERE project.id = $2
             // No node runs a DNS resolver/sync client when cluster DNS is
             // disabled, so no node ever ACKs a DNS generation — nothing to
             // wait for.
-            let dns_states = if cluster_dns_enabled {
+            let dns_states = if cluster_dns_enabled && !dns_nodes.is_empty() {
                 node_dns_state::Entity::find()
-                    .filter(node_dns_state::Column::NodeId.is_in(active_nodes.clone()))
+                    .filter(node_dns_state::Column::NodeId.is_in(dns_nodes.clone()))
                     .all(db)
                     .await
                     .map_err(|e| format!("reading node_dns_state: {e}"))?
@@ -1542,7 +1569,7 @@ WHERE project.id = $2
                 Vec::new()
             };
             let dns_ok = !cluster_dns_enabled
-                || (dns_states.len() == active_nodes.len()
+                || (dns_states.len() == dns_nodes.len()
                     && dns_states.iter().all(|s| s.applied_generation >= dns_gen));
 
             if route_ok && dns_ok {
@@ -1592,15 +1619,13 @@ WHERE project.id = $2
                     }
                 }
                 if cluster_dns_enabled && !dns_ok {
-                    let never_acked = active_nodes.len() - dns_states.len();
+                    let never_acked = dns_nodes.len() - dns_states.len();
                     if never_acked > 0 {
                         reason.push_str(&format!(
-                            " — {never_acked} active node(s) have never ACKed a DNS generation \
-                             at all. Cluster DNS was likely enabled after these nodes' agents \
-                             last started: the per-node resolver is only spawned once, during \
-                             initial overlay bootstrap, so an already-running agent won't pick up \
-                             a newly-enabled cluster_dns.enabled until its `temps agent` process \
-                             is restarted."
+                            " — {never_acked} node(s) report a running DNS resolver but have \
+                             never ACKed a DNS generation. Check that their resolver can reach \
+                             the control plane's DNS sync endpoint (`temps agent` logs on each \
+                             node), then redeploy."
                         ));
                     } else {
                         let lagging = dns_states

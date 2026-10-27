@@ -185,6 +185,16 @@ pub(crate) async fn container_has_walg(docker: &bollard::Docker, container_name:
 /// `mariadb-binlog`/`mysqlbinlog` for replay. Returns `false` on any error or
 /// if any tool is missing, so existing stock MariaDB containers keep the
 /// logical `mariadb_dump` fallback while new managed images use WAL-G.
+/// Shell test that exits 0 only if every MariaDB physical PITR tool resolves.
+/// `mariadb-binlog` and `mysqlbinlog` are the same tool (symlink); either
+/// counts, as do `mariadb-backup` and `mariabackup`.
+pub(crate) const MARIADB_PITR_TOOLS_PROBE: &str = "command -v wal-g >/dev/null 2>&1; w=$?; \
+     command -v mariadb-backup >/dev/null 2>&1 || command -v mariabackup >/dev/null 2>&1; \
+     a=$?; \
+     command -v mariadb-binlog >/dev/null 2>&1 || command -v mysqlbinlog >/dev/null 2>&1; \
+     b=$?; \
+     [ $w -eq 0 ] && [ $a -eq 0 ] && [ $b -eq 0 ]";
+
 pub(crate) async fn container_has_mariadb_pitr_tools(
     docker: &bollard::Docker,
     container_name: &str,
@@ -193,12 +203,7 @@ pub(crate) async fn container_has_mariadb_pitr_tools(
 
     // Single shell test: exit 0 only if ALL tools resolve. `mariadb-binlog`
     // and `mysqlbinlog` are the same tool (symlink); accept either.
-    let probe = "command -v wal-g >/dev/null 2>&1; w=$?; \
-                 command -v mariadb-backup >/dev/null 2>&1 || command -v mariabackup >/dev/null 2>&1; \
-                 a=$?; \
-                 command -v mariadb-binlog >/dev/null 2>&1 || command -v mysqlbinlog >/dev/null 2>&1; \
-                 b=$?; \
-                 [ $w -eq 0 ] && [ $a -eq 0 ] && [ $b -eq 0 ]";
+    let probe = MARIADB_PITR_TOOLS_PROBE;
 
     let exec = match docker
         .create_exec(

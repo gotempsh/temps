@@ -84,3 +84,7 @@ tower.workspace = true
 # control-plane resolver over a UDP socket (mirrors temps-dns-resolver's
 # own end_to_end.rs client).
 hickory-resolver = "0.26"
+# The policy slot test: a restricted snapshot for the test client's address.
+arc-swap = { workspace = true }
+temps-workload = { path = "../temps-workload" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }

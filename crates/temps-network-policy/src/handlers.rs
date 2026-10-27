@@ -29,10 +29,7 @@ use crate::model::{
     parse_action, parse_direction, parse_profile, parse_protocol, parse_subject, profile_str,
     PeerSpec, Profiles,
 };
-use crate::service::{
-    enforcement_unavailable_reason, node_supports_enforcement, EffectivePolicy,
-    NetworkPolicyService, NewRule, NodeModeEntry, RuleFilter,
-};
+use crate::service::{EffectivePolicy, NetworkPolicyService, NewRule, NodeModeEntry, RuleFilter};
 
 #[derive(Clone)]
 pub struct NetworkPolicyAppState {
@@ -350,9 +347,10 @@ pub struct NodeNetworkPolicyModeResponse {
     /// applied) or `enforce`.
     #[schema(example = "legacy")]
     pub mode: String,
-    /// Whether this node can run `shadow` or `enforce`. False on workers:
-    /// no enforcer runs there yet, and a stored non-legacy mode on a worker
-    /// is never counted as enforcing.
+    /// Whether this node can run `shadow` or `enforce`: always on the
+    /// control plane, on a worker while its agent reports an enforcer. A
+    /// stored non-legacy mode on a node without one is never counted as
+    /// enforcing.
     pub supports_enforcement: bool,
     /// Why `shadow`/`enforce` is unavailable, when `supports_enforcement`
     /// is false.
@@ -362,9 +360,8 @@ pub struct NodeNetworkPolicyModeResponse {
 impl From<NodeModeEntry> for NodeNetworkPolicyModeResponse {
     fn from(n: NodeModeEntry) -> Self {
         Self {
-            supports_enforcement: node_supports_enforcement(n.node_id),
-            enforcement_unavailable_reason: enforcement_unavailable_reason(n.node_id)
-                .map(str::to_string),
+            supports_enforcement: n.supports_enforcement,
+            enforcement_unavailable_reason: n.enforcement_unavailable_reason,
             node_id: n.node_id,
             name: n.name,
             role: n.role,
@@ -887,17 +884,20 @@ mod tests {
 
     #[test]
     fn worker_nodes_report_why_enforcement_is_unavailable() {
-        let entry = |node_id| NodeModeEntry {
+        let entry = |node_id, supports: bool| NodeModeEntry {
             node_id,
             name: "n".into(),
             role: "worker".into(),
             status: "active".into(),
             mode: NodeMode::Legacy,
+            supports_enforcement: supports,
+            enforcement_unavailable_reason: (!supports).then(|| "no enforcer".to_string()),
+            backend: None,
         };
-        let worker = NodeNetworkPolicyModeResponse::from(entry(3));
+        let worker = NodeNetworkPolicyModeResponse::from(entry(3, false));
         assert!(!worker.supports_enforcement);
         assert!(worker.enforcement_unavailable_reason.is_some());
-        let control = NodeNetworkPolicyModeResponse::from(entry(0));
+        let control = NodeNetworkPolicyModeResponse::from(entry(0, true));
         assert!(control.supports_enforcement);
         assert!(control.enforcement_unavailable_reason.is_none());
     }

@@ -76,3 +76,8 @@ WRONLY = "WRONLY"
 # Plural of HTTP `DELETE` in a console comment; typos "corrects" it to
 # `DELETEEs`, which is itself a misspelling.
 DELETEs = "DELETEs"
+# nftables' input-interface match (`fib saddr . iif`); "correcting" it to
+# `if` produces a rule nft rejects.
+iif = "iif"
+# The `wrk` HTTP benchmarking tool.
+wrk = "wrk"

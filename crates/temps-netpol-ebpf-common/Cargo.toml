@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# Shared by the eBPF programs (`temps-netpol-ebpf`, built for
+# `bpfel-unknown-none` in its own workspace) and the loader in
+# `temps-workload-netpol`. Fields are spelled out instead of inherited from
+# the workspace because the eBPF crate builds this one from outside it.
+[package]
+name = "temps-netpol-ebpf-common"
+description = "Map key and value layouts shared by the network policy eBPF programs and their loader"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Temps Contributors"]
+repository = "https://github.com/gotempsh/temps"
+homepage = "https://github.com/gotempsh/temps"
+
+[features]
+default = []
+# Implements `aya::Pod` so user space can read and write the maps. aya only
+# builds for Linux, so elsewhere (`--all-features` on macOS) this is a no-op.
+user = ["dep:aya"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+aya = { version = "0.14", optional = true }

@@ -5125,6 +5125,14 @@ mod tests {
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ))),
             docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
+            resolver_coverage: Arc::new(crate::services::ResolverCoverageService::new(
+                db.clone(),
+                Arc::new(temps_core::DockerHandle::disabled(
+                    "test",
+                    "no daemon in tests",
+                )),
+                None,
+            )),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)

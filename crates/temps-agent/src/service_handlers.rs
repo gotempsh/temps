@@ -1678,7 +1678,14 @@ pub async fn health_probe(
         }
     };
 
-    match temps_providers::externalsvc::probe_service_health(request.service_config, docker).await {
+    // The control plane sends the parameters the service was created with,
+    // whose host is `localhost`. This node publishes managed-service ports on
+    // its bind address only (never on all interfaces), so loopback reaches
+    // nothing: probe the address the port was actually published on.
+    let mut service_config = request.service_config;
+    probe_at_published_address(&mut service_config.parameters, &state.host_bind_address());
+
+    match temps_providers::externalsvc::probe_service_health(service_config, docker).await {
         Ok(result) => ok_response(RemoteHealthProbeResponse { result }).into_response(),
         Err(error) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1688,6 +1695,39 @@ pub async fn health_probe(
             ),
         )
         .into_response(),
+    }
+}
+
+/// Point a loopback `host` parameter at `bind_address`, the address this
+/// node publishes service ports on. A host the user chose, a non-object
+/// config, and a loopback or all-interfaces bind are left alone.
+fn probe_at_published_address(parameters: &mut serde_json::Value, bind_address: &str) {
+    let bind: std::net::IpAddr = match bind_address.trim().parse() {
+        Ok(ip) => ip,
+        Err(_) => return,
+    };
+    if bind.is_unspecified() || bind.is_loopback() {
+        return;
+    }
+    let Some(object) = parameters.as_object_mut() else {
+        return;
+    };
+    let host_is_loopback = match object.get("host").and_then(|host| host.as_str()) {
+        // Absent means the provider default, `localhost`.
+        None => true,
+        Some(host) => {
+            let host = host.trim().trim_start_matches('[').trim_end_matches(']');
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }
+    };
+    if host_is_loopback {
+        object.insert(
+            "host".to_string(),
+            serde_json::Value::String(bind.to_string()),
+        );
     }
 }
 
@@ -2786,5 +2826,41 @@ mod service_network_tests {
         );
         assert_eq!(none, Ok(None));
         assert!(!app_created, "no requested network must create nothing");
+    }
+}
+
+#[cfg(test)]
+mod health_probe_target_tests {
+    use super::probe_at_published_address;
+
+    #[test]
+    fn health_probe_targets_the_address_the_port_is_published_on() {
+        let mut params = serde_json::json!({"host": "localhost", "port": "5432"});
+        probe_at_published_address(&mut params, "10.42.0.22");
+        assert_eq!(params["host"], "10.42.0.22");
+
+        let mut params = serde_json::json!({"host": "127.0.0.1", "port": "6379"});
+        probe_at_published_address(&mut params, "10.42.0.22");
+        assert_eq!(params["host"], "10.42.0.22");
+
+        // No host at all means the provider default, localhost.
+        let mut params = serde_json::json!({"port": "5432"});
+        probe_at_published_address(&mut params, "10.42.0.22");
+        assert_eq!(params["host"], "10.42.0.22");
+    }
+
+    #[test]
+    fn health_probe_keeps_hosts_that_already_reach_the_service() {
+        // A host the user chose is never rewritten.
+        let mut params = serde_json::json!({"host": "db.example.com"});
+        probe_at_published_address(&mut params, "10.42.0.22");
+        assert_eq!(params["host"], "db.example.com");
+
+        // Loopback and all-interfaces binds already answer on localhost.
+        for bind in ["127.0.0.1", "0.0.0.0", "not-an-ip"] {
+            let mut params = serde_json::json!({"host": "localhost"});
+            probe_at_published_address(&mut params, bind);
+            assert_eq!(params["host"], "localhost", "bind {bind}");
+        }
     }
 }

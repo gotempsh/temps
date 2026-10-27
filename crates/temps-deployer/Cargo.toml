@@ -55,6 +55,7 @@ temps-network = { path = "../temps-network", features = ["control_plane"] }
 # ADR-024: control-plane DNS resolver bootstrap (CP-only path; workers wire DNS
 # via `temps agent`).
 temps-dns = { path = "../temps-dns" }
+temps-dns-resolver = { path = "../temps-dns-resolver" }
 utoipa = { workspace = true }
 flate2 = { workspace = true }
 reqwest = { workspace = true }

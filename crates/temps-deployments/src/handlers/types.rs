@@ -59,6 +59,9 @@ pub struct AppState {
     /// On-demand `docker system df` for the control-plane host (server
     /// monitoring page). See [`crate::services::DockerDiskUsageService`].
     pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
+    /// Applications running without the cluster resolver (ADR-024), for
+    /// `GET /cluster/dns/status`.
+    pub resolver_coverage: Arc<crate::services::ResolverCoverageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys

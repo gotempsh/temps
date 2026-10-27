@@ -23,6 +23,7 @@ temps-query-s3 = { path = "../temps-query-s3" }
 temps-query-redis = { path = "../temps-query-redis" }
 temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
+temps-dns-resolver = { path = "../temps-dns-resolver" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
