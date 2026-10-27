@@ -504,7 +504,7 @@ mod tests {
         use flate2::write::GzEncoder;
         use std::io::Write;
         let gzip = |data: &[u8]| {
-            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
             encoder.write_all(data).unwrap();
             encoder.finish().unwrap()
         };
@@ -592,7 +592,7 @@ mod tests {
     fn gzip_json<T: serde::Serialize>(value: &T) -> Bytes {
         use flate2::write::GzEncoder;
         use std::io::Write;
-        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::best());
         encoder
             .write_all(&serde_json::to_vec(value).unwrap())
             .unwrap();
