@@ -90,6 +90,12 @@ import {
   serviceMetricsEngine,
   type ServiceMetricsEngine,
 } from '@/lib/service-metrics-engine'
+import {
+  MARIADB_FLAG_METRICS,
+  MARIADB_METRIC_GROUPS,
+  MARIADB_METRIC_LABELS,
+  MARIADB_PER_DATABASE_GROUPS,
+} from '@/lib/mariadb-metrics'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -296,42 +302,7 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       metrics: ['mongo.replication_buffer_ratio'],
     },
   ],
-  mariadb: [
-    {
-      title: 'Connections',
-      metrics: [
-        'mariadb.connections',
-        'mariadb.max_connections',
-        'mariadb.connections_used_ratio',
-        'mariadb.max_used_connections',
-        'mariadb.threads_running',
-        'mariadb.aborted_connects_total',
-        'mariadb.aborted_clients_total',
-      ],
-    },
-    {
-      title: 'Queries',
-      metrics: ['mariadb.queries_total', 'mariadb.slow_queries_total'],
-    },
-    {
-      title: 'InnoDB',
-      metrics: [
-        'mariadb.buffer_pool_hit_ratio',
-        'mariadb.rows_read_total',
-        'mariadb.rows_inserted_total',
-        'mariadb.rows_updated_total',
-        'mariadb.rows_deleted_total',
-      ],
-    },
-    {
-      title: 'Server',
-      metrics: ['mariadb.database_size_bytes', 'mariadb.uptime_seconds'],
-    },
-    {
-      title: 'Replication',
-      metrics: ['mariadb.replication_lag_seconds'],
-    },
-  ],
+  mariadb: MARIADB_METRIC_GROUPS,
   s3: [
     {
       title: 'Storage',
@@ -430,21 +401,26 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
   },
 ]
 
-// Flat list of every per-database metric name (for the by-database query).
-const PG_PER_DATABASE_METRICS: string[] = PG_PER_DATABASE_GROUPS.flatMap(
-  (g) => g.metrics
-)
+// Engines whose collector reports per-database series, shown in the
+// "Databases" section. Must match `per_database_layout` in
+// crates/temps-providers/src/handlers/metrics_handlers.rs.
+const PER_DATABASE_GROUPS: Partial<Record<EngineKind, MetricGroup[]>> = {
+  postgres: PG_PER_DATABASE_GROUPS,
+  mariadb: MARIADB_PER_DATABASE_GROUPS,
+}
 
-// All known metrics for alert rule creation. For Postgres this includes both
-// the global metrics (ENGINE_GROUPS) and the per-database metrics so alert
-// rules can target either scope.
+// All known metrics for alert rule creation: the global metrics
+// (ENGINE_GROUPS) and, where the engine has them, the per-database metrics so
+// alert rules can target either scope.
 const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
     [
       ...RESOURCES_GROUP.metrics,
       ...groups.flatMap((g) => g.metrics),
-      ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
+      ...(PER_DATABASE_GROUPS[engine as EngineKind] ?? []).flatMap(
+        (g) => g.metrics
+      ),
     ],
   ])
 ) as Record<EngineKind, string[]>
@@ -514,6 +490,7 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (MARIADB_FLAG_METRICS.has(name)) return value >= 1 ? 'Yes' : 'No'
   if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
     return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
@@ -564,6 +541,7 @@ const METRIC_LABELS: Record<string, string> = {
   'rustfs.request.body.bytes_total': 'Request Bytes',
   rustfs_system_process_cpu_usage: 'CPU Usage',
   rustfs_system_process_resident_memory_bytes: 'Resident Memory',
+  ...MARIADB_METRIC_LABELS,
 }
 
 function labelForMetric(name: string): string {
@@ -983,7 +961,8 @@ function AddAlertRuleDialog({
 }
 
 // ---------------------------------------------------------------------------
-// DatabasesSection — per-database breakdown for Postgres services
+// DatabasesSection — per-database breakdown (Postgres databases, MariaDB
+// schemas)
 // ---------------------------------------------------------------------------
 
 // Sentinel for the "All databases" selector option (instance-wide aggregate).
@@ -991,21 +970,25 @@ const ALL_DATABASES = '__all__'
 
 type DatabasesSectionProps = {
   serviceId: number
+  /** The engine's per-database metric groups. */
+  groups: MetricGroup[]
   /** Instance-wide aggregate values (from query_latest) for "All databases". */
   aggregateByName: Map<string, number>
 }
 
 /**
- * Per-database Postgres metrics with a database selector.
+ * Per-database metrics with a database selector.
  *
- * A Postgres instance can host many unrelated databases; these metrics
- * (`pg_stat_database` + size) are emitted once per `datname`. The selector
+ * A Postgres or MariaDB instance can host many unrelated databases; these
+ * metrics (`pg_stat_database` + size, or MariaDB per-schema storage) are
+ * emitted once per database. The selector
  * chooses "All databases" (the instance aggregate) or a single database, and
  * the tile grids re-render for that scope. Kept separate from the global tiles
  * so a per-db sum is never shown unlabelled next to a true instance metric.
  */
 function DatabasesSection({
   serviceId,
+  groups,
   aggregateByName,
 }: DatabasesSectionProps) {
   const refetchInterval = useRefreshInterval()
@@ -1054,7 +1037,7 @@ function DatabasesSection({
         </Select>
       </div>
 
-      {PG_PER_DATABASE_GROUPS.map((group) => (
+      {groups.map((group) => (
         <div key={group.title}>
           <div className="mb-2">
             <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
@@ -1300,6 +1283,7 @@ function MonitoringDashboard({
   // operator checks — then the engine-specific groups.
   const groups = [RESOURCES_GROUP, ...ENGINE_GROUPS[engine]]
   const heroMetrics = HERO_METRICS[engine]
+  const perDatabaseGroups = PER_DATABASE_GROUPS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(
     heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
@@ -1432,10 +1416,11 @@ function MonitoringDashboard({
         </div>
       ))}
 
-      {/* Per-database breakdown (Postgres) */}
-      {engine === 'postgres' && (
+      {/* Per-database breakdown (Postgres databases, MariaDB schemas) */}
+      {perDatabaseGroups && (
         <DatabasesSection
           serviceId={serviceId}
+          groups={perDatabaseGroups}
           aggregateByName={latestByName}
         />
       )}

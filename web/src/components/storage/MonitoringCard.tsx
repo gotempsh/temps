@@ -87,6 +87,11 @@ import {
   serviceMetricsEngine,
   type ServiceMetricsEngine,
 } from '@/lib/service-metrics-engine'
+import {
+  MARIADB_FLAG_METRICS,
+  MARIADB_METRIC_LABELS,
+  MARIADB_METRICS,
+} from '@/lib/mariadb-metrics'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -174,10 +179,10 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'mongo.replication_buffer_ratio',
   ],
   mariadb: [
-    'mariadb.connections',
+    'mariadb.connections_used_ratio',
     'mariadb.buffer_pool_hit_ratio',
     'mariadb.queries_total',
-    'mariadb.slow_queries_total',
+    'mariadb.database_size_bytes',
   ],
   s3: [
     's3.bucket_count',
@@ -296,25 +301,7 @@ const KNOWN_METRICS: Record<EngineKind, string[]> = {
     'mongo.cursor_timed_out_total',
     'mongo.replication_buffer_ratio',
   ],
-  mariadb: [
-    'mariadb.connections',
-    'mariadb.max_connections',
-    'mariadb.connections_used_ratio',
-    'mariadb.max_used_connections',
-    'mariadb.threads_running',
-    'mariadb.aborted_connects_total',
-    'mariadb.aborted_clients_total',
-    'mariadb.queries_total',
-    'mariadb.slow_queries_total',
-    'mariadb.buffer_pool_hit_ratio',
-    'mariadb.rows_read_total',
-    'mariadb.rows_inserted_total',
-    'mariadb.rows_updated_total',
-    'mariadb.rows_deleted_total',
-    'mariadb.database_size_bytes',
-    'mariadb.uptime_seconds',
-    'mariadb.replication_lag_seconds',
-  ],
+  mariadb: MARIADB_METRICS,
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -367,7 +354,9 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
-  if (name.endsWith('_bytes')) return formatBytes(value)
+  if (MARIADB_FLAG_METRICS.has(name)) return value >= 1 ? 'Yes' : 'No'
+  if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
+    return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
   if (name.endsWith('_percent')) return `${value.toFixed(1)}%`
   if (name.endsWith('_seconds') || name.endsWith('_sec'))
@@ -391,6 +380,7 @@ const METRIC_LABELS: Record<string, string> = {
   'container.cpu_percent': 'CPU',
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
+  ...MARIADB_METRIC_LABELS,
 }
 
 function labelForMetric(name: string): string {
