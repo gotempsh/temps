@@ -26,6 +26,7 @@ import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
 import { RecentDeployments } from '@/components/deployments/RecentDeployments'
 import { ProjectFailureBanner } from '@/components/project/ProjectFailureBanner'
+import { ClusterDnsStaleBanner } from '@/components/settings/ClusterDnsCoverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
@@ -208,6 +209,7 @@ export function ProjectOverview({
   return (
     <>
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
+      <ClusterDnsStaleBanner projectId={project.id} />
       <div className="@container/overview">
         <div className="grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">
