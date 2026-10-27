@@ -47,7 +47,7 @@ function ShieldEntriesLinks({ projectSlug }: { projectSlug: string }) {
     <ShieldSection
       id="shield-entries"
       title="Entries"
-      description="Addresses, ranges and fingerprints you allow, block or challenge. Entries apply to every environment of the service, so they are kept with its Security settings."
+      description="Addresses Shield challenges or logs, and TLS fingerprints it allows, blocks or challenges. Entries apply to every environment of the service, so they are kept in its Security settings, next to IP access."
     >
       <div className="flex flex-wrap gap-2 p-4">
         <Button asChild size="sm" variant="outline">

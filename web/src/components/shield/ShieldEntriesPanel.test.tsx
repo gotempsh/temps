@@ -3,7 +3,13 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import type { ReactNode } from 'react'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -24,7 +30,7 @@ const ENTRY = {
   project_id: null,
   network: '198.51.100.0/24',
   ja4: null,
-  verdict: 'block',
+  verdict: 'challenge',
   note: null,
   expires_at: null,
   created_by: 1,
@@ -70,13 +76,18 @@ test('a platform entry is added through the platform endpoint', async () => {
   fireEvent.click(view.getByRole('button', { name: 'Add entry' }))
   const value = await view.findByLabelText('Address or CIDR')
   fireEvent.change(value, { target: { value: '198.51.100.0/24' } })
+  // Allowing or blocking an address is IP access's job, so an address entry
+  // starts as a challenge and the form points there.
+  expect(
+    within(view.getByRole('dialog')).getByRole('button', { name: 'IP access' })
+  ).toBeTruthy()
   fireEvent.click(submitButton(view))
 
   await view.findByText('198.51.100.0/24')
   expect(sentBody).toEqual({
     network: '198.51.100.0/24',
     ja4: null,
-    verdict: 'block',
+    verdict: 'challenge',
     note: null,
     expires_at: null,
   })
@@ -115,5 +126,21 @@ test('adding an entry does not submit the settings form it sits in', async () =>
   )
   expect(api.called('GET', PLATFORM_PATH)).toBe(false)
   expect(outerSubmits).toBe(0)
+  api.restore()
+})
+
+test('an address entry saved as a block says IP access applies it in every mode', async () => {
+  const api = mockApi({
+    [`GET ${PROJECT_PATH}`]: () =>
+      jsonResponse([
+        { ...ENTRY, scope: 'project', project_id: 3, verdict: 'block' },
+      ]),
+  })
+  const view = renderPanel({ kind: 'project', projectId: 3 })
+
+  await view.findByText('198.51.100.0/24')
+  expect(
+    view.getByText(/Acts only in selective and attack mode; IP access/)
+  ).toBeTruthy()
   api.restore()
 })

@@ -411,7 +411,7 @@ export function ProjectSecuritySettings({
       <SettingsSection
         id="shield-entries"
         title="Shield entries"
-        description="Allow, block or challenge specific addresses and fingerprints in every environment"
+        description="Challenge addresses and act on TLS fingerprints in every environment"
         icon={ListChecks}
       >
         <ShieldEntriesPanel

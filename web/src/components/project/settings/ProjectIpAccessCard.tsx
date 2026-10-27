@@ -116,6 +116,8 @@ function isLockoutError(error: unknown): boolean {
   return problem.status === 409 && problem.title === 'Policy Would Lock You Out'
 }
 
+const IP_ACCESS_SECTION_ID = 'ip-access'
+
 export function ProjectIpAccessCard({
   projectId,
   environmentId,
@@ -400,13 +402,20 @@ export function ProjectIpAccessCard({
   }
 
   const title = isEnvironment ? 'IP access for this environment' : 'IP access'
+  // The project list is what other sections link to (Shield entries).
+  const sectionId = isEnvironment ? undefined : IP_ACCESS_SECTION_ID
   const description = isEnvironment
     ? 'Limit which client addresses can reach this environment. Overrides the project list.'
     : 'Allow only, or block, specific IP addresses and ranges for every environment of this project.'
 
   if (policyQuery.isPending) {
     return (
-      <SettingsSection title={title} description={description} icon={Network}>
+      <SettingsSection
+        id={sectionId}
+        title={title}
+        description={description}
+        icon={Network}
+      >
         <div className="space-y-3" aria-busy="true">
           <Skeleton className="h-5 w-56" />
           <Skeleton className="h-16 w-full" />
@@ -418,7 +427,12 @@ export function ProjectIpAccessCard({
 
   if (policyQuery.isError || !policy) {
     return (
-      <SettingsSection title={title} description={description} icon={Network}>
+      <SettingsSection
+        id={sectionId}
+        title={title}
+        description={description}
+        icon={Network}
+      >
         <ErrorAlert
           title="Could not load the IP access list"
           description={problemDetail(
@@ -433,7 +447,12 @@ export function ProjectIpAccessCard({
   }
 
   return (
-    <SettingsSection title={title} description={description} icon={Network}>
+    <SettingsSection
+      id={sectionId}
+      title={title}
+      description={description}
+      icon={Network}
+    >
       <form onSubmit={onSubmit} className="space-y-5" noValidate>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={policy.mode === 'disabled' ? 'secondary' : 'default'}>

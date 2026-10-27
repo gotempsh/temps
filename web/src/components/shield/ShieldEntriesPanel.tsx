@@ -52,6 +52,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { openSettingsSection } from '@/hooks/useOpenSectionFromHash'
 import { formatLocalDateTime } from '@/lib/date'
 import {
   isoToLocalInput,
@@ -89,6 +90,17 @@ const VERDICTS: ReadonlyArray<{
   },
 ]
 
+/**
+ * What an address entry may do. Allowing or blocking an address is IP
+ * access's job: it acts in every Shield mode, where a Shield entry acts only
+ * in selective and attack mode, so offering both would let a "block" that
+ * blocks nothing sit next to one that does.
+ */
+const ADDRESS_VERDICTS: ReadonlyArray<ShieldEntryVerdict> = ['challenge', 'log']
+
+/** The section on the same page that allows or blocks addresses. */
+const IP_ACCESS_SECTION = 'ip-access'
+
 const entrySchema = z
   .object({
     match: z.enum(['network', 'ja4']),
@@ -125,9 +137,22 @@ type EntryForm = z.infer<typeof entrySchema>
 const EMPTY_ENTRY: EntryForm = {
   match: 'network',
   value: '',
-  verdict: 'block',
+  verdict: 'challenge',
   note: '',
   expires_at: '',
+}
+
+/** The verdicts the form offers for what the entry matches. */
+function verdictsFor(
+  match: EntryForm['match'],
+  current: ShieldEntryVerdict | null
+) {
+  if (match === 'ja4') return VERDICTS
+  // An address entry saved before keeps its verdict while it is edited.
+  return VERDICTS.filter(
+    (verdict) =>
+      ADDRESS_VERDICTS.includes(verdict.value) || verdict.value === current
+  )
 }
 
 function entryToForm(entry: ShieldEntryResponse): EntryForm {
@@ -156,12 +181,12 @@ const SCOPE_COPY = {
   platform: {
     reach: 'every service on this platform',
     empty:
-      'Block or challenge a network that attacks all your services, or allow a range you trust everywhere. Each service can add its own entries too.',
+      'Challenge a network that probes your services, or act on the TLS fingerprint of a bot that hits all of them. Each service can add its own entries too.',
   },
   project: {
     reach: 'every environment of this service',
     empty:
-      "Allow a partner's range, or block or challenge an address the lists do not know about.",
+      'Challenge an address the lists do not know about, or act on the TLS fingerprint of a bot or of a client you trust.',
   },
 } as const
 
@@ -206,6 +231,7 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
   const errors = form.formState.errors
   const match = useWatch({ control: form.control, name: 'match' })
   const chosenVerdict = useWatch({ control: form.control, name: 'verdict' })
+  const verdictOptions = verdictsFor(match, editing?.verdict ?? null)
 
   const onSaved = (message: string) => {
     toast.success(message)
@@ -317,8 +343,10 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
     <div className="min-w-0 space-y-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <p className="max-w-3xl text-sm text-muted-foreground">
-          Addresses, ranges and JA4 fingerprints with a verdict you set. They
-          apply to {copy.reach}, usually within seconds.
+          Challenge or log addresses and ranges, and allow, block or challenge
+          JA4 fingerprints. Entries apply to {copy.reach}, usually within
+          seconds, and act in selective and attack mode. To allow or block an
+          address in every mode, use <IpAccessLink />.
         </p>
         {rows.length > 0 && addButton}
       </div>
@@ -375,6 +403,13 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
                     <span className="block text-xs text-muted-foreground">
                       {entry.ja4 ? 'JA4 fingerprint' : 'Address range'}
                     </span>
+                    {!entry.ja4 &&
+                      !ADDRESS_VERDICTS.includes(entry.verdict) && (
+                        <span className="block text-xs text-muted-foreground">
+                          Acts only in selective and attack mode; IP access
+                          applies it in every mode.
+                        </span>
+                      )}
                   </TableCell>
                   <TableCell>
                     <Badge variant={shieldVerdictBadge(entry.verdict)}>
@@ -458,7 +493,16 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
                   render={({ field }) => (
                     <Select
                       value={field.value}
-                      onValueChange={field.onChange}
+                      onValueChange={(value) => {
+                        field.onChange(value)
+                        // Allow and block are not offered for addresses.
+                        if (
+                          value === 'network' &&
+                          !ADDRESS_VERDICTS.includes(form.getValues('verdict'))
+                        ) {
+                          form.setValue('verdict', 'challenge')
+                        }
+                      }}
                       disabled={editing !== null}
                     >
                       <SelectTrigger id="shield-entry-match">
@@ -514,7 +558,7 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
-                      {VERDICTS.map((verdict) => (
+                      {verdictOptions.map((verdict) => (
                         <SelectItem key={verdict.value} value={verdict.value}>
                           {verdict.label}
                         </SelectItem>
@@ -529,6 +573,12 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
                     ?.description
                 }
               </p>
+              {match === 'network' && (
+                <p className="text-xs text-muted-foreground">
+                  To allow or block an address in every mode, use{' '}
+                  <IpAccessLink onOpen={() => setDialogOpen(false)} />.
+                </p>
+              )}
             </div>
             <div className="space-y-2">
               <Label htmlFor="shield-entry-note">Note (optional)</Label>
@@ -600,5 +650,21 @@ export function ShieldEntriesPanel({ scope }: { scope: ShieldEntriesScope }) {
         }}
       />
     </div>
+  )
+}
+
+/** Opens the IP access section on the same settings page. */
+function IpAccessLink({ onOpen }: { onOpen?: () => void }) {
+  return (
+    <button
+      type="button"
+      className="font-medium text-foreground underline underline-offset-4"
+      onClick={() => {
+        onOpen?.()
+        openSettingsSection(IP_ACCESS_SECTION)
+      }}
+    >
+      IP access
+    </button>
   )
 }

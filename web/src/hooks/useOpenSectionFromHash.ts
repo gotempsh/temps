@@ -15,10 +15,15 @@ export function useOpenSectionFromHash(ids: readonly string[], ready = true) {
   const id = hash.slice(1)
   const known = ids.includes(id)
   useEffect(() => {
-    if (!known || !ready) return
-    const element = document.getElementById(id)
-    if (!(element instanceof HTMLDetailsElement)) return
-    element.open = true
-    element.scrollIntoView({ block: 'start' })
+    if (known && ready) openSettingsSection(id)
   }, [id, known, ready])
+}
+
+/** Opens the settings section with this DOM id and brings it into view. */
+export function openSettingsSection(id: string): boolean {
+  const element = document.getElementById(id)
+  if (!(element instanceof HTMLDetailsElement)) return false
+  element.open = true
+  element.scrollIntoView({ block: 'start' })
+  return true
 }
