@@ -1,6 +1,180 @@
 {
   "components": {
     "schemas": {
+      "AccessBinding": {
+        "description": "The Cloudflare Access application in front of a signed-in address\n(ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.",
+        "properties": {
+          "app_id": {
+            "type": "string"
+          },
+          "aud": {
+            "type": "string"
+          },
+          "provider_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "provider_id",
+          "app_id",
+          "aud"
+        ],
+        "type": "object"
+      },
+      "AccessPermission": {
+        "enum": [
+          "apps_edit",
+          "organizations_read"
+        ],
+        "type": "string"
+      },
+      "AccessPermissionCheck": {
+        "properties": {
+          "detail": {
+            "description": "Why, and what to change on the token when it is not present.",
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "permission": {
+            "$ref": "#/components/schemas/AccessPermission"
+          },
+          "state": {
+            "$ref": "#/components/schemas/PermissionState"
+          }
+        },
+        "required": [
+          "permission",
+          "label",
+          "state",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "AccessProviderResponse": {
+        "description": "A saved Access token. The token itself is never returned.",
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "addresses": {
+            "description": "How many addresses it protects.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "api_token": {
+            "description": "Always `***`.",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "key_count": {
+            "description": "How many signing keys listeners have for it now.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "keys_fetched_at": {
+            "description": "When the team's signing keys were last fetched.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "account_id",
+          "team_domain",
+          "api_token",
+          "key_count",
+          "addresses",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckRequest": {
+        "properties": {
+          "account_id": {
+            "description": "The Cloudflare account the Access applications live in (32 hex\ncharacters, from the dashboard URL or the account's overview page).",
+            "type": "string"
+          },
+          "token": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "The token, as pasted. Used for this check only; not stored."
+          }
+        },
+        "required": [
+          "token",
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccessTokenCheckResult": {
+        "properties": {
+          "error": {
+            "description": "Why it did not, or why the account could not be checked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/AccessPermissionCheck"
+            },
+            "type": "array"
+          },
+          "ready": {
+            "description": "Every permission is present and the team domain is known.",
+            "type": "boolean"
+          },
+          "team_domain": {
+            "description": "`<team>.cloudflareaccess.com`, when Organizations Read is present.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "token_url": {
+            "description": "Where to create a token.",
+            "type": "string"
+          },
+          "valid": {
+            "description": "Cloudflare accepted the token at all.",
+            "type": "boolean"
+          },
+          "warning": {
+            "description": "What the token can do beyond Temps' own apps.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "valid",
+          "permissions",
+          "ready",
+          "warning",
+          "token_url"
+        ],
+        "type": "object"
+      },
       "AcmeOrderResponse": {
         "properties": {
           "authorizations": {},
@@ -1098,6 +1272,39 @@
           "audience": {
             "$ref": "#/components/schemas/Audience"
           },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate in front of it (ADR 065 D7)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate_access": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AccessBinding",
+                "description": "For `signed_in` with Cloudflare Access: the application in front of\nit (ADR 065 D9)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "gate_allow": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateAllowList",
+                "description": "For `signed_in` with the Temps gate: the teams and users that may\nsign in. `None` admits everyone with access to the project."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "network_range": {
             "description": "For `private`: the network range a visitor must come from.",
             "type": [
@@ -1146,6 +1353,16 @@
           "audience"
         ],
         "type": "object"
+      },
+      "AddressKind": {
+        "description": "What kind of address the primary one is, in D4's order.",
+        "enum": [
+          "custom_domain",
+          "tunnel_host",
+          "generated",
+          "private"
+        ],
+        "type": "string"
       },
       "AddressReachability": {
         "description": "One address of an environment and whether its audience can reach it.",
@@ -1226,7 +1443,8 @@
         "enum": [
           "generated",
           "environment_domain",
-          "custom_domain"
+          "custom_domain",
+          "tunnel_host"
         ],
         "type": "string"
       },
@@ -4079,6 +4297,14 @@
               "environment": "production"
             }
           },
+          "loopback_ja4_header": {
+            "default": null,
+            "description": "The header a trusted loopback proxy puts the visitor's JA4 TLS\nfingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer\n`trust_loopback_forwarded_ip` trusts, and removed from every request\nbefore it goes upstream. `None` records no JA4 behind such a proxy.\nSet through [`normalize_loopback_ja4_header`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
             "default": {
@@ -4387,6 +4613,14 @@
           },
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
+          },
+          "loopback_ja4_header": {
+            "description": "The header a trusted loopback proxy sends the visitor's JA4 in.\n`None` records no JA4 behind such a proxy.",
+            "example": "x-ja4",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
@@ -12614,6 +12848,10 @@
             "format": "int32",
             "type": "integer"
           },
+          "environment_hosts": {
+            "description": "Publishes every environment as `<label>.<domain>` (ADR 068 D3).\nAt most one tunnel does.",
+            "type": "boolean"
+          },
           "external_id": {
             "type": [
               "string",
@@ -12660,6 +12898,7 @@
           "status",
           "edge_port",
           "auto_publish",
+          "environment_hosts",
           "nodes",
           "publications",
           "created_at"
@@ -14625,6 +14864,27 @@
           "rustfs"
         ],
         "type": "string"
+      },
+      "CreateAccessProviderRequest": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "name": {
+            "description": "A name to tell tokens apart.",
+            "type": "string"
+          },
+          "token": {
+            "$ref": "#/components/schemas/SecretString",
+            "description": "Checked, then sealed; never returned."
+          }
+        },
+        "required": [
+          "name",
+          "account_id",
+          "token"
+        ],
+        "type": "object"
       },
       "CreateAlertRuleRequest": {
         "properties": {
@@ -19033,7 +19293,7 @@
         "description": "Response for the per-database metrics breakdown.",
         "properties": {
           "databases": {
-            "description": "One entry per database, sorted by the first metric descending\n(largest first) so the biggest database leads the table.",
+            "description": "One entry per database, largest first by the engine's\n`*.database_size_bytes` metric (ties broken by name) so the biggest\ndatabase leads the table. Empty when the service's engine has no\nper-database series (for example Redis or S3) or nothing has been\nscraped yet. The MariaDB collector labels at most the 100 largest\nschemas per scrape; the response covers the latest lookback window, so\nduring schema churn it can briefly include schemas from an earlier\nscrape as well.",
             "items": {
               "$ref": "#/components/schemas/DatabaseMetricsRow"
             },
@@ -19046,10 +19306,10 @@
         "type": "object"
       },
       "DatabaseMetricsRow": {
-        "description": "Per-database metric values for a Postgres service.\n\nA Postgres instance can host many databases (some unrelated to this\nservice). The collector records per-`datname` series; this groups the\nlatest value of each requested metric by database so the UI can render a\n\"Databases\" breakdown table instead of one collapsed number.",
+        "description": "Per-database metric values for a Postgres or MariaDB service.\n\nA Postgres or MariaDB instance can host many databases (some unrelated to\nthis service). The collector records one series per database — labelled\n`datname` for Postgres, `schema` for MariaDB; this groups the latest value\nof each of the engine's per-database metrics by database so the UI can\nrender a \"Databases\" breakdown table instead of one collapsed number.",
         "properties": {
           "database": {
-            "description": "Database name (`datname`).",
+            "description": "Database name: the `datname` of a Postgres database, or the schema\nname of a MariaDB database.",
             "type": "string"
           },
           "metrics": {
@@ -19057,7 +19317,7 @@
               "format": "double",
               "type": "number"
             },
-            "description": "Latest value of each requested metric for this database\n(e.g. `{\"pg.database_size_bytes\": 7943871, \"pg.cache_hit_ratio\": 0.99}`).",
+            "description": "Latest value of each of the engine's per-database metrics for this\ndatabase, keyed by metric name (e.g. `{\"pg.database_size_bytes\":\n7943871, \"pg.cache_hit_ratio\": 0.99}` for Postgres, or\n`{\"mariadb.database_size_bytes\": 1589248, \"mariadb.tables\": 3}` for\nMariaDB). A metric that has not been reported is absent.",
             "propertyNames": {
               "type": "string"
             },
@@ -20099,6 +20359,7 @@
       "DeploymentEnvironmentResponse": {
         "properties": {
           "domains": {
+            "description": "Best first: the primary address (ADR 068 D4) leads when it is known.",
             "items": {
               "type": "string"
             },
@@ -20110,6 +20371,20 @@
           },
           "name": {
             "type": "string"
+          },
+          "no_address_reason": {
+            "description": "Why nobody can reach the environment; set only when Temps is sure.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary_url": {
+            "description": "The environment's primary address as a URL. `null` while it is not\nknown, or when nobody can reach the environment.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "service_urls": {
             "description": "Public URLs of this environment's Docker Compose services, one per\nconfigured public port. Empty for non-Compose projects.",
@@ -20725,6 +21000,17 @@
           "project_id": {
             "format": "int32",
             "type": "integer"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: set on the environment's current, completed deployment\nwhen nobody can open it, with the fixes that fit this install. The\ndeployment itself stays successful."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "screenshot_location": {
             "type": [
@@ -25387,6 +25673,138 @@
         ],
         "type": "object"
       },
+      "EnvironmentHostRefusal": {
+        "description": "An environment the tunnel does not publish, and why.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostView": {
+        "description": "One environment's tunnel host, as the opt-in lists it.",
+        "properties": {
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "environment_name": {
+            "type": "string"
+          },
+          "hostname": {
+            "description": "The host, or the one it would get.",
+            "example": "shop-production.tunnel.example.com",
+            "type": "string"
+          },
+          "last_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "description": "Why the host is not `<label>.<domain>`, when it is the short-hash\nname.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_slug": {
+            "type": "string"
+          },
+          "state": {
+            "description": "`published`, `pending`, `error`, or `planned` before the opt-in.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "project_slug",
+          "environment_name",
+          "hostname",
+          "state"
+        ],
+        "type": "object"
+      },
+      "EnvironmentHostsResponse": {
+        "description": "`GET`/`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "confirm_token": {
+            "description": "Send back as `confirm` to turn it on or off. It names exactly the\nhosts listed here, so a list that changed since it was shown is not\naccepted.",
+            "example": "3f2a9c1e0b7d4a65",
+            "type": "string"
+          },
+          "connector_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "connector_name": {
+            "type": "string"
+          },
+          "domain": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "enabled_elsewhere": {
+            "description": "The tunnel that has environment hosts on instead, if another does:\nat most one may.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hosts": {
+            "description": "The hosts it publishes, or would publish once turned on.",
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostView"
+            },
+            "type": "array"
+          },
+          "preview_domain_usable": {
+            "description": "The preview domain is usable: existing hosts stay, no new ones are\ngenerated.",
+            "type": "boolean"
+          },
+          "refused": {
+            "items": {
+              "$ref": "#/components/schemas/EnvironmentHostRefusal"
+            },
+            "type": "array"
+          },
+          "warning": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "connector_id",
+          "connector_name",
+          "domain",
+          "enabled",
+          "hosts",
+          "refused",
+          "preview_domain_usable",
+          "warning",
+          "confirm_token"
+        ],
+        "type": "object"
+      },
       "EnvironmentInfo": {
         "properties": {
           "current_deployment_id": {
@@ -25447,6 +25865,17 @@
               {
                 "$ref": "#/components/schemas/ReachabilityPlan",
                 "description": "What *Make it reachable* would do, while no address is reachable."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "primary_address": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/PrimaryAddress",
+                "description": "The address every surface means by \"the app's address\" (ADR 068\nD4); `None` while no address is reachable."
               },
               {
                 "type": "null"
@@ -28600,6 +29029,28 @@
         ],
         "type": "object"
       },
+      "FieldChoice": {
+        "description": "One answer a [`FieldKind::Choice`] field offers.",
+        "properties": {
+          "help": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "type": "object"
+      },
       "FieldKind": {
         "oneOf": [
           {
@@ -28670,6 +29121,73 @@
             },
             "required": [
               "provider_field",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Teams of this instance, answered as a list of team ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "teams"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Users of this instance, answered as a list of user ids.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "users"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "One of `choices`, answered as its `value`.",
+            "properties": {
+              "choices": {
+                "items": {
+                  "$ref": "#/components/schemas/FieldChoice"
+                },
+                "type": "array"
+              },
+              "type": {
+                "enum": [
+                  "choice"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "choices",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A list of text values, answered as an array of strings.",
+            "properties": {
+              "type": {
+                "enum": [
+                  "text_list"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
               "type"
             ],
             "type": "object"
@@ -29632,6 +30150,35 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "GateAllowList": {
+        "description": "Who may sign in to a Temps-gated address besides being able to see the\nproject (ADR 065 D7): stored in `gate_allow`. Empty lists mean no list.",
+        "properties": {
+          "teams": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "users": {
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "GateKind": {
+        "description": "Which gate an address has (D7). Unknown values read as `Unsupported`, and\nan unsupported gate admits nobody.",
+        "enum": [
+          "temps",
+          "cloudflare_access",
+          "unsupported"
+        ],
+        "type": "string"
       },
       "GatewayStatus": {
         "description": "Detailed gateway container status surfaced to the settings UI.",
@@ -36541,6 +37088,34 @@
             "type": "object"
           },
           {
+            "description": "Found by its name, which the run picks before creating it, and its\ndomain (ADR 065 D9).",
+            "properties": {
+              "hostname": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "access_app"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "name",
+              "hostname",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
             "description": "Found by the `tailnet_serve_entries` row and this run's reference to\nit (ADR 065 D4); the step is done only on the agent's report.",
             "properties": {
               "address_id": {
@@ -36622,6 +37197,30 @@
               "tailnet",
               "name",
               "marker",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Found by the connector's `environment_hosts` flag.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
               "type"
             ],
             "type": "object"
@@ -47898,7 +48497,8 @@
           "private_worker",
           "tailscale_serve",
           "tailscale_service",
-          "tailscale_service_with_credential"
+          "tailscale_service_with_credential",
+          "tunnel_environment_hosts"
         ],
         "type": "string"
       },
@@ -47914,6 +48514,17 @@
           },
           "audience": {
             "$ref": "#/components/schemas/Audience"
+          },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate to put in front of it (ADR 065 D7). The\nTemps sign-in when absent."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "principals": {
             "description": "For `tailnet_users`: the tailnet logins and tags it admits (ADR 065\nD6). At least one; checked and lower-cased.",
@@ -48545,6 +49156,50 @@
         ],
         "type": "object"
       },
+      "PreviewDomainStatus": {
+        "description": "D2: whether the preview domain can be reached at all.",
+        "enum": [
+          "local_only",
+          "unresolved",
+          "no_way_in",
+          "usable"
+        ],
+        "type": "string"
+      },
+      "PreviewDomainStatusResponse": {
+        "description": "`GET /settings/preview-domain/status` (ADR 068 D2).",
+        "properties": {
+          "checked_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "preview_domain": {
+            "example": "apps.example.com",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, in words.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/PreviewDomainStatus"
+          },
+          "tunnel_environment_hosts": {
+            "description": "The tunnel that gives every environment an address instead, when\none does (ADR 068 D3): apps are reachable without this domain.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "preview_domain",
+          "status",
+          "reason",
+          "checked_at"
+        ],
+        "type": "object"
+      },
       "PreviewGatewayLogsResponse": {
         "properties": {
           "lines": {
@@ -48792,6 +49447,32 @@
         },
         "required": [
           "models"
+        ],
+        "type": "object"
+      },
+      "PrimaryAddress": {
+        "description": "The address every surface means by \"the app's address\".",
+        "properties": {
+          "address": {
+            "description": "The hostname, without a scheme.",
+            "example": "myapp.example.com",
+            "type": "string"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/AddressKind"
+          },
+          "way_in": {
+            "description": "How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,\n`direct:<node>`, `private:<node>`).",
+            "example": "tunnel:homelab",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "kind"
         ],
         "type": "object"
       },
@@ -50059,6 +50740,17 @@
           "pull_only_root_directory": {
             "description": "When true, deploy clones only `directory` via git sparse-checkout.",
             "type": "boolean"
+          },
+          "reachability_warning": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReachabilityWarning",
+                "description": "ADR 068 D5: nobody can open the production environment's current\ndeployment, and how to fix it. Computed on the single-project detail\nresponses only; `null` there means there is nothing to warn about."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "repo_name": {
             "type": [
@@ -51800,6 +52492,22 @@
           "is_system_request": {
             "type": "boolean"
           },
+          "ja4": {
+            "description": "The client's JA4 TLS fingerprint, when its source gives one.",
+            "example": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4_source": {
+            "description": "Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or\n`edge`.",
+            "example": "direct",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "method": {
             "type": "string"
           },
@@ -53194,6 +53902,62 @@
         ],
         "type": "string"
       },
+      "ReachabilityFix": {
+        "properties": {
+          "command": {
+            "description": "The command to run, when that is the fix.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "connector_id": {
+            "description": "For the tunnel fix: the connector that would carry it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "hostname": {
+            "description": "For the tunnel fix: the hostname it would get.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "href": {
+            "description": "The console page that applies it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ReachabilityFixKind"
+          },
+          "label": {
+            "description": "What the button and the log line say.",
+            "example": "Publish it through tunnel 'homelab' as myapp-production.example.com",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "label"
+        ],
+        "type": "object"
+      },
+      "ReachabilityFixKind": {
+        "description": "One way to fix a [`ReachabilityWarning`], in the order D5 lists them.",
+        "enum": [
+          "tunnel_environment_hosts",
+          "preview_domain",
+          "custom_domain",
+          "worker_ingress"
+        ],
+        "type": "string"
+      },
       "ReachabilityPlan": {
         "properties": {
           "address": {
@@ -53238,6 +54002,17 @@
               "null"
             ]
           },
+          "gate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/GateKind",
+                "description": "For `signed_in`: the gate the plan puts in front of the address."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "options": {
             "description": "In the order Temps prefers them; the first is recommended.",
             "items": {
@@ -53275,6 +54050,43 @@
           "unknown"
         ],
         "type": "string"
+      },
+      "ReachabilityWarning": {
+        "description": "D5: a successful deploy nobody can open. Computed, never stored.",
+        "properties": {
+          "environment": {
+            "description": "The environment's label, as visitors would see it in a hostname.",
+            "example": "myapp-production",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "fixes": {
+            "description": "The fixes that fit this install, best first.",
+            "items": {
+              "$ref": "#/components/schemas/ReachabilityFix"
+            },
+            "type": "array"
+          },
+          "headline": {
+            "description": "`Deployed, but nobody can reach <label> yet`.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Why, about the address visitors would try first.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "environment_id",
+          "environment",
+          "headline",
+          "reason",
+          "fixes"
+        ],
+        "type": "object"
       },
       "ReadFileResponse": {
         "properties": {
@@ -56851,6 +57663,47 @@
             "type": "object"
           },
           {
+            "description": "A Cloudflare Access application the run created (ADR 065 D9). Undo\ndeletes it only while its domain is still `hostname`, and asks\nfirst when its policies no longer match `policies`.",
+            "properties": {
+              "aud": {
+                "type": "string"
+              },
+              "hostname": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "policies": {
+                "description": "The policies' fingerprint when the run created it.",
+                "type": "string"
+              },
+              "provider_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "access_app"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "provider_id",
+              "id",
+              "name",
+              "hostname",
+              "aud",
+              "policies",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
             "description": "This run's reference to a worker's Serve entry (ADR 065 D4). Undo\ndrops the reference; the entry goes with its last one.",
             "properties": {
               "address_id": {
@@ -56953,6 +57806,30 @@
               "created",
               "creator_run_id",
               "definition",
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "A tunnel whose environment hosts the run turned on (ADR 068 D3):\nundo turns them off, which withdraws every host it generated.",
+            "properties": {
+              "connector_id": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "name": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "environment_hosts"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "connector_id",
+              "name",
               "type"
             ],
             "type": "object"
@@ -62162,6 +63039,25 @@
         ],
         "type": "object"
       },
+      "SetEnvironmentHostsRequest": {
+        "description": "`PUT /ingress/connectors/{id}/environment-hosts`.",
+        "properties": {
+          "confirm": {
+            "description": "The `confirm_token` of the list that was shown and accepted: turning\non publishes every host in it, turning off withdraws them.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
+        ],
+        "type": "object"
+      },
       "SetFlagEnvironmentRequest": {
         "properties": {
           "enabled": {
@@ -62775,6 +63671,20 @@
           "project_name",
           "project_slug",
           "first_seen"
+        ],
+        "type": "object"
+      },
+      "SignOutOfAppsResponse": {
+        "properties": {
+          "revoked": {
+            "description": "Gate sessions revoked.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "revoked"
         ],
         "type": "object"
       },
@@ -65370,10 +66280,12 @@
           "wait_for_publication",
           "check_reachability",
           "set_audience",
+          "access_app",
           "configure_tailscale_serve",
           "save_tailscale_credential",
           "define_tailscale_service",
-          "wait_for_service_approval"
+          "wait_for_service_approval",
+          "publish_environment_hosts"
         ],
         "type": "string"
       },
@@ -95122,6 +96034,253 @@
         ]
       }
     },
+    "/cloudflare-access/providers": {
+      "get": {
+        "operationId": "list_access_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AccessProviderResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The saved Cloudflare Access tokens. Tokens are never returned.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      },
+      "post": {
+        "operationId": "create_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAccessProviderRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessProviderResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The token is missing a permission"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check a Cloudflare Access token, then save it sealed. Refused, with the\ncheck in the detail, unless every permission is there.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/check": {
+      "post": {
+        "operationId": "check_access_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccessTokenCheckRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccessTokenCheckResult"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Check which Cloudflare Access permissions a pasted token has: Access:\nApps and Policies Edit (probed with an app body Cloudflare rejects, so\nnothing is created) and Access: Organizations, Identity Providers, and\nGroups Read. The token is used for this check only and is not stored.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
+    "/cloudflare-access/providers/{provider_id}": {
+      "delete": {
+        "operationId": "delete_access_provider",
+        "parameters": [
+          {
+            "description": "Saved token",
+            "in": "path",
+            "name": "provider_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "An address uses it"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Delete a saved Cloudflare Access token. Refused while an address uses it.",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
     "/cluster/dns/status": {
       "get": {
         "description": "Same permission as the other node visibility endpoints in this file\n(`admin_list_nodes`, `admin_get_node`) — this is operational/infra\nvisibility, not a new privilege tier.",
@@ -102237,7 +103396,7 @@
     },
     "/external-services/{id}/metrics/by-database": {
       "get": {
-        "description": "Groups `pg_stat_database` / size metrics by `datname` so the UI can show a\nbreakdown table (each database with its own size, cache-hit ratio, etc.)\nrather than collapsing every database into one value.",
+        "description": "Postgres: groups `pg_stat_database` and size metrics by `datname` (size,\ncache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics\nby schema (data, index and free-space size, table count, estimated rows).\nThe UI shows this as a breakdown table instead of collapsing every database\ninto one value. Engines without per-database series get an empty list\nwhile the metrics store is available; without it the endpoint returns 503.",
         "operationId": "ExternalServiceMetricsByDatabase",
         "parameters": [
           {
@@ -102260,10 +103419,13 @@
                 }
               }
             },
-            "description": "Per-database metric breakdown"
+            "description": "Per-database metric breakdown; empty for engines without per-database series"
           },
           "401": {
             "description": "Unauthorized"
+          },
+          "404": {
+            "description": "External service not found"
           },
           "500": {
             "description": "Internal server error"
@@ -102277,7 +103439,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Return the latest per-database metric values for a Postgres service.",
+        "summary": "Return the latest per-database metric values for a Postgres or MariaDB\nservice.",
         "tags": [
           "Metrics"
         ]
@@ -105643,6 +106805,41 @@
         ]
       }
     },
+    "/gate/sign-out-of-apps": {
+      "post": {
+        "description": "Revokes all of the current user's gate sessions. Listeners refuse them\nas soon as they take the next route snapshot.",
+        "operationId": "sign_out_of_apps",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignOutOfAppsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Not a user"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign out of every signed-in address",
+        "tags": [
+          "Signed-in addresses"
+        ]
+      }
+    },
     "/geo/status": {
       "get": {
         "operationId": "get_geo_database_status",
@@ -108874,6 +110071,123 @@
         "summary": "Change what a tunnel publishes.",
         "tags": [
           "Ingress"
+        ]
+      }
+    },
+    "/ingress/connectors/{id}/environment-hosts": {
+      "get": {
+        "description": "Every environment's host under the tunnel's domain, its publication\nstate, why one got a short-hash name, and the environments it refuses\n(private, signed-in only, hosted elsewhere).",
+        "operationId": "get_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "What a tunnel publishes for environments, or would once turned on.",
+        "tags": [
+          "Reachability"
+        ]
+      },
+      "put": {
+        "description": "On publishes every listed environment as `<label>.<domain>`; off\nwithdraws every host it generated. Both need `confirm`: the\n`confirm_token` of the list from the `GET` that was shown. Turning it on\nis a sensitive action (it widens every environment to public). At most\none tunnel has it on.",
+        "operationId": "set_connector_environment_hosts",
+        "parameters": [
+          {
+            "description": "Tunnel id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetEnvironmentHostsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnvironmentHostsResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Not confirmed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No such tunnel"
+          },
+          "409": {
+            "description": "Another tunnel publishes environment hosts, or the list changed since it was shown"
+          },
+          "428": {
+            "description": "Turning it on needs a recent MFA verification"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn a tunnel's environment hosts on or off.",
+        "tags": [
+          "Reachability"
         ]
       }
     },
@@ -139225,6 +140539,9 @@
           },
           "409": {
             "description": "The plan changed (the body's `plan` is the new one), or a run is in progress"
+          },
+          "428": {
+            "description": "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification"
           }
         },
         "security": [
@@ -143038,6 +144355,62 @@
           "Funnels"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out": {
+      "post": {
+        "description": "Every gate token issued for the address so far is refused; people sign\nin again (and are checked again) on their next visit.",
+        "operationId": "sign_everyone_out_of_address",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`custom:<id>` or `environment:<id>`",
+            "in": "path",
+            "name": "address_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Everyone signed out"
+          },
+          "400": {
+            "description": "Malformed address id"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Address not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Sign everyone out of a signed-in address",
+        "tags": [
+          "Signed-in addresses"
+        ]
       }
     },
     "/projects/{project_id}/git": {
@@ -154408,6 +155781,41 @@
         ]
       }
     },
+    "/settings/preview-domain/status": {
+      "get": {
+        "description": "`local_only` (`localhost`, `localho.st`), `unresolved` (a name under it\ndoes not resolve), `no_way_in` (it resolves, but to nothing this install\nserves publicly) or `usable`. Recomputed when the setting, the tunnels or\nthe nodes' public ingress change, and every 30 minutes.",
+        "operationId": "get_preview_domain_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreviewDomainStatusResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether the preview domain can be reached.",
+        "tags": [
+          "Reachability"
+        ]
+      }
+    },
     "/settings/public-ingress": {
       "get": {
         "description": "Returns the base URL Temps hands to third parties that call back into it\n(email open/click tracking, git provider webhooks, SES/SNS delivery\nevents, revenue webhooks, the Sentry DSN) and whether Temps can tell that\nURL is unreachable for them. Unlike a 404, `configured: false` means the\nfeature exists but needs setting up; `setup_path` says where.",
@@ -162041,6 +163449,10 @@
     {
       "description": "Making a project reachable (ADR 064)",
       "name": "Reachability"
+    },
+    {
+      "description": "The Temps sign-in in front of signed-in addresses (ADR 065)",
+      "name": "Signed-in addresses"
     },
     {
       "description": "Environment management operations",

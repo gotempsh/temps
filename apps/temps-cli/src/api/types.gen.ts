@@ -7,6 +7,98 @@ export type ClientOptions = {
     baseUrl: `${string}://${string}/api` | (string & {});
 };
 
+/**
+ * The Cloudflare Access application in front of a signed-in address
+ * (ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.
+ */
+export type AccessBinding = {
+    app_id: string;
+    aud: string;
+    provider_id: number;
+};
+
+export type AccessPermission = 'apps_edit' | 'organizations_read';
+
+export type AccessPermissionCheck = {
+    /**
+     * Why, and what to change on the token when it is not present.
+     */
+    detail: string;
+    label: string;
+    permission: AccessPermission;
+    state: PermissionState;
+};
+
+/**
+ * A saved Access token. The token itself is never returned.
+ */
+export type AccessProviderResponse = {
+    account_id: string;
+    /**
+     * How many addresses it protects.
+     */
+    addresses: number;
+    /**
+     * Always `***`.
+     */
+    api_token: string;
+    created_at: string;
+    id: number;
+    /**
+     * How many signing keys listeners have for it now.
+     */
+    key_count: number;
+    /**
+     * When the team's signing keys were last fetched.
+     */
+    keys_fetched_at?: string | null;
+    name: string;
+    /**
+     * `<team>.cloudflareaccess.com`.
+     */
+    team_domain: string;
+};
+
+export type AccessTokenCheckRequest = {
+    /**
+     * The Cloudflare account the Access applications live in (32 hex
+     * characters, from the dashboard URL or the account's overview page).
+     */
+    account_id: string;
+    /**
+     * The token, as pasted. Used for this check only; not stored.
+     */
+    token: SecretString;
+};
+
+export type AccessTokenCheckResult = {
+    /**
+     * Why it did not, or why the account could not be checked.
+     */
+    error?: string | null;
+    permissions: Array<AccessPermissionCheck>;
+    /**
+     * Every permission is present and the team domain is known.
+     */
+    ready: boolean;
+    /**
+     * `<team>.cloudflareaccess.com`, when Organizations Read is present.
+     */
+    team_domain?: string | null;
+    /**
+     * Where to create a token.
+     */
+    token_url: string;
+    /**
+     * Cloudflare accepted the token at all.
+     */
+    valid: boolean;
+    /**
+     * What the token can do beyond Temps' own apps.
+     */
+    warning: string;
+};
+
 export type AcmeOrderResponse = {
     authorizations?: unknown;
     certificate_url?: string | null;
@@ -407,6 +499,9 @@ export type AddStatusPageDomainRequest = {
  */
 export type AddressAudience = {
     audience: Audience;
+    gate?: GateKind | null;
+    gate_access?: AccessBinding | null;
+    gate_allow?: GateAllowList | null;
     /**
      * For `private`: the network range a visitor must come from.
      */
@@ -436,6 +531,11 @@ export type AddressAudience = {
      */
     private_via?: string | null;
 };
+
+/**
+ * What kind of address the primary one is, in D4's order.
+ */
+export type AddressKind = 'custom_domain' | 'tunnel_host' | 'generated' | 'private';
 
 /**
  * One address of an environment and whether its audience can reach it.
@@ -472,7 +572,7 @@ export type AddressScope = 'public' | 'private' | 'cgnat' | 'local';
 /**
  * Where an address comes from.
  */
-export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain';
+export type AddressSource = 'generated' | 'environment_domain' | 'custom_domain' | 'tunnel_host';
 
 export type AdminGateResponse = {
     /**
@@ -2005,6 +2105,14 @@ export type AppSettings = {
     kv?: KvSettings;
     letsencrypt?: LetsEncryptSettings;
     /**
+     * The header a trusted loopback proxy puts the visitor's JA4 TLS
+     * fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
+     * `trust_loopback_forwarded_ip` trusts, and removed from every request
+     * before it goes upstream. `None` records no JA4 behind such a proxy.
+     * Set through [`normalize_loopback_ja4_header`].
+     */
+    loopback_ja4_header?: string | null;
+    /**
      * MCP server settings (ADR-039). Off by default — enable via the Settings
      * UI to expose the MCP endpoint to the Temps CLI wizard.
      */
@@ -2222,6 +2330,11 @@ export type AppSettingsResponse = {
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
+    /**
+     * The header a trusted loopback proxy sends the visitor's JA4 in.
+     * `None` records no JA4 behind such a proxy.
+     */
+    loopback_ja4_header?: string | null;
     /**
      * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
      * content — passed through as-is so the settings UI can show and edit it.
@@ -6107,6 +6220,11 @@ export type ConnectorView = {
     dns_target?: string | null;
     domain: string;
     edge_port: number;
+    /**
+     * Publishes every environment as `<label>.<domain>` (ADR 068 D3).
+     * At most one tunnel does.
+     */
+    environment_hosts: boolean;
     external_id?: string | null;
     id: number;
     last_error?: string | null;
@@ -7046,6 +7164,18 @@ export type CostAnalysis = {
 };
 
 export type CreatableServiceTypeRoute = 'mariadb' | 'mongodb' | 'postgres' | 'redis' | 's3' | 'kv' | 'blob' | 'rustfs';
+
+export type CreateAccessProviderRequest = {
+    account_id: string;
+    /**
+     * A name to tell tokens apart.
+     */
+    name: string;
+    /**
+     * Checked, then sealed; never returned.
+     */
+    token: SecretString;
+};
 
 export type CreateAlertRuleRequest = {
     /**
@@ -9193,28 +9323,39 @@ export type DatabaseChoice = {
  */
 export type DatabaseMetricsResponse = {
     /**
-     * One entry per database, sorted by the first metric descending
-     * (largest first) so the biggest database leads the table.
+     * One entry per database, largest first by the engine's
+     * `*.database_size_bytes` metric (ties broken by name) so the biggest
+     * database leads the table. Empty when the service's engine has no
+     * per-database series (for example Redis or S3) or nothing has been
+     * scraped yet. The MariaDB collector labels at most the 100 largest
+     * schemas per scrape; the response covers the latest lookback window, so
+     * during schema churn it can briefly include schemas from an earlier
+     * scrape as well.
      */
     databases: Array<DatabaseMetricsRow>;
 };
 
 /**
- * Per-database metric values for a Postgres service.
+ * Per-database metric values for a Postgres or MariaDB service.
  *
- * A Postgres instance can host many databases (some unrelated to this
- * service). The collector records per-`datname` series; this groups the
- * latest value of each requested metric by database so the UI can render a
- * "Databases" breakdown table instead of one collapsed number.
+ * A Postgres or MariaDB instance can host many databases (some unrelated to
+ * this service). The collector records one series per database — labelled
+ * `datname` for Postgres, `schema` for MariaDB; this groups the latest value
+ * of each of the engine's per-database metrics by database so the UI can
+ * render a "Databases" breakdown table instead of one collapsed number.
  */
 export type DatabaseMetricsRow = {
     /**
-     * Database name (`datname`).
+     * Database name: the `datname` of a Postgres database, or the schema
+     * name of a MariaDB database.
      */
     database: string;
     /**
-     * Latest value of each requested metric for this database
-     * (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+     * Latest value of each of the engine's per-database metrics for this
+     * database, keyed by metric name (e.g. `{"pg.database_size_bytes":
+     * 7943871, "pg.cache_hit_ratio": 0.99}` for Postgres, or
+     * `{"mariadb.database_size_bytes": 1589248, "mariadb.tables": 3}` for
+     * MariaDB). A metric that has not been reported is absent.
      */
     metrics: {
         [key: string]: number;
@@ -9818,9 +9959,21 @@ export type DeploymentContainerLogsListResponse = {
 };
 
 export type DeploymentEnvironmentResponse = {
+    /**
+     * Best first: the primary address (ADR 068 D4) leads when it is known.
+     */
     domains: Array<string>;
     id: number;
     name: string;
+    /**
+     * Why nobody can reach the environment; set only when Temps is sure.
+     */
+    no_address_reason?: string | null;
+    /**
+     * The environment's primary address as a URL. `null` while it is not
+     * known, or when nobody can reach the environment.
+     */
+    primary_url?: string | null;
     /**
      * Public URLs of this environment's Docker Compose services, one per
      * configured public port. Empty for non-Compose projects.
@@ -10057,6 +10210,7 @@ export type DeploymentResponse = {
     is_current: boolean;
     metadata?: DeploymentMetadata | null;
     project_id: number;
+    reachability_warning?: ReachabilityWarning | null;
     screenshot_location?: string | null;
     started_at?: number | null;
     status: string;
@@ -12187,6 +12341,71 @@ export type EnvironmentDomainResponse = {
     url: string;
 };
 
+/**
+ * An environment the tunnel does not publish, and why.
+ */
+export type EnvironmentHostRefusal = {
+    environment_id: number;
+    environment_name: string;
+    project_slug: string;
+    reason: string;
+};
+
+/**
+ * One environment's tunnel host, as the opt-in lists it.
+ */
+export type EnvironmentHostView = {
+    environment_id: number;
+    environment_name: string;
+    /**
+     * The host, or the one it would get.
+     */
+    hostname: string;
+    last_error?: string | null;
+    /**
+     * Why the host is not `<label>.<domain>`, when it is the short-hash
+     * name.
+     */
+    note?: string | null;
+    project_slug: string;
+    /**
+     * `published`, `pending`, `error`, or `planned` before the opt-in.
+     */
+    state: string;
+};
+
+/**
+ * `GET`/`PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type EnvironmentHostsResponse = {
+    /**
+     * Send back as `confirm` to turn it on or off. It names exactly the
+     * hosts listed here, so a list that changed since it was shown is not
+     * accepted.
+     */
+    confirm_token: string;
+    connector_id: number;
+    connector_name: string;
+    domain: string;
+    enabled: boolean;
+    /**
+     * The tunnel that has environment hosts on instead, if another does:
+     * at most one may.
+     */
+    enabled_elsewhere?: string | null;
+    /**
+     * The hosts it publishes, or would publish once turned on.
+     */
+    hosts: Array<EnvironmentHostView>;
+    /**
+     * The preview domain is usable: existing hosts stay, no new ones are
+     * generated.
+     */
+    preview_domain_usable: boolean;
+    refused: Array<EnvironmentHostRefusal>;
+    warning: string;
+};
+
 export type EnvironmentInfo = {
     current_deployment_id?: number | null;
     id: number;
@@ -12208,6 +12427,7 @@ export type EnvironmentReachability = {
     environment_id: number;
     environment_name: string;
     plan?: ReachabilityPlan | null;
+    primary_address?: PrimaryAddress | null;
     project_id: number;
     /**
      * The nodes its containers run on (`control plane` for the local one).
@@ -13589,6 +13809,15 @@ export type FeedbackView = {
     url?: string | null;
 };
 
+/**
+ * One answer a [`FieldKind::Choice`] field offers.
+ */
+export type FieldChoice = {
+    help?: string | null;
+    label: string;
+    value: string;
+};
+
 export type FieldKind = {
     type: 'text';
 } | {
@@ -13600,6 +13829,15 @@ export type FieldKind = {
     allow_subdomain?: boolean;
     provider_field: string;
     type: 'managed_domain';
+} | {
+    type: 'teams';
+} | {
+    type: 'users';
+} | {
+    choices: Array<FieldChoice>;
+    type: 'choice';
+} | {
+    type: 'text_list';
 };
 
 export type FieldResponse = {
@@ -13963,6 +14201,21 @@ export type FunnelResponse = {
     name: string;
     updated_at: string;
 };
+
+/**
+ * Who may sign in to a Temps-gated address besides being able to see the
+ * project (ADR 065 D7): stored in `gate_allow`. Empty lists mean no list.
+ */
+export type GateAllowList = {
+    teams?: Array<number>;
+    users?: Array<number>;
+};
+
+/**
+ * Which gate an address has (D7). Unknown values read as `Unsupported`, and
+ * an unsupported gate admits nobody.
+ */
+export type GateKind = 'temps' | 'cloudflare_access' | 'unsupported';
 
 /**
  * Detailed gateway container status surfaced to the settings UI.
@@ -17116,6 +17369,11 @@ export type Intent = {
     domain: string;
     type: 'certificate';
 } | {
+    hostname: string;
+    name: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
     address_id: string;
     hostname: string;
     node_id: number;
@@ -17136,6 +17394,10 @@ export type Intent = {
     name: string;
     tailnet: string;
     type: 'tailscale_service';
+} | {
+    connector_id: number;
+    name: string;
+    type: 'environment_hosts';
 };
 
 /**
@@ -22241,7 +22503,7 @@ export type PlanOption = {
 /**
  * One way to make the address reachable.
  */
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential' | 'tunnel_environment_hosts';
 
 /**
  * `POST …/reachability/plan`.
@@ -22252,6 +22514,7 @@ export type PlanRequest = {
      */
     address?: string | null;
     audience?: Audience;
+    gate?: GateKind | null;
     /**
      * For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
      * D6). At least one; checked and lower-cased.
@@ -22625,6 +22888,29 @@ export type PreviewDomainDeliveryBindingRequest = {
     zone: string;
 };
 
+/**
+ * D2: whether the preview domain can be reached at all.
+ */
+export type PreviewDomainStatus = 'local_only' | 'unresolved' | 'no_way_in' | 'usable';
+
+/**
+ * `GET /settings/preview-domain/status` (ADR 068 D2).
+ */
+export type PreviewDomainStatusResponse = {
+    checked_at: string;
+    preview_domain: string;
+    /**
+     * Why, in words.
+     */
+    reason: string;
+    status: PreviewDomainStatus;
+    /**
+     * The tunnel that gives every environment an address instead, when
+     * one does (ADR 068 D3): apps are reachable without this domain.
+     */
+    tunnel_environment_hosts?: string | null;
+};
+
 export type PreviewGatewayLogsResponse = {
     lines: Array<string>;
 };
@@ -22779,6 +23065,22 @@ export type PreviousChoice = {
 
 export type PricingResponse = {
     models: Array<ModelPricing>;
+};
+
+/**
+ * The address every surface means by "the app's address".
+ */
+export type PrimaryAddress = {
+    /**
+     * The hostname, without a scheme.
+     */
+    address: string;
+    kind: AddressKind;
+    /**
+     * How traffic gets in, as ADR 064 D3 names it (`tunnel:<name>`,
+     * `direct:<node>`, `private:<node>`).
+     */
+    way_in?: string | null;
 };
 
 /**
@@ -23441,6 +23743,7 @@ export type ProjectResponse = {
      * When true, deploy clones only `directory` via git sparse-checkout.
      */
     pull_only_root_directory: boolean;
+    reachability_warning?: ReachabilityWarning | null;
     repo_name?: string | null;
     repo_owner?: string | null;
     /**
@@ -24203,6 +24506,15 @@ export type ProxyLogResponse = {
     ip_geolocation_id?: number | null;
     is_bot?: boolean | null;
     is_system_request: boolean;
+    /**
+     * The client's JA4 TLS fingerprint, when its source gives one.
+     */
+    ja4?: string | null;
+    /**
+     * Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+     * `edge`.
+     */
+    ja4_source?: string | null;
     method: string;
     operating_system?: string | null;
     path: string;
@@ -24852,6 +25164,35 @@ export type ReachAction = {
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
+export type ReachabilityFix = {
+    /**
+     * The command to run, when that is the fix.
+     */
+    command?: string | null;
+    /**
+     * For the tunnel fix: the connector that would carry it.
+     */
+    connector_id?: number | null;
+    /**
+     * For the tunnel fix: the hostname it would get.
+     */
+    hostname?: string | null;
+    /**
+     * The console page that applies it.
+     */
+    href?: string | null;
+    kind: ReachabilityFixKind;
+    /**
+     * What the button and the log line say.
+     */
+    label: string;
+};
+
+/**
+ * One way to fix a [`ReachabilityWarning`], in the order D5 lists them.
+ */
+export type ReachabilityFixKind = 'tunnel_environment_hosts' | 'preview_domain' | 'custom_domain' | 'worker_ingress';
+
 export type ReachabilityPlan = {
     /**
      * The address asked for, or the one Temps suggests.
@@ -24872,6 +25213,7 @@ export type ReachabilityPlan = {
      * moved on from.
      */
     fingerprint?: string | null;
+    gate?: GateKind | null;
     /**
      * In the order Temps prefers them; the first is recommended.
      */
@@ -24893,6 +25235,29 @@ export type ReachabilityPlan = {
  * Email reachability status
  */
 export type ReachabilityStatus = 'safe' | 'risky' | 'invalid' | 'unknown';
+
+/**
+ * D5: a successful deploy nobody can open. Computed, never stored.
+ */
+export type ReachabilityWarning = {
+    /**
+     * The environment's label, as visitors would see it in a hostname.
+     */
+    environment: string;
+    environment_id: number;
+    /**
+     * The fixes that fit this install, best first.
+     */
+    fixes: Array<ReachabilityFix>;
+    /**
+     * `Deployed, but nobody can reach <label> yet`.
+     */
+    headline: string;
+    /**
+     * Why, about the address visitors would try first.
+     */
+    reason: string;
+};
 
 export type ReadFileResponse = {
     /**
@@ -26551,6 +26916,17 @@ export type RunResource = {
     domain: string;
     type: 'certificate';
 } | {
+    aud: string;
+    hostname: string;
+    id: string;
+    name: string;
+    /**
+     * The policies' fingerprint when the run created it.
+     */
+    policies: string;
+    provider_id: number;
+    type: 'access_app';
+} | {
     address_id: string;
     /**
      * This run created the entry, rather than finding it.
@@ -26587,6 +26963,10 @@ export type RunResource = {
      */
     tailnet: string;
     type: 'tailscale_service';
+} | {
+    connector_id: number;
+    name: string;
+    type: 'environment_hosts';
 };
 
 export type RunState = 'running' | 'succeeded' | 'waiting' | 'failed' | 'interrupted' | 'recovering' | 'conflict' | 'undoing' | 'undo_paused' | 'undone';
@@ -28930,6 +29310,18 @@ export type SetConnectorNodesRequest = {
     node_ids: Array<number>;
 };
 
+/**
+ * `PUT /ingress/connectors/{id}/environment-hosts`.
+ */
+export type SetEnvironmentHostsRequest = {
+    /**
+     * The `confirm_token` of the list that was shown and accepted: turning
+     * on publishes every host in it, turning off withdraws them.
+     */
+    confirm?: string | null;
+    enabled: boolean;
+};
+
 export type SetFlagEnvironmentRequest = {
     /**
      * The kill switch. `false` makes the flag serve its default regardless of
@@ -29287,6 +29679,13 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+export type SignOutOfAppsResponse = {
+    /**
+     * Gate sessions revoked.
+     */
+    revoked: number;
 };
 
 /**
@@ -30455,7 +30854,7 @@ export type StepConversionResponse = {
     step_order: number;
 };
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'access_app' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval' | 'publish_environment_hosts';
 
 /**
  * What kind of resource a migration step operates on
@@ -45629,6 +46028,134 @@ export type GetCloudStatusResponses = {
 
 export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
+export type ListAccessProvidersData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type ListAccessProvidersErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type ListAccessProvidersError = ListAccessProvidersErrors[keyof ListAccessProvidersErrors];
+
+export type ListAccessProvidersResponses = {
+    200: Array<AccessProviderResponse>;
+};
+
+export type ListAccessProvidersResponse = ListAccessProvidersResponses[keyof ListAccessProvidersResponses];
+
+export type CreateAccessProviderData = {
+    body: CreateAccessProviderRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers';
+};
+
+export type CreateAccessProviderErrors = {
+    /**
+     * The token is missing a permission
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateAccessProviderError = CreateAccessProviderErrors[keyof CreateAccessProviderErrors];
+
+export type CreateAccessProviderResponses = {
+    201: AccessProviderResponse;
+};
+
+export type CreateAccessProviderResponse = CreateAccessProviderResponses[keyof CreateAccessProviderResponses];
+
+export type CheckAccessProviderData = {
+    body: AccessTokenCheckRequest;
+    path?: never;
+    query?: never;
+    url: '/cloudflare-access/providers/check';
+};
+
+export type CheckAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+};
+
+export type CheckAccessProviderError = CheckAccessProviderErrors[keyof CheckAccessProviderErrors];
+
+export type CheckAccessProviderResponses = {
+    200: AccessTokenCheckResult;
+};
+
+export type CheckAccessProviderResponse = CheckAccessProviderResponses[keyof CheckAccessProviderResponses];
+
+export type DeleteAccessProviderData = {
+    body?: never;
+    path: {
+        /**
+         * Saved token
+         */
+        provider_id: number;
+    };
+    query?: never;
+    url: '/cloudflare-access/providers/{provider_id}';
+};
+
+export type DeleteAccessProviderErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Not found
+     */
+    404: ProblemDetails;
+    /**
+     * An address uses it
+     */
+    409: ProblemDetails;
+};
+
+export type DeleteAccessProviderError = DeleteAccessProviderErrors[keyof DeleteAccessProviderErrors];
+
+export type DeleteAccessProviderResponses = {
+    /**
+     * Deleted
+     */
+    204: void;
+};
+
+export type DeleteAccessProviderResponse = DeleteAccessProviderResponses[keyof DeleteAccessProviderResponses];
+
 export type ClusterDnsStatusData = {
     body?: never;
     path?: never;
@@ -50488,6 +51015,10 @@ export type ExternalServiceMetricsByDatabaseErrors = {
      */
     401: unknown;
     /**
+     * External service not found
+     */
+    404: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -50499,7 +51030,7 @@ export type ExternalServiceMetricsByDatabaseErrors = {
 
 export type ExternalServiceMetricsByDatabaseResponses = {
     /**
-     * Per-database metric breakdown
+     * Per-database metric breakdown; empty for engines without per-database series
      */
     200: DatabaseMetricsResponse;
 };
@@ -52711,6 +53242,34 @@ export type GetCapabilityResponses = {
 
 export type GetCapabilityResponse = GetCapabilityResponses[keyof GetCapabilityResponses];
 
+export type SignOutOfAppsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/gate/sign-out-of-apps';
+};
+
+export type SignOutOfAppsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not a user
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignOutOfAppsResponses = {
+    200: SignOutOfAppsResponse;
+};
+
+export type SignOutOfAppsResponse2 = SignOutOfAppsResponses[keyof SignOutOfAppsResponses];
+
 export type GetGeoDatabaseStatusData = {
     body?: never;
     path?: never;
@@ -54921,6 +55480,92 @@ export type UpdateIngressConnectorResponses = {
 };
 
 export type UpdateIngressConnectorResponse = UpdateIngressConnectorResponses[keyof UpdateIngressConnectorResponses];
+
+export type GetConnectorEnvironmentHostsData = {
+    body?: never;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type GetConnectorEnvironmentHostsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type GetConnectorEnvironmentHostsResponse = GetConnectorEnvironmentHostsResponses[keyof GetConnectorEnvironmentHostsResponses];
+
+export type SetConnectorEnvironmentHostsData = {
+    body: SetEnvironmentHostsRequest;
+    path: {
+        /**
+         * Tunnel id
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/ingress/connectors/{id}/environment-hosts';
+};
+
+export type SetConnectorEnvironmentHostsErrors = {
+    /**
+     * Not confirmed
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No such tunnel
+     */
+    404: unknown;
+    /**
+     * Another tunnel publishes environment hosts, or the list changed since it was shown
+     */
+    409: unknown;
+    /**
+     * Turning it on needs a recent MFA verification
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetConnectorEnvironmentHostsResponses = {
+    200: EnvironmentHostsResponse;
+};
+
+export type SetConnectorEnvironmentHostsResponse = SetConnectorEnvironmentHostsResponses[keyof SetConnectorEnvironmentHostsResponses];
 
 export type GetIngressConnectorLinksData = {
     body?: never;
@@ -72984,6 +73629,10 @@ export type ApplyEnvironmentReachabilityErrors = {
      * The plan changed (the body's `plan` is the new one), or a run is in progress
      */
     409: unknown;
+    /**
+     * Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification
+     */
+    428: unknown;
 };
 
 export type ApplyEnvironmentReachabilityResponses = {
@@ -75334,6 +75983,54 @@ export type GetFunnelMetricsResponses = {
 };
 
 export type GetFunnelMetricsResponse = GetFunnelMetricsResponses[keyof GetFunnelMetricsResponses];
+
+export type SignEveryoneOutOfAddressData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * `custom:<id>` or `environment:<id>`
+         */
+        address_id: string;
+    };
+    query?: never;
+    url: '/projects/{project_id}/gate/addresses/{address_id}/sign-everyone-out';
+};
+
+export type SignEveryoneOutOfAddressErrors = {
+    /**
+     * Malformed address id
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Address not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SignEveryoneOutOfAddressResponses = {
+    /**
+     * Everyone signed out
+     */
+    204: void;
+};
+
+export type SignEveryoneOutOfAddressResponse = SignEveryoneOutOfAddressResponses[keyof SignEveryoneOutOfAddressResponses];
 
 export type UpdateGitSettingsData = {
     body: UpdateGitSettingsRequest;
@@ -82277,6 +82974,34 @@ export type RevealGlobalMcpConfigResponses = {
 };
 
 export type RevealGlobalMcpConfigResponse = RevealGlobalMcpConfigResponses[keyof RevealGlobalMcpConfigResponses];
+
+export type GetPreviewDomainStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/preview-domain/status';
+};
+
+export type GetPreviewDomainStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetPreviewDomainStatusResponses = {
+    200: PreviewDomainStatusResponse;
+};
+
+export type GetPreviewDomainStatusResponse = GetPreviewDomainStatusResponses[keyof GetPreviewDomainStatusResponses];
 
 export type GetPublicIngressStatusData = {
     body?: never;
