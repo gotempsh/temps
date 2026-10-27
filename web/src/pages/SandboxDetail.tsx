@@ -100,6 +100,7 @@ import { terminalUnavailableReason } from '@/components/sandboxes/sandbox-termin
 import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isVerifiedNotFound } from '@/lib/read-failure'
+import { execFailureResult } from '@/lib/sandbox-exec'
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -382,9 +383,11 @@ export default function SandboxDetail() {
       setExecResult(result)
       invalidate()
     },
+    // Typed `Error` by the mutation, but at runtime the client throws the
+    // parsed problem body; `execFailureResult` handles either.
     onError: (err: Error) => {
       setExecDuration(null)
-      setExecResult({ exit_code: -1, stdout: '', stderr: err.message })
+      setExecResult(execFailureResult(err))
     },
   })
 
