@@ -29,7 +29,7 @@ pub fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
             .with_title("Forbidden")
             .with_detail("WebSocket Origin header is invalid")
     })?;
-    let origin = url::Url::parse(origin).map_err(|_| {
+    let parsed = url::Url::parse(origin).map_err(|_| {
         problemdetails::new(StatusCode::FORBIDDEN)
             .with_title("Forbidden")
             .with_detail("WebSocket Origin header is not allowed")
@@ -42,20 +42,31 @@ pub fn validate_websocket_origin(headers: &HeaderMap) -> Result<(), Problem> {
                 .with_title("Forbidden")
                 .with_detail("WebSocket Host header is required when Origin is present")
         })?;
-    let origin_authority = origin.host_str().map(|name| match origin.port() {
-        Some(port) => format!("{name}:{port}"),
-        None => name.to_string(),
-    });
-    if origin_authority
-        .as_deref()
+    // Compare the authority as the browser wrote it. `Url::port()` drops a
+    // scheme's default port, so `https://host:443` would otherwise look
+    // portless and be rejected against `Host: host:443`.
+    if raw_origin_authority(origin)
         .is_some_and(|authority| authority.eq_ignore_ascii_case(host.trim()))
     {
         return Ok(());
     }
-    warn!(origin = %origin, host = %host, "Rejected cross-origin WebSocket request");
+    warn!(origin = %parsed, host = %host, "Rejected cross-origin WebSocket request");
     Err(problemdetails::new(StatusCode::FORBIDDEN)
         .with_title("Forbidden")
         .with_detail("WebSocket Origin header is not allowed"))
+}
+
+/// The `host[:port]` part of an `Origin` value, exactly as written.
+///
+/// `None` for anything that is not a bare `scheme://host[:port]` origin, such
+/// as one carrying userinfo, so it can never match a `Host` header.
+fn raw_origin_authority(origin: &str) -> Option<&str> {
+    let (_, rest) = origin.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    Some(authority)
 }
 
 #[cfg(test)]
@@ -103,6 +114,34 @@ mod tests {
         assert!(
             validate_websocket_origin(&headers("http://localhost:4000", "localhost:3000")).is_err()
         );
+    }
+
+    #[test]
+    fn explicit_default_port_must_match_host_exactly() {
+        assert!(validate_websocket_origin(&headers(
+            "https://console.example.com:443",
+            "console.example.com:443"
+        ))
+        .is_ok());
+        assert!(validate_websocket_origin(&headers(
+            "https://console.example.com:443",
+            "console.example.com"
+        ))
+        .is_err());
+        assert!(validate_websocket_origin(&headers(
+            "http://console.example.com",
+            "console.example.com:80"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn origin_with_userinfo_is_forbidden() {
+        assert!(validate_websocket_origin(&headers(
+            "https://user@console.example.com",
+            "user@console.example.com"
+        ))
+        .is_err());
     }
 
     #[test]
