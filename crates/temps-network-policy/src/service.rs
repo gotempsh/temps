@@ -1326,20 +1326,20 @@ mod remote_tests {
         let ip = |s: &str| s.parse::<std::net::IpAddr>().unwrap();
         let routes: HashMap<std::net::IpAddr, std::net::IpAddr> = [
             // The worker's private address, reached on the shared network.
-            (ip("10.77.0.12"), ip("10.77.0.10")),
+            (ip("10.20.30.12"), ip("10.20.30.10")),
             // Its mesh address, reached over WireGuard.
             (ip("10.201.0.3"), ip("10.201.0.1")),
             // A second registered address on the same network: same source.
-            (ip("10.77.0.13"), ip("10.77.0.10")),
+            (ip("10.20.30.13"), ip("10.20.30.10")),
             // A worker registered under a loopback address.
             (ip("127.0.0.1"), ip("127.0.0.1")),
         ]
         .into_iter()
         .collect();
         let peers = [
-            ip("10.77.0.12"),
+            ip("10.20.30.12"),
             ip("10.201.0.3"),
-            ip("10.77.0.13"),
+            ip("10.20.30.13"),
             ip("127.0.0.1"),
             // No route: contributes nothing.
             ip("192.0.2.9"),
@@ -1349,7 +1349,7 @@ mod remote_tests {
 
         assert_eq!(
             sources,
-            vec![Cidr::host(ip("10.77.0.10")), Cidr::host(ip("10.201.0.1"))]
+            vec![Cidr::host(ip("10.20.30.10")), Cidr::host(ip("10.201.0.1"))]
         );
     }
 

@@ -2007,7 +2007,7 @@ mod tests {
             Some(hasher.finish())
         }
         fn addresses(&self) -> Vec<IpAddr> {
-            vec!["10.77.0.10".parse().unwrap()]
+            vec!["10.20.30.10".parse().unwrap()]
         }
     }
 
@@ -2119,7 +2119,7 @@ mod tests {
             assert!(by_workload.contains_key(&WorkloadRef::new(WorkloadKind::Deployment, 7)));
             assert!(
                 plan.ipcache
-                    .contains_key(&Cidr::host("10.77.0.10".parse().unwrap())),
+                    .contains_key(&Cidr::host("10.20.30.10".parse().unwrap())),
                 "the node's own address is a system peer"
             );
         }

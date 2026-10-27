@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn a_private_network_node_with_a_mesh_listener_is_dialed_on_the_mesh() {
         let endpoint = node_agent_endpoint(
-            "https://10.77.0.11:3100",
+            "https://10.20.30.11:3100",
             Some("10.201.0.2"),
             Some("10.201.0.2:3100"),
         );
@@ -336,7 +336,7 @@ mod tests {
             endpoint,
             NodeAgentEndpoint {
                 dial_url: "https://10.201.0.2:3100".into(),
-                server_name: Some("10.77.0.11".into()),
+                server_name: Some("10.20.30.11".into()),
             }
         );
         assert!(endpoint.via_mesh());
