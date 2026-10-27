@@ -5166,6 +5166,14 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         request_policy_gate: request_policy_gate_slot.clone(),
         gate: gate_service.clone(),
         access_keys: access_key_service.clone(),
+        // ADR 066, I8: workers' Shield events go to the sink the proxy's
+        // event store registers; looked up on first upload.
+        shield_events: {
+            let services = plugin_manager.service_context().create_plugin_context();
+            Arc::new(temps_routes::shield_sync::ShieldEventSinkSlot::new(
+                move || services.get_service::<dyn temps_routes::shield_sync::EventSink>(),
+            ))
+        },
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);

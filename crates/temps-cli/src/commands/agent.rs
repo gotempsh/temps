@@ -328,6 +328,33 @@ impl AgentCommand {
                 }
             }
 
+            // Shield on the public ingress (ADR 066 D10): the snapshot and
+            // keys the control plane names in the route snapshot, and the
+            // events this node's ingress records.
+            match temps_agent::control_plane_client_builder(&config)
+                .timeout(std::time::Duration::from_secs(60))
+                .build()
+            {
+                Ok(http) => {
+                    temps_agent::shield::sync::start(
+                        temps_agent::shield::sync::ShieldSyncConfig {
+                            control_plane_url: config.control_plane_url.clone(),
+                            node_id: config.node_id,
+                            node_token: config.token.clone(),
+                            http,
+                            private_key_b64: config.public_ingress_private_key.clone(),
+                            uploader: Default::default(),
+                        },
+                        route_store.shield().clone(),
+                        route_sync_shutdown.clone(),
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not start Shield sync; Shield routes on this node will answer 503"
+                ),
+            }
+
             // Signed-in addresses (ADR 065 D8): the ingress redeems sign-in
             // codes and revokes sessions over this node's token channel.
             match temps_agent::gate::GateChannel::new(

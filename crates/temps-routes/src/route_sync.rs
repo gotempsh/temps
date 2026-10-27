@@ -49,7 +49,7 @@ use temps_entities::{node_route_state, nodes};
 use thiserror::Error;
 use tracing::{error, warn};
 
-use crate::route_table::{BackendType, CachedPeerTable, RouteInfo};
+use crate::route_table::{BackendType, CachedPeerTable, RouteInfo, ShieldPinning};
 
 /// Hold the long-poll request open this long before returning the
 /// current snapshot when no generation bump arrives. Slightly less
@@ -66,6 +66,9 @@ pub struct RouteSyncAppState {
     /// Fetches Cloudflare Access keys again when an agent meets an unknown
     /// one (ADR 065 D9).
     pub access_keys: Arc<crate::access_keys::AccessKeyService>,
+    /// Where workers' Shield events go (ADR 066, I8), resolved from the
+    /// plugin service registry on first use.
+    pub shield_events: Arc<crate::shield_sync::ShieldEventSinkSlot>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -102,6 +105,10 @@ pub struct RouteEntryDto {
     /// `gated_routes`, which an agent that predates the gate never reads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate: Option<temps_core::gate::GatePolicy>,
+    /// The environment's Shield settings (ADR 066, D10, I5). Set only for
+    /// an agent that declared `shield-v1`; an older one never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +162,18 @@ pub struct PublicIngressSnapshot {
     /// this field answers their socket 404. Sent on the same condition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identity_serve_routes: Vec<IdentityServeRouteDto>,
+    /// Routes whose environment acts on verdicts (`selective`, `attack`;
+    /// ADR 066, D10), signed-in ones included, each with its Shield
+    /// settings. Never in `routes` or `gated_routes`: an agent that
+    /// predates Shield ignores this field, so it serves none of them
+    /// unprotected, from a snapshot or from the file it loads after a
+    /// rollback. Sent only when the snapshot request declared `shield-v1`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shield_routes: Vec<RouteEntryDto>,
+    /// The current Shield snapshot revision, for an agent that declared
+    /// `shield-v1`: it fetches the body when this differs from its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield: Option<temps_core::worker_shield::ShieldRef>,
 }
 
 /// Where a `tailnet_users` Serve socket sends requests, and who it admits
@@ -289,7 +308,7 @@ async fn count_project_rate_limit_policies(db: &DatabaseConnection) -> Result<i6
 }
 
 #[derive(Debug, Error)]
-enum SnapshotBuildError {
+pub(crate) enum SnapshotBuildError {
     #[error("Failed to {operation} for node {node_id}: {source}")]
     Database {
         node_id: i32,
@@ -370,6 +389,13 @@ pub async fn get_routes_snapshot(
     let enforces_gate = request_declares(&headers, temps_core::gate::GATE_CAPABILITY);
     let tailnet_identity =
         request_declares(&headers, temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY);
+    // ADR 066, D10: the same rule for Shield.
+    let runs_shield = request_declares(&headers, temps_core::worker_shield::SHIELD_CAPABILITY);
+    let capabilities = AgentCapabilities {
+        enforces_gate,
+        tailnet_identity,
+        runs_shield,
+    };
 
     // Arm the notifier BEFORE checking the generation. `Notify::notified()`
     // captures the current notify epoch at construction time, so a reload
@@ -396,7 +422,7 @@ pub async fn get_routes_snapshot(
     let mut current = app_state.peer_table.current_generation();
     if current != q.since {
         return Ok(Json(
-            build_snapshot(&app_state, &node, current, enforces_gate, tailnet_identity)
+            build_snapshot(&app_state, &node, current, capabilities)
                 .await
                 .map_err(snapshot_error_response)?,
         ));
@@ -432,7 +458,7 @@ pub async fn get_routes_snapshot(
     // also drops a token revoked while the request was parked.
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
     Ok(Json(
-        build_snapshot(&app_state, &node, current, enforces_gate, tailnet_identity)
+        build_snapshot(&app_state, &node, current, capabilities)
             .await
             .map_err(snapshot_error_response)?,
     ))
@@ -594,6 +620,18 @@ pub fn configure_routes() -> axum::Router<Arc<RouteSyncAppState>> {
             "/internal/nodes/{node_id}/gate/access-keys",
             post(crate::gate_sync::post_gate_access_keys),
         )
+        .route(
+            "/internal/nodes/{node_id}/shield/snapshot",
+            get(crate::shield_sync::get_shield_snapshot),
+        )
+        .route(
+            "/internal/nodes/{node_id}/shield/events",
+            post(crate::shield_sync::post_shield_events).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    temps_core::worker_shield::MAX_EVENTS_COMPRESSED_BYTES,
+                ),
+            ),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -687,24 +725,47 @@ pub async fn worker_route_policy(
     })
 }
 
+/// The public routes workers serve themselves. `shield` is whether the
+/// worker that will serve them runs Shield (ADR 066, D10): only then are
+/// routes whose environment acts on verdicts included, each route with its
+/// Shield settings.
 pub async fn worker_public_routes(
     db: &DatabaseConnection,
     peer_table: &CachedPeerTable,
     custom_request_policy: bool,
+    shield: bool,
 ) -> Result<WorkerPublicRoutes, (&'static str, sea_orm::DbErr)> {
     let WorkerRoutePolicy {
         blocking_policies,
         registered_worker_addresses,
     } = worker_route_policy(db, custom_request_policy).await?;
     let public_route_count = peer_table.worker_public_route_count();
+    let pinning = if shield {
+        ShieldPinning::None
+    } else {
+        ShieldPinning::Enforcing
+    };
     let raw_public_routes = if blocking_policies.is_empty() {
-        peer_table.snapshot_worker_public_routes()
+        peer_table.snapshot_worker_public_routes(pinning)
     } else {
         Vec::new()
     };
+    let tokens = if shield && !raw_public_routes.is_empty() {
+        crate::shield_sync::BypassTokens::load(db)
+            .await
+            .map_err(|source| ("load Shield bypass tokens", source))?
+    } else {
+        crate::shield_sync::BypassTokens::default()
+    };
     let routes: Vec<RouteEntryDto> = raw_public_routes
         .into_iter()
-        .filter_map(|(host, route)| entry_from_route(host, &route))
+        .filter_map(|(host, route)| {
+            let mut entry = entry_from_route(host, &route)?;
+            if shield {
+                entry.shield = crate::shield_sync::route_policy(&route, &tokens);
+            }
+            Some(entry)
+        })
         .filter(|route| {
             route.backends.iter().all(|backend| {
                 public_backend_is_registered_worker(&backend.address, &registered_worker_addresses)
@@ -719,7 +780,11 @@ pub async fn worker_public_routes(
         .collect();
     let mut unsupported_reasons = blocking_policies.clone();
     if public_route_count > routes.len() && unsupported_reasons.is_empty() {
-        unsupported_reasons.push("some routes require redirects, static-file serving, wake-up, attack mode, project security policy, project-group path routing, or a remotely reachable backend".to_string());
+        unsupported_reasons.push(if shield {
+            "some routes require redirects, static-file serving, wake-up, project security policy, project-group path routing, or a remotely reachable backend".to_string()
+        } else {
+            "some routes require redirects, static-file serving, wake-up, a Shield mode that acts on verdicts (selective or attack), project security policy, project-group path routing, or a remotely reachable backend; update the agent to serve Shield routes on workers".to_string()
+        });
     }
     Ok(WorkerPublicRoutes {
         unsupported_route_count: public_route_count.saturating_sub(routes.len()),
@@ -960,13 +1025,26 @@ pub fn worker_serve_entries(
     (entries, held_back)
 }
 
-async fn build_snapshot(
+/// What the agent asking for a snapshot declared it enforces, on the
+/// request itself (ADR 065 D6, D7; ADR 066 D10).
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct AgentCapabilities {
+    pub(crate) enforces_gate: bool,
+    pub(crate) tailnet_identity: bool,
+    pub(crate) runs_shield: bool,
+}
+
+pub(crate) async fn build_snapshot(
     state: &RouteSyncAppState,
     node: &nodes::Model,
     generation: u64,
-    enforces_gate: bool,
-    tailnet_identity: bool,
+    capabilities: AgentCapabilities,
 ) -> Result<RouteSnapshot, SnapshotBuildError> {
+    let AgentCapabilities {
+        enforces_gate,
+        tailnet_identity,
+        runs_shield,
+    } = capabilities;
     let raw = state.peer_table.snapshot_internal_routes();
     let mut routes = Vec::with_capacity(raw.len());
     for (host, info) in raw {
@@ -1077,6 +1155,8 @@ async fn build_snapshot(
                 serve_entries: Vec::new(),
                 identity_private_routes,
                 identity_serve_routes: Vec::new(),
+                shield_routes: Vec::new(),
+                shield: None,
             }
         } else if node.public_ingress_enabled || runs_connector {
             let WorkerPublicRoutes {
@@ -1088,6 +1168,7 @@ async fn build_snapshot(
                 state.db.as_ref(),
                 &state.peer_table,
                 !state.request_policy_gate.supports_worker_ingress(),
+                runs_shield,
             )
             .await
             .map_err(|(operation, source)| SnapshotBuildError::Database {
@@ -1100,12 +1181,35 @@ async fn build_snapshot(
             // older agent would serve it open.
             let (public_routes, gated_routes, gate_held_back) =
                 split_gated(public_routes, enforces_gate, &node.name);
-            let allowed_certificate_hosts = certificate_hosts(
+            // ADR 066 D10: what acts on verdicts goes only in `shield_routes`.
+            let (public_routes, gated_routes, shield_routes) =
+                split_shielded(public_routes, gated_routes);
+            let shield = if runs_shield {
+                Some(temps_core::worker_shield::ShieldRef {
+                    revision: crate::shield_sync::newest_revision(state.db.as_ref())
+                        .await
+                        .map_err(|source| SnapshotBuildError::Database {
+                            node_id: node.id,
+                            operation: "load the newest Shield snapshot revision",
+                            source,
+                        })?,
+                })
+            } else {
+                None
+            };
+            let mut allowed_certificate_hosts = certificate_hosts(
                 &public_routes,
                 &gated_routes,
                 node.public_ingress_enabled,
                 &private_hosts,
             );
+            if node.public_ingress_enabled {
+                allowed_certificate_hosts.extend(
+                    shield_routes
+                        .iter()
+                        .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase()),
+                );
+            }
             let unsupported_route_count = unsupported_route_count + gate_held_back.len();
             let mut unsupported_reasons = unsupported_reasons;
             unsupported_reasons.extend(gate_held_back);
@@ -1133,6 +1237,8 @@ async fn build_snapshot(
                 serve_entries: Vec::new(),
                 identity_private_routes,
                 identity_serve_routes: Vec::new(),
+                shield_routes,
+                shield,
             }
         } else {
             PublicIngressSnapshot::default()
@@ -1198,6 +1304,26 @@ pub fn split_gated(
         })
         .collect();
     (open, Vec::new(), held_back)
+}
+
+/// ADR 066, D10: take every route whose environment acts on verdicts out
+/// of `routes` and `gated_routes`, the fields an agent that predates Shield
+/// reads, into the Shield routes. A signed-in one keeps its gate there.
+/// Only routes for an agent that runs Shield carry a policy; for any other
+/// none of them reached here.
+pub fn split_shielded(
+    routes: Vec<RouteEntryDto>,
+    gated_routes: Vec<RouteEntryDto>,
+) -> (Vec<RouteEntryDto>, Vec<RouteEntryDto>, Vec<RouteEntryDto>) {
+    let enforces = |route: &RouteEntryDto| {
+        route.shield.as_ref().is_some_and(|policy| {
+            temps_shield::ShieldMode::parse(&policy.mode).is_none_or(|mode| mode.enforces())
+        })
+    };
+    let (mut shielded, open): (Vec<_>, Vec<_>) = routes.into_iter().partition(enforces);
+    let (shielded_gated, gated): (Vec<_>, Vec<_>) = gated_routes.into_iter().partition(enforces);
+    shielded.extend(shielded_gated);
+    (open, gated, shielded)
 }
 
 /// The hosts a node gets certificate keys for: only what it terminates
@@ -1393,6 +1519,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         project_id: info.project.as_ref().map(|p| p.id),
         environment_id: info.environment.as_ref().map(|e| e.id),
         gate: None,
+        shield: None,
     })
 }
 
@@ -1542,6 +1669,7 @@ pub(crate) mod tests {
             project_id: None,
             environment_id: None,
             gate: None,
+            shield: None,
         }
     }
 
@@ -1850,11 +1978,16 @@ pub(crate) mod tests {
                 access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
                     test_db.db.clone(),
                 )),
+                shield_events: Arc::new(crate::shield_sync::ShieldEventSinkSlot::fixed(Arc::new(
+                    temps_shield::NoEvents,
+                ))),
             },
             &node,
             1,
-            true,
-            false,
+            AgentCapabilities {
+                enforces_gate: true,
+                ..AgentCapabilities::default()
+            },
         )
         .await?;
         assert_eq!(open_snapshot.public_ingress.routes.len(), 1);
@@ -1889,11 +2022,16 @@ pub(crate) mod tests {
                     access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
                         test_db.db.clone(),
                     )),
+                    shield_events: Arc::new(crate::shield_sync::ShieldEventSinkSlot::fixed(
+                        Arc::new(temps_shield::NoEvents),
+                    )),
                 },
                 &node,
                 1,
-                true,
-                false,
+                AgentCapabilities {
+                    enforces_gate: true,
+                    ..AgentCapabilities::default()
+                },
             )
             .await?;
             assert!(snapshot.public_ingress.routes.is_empty());
@@ -1946,11 +2084,16 @@ pub(crate) mod tests {
                 access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
                     test_db.db.clone(),
                 )),
+                shield_events: Arc::new(crate::shield_sync::ShieldEventSinkSlot::fixed(Arc::new(
+                    temps_shield::NoEvents,
+                ))),
             },
             &node,
             1,
-            true,
-            false,
+            AgentCapabilities {
+                enforces_gate: true,
+                ..AgentCapabilities::default()
+            },
         )
         .await?;
         assert!(limited_snapshot.public_ingress.routes.is_empty());
@@ -1998,11 +2141,16 @@ pub(crate) mod tests {
                     access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
                         test_db.db.clone(),
                     )),
+                    shield_events: Arc::new(crate::shield_sync::ShieldEventSinkSlot::fixed(
+                        Arc::new(temps_shield::NoEvents),
+                    )),
                 },
                 &node,
                 1,
-                true,
-                false,
+                AgentCapabilities {
+                    enforces_gate: true,
+                    ..AgentCapabilities::default()
+                },
             )
             .await
         };
@@ -2244,6 +2392,7 @@ mod gate_hold_back_tests {
                 temps: None,
                 access: None,
             }),
+            shield: None,
         }
     }
 
@@ -2298,6 +2447,98 @@ mod gate_hold_back_tests {
             hosts,
             std::collections::HashSet::from(["lan.example.test".to_string()])
         );
+    }
+
+    fn shielded(host: &str, mode: &str, gated: bool) -> RouteEntryDto {
+        RouteEntryDto {
+            shield: Some(temps_core::worker_shield::ShieldRoutePolicy {
+                project_id: 1,
+                environment_id: 10,
+                mode: mode.into(),
+                exempt_paths: vec!["/api/*".into()],
+                bypass_token_hashes: vec!["ab".repeat(32)],
+            }),
+            ..route(host, gated)
+        }
+    }
+
+    /// ADR 066, D10: what acts on verdicts never travels in a field an
+    /// agent without Shield reads, signed-in or not; `log` routes stay put,
+    /// with their policy for the agent that reads it.
+    #[test]
+    fn routes_that_act_on_verdicts_travel_only_in_shield_routes() {
+        let routes = vec![
+            route("open.example.test", false),
+            shielded("log.example.test", "log", false),
+            shielded("selective.example.test", "selective", false),
+            shielded("attack.example.test", "attack", false),
+            shielded("team.example.test", "selective", true),
+        ];
+        let (routes, gated, _) = split_gated(routes, true, "worker-1");
+        let (open, gated, shield) = split_shielded(routes, gated);
+        let hosts = |routes: &[RouteEntryDto]| -> Vec<String> {
+            let mut hosts: Vec<String> = routes.iter().map(|r| r.host.clone()).collect();
+            hosts.sort();
+            hosts
+        };
+        assert_eq!(hosts(&open), ["log.example.test", "open.example.test"]);
+        assert!(gated.is_empty());
+        assert_eq!(
+            hosts(&shield),
+            [
+                "attack.example.test",
+                "selective.example.test",
+                "team.example.test"
+            ]
+        );
+        assert!(shield
+            .iter()
+            .find(|r| r.host == "team.example.test")
+            .is_some_and(|r| r.gate.is_some()));
+    }
+
+    /// An agent that predates Shield reads the snapshot with its own types:
+    /// it finds no Shield route, and a policy rides only where it is
+    /// ignored.
+    #[test]
+    fn an_agent_without_shield_finds_no_shield_route() {
+        #[derive(serde::Deserialize)]
+        struct OldRoute {
+            host: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublic {
+            routes: Vec<OldRoute>,
+            #[serde(default)]
+            gated_routes: Vec<OldRoute>,
+        }
+        let (open, gated, shield_routes) = split_shielded(
+            vec![
+                shielded("log.example.test", "log", false),
+                shielded("attack.example.test", "attack", false),
+            ],
+            Vec::new(),
+        );
+        let snapshot = PublicIngressSnapshot {
+            enabled: true,
+            routes: open,
+            gated_routes: gated,
+            shield_routes,
+            shield: Some(temps_core::worker_shield::ShieldRef { revision: 4 }),
+            ..PublicIngressSnapshot::default()
+        };
+        let wire = serde_json::to_string(&snapshot).expect("serialize");
+        let old: OldPublic = serde_json::from_str(&wire).expect("an old agent parses it");
+        let hosts: Vec<&str> = old
+            .routes
+            .iter()
+            .chain(&old.gated_routes)
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, ["log.example.test"]);
+        let value: serde_json::Value = serde_json::from_str(&wire).expect("json");
+        assert_eq!(value["shield"]["revision"], 4);
+        assert_eq!(value["shield_routes"][0]["shield"]["mode"], "attack");
     }
 
     #[test]
