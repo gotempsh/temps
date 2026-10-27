@@ -66,6 +66,13 @@ test('a new token is shown once, then gone when the dialog closes', async () => 
   await view.findByText(SECRET)
   expect(sentBody).toEqual({ name: 'Uptime monitor', project_wide: false })
   expect(view.getByRole('button', { name: 'Copy bypass token' })).toBeTruthy()
+  // How to send it, and where it applies.
+  view.getByText(
+    `curl -H "X-Temps-Shield-Token: ${SECRET}" https://your-app.example.com/`
+  )
+  view.getByText(
+    /never challenges or blocks a request that carries it, in production/
+  )
 
   fireEvent.click(view.getByRole('button', { name: 'I have saved the token' }))
   await view.findByText('Uptime monitor')

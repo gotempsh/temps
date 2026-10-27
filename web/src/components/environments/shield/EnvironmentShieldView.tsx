@@ -4,8 +4,11 @@
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
+import { SHIELD_EVENTS_PARAMS } from '@/lib/environment-navigation'
+import { useUrlState } from '@temps-sdk/ds'
 import { ArrowRight } from 'lucide-react'
 import { Link } from 'react-router'
+import { ShieldEventsList } from './ShieldEventsList'
 import { ShieldEventsPanel } from './ShieldEventsPanel'
 import { ShieldLookupPanel } from './ShieldLookupPanel'
 import { ShieldSection } from './ShieldSection'
@@ -16,7 +19,8 @@ import { ShieldTokensPanel } from './ShieldTokensPanel'
  * The Shield tab of one environment (ADR 066 D11): its mode, what Shield
  * saw, recent events, an address lookup and bypass tokens. Entries apply to
  * more than one environment, so they are edited where they apply: the
- * service's Security settings and the platform's.
+ * service's Security settings and the platform's. `?shield=events` shows
+ * every event instead of the overview.
  */
 export function EnvironmentShieldView({
   project,
@@ -28,13 +32,27 @@ export function EnvironmentShieldView({
   onOpenSettings?: () => void
 }) {
   const path = { project_id: project.id, environment_id: environment.id }
+  const url = useUrlState<(typeof SHIELD_EVENTS_PARAMS)[number]>()
+  if (url.state.shield === 'events') {
+    return (
+      <div key={environment.id} className="w-full min-w-0">
+        <ShieldEventsList
+          path={path}
+          onBack={() => url.clear([...SHIELD_EVENTS_PARAMS])}
+        />
+      </div>
+    )
+  }
   return (
     // Keyed so cursors, lookups and a freshly minted token never carry over
     // from one environment to the next.
     <div key={environment.id} className="w-full min-w-0 space-y-8">
       <ShieldSummaryPanel path={path} onOpenSettings={onOpenSettings} />
       <ShieldLookupPanel path={path} />
-      <ShieldEventsPanel path={path} />
+      <ShieldEventsPanel
+        path={path}
+        onShowAll={() => url.patch({ shield: 'events' })}
+      />
       <ShieldTokensPanel path={path} environmentName={environment.name} />
       <ShieldEntriesLinks projectSlug={project.slug} />
     </div>

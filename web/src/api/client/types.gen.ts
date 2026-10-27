@@ -72119,6 +72119,19 @@ export type ListShieldEventsData = {
          */
         limit?: number;
         /**
+         * Only this kind: `verdict`, `challenge_issued`, `challenge_solved` or
+         * `challenge_failed`.
+         */
+        kind?: string;
+        /**
+         * Only this verdict: `block`, `challenge` or `log`.
+         */
+        verdict?: string;
+        /**
+         * Only this client address, IPv4 or IPv6.
+         */
+        ip?: string;
+        /**
          * Only events before this instant (the `next_before` of the previous
          * page).
          */

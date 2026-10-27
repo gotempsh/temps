@@ -67,6 +67,7 @@ export function ShieldTokensPanel({
   const [createOpen, setCreateOpen] = useState(false)
   // The minted token, shown once in the dialog and dropped when it closes.
   const [secret, setSecret] = useState<string | null>(null)
+  const [projectWide, setProjectWide] = useState(false)
   const [revokeTarget, setRevokeTarget] = useState<ShieldTokenResponse | null>(
     null
   )
@@ -87,6 +88,7 @@ export function ShieldTokensPanel({
     meta: { errorTitle: 'Failed to create bypass token' },
     onSuccess: (created) => {
       setSecret(created.secret)
+      setProjectWide(created.scope === 'project')
       form.reset({ name: '', project_wide: false })
       toast.success('Bypass token created. Copy it now; it is not shown again.')
       void invalidate()
@@ -231,9 +233,36 @@ export function ShieldTokensPanel({
                 </code>
                 <CopyButton value={secret} label="Copy bypass token" />
               </div>
-              <p className="text-xs text-muted-foreground">
-                Send it as <code>X-Temps-Shield-Token: &lt;token&gt;</code>.
-              </p>
+              <div className="space-y-2 text-sm">
+                <p className="font-medium">How to use it</p>
+                <p className="text-muted-foreground">
+                  Send it in the <code>X-Temps-Shield-Token</code> header on
+                  every request, for example from an uptime monitor&apos;s
+                  custom headers or a CI secret:
+                </p>
+                <div className="flex items-start gap-2 rounded-md border bg-muted/40 p-3">
+                  <code className="min-w-0 flex-1 whitespace-pre-wrap break-all font-mono text-xs">
+                    {curlExample(secret)}
+                  </code>
+                  <CopyButton
+                    value={curlExample(secret)}
+                    label="Copy example request"
+                  />
+                </div>
+                <ul className="list-disc space-y-1 pl-5 text-muted-foreground">
+                  <li>
+                    Shield never challenges or blocks a request that carries it,
+                    {projectWide
+                      ? ' in every environment of the service'
+                      : ` in ${environmentName}`}
+                    , even in attack mode. IP access rules still apply.
+                  </li>
+                  <li>
+                    Anyone who has it skips Shield, so keep it out of browsers
+                    and public code. Revoke it here if it leaks.
+                  </li>
+                </ul>
+              </div>
               <DialogFooter>
                 <Button type="button" onClick={() => closeCreate(false)}>
                   I have saved the token
@@ -332,4 +361,9 @@ export function ShieldTokensPanel({
       />
     </ShieldSection>
   )
+}
+
+/** A request that carries `token`, for the dialog to show. */
+function curlExample(token: string) {
+  return `curl -H "X-Temps-Shield-Token: ${token}" https://your-app.example.com/`
 }

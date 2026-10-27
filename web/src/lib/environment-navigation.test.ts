@@ -60,4 +60,17 @@ describe('environment navigation', () => {
 
     expect(next.toString()).toBe('view=shield')
   })
+
+  test('leaving the Shield tab or its environment closes the events list', () => {
+    const current = new URLSearchParams(
+      'environment=7&view=shield&shield=events&kind=verdict&verdict=block&ip=203.0.113.7'
+    )
+
+    expect(
+      updateEnvironmentSearchParams(current, { environmentId: 9 }).toString()
+    ).toBe('environment=9&view=shield')
+    expect(
+      updateEnvironmentSearchParams(current, { view: 'metrics' }).toString()
+    ).toBe('environment=7&view=metrics')
+  })
 })

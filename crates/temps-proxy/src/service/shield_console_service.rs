@@ -31,7 +31,8 @@ use tracing::{error, info};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::storage::shield_stats::{
-    EventCount, KeyedCount, ShieldStatsError, ShieldStatsStorage, StatsScope, StoredShieldEvent,
+    EventCount, EventFilter, KeyedCount, ShieldStatsError, ShieldStatsStorage, StatsScope,
+    StoredShieldEvent,
 };
 
 /// Most active bypass tokens one project may hold. Every ingress carries
@@ -217,6 +218,13 @@ pub struct ShieldSummaryResponse {
 pub struct ShieldEventsQuery {
     /// Events to return, 1 to 100; 20 by default.
     pub limit: Option<u64>,
+    /// Only this kind: `verdict`, `challenge_issued`, `challenge_solved` or
+    /// `challenge_failed`.
+    pub kind: Option<String>,
+    /// Only this verdict: `block`, `challenge` or `log`.
+    pub verdict: Option<String>,
+    /// Only this client address, IPv4 or IPv6.
+    pub ip: Option<String>,
     /// Only events before this instant (the `next_before` of the previous
     /// page).
     #[param(value_type = Option<String>, format = DateTime)]
@@ -406,6 +414,12 @@ pub enum ShieldEntryScope {
     Platform,
     Project,
 }
+
+/// One owner's entries, binding `$1` to [`EntryOwner::scope`] and `$2` to
+/// [`EntryOwner::project_id`]. Written so the `shield_operator_entries_owner`
+/// index serves it: a platform entry has no project, and project ids are
+/// positive.
+const OWNER_ROWS: &str = "scope = $1 AND COALESCE(project_id, 0) = COALESCE($2::int, 0)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryOwner {
@@ -805,9 +819,10 @@ impl ShieldConsoleService {
             .limit
             .unwrap_or(DEFAULT_EVENTS_LIMIT)
             .clamp(1, MAX_EVENTS_LIMIT);
+        let filter = event_filter(&query)?;
         let events = self
             .stats
-            .recent_events(project_id, environment_id, query.before, limit)
+            .recent_events(project_id, environment_id, &filter, query.before, limit)
             .await?;
         let next_before = (events.len() as u64 == limit)
             .then(|| events.last().map(|event| event.timestamp))
@@ -1086,7 +1101,7 @@ impl ShieldConsoleService {
                 DatabaseBackend::Postgres,
                 format!(
                     "SELECT {ENTRY_COLUMNS} FROM shield_operator_entries \
-                     WHERE scope = $1 AND project_id IS NOT DISTINCT FROM $2 \
+                     WHERE {OWNER_ROWS} \
                      ORDER BY created_at DESC, id DESC LIMIT {MAX_ENTRIES_PER_SCOPE}"
                 ),
                 [owner.scope().into(), owner.project_id().into()],
@@ -1237,35 +1252,47 @@ impl ShieldConsoleService {
                 "A search holds at most {MAX_PROPOSAL_SEARCH_CHARS} characters"
             )));
         }
-        let status = query.status.map(|status| status.as_str().to_string());
+        // Only the filters that are set go into the query, so each shape gets
+        // its own plan on the `(status, last_seen, id)` or `(last_seen, id)`
+        // index rather than a generic one that sorts every row.
+        let mut matches = String::from("expires_at > now()");
+        let mut values: Vec<sea_orm::Value> = Vec::new();
+        if let Some(status) = query.status {
+            values.push(status.as_str().into());
+            matches.push_str(&format!(" AND status = ${}", values.len()));
+        }
         // `strpos` rather than LIKE, so `%` and `_` in a search are plain text.
-        const MATCHES: &str = "expires_at > now() AND ($1::text IS NULL OR status = $1) \
-             AND ($2::text IS NULL OR strpos(lower(subject), lower($2)) > 0)";
+        if let Some(search) = search {
+            values.push(search.into());
+            matches.push_str(&format!(
+                " AND strpos(lower(subject), lower(${})) > 0",
+                values.len()
+            ));
+        }
         let offset = (page - 1).saturating_mul(page_size);
         let txn = self.db.begin().await?;
         let total: i64 = txn
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                format!("SELECT COUNT(*)::bigint AS total FROM shield_observed WHERE {MATCHES}"),
-                [status.clone().into(), search.clone().into()],
+                format!("SELECT COUNT(*)::bigint AS total FROM shield_observed WHERE {matches}"),
+                values.clone(),
             ))
             .await?
             .map(|row| row.try_get("", "total"))
             .transpose()?
             .unwrap_or(0);
+        let limit_at = values.len() + 1;
+        values.push((page_size as i64).into());
+        values.push(i64::try_from(offset).unwrap_or(i64::MAX).into());
         let rows = shield_observed::Entity::find()
             .from_raw_sql(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 format!(
-                    "SELECT * FROM shield_observed WHERE {MATCHES} \
-                     ORDER BY last_seen DESC, id DESC LIMIT $3 OFFSET $4"
+                    "SELECT * FROM shield_observed WHERE {matches} \
+                     ORDER BY last_seen DESC, id DESC LIMIT ${limit_at} OFFSET ${}",
+                    limit_at + 1
                 ),
-                [
-                    status.into(),
-                    search.into(),
-                    (page_size as i64).into(),
-                    i64::try_from(offset).unwrap_or(i64::MAX).into(),
-                ],
+                values,
             ))
             .all(&txn)
             .await?;
@@ -1330,11 +1357,13 @@ impl ShieldConsoleService {
             .db
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "SELECT \
-                     COUNT(*) FILTER (WHERE network = $3::cidr OR ja4 = $4)::bigint AS same, \
-                     COUNT(*)::bigint AS total \
-                 FROM shield_operator_entries \
-                 WHERE scope = $1 AND project_id IS NOT DISTINCT FROM $2",
+                format!(
+                    "SELECT \
+                         COUNT(*) FILTER (WHERE network = $3::cidr OR ja4 = $4)::bigint AS same, \
+                         COUNT(*)::bigint AS total \
+                     FROM shield_operator_entries \
+                     WHERE {OWNER_ROWS}"
+                ),
                 [
                     owner.scope().into(),
                     owner.project_id().into(),
@@ -1446,6 +1475,43 @@ fn check_expiry(expires_at: Option<UtcDateTime>) -> Result<(), ShieldConsoleErro
         ))),
         _ => Ok(()),
     }
+}
+
+/// The filters of an events query, checked: an unknown kind or verdict
+/// would match nothing, and an address that does not parse is a typo.
+fn event_filter(query: &ShieldEventsQuery) -> Result<EventFilter, ShieldConsoleError> {
+    let given = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    let kind = given(&query.kind);
+    if let Some(kind) = &kind {
+        if temps_shield::EventKind::parse(kind).is_none() {
+            return Err(invalid(format!(
+                "`{kind}` is not an event kind: verdict, challenge_issued, challenge_solved or \
+                 challenge_failed"
+            )));
+        }
+    }
+    let verdict = given(&query.verdict);
+    if let Some(verdict) = &verdict {
+        if !matches!(verdict.as_str(), "block" | "challenge" | "log") {
+            return Err(invalid(format!(
+                "`{verdict}` is not a verdict an event records: block, challenge or log"
+            )));
+        }
+    }
+    let ip = match given(&query.ip) {
+        Some(text) => Some(
+            text.parse::<IpAddr>()
+                .map_err(|_| invalid(format!("`{text}` is not an IPv4 or IPv6 address")))?,
+        ),
+        None => None,
+    };
+    Ok(EventFilter { kind, verdict, ip })
 }
 
 fn capitalize(text: &str) -> String {
@@ -1848,6 +1914,7 @@ mod tests {
                 ShieldEventsQuery {
                     limit: Some(3),
                     before: None,
+                    ..ShieldEventsQuery::default()
                 },
             )
             .await
@@ -1861,11 +1928,140 @@ mod tests {
                 ShieldEventsQuery {
                     limit: Some(3),
                     before: events.next_before,
+                    ..ShieldEventsQuery::default()
                 },
             )
             .await
             .unwrap();
         assert!(older.events.len() <= 1, "{older:?}");
+    }
+
+    /// Events filter by kind, verdict and address together, the address in
+    /// any form it is written, and a bad filter is refused, not ignored.
+    #[tokio::test]
+    async fn events_filter_by_kind_verdict_and_address() {
+        let Some(test_db) = database().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        seed(&db).await;
+        for (minutes, kind, verdict, ip) in [
+            (1, "verdict", "block", "203.0.113.9"),
+            (2, "verdict", "log", "203.0.113.9"),
+            (3, "challenge_failed", "challenge", "203.0.113.9"),
+            (4, "verdict", "block", "198.51.100.4"),
+            (5, "challenge_issued", "challenge", "2001:db8::7"),
+            (6, "verdict", "log", "198.51.100.4"),
+        ] {
+            exec(
+                &db,
+                "INSERT INTO shield_events (timestamp, project_id, environment_id, request_id, \
+                 kind, ip, verdict, mode, reasons, host, path, user_agent) VALUES \
+                 (now() - $1 * interval '1 minute', 7101, 7201, gen_random_uuid()::text, $2, $3, \
+                  $4, 'selective', '[]', 'a.test', '/', 'ua')",
+                vec![minutes.into(), kind.into(), ip.into(), verdict.into()],
+            )
+            .await;
+        }
+        let service = service(&test_db);
+        let list = |kind: Option<&str>, verdict: Option<&str>, ip: Option<&str>| {
+            let service = &service;
+            let query = ShieldEventsQuery {
+                kind: kind.map(str::to_string),
+                verdict: verdict.map(str::to_string),
+                ip: ip.map(str::to_string),
+                ..ShieldEventsQuery::default()
+            };
+            async move { service.events(7101, 7201, query).await }
+        };
+        let seen = |events: &ShieldEventsResponse| {
+            events
+                .events
+                .iter()
+                .map(|event| (event.kind.clone(), event.verdict.clone(), event.ip.clone()))
+                .collect::<Vec<_>>()
+        };
+        let owned = |rows: &[(&str, &str, &str)]| {
+            rows.iter()
+                .map(|(k, v, ip)| (k.to_string(), v.to_string(), ip.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(list(None, None, None).await.unwrap().events.len(), 6);
+        assert_eq!(
+            seen(&list(None, Some("block"), None).await.unwrap()),
+            owned(&[
+                ("verdict", "block", "203.0.113.9"),
+                ("verdict", "block", "198.51.100.4")
+            ])
+        );
+        assert_eq!(
+            seen(&list(Some("challenge_failed"), None, None).await.unwrap()),
+            owned(&[("challenge_failed", "challenge", "203.0.113.9")])
+        );
+        // Filters combine; an address matches however it is written.
+        for ip in ["198.51.100.4", " 198.51.100.4 ", "::ffff:198.51.100.4"] {
+            assert_eq!(
+                seen(&list(Some("verdict"), Some("log"), Some(ip)).await.unwrap()),
+                owned(&[("verdict", "log", "198.51.100.4")]),
+                "{ip}"
+            );
+        }
+        assert_eq!(
+            seen(&list(None, None, Some("2001:0db8:0::7")).await.unwrap()),
+            owned(&[("challenge_issued", "challenge", "2001:db8::7")])
+        );
+        // An empty filter is no filter.
+        assert_eq!(
+            list(Some(""), Some(" "), Some(""))
+                .await
+                .unwrap()
+                .events
+                .len(),
+            6
+        );
+        // Paging keeps the filter: two blocks, one per page.
+        let first = service
+            .events(
+                7101,
+                7201,
+                ShieldEventsQuery {
+                    limit: Some(1),
+                    verdict: Some("block".into()),
+                    ..ShieldEventsQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        let second = service
+            .events(
+                7101,
+                7201,
+                ShieldEventsQuery {
+                    limit: Some(1),
+                    verdict: Some("block".into()),
+                    before: first.next_before,
+                    ..ShieldEventsQuery::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen(&first)[0].2, "203.0.113.9");
+        assert_eq!(seen(&second)[0].2, "198.51.100.4");
+
+        for (kind, verdict, ip) in [
+            (Some("blocked"), None, None),
+            (None, Some("pass"), None),
+            (None, None, Some("not-an-ip")),
+        ] {
+            assert!(
+                matches!(
+                    list(kind, verdict, ip).await,
+                    Err(ShieldConsoleError::Validation { .. })
+                ),
+                "{kind:?} {verdict:?} {ip:?}"
+            );
+        }
     }
 
     #[tokio::test]

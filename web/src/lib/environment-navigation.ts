@@ -38,11 +38,19 @@ export function resolveEnvironmentSelection(
   )
 }
 
+/** The query parameters of the Shield tab's full events list. */
+export const SHIELD_EVENTS_PARAMS = ['shield', 'kind', 'verdict', 'ip'] as const
+
 export function updateEnvironmentSearchParams(
   current: URLSearchParams,
   change: { environmentId?: number | null; view?: EnvironmentView }
 ): URLSearchParams {
   const next = new URLSearchParams(current)
+  // The Shield events list and its filters belong to one environment's
+  // Shield tab; leaving either closes the list.
+  if (change.environmentId !== undefined || change.view !== undefined) {
+    for (const key of SHIELD_EVENTS_PARAMS) next.delete(key)
+  }
 
   if (change.environmentId === null) {
     next.delete('environment')

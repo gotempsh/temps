@@ -112,14 +112,26 @@ pub trait ShieldStatsStorage: Send + Sync {
     /// The median and 90th percentile of `solve_ms` over solved challenges.
     async fn solve_times(&self, scope: StatsScope) -> Result<SolveTimes, ShieldStatsError>;
 
-    /// The newest events before `before`, newest first.
+    /// The newest events before `before` that `filter` keeps, newest first.
     async fn recent_events(
         &self,
         project_id: i32,
         environment_id: i32,
+        filter: &EventFilter,
         before: Option<UtcDateTime>,
         limit: u64,
     ) -> Result<Vec<StoredShieldEvent>, ShieldStatsError>;
+}
+
+/// Which events a list keeps; every field set must match.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    /// `verdict`, `challenge_issued`, `challenge_solved` or `challenge_failed`.
+    pub kind: Option<String>,
+    /// `block`, `challenge` or `log`.
+    pub verdict: Option<String>,
+    /// The client address; an IPv4-mapped IPv6 address is its IPv4 one.
+    pub ip: Option<std::net::IpAddr>,
 }
 
 /// The source a stored reason names: `spamhaus_drop (185.93.89.0/24)` is
@@ -219,13 +231,16 @@ impl ShieldStatsStorage for PostgresShieldStats {
     }
 
     async fn source_counts(&self, scope: StatsScope) -> Result<Vec<KeyedCount>, ShieldStatsError> {
+        // Only a request with a verdict carries reasons; saying so lets the
+        // partial `idx_proxy_logs_shield_verdict` index skip every other row.
         let sql = format!(
             "SELECT label AS key, COUNT(*)::bigint AS count FROM ( \
                  SELECT DISTINCT p.id, p.timestamp, \
                      split_part(split_part(r.reason, ' (', 1), ' on ', 1) AS label \
                  FROM proxy_logs p \
                  CROSS JOIN LATERAL jsonb_array_elements_text(p.shield_reasons) AS r(reason) \
-                 WHERE {PG_SCOPE_P} AND jsonb_typeof(p.shield_reasons) = 'array' \
+                 WHERE {PG_SCOPE_P} AND p.shield_verdict IS NOT NULL AND p.shield_verdict <> '' \
+                     AND jsonb_typeof(p.shield_reasons) = 'array' \
              ) labelled \
              GROUP BY label ORDER BY count DESC, label LIMIT {MAX_SOURCES}"
         );
@@ -281,12 +296,23 @@ impl ShieldStatsStorage for PostgresShieldStats {
         &self,
         project_id: i32,
         environment_id: i32,
+        filter: &EventFilter,
         before: Option<UtcDateTime>,
         limit: u64,
     ) -> Result<Vec<StoredShieldEvent>, ShieldStatsError> {
         let mut query = shield_events::Entity::find()
             .filter(shield_events::Column::ProjectId.eq(project_id))
             .filter(shield_events::Column::EnvironmentId.eq(environment_id));
+        if let Some(kind) = &filter.kind {
+            query = query.filter(shield_events::Column::Kind.eq(kind.as_str()));
+        }
+        if let Some(verdict) = &filter.verdict {
+            query = query.filter(shield_events::Column::Verdict.eq(verdict.as_str()));
+        }
+        // The address is stored as the proxy wrote it, in canonical form.
+        if let Some(ip) = filter.ip {
+            query = query.filter(shield_events::Column::Ip.eq(ip.to_canonical().to_string()));
+        }
         if let Some(before) = before {
             query = query.filter(shield_events::Column::Timestamp.lt(before));
         }
@@ -516,9 +542,25 @@ impl ShieldStatsStorage for ClickHouseShieldStats {
         &self,
         project_id: i32,
         environment_id: i32,
+        filter: &EventFilter,
         before: Option<UtcDateTime>,
         limit: u64,
     ) -> Result<Vec<StoredShieldEvent>, ShieldStatsError> {
+        // Each filter adds a bound condition; an unset one adds none, so the
+        // binds below follow the same order.
+        let mut conditions = String::new();
+        if filter.kind.is_some() {
+            conditions.push_str(" AND shield_events.kind = ?");
+        }
+        // The select aliases `verdict` and `ip` as text, so these name the
+        // table's columns: compared as stored, the skip indexes of
+        // 0008_shield_events_indexes.sql can rule out granules.
+        if filter.verdict.is_some() {
+            conditions.push_str(" AND shield_events.verdict = ?");
+        }
+        if filter.ip.is_some() {
+            conditions.push_str(" AND shield_events.ip = toIPv6(?)");
+        }
         // `limit` is server-bounded by the caller; it is a number, not text.
         let sql = format!(
             "SELECT toUnixTimestamp64Milli(timestamp) AS ts, node_id, request_id, \
@@ -528,19 +570,31 @@ impl ShieldStatsStorage for ClickHouseShieldStats {
                  toString(signature) AS signature, host, path, user_agent, difficulty, solve_ms \
              FROM shield_events \
              WHERE project_id = ? AND environment_id = ? \
-                 AND timestamp < fromUnixTimestamp64Milli(?) \
+                 AND timestamp < fromUnixTimestamp64Milli(?){conditions} \
              ORDER BY timestamp DESC LIMIT {limit}"
         );
         let before = before.unwrap_or_else(Utc::now).timestamp_millis();
-        let rows = match self
+        let mut query = self
             .client
             .query(&sql)
             .bind(project_id)
             .bind(environment_id)
-            .bind(before)
-            .fetch_all::<ChEventRow>()
-            .await
-        {
+            .bind(before);
+        if let Some(kind) = &filter.kind {
+            query = query.bind(kind.as_str());
+        }
+        if let Some(verdict) = &filter.verdict {
+            query = query.bind(verdict.as_str());
+        }
+        // The column holds IPv4 as IPv4-mapped IPv6, as the writer stores it.
+        if let Some(ip) = filter.ip {
+            let mapped = match ip.to_canonical() {
+                std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped(),
+                std::net::IpAddr::V6(v6) => v6,
+            };
+            query = query.bind(mapped.to_string());
+        }
+        let rows = match query.fetch_all::<ChEventRow>().await {
             Ok(rows) => rows,
             Err(error) if is_missing_table(&error) => Vec::new(),
             Err(error) => return Err(ch_err("recent_events")(error)),
@@ -601,5 +655,150 @@ mod tests {
         assert_eq!(display_ip("::ffff:203.0.113.9".into()), "203.0.113.9");
         assert_eq!(display_ip("2001:db8::1".into()), "2001:db8::1");
         assert_eq!(display_ip("::ffff:zz".into()), "::ffff:zz");
+    }
+
+    /// The ClickHouse event list filters as the Postgres one does: kind,
+    /// verdict (an Enum8 there) and the address (IPv4 stored mapped).
+    #[tokio::test]
+    async fn clickhouse_events_filter_by_kind_verdict_and_address() -> anyhow::Result<()> {
+        use std::time::Duration;
+        use testcontainers::{
+            core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+        let image = GenericImage::new("clickhouse/clickhouse-server", "26.2.5")
+            .with_exposed_port(ContainerPort::Tcp(8123))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/ping")
+                    .with_port(ContainerPort::Tcp(8123))
+                    .with_expected_status_code(200u16),
+            ))
+            .with_env_var("CLICKHOUSE_DB", "shield_test")
+            .with_env_var("CLICKHOUSE_PASSWORD", "test");
+        let container = match image.start().await {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!(
+                    "Skipping ClickHouse Shield events test: cannot start container ({error})"
+                );
+                return Ok(());
+            }
+        };
+        let port = container.get_host_port_ipv4(8123).await?;
+        let client = temps_clickhouse::build_client(
+            &format!("http://127.0.0.1:{port}"),
+            "shield_test",
+            "default",
+            "test",
+            temps_clickhouse::ClickHouseCompression::default(),
+        );
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.query("SELECT 1").execute().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(ready, "ClickHouse never became ready");
+        // The table, and its skip indexes, as the migrations create them.
+        crate::storage::clickhouse_migrations::apply_migrations(&client, "shield_test").await?;
+        for (seconds, kind, verdict, ip) in [
+            (10, "verdict", "block", "203.0.113.9"),
+            (20, "verdict", "log", "203.0.113.9"),
+            (30, "challenge_failed", "challenge", "203.0.113.9"),
+            (40, "verdict", "block", "198.51.100.4"),
+            (50, "challenge_issued", "challenge", "2001:db8::7"),
+            (60, "verdict", "log", "198.51.100.4"),
+        ] {
+            client
+                .query(
+                    "INSERT INTO shield_events (timestamp, project_id, environment_id, request_id, \
+                         kind, ip, verdict, mode, reasons, host, path, user_agent) \
+                     SELECT now64(3) - toIntervalSecond(?), 1, 1, 'req', ?, toIPv6(?), ?, \
+                         'selective', [], 'app.example.test', '/x', 'ua'",
+                )
+                .bind(seconds)
+                .bind(kind)
+                .bind(ip)
+                .bind(verdict)
+                .execute()
+                .await?;
+        }
+        // Another environment's events never show.
+        client
+            .query(
+                "INSERT INTO shield_events (timestamp, project_id, environment_id, request_id, \
+                     kind, ip, verdict, mode, reasons, host, path, user_agent) \
+                 SELECT now64(3), 1, 2, 'req', 'verdict', toIPv6('198.51.100.4'), 'block', \
+                     'selective', [], 'app.example.test', '/x', 'ua'",
+            )
+            .execute()
+            .await?;
+
+        let stats = ClickHouseShieldStats { client };
+        let list = |kind: Option<&str>, verdict: Option<&str>, ip: Option<&str>| {
+            let filter = EventFilter {
+                kind: kind.map(str::to_string),
+                verdict: verdict.map(str::to_string),
+                ip: ip.map(|ip| ip.parse().unwrap()),
+            };
+            let stats = &stats;
+            async move {
+                stats
+                    .recent_events(1, 1, &filter, None, 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|event| (event.kind, event.verdict, event.ip))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let owned = |rows: &[(&str, &str, &str)]| {
+            rows.iter()
+                .map(|(k, v, ip)| (k.to_string(), v.to_string(), ip.to_string()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(list(None, None, None).await.len(), 6);
+        assert_eq!(
+            list(None, Some("block"), None).await,
+            owned(&[
+                ("verdict", "block", "203.0.113.9"),
+                ("verdict", "block", "198.51.100.4")
+            ])
+        );
+        assert_eq!(
+            list(Some("challenge_failed"), None, None).await,
+            owned(&[("challenge_failed", "challenge", "203.0.113.9")])
+        );
+        for ip in ["198.51.100.4", "::ffff:198.51.100.4"] {
+            assert_eq!(
+                list(Some("verdict"), Some("log"), Some(ip)).await,
+                owned(&[("verdict", "log", "198.51.100.4")]),
+                "{ip}"
+            );
+        }
+        assert_eq!(
+            list(None, None, Some("2001:db8::7")).await,
+            owned(&[("challenge_issued", "challenge", "2001:db8::7")])
+        );
+
+        // An address filter can skip granules: ClickHouse plans with the
+        // address index from 0008_shield_events_indexes.sql.
+        let plan: Vec<String> = stats
+            .client
+            .query(
+                "EXPLAIN indexes = 1 SELECT toString(ip) AS ip FROM shield_events \
+                 WHERE environment_id = 1 AND shield_events.ip = toIPv6('203.0.113.9')",
+            )
+            .fetch_all()
+            .await?;
+        assert!(
+            plan.iter().any(|line| line.contains("shield_events_ip")),
+            "{plan:#?}"
+        );
+        Ok(())
     }
 }

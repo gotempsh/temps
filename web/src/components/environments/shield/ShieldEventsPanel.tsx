@@ -22,60 +22,40 @@ import {
   shieldEventKindLabel,
   shieldVerdictBadge,
 } from '@/lib/shield'
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { ChevronLeft, ChevronRight, ShieldCheck } from 'lucide-react'
-import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { ArrowRight, ShieldCheck } from 'lucide-react'
 import type { ShieldEnvironmentPath } from './EnvironmentShieldView'
 import { ShieldSection } from './ShieldSection'
 
-const PAGE_SIZE = 50
+/** How many events the Shield tab shows; the rest are in the full list. */
+export const PREVIEW_SIZE = 10
 
-export function ShieldEventsPanel({ path }: { path: ShieldEnvironmentPath }) {
-  // A stack of `before` cursors: the last one is the page shown, an empty
-  // stack the newest events.
-  const [cursors, setCursors] = useState<string[]>([])
-  const before = cursors[cursors.length - 1]
+/**
+ * The newest Shield events, on the environment's Shield tab. Every event,
+ * with filters and paging, is in the full list (`ShieldEventsList`).
+ */
+export function ShieldEventsPanel({
+  path,
+  onShowAll,
+}: {
+  path: ShieldEnvironmentPath
+  onShowAll: () => void
+}) {
   const events = useQuery({
-    ...listShieldEventsOptions({
-      path,
-      query: { limit: PAGE_SIZE, before },
-    }),
-    placeholderData: keepPreviousData,
+    ...listShieldEventsOptions({ path, query: { limit: PREVIEW_SIZE } }),
   })
-
   const rows = events.data?.events ?? []
-  const nextBefore = events.data?.next_before ?? null
 
   return (
     <ShieldSection
       id="shield-events"
       title="Recent events"
-      description="Requests with a verdict, and the challenges served, newest first."
+      description={`The ${PREVIEW_SIZE} newest requests with a verdict, and challenges served.`}
       actions={
-        <>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={cursors.length === 0 || events.isFetching}
-            onClick={() => setCursors((stack) => stack.slice(0, -1))}
-          >
-            <ChevronLeft className="mr-1 h-4 w-4" />
-            Newer
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            size="sm"
-            disabled={nextBefore === null || events.isFetching}
-            onClick={() => {
-              if (nextBefore) setCursors((stack) => [...stack, nextBefore])
-            }}
-          >
-            Older
-            <ChevronRight className="ml-1 h-4 w-4" />
-          </Button>
-        </>
+        <Button type="button" variant="outline" size="sm" onClick={onShowAll}>
+          All events
+          <ArrowRight className="ml-2 h-4 w-4" />
+        </Button>
       }
     >
       {events.error && (
@@ -99,34 +79,36 @@ export function ShieldEventsPanel({ path }: { path: ShieldEnvironmentPath }) {
           size="compact"
           icon={ShieldCheck}
           title="No Shield events yet"
-          description={
-            cursors.length === 0
-              ? 'Requests Shield has a verdict for, and challenges it serves, appear here.'
-              : 'There are no older events.'
-          }
+          description="Requests Shield has a verdict for, and challenges it serves, appear here."
         />
       ) : (
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Time</TableHead>
-              <TableHead>Event</TableHead>
-              <TableHead>Client</TableHead>
-              <TableHead className="hidden md:table-cell">Request</TableHead>
-              <TableHead className="hidden lg:table-cell">Why</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {rows.map((event, index) => (
-              <EventRow
-                key={`${event.request_id}-${event.kind}-${index}`}
-                event={event}
-              />
-            ))}
-          </TableBody>
-        </Table>
+        <EventsTable rows={rows} />
       )}
     </ShieldSection>
+  )
+}
+
+export function EventsTable({ rows }: { rows: ShieldEventResponse[] }) {
+  return (
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Time</TableHead>
+          <TableHead>Event</TableHead>
+          <TableHead>Client</TableHead>
+          <TableHead className="hidden md:table-cell">Request</TableHead>
+          <TableHead className="hidden lg:table-cell">Why</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {rows.map((event, index) => (
+          <EventRow
+            key={`${event.request_id}-${event.kind}-${index}`}
+            event={event}
+          />
+        ))}
+      </TableBody>
+    </Table>
   )
 }
 
@@ -198,7 +180,7 @@ function EventRow({ event }: { event: ShieldEventResponse }) {
   )
 }
 
-function EventsSkeleton() {
+export function EventsSkeleton() {
   return (
     <div
       role="status"

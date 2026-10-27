@@ -136955,6 +136955,33 @@
             }
           },
           {
+            "description": "Only this kind: `verdict`, `challenge_issued`, `challenge_solved` or\n`challenge_failed`.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this verdict: `block`, `challenge` or `log`.",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this client address, IPv4 or IPv6.",
+            "in": "query",
+            "name": "ip",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Only events before this instant (the `next_before` of the previous\npage).",
             "in": "query",
             "name": "before",
