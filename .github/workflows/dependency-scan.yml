@@ -229,6 +229,29 @@ jobs:
       #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
       #   which does not touch it. Drop this entry once aws-sigv4 moves to
       #   crypto-bigint >= 0.7.6.
+      # - RUSTSEC-2026-0391, RUSTSEC-2026-0398, RUSTSEC-2026-0403 (zstd 0.13.3
+      #   / zstd-safe 7.2.4: data from an abandoned stream leaking into the
+      #   next one on a reused context; `Seekable::decompress` past the end;
+      #   uninitialized memory after a failed legacy-frame streaming decode;
+      #   fixed in zstd >= 0.14.3 / zstd-safe >= 8.2.0). The workspace's own
+      #   zstd is already 0.14.3. The 0.13.3 copy is locked only by two
+      #   upstream crates whose latest releases (checked 2026-10-27) still
+      #   require `zstd ^0.13`:
+      #   * pingora-header-serde 0.9.0 <- pingora-cache <- pingora-proxy
+      #     (temps-proxy, temps-edge): compresses cached response headers.
+      #     Temps never enables Pingora's HTTP cache (no `session.cache` use in
+      #     the workspace), so this code is linked but never runs.
+      #   * msb_krun_vmm 0.1.41 (0.1.42 is the same) <- microsandbox
+      #     (temps-agents), a dependency only on x86_64 and, per the bincode
+      #     entry above, not linked on musl. Its one call is
+      #     `zstd::stream::copy_decode` on an external guest kernel file
+      #     (builder.rs, `KernelFormat::ImageZstd`): a fresh decoder per call,
+      #     so no context is reused (0391); the `seekable` feature is not
+      #     enabled, so 0398's code is not compiled; and 0403 needs a malformed
+      #     legacy frame in a kernel file on the host, which only someone who
+      #     can already write the host's files could plant.
+      #   Drop these three once pingora-header-serde and msb_krun_vmm move to
+      #   zstd >= 0.14.3.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -244,7 +267,7 @@ jobs:
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381,RUSTSEC-2026-0387
+          ignore: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0367,RUSTSEC-2026-0368,RUSTSEC-2026-0369,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0391,RUSTSEC-2026-0398,RUSTSEC-2026-0403
 
   web-audit:
     name: Web Dependency Audit (bun audit)
