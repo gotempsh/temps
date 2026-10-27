@@ -87,11 +87,9 @@ fn mesh_problem(error: WireguardMeshError) -> Problem {
             .with_title("WireGuard Mesh Settings In Use")
             .with_detail(error.to_string()),
         // Not the request's fault: the stored CA must be rotated first.
-        MeshError::CaPredatesCertificateHistory { .. } => {
-            problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Rotate The Cluster CA First")
-                .with_detail(error.to_string())
-        }
+        MeshError::CaPredatesCertificateHistory { .. } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Rotate The Cluster CA First")
+            .with_detail(error.to_string()),
         MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Off")
             .with_detail("Turn the WireGuard mesh on before choosing a hub."),
@@ -813,7 +811,10 @@ mod tests {
         assert_eq!(body["join_url"], "https://cp.example.com");
         assert_eq!(body["enable_command"], ENABLE_MESH_COMMAND);
         assert_eq!(body["can_enable"], cfg!(target_os = "linux"));
-        assert_eq!(body["pool_cidr"], network_config(false, false).wireguard_cidr);
+        assert_eq!(
+            body["pool_cidr"],
+            network_config(false, false).wireguard_cidr
+        );
         assert_eq!(body["ca_rotation_required"], false);
         assert!(body["reason"]
             .as_str()
