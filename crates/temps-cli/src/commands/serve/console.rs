@@ -2834,7 +2834,8 @@ fn ai_read_allowlist() -> Vec<String> {
         "list_ip_access_control",
         // ── Shield (ADR 066) ──
         // Verdict counts, lookups and operator entries; token rows carry
-        // only names and dates, never the token or its hash. The event list
+        // id, scope, environment_id, created_by, name, and timestamps,
+        // never the token or its hash. The event list
         // stays out: it carries visitors' addresses, paths and user agents.
         "get_shield_summary",
         "lookup_shield_client",
