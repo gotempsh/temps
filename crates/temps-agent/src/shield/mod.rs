@@ -44,6 +44,8 @@ use temps_core::worker_shield::{
 };
 use temps_shield::crawler_check::CrawlerVerifier;
 use temps_shield::crawlers::Crawler;
+pub use temps_shield::netwatch::NetwatchConfig;
+use temps_shield::netwatch::{RequestLine, RequestSender};
 use temps_shield::signatures::MATCHED_HEADERS;
 use temps_shield::{
     assets, bypass, events, Action, ChallengeGate, Decision, EnvPolicy, EventKind, EventSink,
@@ -51,7 +53,7 @@ use temps_shield::{
     VerifyOutcome,
 };
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Where the last good Shield snapshot is kept, next to `routes.json`.
 pub const SNAPSHOT_FILE: &str = "shield.json";
@@ -192,6 +194,8 @@ pub struct WorkerShield {
     /// The revision of the loaded snapshot; 0 for the built-in lists.
     revision: AtomicU64,
     sink: OnceLock<Arc<dyn EventSink>>,
+    /// Where request lines go when netwatch runs on this node (D12).
+    netwatch: OnceLock<RequestSender>,
     crawlers: OnceLock<Option<CrawlerVerifier>>,
     path: PathBuf,
 }
@@ -206,14 +210,33 @@ impl WorkerShield {
             current: tokio::sync::watch::Sender::new(None),
             revision: AtomicU64::new(0),
             sink: OnceLock::new(),
+            netwatch: OnceLock::new(),
             crawlers: OnceLock::new(),
             path,
         }
     }
 
-    /// Where this node's own lists go (workstream E's netwatch reader).
+    /// This node's own lists: netwatch's bans, empty without netwatch.
     pub fn local(&self) -> Arc<ArcSwapOption<Index>> {
         Arc::clone(&self.local)
+    }
+
+    /// Talk to the node's netwatch (D12): its bans join this node's lists
+    /// and every request Shield sees is reported to it. Must run inside a
+    /// Tokio runtime; a second call is ignored.
+    pub fn start_netwatch(&self, config: NetwatchConfig) {
+        if self.netwatch.get().is_some() {
+            return;
+        }
+        if config.enabled {
+            info!(
+                ?config,
+                "Shield: reading netwatch bans and reporting requests to it"
+            );
+        }
+        let _ = self
+            .netwatch
+            .set(temps_shield::netwatch::spawn_into(config, &self.local));
     }
 
     /// Where events go; set once, by the uploader.
@@ -307,16 +330,23 @@ pub(crate) struct Visitor {
 pub(crate) struct Applied {
     engine: Arc<ShieldEngine>,
     environment_id: i32,
+    /// The request's line for netwatch, sent once its status is known.
+    netwatch: Option<(RequestSender, RequestLine)>,
 }
 
 impl Applied {
-    /// Counts the response for the adaptive difficulty (D6).
-    pub fn record_status(&self, status: StatusCode) {
+    /// Counts the response for the adaptive difficulty (D6) and reports
+    /// the request to netwatch (D12).
+    pub fn record_status(self, status: StatusCode) {
         self.engine.record_status(
             self.environment_id,
             status.as_u16(),
             temps_shield::unix_now(),
         );
+        if let Some((sender, mut line)) = self.netwatch {
+            line.status = status.as_u16();
+            sender.send(line);
+        }
     }
 }
 
@@ -749,9 +779,24 @@ pub(crate) async fn guard(
             }
         }
     }
+    let netwatch = shield
+        .netwatch
+        .get()
+        .filter(|sender| sender.is_enabled())
+        .and_then(|sender| {
+            let line = RequestLine::new(
+                &shield_request,
+                host,
+                0,
+                Some(&decision),
+                chrono::Utc::now().timestamp_millis(),
+            )?;
+            Some((sender.clone(), line))
+        });
     let applied = Applied {
         engine: Arc::clone(&engine),
         environment_id: policy.environment_id,
+        netwatch,
     };
     if decision.is_event() {
         let request_id = request_id();
@@ -764,10 +809,14 @@ pub(crate) async fn guard(
             path,
             user_agent: shield_request.user_agent,
         };
-        let mut recorded = vec![context.event(EventKind::Verdict, Some(&decision))];
-        if matches!(decision.outcome, Outcome::Challenge { .. }) {
-            recorded.push(context.event(EventKind::ChallengeIssued, Some(&decision)));
-        }
+        // One event per decision, as on the control plane: a served
+        // challenge is its `challenge_issued`.
+        let kind = if matches!(decision.outcome, Outcome::Challenge { .. }) {
+            EventKind::ChallengeIssued
+        } else {
+            EventKind::Verdict
+        };
+        let recorded = vec![context.event(kind, Some(&decision))];
         if let Some(admitted) = decision.admitted {
             debug!(
                 host,

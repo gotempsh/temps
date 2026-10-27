@@ -710,6 +710,7 @@ pub fn setup_proxy_server(
     .with_shield_lists(shield_lists)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
+    .with_netwatch(spawn_netwatch()?)
     // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
     // process, so it needs the database and the gate key's sealing key; in
     // split topology both are available here as they are to the console.
@@ -978,6 +979,21 @@ fn bind_failure_message(
     }
 }
 
+/// The node's netwatch exchange (ADR 066 D12), on the shared refresh
+/// runtime. Off unless `TEMPS_NETWATCH` turns it on.
+fn spawn_netwatch() -> Result<temps_shield::netwatch::Netwatch> {
+    let config = temps_shield::netwatch::NetwatchConfig::from_env();
+    if config.enabled {
+        tracing::info!(
+            ?config,
+            "Shield: reading netwatch bans and reporting requests to it"
+        );
+    }
+    let runtime = security_refresh_runtime()?;
+    let _entered = runtime.enter();
+    Ok(temps_shield::netwatch::spawn(config))
+}
+
 /// The proxy's Shield event store (ADR 066, I8), writing on the shared
 /// refresh runtime: events arrive in batches and a slow write only drops
 /// events, never delays a request.
@@ -1121,7 +1137,8 @@ pub fn create_proxy_service(
     .with_proxy_metrics(proxy_metrics)
     .with_shield_lists(shield_lists)
     .with_shield_bypass_tokens(shield_bypass)
-    .with_shield_events(shield_events);
+    .with_shield_events(shield_events)
+    .with_netwatch(spawn_netwatch()?);
 
     Ok(lb)
 }

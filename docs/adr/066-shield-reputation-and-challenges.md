@@ -1061,6 +1061,12 @@ which every control plane registers:
   wrote: `block` on a `403`, `challenge` on a challenge page, a `429` or a
   `426`, and `error` on a `503` when no challenge could be issued. A
   request Shield let through carries no header, whatever its verdict.
+- **netwatch.** Each node turns the exchange on for itself with
+  `TEMPS_NETWATCH=1` (`TEMPS_NETWATCH_URL`, `TEMPS_NETWATCH_TOKEN` and
+  `TEMPS_NETWATCH_SOCKET` override the defaults), not with a platform
+  setting, since netwatch runs per host. The bans load as the node's local
+  list; request lines go to netwatch's Unix datagram socket, one versioned
+  JSON object each, for requests to environments whose mode is not `off`.
 - **Signatures.** The table lives in the `temps-signatures` crate, with no
   dependencies, so netwatch can depend on it too. Recon and secret probes
   log unless the address is also listed at `challenge` or above, as D8 says.

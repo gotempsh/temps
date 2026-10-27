@@ -122,6 +122,34 @@ impl Default for NetwatchConfig {
     }
 }
 
+impl NetwatchConfig {
+    /// The node's netwatch settings from its environment. Off unless
+    /// `TEMPS_NETWATCH` is `1` or `true`: temps never assumes netwatch is
+    /// there. `TEMPS_NETWATCH_URL`, `TEMPS_NETWATCH_TOKEN` and
+    /// `TEMPS_NETWATCH_SOCKET` override the defaults.
+    pub fn from_env() -> Self {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let set = |name: &str| {
+            var(name)
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        let defaults = Self::default();
+        Self {
+            enabled: set("TEMPS_NETWATCH")
+                .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            api_url: set("TEMPS_NETWATCH_URL").unwrap_or(defaults.api_url),
+            api_token: set("TEMPS_NETWATCH_TOKEN"),
+            socket_path: set("TEMPS_NETWATCH_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or(defaults.socket_path),
+        }
+    }
+}
+
 impl std::fmt::Debug for NetwatchConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NetwatchConfig")
@@ -159,17 +187,21 @@ pub struct Netwatch {
 /// is dropped, the sender's task once every [`RequestSender`] is.
 pub fn spawn(config: NetwatchConfig) -> Netwatch {
     let local = Arc::new(ArcSwapOption::empty());
+    let sender = spawn_into(config, &local);
+    Netwatch { local, sender }
+}
+
+/// As [`spawn`], loading the bans into `local`, an index the caller
+/// already hands its ingress.
+pub fn spawn_into(config: NetwatchConfig, local: &Arc<ArcSwapOption<Index>>) -> RequestSender {
     if !config.enabled {
-        return Netwatch {
-            local,
-            sender: RequestSender::disabled(),
-        };
+        return RequestSender::disabled();
     }
     let reader = BansReader::new(&config, Timing::default());
-    tokio::spawn(reader.run(Arc::downgrade(&local)));
+    tokio::spawn(reader.run(Arc::downgrade(local)));
     let (sender, rx) = RequestSender::channel(QUEUE_LINES);
     tokio::spawn(deliver(rx, config.socket_path, sender.dropped.clone()));
-    Netwatch { local, sender }
+    sender
 }
 
 // -- bans --------------------------------------------------------------------
@@ -442,6 +474,11 @@ impl RequestSender {
         (sender, rx)
     }
 
+    /// Whether lines go anywhere, so callers can skip building them.
+    pub fn is_enabled(&self) -> bool {
+        self.tx.is_some()
+    }
+
     /// Queues `line`, or drops it when the queue is full.
     pub fn send(&self, line: RequestLine) {
         if let Some(tx) = &self.tx {
@@ -512,6 +549,25 @@ fn send_line(socket: &UnixDatagram, path: &Path, line: &RequestLine) -> std::io:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_environment_turns_netwatch_on_and_overrides_the_defaults() {
+        let off = NetwatchConfig::from_vars(|_| None);
+        assert!(!off.enabled);
+        assert_eq!(off.api_url, DEFAULT_API_URL);
+        let vars = |name: &str| match name {
+            "TEMPS_NETWATCH" => Some("true".to_string()),
+            "TEMPS_NETWATCH_URL" => Some("http://127.0.0.1:9999".to_string()),
+            "TEMPS_NETWATCH_SOCKET" => Some(" ".to_string()),
+            _ => None,
+        };
+        let on = NetwatchConfig::from_vars(vars);
+        assert!(on.enabled);
+        assert_eq!(on.api_url, "http://127.0.0.1:9999");
+        assert_eq!(on.socket_path, PathBuf::from(DEFAULT_SOCKET_PATH));
+        assert_eq!(on.api_token, None);
+        assert!(!RequestSender::disabled().is_enabled());
+    }
     use crate::events::MAX_FIELD_CHARS;
     use std::net::Ipv4Addr;
     use std::sync::Mutex;

@@ -1116,6 +1116,9 @@ pub struct ProxyContext {
     /// The environment Shield counted this request for, so its response
     /// status feeds the same environment's adaptive difficulty (D6).
     pub shield_env: Option<i32>,
+    /// The line netwatch gets for this request once its status is known
+    /// (ADR 066 D12); `None` without netwatch.
+    pub netwatch_line: Option<temps_shield::netwatch::RequestLine>,
     /// The client's JA4 and where it came from (ADR 066 D4), resolved with
     /// the client address. Recorded with the request log; nothing acts on
     /// it yet.
@@ -1519,6 +1522,14 @@ impl LoadBalancer {
     /// Record Shield events in `events` instead of discarding them.
     pub fn with_shield_events(mut self, events: Arc<dyn temps_shield::EventSink>) -> Self {
         self.shield.events = events;
+        self
+    }
+
+    /// Talk to the node's netwatch (ADR 066 D12): its bans join the lists
+    /// as this node's own, and every request Shield sees is reported to it.
+    pub fn with_netwatch(mut self, netwatch: temps_shield::netwatch::Netwatch) -> Self {
+        self.shield.local = netwatch.local;
+        self.shield.netwatch = netwatch.sender;
         self
     }
 
@@ -3645,7 +3656,7 @@ impl LoadBalancer {
         // The clearance cookie is `__Host-` and `Secure`: only a TLS
         // connection can receive one.
         let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
-        let decision = {
+        let (decision, netwatch_line) = {
             let header = session.req_header();
             let text = |name: &str| header.headers.get(name).and_then(|v| v.to_str().ok());
             let mut matched = [("", ""); temps_shield::signatures::MATCHED_HEADERS.len()];
@@ -3700,9 +3711,21 @@ impl LoadBalancer {
                     },
                 ));
             }
-            decision
+            let line = if self.shield.netwatch.is_enabled() {
+                temps_shield::netwatch::RequestLine::new(
+                    &request,
+                    &ctx.host,
+                    0,
+                    Some(&decision),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            } else {
+                None
+            };
+            (decision, line)
         };
         ctx.shield_env = Some(environment.id);
+        ctx.netwatch_line = netwatch_line;
         if let Some(temps_shield::Admitted::BypassToken(id)) = decision.admitted {
             self.shield.bypass.record_use(id, now);
         }
@@ -5587,6 +5610,7 @@ impl ProxyHttp for LoadBalancer {
             shield: None,
             shield_header: None,
             shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
@@ -8728,6 +8752,10 @@ impl ProxyHttp for LoadBalancer {
                 .engine
                 .record_status(env_id, status_code, temps_shield::unix_now());
         }
+        if let Some(mut line) = ctx.netwatch_line.take() {
+            line.status = status_code;
+            self.shield.netwatch.send(line);
+        }
 
         // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(
@@ -9238,6 +9266,7 @@ mod markdown_tests {
             shield: None,
             shield_header: None,
             shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
@@ -9781,6 +9810,7 @@ mod markdown_pipeline_tests {
             shield: None,
             shield_header: None,
             shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,

@@ -328,6 +328,12 @@ impl AgentCommand {
                 }
             }
 
+            // netwatch on this node (ADR 066 D12), when TEMPS_NETWATCH turns
+            // it on: its bans join this node's lists.
+            route_store
+                .shield()
+                .start_netwatch(temps_agent::shield::NetwatchConfig::from_env());
+
             // Shield on the public ingress (ADR 066 D10): the snapshot and
             // keys the control plane names in the route snapshot, and the
             // events this node's ingress records.

@@ -349,10 +349,8 @@ async fn attack_challenges_a_page_load_and_admits_it_once_solved() {
     let html = body_text(challenged).await;
     let token = attribute(&html, "data-token").to_string();
     let difficulty: u8 = attribute(&html, "data-difficulty").parse().unwrap();
-    assert_eq!(
-        fixture.events.kinds(),
-        vec![EventKind::Verdict, EventKind::ChallengeIssued]
-    );
+    // One event per decision, as on the control plane.
+    assert_eq!(fixture.events.kinds(), vec![EventKind::ChallengeIssued]);
 
     let nonce = solve(&token, difficulty);
     let verified = run(
@@ -930,4 +928,37 @@ async fn shutdown_sends_what_waits() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     shutdown.notify_waiters();
     until(|| plane.received.lock().unwrap().len() == 2).await;
+}
+
+#[tokio::test]
+async fn netwatch_gets_each_request_with_its_status() {
+    let fixture = fixture(policy("log", None), true);
+    let socket_path = fixture._dir.path().join("requests.sock");
+    let socket = tokio::net::UnixDatagram::bind(&socket_path).unwrap();
+    fixture.shield.start_netwatch(super::NetwatchConfig {
+        enabled: true,
+        // Nobody answers here: the bans reader only backs off.
+        api_url: "http://127.0.0.1:9".to_string(),
+        api_token: None,
+        socket_path,
+    });
+
+    let (_, applied) = guard(&fixture.shield, HOST, get_page("/.env"), visitor(CLEAN))
+        .await
+        .unwrap();
+    applied
+        .expect("Shield ran")
+        .record_status(StatusCode::NOT_FOUND);
+
+    let mut datagram = vec![0u8; 4096];
+    let length = tokio::time::timeout(Duration::from_secs(5), socket.recv(&mut datagram))
+        .await
+        .expect("netwatch got a line")
+        .unwrap();
+    let line: serde_json::Value = serde_json::from_slice(&datagram[..length]).unwrap();
+    assert_eq!(line["v"], 1);
+    assert_eq!(line["ip"], CLEAN.to_string());
+    assert_eq!(line["host"], HOST);
+    assert_eq!(line["path"], "/.env");
+    assert_eq!(line["status"], 404);
 }

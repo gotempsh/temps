@@ -28,11 +28,13 @@ pub const CRAWLER_CHECK_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct ProxyShield {
     pub(crate) engine: Arc<ShieldEngine>,
     pub(crate) lists: Arc<ShieldLists>,
-    /// What this node adds to the lists on its own (netwatch's bans, phase
-    /// 8). Empty until that reader is wired in.
+    /// What this node adds to the lists on its own: netwatch's bans
+    /// (phase 8), empty without netwatch.
     pub(crate) local: Arc<ArcSwapOption<Index>>,
     pub(crate) bypass: Arc<BypassTokens>,
     pub(crate) events: Arc<dyn EventSink>,
+    /// Where request lines go when netwatch runs on this node (D12).
+    pub(crate) netwatch: temps_shield::netwatch::RequestSender,
     /// Built on first use, on the runtime that serves requests; `None` when
     /// the system DNS configuration cannot be read.
     crawlers: OnceLock<Option<Arc<CrawlerVerifier>>>,
@@ -46,6 +48,7 @@ impl ProxyShield {
             local: Arc::new(ArcSwapOption::empty()),
             bypass: Arc::new(BypassTokens::default()),
             events: Arc::new(NoEvents),
+            netwatch: temps_shield::netwatch::RequestSender::disabled(),
             crawlers: OnceLock::new(),
         }
     }
