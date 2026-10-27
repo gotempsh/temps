@@ -11,6 +11,9 @@ import type {
 } from '@/api/client'
 import {
   applyValues,
+  idList,
+  textList,
+  toggleId,
   canResumeRun,
   canUndoRun,
   conflictChoices,
@@ -28,6 +31,8 @@ import {
   privateDnsWarning,
   parsePrincipals,
   wayInLabel,
+  planGate,
+  accessPolicyMissing,
 } from './reachability'
 
 const address = (
@@ -259,6 +264,44 @@ describe('apply answers', () => {
     ).toEqual({ address: 'app.example.com', dns_provider_id: 7 })
   })
 
+  test('send who may sign in as lists of ids, and no list when empty', () => {
+    const gateFields: SetupField[] = [
+      {
+        key: 'gate_teams',
+        label: 'Only these teams',
+        kind: { type: 'teams' },
+        required: false,
+      },
+      {
+        key: 'gate_users',
+        label: 'Only these people',
+        kind: { type: 'users' },
+        required: false,
+      },
+    ]
+    expect(
+      applyValues(
+        gateFields,
+        { gate_teams: '3, 1,3', gate_users: '' },
+        'team.example.com'
+      )
+    ).toEqual({ address: 'team.example.com', gate_teams: [3, 1] })
+    expect(
+      applyValues(gateFields, { gate_teams: 'x,,' }, 'team.example.com')
+    ).toEqual({ address: 'team.example.com' })
+  })
+
+  test('id and text lists ignore junk and duplicates', () => {
+    expect(idList('1,2,2, 0,-4,abc')).toEqual([1, 2])
+    expect(idList(undefined)).toEqual([])
+    expect(toggleId('1,2', 2)).toBe('1')
+    expect(toggleId('1', 5)).toBe('1,5')
+    expect(textList('a@example.com\n example.org,a@example.com')).toEqual([
+      'a@example.com',
+      'example.org',
+    ])
+  })
+
   test('send the planned address when the option does not ask for one', () => {
     expect(applyValues([], {}, 'app.example.com')).toEqual({
       address: 'app.example.com',
@@ -364,6 +407,16 @@ describe('conflicts (ADR 064 D4)', () => {
     intent: { type: 'connector', name: 'homelab' },
     conflict: 'other.example.com',
   })
+  const accessApp = entry({
+    key: 'run-1/access_app/3/app.example.com',
+    intent: {
+      type: 'access_app',
+      provider_id: 3,
+      name: 'temps-app.example.com-ab12',
+      hostname: 'app.example.com',
+    },
+    conflict: 'its policies were changed',
+  })
   const view = (state: RunView['state'], journal: JournalEntry[]): RunView => ({
     id: 1,
     audience: 'public',
@@ -404,6 +457,47 @@ describe('conflicts (ADR 064 D4)', () => {
       'keep',
       'overwrite',
     ])
+  })
+
+  test('an edited Access app is kept unless they say delete it (ADR 065 D9)', () => {
+    expect(conflictSubject(accessApp)).toBe(
+      'Cloudflare Access app temps-app.example.com-ab12'
+    )
+    expect(conflictChoices(accessApp, true)).toEqual([
+      { decision: 'keep', label: 'Keep the app' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
+    ])
+  })
+})
+
+describe('signed-in gate choice (ADR 065 D7, D9)', () => {
+  const field = (key: string): SetupField =>
+    ({ key, label: key, kind: { type: 'text' }, required: false }) as SetupField
+
+  test('only a signed-in plan names a gate', () => {
+    expect(planGate('signed_in', 'cloudflare_access')).toBe('cloudflare_access')
+    expect(planGate('signed_in', 'temps')).toBe('temps')
+    expect(planGate('public', 'cloudflare_access')).toBeNull()
+    expect(planGate('private', 'temps')).toBeNull()
+  })
+
+  test('a new Access app needs someone to let in', () => {
+    const fields = [field('access_emails'), field('access_email_domains')]
+    expect(accessPolicyMissing(fields, {})).toMatch(/at least one email/)
+    expect(accessPolicyMissing(fields, { access_emails: ' , ' })).toMatch(
+      /at least one email/
+    )
+    expect(
+      accessPolicyMissing(fields, { access_emails: 'ana@example.com' })
+    ).toBeNull()
+    expect(
+      accessPolicyMissing(fields, { access_email_domains: 'example.com' })
+    ).toBeNull()
+  })
+
+  test('an option that uses an existing app asks nothing', () => {
+    expect(accessPolicyMissing([field('access_provider_id')], {})).toBeNull()
+    expect(accessPolicyMissing([], {})).toBeNull()
   })
 })
 

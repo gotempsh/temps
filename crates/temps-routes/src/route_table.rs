@@ -29,6 +29,7 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_core::gate::{AccessGate, GateKind, GatePolicy, TempsGate};
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{
     AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
@@ -232,6 +233,20 @@ fn select_public_route_containers<'a>(
 /// configured public port, in `public_ports` order. Empty for non-Compose
 /// projects. Sleeping on-demand environments register these alongside the
 /// environment hostname so a request to any public service URL wakes them.
+/// ADR 068 D3: a public Compose service beside each host a tunnel generated
+/// for its environment, `<label>--<service>.<tunnel domain>` (the Flat form:
+/// one level under the tunnel's zone).
+fn tunnel_service_hostnames(hosts: Option<&Vec<String>>, route_label: &str) -> Vec<String> {
+    hosts
+        .into_iter()
+        .flatten()
+        .filter_map(|host| host.split_once('.'))
+        .map(|(label, domain)| {
+            PublicHostnameStrategy::Flat.service_hostname(domain, label, route_label)
+        })
+        .collect()
+}
+
 fn compose_public_service_hostnames(
     preset_config: Option<&temps_entities::preset::PresetConfig>,
     preview_domain: &str,
@@ -834,6 +849,110 @@ fn private_address(
     }
 }
 
+/// What the route table reads from a signed-in address's row (ADR 065 D7).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GatedMeta {
+    address_id: String,
+    gate: GateKind,
+    not_before: i64,
+    /// For Cloudflare Access (D9): the Access token whose team signs the
+    /// JWTs, and the app's AUD.
+    access: Option<(i32, String)>,
+}
+
+impl GatedMeta {
+    fn from_row(
+        address_id: String,
+        gate: Option<&str>,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+        access_provider_id: Option<i32>,
+        access_aud: Option<&str>,
+    ) -> GatedMeta {
+        let gate = gate.map_or(GateKind::Unsupported, GateKind::parse);
+        GatedMeta {
+            address_id,
+            // A signed-in row with no gate is not something Temps writes;
+            // it reads as unsupported and serves nobody.
+            gate,
+            not_before: not_before.map_or(0, |t| t.timestamp()),
+            access: match (gate, access_provider_id, access_aud) {
+                (GateKind::CloudflareAccess, Some(provider), Some(aud)) if !aud.is_empty() => {
+                    Some((provider, aud.to_string()))
+                }
+                _ => None,
+            },
+        }
+    }
+}
+
+/// How a host is keyed in the gate map: lower-case, no trailing dot.
+fn gate_host_key(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// `scheme://authority` of the console's external URL, or `None` when it
+/// is not an http(s) URL or bare host. The gate's authorize URL hangs off it.
+fn console_origin(external_url: &str) -> Option<String> {
+    let trimmed = external_url.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (scheme, rest) = match trimmed.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("https".to_string(), trimmed),
+    };
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') || authority.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
+/// The gate policy of every signed-in address (ADR 065 D8). Without a gate
+/// key or a console URL the Temps gate cannot run, and the policy carries
+/// no `temps` part: every listener then answers `503`, never the app. An
+/// Access address whose token or AUD is missing carries no `access` part,
+/// with the same effect (D9).
+fn build_gate_policies(
+    gated_meta: HashMap<String, GatedMeta>,
+    public_key: Option<&str>,
+    authorize_url: Option<&str>,
+    mut revoked: HashMap<String, Vec<String>>,
+    access_teams: &HashMap<i32, crate::access_keys::AccessTeam>,
+) -> HashMap<String, Arc<GatePolicy>> {
+    gated_meta
+        .into_iter()
+        .map(|(host, meta)| {
+            let temps = match (meta.gate, public_key, authorize_url) {
+                (GateKind::Temps, Some(public_key), Some(authorize_url)) => Some(TempsGate {
+                    public_key: public_key.to_string(),
+                    authorize_url: authorize_url.to_string(),
+                    not_before: meta.not_before,
+                    revoked: revoked.remove(&meta.address_id).unwrap_or_default(),
+                }),
+                _ => None,
+            };
+            let access = meta.access.as_ref().and_then(|(provider, aud)| {
+                access_teams.get(provider).map(|team| AccessGate {
+                    issuer: team.issuer.clone(),
+                    audience: aud.clone(),
+                    keys: team.keys.clone(),
+                })
+            });
+            let policy = GatePolicy {
+                address_id: meta.address_id,
+                gate: meta.gate,
+                temps,
+                access,
+            };
+            (host, Arc::new(policy))
+        })
+        .collect()
+}
+
 /// A private address with the route it would take. Never part of the maps
 /// this proxy serves from, and never exported as a public worker route.
 #[derive(Clone, Debug)]
@@ -880,6 +999,9 @@ struct RouteTableSnapshot {
     ingress: Arc<crate::ingress::IngressSnapshot>,
     /// Private addresses and their routes (ADR 064 D5), by host.
     private: HashMap<String, PrivateRoute>,
+    /// The gate of each signed-in address (ADR 065 D7), by lower-cased host.
+    /// Empty on an install with no signed-in address.
+    gated: HashMap<String, Arc<GatePolicy>>,
 }
 
 impl RouteTableSnapshot {
@@ -914,6 +1036,29 @@ impl LegacyRouteTable {
             .get(host)
             .or_else(|| self.wildcards.match_domain(host))
     }
+}
+
+/// Find the gate for `host` the way the route itself is found: an exact
+/// gated address, else none when another exact route takes the host (an
+/// ungated `api.example.com` beats a gated `*.example.com`, as it does for
+/// routing), else a gated wildcard covering it.
+fn gate_lookup(
+    gated: &HashMap<String, Arc<GatePolicy>>,
+    host: &str,
+    has_exact_route: impl Fn(&str) -> bool,
+) -> Option<Arc<GatePolicy>> {
+    if gated.is_empty() {
+        return None;
+    }
+    let host = gate_host_key(host);
+    if let Some(policy) = gated.get(&host) {
+        return Some(Arc::clone(policy));
+    }
+    if has_exact_route(&host) {
+        return None;
+    }
+    let (_, parent) = host.split_once('.')?;
+    gated.get(&format!("*.{parent}")).map(Arc::clone)
 }
 
 /// Take private addresses (ADR 064 D5) out of the maps the control-plane
@@ -1656,6 +1801,15 @@ impl CachedPeerTable {
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
+    /// Make `host` a signed-in address for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn insert_gate_policy_for_test(&self, host: &str, policy: GatePolicy) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.gated.insert(gate_host_key(host), Arc::new(policy));
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
     /// Attach path routes to a source environment for cross-crate tests
     /// without database setup.
     #[doc(hidden)]
@@ -1747,6 +1901,9 @@ impl CachedPeerTable {
         // Addresses whose audience is `private` (ADR 064 D5): routed like any
         // other below, then moved out of everything this proxy serves.
         let mut private_meta: HashMap<String, PrivateAddress> = HashMap::new();
+        // Addresses whose audience is `signed_in` (ADR 065 D7): served like
+        // public ones, with the gate every listener puts in front of them.
+        let mut gated_meta: HashMap<String, GatedMeta> = HashMap::new();
 
         // Build entity caches as we go - only cache what we actually need for routing
         let mut projects_cache: HashMap<i32, Arc<projects::Model>> = HashMap::new();
@@ -1803,8 +1960,34 @@ impl CachedPeerTable {
             env_domains.len()
         );
 
+        // ADR 068 D3: the hosts a tunnel generated for each environment. Its
+        // public Compose services are served as `<label>--<service>` beside
+        // each one (section 4).
+        let mut tunnel_environment_hosts: HashMap<i32, Vec<String>> = HashMap::new();
+        for env_domain in &env_domains {
+            if env_domain.generated_by_connector_id.is_some()
+                && env_domain.audience == temps_entities::audience::PUBLIC
+            {
+                tunnel_environment_hosts
+                    .entry(env_domain.environment_id)
+                    .or_default()
+                    .push(env_domain.domain.to_ascii_lowercase());
+            }
+        }
+
         for env_domain in env_domains {
-            if env_domain.audience != temps_entities::audience::PUBLIC {
+            if env_domain.audience == temps_entities::audience::SIGNED_IN {
+                gated_meta.insert(
+                    gate_host_key(&env_domain.domain),
+                    GatedMeta::from_row(
+                        temps_core::worker_ingress::private_address_id(false, env_domain.id),
+                        env_domain.gate.as_deref(),
+                        env_domain.gate_not_before,
+                        env_domain.gate_access_provider_id,
+                        env_domain.gate_access_aud.as_deref(),
+                    ),
+                );
+            } else if env_domain.audience != temps_entities::audience::PUBLIC {
                 let mut address = private_address(
                     &env_domain.audience,
                     temps_core::worker_ingress::private_address_id(false, env_domain.id),
@@ -2099,7 +2282,18 @@ impl CachedPeerTable {
         );
 
         for custom_domain in custom_domains {
-            if custom_domain.audience != temps_entities::audience::PUBLIC {
+            if custom_domain.audience == temps_entities::audience::SIGNED_IN {
+                gated_meta.insert(
+                    gate_host_key(&custom_domain.domain),
+                    GatedMeta::from_row(
+                        temps_core::worker_ingress::private_address_id(true, custom_domain.id),
+                        custom_domain.gate.as_deref(),
+                        custom_domain.gate_not_before,
+                        custom_domain.gate_access_provider_id,
+                        custom_domain.gate_access_aud.as_deref(),
+                    ),
+                );
+            } else if custom_domain.audience != temps_entities::audience::PUBLIC {
                 let mut address = private_address(
                     &custom_domain.audience,
                     temps_core::worker_ingress::private_address_id(true, custom_domain.id),
@@ -2759,6 +2953,18 @@ impl CachedPeerTable {
                                     cert_eligible: true,
                                 };
 
+                                // ADR 068 D3: the same service beside each
+                                // tunnel host, in the Flat form the tunnel's
+                                // zone takes. Never displaces a route.
+                                for tunnel_svc_domain in tunnel_service_hostnames(
+                                    tunnel_environment_hosts.get(&env.id),
+                                    route_label,
+                                ) {
+                                    routes
+                                        .entry(tunnel_svc_domain)
+                                        .or_insert_with(|| svc_route_info.clone());
+                                }
+
                                 if let std::collections::hash_map::Entry::Vacant(e) =
                                     routes.entry(svc_domain.clone())
                                 {
@@ -3214,7 +3420,8 @@ impl CachedPeerTable {
         // listener of the worker recorded for it. Take it out of every map
         // this proxy serves from, and out of the wake path, so neither this
         // proxy nor a public worker route ever answers it, whatever DNS says.
-        // `signed_in` (reserved) is held back the same way until it has a gate.
+        // Other non-public audiences are held back the same way; `signed_in`
+        // is served with its gate (below).
         let (private_routes, private_hosts) = withdraw_private_addresses(
             private_meta,
             &mut routes,
@@ -3223,6 +3430,34 @@ impl CachedPeerTable {
             &mut unavailable.exact,
             &mut sleeping_environments,
         );
+
+        // ADR 065 D8: the gate for each signed-in address. Nothing is read
+        // when no address is signed in, so an install that never opts in
+        // does exactly what it did before (D11).
+        let gated = if gated_meta.is_empty() {
+            HashMap::new()
+        } else {
+            let public_key = crate::gate::current_public_key(self.db.as_ref()).await?;
+            let revoked = crate::gate::revoked_sessions(self.db.as_ref()).await?;
+            // Cloudflare Access teams are read only when an address uses one.
+            let access_teams = if gated_meta.values().any(|m| m.access.is_some()) {
+                crate::access_keys::access_teams(self.db.as_ref()).await?
+            } else {
+                HashMap::new()
+            };
+            build_gate_policies(
+                gated_meta,
+                public_key.as_deref(),
+                app_settings
+                    .external_url
+                    .as_deref()
+                    .and_then(console_origin)
+                    .map(|origin| format!("{origin}{}", temps_core::gate::AUTHORIZE_PATH))
+                    .as_deref(),
+                revoked,
+                &access_teams,
+            )
+        };
 
         // A live route always wins over an unavailable entry for the same
         // host, whichever section recorded it, and the console hostname is
@@ -3337,6 +3572,7 @@ impl CachedPeerTable {
             unavailable,
             ingress,
             private: private_routes,
+            gated,
         });
 
         // Collect on-demand configs for awake environments so the idle sweep can track them.
@@ -3791,6 +4027,15 @@ impl CachedPeerTable {
                 .legacy
                 .private_hosts
                 .contains(&host.trim_end_matches('.').to_ascii_lowercase())
+    }
+
+    /// The gate in front of `host` (ADR 065 D7), if it is a signed-in
+    /// address. Lock-free, and a no-op lookup on an install with none.
+    pub fn gate_for_host(&self, host: &str) -> Option<Arc<GatePolicy>> {
+        let snapshot = self.route_snapshot.load();
+        gate_lookup(&snapshot.gated, host, |host| {
+            snapshot.legacy.exact.contains_key(host)
+        })
     }
 
     pub fn worker_public_route_count(&self) -> usize {
@@ -5512,8 +5757,15 @@ mod tests {
                             private_range: None,
                             private_node_id: None,
                             private_listener: None,
+                            gate: None,
+                            gate_allow: None,
+                            gate_not_before: None,
+                            gate_access_provider_id: None,
+                            gate_access_app_id: None,
+                            gate_access_aud: None,
                             private_via: None,
                             private_service: None,
+                            generated_by_connector_id: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])
@@ -5677,6 +5929,22 @@ mod tests {
         ];
 
         assert!(select_public_route_containers(&containers, None).is_none());
+    }
+
+    #[test]
+    fn tunnel_environment_hosts_get_flat_service_hostnames() {
+        let hosts = vec![
+            "shop-staging.tunnel.example.com".to_string(),
+            "shop-production-a1b2c3.tunnel.example.com".to_string(),
+        ];
+        assert_eq!(
+            tunnel_service_hostnames(Some(&hosts), "api"),
+            vec![
+                "shop-staging--api.tunnel.example.com".to_string(),
+                "shop-production-a1b2c3--api.tunnel.example.com".to_string(),
+            ]
+        );
+        assert!(tunnel_service_hostnames(None, "api").is_empty());
     }
 
     #[test]
@@ -7058,5 +7326,192 @@ mod route_generation_tests {
             .expect("first load after restart");
         assert_eq!(restarted.current_generation(), 102);
         assert_eq!(persisted(&db).await, Some(102));
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn meta(address_id: &str, gate: GateKind) -> GatedMeta {
+        GatedMeta {
+            address_id: address_id.to_string(),
+            gate,
+            not_before: 100,
+            access: None,
+        }
+    }
+
+    #[test]
+    fn console_origin_keeps_only_scheme_and_authority() {
+        assert_eq!(
+            console_origin("https://Console.Example.test/some/path?x"),
+            Some("https://console.example.test".into())
+        );
+        assert_eq!(
+            console_origin("console.example.test"),
+            Some("https://console.example.test".into())
+        );
+        assert_eq!(
+            console_origin("http://localho.st:8080/"),
+            Some("http://localho.st:8080".into())
+        );
+        assert_eq!(console_origin("ftp://x"), None);
+        assert_eq!(console_origin("https://user@evil.example"), None);
+        assert_eq!(console_origin("  "), None);
+    }
+
+    #[test]
+    fn a_signed_in_address_gets_its_key_url_and_only_its_own_revocations() {
+        let mut gated = HashMap::new();
+        gated.insert(
+            "a.example.test".to_string(),
+            meta("custom:1", GateKind::Temps),
+        );
+        gated.insert(
+            "b.example.test".to_string(),
+            meta("custom:2", GateKind::Temps),
+        );
+        let mut revoked = HashMap::new();
+        revoked.insert("custom:1".to_string(), vec!["s1".to_string()]);
+        revoked.insert("custom:9".to_string(), vec!["s9".to_string()]);
+        let policies = build_gate_policies(
+            gated,
+            Some("pk"),
+            Some("https://c.example.test/_temps/gate/authorize"),
+            revoked,
+            &HashMap::new(),
+        );
+        let a = policies["a.example.test"]
+            .temps
+            .clone()
+            .expect("temps gate");
+        assert_eq!(a.public_key, "pk");
+        assert_eq!(a.not_before, 100);
+        assert_eq!(a.revoked, vec!["s1".to_string()]);
+        let b = policies["b.example.test"]
+            .temps
+            .clone()
+            .expect("temps gate");
+        assert!(b.revoked.is_empty());
+    }
+
+    #[test]
+    fn without_a_key_or_console_url_the_gate_serves_nobody() {
+        for (key, url) in [
+            (None, Some("https://c/_temps/gate/authorize")),
+            (Some("pk"), None),
+        ] {
+            let mut gated = HashMap::new();
+            gated.insert(
+                "a.example.test".to_string(),
+                meta("custom:1", GateKind::Temps),
+            );
+            let policies = build_gate_policies(gated, key, url, HashMap::new(), &HashMap::new());
+            assert!(policies["a.example.test"].temps.is_none());
+        }
+        // A gate this version does not implement is never given a Temps part.
+        let mut gated = HashMap::new();
+        gated.insert(
+            "a.example.test".to_string(),
+            meta("custom:1", GateKind::Unsupported),
+        );
+        let policies = build_gate_policies(
+            gated,
+            Some("pk"),
+            Some("u"),
+            HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(policies["a.example.test"].temps.is_none());
+        assert_eq!(
+            GatedMeta::from_row("custom:1".into(), None, None, None, None).gate,
+            GateKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn an_access_address_gets_its_teams_keys_and_its_own_aud() {
+        let team = crate::access_keys::AccessTeam {
+            issuer: "https://team.cloudflareaccess.com".into(),
+            keys: vec![temps_core::gate::AccessKey {
+                kid: "k1".into(),
+                n: "n".into(),
+                e: "AQAB".into(),
+            }],
+        };
+        let teams = HashMap::from([(3, team.clone())]);
+        let mut gated = HashMap::new();
+        gated.insert(
+            "a.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:1".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(3),
+                Some("aud-a"),
+            ),
+        );
+        // A token that is gone, or no AUD: no Access part, so nobody is let in.
+        gated.insert(
+            "b.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:2".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(9),
+                Some("aud-b"),
+            ),
+        );
+        gated.insert(
+            "c.example.test".to_string(),
+            GatedMeta::from_row(
+                "custom:3".into(),
+                Some("cloudflare_access"),
+                None,
+                Some(3),
+                None,
+            ),
+        );
+        // A Temps gate never picks up Access fields left on its row.
+        gated.insert(
+            "d.example.test".to_string(),
+            GatedMeta::from_row("custom:4".into(), Some("temps"), None, Some(3), Some("x")),
+        );
+        let policies = build_gate_policies(gated, Some("pk"), Some("u"), HashMap::new(), &teams);
+        let a = policies["a.example.test"].access.clone().expect("access");
+        assert_eq!(a.issuer, team.issuer);
+        assert_eq!(a.audience, "aud-a");
+        assert_eq!(a.keys, team.keys);
+        assert!(policies["a.example.test"].temps.is_none());
+        assert!(policies["b.example.test"].access.is_none());
+        assert!(policies["c.example.test"].access.is_none());
+        assert!(policies["d.example.test"].access.is_none());
+    }
+
+    #[test]
+    fn gate_lookup_is_case_insensitive_and_covers_wildcards() {
+        let mut gated = HashMap::new();
+        let policy = Arc::new(GatePolicy {
+            address_id: "custom:1".into(),
+            gate: GateKind::Temps,
+            temps: None,
+            access: None,
+        });
+        gated.insert("app.example.test".to_string(), Arc::clone(&policy));
+        gated.insert("*.preview.example.test".to_string(), Arc::clone(&policy));
+        let none = |_: &str| false;
+        assert!(gate_lookup(&gated, "APP.example.test.", none).is_some());
+        assert!(gate_lookup(&gated, "x.preview.example.test", none).is_some());
+        assert!(gate_lookup(&gated, "other.example.test", none).is_none());
+        assert!(gate_lookup(&HashMap::new(), "app.example.test", none).is_none());
+        // An ungated exact route under a gated wildcard is not gated, as it
+        // is not routed by the wildcard either.
+        assert!(gate_lookup(&gated, "api.preview.example.test", |h| {
+            h == "api.preview.example.test"
+        })
+        .is_none());
+        // An exact gated address stays gated whatever else routes there.
+        assert!(gate_lookup(&gated, "app.example.test", |_| true).is_some());
     }
 }

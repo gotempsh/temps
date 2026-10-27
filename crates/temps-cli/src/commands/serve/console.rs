@@ -1625,6 +1625,29 @@ fn create_swagger_router(plugin_manager: &PluginManager) -> anyhow::Result<Route
 }
 
 /// Static file handler for embedded website
+/// `GET /_temps/gate/authorize` (ADR 065 D8). Without a console session
+/// (signed out, or MFA not finished) this is the console itself: its
+/// sign-in page remembers the URL and comes back here once signed in.
+async fn gate_authorize(
+    state: Arc<temps_ingress::reachability::gate_handlers::GateConsoleState>,
+    req: Request,
+) -> Response {
+    let Some(auth) = req.extensions().get::<temps_auth::AuthContext>().cloned() else {
+        return serve_static_file(req).await;
+    };
+    let metadata = req
+        .extensions()
+        .get::<temps_core::RequestMetadata>()
+        .cloned();
+    temps_ingress::reachability::gate_handlers::authorize_response(
+        &state,
+        &auth,
+        metadata.as_ref(),
+        req.uri().query(),
+    )
+    .await
+}
+
 async fn serve_static_file(req: Request) -> Response {
     with_console_security_headers(serve_static_from(website(), req))
 }
@@ -2869,6 +2892,9 @@ fn ai_read_allowlist() -> Vec<String> {
         // before responding — the actual provider API key is replaced with "***".
         "get_dns_provider",
         "list_dns_providers",
+        // Cloudflare Access tokens (ADR 065 D9): the token is never returned,
+        // `api_token` is always "***".
+        "list_access_providers",
         // Domain lookups — metadata only, no signing secrets.
         "get_domain_by_host",
         "get_domain_by_id",
@@ -2891,6 +2917,10 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_ingress_connector_links",
         "list_ingress_hostnames",
         "get_ingress_hostname",
+        // ADR 068: whether the preview domain is reachable and why, and the
+        // hosts a tunnel publishes for environments (names and states only).
+        "get_preview_domain_status",
+        "get_connector_environment_hosts",
         // ── User preferences + cluster metadata ──
         // Notification preferences for the current user — no credentials.
         "get_preferences",
@@ -3797,6 +3827,20 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(
         route_table.clone() as Arc<dyn temps_core::route_table::RouteTableRefresher>
     );
+    // The signed-in gate (ADR 065 D8): issues sign-in codes for the console's
+    // authorize endpoint, redeems them for agents, revokes sessions.
+    let gate_service = Arc::new(temps_routes::gate::GateService::new(
+        db.clone(),
+        encryption_service.clone(),
+    ));
+    service_context.register_service(gate_service.clone());
+    // Cloudflare Access signing keys (ADR 065 D9): fetched again every hour
+    // for the tokens in use, and when an agent meets an unknown key. The
+    // hourly loop reads nothing and fetches nothing while no address uses
+    // Access.
+    let access_key_service = Arc::new(temps_routes::access_keys::AccessKeyService::new(db.clone()));
+    service_context.register_service(access_key_service.clone());
+    tokio::spawn(access_key_service.clone().run_hourly());
 
     // Register TemplateService - provides project templates from YAML configuration
     // Bundled templates are loaded automatically; external file in data_dir can override them
@@ -5201,6 +5245,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         peer_table: route_table.clone(),
         encryption_service: encryption_service.clone(),
         request_policy_gate: request_policy_gate_slot.clone(),
+        gate: gate_service.clone(),
+        access_keys: access_key_service.clone(),
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);
@@ -5488,7 +5534,30 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             None
         };
 
+    // The signed-in gate's authorize step (ADR 065 D8) is a page a browser
+    // opens on the console, so it lives at the root of the admin surface
+    // with the auth middleware in front of it.
+    let gate_authorize_router = {
+        let gate_state = Arc::new(
+            temps_ingress::reachability::gate_handlers::GateConsoleState {
+                gate: gate_service.clone(),
+                audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
+                project_access_checker: service_context
+                    .get_service::<dyn temps_core::ProjectAccessChecker>(),
+            },
+        );
+        let router = Router::new().route(
+            temps_core::gate::AUTHORIZE_PATH,
+            axum::routing::get(move |req: Request| {
+                let gate_state = gate_state.clone();
+                async move { gate_authorize(gate_state, req).await }
+            }),
+        );
+        plugin_manager.apply_middleware_to_router(router, plugin_manager.get_middleware())
+    };
+
     let admin_app = Router::new()
+        .merge(gate_authorize_router)
         .nest("/api", admin_router)
         .fallback(serve_static_file)
         .layer(axum::middleware::from_fn(track_server_errors));

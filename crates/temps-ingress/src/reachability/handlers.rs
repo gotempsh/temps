@@ -27,6 +27,8 @@ use temps_core::{
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
+use temps_core::gate::GateKind;
+
 use super::model::{
     ActionKind, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, Decision, DnsRecordState, EnvironmentReachability, Intent, JournalEntry,
@@ -324,7 +326,8 @@ async fn plan_environment_reachability(
         (status = 400, description = "An answer is missing or invalid"),
         (status = 403, description = "A permission the option needs is missing"),
         (status = 404, description = "Project or environment not found"),
-        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress")
+        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress"),
+        (status = 428, description = "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification")
     ),
     security(("bearer_auth" = []))
 )]
@@ -344,24 +347,41 @@ async fn apply_environment_reachability(
     );
     require_all(&auth, &permissions_for(request.option), "This way in")?;
     // Changing who an existing address is for is a sensitive action, both
-    // ways (ADR 064 Security).
-    let answered = request
-        .answers
-        .get(super::plan::FIELD_ADDRESS)
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    if let Some(action) = audience_action(
-        state
-            .service
-            .audience_change(
-                project_id,
-                environment_id,
-                &request.plan_id,
-                request.option,
-                answered.as_deref(),
-            )
-            .await?,
-    ) {
+    // ways (ADR 064 Security), and so is its gate or sign-in list (ADR 065
+    // D7).
+    // Publishing every environment under a tunnel widens all of them to
+    // public at once (ADR 068 D3).
+    if request.option == PlanOptionKind::TunnelEnvironmentHosts {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::PublishEnvironmentHosts { connector_id: None },
+        )
+        .await?;
+    }
+    let change = state
+        .service
+        .audience_change(
+            project_id,
+            environment_id,
+            &request.plan_id,
+            request.option,
+            &request.answers,
+        )
+        .await?;
+    // ADR 065 D9: a Cloudflare Access plan creates or uses an Access app
+    // with a saved token.
+    if change
+        .as_ref()
+        .is_some_and(|(_, _, after)| after.gate == Some(GateKind::CloudflareAccess))
+    {
+        require_all(
+            &auth,
+            &[Permission::DnsProvidersWrite],
+            "Putting Cloudflare Access in front of it",
+        )?;
+    }
+    if let Some(action) = audience_action(change) {
         require_sensitive_action(state.sensitive_action_authorizer.as_ref(), &auth, action).await?;
     }
     let option = request.option;
@@ -703,24 +723,21 @@ async fn decide_reachability_conflict(
 /// The step-up an apply needs when its option changes an existing
 /// address's audience.
 fn audience_action(
-    change: Option<(
-        String,
-        AddressAudience,
-        Audience,
-        Vec<temps_core::tailnet::TailnetPrincipal>,
-    )>,
+    change: Option<(String, AddressAudience, AddressAudience)>,
 ) -> Option<SensitiveAction> {
-    let (hostname, before, after, principals) = change?;
-    if before.audience != after {
-        return Some(SensitiveAction::ChangeAddressAudience {
-            hostname,
-            from: before.audience.as_str().to_string(),
-            to: after.as_str().to_string(),
-        });
+    let (hostname, before, after) = change?;
+    if before.who() == after.who() {
+        return None;
     }
     // ADR 065 D6: editing who a `tailnet_users` address admits.
-    (after == Audience::TailnetUsers && before.principals != principals)
-        .then_some(SensitiveAction::ChangeTailnetPrincipals { hostname })
+    if before.audience == Audience::TailnetUsers && after.audience == Audience::TailnetUsers {
+        return Some(SensitiveAction::ChangeTailnetPrincipals { hostname });
+    }
+    Some(SensitiveAction::ChangeAddressAudience {
+        hostname,
+        from: before.who_label(),
+        to: after.who_label(),
+    })
 }
 
 /// The step-up an undo needs when it puts an address back to another
@@ -732,15 +749,17 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
             hostname,
             before,
             after,
-        } if before.audience != after.audience
+        } if before.who() != after.who()
+            && !(before.audience == Audience::TailnetUsers
+                && after.audience == Audience::TailnetUsers)
             && !pending.iter().any(
                 |r| matches!(r, RunResource::CustomDomain { domain, .. } if domain == hostname),
             ) =>
         {
             Some(SensitiveAction::ChangeAddressAudience {
                 hostname: hostname.clone(),
-                from: after.audience.as_str().to_string(),
-                to: before.audience.as_str().to_string(),
+                from: after.who_label(),
+                to: before.who_label(),
             })
         }
         // ADR 065 D6: undo puts an earlier list back.
@@ -748,7 +767,10 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
             hostname,
             before,
             after,
-        } if before.audience == Audience::TailnetUsers && before.principals != after.principals => {
+        } if before.audience == Audience::TailnetUsers
+            && after.audience == Audience::TailnetUsers
+            && before.who() != after.who() =>
+        {
             Some(SensitiveAction::ChangeTailnetPrincipals {
                 hostname: hostname.clone(),
             })
@@ -767,15 +789,16 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             | RunResource::AutoManageEnabled { .. }
             | RunResource::DnsRecord { .. }
             | RunResource::DnsChange { .. } => Permission::DnsProvidersWrite,
-            RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
-                Permission::SettingsWrite
-            }
+            RunResource::Connector { .. }
+            | RunResource::HostnameChoice { .. }
+            | RunResource::EnvironmentHosts { .. } => Permission::SettingsWrite,
             RunResource::CustomDomain { .. }
             | RunResource::AddressAudience { .. }
             | RunResource::TailscaleServe { .. }
             | RunResource::TailscaleService { .. } => Permission::ProjectsWrite,
             RunResource::TailscaleCredential { .. } => Permission::SettingsWrite,
             RunResource::Certificate { .. } => Permission::DomainsDelete,
+            RunResource::AccessApp { .. } => Permission::DnsProvidersWrite,
         };
         if !needed.contains(&permission) {
             needed.push(permission);
@@ -836,6 +859,75 @@ async fn get_certificate_methods(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_core::gate::{GateAllowList, GateKind};
+
+    fn change(
+        before: AddressAudience,
+        after: AddressAudience,
+    ) -> Option<(String, AddressAudience, AddressAudience)> {
+        Some(("app.example.com".into(), before, after))
+    }
+
+    fn list(teams: Vec<i32>, users: Vec<i32>) -> Option<GateAllowList> {
+        Some(GateAllowList { teams, users })
+    }
+
+    /// ADR 065 D7: changing the audience, the gate or the list of who may
+    /// sign in is a sensitive action; keeping all three the same is not.
+    #[test]
+    fn changing_who_can_open_an_address_needs_a_step_up() {
+        let signed_in = AddressAudience::signed_in(GateKind::Temps, None);
+        let listed = AddressAudience::signed_in(GateKind::Temps, list(vec![2], vec![]));
+        for (before, after) in [
+            (AddressAudience::public(), signed_in.clone()),
+            (signed_in.clone(), AddressAudience::public()),
+            (signed_in.clone(), listed.clone()),
+            (listed.clone(), signed_in.clone()),
+            (
+                listed.clone(),
+                AddressAudience::signed_in(GateKind::Temps, list(vec![2], vec![9])),
+            ),
+            (
+                signed_in.clone(),
+                AddressAudience::signed_in(GateKind::CloudflareAccess, None),
+            ),
+        ] {
+            let label = format!("{} -> {}", before.who_label(), after.who_label());
+            assert!(
+                matches!(
+                    audience_action(change(before, after)),
+                    Some(SensitiveAction::ChangeAddressAudience { .. })
+                ),
+                "no step-up for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_people_in_another_order_is_not_a_change() {
+        let before = AddressAudience::signed_in(GateKind::Temps, list(vec![3, 1], vec![7]));
+        let after = AddressAudience::signed_in(GateKind::Temps, list(vec![1, 3, 3], vec![7]));
+        assert!(audience_action(change(before, after)).is_none());
+        assert!(
+            audience_action(change(AddressAudience::public(), AddressAudience::public())).is_none()
+        );
+        assert!(audience_action(None).is_none());
+    }
+
+    #[test]
+    fn undoing_a_gate_change_needs_a_step_up_unless_the_run_attached_the_address() {
+        let gate = RunResource::AddressAudience {
+            hostname: "app.example.com".into(),
+            before: AddressAudience::public(),
+            after: AddressAudience::signed_in(GateKind::Temps, list(vec![1], vec![])),
+        };
+        assert!(undo_audience_action(std::slice::from_ref(&gate)).is_some());
+        let attached = RunResource::CustomDomain {
+            id: 4,
+            domain: "app.example.com".into(),
+        };
+        assert!(undo_audience_action(&[attached, gate]).is_none());
+    }
     use temps_core::tailnet::TailnetPrincipal;
 
     fn users(values: &[&str]) -> AddressAudience {
@@ -854,31 +946,37 @@ mod tests {
     fn editing_who_a_tailnet_users_address_admits_needs_step_up() {
         let host = "homelab.example.ts.net".to_string();
         let before = users(&["alice@example.com"]);
-        let wider = users(&["alice@example.com", "bob@example.com"]).principals;
+        let wider = users(&["alice@example.com", "bob@example.com"]);
         assert_eq!(
-            audience_action(Some((
-                host.clone(),
-                before.clone(),
-                Audience::TailnetUsers,
-                wider
-            ))),
+            audience_action(Some((host.clone(), before.clone(), wider.clone()))),
             Some(SensitiveAction::ChangeTailnetPrincipals {
                 hostname: host.clone()
             })
         );
         // The same list again changes nothing.
         assert_eq!(
+            audience_action(Some((host.clone(), before.clone(), before.clone()))),
+            None
+        );
+        // The same people in another order is no change either.
+        assert_eq!(
             audience_action(Some((
                 host.clone(),
-                before.clone(),
-                Audience::TailnetUsers,
-                before.principals.clone()
+                users(&["bob@example.com", "alice@example.com"]),
+                wider.clone()
             ))),
             None
         );
         // Another audience is the audience change it always was.
         assert!(matches!(
-            audience_action(Some((host, before, Audience::Private, Vec::new()))),
+            audience_action(Some((
+                host,
+                before,
+                AddressAudience {
+                    audience: Audience::Private,
+                    ..AddressAudience::default()
+                }
+            ))),
             Some(SensitiveAction::ChangeAddressAudience { ref from, ref to, .. })
                 if from == "tailnet_users" && to == "private"
         ));

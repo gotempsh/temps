@@ -9,7 +9,8 @@ pub const PUBLIC: &str = "public";
 /// Only devices on the operator's private network (a tailnet or a LAN),
 /// served by a worker's private listener (ADR 064 D5).
 pub const PRIVATE: &str = "private";
-/// Anyone who signs in to Temps. Reserved for phase 4.
+/// People who sign in, behind a gate (ADR 065 D7): the Temps gate or
+/// Cloudflare Access, as `gate` says.
 pub const SIGNED_IN: &str = "signed_in";
 /// Private, and only for the tailnet logins and tags listed in
 /// `address_tailnet_principals` (ADR 065 D6).
@@ -22,6 +23,11 @@ pub const ALL: [&str; 4] = [PUBLIC, PRIVATE, SIGNED_IN, TAILNET_USERS];
 pub fn default_audience() -> String {
     PUBLIC.to_string()
 }
+
+/// `gate` for the Temps sign-in (ADR 065 D7).
+pub const GATE_TEMPS: &str = "temps";
+/// `gate` for Cloudflare Access, tunneled addresses only (ADR 065 D9).
+pub const GATE_CLOUDFLARE_ACCESS: &str = "cloudflare_access";
 
 /// How a private address is served (ADR 065 D1), the `private_via` column.
 pub mod via {

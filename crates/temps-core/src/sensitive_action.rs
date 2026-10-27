@@ -164,6 +164,12 @@ pub enum SensitiveAction {
     ChangeTailnetPrincipals {
         hostname: String,
     },
+    /// Turn on a tunnel's environment hosts (ADR 068 D3): every environment,
+    /// preview environments included, gets a public name under the tunnel's
+    /// domain at once.
+    PublishEnvironmentHosts {
+        connector_id: Option<i32>,
+    },
 }
 
 impl SensitiveAction {
@@ -211,6 +217,7 @@ impl SensitiveAction {
             Self::ChangeAddressAudience { .. } => "change_address_audience",
             Self::DeleteTailscaleService { .. } => "delete_tailscale_service",
             Self::ChangeTailnetPrincipals { .. } => "change_tailnet_principals",
+            Self::PublishEnvironmentHosts { .. } => "publish_environment_hosts",
         }
     }
 }
@@ -417,6 +424,13 @@ mod tests {
             }
             .as_str(),
             "change_address_audience"
+        );
+        assert_eq!(
+            SensitiveAction::PublishEnvironmentHosts {
+                connector_id: Some(3)
+            }
+            .as_str(),
+            "publish_environment_hosts"
         );
     }
 

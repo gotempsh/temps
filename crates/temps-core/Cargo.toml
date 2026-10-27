@@ -41,6 +41,10 @@ rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = "0.13"
+# Gate tokens for signed-in addresses (ADR 065 D8): one verifier for every listener.
+ed25519-dalek = { workspace = true }
+# Cloudflare Access JWTs (ADR 065 D9): RS256 only, checked at every listener.
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 x25519-dalek = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
@@ -67,6 +71,8 @@ bollard = { workspace = true }
 temps-memory = { path = "../temps-memory" }
 
 [dev-dependencies]
+# Signs test Access JWTs.
+rsa = "0.9"
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }

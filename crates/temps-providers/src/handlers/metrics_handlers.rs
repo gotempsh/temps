@@ -523,26 +523,37 @@ async fn get_service_metrics_status(
     ))
 }
 
-/// Per-database metric values for a Postgres service.
+/// Per-database metric values for a Postgres or MariaDB service.
 ///
-/// A Postgres instance can host many databases (some unrelated to this
-/// service). The collector records per-`datname` series; this groups the
-/// latest value of each requested metric by database so the UI can render a
-/// "Databases" breakdown table instead of one collapsed number.
+/// A Postgres or MariaDB instance can host many databases (some unrelated to
+/// this service). The collector records one series per database — labelled
+/// `datname` for Postgres, `schema` for MariaDB; this groups the latest value
+/// of each of the engine's per-database metrics by database so the UI can
+/// render a "Databases" breakdown table instead of one collapsed number.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsRow {
-    /// Database name (`datname`).
+    /// Database name: the `datname` of a Postgres database, or the schema
+    /// name of a MariaDB database.
     pub database: String,
-    /// Latest value of each requested metric for this database
-    /// (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+    /// Latest value of each of the engine's per-database metrics for this
+    /// database, keyed by metric name (e.g. `{"pg.database_size_bytes":
+    /// 7943871, "pg.cache_hit_ratio": 0.99}` for Postgres, or
+    /// `{"mariadb.database_size_bytes": 1589248, "mariadb.tables": 3}` for
+    /// MariaDB). A metric that has not been reported is absent.
     pub metrics: HashMap<String, f64>,
 }
 
 /// Response for the per-database metrics breakdown.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DatabaseMetricsResponse {
-    /// One entry per database, sorted by the first metric descending
-    /// (largest first) so the biggest database leads the table.
+    /// One entry per database, largest first by the engine's
+    /// `*.database_size_bytes` metric (ties broken by name) so the biggest
+    /// database leads the table. Empty when the service's engine has no
+    /// per-database series (for example Redis or S3) or nothing has been
+    /// scraped yet. The MariaDB collector labels at most the 100 largest
+    /// schemas per scrape; the response covers the latest lookback window, so
+    /// during schema churn it can briefly include schemas from an earlier
+    /// scrape as well.
     pub databases: Vec<DatabaseMetricsRow>,
 }
 
@@ -552,7 +563,7 @@ pub struct DatabaseMetricsResponse {
 // Must stay in sync with the web `PG_PER_DATABASE_GROUPS` list in
 // ServiceMonitoring.tsx — every metric the per-database section displays has to
 // be requested here, or the UI shows "—" for the missing ones.
-const PER_DATABASE_METRICS: &[&str] = &[
+const PG_PER_DATABASE_METRICS: &[&str] = &[
     "pg.database_size_bytes",
     "pg.cache_hit_ratio",
     "pg.tuple_fetch_ratio",
@@ -566,11 +577,56 @@ const PER_DATABASE_METRICS: &[&str] = &[
     "pg.tuples_deleted_total",
 ];
 
-/// Return the latest per-database metric values for a Postgres service.
+// Per-schema series of the MariaDB collector (`temps_metrics::collector::
+// mariadb`). Must stay in sync with the web `MARIADB_PER_DATABASE_GROUPS` list
+// in web/src/lib/mariadb-metrics.ts.
+const MARIADB_PER_DATABASE_METRICS: &[&str] = &[
+    "mariadb.database_size_bytes",
+    "mariadb.data_size_bytes",
+    "mariadb.index_size_bytes",
+    "mariadb.data_free_bytes",
+    "mariadb.tables",
+    "mariadb.rows_estimated",
+];
+
+/// Where an engine's collector records per-database series.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PerDatabaseLayout {
+    /// Label carrying the database name.
+    label_key: &'static str,
+    metrics: &'static [&'static str],
+    /// Metric the breakdown is sorted by, largest first.
+    size_metric: &'static str,
+}
+
+/// The per-database layout of `service_type`, or `None` when its collector
+/// records no per-database series.
+fn per_database_layout(service_type: &str) -> Option<PerDatabaseLayout> {
+    match service_type.trim().to_ascii_lowercase().as_str() {
+        "postgres" => Some(PerDatabaseLayout {
+            label_key: "datname",
+            metrics: PG_PER_DATABASE_METRICS,
+            size_metric: "pg.database_size_bytes",
+        }),
+        // MariaDB calls databases schemas; one series per schema.
+        "mariadb" => Some(PerDatabaseLayout {
+            label_key: "schema",
+            metrics: MARIADB_PER_DATABASE_METRICS,
+            size_metric: "mariadb.database_size_bytes",
+        }),
+        _ => None,
+    }
+}
+
+/// Return the latest per-database metric values for a Postgres or MariaDB
+/// service.
 ///
-/// Groups `pg_stat_database` / size metrics by `datname` so the UI can show a
-/// breakdown table (each database with its own size, cache-hit ratio, etc.)
-/// rather than collapsing every database into one value.
+/// Postgres: groups `pg_stat_database` and size metrics by `datname` (size,
+/// cache-hit ratio, commits, tuple activity). MariaDB: groups storage metrics
+/// by schema (data, index and free-space size, table count, estimated rows).
+/// The UI shows this as a breakdown table instead of collapsing every database
+/// into one value. Engines without per-database series get an empty list
+/// while the metrics store is available; without it the endpoint returns 503.
 #[utoipa::path(
     get,
     path = "/external-services/{id}/metrics/by-database",
@@ -578,8 +634,9 @@ const PER_DATABASE_METRICS: &[&str] = &[
     tag = "Metrics",
     params(("id" = i32, Path, description = "External service ID")),
     responses(
-        (status = 200, description = "Per-database metric breakdown", body = DatabaseMetricsResponse),
+        (status = 200, description = "Per-database metric breakdown; empty for engines without per-database series", body = DatabaseMetricsResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "External service not found"),
         (status = 503, description = "Metrics not available"),
         (status = 500, description = "Internal server error"),
     ),
@@ -600,12 +657,39 @@ async fn get_service_metrics_by_database(
             .build()
     })?;
 
+    let service = state
+        .external_service_manager
+        .get_service(id)
+        .await
+        .map_err(|e| match e {
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => not_found()
+                .detail(format!("External service {} not found", id))
+                .build(),
+            other => {
+                error!(service_id = id, error = %other, "Failed to load service for per-database metrics");
+                internal_server_error()
+                    .detail(format!(
+                        "Failed to load external service {} for per-database metrics: {}",
+                        id, other
+                    ))
+                    .build()
+            }
+        })?;
+    let Some(layout) = per_database_layout(&service.service_type) else {
+        return Ok((
+            StatusCode::OK,
+            Json(DatabaseMetricsResponse {
+                databases: Vec::new(),
+            }),
+        ));
+    };
+
     let rows = store
         .query_latest_by_label(LatestByLabelQuery {
             source_kind: SourceKind::Database,
             source_id: id,
-            names: PER_DATABASE_METRICS.iter().map(|s| s.to_string()).collect(),
-            label_key: "datname".to_string(),
+            names: layout.metrics.iter().map(|s| s.to_string()).collect(),
+            label_key: layout.label_key.to_string(),
         })
         .await
         .map_err(|e| {
@@ -632,16 +716,8 @@ async fn get_service_metrics_by_database(
 
     // Largest database first (by the headline size metric); fall back to name.
     databases.sort_by(|a, b| {
-        let av = a
-            .metrics
-            .get("pg.database_size_bytes")
-            .copied()
-            .unwrap_or(0.0);
-        let bv = b
-            .metrics
-            .get("pg.database_size_bytes")
-            .copied()
-            .unwrap_or(0.0);
+        let av = a.metrics.get(layout.size_metric).copied().unwrap_or(0.0);
+        let bv = b.metrics.get(layout.size_metric).copied().unwrap_or(0.0);
         bv.partial_cmp(&av)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.database.cmp(&b.database))
@@ -2790,6 +2866,33 @@ pub struct MetricsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the per-database breakdown only ever queried Postgres
+    /// series, so a MariaDB service's per-schema metrics were never shown.
+    #[test]
+    fn mariadb_breakdown_reads_per_schema_series() {
+        let layout = per_database_layout("mariadb").expect("mariadb has a breakdown");
+        assert_eq!(layout.label_key, "schema");
+        assert_eq!(layout.size_metric, "mariadb.database_size_bytes");
+        assert!(layout.metrics.contains(&layout.size_metric));
+        assert!(layout.metrics.iter().all(|m| m.starts_with("mariadb.")));
+        assert_eq!(per_database_layout(" MariaDB "), Some(layout));
+    }
+
+    #[test]
+    fn postgres_breakdown_reads_per_datname_series() {
+        let layout = per_database_layout("postgres").expect("postgres has a breakdown");
+        assert_eq!(layout.label_key, "datname");
+        assert!(layout.metrics.contains(&layout.size_metric));
+        assert!(layout.metrics.iter().all(|m| m.starts_with("pg.")));
+    }
+
+    #[test]
+    fn engines_without_per_database_series_have_no_breakdown() {
+        for engine in ["redis", "mongodb", "s3", "rustfs", ""] {
+            assert_eq!(per_database_layout(engine), None, "{engine}");
+        }
+    }
 
     #[test]
     fn cluster_node_ids_are_bounded_and_deduplicated() {

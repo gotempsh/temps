@@ -74,6 +74,28 @@ pub trait NotificationService: Send + Sync {
     async fn destination_count(&self, _severity: &str) -> Result<Option<usize>, NotificationError> {
         Ok(None)
     }
+
+    /// Send `notification` under `batch_key` once per episode: when no
+    /// episode under that key is open. Returns whether it was sent. An
+    /// episode stays open until [`close_episode`](Self::close_episode), so
+    /// a condition that persists across many deploys notifies once
+    /// (ADR 068 D5: `reachability:<environment_id>`).
+    ///
+    /// Default impl sends nothing: a service that cannot remember episodes
+    /// must not send one per call.
+    async fn open_episode(
+        &self,
+        _batch_key: &str,
+        _notification: NotificationData,
+    ) -> Result<bool, NotificationError> {
+        Ok(false)
+    }
+
+    /// The condition behind `batch_key` cleared: the next
+    /// [`open_episode`](Self::open_episode) sends again.
+    async fn close_episode(&self, _batch_key: &str) -> Result<(), NotificationError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

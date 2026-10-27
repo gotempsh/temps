@@ -1357,8 +1357,12 @@ pub async fn get_project(
         .await
         .map_err(Problem::from)?;
 
+    let reachability_warning = state.project_service.reachability_warning(id).await;
+
     Ok(Json(
-        ProjectResponse::map_from_project(project).with_docker_socket(docker_socket),
+        ProjectResponse::map_from_project(project)
+            .with_docker_socket(docker_socket)
+            .with_reachability_warning(reachability_warning),
     ))
 }
 
@@ -1401,10 +1405,14 @@ pub async fn get_project_by_slug(
         .await
         .map_err(Problem::from)?;
 
-    Ok(
-        Json(ProjectResponse::map_from_project(project).with_docker_socket(docker_socket))
-            .into_response(),
+    let reachability_warning = state.project_service.reachability_warning(project.id).await;
+
+    Ok(Json(
+        ProjectResponse::map_from_project(project)
+            .with_docker_socket(docker_socket)
+            .with_reachability_warning(reachability_warning),
     )
+    .into_response())
 }
 
 #[utoipa::path(

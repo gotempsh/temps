@@ -14,6 +14,7 @@
  */
 
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   TOOLTIP_CONTENT_STYLE,
   TOOLTIP_LABEL_STYLE,
@@ -86,6 +87,17 @@ import {
   type ServiceAlertComparator,
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
+import {
+  serviceMetricsEngine,
+  type ServiceMetricsEngine,
+} from '@/lib/service-metrics-engine'
+import {
+  MARIADB_FLAG_METRICS,
+  formatFlagValue,
+  MARIADB_METRIC_GROUPS,
+  MARIADB_METRIC_LABELS,
+  MARIADB_PER_DATABASE_GROUPS,
+} from '@/lib/mariadb-metrics'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -128,7 +140,7 @@ function isMonitoringUnavailable(err: unknown): boolean {
 // Metric metadata per engine
 // ---------------------------------------------------------------------------
 
-type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
+type EngineKind = ServiceMetricsEngine
 
 type MetricGroup = {
   title: string
@@ -292,6 +304,7 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       metrics: ['mongo.replication_buffer_ratio'],
     },
   ],
+  mariadb: MARIADB_METRIC_GROUPS,
   s3: [
     {
       title: 'Storage',
@@ -343,6 +356,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
       ],
     },
   ],
+  // Only the engine-agnostic Resources group exists for these.
+  unsupported: [],
 }
 
 // Container resource metrics — CPU/memory of the docker container(s) backing
@@ -388,21 +403,26 @@ const PG_PER_DATABASE_GROUPS: MetricGroup[] = [
   },
 ]
 
-// Flat list of every per-database metric name (for the by-database query).
-const PG_PER_DATABASE_METRICS: string[] = PG_PER_DATABASE_GROUPS.flatMap(
-  (g) => g.metrics
-)
+// Engines whose collector reports per-database series, shown in the
+// "Databases" section. Must match `per_database_layout` in
+// crates/temps-providers/src/handlers/metrics_handlers.rs.
+const PER_DATABASE_GROUPS: Partial<Record<EngineKind, MetricGroup[]>> = {
+  postgres: PG_PER_DATABASE_GROUPS,
+  mariadb: MARIADB_PER_DATABASE_GROUPS,
+}
 
-// All known metrics for alert rule creation. For Postgres this includes both
-// the global metrics (ENGINE_GROUPS) and the per-database metrics so alert
-// rules can target either scope.
+// All known metrics for alert rule creation: the global metrics
+// (ENGINE_GROUPS) and, where the engine has them, the per-database metrics so
+// alert rules can target either scope.
 const ALL_METRICS: Record<EngineKind, string[]> = Object.fromEntries(
   Object.entries(ENGINE_GROUPS).map(([engine, groups]) => [
     engine,
     [
       ...RESOURCES_GROUP.metrics,
       ...groups.flatMap((g) => g.metrics),
-      ...(engine === 'postgres' ? PG_PER_DATABASE_METRICS : []),
+      ...(PER_DATABASE_GROUPS[engine as EngineKind] ?? []).flatMap(
+        (g) => g.metrics
+      ),
     ],
   ])
 ) as Record<EngineKind, string[]>
@@ -427,6 +447,12 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections',
+    'mariadb.queries_total',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.database_size_bytes',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -439,24 +465,16 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_capacity_free_bytes',
     'rustfs_s3_operations_total',
   ],
+  unsupported: [
+    'container.cpu_percent',
+    'container.memory_used_bytes',
+    'container.memory_percent',
+  ],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function normalizeEngine(
-  engine: string,
-  dockerImage?: string | null
-): EngineKind {
-  // An s3 service running the rustfs image should use rustfs metric groups
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
-    return 'rustfs'
-  if (engine === 'rustfs') return 'rustfs'
-  if (['postgres', 'redis', 'mongodb', 's3'].includes(engine))
-    return engine as EngineKind
-  return 'postgres'
-}
 
 /** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
 function formatRelativeTime(iso: string): string {
@@ -474,6 +492,10 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (MARIADB_FLAG_METRICS.has(name)) {
+    const flag = formatFlagValue(value)
+    if (flag !== null) return flag
+  }
   if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
     return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
@@ -524,6 +546,7 @@ const METRIC_LABELS: Record<string, string> = {
   'rustfs.request.body.bytes_total': 'Request Bytes',
   rustfs_system_process_cpu_usage: 'CPU Usage',
   rustfs_system_process_resident_memory_bytes: 'Resident Memory',
+  ...MARIADB_METRIC_LABELS,
 }
 
 function labelForMetric(name: string): string {
@@ -592,14 +615,16 @@ function storeRefreshInterval(value: number | null): void {
 }
 
 // ---------------------------------------------------------------------------
-// MetricTile — a single clickable stat item rendered inside a <dl> grid
+// MetricTile — a single stat item rendered inside a <dl> grid; clickable when
+// it has an `onClick`, plain otherwise
 // ---------------------------------------------------------------------------
 
 type MetricTileProps = {
   name: string
   value: number | undefined
   selected: boolean
-  onClick: () => void
+  /** Omit for a tile with no action, so it is not rendered as a button. */
+  onClick?: () => void
   alert?: 'warning' | 'critical'
   size?: 'hero' | 'group'
 }
@@ -613,19 +638,18 @@ function MetricTile({
   size = 'group',
 }: MetricTileProps) {
   const isHero = size === 'hero'
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={[
-        'flex flex-col text-left transition-colors',
-        isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
-        'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary',
-        selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
-      ]
-        .filter(Boolean)
-        .join(' ')}
-    >
+  const className = [
+    'flex flex-col text-left transition-colors',
+    isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
+    onClick
+      ? 'hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-primary'
+      : '',
+    selected ? 'bg-primary/5 ring-1 ring-inset ring-primary/30' : '',
+  ]
+    .filter(Boolean)
+    .join(' ')
+  const content = (
+    <>
       <dt
         className={[
           'flex items-center gap-1.5 truncate font-medium text-muted-foreground',
@@ -648,6 +672,12 @@ function MetricTile({
       >
         {value != null ? formatMetricValue(name, value) : '—'}
       </dd>
+    </>
+  )
+  if (!onClick) return <div className={className}>{content}</div>
+  return (
+    <button type="button" onClick={onClick} className={className}>
+      {content}
     </button>
   )
 }
@@ -943,7 +973,8 @@ function AddAlertRuleDialog({
 }
 
 // ---------------------------------------------------------------------------
-// DatabasesSection — per-database breakdown for Postgres services
+// DatabasesSection — per-database breakdown (Postgres databases, MariaDB
+// schemas)
 // ---------------------------------------------------------------------------
 
 // Sentinel for the "All databases" selector option (instance-wide aggregate).
@@ -951,35 +982,75 @@ const ALL_DATABASES = '__all__'
 
 type DatabasesSectionProps = {
   serviceId: number
+  /** The engine's per-database metric groups. */
+  groups: MetricGroup[]
   /** Instance-wide aggregate values (from query_latest) for "All databases". */
   aggregateByName: Map<string, number>
 }
 
 /**
- * Per-database Postgres metrics with a database selector.
+ * Per-database metrics with a database selector.
  *
- * A Postgres instance can host many unrelated databases; these metrics
- * (`pg_stat_database` + size) are emitted once per `datname`. The selector
+ * A Postgres or MariaDB instance can host many unrelated databases; these
+ * metrics (`pg_stat_database` + size, or MariaDB per-schema storage) are
+ * emitted once per database. The selector
  * chooses "All databases" (the instance aggregate) or a single database, and
  * the tile grids re-render for that scope. Kept separate from the global tiles
  * so a per-db sum is never shown unlabelled next to a true instance metric.
  */
 function DatabasesSection({
   serviceId,
+  groups,
   aggregateByName,
 }: DatabasesSectionProps) {
   const refetchInterval = useRefreshInterval()
   const [selected, setSelected] = useState<string>(ALL_DATABASES)
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, error, refetch, isFetching } = useQuery({
     ...externalServiceMetricsByDatabaseOptions({ path: { id: serviceId } }),
     refetchInterval,
   })
 
   const databases = data?.databases ?? []
 
-  // Don't render until at least one database has reported per-db metrics.
-  if (!isLoading && databases.length === 0) return null
+  // A request that is still loading, or failed, says nothing about whether
+  // there are databases, so neither may fall through to the "none" case below.
+  if (isLoading) return <Skeleton className="h-40 w-full" />
+  // Failed request: say why, and offer a retry. With earlier data the values
+  // stay on screen under the same notice, so a failed refresh neither hides
+  // the failure nor throws the user's place away.
+  const failure = isError ? (
+    <div className="space-y-2 rounded-lg border border-border p-4">
+      <p className="text-sm text-muted-foreground">
+        {data
+          ? 'Could not refresh per-database metrics'
+          : 'Could not load per-database metrics'}
+        : {metricsErrorText(error)}
+      </p>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={() => refetch()}
+        disabled={isFetching}
+      >
+        <RefreshCw className="mr-2 size-4" />
+        Retry
+      </Button>
+    </div>
+  ) : null
+  if (isError && !data) {
+    return (
+      <div className="space-y-2">
+        <h2 className="text-[10px] font-semibold uppercase tracking-widest text-muted-foreground">
+          Databases
+        </h2>
+        {failure}
+      </div>
+    )
+  }
+
+  // Nothing to break down until at least one database has reported.
+  if (databases.length === 0) return null
 
   // Resolve the value map for the current selection.
   const valuesForSelection = (): Map<string, number> => {
@@ -1014,7 +1085,9 @@ function DatabasesSection({
         </Select>
       </div>
 
-      {PG_PER_DATABASE_GROUPS.map((group) => (
+      {failure}
+
+      {groups.map((group) => (
         <div key={group.title}>
           <div className="mb-2">
             <h3 className="text-[10px] font-medium uppercase tracking-widest text-muted-foreground">
@@ -1028,7 +1101,6 @@ function DatabasesSection({
                 name={name}
                 value={values.get(name)}
                 selected={false}
-                onClick={() => {}}
               />
             ))}
           </dl>
@@ -1244,12 +1316,15 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
 type MonitoringDashboardProps = {
   serviceId: number
   engine: EngineKind
+  /** Raw service type, named in the notice for engines without a collector. */
+  serviceType: string
   latestMetrics: MetricLatest[]
 }
 
 function MonitoringDashboard({
   serviceId,
   engine,
+  serviceType,
   latestMetrics,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
@@ -1257,6 +1332,7 @@ function MonitoringDashboard({
   // operator checks — then the engine-specific groups.
   const groups = [RESOURCES_GROUP, ...ENGINE_GROUPS[engine]]
   const heroMetrics = HERO_METRICS[engine]
+  const perDatabaseGroups = PER_DATABASE_GROUPS[engine]
 
   const [selectedMetric, setSelectedMetric] = useState(
     heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
@@ -1296,6 +1372,17 @@ function MonitoringDashboard({
           >
             View all
           </Link>
+        </div>
+      )}
+
+      {engine === 'unsupported' && (
+        <div className="rounded-lg border border-dashed border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+          <span className="font-medium text-foreground">
+            {serviceType} metrics are not collected yet.
+          </span>{' '}
+          Connections, queries and storage are only reported for PostgreSQL,
+          MariaDB, Redis, MongoDB and S3/RustFS services. Container CPU and
+          memory are still sampled for this service.
         </div>
       )}
 
@@ -1378,10 +1465,11 @@ function MonitoringDashboard({
         </div>
       ))}
 
-      {/* Per-database breakdown (Postgres) */}
-      {engine === 'postgres' && (
+      {/* Per-database breakdown (Postgres databases, MariaDB schemas) */}
+      {perDatabaseGroups && (
         <DatabasesSection
           serviceId={serviceId}
+          groups={perDatabaseGroups}
           aggregateByName={latestByName}
         />
       )}
@@ -1417,7 +1505,7 @@ export function ServiceMonitoring() {
     enabled: !!serviceId,
   })
 
-  const engine = normalizeEngine(
+  const engine = serviceMetricsEngine(
     serviceData?.service?.service_type ?? '',
     serviceData?.current_parameters?.docker_image
   )
@@ -1606,6 +1694,7 @@ export function ServiceMonitoring() {
             <MonitoringDashboard
               serviceId={serviceId}
               engine={engine}
+              serviceType={serviceData?.service?.service_type ?? ''}
               latestMetrics={latestMetrics}
             />
           )}

@@ -10,6 +10,8 @@ use crate::services::*;
 use crate::tls_cert_loader::CertificateLoader;
 use crate::traits::*;
 use anyhow::Result;
+use arc_swap::ArcSwapOption;
+use axum::http::HeaderName;
 use pingora::server::RunArgs;
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::listeners::tls::TlsSettings;
@@ -71,16 +73,56 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<bool> {
+) -> Result<(bool, Option<Arc<HeaderName>>)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
-    Ok(settings.trust_loopback_forwarded_ip())
+    Ok((
+        settings.trust_loopback_forwarded_ip(),
+        loopback_ja4_header(&settings),
+    ))
+}
+
+/// What the proxy trusts a loopback peer for, refreshed together from the
+/// platform settings.
+#[derive(Debug)]
+struct LoopbackTrust {
+    forwarded_ip: Arc<AtomicBool>,
+    /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
+    ja4_header: Arc<ArcSwapOption<HeaderName>>,
+}
+
+/// The settings handler only stores names its rule accepts, but the row
+/// can be written by other means; a name the rule refuses is ignored rather
+/// than trusted, so the proxy never strips a header such as `Authorization`
+/// from every request.
+fn loopback_ja4_header(settings: &temps_core::AppSettings) -> Option<Arc<HeaderName>> {
+    let stored = settings.loopback_ja4_header.as_deref()?;
+    let name = match temps_core::normalize_loopback_ja4_header(Some(stored)) {
+        Ok(name) => name?,
+        Err(error) => {
+            tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
+            return None;
+        }
+    };
+    HeaderName::from_bytes(name.as_bytes()).ok().map(Arc::new)
+}
+
+/// Returns whether the header changed.
+fn apply_loopback_ja4_header_refresh(
+    snapshot: &ArcSwapOption<HeaderName>,
+    header: Option<Arc<HeaderName>>,
+) -> bool {
+    let changed = snapshot.load().as_deref() != header.as_deref();
+    if changed {
+        snapshot.store(header);
+    }
+    changed
 }
 
 fn start_forwarded_ip_trust_refresh(
     config_service: Arc<temps_config::ConfigService>,
-) -> Result<Arc<AtomicBool>> {
+) -> Result<LoopbackTrust> {
     let runtime = security_refresh_runtime()?;
     // `block_on` on `security_refresh_runtime` from within `create_proxy_service`'s
     // own caller runtime is a second nested `block_on` alongside the one
@@ -88,32 +130,49 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let initial = runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
+    let (initial, initial_ja4_header) =
+        runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
+        ja4_header = initial_ja4_header.as_deref().map(HeaderName::as_str),
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
-    let effective = Arc::new(AtomicBool::new(initial));
-    let snapshot = Arc::downgrade(&effective);
+    let trust = LoopbackTrust {
+        forwarded_ip: Arc::new(AtomicBool::new(initial)),
+        ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
+    };
+    let snapshot = Arc::downgrade(&trust.forwarded_ip);
+    let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
-        while let Some(snapshot) = snapshot.upgrade() {
-            let settings_enabled = match config_service.get_settings().await {
-                Ok(settings) => Some(settings.trust_loopback_forwarded_ip()),
+        while let (Some(snapshot), Some(ja4_header)) = (snapshot.upgrade(), ja4_header.upgrade()) {
+            let settings = match config_service.get_settings().await {
+                Ok(settings) => Some(settings),
                 Err(error) => {
                     tracing::warn!(%error, "Could not refresh forwarded-IP trust; retaining the last known value");
                     None
                 }
             };
+            let settings_enabled = settings
+                .as_ref()
+                .map(|settings| settings.trust_loopback_forwarded_ip());
             if let Some(enabled) = apply_forwarded_ip_trust_refresh(&snapshot, settings_enabled) {
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
-            // Release the task's strong reference before sleeping. If the
+            if let Some(settings) = &settings {
+                let header = loopback_ja4_header(settings);
+                let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
+                if apply_loopback_ja4_header_refresh(&ja4_header, header) {
+                    info!(ja4_header = name, "Updated loopback JA4 header from platform settings");
+                }
+            }
+            // Release the task's strong references before sleeping. If the
             // LoadBalancer is dropped, the next weak upgrade ends this task.
             drop(snapshot);
+            drop(ja4_header);
             tokio::time::sleep(FORWARDED_IP_TRUST_REFRESH_INTERVAL).await;
         }
     });
-    Ok(effective)
+    Ok(trust)
 }
 
 /// TLS extension data stored in SslDigest via the new Pingora 0.8.0 SslDigestExtension.
@@ -124,6 +183,9 @@ fn start_forwarded_ip_trust_refresh(
 pub struct TlsExtensionData {
     /// SNI hostname captured during TLS handshake
     pub sni_hostname: String,
+    /// The client's JA4, from the ClientHello the pre-TLS hook read
+    /// (ADR 066, I6). `None` when it could not be read.
+    pub ja4: Option<temps_shield::ja4::Ja4>,
 }
 
 /// How the TLS callback treats an SNI hostname.
@@ -160,6 +222,9 @@ struct DynamicCertLoader {
     /// still returns `Ok(None)` immediately (Option B: fail-fast, do not block
     /// the handshake). `None` preserves the pre-ADR behavior exactly.
     on_demand_cert_manager: Option<Arc<crate::on_demand_cert::OnDemandCertManager>>,
+    /// Holds each connection's JA4 from the pre-TLS hook until the handshake
+    /// completes.
+    ja4_hook: Arc<crate::shield::Ja4Hook>,
 }
 
 #[async_trait]
@@ -280,7 +345,17 @@ impl TlsAccept for DynamicCertLoader {
 
         debug!("TLS handshake complete for SNI: {}", sni);
 
-        Some(Arc::new(TlsExtensionData { sni_hostname: sni }))
+        let mut random = [0u8; 32];
+        let ja4 = if ssl_ref.client_random(&mut random) == random.len() {
+            self.ja4_hook.take(&random).await
+        } else {
+            None
+        };
+
+        Some(Arc::new(TlsExtensionData {
+            sni_hostname: sni,
+            ja4,
+        }))
     }
 }
 
@@ -610,7 +685,7 @@ pub fn setup_proxy_server(
     };
 
     // Create the main load balancer
-    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let loopback_trust = start_forwarded_ip_trust_refresh(config_service.clone())?;
     let disable_https_redirect = security_refresh_runtime()?.block_on(
         load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
     )?;
@@ -628,10 +703,21 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
+    .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
-    .with_shield_lists(shield_lists);
+    .with_shield_lists(shield_lists)
+    // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
+    // process, so it needs the database and the gate key's sealing key; in
+    // split topology both are available here as they are to the console.
+    .with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+        route_table.clone(),
+        Arc::new(temps_routes::gate::GateService::new(
+            db.clone(),
+            encryption_service.clone(),
+        )),
+    )));
     if let Some(gate) = admin_gate {
         lb = lb.with_admin_gate(gate);
     }
@@ -776,10 +862,14 @@ pub fn setup_proxy_server(
         // taken from the proxy config; `None` keeps the legacy fail-fast-only
         // behavior. tls_cert_loader stays a pure DB lookup — the manager lives
         // only in DynamicCertLoader, never in the loader (ADR §7).
+        // ADR 066, I6: the JA4 is read from the raw ClientHello before
+        // OpenSSL sees it, and handed to the handshake callback.
+        let ja4_hook = Arc::new(crate::shield::Ja4Hook::default());
         let tls_callbacks: Box<dyn TlsAccept + Send + Sync> = Box::new(DynamicCertLoader {
             cert_loader,
             route_table: route_table.clone(),
             on_demand_cert_manager: proxy_config.on_demand_cert_manager.clone(),
+            ja4_hook: ja4_hook.clone(),
         });
 
         // Create TLS settings with dynamic certificate callback and HTTP/2 support
@@ -790,6 +880,8 @@ pub fn setup_proxy_server(
         tls_settings.enable_h2();
 
         proxy_service.add_tls_with_settings(tls_address, None, tls_settings);
+        // Runs only on TLS endpoints: Pingora calls it before the handshake.
+        proxy_service.endpoints().set_pre_tls_callback(ja4_hook);
         debug!(
             "TLS listener configured on {} with HTTP/2 support",
             tls_address
@@ -987,7 +1079,7 @@ pub fn create_proxy_service(
         as Arc<dyn ProjectContextResolver>;
 
     // Create the main load balancer
-    let trust_loopback_forwarded_ip = start_forwarded_ip_trust_refresh(config_service.clone())?;
+    let loopback_trust = start_forwarded_ip_trust_refresh(config_service.clone())?;
     let disable_https_redirect = security_refresh_runtime()?.block_on(
         load_https_redirect_policy(&config_service, proxy_config.disable_https_redirect),
     )?;
@@ -1005,7 +1097,8 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
-    .with_trust_loopback_forwarded_ip(trust_loopback_forwarded_ip)
+    .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
+    .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
     .with_shield_lists(shield_lists);
 
@@ -1096,9 +1189,80 @@ mod preflight_bind_tests {
             Arc::new(db),
         ));
 
-        let snapshot = start_forwarded_ip_trust_refresh(service)
+        let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
-        assert!(snapshot.load(Ordering::Relaxed));
+        assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(
+            trust.ja4_header.load().is_none(),
+            "no JA4 header configured"
+        );
+    }
+
+    #[test]
+    fn initial_loopback_ja4_header_loads_saved_admin_choice() {
+        let settings = AppSettings {
+            trust_loopback_forwarded_ip: Some(true),
+            loopback_ja4_header: Some("x-ja4".into()),
+            ..AppSettings::default()
+        };
+        let row = settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[row]])
+            .into_connection();
+        let service = Arc::new(temps_config::ConfigService::new(
+            test_config(),
+            Arc::new(db),
+        ));
+
+        let trust = start_forwarded_ip_trust_refresh(service)
+            .expect("saved JA4 header must apply at startup");
+        assert_eq!(
+            trust.ja4_header.load().as_deref().map(HeaderName::as_str),
+            Some("x-ja4")
+        );
+    }
+
+    #[test]
+    fn loopback_ja4_header_refresh_reports_changes_only() {
+        let snapshot = ArcSwapOption::empty();
+        let header = || Some(Arc::new(HeaderName::from_static("x-ja4")));
+
+        assert!(apply_loopback_ja4_header_refresh(&snapshot, header()));
+        assert!(!apply_loopback_ja4_header_refresh(&snapshot, header()));
+        assert_eq!(
+            snapshot.load().as_deref().map(HeaderName::as_str),
+            Some("x-ja4")
+        );
+        assert!(apply_loopback_ja4_header_refresh(&snapshot, None));
+        assert!(snapshot.load().is_none());
+    }
+
+    /// A stored name the handler would refuse is ignored, never trusted:
+    /// the proxy strips the header it trusts from every request.
+    #[test]
+    fn invalid_stored_loopback_ja4_header_is_ignored() {
+        for stored in ["x ja4", "authorization", "cookie"] {
+            let settings = AppSettings {
+                loopback_ja4_header: Some(stored.into()),
+                ..AppSettings::default()
+            };
+            assert!(loopback_ja4_header(&settings).is_none(), "{stored}");
+        }
+        let settings = AppSettings {
+            loopback_ja4_header: Some(" X-JA4 ".into()),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            loopback_ja4_header(&settings)
+                .as_deref()
+                .map(HeaderName::as_str),
+            Some("x-ja4")
+        );
     }
 
     #[test]
@@ -1163,12 +1327,12 @@ mod preflight_bind_tests {
             Arc::new(db),
         ));
 
-        let snapshot =
+        let trust =
             start_forwarded_ip_trust_refresh(service).expect("initial settings load succeeds");
-        let weak = Arc::downgrade(&snapshot);
+        let weak = Arc::downgrade(&trust.forwarded_ip);
         assert!(weak.upgrade().is_some(), "still held by this test's Arc");
 
-        drop(snapshot);
+        drop(trust);
         assert!(
             weak.upgrade().is_none(),
             "once the LoadBalancer's Arc is dropped, the next loop iteration's \

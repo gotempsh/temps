@@ -22,6 +22,8 @@ function renderHeader(
     preset = 'dockerfile',
     linkEnvironmentId = 1,
     linkContainers,
+    linkUrl = 'https://app.example.com',
+    unavailableReason,
   }: {
     activeVisitors?: number
     containers?: {
@@ -37,6 +39,8 @@ function renderHeader(
       container_port?: number | null
       health_state?: string
     }[]
+    linkUrl?: string | null
+    unavailableReason?: string
   } = {}
 ) {
   const client = new QueryClient({
@@ -102,7 +106,8 @@ function renderHeader(
             } as DeploymentResponse
           }
           onDeploy={() => {}}
-          lastDeploymentUrl="https://app.example.com"
+          lastDeploymentUrl={linkUrl}
+          lastDeploymentUnavailableReason={unavailableReason}
           activeVisitorsCount={
             activeVisitors === undefined
               ? undefined
@@ -273,4 +278,23 @@ test('a missing link environment does not borrow production worker classificatio
     linkEnvironmentId: null,
   })
   expect(html).toContain('Visit deployed site')
+})
+
+test('the visit link follows the primary address it is given', () => {
+  const html = renderHeader('completed', 3513, {
+    linkUrl: 'https://shop.example.com',
+  })
+  expect(html).toContain('href="https://shop.example.com"')
+})
+
+test('with no address the visit button stays, disabled, and says why', () => {
+  const html = renderHeader('completed', 3513, {
+    linkUrl: null,
+    unavailableReason: 'app-production.localho.st only resolves on this machine',
+  })
+  expect(html).not.toContain('href="https://')
+  expect(html).toContain(
+    'title="Nothing to visit yet: app-production.localho.st only resolves on this machine"'
+  )
+  expect(html).toMatch(/<button[^>]*disabled=""[^>]*aria-label="Visit deployed site: unavailable/)
 })

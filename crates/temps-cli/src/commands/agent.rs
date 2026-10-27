@@ -365,6 +365,23 @@ impl AgentCommand {
                 ),
             }
 
+            // Signed-in addresses (ADR 065 D8): the ingress redeems sign-in
+            // codes and revokes sessions over this node's token channel.
+            match temps_agent::gate::GateChannel::new(
+                config.control_plane_url.clone(),
+                config.node_id,
+                config.token.clone(),
+                config.node_name.clone(),
+                temps_agent::control_plane_ca(&config),
+            ) {
+                Ok(channel) => temps_agent::gate::install(channel),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "could not build the signed-in gate channel; signed-in addresses on this \
+                     node will say sign-in is unavailable"
+                ),
+            }
+
             // Direct worker ingress (ADR 058 D7): the worker's own mode
             // (`temps agent ingress`) decides whether and where it listens.
             temps_agent::public_ingress_manager::start(

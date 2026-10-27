@@ -16,7 +16,7 @@ name: Dependency & Container Scan
 #   published release image with Trivy. It intentionally does not run on
 #   pull_request: a PR has no fresh image to scan (release.yml only builds
 #   images for pushed `v*.*.*` tags), so scanning the last published
-#   `:latest` (stable) and `:beta` (nightly) tags weekly is the meaningful
+#   `:latest` (stable), `:beta` and `:nightly` tags weekly is the meaningful
 #   signal here.
 on:
   pull_request:
@@ -302,8 +302,8 @@ jobs:
     # Only meaningful on a schedule/manual run: PRs don't produce a fresh
     # published image to scan (release.yml only builds+pushes on `v*.*.*`
     # tags). This job scans whatever is currently published on each release
-    # channel. Both are needed: release.yml moves `:latest` only on a stable
-    # tag and `:beta` on every prerelease (the nightlies), and
+    # channel. All three are needed: release.yml moves `:latest` on a stable
+    # tag, `:beta` on betas/RCs and `:nightly` on nightlies, and
     # docker-compose.release.yml deploys `:latest` by default. Scanning only
     # `:latest` let the image every nightly ships go unscanned while
     # `:latest` sat unchanged for months; scanning only `:beta` would hide
@@ -323,6 +323,8 @@ jobs:
             sarif-category: ".github/workflows/dependency-scan.yml:container-scan"
           - channel: beta
             sarif-category: ".github/workflows/dependency-scan.yml:container-scan-beta"
+          - channel: nightly
+            sarif-category: ".github/workflows/dependency-scan.yml:container-scan-nightly"
     permissions:
       contents: read
       security-events: write

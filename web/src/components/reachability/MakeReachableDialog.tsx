@@ -28,6 +28,7 @@ import {
   planEnvironmentReachability,
   type Decision,
   type PlanOption,
+  type PlanOptionKind,
   type ReachabilityPlan,
   type RunStep,
   type RunView,
@@ -66,8 +67,9 @@ import {
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Textarea } from '@/components/ui/textarea'
+import { PeoplePicker } from '@/components/reachability/PeoplePicker'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import {
   Select,
   SelectContent,
@@ -88,8 +90,11 @@ import {
   conflictSubject,
   conflictsToDecide,
   defaultOption,
+  accessPolicyMissing,
   isActiveRun,
   missingAnswers,
+  planGate,
+  SIGN_IN_GATES,
   planIsCurrent,
   parsePrincipals,
   privateDnsWarning,
@@ -101,8 +106,10 @@ import {
 import { cn } from '@/lib/utils'
 
 const schema = z.object({
-  /** Who can open the address (ADR 064 D5). */
-  audience: z.enum(['public', 'private', 'tailnet_users']),
+  /** Who can open the address (ADR 064 D5, ADR 065 D6, D7). */
+  audience: z.enum(['public', 'signed_in', 'private', 'tailnet_users']),
+  /** For a signed-in address: which sign-in (ADR 065 D9). */
+  gate: z.enum(['temps', 'cloudflare_access']),
   address: z.string().trim(),
   /** For `tailnet_users`: logins and tags, as typed (ADR 065 D6). */
   principals: z.string(),
@@ -119,6 +126,10 @@ export interface MakeReachableDialogProps {
   projectId: number
   environmentId: number
   environmentName?: string
+  /** An address to plan for straight away (ADR 068 D5's tunnel fix). */
+  initialAddress?: string
+  /** The option to pick when the plan offers it. */
+  initialOption?: PlanOptionKind
 }
 
 export function MakeReachableDialog({
@@ -127,6 +138,8 @@ export function MakeReachableDialog({
   projectId,
   environmentId,
   environmentName,
+  initialAddress,
+  initialOption,
 }: MakeReachableDialogProps) {
   const queryClient = useQueryClient()
   const path = { project_id: projectId, environment_id: environmentId }
@@ -138,6 +151,7 @@ export function MakeReachableDialog({
     resolver: zodResolver(schema),
     defaultValues: {
       audience: 'public',
+      gate: 'temps',
       address: '',
       principals: '',
       option: '',
@@ -150,6 +164,8 @@ export function MakeReachableDialog({
   const chosen = useWatch({ control: form.control, name: 'option' })
   const answers = useWatch({ control: form.control, name: 'values' })
   const audience = useWatch({ control: form.control, name: 'audience' })
+  const gateChoice = useWatch({ control: form.control, name: 'gate' })
+  const gate = planGate(audience, gateChoice)
   const typedPrincipals = useWatch({
     control: form.control,
     name: 'principals',
@@ -161,6 +177,7 @@ export function MakeReachableDialog({
     projectId,
     environmentId,
     audience,
+    gate,
     requested,
     principals.map((p) => p.value).join(','),
   ]
@@ -195,6 +212,7 @@ export function MakeReachableDialog({
         body: {
           audience,
           address: requested || null,
+          gate,
           ...(audience === 'tailnet_users' ? { principals } : {}),
         },
         signal,
@@ -218,16 +236,21 @@ export function MakeReachableDialog({
   // the plan's recommendation unless the user picked one that still fits.
   const suggested = plan.data?.address
   useEffect(() => {
+    if (open && initialAddress && !form.getValues('address'))
+      form.setValue('address', initialAddress)
+  }, [open, initialAddress, form])
+  useEffect(() => {
     if (suggested && !form.getValues('address'))
       form.setValue('address', suggested)
   }, [suggested, form])
   const options = useMemo(() => plan.data?.options ?? [], [plan.data])
   useEffect(() => {
     if (!options.some((o) => o.kind === form.getValues('option'))) {
-      form.setValue('option', defaultOption(options)?.kind ?? '')
+      const preferred = options.find((o) => o.kind === initialOption)
+      form.setValue('option', (preferred ?? defaultOption(options))?.kind ?? '')
       form.setValue('confirmed', false)
     }
-  }, [options, form])
+  }, [options, form, initialOption])
   const option = options.find((o) => o.kind === chosen)
   const fields = (option?.fields ?? []).filter((f) => f.key !== 'address')
 
@@ -303,6 +326,11 @@ export function MakeReachableDialog({
       form.setError('values', {
         message: `Still needed: ${missing.join(', ')}.`,
       })
+      return
+    }
+    const noOne = accessPolicyMissing(fields, values.values)
+    if (noOne) {
+      form.setError('values', { message: noOne })
       return
     }
     if (values.audience === 'tailnet_users') {
@@ -490,6 +518,54 @@ export function MakeReachableDialog({
                     </FormItem>
                   )}
                 />
+                {audience === 'signed_in' && (
+                  <FormField
+                    control={form.control}
+                    name="gate"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Sign in with</FormLabel>
+                        <FormControl>
+                          <RadioGroup
+                            aria-label="Sign in with"
+                            value={field.value}
+                            onValueChange={(next) => {
+                              field.onChange(next)
+                              form.setValue('option', '')
+                              form.setValue('confirmed', false)
+                            }}
+                            className="grid gap-2 sm:grid-cols-2"
+                          >
+                            {SIGN_IN_GATES.map((choice) => (
+                              <label
+                                key={choice.value}
+                                className={cn(
+                                  'flex cursor-pointer items-start gap-2 rounded-md border p-3',
+                                  field.value === choice.value
+                                    ? 'border-primary'
+                                    : 'border-border hover:border-primary/50'
+                                )}
+                              >
+                                <RadioGroupItem
+                                  value={choice.value}
+                                  className="mt-0.5"
+                                />
+                                <span className="space-y-0.5">
+                                  <span className="block text-sm font-medium">
+                                    {choice.label}
+                                  </span>
+                                  <span className="block text-xs text-muted-foreground">
+                                    {choice.help}
+                                  </span>
+                                </span>
+                              </label>
+                            ))}
+                          </RadioGroup>
+                        </FormControl>
+                      </FormItem>
+                    )}
+                  />
+                )}
                 {audience === 'tailnet_users' && (
                   <FormField
                     control={form.control}
@@ -669,6 +745,11 @@ const AUDIENCES = [
     help: 'A public address with HTTPS.',
   },
   {
+    value: 'signed_in',
+    label: 'People who sign in',
+    help: 'A public address with a sign-in in front: the Temps sign-in, or Cloudflare Access.',
+  },
+  {
     value: 'private',
     label: 'Only my private network',
     help: 'Served by a worker on your tailnet or LAN, or at its own tailnet name with Tailscale Serve; nobody else can connect.',
@@ -826,7 +907,49 @@ function SetupFieldInput({
               </span>
             )}
           </FormLabel>
-          {setupField.kind.type === 'dns_provider' ? (
+          {setupField.kind.type === 'teams' ||
+          setupField.kind.type === 'users' ? (
+            <PeoplePicker
+              kind={setupField.kind.type}
+              value={field.value ?? ''}
+              onChange={field.onChange}
+            />
+          ) : setupField.kind.type === 'choice' ? (
+            <FormControl>
+              <RadioGroup
+                aria-label={setupField.label}
+                value={field.value ?? ''}
+                onValueChange={field.onChange}
+                className="grid gap-2"
+              >
+                {setupField.kind.choices.map((choice) => (
+                  <label
+                    key={choice.value}
+                    className="flex cursor-pointer items-start gap-2 text-sm"
+                  >
+                    <RadioGroupItem value={choice.value} className="mt-0.5" />
+                    <span className="space-y-0.5">
+                      <span className="block font-medium">{choice.label}</span>
+                      {choice.help && (
+                        <span className="block text-xs text-muted-foreground">
+                          {choice.help}
+                        </span>
+                      )}
+                    </span>
+                  </label>
+                ))}
+              </RadioGroup>
+            </FormControl>
+          ) : setupField.kind.type === 'text_list' ? (
+            <FormControl>
+              <Textarea
+                rows={3}
+                placeholder={setupField.placeholder ?? undefined}
+                {...field}
+                value={field.value ?? ''}
+              />
+            </FormControl>
+          ) : setupField.kind.type === 'dns_provider' ? (
             providers.isPending ? (
               <Skeleton className="h-9 w-full" />
             ) : (

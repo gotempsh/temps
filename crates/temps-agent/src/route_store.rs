@@ -59,6 +59,10 @@ pub struct RouteEntry {
     pub deployment_id: Option<i32>,
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
+    /// The signed-in gate in front of this address (ADR 065 D8). Only on
+    /// routes in `gated_routes`, here and in `routes.json`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -95,6 +99,12 @@ pub struct PublicIngressSnapshot {
     /// 404 for it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub identity_serve_routes: Vec<IdentityServeRoute>,
+    /// Signed-in addresses (ADR 065 D7), each with its gate. Never in
+    /// `routes`, here or in `routes.json`: an agent rolled back to a version
+    /// without the gate reads that file and ignores this field, so it serves
+    /// none of them, open, for the rest of its lease.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated_routes: Vec<RouteEntry>,
 }
 
 /// Where a `tailnet_users` Serve socket sends requests, and who it admits.
@@ -107,6 +117,23 @@ pub struct IdentityServeRoute {
 }
 
 impl PublicIngressSnapshot {
+    /// ADR 065 D7: move every signed-in route out of `routes`, whatever put
+    /// it there, and drop any route in `gated_routes` that names no gate
+    /// (it would be served open).
+    fn separate_gated(&mut self) {
+        let (gated, open): (Vec<_>, Vec<_>) = std::mem::take(&mut self.routes)
+            .into_iter()
+            .partition(|route| route.gate.is_some());
+        self.routes = open;
+        self.gated_routes.extend(gated);
+        self.gated_routes.retain(|route| {
+            if route.gate.is_none() {
+                warn!(host = %route.host, "dropping a signed-in route that names no gate");
+            }
+            route.gate.is_some()
+        });
+    }
+
     /// ADR 065 D6: move every `tailnet_users` route out of the fields an
     /// older agent reads, whatever put it there, and make sure none of the
     /// moved ones is left without a list (that would be the whole range).
@@ -299,6 +326,7 @@ impl RouteStore {
     /// snapshot. The encrypted certificate bundles are safe to cache on disk;
     /// decrypted private keys are never stored here.
     pub fn apply_public_snapshot(&self, mut snapshot: PublicIngressSnapshot) {
+        snapshot.separate_gated();
         snapshot.separate_tailnet_users();
         if !snapshot.enabled {
             self.public_enabled.store(false, Ordering::Release);
@@ -506,6 +534,7 @@ impl RouteStore {
             enabled: snap.public_ingress.enabled && valid_expiry,
             ..snap.public_ingress
         };
+        public_ingress.separate_gated();
         public_ingress.separate_tailnet_users();
         *self.public_ingress.write() = public_ingress;
         self.public_enabled
@@ -603,10 +632,13 @@ impl RouteStore {
                 })
                 .collect(),
         ));
+        // A signed-in route comes last, so it wins over an open one for the
+        // same host.
         self.public_routes.store(Arc::new(
             snapshot
                 .routes
                 .iter()
+                .chain(&snapshot.gated_routes)
                 .map(|route| {
                     (
                         route.host.trim_end_matches('.').to_ascii_lowercase(),
@@ -792,6 +824,7 @@ mod tests {
             deployment_id: Some(1),
             project_id,
             environment_id: Some(1),
+            gate: None,
         }
     }
 
@@ -834,6 +867,99 @@ mod tests {
         assert!(store.container_id_has_project("container-alpha", 10));
         assert!(!store.container_id_has_project("container-alpha", 20));
         assert!(!store.container_id_has_project("unknown", 10));
+    }
+
+    /// ADR 065 D7: a signed-in route given in `routes` is moved out of it,
+    /// so `routes.json` never holds one where an agent that predates the
+    /// gate reads. That agent, reading the file after a rollback, finds no
+    /// signed-in host; this one still serves it, with its gate.
+    #[test]
+    fn routes_json_holds_no_signed_in_route_where_an_older_agent_reads() {
+        #[derive(serde::Deserialize)]
+        struct OldDisk {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            routes: Vec<OldEntry>,
+            #[serde(default)]
+            private_routes: Vec<OldPrivate>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldEntry {
+            host: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPrivate {
+            route: OldEntry,
+        }
+
+        let gated = |host: &str| RouteEntry {
+            gate: Some(temps_core::gate::GatePolicy {
+                address_id: "custom:1".into(),
+                gate: temps_core::gate::GateKind::Temps,
+                temps: None,
+                access: None,
+            }),
+            ..entry(host, "10.0.0.1:80")
+        };
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("routes.json");
+        let store = RouteStore::new(path.clone());
+        store.apply_public_snapshot(PublicIngressSnapshot {
+            enabled: true,
+            routes: vec![
+                entry("open.example.test", "10.0.0.1:80"),
+                gated("team.example.test"),
+            ],
+            gated_routes: vec![
+                gated("access.example.test"),
+                // Names no gate: never served from here.
+                entry("nogate.example.test", "10.0.0.1:80"),
+            ],
+            ..PublicIngressSnapshot::default()
+        });
+        store.apply_snapshot(1, Vec::new());
+
+        // This agent serves them, each behind its gate.
+        assert!(store
+            .lookup_public("team.example.test")
+            .unwrap()
+            .gate
+            .is_some());
+        assert!(store
+            .lookup_public("access.example.test")
+            .unwrap()
+            .gate
+            .is_some());
+        assert!(store.lookup_public("nogate.example.test").is_none());
+        assert!(store
+            .lookup_public("open.example.test")
+            .unwrap()
+            .gate
+            .is_none());
+
+        // The agent that predates the gate, reading the same file, serves
+        // none of them.
+        let old: OldDisk = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let hosts: Vec<&str> = old
+            .public_ingress
+            .routes
+            .iter()
+            .chain(old.public_ingress.private_routes.iter().map(|p| &p.route))
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["open.example.test"]);
+
+        // And this agent, restarted on that file, still gates them.
+        let reloaded = RouteStore::new(path);
+        reloaded.load_from_disk();
+        assert!(reloaded
+            .lookup_public("team.example.test")
+            .unwrap()
+            .gate
+            .is_some());
+        assert!(reloaded.lookup_public("nogate.example.test").is_none());
     }
 
     /// ADR 065 D6: a `tailnet_users` route given in the fields every agent
@@ -989,6 +1115,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),

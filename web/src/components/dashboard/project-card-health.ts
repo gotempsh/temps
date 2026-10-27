@@ -47,7 +47,7 @@ export interface ProjectHealthInput {
 
 /** The slice of `ProjectMonitorHealth` this indicator reads. */
 export interface ProjectMonitorHealthInput {
-  /** `operational` | `degraded` | `down` | `not_deployed` | `no_monitors` */
+  /** `operational` | `degraded` | `down` | `not_deployed` | `no_address` | `no_monitors` */
   status: string
 }
 
@@ -122,6 +122,15 @@ function monitorIndicator(
         label: 'Not deployed yet',
         detail:
           'Production has no deployment yet, so its uptime monitor has nothing to check. Uptime checks start with the first production deployment.',
+      }
+    case 'no_address':
+      // ADR 068 D4: nobody can reach production yet, so the monitor does
+      // not probe. Grey, never down: nothing failed.
+      return {
+        tone: 'idle',
+        label: 'Nothing to check',
+        detail:
+          'Nothing to check: nobody can reach this environment yet. Uptime checks start once it has an address.',
       }
     default:
       // 'no_monitors', or a status this build does not know about.

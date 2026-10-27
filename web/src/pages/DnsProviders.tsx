@@ -46,6 +46,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { getDnsProviderIcon } from '@/components/icons/DnsProviderIcons'
+import { CloudflareAccessTokens } from '@/components/domains/CloudflareAccessTokens'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -382,6 +383,8 @@ export function DnsProviders() {
             </ul>
           </div>
         )}
+
+        <CloudflareAccessTokens canManage={canManageProviders} />
       </div>
 
       {/* Delete Confirmation Dialog */}

@@ -262,8 +262,10 @@ pub struct ListenerReport {
     /// (ADR 065 D2, D4). `None` from agents that predate it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tailscale: Option<crate::tailnet::TailscaleReport>,
-    /// What this agent enforces, e.g. `tailnet_identity.v1` (ADR 065 D6).
-    /// A route that needs one is never sent to an agent without it.
+    /// What this agent enforces, e.g. `gate.v1` (ADR 065 D7) or
+    /// `tailnet_identity.v1` (D6). Informational: what a snapshot may carry
+    /// is decided from what each request declares, never from this report.
+    /// An agent that predates the field reports none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }

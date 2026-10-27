@@ -482,6 +482,8 @@ pub struct WorkflowExecutionService {
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// ADR 068 D5: the deploy warning (late-bound, optional).
+    environment_addresses: OnceCell<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
     /// Audit sink for deploy-path security events (late-bound, optional).
     ///
     /// Currently the ADR-045 "this deployment received the host Docker socket"
@@ -531,6 +533,7 @@ impl WorkflowExecutionService {
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            environment_addresses: OnceCell::new(),
             audit_logger: OnceCell::new(),
         }
     }
@@ -543,6 +546,14 @@ impl WorkflowExecutionService {
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events.
     pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
         let _ = self.telemetry.set(reporter);
+    }
+
+    /// Wire the ADR 068 D5 deploy warning.
+    pub fn set_environment_addresses(
+        &self,
+        slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
+    ) {
+        let _ = self.environment_addresses.set(slot);
     }
 
     /// The telemetry reporter, or a no-op when none has been wired. Always safe
@@ -2267,6 +2278,7 @@ impl WorkflowExecutionService {
                     })? as i32;
 
                 let mut builder = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+                    .environment_addresses(self.environment_addresses.get().cloned())
                     .job_id(db_job.job_id.clone())
                     .deployment_id(deployment_id)
                     .db(self.db.clone())

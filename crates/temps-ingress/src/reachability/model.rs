@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::registry::SetupField;
+pub use temps_core::gate::{GateAllowList, GateKind};
 
 /// Who an address is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
@@ -17,7 +18,7 @@ pub enum Audience {
     Public,
     /// Only devices on the operator's private network. Reserved (phase 2).
     Private,
-    /// Anyone who signs in. Reserved (phase 4).
+    /// People who sign in, behind the address's gate (ADR 065 D7).
     SignedIn,
     /// Private, and only the tailnet users and tags listed for the address
     /// (ADR 065 D6). Served only by an agent that checks who they are.
@@ -45,12 +46,12 @@ impl Audience {
         matches!(self, Audience::Private | Audience::TailnetUsers)
     }
 
-    /// Whether this version can serve the audience (`signed_in` arrives in
-    /// phase 4). Anything else is served to nobody.
+    /// Whether this version can serve the audience. Anything else is
+    /// served to nobody.
     pub fn is_served(self) -> bool {
         matches!(
             self,
-            Audience::Public | Audience::Private | Audience::TailnetUsers
+            Audience::Public | Audience::Private | Audience::SignedIn | Audience::TailnetUsers
         )
     }
 
@@ -89,6 +90,8 @@ pub enum AddressSource {
     EnvironmentDomain,
     /// A project custom domain.
     CustomDomain,
+    /// The environment domain under a tunnel's zone (ADR 068 D3).
+    TunnelHost,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -165,6 +168,13 @@ pub struct AddressReachability {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "Tailscale")]
     pub network: Option<String>,
+    /// ADR 068 D4: no way in was ever set up for it -- it is local-only,
+    /// for an audience routing does not serve, not deployed, or the
+    /// generated host with no DNS record and no tunnel covering it. A way
+    /// in that was set up and broke is `false`, so an outage is never read
+    /// as "nothing to check". Not part of the API.
+    #[serde(skip)]
+    pub nothing_set_up: bool,
 }
 
 /// Everything about one environment's addresses.
@@ -184,6 +194,9 @@ pub struct EnvironmentReachability {
     pub addresses: Vec<AddressReachability>,
     /// What *Make it reachable* would do, while no address is reachable.
     pub plan: Option<ReachabilityPlan>,
+    /// The address every surface means by "the app's address" (ADR 068
+    /// D4); `None` while no address is reachable.
+    pub primary_address: Option<temps_core::environment_address::PrimaryAddress>,
 }
 
 /// `POST …/reachability/plan`.
@@ -193,6 +206,10 @@ pub struct PlanRequest {
     pub audience: Audience,
     /// The hostname to make reachable; Temps suggests one without it.
     pub address: Option<String>,
+    /// For `signed_in`: the gate to put in front of it (ADR 065 D7). The
+    /// Temps sign-in when absent.
+    #[serde(default)]
+    pub gate: Option<GateKind>,
     /// For `tailnet_users`: the tailnet logins and tags it admits (ADR 065
     /// D6). At least one; checked and lower-cased.
     #[serde(default)]
@@ -226,6 +243,9 @@ pub enum PlanOptionKind {
     TailscaleService,
     /// A Tailscale Service, after saving a pasted Tailscale OAuth client.
     TailscaleServiceWithCredential,
+    /// Turn on a tunnel's environment hosts (ADR 068 D3): every
+    /// environment, this one included, gets `<label>.<tunnel domain>`.
+    TunnelEnvironmentHosts,
 }
 
 impl PlanOptionKind {
@@ -240,6 +260,7 @@ impl PlanOptionKind {
             PlanOptionKind::TailscaleServe,
             PlanOptionKind::TailscaleService,
             PlanOptionKind::TailscaleServiceWithCredential,
+            PlanOptionKind::TunnelEnvironmentHosts,
         ]
         .into_iter()
         .find(|kind| kind.as_str() == value)
@@ -256,6 +277,7 @@ impl PlanOptionKind {
             PlanOptionKind::TailscaleServe => "tailscale_serve",
             PlanOptionKind::TailscaleService => "tailscale_service",
             PlanOptionKind::TailscaleServiceWithCredential => "tailscale_service_with_credential",
+            PlanOptionKind::TunnelEnvironmentHosts => "tunnel_environment_hosts",
         }
     }
 }
@@ -278,6 +300,9 @@ pub enum StepKind {
     /// Records who an address is for, and for a private one the network
     /// range and the listener that serve it (ADR 064 D5).
     SetAudience,
+    /// Uses the Cloudflare Access application covering the address, or
+    /// creates one (ADR 065 D9).
+    AccessApp,
     /// Declares the worker's Serve entry for the address and waits for its
     /// agent to apply it (ADR 065 D4).
     ConfigureTailscaleServe,
@@ -290,6 +315,8 @@ pub enum StepKind {
     /// Waits for the tailnet admin to approve the worker as the Service's
     /// host; never approves it.
     WaitForServiceApproval,
+    /// Turns on the tunnel's environment hosts (ADR 068 D3).
+    PublishEnvironmentHosts,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -345,6 +372,9 @@ pub struct ReachabilityPlan {
     #[schema(value_type = Option<String>, format = DateTime)]
     pub expires_at: Option<temps_core::DBDateTime>,
     pub audience: Audience,
+    /// For `signed_in`: the gate the plan puts in front of the address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateKind>,
     /// The address asked for, or the one Temps suggests.
     pub address: Option<String>,
     /// Why the address cannot be used, when it cannot.
@@ -550,6 +580,10 @@ pub enum PlannedRecord {
 }
 
 /// Something a run made, so undo removes exactly that.
+// The `AddressAudience` variant carries two full audiences (gate and
+// tailnet fields). Journal entries are a handful per run and are stored as
+// JSON, never held in bulk, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunResource {
@@ -608,6 +642,18 @@ pub enum RunResource {
     Certificate {
         domain: String,
     },
+    /// A Cloudflare Access application the run created (ADR 065 D9). Undo
+    /// deletes it only while its domain is still `hostname`, and asks
+    /// first when its policies no longer match `policies`.
+    AccessApp {
+        provider_id: i32,
+        id: String,
+        name: String,
+        hostname: String,
+        aud: String,
+        /// The policies' fingerprint when the run created it.
+        policies: String,
+    },
     /// This run's reference to a worker's Serve entry (ADR 065 D4). Undo
     /// drops the reference; the entry goes with its last one.
     TailscaleServe {
@@ -639,7 +685,33 @@ pub enum RunResource {
         /// As read back once the step was done, with its addresses.
         definition: crate::tailscale::ServiceDefinition,
     },
+    /// A tunnel whose environment hosts the run turned on (ADR 068 D3):
+    /// undo turns them off, which withdraws every host it generated.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
+    },
 }
+
+/// The Cloudflare Access application in front of a signed-in address
+/// (ADR 065 D9): its JWTs carry `aud`, from the team of `provider_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct AccessBinding {
+    pub provider_id: i32,
+    pub app_id: String,
+    pub aud: String,
+}
+
+/// [`AddressAudience::who`]: the audience; for a signed-in address its
+/// gate, its list, and the Access application `(provider, app id)`; and
+/// for a `tailnet_users` one the logins and tags it admits.
+pub type Who = (
+    Audience,
+    Option<GateKind>,
+    Option<GateAllowList>,
+    Option<(i32, String)>,
+    Vec<temps_core::tailnet::TailnetPrincipal>,
+);
 
 /// Who one address is for, with what bounds a private one (ADR 064 D5).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
@@ -655,6 +727,17 @@ pub struct AddressAudience {
     /// inside check dials.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For `signed_in`: the gate in front of it (ADR 065 D7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateKind>,
+    /// For `signed_in` with the Temps gate: the teams and users that may
+    /// sign in. `None` admits everyone with access to the project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_allow: Option<GateAllowList>,
+    /// For `signed_in` with Cloudflare Access: the application in front of
+    /// it (ADR 065 D9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_access: Option<AccessBinding>,
     /// For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
     /// `tailscale_service`. `None` is phase 2's listener, so runs journaled
     /// before this column compare equal to what they set.
@@ -674,6 +757,62 @@ impl AddressAudience {
         Self::default()
     }
 
+    /// For people who sign in through `gate`, optionally only `allow`.
+    pub fn signed_in(gate: GateKind, allow: Option<GateAllowList>) -> Self {
+        Self {
+            audience: Audience::SignedIn,
+            gate: Some(gate),
+            gate_allow: allow
+                .map(GateAllowList::normalized)
+                .filter(|list| !list.is_empty() && gate == GateKind::Temps),
+            ..Self::default()
+        }
+    }
+
+    /// Who may open the address, as a comparable value: the audience, for
+    /// a signed-in one its gate and list, and for a `tailnet_users` one who
+    /// it admits. Changing it is the sensitive action (ADR 064 Security,
+    /// ADR 065 D6, D7), and for a signed-in address it revokes the
+    /// address's gate sessions (D8).
+    pub fn who(&self) -> Who {
+        if self.audience == Audience::TailnetUsers {
+            let mut principals = self.principals.clone();
+            principals.sort();
+            principals.dedup();
+            return (self.audience, None, None, None, principals);
+        }
+        if self.audience != Audience::SignedIn {
+            return (self.audience, None, None, None, Vec::new());
+        }
+        let gate = self.gate.unwrap_or_default();
+        (
+            self.audience,
+            Some(gate),
+            self.gate_allow
+                .clone()
+                .map(GateAllowList::normalized)
+                .filter(|list| !list.is_empty()),
+            // Which Access app decides who gets in is part of who it is for.
+            self.gate_access
+                .as_ref()
+                .filter(|_| gate == GateKind::CloudflareAccess)
+                .map(|access| (access.provider_id, access.app_id.clone())),
+            Vec::new(),
+        )
+    }
+
+    /// The value a step-up prompt names (`signed_in`, or
+    /// `signed_in:cloudflare_access`, `signed_in:temps+list`).
+    pub fn who_label(&self) -> String {
+        match self.who() {
+            (audience, None, ..) => audience.as_str().to_string(),
+            (audience, Some(gate), None, ..) => format!("{}:{}", audience.as_str(), gate.as_str()),
+            (audience, Some(gate), Some(_), ..) => {
+                format!("{}:{}+list", audience.as_str(), gate.as_str())
+            }
+        }
+    }
+
     /// Served through tailscaled (ADR 065 D1), not a listener.
     pub fn on_tailscale(&self) -> bool {
         self.audience.is_private()
@@ -689,7 +828,20 @@ impl AddressAudience {
             (Audience::Private, Some(range)) => format!("private to {range}"),
             (Audience::Private, None) => "private".to_string(),
             (Audience::Public, _) => "public".to_string(),
-            (Audience::SignedIn, _) => "for people who sign in".to_string(),
+            (Audience::SignedIn, _) => match (self.gate.unwrap_or_default(), &self.gate_allow) {
+                (GateKind::CloudflareAccess, _) => {
+                    "for people Cloudflare Access lets in".to_string()
+                }
+                (GateKind::Temps, Some(list)) if !list.is_empty() => {
+                    "for listed people who sign in to Temps".to_string()
+                }
+                (GateKind::Temps, _) => {
+                    "for people who sign in to Temps with access to the project".to_string()
+                }
+                (GateKind::Unsupported, _) => {
+                    "behind a gate set by a newer version of Temps".to_string()
+                }
+            },
             (Audience::TailnetUsers, _) => match self.principals.len() {
                 1 => format!("only for {}", self.principals[0].value),
                 n => format!("only for {n} tailnet users and tags"),
@@ -728,6 +880,9 @@ impl RunResource {
                 before.describe()
             ),
             RunResource::Certificate { domain } => format!("Certificate for {domain}"),
+            RunResource::AccessApp { name, hostname, .. } => {
+                format!("Cloudflare Access app {name} for {hostname}")
+            }
             RunResource::TailscaleServe {
                 node_name, hostname, ..
             } => format!("{node_name} serving {hostname} through Tailscale Serve"),
@@ -737,12 +892,19 @@ impl RunResource {
             RunResource::TailscaleService { name, tailnet, .. } => {
                 format!("Tailscale Service `{name}` in {tailnet}")
             }
+            RunResource::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
+            }
         }
     }
 }
 
 /// What a run set out to create, with what finds it again (ADR 064 D4):
 /// written to the journal before the call that creates it.
+// The `AddressAudience` variant carries two full audiences (gate and
+// tailnet fields). Journal entries are a handful per run and are stored as
+// JSON, never held in bulk, so the size difference costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
@@ -796,6 +958,13 @@ pub enum Intent {
     Certificate {
         domain: String,
     },
+    /// Found by its name, which the run picks before creating it, and its
+    /// domain (ADR 065 D9).
+    AccessApp {
+        provider_id: i32,
+        name: String,
+        hostname: String,
+    },
     /// Found by the `tailnet_serve_entries` row and this run's reference to
     /// it (ADR 065 D4); the step is done only on the agent's report.
     TailscaleServe {
@@ -817,6 +986,11 @@ pub enum Intent {
         name: String,
         /// `temps:<install>:<this run>`.
         marker: String,
+    },
+    /// Found by the connector's `environment_hosts` flag.
+    EnvironmentHosts {
+        connector_id: i32,
+        name: String,
     },
 }
 
@@ -841,10 +1015,14 @@ impl Intent {
     pub fn authority(&self) -> LookupAuthority {
         use std::time::Duration;
         match self {
-            Intent::DnsRecord { .. } | Intent::DnsChange { .. } => LookupAuthority::Settled {
-                timeout: Duration::from_secs(30),
-                settle: Duration::from_secs(30),
-            },
+            // Cloudflare documents no read-after-write guarantee for listing
+            // Access applications either.
+            Intent::DnsRecord { .. } | Intent::DnsChange { .. } | Intent::AccessApp { .. } => {
+                LookupAuthority::Settled {
+                    timeout: Duration::from_secs(30),
+                    settle: Duration::from_secs(30),
+                }
+            }
             // Tailscale documents no read-after-write guarantee for a
             // Service either (ADR 065 D4: two misses, as Cloudflare DNS).
             Intent::TailscaleService { .. } => LookupAuthority::Settled {
@@ -877,6 +1055,10 @@ impl Intent {
                 record_type,
                 ..
             } => format!("Check the {record_type} record for `{hostname}` at your DNS provider."),
+            Intent::AccessApp { name, hostname, .. } => format!(
+                "Check whether an Access application named `{name}` for `{hostname}` exists in \
+                 Cloudflare (Zero Trust → Access → Applications)."
+            ),
             Intent::TailscaleService { name, .. } => format!(
                 "Check whether `{name}` exists at login.tailscale.com/admin/services, and what its \
                  comment says."
@@ -923,6 +1105,11 @@ impl Intent {
             }
             Intent::AddressAudience { hostname, .. } => format!("audience/{hostname}"),
             Intent::Certificate { domain } => format!("certificate/{domain}"),
+            Intent::AccessApp {
+                provider_id,
+                hostname,
+                ..
+            } => format!("access_app/{provider_id}/{hostname}"),
             Intent::TailscaleServe {
                 node_id,
                 address_id,
@@ -931,6 +1118,9 @@ impl Intent {
             Intent::TailscaleCredential { name } => format!("tailscale_credential/{name}"),
             Intent::TailscaleService { tailnet, name, .. } => {
                 format!("tailscale_service/{tailnet}/{name}")
+            }
+            Intent::EnvironmentHosts { connector_id, .. } => {
+                format!("environment_hosts/{connector_id}")
             }
         };
         format!("run-{run_id}/{what}")
@@ -959,6 +1149,9 @@ impl Intent {
                 format!("{hostname} made {}", after.describe())
             }
             Intent::Certificate { domain } => format!("Certificate for {domain}"),
+            Intent::AccessApp { name, hostname, .. } => {
+                format!("Cloudflare Access app {name} for {hostname}")
+            }
             Intent::TailscaleServe {
                 node_name,
                 hostname,
@@ -967,6 +1160,9 @@ impl Intent {
             Intent::TailscaleCredential { name } => format!("Tailscale OAuth client {name}"),
             Intent::TailscaleService { name, tailnet, .. } => {
                 format!("Tailscale Service `{name}` in {tailnet}")
+            }
+            Intent::EnvironmentHosts { name, .. } => {
+                format!("Environment addresses through tunnel {name}")
             }
         }
     }

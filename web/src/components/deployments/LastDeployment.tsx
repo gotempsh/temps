@@ -16,7 +16,11 @@ import {
   GitBranch,
 } from 'lucide-react'
 import { Link } from 'react-router'
-import { displayUrl, normalizeUrl } from '@/lib/deployment-url'
+import {
+  displayUrl,
+  normalizeUrl,
+  resolveStableLink,
+} from '@/lib/deployment-url'
 import { deploymentSourceLabel } from '@/lib/deployment-source-label'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
@@ -31,13 +35,19 @@ export function LastDeployment({
   projectName,
   screenshotsEnabled,
 }: LastDeploymentProps) {
-  const primaryUrl = deployment.environment.domains[0] ?? deployment.url
-  const primaryHref = normalizeUrl(primaryUrl)
+  // ADR 068 D4: when nobody can reach the environment there is no URL to
+  // show or open, only the reason.
+  const { url: stableUrl, unavailableReason } = resolveStableLink(deployment)
+  const primaryUrl = unavailableReason ? null : (stableUrl ?? deployment.url)
+  const primaryHref = primaryUrl ? normalizeUrl(primaryUrl) : null
   // Additional public Docker Compose service ports each have their own URL;
-  // the first is normally the environment URL shown above.
-  const serviceUrls = (deployment.environment.service_urls ?? []).filter(
-    (route) => normalizeUrl(route.url) !== primaryHref
-  )
+  // the first is normally the environment URL shown above. They are served
+  // under the same address, so nobody can open them either without one.
+  const serviceUrls = unavailableReason
+    ? []
+    : (deployment.environment.service_urls ?? []).filter(
+        (route) => normalizeUrl(route.url) !== primaryHref
+      )
   const screenshotLocation = deployment.screenshot_location
   const screenshotUrl = screenshotLocation
     ? `/api/files${screenshotLocation.startsWith('/') ? screenshotLocation : `/${screenshotLocation}`}`
@@ -89,6 +99,11 @@ export function LastDeployment({
                 </p>
               </div>
               {primaryUrl && <DeploymentUrlRow value={primaryUrl} />}
+              {unavailableReason && (
+                <p className="text-xs text-muted-foreground">
+                  Nobody can open it yet: {unavailableReason}
+                </p>
+              )}
               {serviceUrls.map((route) => (
                 <DeploymentUrlRow
                   key={route.url}
@@ -99,6 +114,16 @@ export function LastDeployment({
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              {unavailableReason && (
+                // The span carries the tooltip, which a disabled button
+                // would not show.
+                <span title={`Nothing to open yet: ${unavailableReason}`}>
+                  <Button variant="outline" size="sm" disabled>
+                    Open site
+                    <ExternalLink className="ml-1.5 size-3.5" />
+                  </Button>
+                </span>
+              )}
               {primaryHref && (
                 <Button variant="outline" size="sm" asChild>
                   <a

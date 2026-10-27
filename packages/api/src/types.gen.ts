@@ -1696,6 +1696,14 @@ export type AppSettings = {
   internal_url?: string | null;
   letsencrypt?: LetsEncryptSettings;
   /**
+   * The header a trusted loopback proxy puts the visitor's JA4 TLS
+   * fingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer
+   * `trust_loopback_forwarded_ip` trusts, and removed from every request
+   * before it goes upstream. `None` records no JA4 behind such a proxy.
+   * Set through [`normalize_loopback_ja4_header`].
+   */
+  loopback_ja4_header?: string | null;
+  /**
    * MCP server settings (ADR-039). Off by default — enable via the Settings
    * UI to expose the MCP endpoint to the Temps CLI wizard.
    */
@@ -1863,6 +1871,11 @@ export type AppSettingsResponse = {
   insecure_tls: boolean;
   internal_url?: string | null;
   letsencrypt: LetsEncryptSettings;
+  /**
+   * The header a trusted loopback proxy sends the visitor's JA4 in.
+   * `None` records no JA4 behind such a proxy.
+   */
+  loopback_ja4_header?: string | null;
   /**
    * MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
    * content — passed through as-is so the settings UI can show and edit it.
@@ -17374,6 +17387,15 @@ export type ProxyLogResponse = {
   ip_geolocation_id?: number | null;
   is_bot?: boolean | null;
   is_system_request: boolean;
+  /**
+   * The client's JA4 TLS fingerprint, when its source gives one.
+   */
+  ja4?: string | null;
+  /**
+   * Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+   * `edge`.
+   */
+  ja4_source?: string | null;
   method: string;
   operating_system?: string | null;
   path: string;

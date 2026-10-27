@@ -16,6 +16,7 @@
 //! cumulative readings into deltas before calling [`MetricsStore::write_batch`].
 
 pub mod disk_health;
+pub mod mariadb;
 pub mod mongodb;
 pub mod node;
 pub mod postgres;

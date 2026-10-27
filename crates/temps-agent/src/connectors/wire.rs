@@ -21,8 +21,19 @@ pub struct NodeConnectorSpec {
     pub revision: String,
     pub edge_port: u16,
     pub client_address_header: Option<String>,
+    /// Absent from older control planes.
+    #[serde(default)]
+    pub client_ja4: Option<ForwardedJa4>,
     pub drivers: Vec<DriverChoice>,
     pub secrets: BTreeMap<String, String>,
+}
+
+/// The header a connector puts the visitor's JA4 in (ADR 066, D4), and the
+/// `ja4_source` it stands for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForwardedJa4 {
+    pub header: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

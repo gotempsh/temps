@@ -46,12 +46,14 @@ impl IngressHarness {
                 deployment_id: Some(41),
                 project_id: Some(42),
                 environment_id: Some(43),
+                gate: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -152,6 +154,7 @@ fn enabled_public_store(snapshot_dir: &TempDir) -> SharedRouteStore {
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -235,6 +238,84 @@ async fn test_public_ingress_known_host_forwards_request_to_published_backend() 
     backend_shutdown.notify_waiters();
 }
 
+/// ADR 065 D10: monitors take `x-temps-gate` for the gate's own answer, so
+/// an app on an ordinary (not signed-in) host cannot pass a failing answer
+/// off as one.
+#[tokio::test]
+async fn test_public_ingress_app_cannot_send_the_gate_header() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test backend");
+    let backend_address = listener.local_addr().expect("read test backend address");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 500 Internal Server Error\r\nx-temps-gate: sign-in\r\n\
+                          Content-Length: 6\r\nConnection: close\r\n\r\nbroken",
+                    )
+                    .await;
+            });
+        }
+    });
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request("GET / HTTP/1.1\r\nHost: app.example.test\r\nConnection: close\r\n\r\n")
+        .await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 500 Internal Server Error"),
+        "{response}"
+    );
+    assert!(
+        !response.to_ascii_lowercase().contains("x-temps-gate"),
+        "{response}"
+    );
+}
+
+/// A host that is not signed-in (any more) never passes the gate's cookies
+/// or a client's `x-temps-*` headers to its app: a gate cookie left from
+/// before is still a token, and only Temps sets `x-temps-*` (ADR 065 D8).
+#[tokio::test]
+async fn test_public_ingress_never_forwards_gate_cookies_or_client_temps_headers() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+
+    let response = ingress
+        .request(
+            "GET / HTTP/1.1\r\nHost: app.example.test\r\n\
+             Cookie: a=1; __Host-temps_gate=old-token; __Host-temps_gate_state=s; b=2\r\n\
+             X-Temps-User: 1\r\nX-Temps-User-Role: admin\r\nX-Temps-Anything: x\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+
+    let backend_request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(
+        backend_request.contains("cookie: a=1; b=2\r\n"),
+        "{backend_request}"
+    );
+    assert!(!backend_request.contains("temps_gate"), "{backend_request}");
+    assert!(
+        !backend_request.contains("x-temps-user"),
+        "{backend_request}"
+    );
+    assert!(
+        !backend_request.contains("x-temps-anything"),
+        "{backend_request}"
+    );
+    backend_shutdown.notify_waiters();
+}
+
 #[tokio::test]
 async fn test_public_ingress_unknown_host_returns_not_found_without_backend_access() {
     let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
@@ -286,7 +367,7 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
 
     let response = ingress
         .request(
-            "GET /headers HTTP/1.1\r\nHost: app.example.test:8443\r\nForwarded: for=203.0.113.99;proto=http\r\nX-Forwarded-For: 203.0.113.99\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-Proto: http\r\nConnection: close\r\n\r\n",
+            "GET /headers HTTP/1.1\r\nHost: app.example.test:8443\r\nForwarded: for=203.0.113.99;proto=http\r\nX-Forwarded-For: 203.0.113.99\r\nX-Forwarded-Host: attacker.example\r\nX-Forwarded-Proto: http\r\nCF-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nCDN-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nCloudFront-Viewer-JA4-Fingerprint: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nConnection: close\r\n\r\n",
         )
         .await;
 
@@ -298,6 +379,8 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
         .to_ascii_lowercase();
     assert!(!request.contains("203.0.113.99"), "{request}");
     assert!(!request.contains("attacker.example"), "{request}");
+    // ADR 066 D4: no JA4 header a visitor wrote reaches the app.
+    assert!(!request.contains("ja4"), "{request}");
     assert!(request.contains("x-forwarded-for: 127.0.0.1"), "{request}");
     assert!(
         request.contains("x-forwarded-host: app.example.test:8443"),
@@ -309,6 +392,78 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
             .filter(|line| line.starts_with("host:"))
             .collect::<Vec<_>>(),
         vec!["host: app.example.test:8443"]
+    );
+    backend_shutdown.notify_waiters();
+}
+
+/// A tunnel connector's JA4 header (ADR 066, D4) is read at the tunnel
+/// origin and never reaches the app, whatever its name, including when the
+/// control plane names it after the listener started.
+#[tokio::test]
+async fn test_tunnel_origin_removes_the_connector_ja4_header() {
+    let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
+    let ingress = IngressHarness::start(backend_address, true).await;
+    use temps_agent::internal_proxy::TunnelOriginHeaders;
+    let headers = Arc::new(arc_swap::ArcSwap::from_pointee(
+        TunnelOriginHeaders::new(Some("x-connector-client-ip"), None).expect("valid header names"),
+    ));
+    let origin = temps_agent::internal_proxy::spawn_tunnel_origin(
+        "127.0.0.1:0".parse().expect("parse loopback address"),
+        Arc::clone(&ingress.store),
+        Arc::clone(&ingress.shutdown),
+        Arc::clone(&headers),
+    )
+    .await
+    .expect("start tunnel origin");
+    let send = || async {
+        let mut stream = TcpStream::connect(origin)
+            .await
+            .expect("connect to tunnel origin");
+        stream
+            .write_all(
+                b"GET / HTTP/1.1\r\nHost: app.example.test\r\nX-Connector-Client-IP: 198.51.100.7\r\nX-Connector-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request to tunnel origin");
+        let mut response = Vec::new();
+        timeout(Duration::from_secs(3), stream.read_to_end(&mut response))
+            .await
+            .expect("tunnel origin response timed out")
+            .expect("read tunnel origin response");
+        let response = String::from_utf8_lossy(&response).into_owned();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    };
+
+    // Not yet named: an ordinary header, passed through.
+    send().await;
+    let request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(request.contains("x-connector-ja4"), "{request}");
+    assert!(
+        request.contains("x-forwarded-for: 198.51.100.7"),
+        "{request}"
+    );
+
+    headers.store(Arc::new(
+        TunnelOriginHeaders::new(
+            Some("x-connector-client-ip"),
+            Some(("x-connector-ja4", temps_shield::ja4::Ja4Source::Cloudflare)),
+        )
+        .expect("valid header names"),
+    ));
+    send().await;
+    let request = timeout(Duration::from_secs(1), requests.recv())
+        .await
+        .expect("backend request timed out")
+        .expect("backend request channel closed")
+        .to_ascii_lowercase();
+    assert!(!request.contains("ja4"), "{request}");
+    assert!(
+        request.contains("x-forwarded-for: 198.51.100.7"),
+        "{request}"
     );
     backend_shutdown.notify_waiters();
 }
@@ -394,12 +549,14 @@ fn test_public_ingress_invalid_disk_lease_fails_closed() {
                 deployment_id: None,
                 project_id: None,
                 environment_id: None,
+                gate: None,
             }],
             certificates: None,
             unsupported_route_count: 0,
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -580,6 +737,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
             deployment_id: Some(51),
             project_id: Some(52),
             environment_id: Some(53),
+            gate: None,
         }],
         certificates: Some(PublicIngressCertificates {
             ephemeral_public_key: encryption.ephemeral_public_key().to_string(),
@@ -601,6 +759,7 @@ async fn test_public_ingress_https_uses_synced_certificate_and_forwards_request(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -750,6 +909,7 @@ async fn test_public_ingress_acme_relay_returns_plaintext_for_pending_host_only(
         unsupported_reasons: Vec::new(),
         listen: None,
         private_routes: Vec::new(),
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -1169,6 +1329,7 @@ async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
         );
         assert!(request.contains("x-forwarded-for: 127.0.0.1"), "{request}");
         assert!(!request.contains("203.0.113.99"), "{request}");
+        assert!(!request.contains("ja4"), "{request}");
         stream
             .write_all(
                 b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
@@ -1191,7 +1352,7 @@ async fn test_public_ingress_websocket_upgrade_tunnels_bidirectionally() {
         .expect("connect to public ingress");
     client
         .write_all(
-            b"GET /socket HTTP/1.1\r\nHost: app.example.test:8443\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1vbmx5LWtleQ==\r\nX-Forwarded-For: 203.0.113.99\r\nX-Real-IP: 203.0.113.99\r\n\r\n",
+            b"GET /socket HTTP/1.1\r\nHost: app.example.test:8443\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC1vbmx5LWtleQ==\r\nX-Forwarded-For: 203.0.113.99\r\nX-Real-IP: 203.0.113.99\r\nCF-JA4: t13d1516h2_8daaf6152771_e5627efa2ab1\r\n\r\n",
         )
         .await
         .expect("write websocket upgrade request");
@@ -1239,6 +1400,7 @@ fn private_route(host: &str, backend: std::net::SocketAddr, range: &str) -> Priv
             deployment_id: Some(51),
             project_id: Some(52),
             environment_id: Some(53),
+            gate: None,
         },
         address_id: "custom:9".to_string(),
         range: range.to_string(),
@@ -1286,6 +1448,7 @@ async fn test_private_addresses_are_served_only_by_the_private_listener_within_r
             // ...and outside this one.
             private_route("tailnet.example.test", backend_address, "100.64.0.0/10"),
         ],
+        gated_routes: Vec::new(),
         serve_entries: Vec::new(),
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
@@ -1393,7 +1556,7 @@ async fn test_tailnet_identity_headers_are_stripped_on_every_tcp_listener() {
         "127.0.0.1:0".parse().expect("loopback"),
         Arc::clone(&ingress.store),
         Arc::clone(&ingress.shutdown),
-        None,
+        Default::default(),
     )
     .await
     .expect("start the tunnel origin");
@@ -1461,12 +1624,14 @@ fn serve_snapshot(
                 deployment_id: Some(61),
                 project_id: Some(62),
                 environment_id: Some(63),
+                gate: None,
             }),
             addrs: Vec::new(),
             principals,
         }],
         identity_private_routes: Vec::new(),
         identity_serve_routes: Vec::new(),
+        gated_routes: Vec::new(),
     }
 }
 

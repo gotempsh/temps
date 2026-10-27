@@ -506,6 +506,11 @@ pub struct ProjectResponse {
     /// clients read `granted` from the object, not from its presence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_socket: Option<DockerSocketCapability>,
+    /// ADR 068 D5: nobody can open the production environment's current
+    /// deployment, and how to fix it. Computed on the single-project detail
+    /// responses only; `null` there means there is nothing to warn about.
+    #[serde(default)]
+    pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -523,6 +528,15 @@ impl ProjectResponse {
     /// operator, not disappear from the response.
     pub fn with_docker_socket(mut self, capability: DockerSocketCapability) -> Self {
         self.docker_socket = Some(capability);
+        self
+    }
+
+    /// ADR 068 D5, on the single-project detail responses.
+    pub fn with_reachability_warning(
+        mut self,
+        warning: Option<temps_core::environment_address::ReachabilityWarning>,
+    ) -> Self {
+        self.reachability_warning = warning;
         self
     }
 
@@ -572,6 +586,7 @@ impl ProjectResponse {
             // Filled in by the detail handlers via `with_docker_socket`; the
             // list path deliberately leaves it unset.
             docker_socket: None,
+            reachability_warning: None,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -1649,6 +1664,12 @@ mod tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
             private_via: None,
             private_service: None,
         };

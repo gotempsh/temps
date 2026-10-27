@@ -1488,6 +1488,16 @@ impl EnvironmentService {
                     "Domain '{normalized}' is already attached to another environment"
                 )));
             }
+            // ADR 068 D3: a tunnel's environment host is Temps's, and goes
+            // when the tunnel stops publishing environment hosts. Handing it
+            // back as the user's own domain would let that delete it.
+            if let Some(connector_id) = existing.generated_by_connector_id {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is environment {env_id}'s tunnel host, published by \
+                     tunnel {connector_id} and removed when it stops publishing environment \
+                     hosts; it cannot also be added as the environment's own domain"
+                )));
+            }
             return Ok(existing);
         }
 
@@ -2351,6 +2361,64 @@ mod tests {
         EnvironmentService::new(db, config_service)
     }
 
+    /// ADR 068 D3: a tunnel environment host is not handed back as the
+    /// user's own domain, which turning the tunnel's hosts off would delete.
+    #[tokio::test]
+    async fn a_tunnel_environment_host_cannot_be_added_as_a_domain() {
+        let env = env_for_ceiling_test();
+        let generated = environment_domains::Model {
+            id: 9,
+            environment_id: env.id,
+            domain: "shop-staging.tunnel.example.com".to_string(),
+            created_at: chrono::Utc::now(),
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            generated_by_connector_id: Some(4),
+            private_via: None,
+            private_service: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![env.clone()]])
+            .append_query_results([vec![generated]])
+            .into_connection();
+        // No settings row: the defaults, whose zones do not cover the host.
+        let settings_db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .into_connection();
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(settings_db),
+        ));
+        let result = EnvironmentService::new(Arc::new(db), config_service)
+            .add_environment_domain(
+                env.project_id,
+                env.id,
+                "shop-staging.tunnel.example.com".to_string(),
+            )
+            .await;
+        match result {
+            Err(EnvironmentError::InvalidInput(message)) => {
+                assert!(message.contains("tunnel host"), "{message}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     fn env_for_ceiling_test() -> environments::Model {
         environments::Model {
             id: 1,
@@ -2746,8 +2814,15 @@ mod tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
             private_via: None,
             private_service: None,
+            generated_by_connector_id: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

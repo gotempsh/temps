@@ -51,6 +51,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permissions::Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::websocket_origin::validate_websocket_origin;
 use temps_pty_agent::protocol as pty;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::FramedRead;
@@ -367,8 +368,10 @@ pub async fn terminal(
     State(state): State<Arc<SandboxAppState>>,
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<TerminalParams>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    validate_websocket_origin(&headers)?;
     // This endpoint launches a PTY and forwards `?cmd=` to the agent, which
     // spawns it via `/bin/sh -c` — it is arbitrary code execution inside the
     // sandbox, exactly like the /exec routes. It must therefore require
@@ -893,6 +896,7 @@ fn attach_failure_problem(
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
         | AgentError::ProjectNotFound { .. }
+        | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }
         | AgentError::CooldownActive { .. }
         | AgentError::AiCliNotInstalled { .. }
@@ -947,6 +951,28 @@ async fn bounded_attach<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cross-origin page must not be able to open this socket with the
+    /// user's cookie (browsers apply no CORS to WebSocket handshakes), so the
+    /// Origin check has to run before any lookup or upgrade work.
+    #[test]
+    fn websocket_handlers_validate_origin_before_any_work() {
+        let source = include_str!("terminal.rs");
+        let name = "terminal";
+        let start = source
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} handler not found in source"));
+        let body_start = start + source[start..].find(") -> ").unwrap_or(0);
+        let body = &source[body_start..];
+        let check = body
+            .find("validate_websocket_origin(&headers)?")
+            .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
+        let first_await = body.find(".await").unwrap_or(usize::MAX);
+        assert!(
+            check < first_await,
+            "{name} must validate the Origin before its first await"
+        );
+    }
 
     #[test]
     fn default_shell_is_a_login_shell() {

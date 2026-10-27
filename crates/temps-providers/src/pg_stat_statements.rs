@@ -487,18 +487,26 @@ impl PgStatStatementsService {
                 })?;
                 // A worker publishes the service on its data address; the
                 // stored `localhost` would point at the control plane itself.
+                let resolve_failed = |e| PgStatStatementsError::ConnectionFailed {
+                    service_id,
+                    host: config.host.clone(),
+                    port,
+                    reason: format!("failed to resolve the node hosting the service: {}", e),
+                };
+                let service = self
+                    .external_service_manager
+                    .get_service(service_id)
+                    .await
+                    .map_err(resolve_failed)?;
                 let worker_host = self
                     .external_service_manager
-                    .worker_data_address(service_id)
+                    .worker_data_address(&service)
                     .await
-                    .map_err(|e| PgStatStatementsError::ConnectionFailed {
-                        service_id,
-                        host: config.host.clone(),
-                        port,
-                        reason: format!("failed to resolve the node hosting the service: {}", e),
-                    })?;
+                    .map_err(resolve_failed)?;
                 match worker_host {
-                    Some(worker) if crate::query_service::is_loopback_host(&config.host) => {
+                    Some(worker)
+                        if temps_core::node_address::is_local_service_host(&config.host) =>
+                    {
                         pg_stat_connection_target(Some((worker, port)), config.host.clone(), port)
                     }
                     _ => pg_stat_connection_target(None, config.host.clone(), port),

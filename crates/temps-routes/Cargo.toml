@@ -54,3 +54,5 @@ subtle = "2.6"
 # ADR-055 ingress endpoints compiled into the route snapshot.
 temps-workload-ingress = { path = "../temps-workload-ingress" }
 ipnetwork = "0.21"
+# Fetches Cloudflare Access signing keys (ADR 065 D9).
+reqwest = { workspace = true }

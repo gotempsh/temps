@@ -56,7 +56,9 @@ use temps_core::tailnet::{messages as tailnet_messages, TailscaleReport};
 use temps_core::ways_in::{private_allow_list_message, PrivateAllowList};
 
 use temps_auth::permissions::Permission;
+use temps_core::gate::GateKind;
 
+use super::access::{AccessApp, AccessPolicyAnswer};
 use super::compute::{
     is_local_only, tailnet_worker_problem, DirectIngress, INGRESS_SETUP_PATH, PRIVATE_COMMAND,
     TAILNET_REPORT_STALE_MINUTES,
@@ -65,7 +67,7 @@ use super::model::{
     ActionKind, AddressAudience, Audience, PlanBlocked, PlanOption, PlanOptionKind, PlanStep,
     PlannedRecord, ReachAction, ReachabilityPlan, StepKind,
 };
-use crate::registry::{FieldKind, SetupField};
+use crate::registry::{FieldChoice, FieldKind, SetupField};
 use crate::service::{covers, normalize_host, record_label, PublicationIntent, TunnelFact};
 use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 
@@ -73,6 +75,67 @@ use crate::tailscale::{self, Ownership, ServiceDefinition, TailscaleFactory};
 pub const FIELD_ADDRESS: &str = "address";
 pub const FIELD_DNS_PROVIDER: &str = "dns_provider_id";
 pub const FIELD_TOKEN: &str = "cloudflare_api_token";
+/// The teams that may sign in to a signed-in address (ADR 065 D7).
+pub const FIELD_GATE_TEAMS: &str = "gate_teams";
+/// The users that may sign in to a signed-in address (ADR 065 D7).
+pub const FIELD_GATE_USERS: &str = "gate_users";
+/// The Cloudflare Access token whose account gets the app (ADR 065 D9).
+pub const FIELD_ACCESS_PROVIDER: &str = "access_provider_id";
+/// Who a new Access app lets in: email addresses, and email domains.
+pub const FIELD_ACCESS_EMAILS: &str = "access_emails";
+pub const FIELD_ACCESS_EMAIL_DOMAINS: &str = "access_email_domains";
+/// Where a Cloudflare Access token is added.
+pub const ACCESS_SETUP_PATH: &str = "/dns-providers#cloudflare-access";
+
+/// A saved Cloudflare Access token, and the apps in its account that
+/// protect the planned address (ADR 065 D9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessProviderFact {
+    pub id: i32,
+    pub name: String,
+    /// Its apps covering the address, ranked by [`super::access::covering`]
+    /// (the one Cloudflare enforces first); why they could not be read.
+    pub covering: Result<Vec<AccessApp>, String>,
+}
+
+/// What a Cloudflare Access plan does about the app in front of an address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AccessChoice<'a> {
+    /// No Access token is saved.
+    NoProvider,
+    /// An account's apps could not be read, so Temps cannot tell whether
+    /// one already covers the address.
+    Unreadable {
+        provider: &'a AccessProviderFact,
+        error: &'a str,
+    },
+    /// An existing app covers it: used as found, never edited or deleted.
+    Existing {
+        provider: &'a AccessProviderFact,
+        app: &'a AccessApp,
+    },
+    /// None does: the run creates one in one of these accounts.
+    Create(Vec<&'a AccessProviderFact>),
+}
+
+/// The app a Cloudflare Access plan for an address uses or creates.
+pub fn access_choice(facts: &PlanFacts) -> AccessChoice<'_> {
+    if facts.access_providers.is_empty() {
+        return AccessChoice::NoProvider;
+    }
+    for provider in &facts.access_providers {
+        match &provider.covering {
+            Err(error) => return AccessChoice::Unreadable { provider, error },
+            Ok(apps) => {
+                // `covering` comes ranked: the app Cloudflare enforces first.
+                if let Some(app) = apps.first() {
+                    return AccessChoice::Existing { provider, app };
+                }
+            }
+        }
+    }
+    AccessChoice::Create(facts.access_providers.iter().collect())
+}
 
 /// A zone a DNS provider of the cluster manages.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +248,10 @@ pub struct PlanFacts {
     pub private_rule: Option<PrivateAllowList>,
     /// The environment's addresses and their audiences.
     pub audiences: Vec<(String, Audience)>,
+    /// Public hostnames that reach one Compose service of the environment
+    /// (generated `<service>--<env>` names, service custom domains). They
+    /// open the same app, and a signed-in plan says so (ADR 065 D8).
+    pub service_addresses: Vec<String>,
     /// Every hostname choice.
     pub choices: Vec<(String, Option<i32>)>,
     /// Active workers and their ingress mode.
@@ -199,6 +266,17 @@ pub struct PlanFacts {
     pub suggested_private_worker: Option<String>,
     /// The environment's private addresses and the range each is bound to.
     pub private_ranges: Vec<(String, Option<String>)>,
+    /// The label a tunnel's environment hosts give this environment
+    /// (ADR 068 D3): its subdomain, or the production template's.
+    pub environment_host_label: Option<String>,
+    /// Whether the environment or its project has password protection on,
+    /// which applies on top of a sign-in (ADR 065 D7).
+    pub password_protected: bool,
+    /// For `signed_in`: the gate asked for.
+    pub gate: GateKind,
+    /// For Cloudflare Access: the saved tokens and the apps covering the
+    /// planned address. Read only for such a plan.
+    pub access_providers: Vec<AccessProviderFact>,
     /// Workers that report their tailscaled (ADR 065 D2).
     pub tailnet_workers: Vec<TailnetWorkerFact>,
     /// The Serve entries declared on those workers.
@@ -290,6 +368,10 @@ pub fn planned_address(facts: &PlanFacts) -> Result<Option<String>, String> {
     }
 }
 
+/// The `(id, aud)` of the Access apps an account has for the address, in
+/// the fingerprint; `None` stands for an account that could not be read.
+type AppIds<'a> = Vec<(&'a str, &'a str)>;
+
 /// The address the plan for `facts.audience` is for: what the stored plan
 /// records and the fingerprint covers.
 pub fn address_for_audience(facts: &PlanFacts) -> Result<Option<String>, String> {
@@ -339,6 +421,25 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     private_workers.sort();
     let mut ranges = facts.private_ranges.clone();
     ranges.sort();
+    // An app created or removed in Cloudflare since planning changes what
+    // an Access plan does.
+    let mut access: Vec<(i32, Option<AppIds<'_>>)> = facts
+        .access_providers
+        .iter()
+        .map(|p| {
+            let apps = p.covering.as_ref().ok().map(|apps| {
+                let mut ids: Vec<(&str, &str)> = apps
+                    .iter()
+                    .map(|a| (a.id.as_str(), a.aud.as_str()))
+                    .collect();
+                ids.sort();
+                ids
+            });
+            (p.id, apps)
+        })
+        .collect();
+    access.sort_by_key(|(id, _)| *id);
+    let gate = (facts.audience == Audience::SignedIn).then_some(facts.gate);
     // ADR 065 D4: the Tailscale facts as last reported, without the inside
     // checks and entry outcomes, which change on every pass.
     let mut tailnet: Vec<_> = facts
@@ -385,12 +486,16 @@ pub fn fingerprint(facts: &PlanFacts, address: Option<&str>) -> String {
     let canonical = format!(
         "v5|{:?}|{address:?}|{audiences:?}|{}|{}|{}|{tunnels:?}|{choices:?}|{zones:?}|\
          {accounts:?}|{directs:?}|{modes:?}|{intent:?}|{:?}|{records:?}|{private_workers:?}|\
-         {ranges:?}|{tailnet:?}|{entries:?}|{credential:?}|{seen:?}",
+         {ranges:?}|{tailnet:?}|{entries:?}|{credential:?}|{seen:?}|{:?}{}",
         facts.audience,
         facts.deployed,
         facts.served_by_workers,
         address.is_some_and(|a| facts.taken_elsewhere.contains(a)),
         facts.private_rule,
+        facts.environment_host_label,
+        // Only signed-in plans gain a part, so other plans hash as before.
+        gate.map(|gate| format!("|{gate:?}|{access:?}"))
+            .unwrap_or_default(),
     );
     // ADR 065 D6: who it admits, asked for and now, and which agents can
     // check it. Only for `tailnet_users`, so other plans hash as before.
@@ -662,7 +767,40 @@ pub fn permissions_for(kind: PlanOptionKind) -> Vec<Permission> {
         PlanOptionKind::TailscaleServiceWithCredential => {
             vec![Permission::SettingsWrite, Permission::DomainsCreate]
         }
+        PlanOptionKind::TunnelEnvironmentHosts => vec![Permission::SettingsWrite],
     }
+}
+
+/// What the opt-in to a tunnel's environment hosts says first (ADR 068).
+pub const ENVIRONMENT_HOSTS_WARNING: &str = "Every environment, including preview environments \
+     named after branches, gets a public DNS name under the tunnel's domain: branch names \
+     become public, and each name's certificate appears in Certificate Transparency logs.";
+
+/// The tunnel whose environment hosts would give this environment `host`
+/// (ADR 068 D3): `host` is `<its label>.<tunnel domain>`, the tunnel can
+/// publish, its environment hosts are off, and no other tunnel's are on.
+pub fn environment_hosts_tunnel<'a>(facts: &'a PlanFacts, host: &str) -> Option<&'a TunnelFact> {
+    let label = facts.environment_host_label.as_deref()?;
+    if facts.tunnels.iter().any(|t| t.environment_hosts) {
+        return None;
+    }
+    // Hosts are never generated for an environment with a restricted
+    // address (ADR 068 Security), nor offered as the way to make one: they
+    // are public, and a signed-in plan would publish them without a gate.
+    if facts.audience != Audience::Public
+        || facts.audiences.iter().any(|(_, a)| *a != Audience::Public)
+    {
+        return None;
+    }
+    facts.tunnels.iter().find(|t| {
+        usable(t)
+            && t.zone.is_some()
+            && host
+                == format!(
+                    "{label}.{}",
+                    t.domain.trim_end_matches('.').to_ascii_lowercase()
+                )
+    })
 }
 
 fn address_field(suggested: Option<&str>) -> SetupField {
@@ -761,11 +899,13 @@ pub fn http01_direct(facts: &PlanFacts) -> Option<&DirectIngress> {
 /// The plan for `facts`.
 pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     let mut blocked_reasons: Vec<PlanBlocked> = Vec::new();
+    let gate = (facts.audience == Audience::SignedIn).then_some(facts.gate);
     let empty = |audience, address, address_error, blocked| ReachabilityPlan {
         plan_id: None,
         fingerprint: None,
         expires_at: None,
         audience,
+        gate,
         address,
         address_error,
         options: Vec::new(),
@@ -787,15 +927,21 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     if facts.audience == Audience::TailnetUsers {
         return plan_tailnet_users(facts);
     }
-    if facts.audience != Audience::Public {
+    if !matches!(facts.audience, Audience::Public | Audience::SignedIn) {
         return empty(
             facts.audience,
             facts.requested.clone(),
             None,
             PlanBlocked {
-                reason: "Addresses for people who sign in are not available yet. Choose \
-                         public, or only your private network."
-                    .to_string(),
+                reason: format!(
+                    "Temps cannot plan an address {} here. Choose public, for people who \
+                     sign in, or only your private network.",
+                    AddressAudience {
+                        audience: facts.audience,
+                        ..AddressAudience::default()
+                    }
+                    .describe()
+                ),
                 action: None,
             },
         );
@@ -839,6 +985,7 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
     // B5: an address that is private now becomes public, and says so.
     let made_public = address
         .as_deref()
+        .filter(|_| facts.audience == Audience::Public)
         .and_then(|host| becomes_public(facts, host));
 
     // A tunnel only carries what workers serve, and never into an allow
@@ -889,6 +1036,39 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         )
     });
     let mut drafts: Vec<OptionDraft> = Vec::new();
+
+    // 0. The address is this environment's host under a tunnel: one switch
+    //    gives every environment its host there (ADR 068 D3, D5's fix).
+    if let (Some(host), true) = (address.as_deref(), tunnels_possible) {
+        if let Some(tunnel) = environment_hosts_tunnel(facts, host) {
+            drafts.push(OptionDraft {
+                kind: PlanOptionKind::TunnelEnvironmentHosts,
+                title: format!("Give every environment an address under {}", tunnel.domain),
+                description: format!(
+                    "Tunnel {} publishes each environment as <environment>.{}, and keeps \
+                     them as environments come, go and are renamed; {host} is this one's. \
+                     Cloudflare serves HTTPS.",
+                    tunnel.name, tunnel.domain
+                ),
+                actions: 1,
+                way_in: format!("tunnel:{}", tunnel.name),
+                steps: vec![
+                    step(
+                        StepKind::PublishEnvironmentHosts,
+                        format!("Publish every environment through tunnel {}", tunnel.name),
+                    ),
+                    step(
+                        StepKind::WaitForPublication,
+                        format!("Wait for tunnel {} to publish {host}", tunnel.name),
+                    ),
+                    step(StepKind::CheckReachability, format!("Check {host}")),
+                ],
+                fields: Vec::new(),
+                warnings: not_deployed_warning.iter().cloned().collect(),
+                confirmation: Some(ENVIRONMENT_HOSTS_WARNING.to_string()),
+            });
+        }
+    }
 
     // 1. A tunnel that would publish the address, or one that covers it
     //    with its hostname choice set (and confirmed).
@@ -1209,6 +1389,14 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
             draft.warnings.insert(0, warning.clone());
         }
     }
+    if facts.audience == Audience::SignedIn {
+        if facts.gate == GateKind::CloudflareAccess {
+            if let Err(blocked) = access_drafts(facts, &shown, &mut drafts) {
+                return empty(facts.audience, address, None, blocked);
+            }
+        }
+        signed_in_drafts(facts, address.as_deref(), &shown, &mut drafts);
+    }
     let options: Vec<PlanOption> = drafts
         .into_iter()
         .enumerate()
@@ -1256,11 +1444,189 @@ pub fn plan(facts: &PlanFacts) -> ReachabilityPlan {
         fingerprint: None,
         expires_at: None,
         audience: facts.audience,
+        gate,
         address,
         address_error: None,
         options,
         blocked,
         principals: Vec::new(),
+    }
+}
+
+/// What a Cloudflare Access plan changes in the drafts (ADR 065 D9): only
+/// ways in through a tunnel stay, since Access sees nothing else, and the
+/// app in front of the address is used as found or created before the
+/// address is attached. `Err` when no option can be offered.
+fn access_drafts(
+    facts: &PlanFacts,
+    shown: &str,
+    drafts: &mut Vec<OptionDraft>,
+) -> Result<(), PlanBlocked> {
+    let before = drafts.len();
+    drafts.retain(|d| d.way_in.starts_with("tunnel"));
+    let dropped = before - drafts.len();
+    if drafts.is_empty() {
+        return Err(PlanBlocked {
+            reason: format!(
+                "Cloudflare Access only sees traffic that comes through a Cloudflare tunnel, \
+                 and no tunnel can carry {shown} here. Add a worker that allows a tunnel, or \
+                 use the Temps sign-in instead."
+            ),
+            action: Some(
+                ReachAction::new(ActionKind::OpenIngress, "Set up ingress")
+                    .with_href(INGRESS_SETUP_PATH),
+            ),
+        });
+    }
+    let (step_label, fields, warning) = match access_choice(facts) {
+        AccessChoice::NoProvider => {
+            return Err(PlanBlocked {
+                reason: "No Cloudflare Access token is saved. Add one with Access: Apps and \
+                         Policies Edit and Access: Organizations, Identity Providers, and Groups \
+                         Read, then plan again."
+                    .to_string(),
+                action: Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Add a Cloudflare Access token")
+                        .with_href(ACCESS_SETUP_PATH),
+                ),
+            })
+        }
+        AccessChoice::Unreadable { provider, error } => {
+            return Err(PlanBlocked {
+                reason: format!(
+                    "Temps could not read the Access applications of {}, so it cannot tell \
+                     whether one already protects {shown}: {error} Try again.",
+                    provider.name
+                ),
+                action: Some(
+                    ReachAction::new(ActionKind::OpenIngress, "Check the Access token")
+                        .with_href(ACCESS_SETUP_PATH),
+                ),
+            })
+        }
+        AccessChoice::Existing { provider, app } => (
+            format!(
+                "Use Cloudflare Access app {} ({}) in front of {shown}",
+                app.name, provider.name
+            ),
+            Vec::new(),
+            format!(
+                "Access app {} already protects {shown}: Temps uses it as it is and never \
+                 edits or deletes it. Its policies decide who gets in.",
+                app.name
+            ),
+        ),
+        AccessChoice::Create(providers) => {
+            let mut fields = Vec::new();
+            if providers.len() > 1 {
+                fields.push(SetupField {
+                    key: FIELD_ACCESS_PROVIDER.to_string(),
+                    label: "Cloudflare Access account".to_string(),
+                    help: Some("The account the Access app is created in.".to_string()),
+                    kind: FieldKind::Choice {
+                        choices: providers
+                            .iter()
+                            .map(|p| FieldChoice {
+                                value: p.id.to_string(),
+                                label: p.name.clone(),
+                                help: None,
+                            })
+                            .collect(),
+                    },
+                    required: true,
+                    placeholder: None,
+                });
+            }
+            fields.extend(access_policy_fields());
+            (
+                format!("Create a Cloudflare Access app for {shown}"),
+                fields,
+                format!(
+                    "Cloudflare Access decides who can open {shown}: only the email addresses \
+                     and domains you give get in. Undo deletes the app again unless someone \
+                     edited it in Cloudflare."
+                ),
+            )
+        }
+    };
+    for draft in drafts.iter_mut() {
+        let at = draft
+            .steps
+            .iter()
+            .position(|s| s.kind == StepKind::AttachDomain)
+            .unwrap_or(0);
+        draft
+            .steps
+            .insert(at, step(StepKind::AccessApp, step_label.clone()));
+        draft.fields.extend(fields.iter().cloned());
+        draft.warnings.insert(0, warning.clone());
+        if dropped > 0 {
+            draft.warnings.push(
+                "Ways in that reach Temps directly are not offered: Cloudflare Access only \
+                 sees traffic that comes through a Cloudflare tunnel."
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Who a new Access app lets in.
+fn access_policy_fields() -> Vec<SetupField> {
+    vec![
+        SetupField {
+            key: FIELD_ACCESS_EMAILS.to_string(),
+            label: "Email addresses".to_string(),
+            help: Some("People who may open it, one email address each.".to_string()),
+            kind: FieldKind::TextList,
+            required: false,
+            placeholder: Some("ana@example.com".to_string()),
+        },
+        SetupField {
+            key: FIELD_ACCESS_EMAIL_DOMAINS.to_string(),
+            label: "Email domains".to_string(),
+            help: Some(
+                "Everyone with an email address at these domains. Give at least one address \
+                 or domain."
+                    .to_string(),
+            ),
+            kind: FieldKind::TextList,
+            required: false,
+            placeholder: Some("example.com".to_string()),
+        },
+    ]
+}
+
+/// Who a new Access app lets in, from an apply's answers: lists of
+/// strings (or one comma-separated string).
+pub fn access_policy_answer(
+    answers: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<AccessPolicyAnswer, String> {
+    let list = |key: &str| -> Result<Vec<String>, String> {
+        match answers.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::String(text)) => {
+                Ok(text.split([',', '\n']).map(str::to_string).collect())
+            }
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("{key} must be a list of text values."))
+                })
+                .collect(),
+            Some(_) => Err(format!("{key} must be a list of text values.")),
+        }
+    };
+    let answer = AccessPolicyAnswer {
+        emails: list(FIELD_ACCESS_EMAILS)?,
+        email_domains: list(FIELD_ACCESS_EMAIL_DOMAINS)?,
+    }
+    .normalized();
+    match answer.problem() {
+        Some(problem) => Err(problem),
+        None => Ok(answer),
     }
 }
 
@@ -1287,12 +1653,172 @@ fn unchangeable_audience(facts: &PlanFacts, host: &str) -> Option<PlanBlocked> {
     })
 }
 
+/// What a signed-in plan adds to every way in (ADR 065 D7): the gate is
+/// set right after the address is attached, before anything publishes it,
+/// so no listener serves it open; who may sign in is asked; and a password
+/// the environment already has is said to apply as well.
+fn signed_in_drafts(
+    facts: &PlanFacts,
+    address: Option<&str>,
+    shown: &str,
+    drafts: &mut [OptionDraft],
+) {
+    let current = address.and_then(|host| {
+        facts
+            .audiences
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(host))
+            .map(|(_, audience)| *audience)
+    });
+    let access = facts.gate == GateKind::CloudflareAccess;
+    let mut warnings = vec![if access {
+        format!(
+            "Only people Cloudflare Access lets in can open {shown}, and only through the \
+             tunnel. Changing who can open it needs a recent password or passkey \
+             confirmation."
+        )
+    } else {
+        format!(
+            "Only people who sign in to Temps, with access to this project (and on the list, \
+             if you give one), can open {shown}. Everyone else gets the Temps sign-in. \
+             Changing who can open it needs a recent password or passkey confirmation."
+        )
+    }];
+    if current == Some(Audience::Private) {
+        warnings.push(format!(
+            "{shown} is private now. This puts it on a public way in behind the sign-in: \
+             anyone allowed to sign in can open it from anywhere, not only from your private \
+             network."
+        ));
+    }
+    if let Some(warning) = still_open_warning(facts, address, shown) {
+        warnings.push(warning);
+    }
+    if facts.password_protected {
+        warnings.push(format!(
+            "{} also has password protection. Both apply: visitors sign in first, then enter \
+             the password.",
+            facts.environment_name
+        ));
+    }
+    let label = if access {
+        format!("Let only people Cloudflare Access admits open {shown}")
+    } else {
+        format!("Put the Temps sign-in in front of {shown}")
+    };
+    for draft in drafts.iter_mut() {
+        let at = draft
+            .steps
+            .iter()
+            .position(|s| s.kind == StepKind::AttachDomain)
+            .map_or(0, |i| i + 1);
+        draft
+            .steps
+            .insert(at, step(StepKind::SetAudience, label.clone()));
+        if !access {
+            draft.fields.extend(gate_list_fields());
+        }
+        for (index, warning) in warnings.iter().enumerate() {
+            draft.warnings.insert(index, warning.clone());
+        }
+    }
+}
+
+/// The sign-in is per address: every other public way to the same app
+/// stays open to anyone, and the plan names each one rather than imply the
+/// app is behind the sign-in. `None` when there is no other.
+fn still_open_warning(facts: &PlanFacts, address: Option<&str>, shown: &str) -> Option<String> {
+    let mut open: Vec<&str> = facts
+        .audiences
+        .iter()
+        .filter(|(host, audience)| {
+            *audience == Audience::Public && address.is_none_or(|a| !a.eq_ignore_ascii_case(host))
+        })
+        .map(|(host, _)| host.as_str())
+        .chain(facts.service_addresses.iter().map(String::as_str))
+        .collect();
+    open.sort_unstable();
+    open.dedup();
+    if open.is_empty() {
+        return None;
+    }
+    let list = open.join(", ");
+    Some(format!(
+        "The sign-in covers {shown} only. The same app stays open to anyone at {list}. Make \
+         those signed-in or detach them if they shouldn't be public; the generated address \
+         and Compose service addresses can't be signed-in yet."
+    ))
+}
+
+/// Who may sign in, besides having access to the project: both optional.
+fn gate_list_fields() -> Vec<SetupField> {
+    vec![
+        SetupField {
+            key: FIELD_GATE_TEAMS.to_string(),
+            label: "Only these teams".to_string(),
+            help: Some(
+                "Leave empty to let everyone with access to the project sign in.".to_string(),
+            ),
+            kind: FieldKind::Teams,
+            required: false,
+            placeholder: None,
+        },
+        SetupField {
+            key: FIELD_GATE_USERS.to_string(),
+            label: "Only these people".to_string(),
+            help: Some(
+                "People who may sign in even when they are in none of the teams above.".to_string(),
+            ),
+            kind: FieldKind::Users,
+            required: false,
+            placeholder: None,
+        },
+    ]
+}
+
+/// The list a signed-in apply was answered with: team and user ids, as
+/// numbers or numeric strings. `None` for no list.
+pub fn gate_allow_answer(
+    answers: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Result<Option<temps_core::gate::GateAllowList>, String> {
+    let ids = |key: &str, what: &str| -> Result<Vec<i32>, String> {
+        match answers.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(Vec::new()),
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                        .and_then(|id| i32::try_from(id).ok())
+                        .filter(|id| *id > 0)
+                        .ok_or_else(|| format!("{what} must be a list of {what} ids ({key})."))
+                })
+                .collect(),
+            Some(_) => Err(format!("{what} must be a list of {what} ids ({key}).")),
+        }
+    };
+    let list = temps_core::gate::GateAllowList {
+        teams: ids(FIELD_GATE_TEAMS, "teams")?,
+        users: ids(FIELD_GATE_USERS, "users")?,
+    }
+    .normalized();
+    Ok((!list.is_empty()).then_some(list))
+}
+
 /// When `host` is attached here as a private address: what making it
 /// public exposes, in words (ADR 064 Security).
 pub fn becomes_public(facts: &PlanFacts, host: &str) -> Option<String> {
     let (_, audience) = facts.audiences.iter().find(|(a, _)| a == host)?;
     if *audience == Audience::Public {
         return None;
+    }
+    if *audience == Audience::SignedIn {
+        return Some(format!(
+            "{host} is for people who sign in now. This makes it public: the sign-in in \
+             front of it goes, and anyone on the internet can open {host} and everything {} \
+             serves there. It needs a recent password or passkey confirmation.",
+            facts.environment_name
+        ));
     }
     let range = facts
         .private_ranges
@@ -1322,6 +1848,7 @@ fn private_blocked(
         fingerprint: None,
         expires_at: None,
         audience: Audience::Private,
+        gate: None,
         address,
         address_error,
         options: Vec::new(),
@@ -1815,6 +2342,7 @@ fn plan_machine_name(
         address_error: None,
         options: vec![option],
         blocked: None,
+        gate: None,
         principals: Vec::new(),
     }
 }
@@ -2028,6 +2556,7 @@ fn plan_service(facts: &PlanFacts, address: Option<String>) -> ReachabilityPlan 
         address_error: None,
         options: vec![option],
         blocked: None,
+        gate: None,
         principals: Vec::new(),
     }
 }
@@ -2293,6 +2822,7 @@ fn plan_listener(
         fingerprint: None,
         expires_at: None,
         audience: Audience::Private,
+        gate: None,
         address,
         address_error: None,
         options: vec![option],
@@ -2316,6 +2846,7 @@ mod tests {
             ready: true,
             has_nodes: true,
             auto_publish: true,
+            environment_hosts: false,
         }
     }
 
@@ -2390,6 +2921,162 @@ mod tests {
         }
     }
 
+    /// ADR 065 D7: a signed-in plan is a public plan with the sign-in put
+    /// in front of the address right after it is attached, and the
+    /// optional list of who may sign in.
+    #[test]
+    fn a_signed_in_plan_puts_the_sign_in_in_front_after_attaching() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+            let gate = kinds
+                .iter()
+                .position(|k| *k == StepKind::SetAudience)
+                .expect("a SetAudience step");
+            if let Some(attach) = kinds.iter().position(|k| *k == StepKind::AttachDomain) {
+                assert_eq!(gate, attach + 1, "{kinds:?}");
+            }
+            let keys: Vec<&str> = option.fields.iter().map(|f| f.key.as_str()).collect();
+            assert!(keys.contains(&FIELD_GATE_TEAMS) && keys.contains(&FIELD_GATE_USERS));
+            assert!(option
+                .fields
+                .iter()
+                .filter(|f| f.key == FIELD_GATE_TEAMS || f.key == FIELD_GATE_USERS)
+                .all(|f| !f.required));
+            assert!(option.warnings[0].contains("Only people who sign in"));
+            assert!(!option
+                .warnings
+                .iter()
+                .any(|w| w.contains("password protection")));
+        }
+    }
+
+    /// The sign-in is per address: a plan never implies the app is behind
+    /// it while the generated hostname or a Compose service name still
+    /// opens it for anyone.
+    #[test]
+    fn a_signed_in_plan_names_every_address_that_stays_open() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            requested: Some("app.example.com".into()),
+            attached_here: vec!["app.example.com".into()],
+            audiences: vec![
+                ("app.example.com".into(), Audience::Public),
+                ("shop-prod.apps.example.net".into(), Audience::Public),
+                ("lan.example.com".into(), Audience::Private),
+                ("team.example.com".into(), Audience::SignedIn),
+            ],
+            service_addresses: vec!["api--shop-prod.apps.example.net".into()],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = plan.options.first().expect("an option");
+        let warning = option
+            .warnings
+            .iter()
+            .find(|w| w.contains("stays open to anyone"))
+            .unwrap_or_else(|| panic!("{:?}", option.warnings));
+        assert!(
+            warning.contains("api--shop-prod.apps.example.net, shop-prod.apps.example.net"),
+            "{warning}"
+        );
+        // Not the address being signed in, nor ones that are not public.
+        assert!(!warning.contains(" app.example.com,"), "{warning}");
+        assert!(!warning.contains("lan.example.com"), "{warning}");
+        assert!(!warning.contains("team.example.com"), "{warning}");
+
+        let alone = PlanFacts {
+            audiences: vec![("app.example.com".into(), Audience::Public)],
+            service_addresses: vec![],
+            ..facts
+        };
+        let plan = super::plan(&alone);
+        let option = plan.options.first().expect("an option");
+        assert!(
+            !option.warnings.iter().any(|w| w.contains("stays open")),
+            "{:?}",
+            option.warnings
+        );
+    }
+
+    #[test]
+    fn a_signed_in_plan_says_password_protection_also_applies() {
+        let facts = PlanFacts {
+            audience: Audience::SignedIn,
+            password_protected: true,
+            requested: Some("app.example.com".into()),
+            attached_here: vec!["app.example.com".into()],
+            audiences: vec![("app.example.com".into(), Audience::Private)],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            ..base()
+        };
+        let plan = plan(&facts);
+        let option = plan.options.first().expect("an option");
+        assert!(
+            option.warnings.iter().any(|w| w.contains("Both apply")),
+            "{:?}",
+            option.warnings
+        );
+        assert!(
+            option.warnings.iter().any(|w| w.contains("is private now")),
+            "{:?}",
+            option.warnings
+        );
+        // Signed in is not public: no "this makes it public" warning.
+        assert!(!option
+            .warnings
+            .iter()
+            .any(|w| w.contains("This makes it public")));
+    }
+
+    #[test]
+    fn gate_list_answers_take_positive_ids_and_drop_an_empty_list() {
+        use serde_json::json;
+        let answers = |teams: serde_json::Value, users: serde_json::Value| {
+            std::collections::BTreeMap::from([
+                (FIELD_GATE_TEAMS.to_string(), teams),
+                (FIELD_GATE_USERS.to_string(), users),
+            ])
+        };
+        assert_eq!(
+            gate_allow_answer(&std::collections::BTreeMap::new()),
+            Ok(None)
+        );
+        assert_eq!(
+            gate_allow_answer(&answers(json!([]), json!(null))),
+            Ok(None)
+        );
+        let list = gate_allow_answer(&answers(json!([3, "1", 3]), json!(["7"])))
+            .expect("valid")
+            .expect("a list");
+        assert_eq!(list.teams, vec![1, 3]);
+        assert_eq!(list.users, vec![7]);
+        for bad in [
+            json!([0]),
+            json!([-2]),
+            json!(["x"]),
+            json!("1,2"),
+            json!([1.5]),
+        ] {
+            assert!(
+                gate_allow_answer(&answers(bad.clone(), json!([]))).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn an_existing_tunnel_wins_and_suggests_an_address_under_it() {
         let facts = PlanFacts {
@@ -2423,6 +3110,100 @@ mod tests {
             .iter()
             .any(|s| s.kind == StepKind::RouteHostname));
         assert_eq!(first.fields[0].key, FIELD_ADDRESS);
+    }
+
+    /// ADR 068 D5's tunnel fix: the environment's own host under a tunnel
+    /// is offered first as "every environment gets one", behind the
+    /// public-names warning; the single-host option stays as the alternative.
+    #[test]
+    fn the_environment_host_under_a_tunnel_offers_environment_hosts_first() {
+        let facts = PlanFacts {
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            requested: Some("myapp-production.example.com".into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        };
+        let plan = plan(&facts);
+        assert_eq!(
+            kinds(&plan),
+            vec![
+                PlanOptionKind::TunnelEnvironmentHosts,
+                PlanOptionKind::ExistingTunnel
+            ]
+        );
+        let first = &plan.options[0];
+        assert_eq!(first.way_in, "tunnel:homelab");
+        assert_eq!(
+            first.confirmation.as_deref(),
+            Some(ENVIRONMENT_HOSTS_WARNING)
+        );
+        assert_eq!(
+            first.steps.iter().map(|s| s.kind).collect::<Vec<_>>(),
+            vec![
+                StepKind::PublishEnvironmentHosts,
+                StepKind::WaitForPublication,
+                StepKind::CheckReachability
+            ]
+        );
+        assert_eq!(
+            permissions_for(PlanOptionKind::TunnelEnvironmentHosts),
+            vec![Permission::SettingsWrite]
+        );
+    }
+
+    #[test]
+    fn environment_hosts_are_not_offered_when_they_cannot_apply() {
+        let with = |facts: PlanFacts| {
+            kinds(&plan(&PlanFacts {
+                requested: Some("myapp-production.example.com".into()),
+                environment_host_label: Some("myapp-production".into()),
+                ..facts
+            }))
+        };
+        let homelab = || tunnel("homelab", "example.com", "example.com");
+        // Another address than the environment's own host.
+        assert!(!kinds(&plan(&PlanFacts {
+            tunnels: vec![homelab()],
+            requested: Some("shop.example.com".into()),
+            environment_host_label: Some("myapp-production".into()),
+            ..base()
+        }))
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // Some tunnel already has them on (Q3: at most one).
+        assert!(!with(PlanFacts {
+            tunnels: vec![
+                homelab(),
+                TunnelFact {
+                    id: 4,
+                    environment_hosts: true,
+                    ..tunnel("edge", "other.example.net", "example.net")
+                },
+            ],
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // An address that is private or for signed-in people (Security).
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            audiences: vec![("myapp.internal.example.com".into(), Audience::Private)],
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // A plan to make the address signed-in (ADR 065): environment hosts
+        // are public.
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            audience: Audience::SignedIn,
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
+        // Served by the control plane: no tunnel carries it.
+        assert!(!with(PlanFacts {
+            tunnels: vec![homelab()],
+            served_by_workers: false,
+            ..base()
+        })
+        .contains(&PlanOptionKind::TunnelEnvironmentHosts));
     }
 
     #[test]
@@ -3023,6 +3804,204 @@ mod tests {
             .options
             .iter()
             .all(|o| o.steps.iter().all(|s| s.kind != StepKind::SetAudience)));
+    }
+
+    fn access_app(id: &str, name: &str) -> AccessApp {
+        AccessApp {
+            id: id.into(),
+            name: name.into(),
+            app_type: super::super::access::SELF_HOSTED.into(),
+            domain: "myapp.example.com".into(),
+            aud: format!("aud-{id}"),
+            domains: vec!["myapp.example.com".into()],
+            policies: "p".into(),
+        }
+    }
+
+    fn access_facts(providers: Vec<AccessProviderFact>) -> PlanFacts {
+        PlanFacts {
+            audience: Audience::SignedIn,
+            gate: GateKind::CloudflareAccess,
+            requested: Some("myapp.example.com".into()),
+            tunnels: vec![tunnel("homelab", "example.com", "example.com")],
+            zones: vec![zone("example.com", "cloudflare")],
+            directs: vec![direct(true)],
+            access_providers: providers,
+            ..base()
+        }
+    }
+
+    fn provider(id: i32, covering: Result<Vec<AccessApp>, String>) -> AccessProviderFact {
+        AccessProviderFact {
+            id,
+            name: format!("Access {id}"),
+            covering,
+        }
+    }
+
+    /// ADR 065 D9: Access only sees tunnel traffic, so direct ways in go;
+    /// the app is made before the address is attached, and the gate set
+    /// right after attaching, as for the Temps sign-in.
+    #[test]
+    fn an_access_plan_offers_only_tunnels_and_creates_the_app_before_attaching() {
+        let plan = plan(&access_facts(vec![provider(4, Ok(vec![]))]));
+        assert_eq!(plan.gate, Some(GateKind::CloudflareAccess));
+        assert!(plan.blocked.is_none(), "{:?}", plan.blocked);
+        assert!(!plan.options.is_empty());
+        for option in &plan.options {
+            assert!(option.way_in.starts_with("tunnel"), "{}", option.way_in);
+            let kinds: Vec<StepKind> = option.steps.iter().map(|s| s.kind).collect();
+            let app = kinds
+                .iter()
+                .position(|k| *k == StepKind::AccessApp)
+                .expect("an AccessApp step");
+            let attach = kinds
+                .iter()
+                .position(|k| *k == StepKind::AttachDomain)
+                .expect("attach");
+            let gate = kinds
+                .iter()
+                .position(|k| *k == StepKind::SetAudience)
+                .expect("gate");
+            assert!(app < attach && gate == attach + 1, "{kinds:?}");
+            let keys: Vec<&str> = option.fields.iter().map(|f| f.key.as_str()).collect();
+            assert!(keys.contains(&FIELD_ACCESS_EMAILS));
+            assert!(keys.contains(&FIELD_ACCESS_EMAIL_DOMAINS));
+            // One account: nothing to pick. No Temps sign-in list.
+            assert!(!keys.contains(&FIELD_ACCESS_PROVIDER));
+            assert!(!keys.contains(&FIELD_GATE_TEAMS));
+            assert!(option
+                .warnings
+                .iter()
+                .any(|w| w.contains("reach Temps directly are not offered")));
+        }
+    }
+
+    #[test]
+    fn an_access_plan_uses_an_app_that_already_covers_the_address() {
+        let plan = plan(&access_facts(vec![
+            provider(4, Ok(vec![])),
+            provider(5, Ok(vec![access_app("a1", "team app")])),
+        ]));
+        let option = &plan.options[0];
+        let step = option
+            .steps
+            .iter()
+            .find(|s| s.kind == StepKind::AccessApp)
+            .expect("step");
+        assert!(step.label.contains("team app"), "{}", step.label);
+        assert!(option.fields.iter().all(|f| f.key != FIELD_ACCESS_EMAILS));
+        assert!(option
+            .warnings
+            .iter()
+            .any(|w| w.contains("never edits or deletes it")));
+    }
+
+    #[test]
+    fn several_access_accounts_ask_which_one_creates_the_app() {
+        let plan = plan(&access_facts(vec![
+            provider(4, Ok(vec![])),
+            provider(5, Ok(vec![])),
+        ]));
+        let field = plan.options[0]
+            .fields
+            .iter()
+            .find(|f| f.key == FIELD_ACCESS_PROVIDER)
+            .expect("a provider choice");
+        assert!(field.required);
+        assert!(matches!(&field.kind, FieldKind::Choice { choices } if choices.len() == 2));
+    }
+
+    #[test]
+    fn an_access_plan_without_a_token_points_at_where_one_is_added() {
+        let plan = plan(&access_facts(vec![]));
+        assert!(plan.options.is_empty());
+        let blocked = plan.blocked.expect("blocked");
+        assert!(blocked.reason.contains("No Cloudflare Access token"));
+        assert_eq!(
+            blocked.action.and_then(|a| a.href).as_deref(),
+            Some(ACCESS_SETUP_PATH)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_access_account_blocks_rather_than_risk_a_second_app() {
+        let plan = plan(&access_facts(vec![provider(
+            4,
+            Err("token revoked".into()),
+        )]));
+        assert!(plan.options.is_empty());
+        assert!(plan
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("token revoked"));
+    }
+
+    #[test]
+    fn an_access_plan_with_no_tunnel_possible_says_why() {
+        let facts = PlanFacts {
+            tunnels: vec![],
+            zones: vec![],
+            tunnel_workers: vec![],
+            served_by_workers: false,
+            ..access_facts(vec![provider(4, Ok(vec![]))])
+        };
+        let plan = plan(&facts);
+        assert!(plan.options.is_empty());
+        assert!(plan
+            .blocked
+            .expect("blocked")
+            .reason
+            .contains("only sees traffic that comes through a Cloudflare tunnel"));
+    }
+
+    #[test]
+    fn a_new_covering_access_app_changes_the_fingerprint_and_others_hash_as_before() {
+        let before = access_facts(vec![provider(4, Ok(vec![]))]);
+        let after = access_facts(vec![provider(4, Ok(vec![access_app("a1", "x")]))]);
+        let host = Some("myapp.example.com");
+        assert_ne!(fingerprint(&before, host), fingerprint(&after, host));
+        // A public plan carries no gate part at all.
+        let public = PlanFacts {
+            audience: Audience::Public,
+            ..before.clone()
+        };
+        let public_other_gate = PlanFacts {
+            gate: GateKind::Temps,
+            access_providers: vec![],
+            ..public.clone()
+        };
+        assert_eq!(
+            fingerprint(&public, host),
+            fingerprint(&public_other_gate, host)
+        );
+    }
+
+    #[test]
+    fn access_policy_answers_take_lists_or_text_and_need_someone() {
+        let answers = |pairs: Vec<(&str, serde_json::Value)>| {
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let policy = access_policy_answer(&answers(vec![
+            (FIELD_ACCESS_EMAILS, serde_json::json!(["Ana@Example.com"])),
+            (
+                FIELD_ACCESS_EMAIL_DOMAINS,
+                serde_json::json!("@example.org, example.net"),
+            ),
+        ]))
+        .expect("valid");
+        assert_eq!(policy.emails, vec!["ana@example.com"]);
+        assert_eq!(policy.email_domains, vec!["example.net", "example.org"]);
+        assert!(access_policy_answer(&answers(vec![])).is_err());
+        assert!(access_policy_answer(&answers(vec![(
+            FIELD_ACCESS_EMAILS,
+            serde_json::json!([1])
+        )]))
+        .is_err());
     }
 
     fn tailnet_report() -> TailscaleReport {

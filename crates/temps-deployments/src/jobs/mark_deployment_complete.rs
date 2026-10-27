@@ -75,7 +75,13 @@ pub struct MarkDeploymentCompleteJob {
     /// `enforce` deployment started through it is retired by deleting its
     /// workload, never by removing the container behind the plane's back.
     workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
+    /// ADR 068 D5: whether anyone can open what was deployed. Empty in a
+    /// binary without the ingress plugin.
+    environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
 }
+
+/// Longest the D5 reachability check may hold a finished deploy.
+const REACHABILITY_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl std::fmt::Debug for MarkDeploymentCompleteJob {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -106,6 +112,60 @@ impl MarkDeploymentCompleteJob {
             config_service: None,
             encryption_service,
             workload_plane: None,
+            environment_addresses: None,
+        }
+    }
+
+    pub fn with_environment_addresses(
+        mut self,
+        slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
+    ) -> Self {
+        self.environment_addresses = Some(slot);
+        self
+    }
+
+    /// ADR 068 D5: when nobody can open the environment, end the log with
+    /// why and how to fix it. Never fails the deploy.
+    async fn warn_when_unreachable(&self, project_id: i32, environment_id: i32) {
+        let Some(addresses) = self.environment_addresses.as_ref().and_then(|s| s.get()) else {
+            return;
+        };
+        let warning = match tokio::time::timeout(
+            REACHABILITY_CHECK_TIMEOUT,
+            addresses.deployment_completed(project_id, environment_id),
+        )
+        .await
+        {
+            Ok(warning) => warning,
+            Err(_) => {
+                warn!(
+                    deployment_id = self.deployment_id,
+                    environment_id, "reachability check of the deployed environment timed out"
+                );
+                None
+            }
+        };
+        let Some(warning) = warning else {
+            return;
+        };
+        info!(
+            deployment_id = self.deployment_id,
+            environment_id, "deployed environment has no reachable address"
+        );
+        if let (Some(log_id), Some(log_service)) = (&self.log_id, &self.log_service) {
+            for line in warning.log_lines() {
+                if let Err(error) = log_service
+                    .append_structured_log(log_id, LogLevel::Warning, line)
+                    .await
+                {
+                    warn!(
+                        deployment_id = self.deployment_id,
+                        %error,
+                        "could not write the reachability warning to the deploy log"
+                    );
+                    return;
+                }
+            }
         }
     }
 
@@ -1153,6 +1213,10 @@ impl MarkDeploymentCompleteJob {
 
         self.log("Deployment is now LIVE and ready for traffic!".to_string())
             .await?;
+        if !portless {
+            self.warn_when_unreachable(deployment.project_id, environment_id)
+                .await;
+        }
 
         // ── Phase 4: Emit DeploymentSucceeded event ──────────────────────
         // Get deployment URL from environment: prefer custom host, fall back to preview domain.
@@ -2815,6 +2879,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     config_service: Option<Arc<temps_config::ConfigService>>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
+    environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -2830,6 +2895,7 @@ impl MarkDeploymentCompleteJobBuilder {
             config_service: None,
             encryption_service: None,
             workload_plane: None,
+            environment_addresses: None,
         }
     }
 
@@ -2891,6 +2957,14 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
+    pub fn environment_addresses(
+        mut self,
+        slot: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    ) -> Self {
+        self.environment_addresses = slot;
+        self
+    }
+
     pub fn build(self) -> Result<MarkDeploymentCompleteJob, WorkflowError> {
         let job_id = self
             .job_id
@@ -2932,6 +3006,9 @@ impl MarkDeploymentCompleteJobBuilder {
         job = job.with_config_service(config_service);
         if let Some(plane) = self.workload_plane {
             job = job.with_workload_plane(plane);
+        }
+        if let Some(slot) = self.environment_addresses {
+            job = job.with_environment_addresses(slot);
         }
 
         Ok(job)

@@ -3419,6 +3419,12 @@ mod apply_resume_and_progress_tests {
             private_range: None,
             private_node_id: None,
             private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
             private_via: None,
             private_service: None,
         };

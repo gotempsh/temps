@@ -71,7 +71,8 @@ import { AlertRuleForm } from '@/pages/AlertRuleForm'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { resolveStableUrl } from '@/lib/deployment-url'
+import { resolveStableLink } from '@/lib/deployment-url'
+import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
 import { selectLastDeployment } from '@/lib/empty-state-selectors'
 import { legacyDatabasesRedirectPath } from '@/lib/project-detail-routes'
 import { projectLoadState } from '@/lib/project-load-state'
@@ -201,6 +202,7 @@ export function ProjectDetail() {
   // The API answers 200 with `deployment: null` for a project that has never
   // deployed; consumers take `undefined` for "nothing yet".
   const lastDeployment = lastDeploymentOrNull ?? undefined
+  const stableLink = lastDeployment ? resolveStableLink(lastDeployment) : null
 
   // Fetch active visitors count
   const { data: activeVisitorsCount } = useQuery({
@@ -668,8 +670,9 @@ export function ProjectDetail() {
             repository?.clone_url || project.git_url || undefined
           }
           repositoryProviderType={repositoryProviderType}
-          lastDeploymentUrl={
-            lastDeployment ? resolveStableUrl(lastDeployment) : null
+          lastDeploymentUrl={stableLink?.url ?? null}
+          lastDeploymentUnavailableReason={
+            stableLink?.unavailableReason ?? null
           }
           lastDeploymentEnvironmentId={lastDeployment?.environment_id}
           isLoadingLastDeployment={isLoadingLastDeployment}
@@ -716,6 +719,11 @@ export function ProjectDetail() {
               </AlertDescription>
             </Alert>
           )}
+          <ReachabilityWarningBanner
+            warning={project.reachability_warning}
+            projectId={project.id}
+            className="mb-4"
+          />
           <ProjectTour />
           <ProjectSectionLayout project={project}>
             <Routes>

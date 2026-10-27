@@ -20,4 +20,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.11"
 thiserror = { workspace = true }
+tokio = { workspace = true, optional = true }
 zstd = { workspace = true }
+
+[features]
+# `ja4::read_client_hello`, for the ingresses that read a ClientHello off
+# a socket.
+tokio = ["dep:tokio"]
+
+[dev-dependencies]
+# Turns on `tokio` for this crate's own tests.
+temps-shield = { path = ".", features = ["tokio"] }
+tokio = { workspace = true }

@@ -9,6 +9,7 @@ import {
   updateSelfMutation,
   verifyAndEnableMfaMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { SignOutOfAppsCard } from '@/components/account/SignOutOfAppsCard'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -588,6 +589,8 @@ export function Account() {
           )}
         </CardContent>
       </Card>
+
+      <SignOutOfAppsCard />
 
       {/* Current-password confirmation before generating a new MFA secret.
           SSO-only accounts (no local password) may leave the field empty;

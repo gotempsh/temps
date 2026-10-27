@@ -39,3 +39,4 @@ utoipa.workspace = true
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }
+sea-orm = { workspace = true, features = ["mock"] }

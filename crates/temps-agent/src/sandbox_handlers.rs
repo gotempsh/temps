@@ -294,6 +294,7 @@ fn provider_err(e: AgentError) -> ApiError {
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
         | AgentError::ProjectNotFound { .. }
+        | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }
         | AgentError::CooldownActive { .. }
         | AgentError::AiCliNotInstalled { .. }

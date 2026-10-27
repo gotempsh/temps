@@ -443,6 +443,10 @@ pub struct AppSettingsResponse {
     /// Database-backed opt-in; this is the sole control surface for every
     /// proxy process, including a standalone `temps proxy`.
     pub trust_loopback_forwarded_ip: bool,
+    /// The header a trusted loopback proxy sends the visitor's JA4 in.
+    /// `None` records no JA4 behind such a proxy.
+    #[schema(example = "x-ja4")]
+    pub loopback_ja4_header: Option<String>,
 
     // Docker registry settings with masked password
     pub docker_registry: DockerRegistrySettingsMasked,
@@ -1062,6 +1066,7 @@ impl From<AppSettings> for AppSettingsResponse {
             security_headers: settings.security_headers,
             rate_limiting: settings.rate_limiting,
             trust_loopback_forwarded_ip,
+            loopback_ja4_header: settings.loopback_ja4_header,
             docker_registry: DockerRegistrySettingsMasked {
                 enabled: settings.docker_registry.enabled,
                 registry_url: settings.docker_registry.registry_url,
@@ -3033,6 +3038,16 @@ fn validate_sandbox_limits(sandbox: &temps_core::AgentSandboxSettings) -> Result
 /// Host-default sandbox backend accepted in platform settings. Selecting a
 /// backend this host can't run is allowed (the settings page shows its
 /// onboarding state); the agents plugin only routes to registered backends.
+/// The stored form of the loopback JA4 header (ADR 066, D4), or a 400 that
+/// says why the name was refused.
+fn validate_loopback_ja4_header(value: Option<&str>) -> Result<Option<String>, Problem> {
+    temps_core::normalize_loopback_ja4_header(value).map_err(|error| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .detail(format!("loopback_ja4_header: {error}"))
+            .build()
+    })
+}
+
 fn validate_sandbox_backend(backend: Option<&str>) -> Result<(), Problem> {
     let Some(backend) = backend.map(str::trim) else {
         return Ok(());
@@ -3685,6 +3700,8 @@ async fn update_settings(
     }
 
     normalize_edge_target(&mut settings);
+    settings.loopback_ja4_header =
+        validate_loopback_ja4_header(settings.loopback_ja4_header.as_deref())?;
 
     let next_trust_loopback_forwarded_ip = settings.trust_loopback_forwarded_ip();
     let previous_clickhouse_compression = stored_settings.clickhouse.compression;
@@ -4518,8 +4535,15 @@ mod tests {
                 private_range: None,
                 private_node_id: None,
                 private_listener: None,
+                gate: None,
+                gate_allow: None,
+                gate_not_before: None,
+                gate_access_provider_id: None,
+                gate_access_app_id: None,
+                gate_access_aud: None,
                 private_via: None,
                 private_service: None,
+                generated_by_connector_id: None,
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(
@@ -4810,6 +4834,28 @@ mod tests {
                 detail.contains(field),
                 "{field}: detail must name the setting, got {detail:?}"
             );
+        }
+    }
+
+    #[test]
+    fn loopback_ja4_header_is_normalized_or_refused() {
+        assert_eq!(
+            validate_loopback_ja4_header(Some(" X-JA4 "))
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some("x-ja4")
+        );
+        assert_eq!(validate_loopback_ja4_header(Some("")).ok(), Some(None));
+        for name in ["cookie", "x ja4"] {
+            let problem = validate_loopback_ja4_header(Some(name)).expect_err(name);
+            assert_eq!(problem.status_code, StatusCode::BAD_REQUEST, "{name}");
+            let detail = problem
+                .body
+                .get("detail")
+                .and_then(|d| d.as_str())
+                .unwrap_or_default();
+            assert!(detail.contains("loopback_ja4_header"), "{detail:?}");
         }
     }
 

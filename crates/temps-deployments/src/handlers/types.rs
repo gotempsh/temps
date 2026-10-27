@@ -310,6 +310,11 @@ pub struct DeploymentResponse {
     pub deployment_config: Option<temps_entities::deployment_config::DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
     pub metadata: Option<temps_entities::prelude::DeploymentMetadata>,
+    /// ADR 068 D5: set on the environment's current, completed deployment
+    /// when nobody can open it, with the fixes that fit this install. The
+    /// deployment itself stays successful.
+    #[serde(default)]
+    pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
 }
 
 // Add new struct for environment info in response
@@ -318,7 +323,15 @@ pub struct DeploymentEnvironmentResponse {
     pub id: i32,
     pub name: String,
     pub slug: String,
+    /// Best first: the primary address (ADR 068 D4) leads when it is known.
     pub domains: Vec<String>,
+    /// The environment's primary address as a URL. `null` while it is not
+    /// known, or when nobody can reach the environment.
+    #[serde(default)]
+    pub primary_url: Option<String>,
+    /// Why nobody can reach the environment; set only when Temps is sure.
+    #[serde(default)]
+    pub no_address_reason: Option<String>,
     /// Public URLs of this environment's Docker Compose services, one per
     /// configured public port. Empty for non-Compose projects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -332,15 +345,25 @@ impl DeploymentResponse {
         } else {
             None
         };
+        let reachability_warning = if deployment.is_current
+            && matches!(deployment.status.as_str(), "completed" | "deployed")
+        {
+            deployment.environment.reachability_warning
+        } else {
+            None
+        };
         Self {
             id: deployment.id,
             project_id: deployment.project_id,
             environment_id: deployment.environment_id,
+            reachability_warning,
             environment: DeploymentEnvironmentResponse {
                 id: deployment.environment.id,
                 name: deployment.environment.name,
                 slug: deployment.environment.slug,
                 domains: deployment.environment.domains,
+                primary_url: deployment.environment.primary_url,
+                no_address_reason: deployment.environment.no_address_reason,
                 service_urls: Vec::new(),
             },
             status: deployment.status,

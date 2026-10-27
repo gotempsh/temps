@@ -930,6 +930,13 @@ window in which a phase 2 address is unserved.
   settable by it (D8). Sign-in uses state and PKCE; codes are single use,
   60 seconds, bound to the address and redeemable only by the listener
   serving it. The redirect target comes from the server.
+- The sign-in state cookie is not signed: it binds the callback to the
+  browser that started the sign-in, as OAuth's state does, and is no
+  secret from the address's own origin. Script running on a signed-in
+  address can open `/authorize` in a popup and redeem the code into its own
+  8-hour token, the same exposure OAuth has on the client's origin: an app
+  that runs hostile script has its visitors' sessions anyway. The token
+  still opens only that address.
 - Revocation reaches listeners with the next route snapshot; a worker that
   cannot reach the control plane honours existing gate tokens for at most
   8 hours and admits no one new (D8).
@@ -1171,6 +1178,204 @@ Open, found in review of 3b:
    invite link, a one-time email code), or is that what Access is for?
 6. ADR 064's open question 2 applies here too: do preview environments
    inherit `tailnet_users` and `signed_in`, with the same principals?
+
+## Implementation notes: phase 4 (signed-in addresses)
+
+Where the code had to be more specific than the decisions above, or departs
+from their letter:
+
+- **The token carries the email.** D8 lists session, user, address, issue
+  and expiry. The token also holds the user's email at sign-in, so a
+  listener can send `x-temps-user-email` without asking the control plane.
+  It is signed like the rest and the cookie is host-only.
+- **Plain HTTP on a signed-in host gets `308` to HTTPS**, with
+  `x-temps-gate: sign-in`, before anything else: a `__Host-` cookie is only
+  kept over HTTPS. The exception is a control-plane proxy started with
+  `--disable-https-redirect` (TLS ends in front of it), which treats the
+  connection as secure.
+- **The address's list applies to instance admins too.** Admins skip the
+  project-access check, as everywhere in Temps, but an address limited to
+  listed teams or users admits an admin only if they are on it.
+- **"Cannot reach the control plane" is 90 seconds without a snapshot.** An
+  agent that has had no route snapshot for that long shows "Sign-in is
+  unavailable: `<node>` cannot reach the control plane" to people who are
+  not signed in, and keeps honouring existing tokens until they expire, as
+  D8 says.
+- **Revocation without a route change.** The route snapshot is rebuilt on
+  `route_table_changes`. A console sign-out, a removal from a team or from a
+  project's teams, an admin demoted and a user deleted change no route, so
+  database triggers announce one, and only when the user concerned has a
+  live gate session (any live session for a change to a project's teams).
+  Installs with no signed-in address never have one (D11).
+- **An unauthenticated authorize request gets the console's sign-in page**,
+  which returns to the authorize URL after password and MFA with a full page
+  load, so the server makes the redirect.
+- **Plans set the gate on custom domains.** Runs attach custom domains (ADR
+  064), so that is where a plan sets `signed_in`. Environment domains have
+  the same columns and listeners enforce them, but nothing in the console
+  sets them yet.
+- **Attached already gated.** A run that makes an address signed-in
+  attaches it with its gate set, the Access app's binding included, in the
+  same insert: no route table ever holds it open, even when its DNS and
+  certificate existed before the run. The audience step after it then has
+  nothing to change. Private addresses are still attached first and made
+  private in the next step, before anything publishes them, as in phase 2.
+- **The reachability check (D10) dials only addresses the outbound policy
+  accepts**, pinned to them, with no redirect followed. An address it cannot
+  check is shown as unknown, never as a pass.
+- **Monitors of a gated address stay operational** and say "Behind sign-in"
+  with the container health checks as what watches the app: the gate
+  answering means the address is up, and an outage alert for every gated
+  address would be noise.
+- **Access addresses stay in every snapshot and fail closed off the
+  tunnel.** D9 says the route table withdraws an Access address from direct
+  listeners and the control-plane proxy. It keeps the route, and every
+  listener that is not a tunnel's origin answers it with `403` and
+  `x-temps-gate: access` ("only sees traffic through the tunnel"); the
+  control-plane proxy, which a tunnel never reaches, always does. Withdrawn,
+  a direct listener would fall through to whatever else matches the host;
+  refused, it cannot serve the app by any route.
+- **Nothing known means refused, never open.** A listener whose snapshot
+  has no Access app for an Access address (its binding missing, its token
+  deleted) answers `503` "Sign-in is unavailable" and serves nothing. A team
+  whose keys are not fetched yet has no key a JWT can match, so requests get
+  the `403`. An unknown `kid` asks the control plane to refetch the team's
+  keys at most once a minute per agent, and the control plane fetches at
+  most once every five minutes per team, besides the hourly refresh and the
+  fetch when a token is saved.
+- **`/_temps/gate/*` is not Temps' on an Access host.** The Temps gate's
+  paths answer `404` there; Access has its own (`/cdn-cgi/access/*`), which
+  Cloudflare serves at its edge.
+- **No HTTPS upgrade on an Access host.** Cloudflare's edge ends TLS and the
+  tunnel carries plain HTTP to the node, so the Temps gate's `308` to HTTPS
+  does not apply; the JWT, not the scheme, is what is checked.
+- **The app is created before the address is attached.** The plan puts the
+  Access app step before attaching, and the gate in the step right after
+  attaching, as for the Temps sign-in: a Cloudflare call never sits between
+  the two. The app names the hostname as its domain, so it protects it as
+  soon as the tunnel publishes it.
+- **A create that timed out is found by name and domain.** D9 says it is
+  resolved by listing apps by domain. The run names the app for itself
+  before creating it (`temps-<hostname>-<install>-r<run>`), and the lookup
+  requires both, so neither an app someone else made for the hostname nor
+  one another run made for it is mistaken for this run's own (and then
+  deleted by undo). Undo still checks the domain before deleting, and an
+  app that now protects another domain is left.
+- **An existing app is re-read when the run starts.** One deleted, or
+  moved to another domain, since planning fails the run before anything is
+  attached.
+- **Unreadable accounts block the plan.** If any saved Access token cannot
+  list its account's apps, the plan cannot tell whether one already covers
+  the address, so it offers nothing rather than risk a second app.
+- **cloudflared's own check (`originRequest.access`) is built but off.**
+  Whether remotely managed tunnels accept it in the configuration API could
+  not be confirmed when this was built. The rule builder and its test are in
+  `crates/temps-ingress/src/cloudflare.rs` behind `CLOUDFLARED_ORIGIN_ACCESS
+  = false`; the tunnel keeps its single catch-all rule. Nothing depends on
+  it: the listener verifies the JWT on every request. Turning it on also
+  needs tunnels reconfigured when an address's Access app changes.
+- **Moving an Access address off its tunnel is refused where Temps moves
+  it**: a hostname choice of "off tunnels", and an apply that would put it on
+  a direct way in, answer with D9's sentence. Plans for an Access address
+  offer only tunnel options.
+- **Creating or using an Access app needs `dns_providers:write`** on top of
+  the option's own permissions, as saving the token does; so does undoing a
+  run that created one.
+- **ACME HTTP-01 is answered before the gate.** Let's Encrypt never signs
+  in, so a signed-in host must still answer its challenge or it could
+  never get or renew a certificate. The control-plane proxy answers a
+  challenge stored for the host before the gate, as agents already do, and
+  only that: any other path under `/.well-known/acme-challenge/` still
+  meets the gate, so the prefix is no way past it.
+- **The sign-in is per address, and the plan says which addresses stay
+  open.** The generated hostname (`<env>.<preview domain>`) and Compose
+  service names (`<service>--<env>`) have no row and are always routed, and
+  service custom domains are not addresses Make it reachable manages. A
+  signed-in plan lists every other public address of the environment that
+  opens the same app, so "only people who sign in can open it" is never
+  read as covering the app. Follow-up: offer to sign in or withdraw the
+  generated hostname and service names in the same run.
+- **Wildcards are never signed-in.** Sign-in returns each visitor to one
+  hostname's callback, and `*.example.com` names none. The reachability
+  service refuses to make a wildcard row signed-in, and the authorize
+  endpoint refuses one written any other way, so it serves no one rather
+  than build a callback to `https://*.example.com`.
+- **Which listener may redeem a code is decided from the shared worker
+  snapshot.** A code is redeemed over a node's token channel only for an
+  address that node serves, and that is read from the worker public
+  routes, which are the same for every node: any `gate.v1` node with public
+  ingress or a connector can redeem a code for any worker-served signed-in
+  address. Redeeming still needs the code and its PKCE verifier, which only
+  the listener that started the sign-in holds. This must move to per-node
+  snapshots when they exist.
+- **An existing app is the most specific `self_hosted` one.** Only
+  `self_hosted` apps protect a hostname (bookmark, SaaS and SSH apps do
+  not), and Cloudflare enforces the most specific app for a request, so an
+  app for the exact hostname is used before a wildcard one. Using a
+  wildcard's AUD while an exact app is in front would turn every visitor
+  away.
+- **The check accepts only the address's own team's sign-in.** The
+  reachability check passes an Access address only on a redirect to the
+  team domain of the token it is bound to, not to any
+  `*.cloudflareaccess.com`; with no bound token it is "not checked".
+- **Signing-key refetches are rate-limited per team.** An agent asks for a
+  refetch at most once per 60 s per team (a fixed array of slots keyed by
+  a per-process hash of the issuer), so one team's unknown `kid` never
+  holds back another's. Two teams sharing a slot share its limit; that only
+  slows a refetch.
+- **Cloudflare's answers are capped as they are read.** The certs answer
+  and the API answers the token check reads are refused on a
+  `Content-Length` over the cap, and otherwise read in chunks that stop at
+  it, never read whole first.
+- **A token is not deleted while a run may still have to undo an app it
+  created.** Besides the addresses bound to it, a token stays while any run
+  journal holds an Access app of it that is not yet gone; without the
+  token, that undo could never reach the app. The answer names the runs.
+  `gate_access_provider_id` also references its token `ON DELETE RESTRICT`.
+- **`gate.v1` is declared on each request, and signed-in routes travel in
+  their own field.** D7 says an agent that does not report `gate.v1` never
+  receives a signed-in route. Trusting the capability last stored for the
+  node, with the gate as a subfield of an ordinary public route, fails
+  open on a rollback: an agent that predates the gate ignores the
+  subfield, so it would serve every signed-in address with no gate. It
+  would do that from the `routes.json` it loads at start for the rest of
+  the 300 s lease, and from every snapshot while the stale capability
+  stays stored. So signed-in routes travel only in
+  `public_ingress.gated_routes`, on the wire and in `routes.json`, and
+  `routes` never holds one. The agent names its capabilities in
+  `x-temps-agent-capabilities` on every snapshot and gate request (the
+  header the tailnet identity capability uses), and the control plane
+  decides from that request alone. An older agent finds no signed-in host
+  anywhere it reads; tests check both the snapshot and `routes.json` with
+  the pre-gate agent's types. Both capabilities share that header as one
+  comma-separated list (`gate.v1,tailnet_identity.v1`), read from every
+  header line, and the ingress report stores them together in
+  `node_public_ingress.listening`; there is no separate column.
+- **The gate's cookies and every `x-temps-user*` header are dropped from
+  every request to every app, admitted or not.** Dropping the cookies only
+  when the gate admits a request let an address that stopped being
+  signed-in pass a still-valid token to its app. The control-plane proxy
+  strips them on every upstream request and the agent on both of its
+  forwarding paths; a request without a gate cookie is left as sent. A
+  client's `x-temps-user*` headers are dropped by prefix, so the tailnet
+  login and any later identity header are covered, and the agent's plain
+  forwarding path drops every client `x-temps-*` header, as its upgrade
+  path already did.
+- **A monitor trusts `x-temps-gate` only from Temps' own proxy.** A probe
+  through the local proxy sees the header only from the gate, since the
+  proxy and the agent drop it from every app response. A probe straight to
+  the public address may reach anything, so there the header proves
+  nothing: such a monitor reports "behind sign-in" only for a redirect to
+  the sign-in of the Access team the address is bound to, and any other
+  answer is classified by its status as usual.
+- **The gate runs before Shield.** On the control plane the gate answers
+  before wake-on-request (D8), which comes before the project's IP rules,
+  rate limits and Shield's challenge. A visitor who is not signed in gets
+  the sign-in and never reaches the app; a signed-in request then goes
+  through the IP rules, rate limits and Shield like any other. ADR 066 does
+  not order the two; challenging first would need the project resolved,
+  which today happens after wake-on-request. Workers do not run Shield
+  yet; when they do (ADR 066 I5), the same order applies there.
 
 ## Sources
 

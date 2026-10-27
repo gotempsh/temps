@@ -883,6 +883,11 @@ impl OutageDetectionService {
                 .await?;
 
             if let Some(check) = recent_check {
+                // Nothing was probed (ADR 068 D4); read as a status it would
+                // be `operational`, which could resolve a real outage.
+                if check.status == temps_core::environment_address::NO_ADDRESS_CHECK_STATUS {
+                    continue;
+                }
                 let status = MonitorStatus::from_str(&check.status);
                 if let Some(event) = self
                     .process_check(monitor.id, status, check.error_message)
@@ -1018,6 +1023,16 @@ WHERE NOT EXISTS (
                         if let Err(error) = self.retire_http_monitor(job.monitor_id).await {
                             error!(monitor_id = job.monitor_id, reason = %error, "Failed to retire HTTP monitor state");
                         }
+                        continue;
+                    }
+                    // ADR 068 D4: nothing was probed because nobody can
+                    // reach the environment. Neither an outage nor a
+                    // recovery: an open incident stays as it was.
+                    if job.status == "no_address" {
+                        debug!(
+                            monitor_id = job.monitor_id,
+                            "monitor has no address to check; outage state unchanged"
+                        );
                         continue;
                     }
                     let status = MonitorStatus::from_str(&job.status);
@@ -1668,6 +1683,53 @@ pub(crate) mod tests {
             incident_id: Some(42),
             occurred_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_monitor_with_no_address_is_neither_up_nor_down_in_the_scan() {
+        let check = temps_entities::status_checks::Model {
+            id: 1,
+            checked_at: Utc::now(),
+            monitor_id: 3,
+            status: temps_core::environment_address::NO_ADDRESS_CHECK_STATUS.to_string(),
+            response_time_ms: None,
+            error_message: Some("Nothing to check".to_string()),
+            created_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(3, Some(1))]])
+                .append_query_results([vec![check]])
+                .into_connection(),
+        );
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            Arc::new(NoopJobQueue),
+        ));
+        let service = OutageDetectionService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            alarm_service,
+        );
+        // It was down before its address went away.
+        service.monitor_states.write().await.insert(
+            3,
+            MonitorState {
+                status: MonitorStatus::Down,
+                active_incident_id: Some(42),
+                consecutive_failures: 3,
+            },
+        );
+
+        let events = service.scan_monitors().await.unwrap();
+
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            service.get_monitor_statuses().await.get(&3),
+            Some(&MonitorStatus::Down),
+            "no_address does not resolve the outage"
+        );
     }
 
     #[tokio::test]

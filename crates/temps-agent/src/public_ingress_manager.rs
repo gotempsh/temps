@@ -348,8 +348,14 @@ async fn run(
             error: error.clone(),
             private_checks: private_checks.clone(),
             tailscale: tailscale_report,
-            // ADR 065 D6: this agent checks who a tailnet visitor is.
-            capabilities: vec![temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY.to_string()],
+            // What this agent enforces: the signed-in gate on every listener
+            // (ADR 065 D7) and who a tailnet visitor is (D6). Informational
+            // for the console; snapshots trust only what each request
+            // declares.
+            capabilities: crate::route_sync_client::DECLARED_CAPABILITIES
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
         };
         if last_reported.as_ref() != Some(&report) || last_report_at.elapsed() >= REPORT_INTERVAL {
             match send_report(&client, &base, &config, &report).await {
@@ -739,6 +745,7 @@ mod tests {
                     deployment_id: None,
                     project_id: None,
                     environment_id: None,
+                    gate: None,
                 },
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),

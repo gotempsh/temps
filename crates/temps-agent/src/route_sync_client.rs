@@ -66,6 +66,10 @@ struct SnapshotPublicIngress {
     listen: Option<crate::route_store::PublicListen>,
     #[serde(default)]
     private_routes: Vec<SnapshotPrivateRoute>,
+    /// ADR 065 D7: signed-in addresses, sent only because this agent
+    /// declared it enforces the gate.
+    #[serde(default)]
+    gated_routes: Vec<SnapshotRoute>,
     #[serde(default)]
     serve_entries: Vec<SnapshotServeEntry>,
     /// ADR 065 D6: `tailnet_users` private addresses, sent only because
@@ -141,6 +145,8 @@ struct SnapshotRoute {
     project_id: Option<i32>,
     #[serde(default)]
     environment_id: Option<i32>,
+    #[serde(default)]
+    gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -155,6 +161,20 @@ struct SnapshotBackend {
 #[derive(Debug, Clone, Serialize)]
 struct AckRequest {
     applied_generation: u64,
+}
+
+/// What this agent enforces (ADR 065 D6, D7), declared on every request
+/// it makes to the control plane. The control plane sends `tailnet_users`
+/// and signed-in routes only to a request that names the capability, so a
+/// binary rolled back to one without it stops getting them at once.
+pub const DECLARED_CAPABILITIES: [&str; 2] = [
+    temps_core::gate::GATE_CAPABILITY,
+    temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+];
+
+/// [`DECLARED_CAPABILITIES`] as the header value: one comma-separated list.
+pub fn declared_capabilities() -> String {
+    DECLARED_CAPABILITIES.join(",")
 }
 
 /// Retry interval while the control plane refuses this node (401/403/404).
@@ -327,11 +347,12 @@ impl RouteSyncClient {
             .http
             .get(&url)
             .bearer_auth(&self.node_token)
-            // ADR 065 D6: what this binary enforces, on every request, so a
-            // rollback stops `tailnet_users` routes at the next snapshot.
+            // ADR 065 D6, D7: what this binary enforces, on every request, so
+            // a rollback stops `tailnet_users` and signed-in routes at the
+            // next snapshot.
             .header(
                 temps_core::tailnet::AGENT_CAPABILITIES_HEADER,
-                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+                declared_capabilities(),
             )
             .send()
             .await
@@ -354,6 +375,9 @@ impl RouteSyncClient {
             .json()
             .await
             .map_err(|e| format!("parse snapshot: {e}"))?;
+        // The signed-in gate sends visitors to sign in only while the
+        // control plane answers (ADR 065 D8).
+        crate::gate::mark_control_plane_contact();
 
         let public_ingress = PublicIngressSnapshot {
             enabled: body.public_ingress.enabled,
@@ -381,6 +405,12 @@ impl RouteSyncClient {
                 }
             }),
             listen: body.public_ingress.listen,
+            gated_routes: body
+                .public_ingress
+                .gated_routes
+                .into_iter()
+                .map(snapshot_route_into_entry)
+                .collect(),
             private_routes: body
                 .public_ingress
                 .private_routes
@@ -517,6 +547,7 @@ fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
         deployment_id: route.deployment_id,
         project_id: route.project_id,
         environment_id: route.environment_id,
+        gate: route.gate,
     }
 }
 
@@ -590,6 +621,7 @@ mod tests {
             deployment_id: Some(1),
             project_id: Some(2),
             environment_id: Some(3),
+            gate: None,
         }
     }
 
@@ -627,6 +659,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -752,6 +785,7 @@ mod tests {
             unsupported_reasons: Vec::new(),
             listen: None,
             private_routes: Vec::new(),
+            gated_routes: Vec::new(),
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
@@ -928,11 +962,14 @@ mod tests {
         .expect("create route sync client");
 
         let _ = client.tick_once().await;
+        // One header naming both capabilities.
         assert_eq!(
             *seen.lock().expect("fixture lock"),
-            vec![Some(
-                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY.to_string()
-            )]
+            vec![Some(format!(
+                "{},{}",
+                temps_core::gate::GATE_CAPABILITY,
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY
+            ))]
         );
         let private = store.lookup_private("users.example.test").expect("served");
         assert_eq!(

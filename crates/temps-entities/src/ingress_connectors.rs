@@ -32,6 +32,10 @@ pub struct Model {
     /// Publish every worker-served hostname under `domain` (true), or only
     /// the hostnames chosen for this tunnel (false).
     pub auto_publish: bool,
+    /// Publish every environment as `<label>.<domain>` (ADR 068 D3). At
+    /// most one connector has it on.
+    #[serde(default)]
+    pub environment_hosts: bool,
     /// `pending`, `ready`, `error`, or `deleting` while it is being removed
     /// (ADR 064 D4): sync and reconcile skip it, and it is never reverted.
     pub status: String,

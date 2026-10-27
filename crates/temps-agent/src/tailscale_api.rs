@@ -780,6 +780,8 @@ pub(crate) mod fake {
         /// prefs write, one per write, oldest first.
         pub advertise_after_write: std::collections::VecDeque<Value>,
         pub prefs_writes: u32,
+        /// When set, reading the Serve config answers with this status.
+        pub config_status: Option<u16>,
         /// When set, whois answers only once this is notified.
         pub whois_gate: Option<Arc<tokio::sync::Notify>>,
     }
@@ -829,6 +831,12 @@ pub(crate) mod fake {
         let state = state.lock();
         if let Some(garbage) = &state.garbage {
             return garbage.clone().into_response();
+        }
+        if let Some(status) = state
+            .config_status
+            .and_then(|s| StatusCode::from_u16(s).ok())
+        {
+            return (status, "serve config unavailable").into_response();
         }
         let mut response = axum::Json(state.config.clone()).into_response();
         if let Ok(value) = etag(&state).parse() {

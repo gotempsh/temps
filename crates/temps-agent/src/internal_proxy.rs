@@ -82,6 +82,12 @@ pub(crate) struct PublicAcmeConfig {
 #[derive(Clone, Copy)]
 pub(crate) struct PublicPeer(pub SocketAddr);
 
+/// The visitor's TLS fingerprint (ADR 066, D4): computed by the public
+/// HTTPS listener, or taken from a tunnel connector's header over
+/// loopback. Logged at `debug` until Shield runs on workers (phase 5).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PublicClientFingerprint(pub temps_shield::ja4::ClientFingerprint);
+
 #[derive(Clone)]
 pub(crate) struct PublicConnectionPermit(pub Arc<tokio::sync::OwnedSemaphorePermit>);
 
@@ -112,7 +118,25 @@ const HOP_BY_HOP: &[&str] = &[
     "x-forwarded-proto",
     "x-real-ip",
     "x-temps-deployment-id",
+    // Only the signed-in gate says who is signed in (ADR 065 D8): a client's
+    // own copies are dropped on every listener, and an admitted request gets
+    // the gate's from `GateIdentity`.
+    "x-temps-user",
+    "x-temps-user-email",
 ];
+
+/// Who the signed-in gate admitted, attached to the request so both
+/// forwarding paths (plain and upgrade) add the identity headers after
+/// stripping the client's.
+#[derive(Clone)]
+struct GateIdentity(Vec<(&'static str, HeaderValue)>);
+
+/// The JA4 headers of ADR 066 D4. A worker reads none of them from a
+/// visitor, so none reaches an app, where it could pass for one the
+/// platform vouched for.
+fn is_forwarded_ja4_header(name: &str) -> bool {
+    temps_shield::ja4::FORWARDED_JA4_HEADERS.contains(&name)
+}
 
 /// Per-attempt upstream timeout. Internal-zone calls are between
 /// containers on the same overlay; if 30s isn't enough something is
@@ -186,6 +210,10 @@ struct ProxyState {
     /// origin is told `https` by the provider, which terminated TLS, so it
     /// has no server name to check.
     require_sni: bool,
+    /// The loopback origin a tunnel connector forwards to (ADR 058). The
+    /// only listener that may serve a Cloudflare Access address, since
+    /// Access only sees tunnel traffic (ADR 065 D9).
+    tunnel_origin: bool,
     acme: Option<PublicAcmeConfig>,
     acme_relay: Arc<AcmeRelayState>,
     /// A Serve socket (ADR 065 D3): serves its one address, and is the only
@@ -317,6 +345,7 @@ pub async fn spawn(
         public_mode: false,
         private_mode: false,
         require_sni: false,
+        tunnel_origin: false,
         forwarded_proto: "http",
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
@@ -629,7 +658,12 @@ async fn handle_serve(state: &ProxyState, socket: &ServeSocket, mut req: Request
     proxy_with_retries(state, &route, req).await
 }
 
-async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Response {
+    // ADR 065 D8: the gate's identity headers are set only for a request it
+    // admitted, never taken from a client, on every listener including a
+    // Serve socket. Tailnet identity is filtered where requests are
+    // forwarded (`forwards_header`, D3).
+    temps_core::gate::strip_identity_headers(req.headers_mut());
     if let Some(socket) = state.serve.clone() {
         return handle_serve(&state, &socket, req).await;
     }
@@ -691,13 +725,49 @@ async fn handle(State(state): State<Arc<ProxyState>>, req: Request) -> Response 
         if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
             recorder.mark_project();
         }
+        if let Some(PublicClientFingerprint(fingerprint)) = req.extensions().get() {
+            debug!(
+                host = %host,
+                ja4 = fingerprint.ja4.as_ref().map(|ja4| ja4.as_str()),
+                ja4_source = fingerprint.source.as_str(),
+                "public request"
+            );
+        }
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // reaches the app. Routes without a gate are not affected.
+        if let Some(policy) = entry.gate.as_ref() {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            match crate::gate::enforce(
+                policy,
+                &host,
+                state.forwarded_proto == "https",
+                state.tunnel_origin,
+                &method,
+                &uri,
+                req.headers_mut(),
+            )
+            .await
+            {
+                crate::gate::Enforced::Respond(response) => return response,
+                crate::gate::Enforced::Admit(identity) => {
+                    req.extensions_mut().insert(GateIdentity(identity));
+                }
+            }
+        }
         if entry.backends.is_empty() {
             return error_body(StatusCode::SERVICE_UNAVAILABLE, "no live backends");
         }
-        if is_upgrade_request(req.headers()) {
-            return proxy_upgrade(&entry, req, state.forwarded_proto, false).await;
+        let mut response = if is_upgrade_request(req.headers()) {
+            proxy_upgrade(&entry, req, state.forwarded_proto, false).await
+        } else {
+            proxy_with_retries(&state, &entry, req).await
+        };
+        if entry.gate.is_some() {
+            // The app may neither pass for the gate nor touch its cookies.
+            temps_core::gate::strip_gate_response_headers(response.headers_mut());
         }
-        return proxy_with_retries(&state, &entry, req).await;
+        return response;
     }
 
     // Reject non-temps.local up front. The proxy is not a generic
@@ -779,7 +849,7 @@ pub(crate) fn public_router(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
 ) -> std::io::Result<axum::Router> {
-    public_router_with(store, forwarded_proto, acme, true)
+    public_router_with(store, forwarded_proto, acme, true, false)
 }
 
 /// The private listener's router (ADR 064 D5): no ACME relay (a private
@@ -789,18 +859,70 @@ pub(crate) fn private_router(
     forwarded_proto: &'static str,
     tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, None, true, true, tailnet)
+    router_with(store, forwarded_proto, None, true, true, false, tailnet)
+}
+
+/// The headers a tunnel origin trusts from its loopback connector. The
+/// connector supervisor swaps them in place on every sync, so a running
+/// listener never keeps settings the control plane has since changed.
+#[derive(Debug, Default)]
+pub struct TunnelOriginHeaders {
+    pub(crate) client_address: Option<HeaderName>,
+    pub(crate) client_ja4: Option<(HeaderName, temps_shield::ja4::Ja4Source)>,
+}
+
+impl TunnelOriginHeaders {
+    /// `client_ja4` is the header a connector puts the visitor's JA4 in, and
+    /// the source it stands for (ADR 066, D4).
+    pub fn new(
+        client_address_header: Option<&str>,
+        client_ja4: Option<(&str, temps_shield::ja4::Ja4Source)>,
+    ) -> std::io::Result<Self> {
+        let header = |name: &str| {
+            HeaderName::from_bytes(name.as_bytes())
+                .map_err(|error| std::io::Error::other(error.to_string()))
+        };
+        Ok(Self {
+            client_address: client_address_header.map(header).transpose()?,
+            client_ja4: client_ja4
+                .map(|(name, source)| header(name).map(|name| (name, source)))
+                .transpose()?,
+        })
+    }
+}
+
+/// Remove a tunnel connector's JA4 header and, when the connection came
+/// from loopback, return what it says (ADR 066, D4). The header is removed
+/// either way, and a value not in the exact JA4 format counts as none.
+fn take_forwarded_ja4(
+    headers: &mut HeaderMap,
+    from_loopback: bool,
+    name: &HeaderName,
+    source: temps_shield::ja4::Ja4Source,
+) -> Option<PublicClientFingerprint> {
+    let ja4 = headers.remove(name).and_then(|value| {
+        value
+            .to_str()
+            .ok()
+            .and_then(temps_shield::ja4::Ja4::parse_forwarded)
+    });
+    from_loopback.then_some(PublicClientFingerprint(
+        temps_shield::ja4::ClientFingerprint { ja4, source },
+    ))
 }
 
 /// The loopback origin an ingress connector forwards to (ADR 058): serves
 /// the public snapshot like the public HTTPS listener, without a server name
 /// to check, and takes the visitor's address from `client_address_header`
-/// when, and only when, the connection comes from loopback.
+/// when, and only when, the connection comes from loopback. The visitor's
+/// JA4 comes from `client_ja4`'s header the same way (ADR 066, D4): the
+/// connector ended TLS, so nothing else here can know it. Both are read
+/// from `headers` on every request.
 pub async fn spawn_tunnel_origin(
     address: SocketAddr,
     store: SharedRouteStore,
     shutdown: Arc<Notify>,
-    client_address_header: Option<String>,
+    headers: Arc<arc_swap::ArcSwap<TunnelOriginHeaders>>,
 ) -> std::io::Result<SocketAddr> {
     if !address.ip().is_loopback() {
         return Err(std::io::Error::other(
@@ -809,19 +931,22 @@ pub async fn spawn_tunnel_origin(
     }
     let listener = TcpListener::bind(address).await?;
     let bound = listener.local_addr()?;
-    let header = client_address_header
-        .map(|name| HeaderName::from_bytes(name.as_bytes()))
-        .transpose()
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
-    let app = public_router_with(store, "https", None, false)?.layer(axum::middleware::from_fn(
-        move |mut req: Request, next: axum::middleware::Next| {
-            let header = header.clone();
+    let app = public_router_with(store, "https", None, false, true)?.layer(
+        axum::middleware::from_fn(move |mut req: Request, next: axum::middleware::Next| {
+            let trusted = headers.load_full();
             async move {
-                if let Some(name) = &header {
-                    let from_loopback = req
-                        .extensions()
-                        .get::<ConnectInfo<SocketAddr>>()
-                        .is_some_and(|peer| peer.0.ip().is_loopback());
+                let from_loopback = req
+                    .extensions()
+                    .get::<ConnectInfo<SocketAddr>>()
+                    .is_some_and(|peer| peer.0.ip().is_loopback());
+                if let Some((name, source)) = &trusted.client_ja4 {
+                    if let Some(fingerprint) =
+                        take_forwarded_ja4(req.headers_mut(), from_loopback, name, *source)
+                    {
+                        req.extensions_mut().insert(fingerprint);
+                    }
+                }
+                if let Some(name) = &trusted.client_address {
                     let visitor = req
                         .headers()
                         .get(name)
@@ -835,8 +960,8 @@ pub async fn spawn_tunnel_origin(
                 }
                 next.run(req).await
             }
-        },
-    ));
+        }),
+    );
     tokio::spawn(async move {
         let server = axum::serve(
             listener,
@@ -895,6 +1020,7 @@ pub async fn spawn_serve_socket(
         private_mode: false,
         forwarded_proto: "https",
         require_sni: false,
+        tunnel_origin: false,
         acme: None,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: Some(socket),
@@ -919,8 +1045,17 @@ fn public_router_with(
     forwarded_proto: &'static str,
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
+    tunnel_origin: bool,
 ) -> std::io::Result<axum::Router> {
-    router_with(store, forwarded_proto, acme, require_sni, false, None)
+    router_with(
+        store,
+        forwarded_proto,
+        acme,
+        require_sni,
+        false,
+        tunnel_origin,
+        None,
+    )
 }
 
 fn router_with(
@@ -929,6 +1064,7 @@ fn router_with(
     acme: Option<PublicAcmeConfig>,
     require_sni: bool,
     private_mode: bool,
+    tunnel_origin: bool,
     tailnet: Option<Arc<crate::tailnet_identity::TailnetIdentity>>,
 ) -> std::io::Result<axum::Router> {
     let client = reqwest::Client::builder()
@@ -951,6 +1087,7 @@ fn router_with(
         private_mode,
         forwarded_proto,
         require_sni,
+        tunnel_origin,
         acme,
         acme_relay: Arc::new(AcmeRelayState::new()),
         serve: None,
@@ -1309,10 +1446,14 @@ fn is_upgrade_request(headers: &HeaderMap) -> bool {
 /// side closes.
 async fn proxy_upgrade(
     entry: &RouteEntry,
-    req: Request,
+    mut req: Request,
     forwarded_proto: &'static str,
     serve_socket: bool,
 ) -> Response {
+    // The gate's cookies never reach an app, admitted or not, gated host or
+    // not: a cookie left from before an address stopped being signed-in is
+    // still a token (ADR 065 D8).
+    temps_core::gate::strip_gate_cookies(req.headers_mut());
     use rand::prelude::IndexedRandom;
     let backend = {
         let mut rng = rand::rng();
@@ -1330,6 +1471,7 @@ async fn proxy_upgrade(
         .unwrap_or("/")
         .to_string();
     let headers = req.headers().clone();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
@@ -1397,6 +1539,7 @@ async fn proxy_upgrade(
             || name_str.starts_with("x-forwarded-")
             || name_str.starts_with("x-temps-")
             || name_str == "x-real-ip"
+            || is_forwarded_ja4_header(name_str)
         {
             continue;
         }
@@ -1410,6 +1553,12 @@ async fn proxy_upgrade(
     }
     if let Some(h) = &original_host {
         wire.extend_from_slice(format!("host: {}\r\n", h).as_bytes());
+    }
+    for (name, value) in identity.iter().flat_map(|identity| identity.0.iter()) {
+        wire.extend_from_slice(name.as_bytes());
+        wire.extend_from_slice(b": ");
+        wire.extend_from_slice(value.as_bytes());
+        wire.extend_from_slice(b"\r\n");
     }
     if let Some(deployment_id) = entry.deployment_id {
         wire.extend_from_slice(format!("x-temps-deployment-id: {}\r\n", deployment_id).as_bytes());
@@ -1505,7 +1654,7 @@ async fn proxy_upgrade(
         let mut resp = Response::new(Body::from(leftover));
         *resp.status_mut() = status;
         for (name, value) in headers_out.iter() {
-            if HOP_BY_HOP.contains(&name.as_str()) {
+            if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
                 continue;
             }
             resp.headers_mut().insert(name.clone(), value.clone());
@@ -1524,7 +1673,7 @@ async fn proxy_upgrade(
     // there and must round-trip unchanged.
     let mut client_resp = Response::new(Body::empty());
     *client_resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
-    for (name, value) in response_bytes.iter() {
+    for (name, value) in response_bytes.iter().filter(|(name, _)| app_may_send(name)) {
         client_resp
             .headers_mut()
             .insert(name.clone(), value.clone());
@@ -1723,13 +1872,16 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
     // the body issue is moot. Methods with bodies get one shot.
     let method = req.method().clone();
     let uri = req.uri().clone();
-    let headers = req.headers().clone();
+    let mut headers = req.headers().clone();
+    // As in `proxy_upgrade`: no app ever receives the gate's cookies.
+    temps_core::gate::strip_gate_cookies(&mut headers);
     let public_peer = req.extensions().get::<PublicPeer>().copied().or_else(|| {
         req.extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|peer| PublicPeer(peer.0))
     });
     let recorder = req.extensions().get::<RequestRecorder>().cloned();
+    let identity = req.extensions().get::<GateIdentity>().cloned();
     let login = req
         .extensions()
         .get::<AdmittedLogin>()
@@ -1740,6 +1892,7 @@ async fn proxy_with_retries(state: &ProxyState, entry: &RouteEntry, req: Request
         headers,
         public_peer,
         recorder,
+        identity,
         login,
     };
     let retryable = metadata.method == axum::http::Method::GET
@@ -1832,6 +1985,8 @@ struct ForwardRequestMetadata {
     public_peer: Option<PublicPeer>,
     /// Public listeners only (ADR 061).
     recorder: Option<RequestRecorder>,
+    /// Who the signed-in gate admitted (ADR 065 D8).
+    identity: Option<GateIdentity>,
     /// An admitted tailnet login (ADR 065 D6).
     login: Option<String>,
 }
@@ -1863,8 +2018,12 @@ async fn forward_once(
     let mut builder = state.client.request(metadata.method.clone(), &upstream_url);
 
     for (name, value) in metadata.headers.iter() {
-        // Tailnet identity is trusted only from a Serve socket (ADR 065 D3).
+        // Every `x-temps-*` header is Temps' to set, below; a client's copy
+        // never passes, as on the upgrade path. Tailnet identity is trusted
+        // only from a Serve socket (ADR 065 D3).
         if HOP_BY_HOP.contains(&name.as_str())
+            || name.as_str().starts_with("x-temps-")
+            || is_forwarded_ja4_header(name.as_str())
             || !temps_core::tailnet::forwards_header(name.as_str(), state.serve.is_some())
         {
             continue;
@@ -1888,6 +2047,13 @@ async fn forward_once(
     }
     if let Some(deployment_id) = entry.deployment_id {
         builder = builder.header("x-temps-deployment-id", deployment_id.to_string());
+    }
+    for (name, value) in metadata
+        .identity
+        .iter()
+        .flat_map(|identity| identity.0.iter())
+    {
+        builder = builder.header(*name, value.clone());
     }
     if let Some(login) = metadata
         .login
@@ -1945,12 +2111,19 @@ async fn forward_once(
     let mut out = Response::new(Body::from_stream(upstream.bytes_stream()));
     *out.status_mut() = status;
     for (name, value) in upstream_headers_owned.iter() {
-        if HOP_BY_HOP.contains(&name.as_str()) {
+        if HOP_BY_HOP.contains(&name.as_str()) || !app_may_send(name) {
             continue;
         }
         out.headers_mut().insert(name.clone(), value.clone());
     }
     out
+}
+
+/// Whether an app's response may carry `name` to the client. No app, gated
+/// or not, may send `x-temps-gate`: monitors read it as the gate's own
+/// answer (ADR 065 D10), so an app could pass for a gate that is up.
+fn app_may_send(name: &axum::http::HeaderName) -> bool {
+    name.as_str() != temps_core::gate::GATE_HEADER
 }
 
 /// Convert axum's `Body` into a stream of `Result<Bytes, _>` that
@@ -2050,7 +2223,41 @@ mod tests {
             deployment_id: Some(project_id * 10),
             project_id: Some(project_id),
             environment_id: Some(project_id * 100),
+            gate: None,
         }
+    }
+
+    #[test]
+    fn tunnel_connector_ja4_is_trusted_from_loopback_only() {
+        use temps_shield::ja4::Ja4Source;
+        const SPEC_JA4: &str = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+        let name = HeaderName::from_static("cf-ja4");
+        let headers = |value: &'static str| {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(&name, HeaderValue::from_static(value));
+            headers
+        };
+
+        let mut from_connector = headers(SPEC_JA4);
+        let fingerprint =
+            take_forwarded_ja4(&mut from_connector, true, &name, Ja4Source::Cloudflare)
+                .expect("a loopback connector is trusted");
+        assert_eq!(
+            fingerprint.0.ja4.as_ref().map(|ja4| ja4.as_str()),
+            Some(SPEC_JA4)
+        );
+        assert_eq!(fingerprint.0.source, Ja4Source::Cloudflare);
+        assert!(from_connector.is_empty(), "the header never goes upstream");
+
+        let mut malformed = headers("not a ja4");
+        let fingerprint = take_forwarded_ja4(&mut malformed, true, &name, Ja4Source::Cloudflare)
+            .expect("still the connector's request");
+        assert_eq!(fingerprint.0.ja4, None);
+        assert!(malformed.is_empty());
+
+        let mut elsewhere = headers(SPEC_JA4);
+        assert!(take_forwarded_ja4(&mut elsewhere, false, &name, Ja4Source::Cloudflare).is_none());
+        assert!(elsewhere.is_empty());
     }
 
     #[test]
@@ -2261,6 +2468,7 @@ mod tests {
                 deployment_id: Some(1),
                 project_id: Some(1),
                 environment_id: Some(1),
+                gate: None,
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

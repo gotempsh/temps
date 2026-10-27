@@ -133,6 +133,14 @@ pub struct Model {
 
     /// Why, as a JSON array of strings like `spamhaus_drop (192.0.2.0/24)`.
     pub shield_reasons: Option<serde_json::Value>,
+
+    /// The client's JA4 TLS fingerprint (ADR 066 D4), when its source gives
+    /// one.
+    pub ja4: Option<String>,
+
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`.
+    pub ja4_source: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -34,6 +34,7 @@ import {
   HostnameChoice,
   TunnelHostnames,
 } from '@/components/domains/TunnelHostnames'
+import { TunnelEnvironmentHosts } from '@/components/domains/TunnelEnvironmentHosts'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -178,6 +179,7 @@ function ZoneDetail({
             </CardHeader>
             <CardContent>
               <TunnelHostnames connector={connector} />
+              <TunnelEnvironmentHosts connector={connector} />
             </CardContent>
           </Card>
         </>

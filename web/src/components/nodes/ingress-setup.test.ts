@@ -47,6 +47,7 @@ function connector(
     created_at: '2026-01-01T00:00:00Z',
     domain: 'example.com',
     edge_port: 8080,
+    environment_hosts: false,
     id: 9,
     name: 'example-com',
     provider: 'cloudflare_tunnel',

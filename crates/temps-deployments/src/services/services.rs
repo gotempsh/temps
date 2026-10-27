@@ -739,6 +739,10 @@ pub struct DeploymentService {
     /// Anonymous product telemetry reporter (late-bound, optional). Set via
     /// [`Self::set_telemetry`]; defaults to a no-op when unset.
     telemetry: std::sync::OnceLock<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// ADR 068: an environment's primary address and the deploy warning
+    /// (late-bound, optional: empty without the ingress plugin).
+    environment_addresses:
+        std::sync::OnceLock<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
     /// Resolves a container's environment variables from the selected
     /// environment (late-bound; the resolver's six service deps only exist later
     /// in plugin init). Set via [`Self::set_env_resolver`]. Used by the inline
@@ -848,6 +852,64 @@ fn environment_links(
         links.push(generated_url.to_string());
     }
     links
+}
+
+/// An environment's links with its primary address first (ADR 068 D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrderedLinks {
+    domains: Vec<String>,
+    primary_url: Option<String>,
+    no_address_reason: Option<String>,
+}
+
+/// Put the primary address first. A custom domain or private address is
+/// served by the same listener as the generated URL, so it takes its scheme
+/// and port; a tunnel host is served by the tunnel, on `https`. Without an
+/// answer from reachability the stored order stays, as before ADR 068.
+fn primary_first(
+    links: Vec<String>,
+    generated_url: &str,
+    address: Option<&temps_core::environment_address::EnvironmentAddress>,
+) -> OrderedLinks {
+    use temps_core::environment_address::{https_url, AddressKind};
+    let Some(address) = address else {
+        return OrderedLinks {
+            domains: links,
+            primary_url: None,
+            no_address_reason: None,
+        };
+    };
+    let Some(primary) = &address.primary else {
+        return OrderedLinks {
+            domains: links,
+            primary_url: None,
+            no_address_reason: address.no_address_reason.clone(),
+        };
+    };
+    let host_of = |link: &str| {
+        url::Url::parse(link)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+    };
+    let wanted = primary.address.to_ascii_lowercase();
+    let is_primary = |link: &String| host_of(link).as_deref() == Some(wanted.as_str());
+    let url = match primary.kind {
+        // A bound tunnel host is listed on the generated listener's scheme
+        // and port, which is not how the tunnel serves it.
+        AddressKind::TunnelHost => https_url(&primary.address),
+        AddressKind::CustomDomain | AddressKind::Generated | AddressKind::Private => links
+            .iter()
+            .find(|link| is_primary(link))
+            .cloned()
+            .unwrap_or_else(|| on_listener_of(generated_url, &primary.address)),
+    };
+    let mut domains = vec![url.clone()];
+    domains.extend(links.into_iter().filter(|l| !is_primary(l)));
+    OrderedLinks {
+        domains,
+        primary_url: Some(url),
+        no_address_reason: None,
+    }
 }
 
 /// `host` as an absolute URL on the same scheme and port as `reference`.
@@ -1631,6 +1693,7 @@ impl DeploymentService {
             image_builder,
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
+            environment_addresses: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
@@ -1659,6 +1722,14 @@ impl DeploymentService {
     /// (currently `rollback_triggered`).
     pub fn set_telemetry(&self, reporter: Arc<dyn temps_core::telemetry::TelemetryReporter>) {
         let _ = self.telemetry.set(reporter);
+    }
+
+    /// Wire the ADR 068 primary address and deploy warning.
+    pub fn set_environment_addresses(
+        &self,
+        slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
+    ) {
+        let _ = self.environment_addresses.set(slot);
     }
 
     /// Set the audit sink used for deploy-path security events (ADR 045), so
@@ -2135,7 +2206,7 @@ impl DeploymentService {
             .collect();
 
         // Fetch all environments with their domains in a single query
-        let environments_with_domains = self.get_environments_with_domains(&env_ids).await?;
+        let environments_with_domains = self.get_environments_with_domains(&env_ids, false).await?;
 
         // For each deployment, check if it's the current deployment for any environment
         let mut deployments_with_info = Vec::new();
@@ -2230,7 +2301,7 @@ impl DeploymentService {
 
         // Fetch environment with domains
         let environments_with_domains = self
-            .get_environments_with_domains(&[deployment.environment_id])
+            .get_environments_with_domains(&[deployment.environment_id], true)
             .await?;
         let environment = environments_with_domains
             .get(&deployment.environment_id)
@@ -2272,7 +2343,7 @@ impl DeploymentService {
 
         // Fetch environment with domains
         let environments_with_domains = self
-            .get_environments_with_domains(&[deployment.environment_id])
+            .get_environments_with_domains(&[deployment.environment_id], true)
             .await?;
         let environment = environments_with_domains
             .get(&deployment.environment_id)
@@ -3423,6 +3494,7 @@ impl DeploymentService {
             })?;
 
         let job = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+            .environment_addresses(self.environment_addresses.get().cloned())
             .job_id("mark_deployment_complete".to_string())
             .deployment_id(deployment.id)
             .db(self.db.clone())
@@ -4276,6 +4348,7 @@ impl DeploymentService {
                     })?;
 
             let mark_complete_job = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+                .environment_addresses(self.environment_addresses.get().cloned())
                 .job_id("mark_deployment_complete".to_string())
                 .deployment_id(rollback_deployment_id)
                 .db(self.db.clone())
@@ -4916,6 +4989,7 @@ impl DeploymentService {
                     })?;
 
             let mark_complete_job = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
+                .environment_addresses(self.environment_addresses.get().cloned())
                 .job_id("mark_deployment_complete".to_string())
                 .deployment_id(promoted_id)
                 .db(self.db.clone())
@@ -5368,15 +5442,20 @@ impl DeploymentService {
         Ok(())
     }
 
+    /// `resolve`: judge each environment's primary address now (ADR 068
+    /// D4), for a single deployment; otherwise only reuse a recent answer,
+    /// so a list never resolves DNS per row.
     async fn get_environments_with_domains(
         &self,
         environment_ids: &[i32],
+        resolve: bool,
     ) -> Result<HashMap<i32, DeploymentEnvironment>, DeploymentError> {
         use temps_entities::{environment_domains, environments, project_custom_domains, projects};
 
         if environment_ids.is_empty() {
             return Ok(HashMap::new());
         }
+        let addresses = self.environment_addresses.get().and_then(|slot| slot.get());
 
         // Fetch all environments with their projects
         let environments = environments::Entity::find()
@@ -5430,6 +5509,24 @@ impl DeploymentService {
                 .await
                 .unwrap_or_else(|_| format!("http://{}.localhost", env.subdomain));
             let domains = environment_links(&env_url, &env.subdomain, &custom, &bound);
+            let address = match &addresses {
+                Some(addresses) if resolve => {
+                    match addresses.address(env.project_id, env.id).await {
+                        Ok(address) => Some(address),
+                        Err(error) => {
+                            warn!(
+                                environment_id = env.id,
+                                %error,
+                                "could not tell the primary address; keeping the stored order"
+                            );
+                            None
+                        }
+                    }
+                }
+                Some(addresses) => addresses.cached(env.id),
+                None => None,
+            };
+            let ordered = primary_first(domains, &env_url, address.as_ref());
 
             result.insert(
                 env.id,
@@ -5437,7 +5534,10 @@ impl DeploymentService {
                     id: env.id,
                     name: env.name,
                     slug: env.slug,
-                    domains,
+                    domains: ordered.domains,
+                    primary_url: ordered.primary_url,
+                    no_address_reason: ordered.no_address_reason,
+                    reachability_warning: address.and_then(|a| a.warning),
                 },
             );
         }
@@ -5514,6 +5614,9 @@ impl DeploymentService {
             id: db_deployment.environment_id,
             name: "Environment".to_string(),
             slug: "environment".to_string(),
+            primary_url: None,
+            no_address_reason: None,
+            reachability_warning: None,
             domains: vec![],
         });
 
@@ -6174,6 +6277,9 @@ impl DeploymentService {
             id: environment.id,
             name: environment.name,
             slug: environment.slug,
+            primary_url: None,
+            no_address_reason: None,
+            reachability_warning: None,
             domains: vec![], // Could be populated if needed
         };
 
@@ -7201,6 +7307,115 @@ mod environment_link_tests {
         assert_eq!(links, s(&["https://shop-production.apps.example.net"]));
     }
 
+    fn address(
+        primary: Option<(&str, temps_core::environment_address::AddressKind)>,
+        no_address: Option<&str>,
+    ) -> temps_core::environment_address::EnvironmentAddress {
+        temps_core::environment_address::EnvironmentAddress {
+            environment_id: 1,
+            primary: primary.map(
+                |(host, kind)| temps_core::environment_address::PrimaryAddress {
+                    address: host.to_string(),
+                    kind,
+                    way_in: None,
+                },
+            ),
+            no_address_reason: no_address.map(str::to_string),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn the_primary_address_leads_the_links() {
+        use temps_core::environment_address::AddressKind;
+        let generated = "http://shop-production.localho.st:8080";
+        let links = environment_links(
+            generated,
+            "shop-production",
+            &s(&["shop.example.com", "old.example.com"]),
+            &[],
+        );
+
+        // No answer from reachability: the stored order, as before.
+        let kept = primary_first(links.clone(), generated, None);
+        assert_eq!(kept.domains, links);
+        assert_eq!(kept.primary_url, None);
+
+        // A reachable custom domain that is not first moves to the front.
+        let ordered = primary_first(
+            links.clone(),
+            generated,
+            Some(&address(
+                Some(("old.example.com", AddressKind::CustomDomain)),
+                None,
+            )),
+        );
+        assert_eq!(
+            ordered.domains,
+            s(&[
+                "http://old.example.com:8080",
+                "http://shop.example.com:8080",
+                generated,
+            ])
+        );
+        assert_eq!(
+            ordered.primary_url.as_deref(),
+            Some("http://old.example.com:8080")
+        );
+
+        // A tunnel host is not among the stored links and is served on https.
+        let ordered = primary_first(
+            links.clone(),
+            generated,
+            Some(&address(
+                Some(("shop-production.example.org", AddressKind::TunnelHost)),
+                None,
+            )),
+        );
+        assert_eq!(ordered.domains[0], "https://shop-production.example.org");
+        assert_eq!(ordered.domains.len(), links.len() + 1);
+
+        // A bound tunnel host is listed on the listener's http; it is still
+        // advertised on https, and only once.
+        let bound = environment_links(
+            generated,
+            "shop-production",
+            &s(&["shop.example.com"]),
+            &s(&["Shop-Production.example.org"]),
+        );
+        assert!(bound.contains(&"http://shop-production.example.org:8080".to_string()));
+        let ordered = primary_first(
+            bound.clone(),
+            generated,
+            Some(&address(
+                Some(("shop-production.example.org", AddressKind::TunnelHost)),
+                None,
+            )),
+        );
+        assert_eq!(
+            ordered.primary_url.as_deref(),
+            Some("https://shop-production.example.org")
+        );
+        assert_eq!(ordered.domains[0], "https://shop-production.example.org");
+        assert_eq!(ordered.domains.len(), bound.len());
+        assert!(!ordered
+            .domains
+            .contains(&"http://shop-production.example.org:8080".to_string()));
+
+        // Nobody can reach it: the links stay, the reason is reported.
+        let none = primary_first(
+            links.clone(),
+            generated,
+            Some(&address(None, Some("only resolves to this computer"))),
+        );
+        assert_eq!(none.domains, links);
+        assert_eq!(none.primary_url, None);
+        assert_eq!(
+            none.no_address_reason.as_deref(),
+            Some("only resolves to this computer")
+        );
+    }
+
     #[test]
     fn a_domain_listed_in_both_tables_appears_once() {
         let links = environment_links(
@@ -8196,6 +8411,7 @@ mod tests {
             image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
+            environment_addresses: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
@@ -8282,6 +8498,7 @@ mod tests {
             image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
+            environment_addresses: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),
@@ -10634,6 +10851,7 @@ mod tests {
             image_builder: Arc::new(NoopImageBuilder),
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
+            environment_addresses: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
             compose_executor: std::sync::OnceLock::new(),
             audit_logger: std::sync::OnceLock::new(),

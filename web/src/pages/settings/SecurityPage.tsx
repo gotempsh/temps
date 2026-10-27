@@ -4,9 +4,11 @@
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
+import { validateLoopbackJa4Header } from '@/lib/loopback-ja4-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
@@ -28,6 +30,8 @@ interface SecurityFormData {
   security_headers: SecurityHeadersType
   rate_limiting: RateLimitType
   trust_loopback_forwarded_ip: boolean
+  /** Blank means none; sent as null. */
+  loopback_ja4_header: string
   /** One network per line; split into `trusted_private_networks` on save. */
   trusted_private_networks_text: string
 }
@@ -48,7 +52,7 @@ export function SecurityPage() {
     register,
     handleSubmit,
     control,
-    formState: { isDirty, isSubmitting },
+    formState: { errors, isDirty, isSubmitting },
     reset,
     setValue,
   } = useForm<SecurityFormData>({
@@ -72,6 +76,7 @@ export function SecurityPage() {
         blacklist_ips: [],
       },
       trust_loopback_forwarded_ip: false,
+      loopback_ja4_header: '',
       trusted_private_networks_text: '',
     },
   })
@@ -92,49 +97,58 @@ export function SecurityPage() {
 
   usePageTitle('Security')
 
+  // A refetch updates only the fields the user has not touched, so unsaved
+  // edits survive it; a save resets the form itself first (onSubmit).
   useEffect(() => {
     if (settings) {
-      reset({
-        security_headers: settings.security_headers || {
-          enabled: true,
-          preset: 'moderate',
-          content_security_policy: null,
-          x_frame_options: 'SAMEORIGIN',
-          x_content_type_options: 'nosniff',
-          x_xss_protection: '1; mode=block',
-          strict_transport_security: 'max-age=31536000; includeSubDomains',
-          referrer_policy: 'strict-origin-when-cross-origin',
-          permissions_policy: null,
+      reset(
+        {
+          security_headers: settings.security_headers || {
+            enabled: true,
+            preset: 'moderate',
+            content_security_policy: null,
+            x_frame_options: 'SAMEORIGIN',
+            x_content_type_options: 'nosniff',
+            x_xss_protection: '1; mode=block',
+            strict_transport_security: 'max-age=31536000; includeSubDomains',
+            referrer_policy: 'strict-origin-when-cross-origin',
+            permissions_policy: null,
+          },
+          rate_limiting: settings.rate_limiting || {
+            enabled: false,
+            max_requests_per_minute: 60,
+            max_requests_per_hour: 1000,
+            whitelist_ips: [],
+            blacklist_ips: [],
+          },
+          trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
+          loopback_ja4_header: settings.loopback_ja4_header ?? '',
+          trusted_private_networks_text: (
+            settings.trusted_private_networks ?? []
+          ).join('\n'),
         },
-        rate_limiting: settings.rate_limiting || {
-          enabled: false,
-          max_requests_per_minute: 60,
-          max_requests_per_hour: 1000,
-          whitelist_ips: [],
-          blacklist_ips: [],
-        },
-        trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
-        trusted_private_networks_text: (
-          settings.trusted_private_networks ?? []
-        ).join('\n'),
-      })
+        { keepDirtyValues: true }
+      )
     }
   }, [settings, reset])
 
   const onSubmit = async (data: SecurityFormData) => {
-    const { trusted_private_networks_text, ...rest } = data
+    const { trusted_private_networks_text, loopback_ja4_header, ...rest } = data
     try {
       const saved = await updateSettings.mutateAsync({
         ...rest,
+        loopback_ja4_header: loopback_ja4_header.trim() || null,
         trusted_private_networks: parseNetworkLines(
           trusted_private_networks_text
         ),
       })
       // The server normalizes entries (bare IPs gain /32, host bits are
-      // cleared); the settings refetch re-runs the reset effect above with
-      // the stored form, so the textarea ends up showing what is enforced.
+      // cleared). Resetting with the saved values leaves nothing dirty, so
+      // the refetch's reset above then shows the stored form everywhere and
+      // the textarea ends up showing what is enforced.
       reset({
         ...data,
+        loopback_ja4_header: saved.loopback_ja4_header ?? '',
         trusted_private_networks_text: (
           saved.trusted_private_networks ?? []
         ).join('\n'),
@@ -195,6 +209,30 @@ export function SecurityPage() {
               the final entry. Otherwise, clients may spoof their IP in
               analytics and IP-based controls. Changes reach proxy processes
               within a few seconds.
+            </p>
+            <Label htmlFor="loopback-ja4-header">
+              JA4 fingerprint header (optional)
+            </Label>
+            <Input
+              id="loopback-ja4-header"
+              className="font-mono text-sm"
+              placeholder="x-ja4"
+              aria-invalid={errors.loopback_ja4_header ? true : undefined}
+              {...register('loopback_ja4_header', {
+                validate: validateLoopbackJa4Header,
+              })}
+            />
+            {errors.loopback_ja4_header && (
+              <p className="text-xs text-destructive">
+                {errors.loopback_ja4_header.message}
+              </p>
+            )}
+            <p className="text-sm text-muted-foreground">
+              Your reverse proxy ends TLS, so Temps cannot fingerprint the
+              visitor itself. If the proxy computes the visitor&apos;s JA4 and
+              overwrites a header with it, name that header here; the name must
+              contain &quot;ja4&quot;. Temps reads it only from the trusted
+              loopback proxy and removes it before requests reach your apps.
             </p>
           </div>
         </SettingsSection>

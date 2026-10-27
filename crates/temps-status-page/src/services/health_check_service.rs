@@ -11,13 +11,17 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_config::ConfigService;
+use temps_core::environment_address::{
+    https_url, AddressKind, EnvironmentAddress, EnvironmentAddressSlot, EnvironmentAddresses,
+};
 use temps_core::log_transitions::{FailureLog, KeyedFailureLatch};
 use temps_core::url_validation::{
     resolve_and_validate_domain, validate_outbound_ip, UrlValidationError,
 };
 use temps_core::{Job, JobQueue, JobReceiver, QueueError, StatusCheckCompletedJob};
 use temps_entities::{
-    deployment_containers, deployments, environments, projects, status_checks, status_monitors,
+    cloudflare_access_providers, deployment_containers, deployments, environment_domains,
+    environments, project_custom_domains, projects, status_checks, status_monitors,
 };
 use tokio::time::{sleep, timeout};
 use tracing::{debug, error, info, warn};
@@ -266,6 +270,137 @@ fn local_listener_for_url<'a>(
 const PROXY_HTTPS_REDIRECT_HEADER: &str = "x-temps-proxy-https-redirect";
 const PROXY_PROBE_CAPABILITY_HEADER: &str = "x-temps-proxy-probe-capable";
 
+/// Where a probe's answer came from, which decides what in it is evidence
+/// of the gate (ADR 065 D10).
+#[derive(Debug, Clone, Copy)]
+enum ProbeOrigin<'a> {
+    /// Through this server's own proxy, which drops `x-temps-gate` from
+    /// every app response: the header can only be the gate's.
+    LocalProxy,
+    /// Straight to the public address. Anything may answer there, so the
+    /// header proves nothing; only a redirect to the sign-in of the
+    /// Cloudflare Access team the address is bound to counts.
+    Direct { access_team: Option<&'a str> },
+}
+
+/// What a monitor reports when the address it checks is behind sign-in
+/// (ADR 065 D10): the gate answered, so the address is up, but the app's
+/// own health is out of the monitor's sight.
+///
+/// Through the local proxy, only an answer that is the gate doing its job
+/// counts: the Temps sign-in or a Cloudflare Access refusal at the origin.
+/// `unavailable` means the gate itself cannot run, so the address is down,
+/// and an unknown value is not trusted either.
+fn sign_in_note(
+    origin: ProbeOrigin<'_>,
+    status: u16,
+    gate_header: Option<&str>,
+    location: Option<&str>,
+) -> Option<String> {
+    let gated = match origin {
+        ProbeOrigin::LocalProxy => gate_header.is_some_and(|value| {
+            value.eq_ignore_ascii_case(temps_core::gate::GATE_SIGN_IN)
+                || value.eq_ignore_ascii_case(temps_core::gate::GATE_ACCESS)
+        }),
+        ProbeOrigin::Direct { access_team } => {
+            matches!(status, 302 | 303)
+                && access_team
+                    .is_some_and(|team| temps_core::gate_access::is_team_sign_in(location, team))
+        }
+    };
+    gated.then(|| {
+        "Behind sign-in: this address only lets in people who sign in, so the monitor sees \
+         the sign-in, not the app. Temps offers no way past it. Container health checks \
+         (restarts, out-of-memory kills, exits) watch the app itself."
+            .to_string()
+    })
+}
+
+/// [`sign_in_note`] for an answer that came through this server's own proxy:
+/// the first answer of a local probe, and the answer to its HTTPS follow-up,
+/// where a Cloudflare Access refusal at the origin shows up when the address
+/// forces HTTPS.
+fn local_sign_in_note(response: &reqwest::Response) -> Option<String> {
+    sign_in_note(
+        ProbeOrigin::LocalProxy,
+        response.status().as_u16(),
+        response
+            .headers()
+            .get(temps_core::gate::GATE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok()),
+    )
+}
+
+/// The team of the Cloudflare Access account the address a direct probe
+/// asked for is bound to, looked up only when the answer redirects to some
+/// Access sign-in: every other direct answer needs no lookup.
+async fn direct_access_team(
+    db: &DatabaseConnection,
+    monitor_id: i32,
+    url: &str,
+    status: u16,
+    location: Option<&str>,
+) -> Option<String> {
+    if !matches!(status, 302 | 303)
+        || !location.is_some_and(|l| l.contains(temps_core::gate_access::TEAM_DOMAIN_SUFFIX))
+    {
+        return None;
+    }
+    let host = reqwest::Url::parse(url)
+        .ok()?
+        .host_str()?
+        .to_ascii_lowercase();
+    match access_team_of_host(db, &host).await {
+        Ok(team) => team,
+        Err(error) => {
+            warn!(
+                monitor_id,
+                host = %host,
+                %error,
+                "Could not read the Cloudflare Access account of the probed address"
+            );
+            None
+        }
+    }
+}
+
+/// The team domain of the Cloudflare Access account `host` is bound to, when
+/// it is a signed-in address behind Access.
+async fn access_team_of_host(
+    db: &DatabaseConnection,
+    host: &str,
+) -> Result<Option<String>, sea_orm::DbErr> {
+    use temps_entities::audience::{GATE_CLOUDFLARE_ACCESS, SIGNED_IN};
+    let custom = project_custom_domains::Entity::find()
+        .filter(project_custom_domains::Column::Domain.eq(host))
+        .filter(project_custom_domains::Column::Audience.eq(SIGNED_IN))
+        .filter(project_custom_domains::Column::Gate.eq(GATE_CLOUDFLARE_ACCESS))
+        .one(db)
+        .await?
+        .and_then(|d| d.gate_access_provider_id);
+    let provider_id = match custom {
+        Some(id) => Some(id),
+        None => environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.eq(host))
+            .filter(environment_domains::Column::Audience.eq(SIGNED_IN))
+            .filter(environment_domains::Column::Gate.eq(GATE_CLOUDFLARE_ACCESS))
+            .one(db)
+            .await?
+            .and_then(|d| d.gate_access_provider_id),
+    };
+    let Some(provider_id) = provider_id else {
+        return Ok(None);
+    };
+    Ok(cloudflare_access_providers::Entity::find_by_id(provider_id)
+        .one(db)
+        .await?
+        .map(|p| p.team_domain))
+}
+
 fn proxy_supports_probe_markers(response: &reqwest::Response) -> bool {
     response
         .headers()
@@ -370,6 +505,10 @@ fn report_check_outcome(
     status: &str,
     error_message: Option<&str>,
 ) -> Option<FailureLog> {
+    if status == NO_ADDRESS_STATUS {
+        // Nothing was probed (ADR 068 D4): neither a failure nor a recovery.
+        return None;
+    }
     if status == "operational" {
         if let Some(failures) = latch.record_success(&monitor_id) {
             info!(
@@ -449,6 +588,25 @@ pub struct HealthCheckService {
     http_client: reqwest::Client,
     config_service: Arc<ConfigService>,
     job_queue: Arc<dyn JobQueue>,
+    /// ADR 068 D4: which address to probe, if any. Empty without the
+    /// ingress plugin, where every monitor probes as before.
+    environment_addresses: Option<Arc<EnvironmentAddressSlot>>,
+}
+
+/// What a monitor records when its environment has no address anyone can
+/// reach (ADR 068 D4): it does not probe, and it is never `down`.
+pub const NO_ADDRESS_STATUS: &str = temps_core::environment_address::NO_ADDRESS_CHECK_STATUS;
+pub const NO_ADDRESS_MESSAGE: &str = "Nothing to check: nobody can reach this environment yet";
+
+/// The URL a monitor probes for the environment's primary address, and
+/// whether it is a public address to dial (not the local proxy). `None`
+/// keeps today's URL: the generated host, a private address, or no answer.
+fn primary_probe_url(address: Option<&EnvironmentAddress>) -> Option<String> {
+    let primary = address?.primary.as_ref()?;
+    match primary.kind {
+        AddressKind::CustomDomain | AddressKind::TunnelHost => Some(https_url(&primary.address)),
+        AddressKind::Generated | AddressKind::Private => None,
+    }
 }
 
 impl HealthCheckService {
@@ -481,7 +639,18 @@ impl HealthCheckService {
             http_client,
             config_service,
             job_queue,
+            environment_addresses: None,
         })
+    }
+
+    /// Probe each environment's primary address (ADR 068 D4).
+    pub fn with_environment_addresses(mut self, slot: Arc<EnvironmentAddressSlot>) -> Self {
+        self.environment_addresses = Some(slot);
+        self
+    }
+
+    fn addresses(&self) -> Option<Arc<dyn EnvironmentAddresses>> {
+        self.environment_addresses.as_ref().and_then(|s| s.get())
     }
 
     /// Resolve a monitor's configured interval into the value the scheduler
@@ -664,6 +833,7 @@ impl HealthCheckService {
             let db = self.db.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
+            let addresses = self.addresses();
             let permit = match semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
                 Err(error) => {
@@ -678,7 +848,9 @@ impl HealthCheckService {
             let monitor_id = monitor.id;
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
-                match Self::check_monitor(db, config_service, monitor, job_queue).await {
+                match Self::check_monitor_with(db, config_service, monitor, job_queue, addresses)
+                    .await
+                {
                     Ok(()) => {
                         if MONITOR_CHECK_ERRORS.record_success(&monitor_id).is_some() {
                             info!(monitor_id, "Monitor can be checked again");
@@ -729,11 +901,12 @@ impl HealthCheckService {
             // probe still consumes the monitor's slot, so push the due time
             // out before running it.
             Self::schedule_next_check(self.db.as_ref(), &monitor).await;
-            Self::check_monitor(
+            Self::check_monitor_with(
                 self.db.clone(),
                 self.config_service.clone(),
                 monitor,
                 self.job_queue.clone(),
+                self.addresses(),
             )
             .await?;
         }
@@ -741,12 +914,24 @@ impl HealthCheckService {
         Ok(monitor_count)
     }
 
-    /// Check a single monitor
+    /// Check a single monitor, without knowing environment addresses.
+    #[cfg(test)]
     async fn check_monitor(
         db: Arc<DatabaseConnection>,
         config_service: Arc<ConfigService>,
         monitor: status_monitors::Model,
         job_queue: Arc<dyn JobQueue>,
+    ) -> Result<(), StatusPageError> {
+        Self::check_monitor_with(db, config_service, monitor, job_queue, None).await
+    }
+
+    /// Check a single monitor
+    async fn check_monitor_with(
+        db: Arc<DatabaseConnection>,
+        config_service: Arc<ConfigService>,
+        monitor: status_monitors::Model,
+        job_queue: Arc<dyn JobQueue>,
+        addresses: Option<Arc<dyn EnvironmentAddresses>>,
     ) -> Result<(), StatusPageError> {
         // NOTE: the monitor's slot is claimed by the *caller*, before this is
         // dispatched — `run_all_checks` via `claim_due_monitor` (a CAS that
@@ -852,12 +1037,42 @@ impl HealthCheckService {
             monitor_updated_at: monitor.updated_at,
         };
 
+        // ADR 068 D4: probe the environment's primary address when it has a
+        // reachable one; otherwise probe exactly as before. `no_address` only
+        // replaces the one failure that means nothing was ever set up: the
+        // target hostname does not resolve and the environment has no
+        // address at all. Without an answer, probe as before.
+        let address = match &addresses {
+            Some(addresses) => match addresses.address(environment.project_id, env_id).await {
+                Ok(address) => Some(address),
+                Err(error) => {
+                    warn!(
+                        monitor_id = monitor.id,
+                        environment_id = env_id,
+                        %error,
+                        "Could not tell the primary address; probing the generated URL"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let no_address = address
+            .as_ref()
+            .is_some_and(EnvironmentAddress::has_no_address);
+        let primary_url = primary_probe_url(address.as_ref());
+
         // IMPORTANT: Always use the public URL for health checks
         // This ensures we're testing the actual user-facing endpoint, not internal container networking
-        let (health_url, uses_external_url) = match config_service
-            .get_deployment_url_by_slug_with_source(&environment.subdomain)
-            .await
-        {
+        let public_url = match primary_url {
+            Some(url) => Ok((url, true)),
+            None => {
+                config_service
+                    .get_deployment_url_by_slug_with_source(&environment.subdomain)
+                    .await
+            }
+        };
+        let (health_url, uses_external_url) = match public_url {
             Ok((public_url, uses_external_url)) => {
                 debug!("Using public URL for health check: {}", public_url);
                 // Use custom check_path if set, otherwise fall back to monitor_type logic.
@@ -882,8 +1097,9 @@ impl HealthCheckService {
                 (health_url, uses_external_url)
             }
             Err(e) => {
+                let e = format!("{e:?}");
                 error!(
-                    "Failed to get public URL for deployment {}: {:?}",
+                    "Failed to get public URL for deployment {}: {}",
                     environment.subdomain, e
                 );
 
@@ -893,7 +1109,7 @@ impl HealthCheckService {
                     probe.clone(),
                     "degraded".to_string(),
                     None,
-                    Some(format!("Failed to determine public URL: {:?}", e)),
+                    Some(format!("Failed to determine public URL: {e}")),
                     &job_queue,
                 )
                 .await?;
@@ -922,15 +1138,29 @@ impl HealthCheckService {
                     );
                 }
                 Ok(PublicProbeTarget::Unresolved(reason)) => {
-                    Self::record_check(
-                        &db,
-                        probe.clone(),
-                        "major_outage".to_string(),
-                        None,
-                        Some(format!("DNS resolution failed: {reason}")),
-                        &job_queue,
-                    )
-                    .await?;
+                    // A name that does not resolve for an environment nobody
+                    // was ever given a way into is not an outage: there is
+                    // nothing to check yet. Any address that was once set up
+                    // keeps the outage.
+                    let (status, message) = if no_address {
+                        debug!(
+                            monitor_id = monitor.id,
+                            environment_id = env_id,
+                            %reason,
+                            "Health URL does not resolve and the environment has no address"
+                        );
+                        (
+                            NO_ADDRESS_STATUS.to_string(),
+                            NO_ADDRESS_MESSAGE.to_string(),
+                        )
+                    } else {
+                        (
+                            "major_outage".to_string(),
+                            format!("DNS resolution failed: {reason}"),
+                        )
+                    };
+                    Self::record_check(&db, probe.clone(), status, None, Some(message), &job_queue)
+                        .await?;
                     return Ok(());
                 }
                 Err(error) => {
@@ -1034,6 +1264,40 @@ impl HealthCheckService {
 
             match check_result {
                 Ok(Ok(response)) => {
+                    // ADR 065 D10: a signed-in address answers with its
+                    // gate, never the app, and Temps offers no way past it.
+                    let status = response.status().as_u16();
+                    let location = response
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|value| value.to_str().ok());
+                    let gate_header = response
+                        .headers()
+                        .get(temps_core::gate::GATE_HEADER)
+                        .and_then(|value| value.to_str().ok());
+                    let access_team = if is_local_probe {
+                        None
+                    } else {
+                        direct_access_team(&db, monitor.id, &health_url, status, location).await
+                    };
+                    let origin = if is_local_probe {
+                        ProbeOrigin::LocalProxy
+                    } else {
+                        ProbeOrigin::Direct {
+                            access_team: access_team.as_deref(),
+                        }
+                    };
+                    if let Some(note) = sign_in_note(origin, status, gate_header, location) {
+                        return Self::record_check(
+                            &db,
+                            probe.clone(),
+                            "operational".to_string(),
+                            Some(total_response_time_ms),
+                            Some(note),
+                            &job_queue,
+                        )
+                        .await;
+                    }
                     // The HTTP proxy can emit its force-HTTPS redirect before
                     // resolving or contacting the application. Counting that
                     // response as healthy would let a dead upstream look
@@ -1119,6 +1383,22 @@ impl HealthCheckService {
                     } else {
                         response
                     };
+
+                    // The follow-up came through the local proxy too, so its
+                    // gate answer counts the same way as the first one's.
+                    if is_local_probe {
+                        if let Some(note) = local_sign_in_note(&response) {
+                            return Self::record_check(
+                                &db,
+                                probe.clone(),
+                                "operational".to_string(),
+                                Some(total_response_time_ms),
+                                Some(note),
+                                &job_queue,
+                            )
+                            .await;
+                        }
+                    }
 
                     if is_local_probe
                         && response.status().is_redirection()
@@ -1602,11 +1882,12 @@ impl HealthCheckService {
                                 // claim the slot before probing so the sweep
                                 // does not immediately re-probe this monitor.
                                 Self::schedule_next_check(service.db.as_ref(), &monitor).await;
-                                if let Err(e) = Self::check_monitor(
+                                if let Err(e) = Self::check_monitor_with(
                                     service.db.clone(),
                                     service.config_service.clone(),
                                     monitor,
                                     service.job_queue.clone(),
+                                    service.addresses(),
                                 )
                                 .await
                                 {
@@ -1756,6 +2037,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_gated_answer_is_reported_behind_sign_in() {
+        let local = |header| sign_in_note(ProbeOrigin::LocalProxy, 302, header, None);
+        assert!(local(Some("sign-in")).is_some_and(|note| note.starts_with("Behind sign-in")));
+        assert!(sign_in_note(ProbeOrigin::LocalProxy, 403, Some("access"), None).is_some());
+        assert!(local(None).is_none());
+    }
+
+    /// A gate that cannot run is an outage, not "behind sign-in", and a
+    /// value the gate never sends is not taken for it.
+    #[test]
+    fn an_unavailable_gate_is_not_reported_behind_sign_in() {
+        let local = |header| sign_in_note(ProbeOrigin::LocalProxy, 503, header, None);
+        assert!(local(Some(temps_core::gate::GATE_UNAVAILABLE)).is_none());
+        assert!(local(Some("anything-else")).is_none());
+        assert!(local(Some("")).is_none());
+    }
+
+    /// A direct probe reaches whatever answers at the public address, so a
+    /// gate header there proves nothing: an app failing with
+    /// `x-temps-gate: access` stays an outage.
+    #[test]
+    fn a_direct_probe_does_not_trust_the_gate_header() {
+        let direct = ProbeOrigin::Direct {
+            access_team: Some("team.cloudflareaccess.com"),
+        };
+        for header in ["access", "sign-in"] {
+            assert!(sign_in_note(direct, 503, Some(header), None).is_none());
+            assert!(sign_in_note(direct, 403, Some(header), None).is_none());
+        }
+        assert!(!HealthCheckService::is_operational_http_status(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ));
+    }
+
+    /// Directly, only a redirect to the sign-in of the address's own Access
+    /// team is the gate.
+    #[test]
+    fn a_direct_probe_recognises_its_own_access_sign_in() {
+        let own = "https://team.cloudflareaccess.com/cdn-cgi/access/login/app.example.com";
+        let other = "https://other.cloudflareaccess.com/cdn-cgi/access/login/app.example.com";
+        let direct = ProbeOrigin::Direct {
+            access_team: Some("team.cloudflareaccess.com"),
+        };
+        assert!(sign_in_note(direct, 302, None, Some(own)).is_some());
+        assert!(sign_in_note(direct, 303, None, Some(own)).is_some());
+        assert!(sign_in_note(direct, 302, None, Some(other)).is_none());
+        assert!(sign_in_note(direct, 200, None, Some(own)).is_none());
+        assert!(
+            sign_in_note(direct, 302, None, Some("http://team.cloudflareaccess.com/")).is_none()
+        );
+        let unbound = ProbeOrigin::Direct { access_team: None };
+        assert!(sign_in_note(unbound, 302, Some("access"), Some(own)).is_none());
+    }
+
+    #[test]
     fn down_monitor_is_logged_on_transitions_only() {
         let latch = KeyedFailureLatch::default();
 
@@ -1800,6 +2136,19 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn spawn_test_tls_server(hostname: &str) -> (SocketAddr, reqwest::Certificate) {
+        spawn_test_tls_server_answering(
+            hostname,
+            b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+    }
+
+    /// A TLS server for `hostname` that answers one `GET /ready` with
+    /// `response`.
+    async fn spawn_test_tls_server_answering(
+        hostname: &str,
+        response: &'static [u8],
+    ) -> (SocketAddr, reqwest::Certificate) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec![hostname.to_string()])
@@ -1835,7 +2184,7 @@ mod tests {
                 String::from_utf8_lossy(&request[..size]).starts_with("GET /ready HTTP/1.1\r\n")
             );
             stream
-                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .write_all(response)
                 .await
                 .expect("write HTTPS response");
         });
@@ -2132,6 +2481,29 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         assert_eq!(attempts, 1);
         assert_eq!(response.url().host_str(), Some(hostname));
+    }
+
+    /// An address that forces HTTPS shows its gate only on the follow-up:
+    /// a Cloudflare Access refusal at the origin, marked by the proxy, comes
+    /// back over the pinned TLS connection and counts as behind sign-in.
+    #[tokio::test]
+    async fn gate_answer_on_the_https_follow_up_is_behind_sign_in() {
+        let hostname = "gated-probe.invalid";
+        let (destination, root) = spawn_test_tls_server_answering(
+            hostname,
+            b"HTTP/1.1 403 Forbidden\r\nX-Temps-Gate: access\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let logical_url = format!("https://{hostname}/ready");
+        let client = local_proxy_client_with_roots(&logical_url, &destination.to_string(), &[root])
+            .expect("build pinned TLS client with test root");
+
+        let (response, _) =
+            send_with_timeout_retries(&client, &logical_url, Duration::from_secs(1))
+                .await
+                .expect("HTTPS follow-up succeeds");
+        assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+        assert!(local_sign_in_note(&response).is_some());
     }
 
     #[tokio::test]
@@ -2676,6 +3048,361 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    /// An environment whose reachability is settled.
+    struct FixedAddress(EnvironmentAddress);
+
+    #[async_trait::async_trait]
+    impl EnvironmentAddresses for FixedAddress {
+        async fn address(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Result<EnvironmentAddress, temps_core::environment_address::EnvironmentAddressError>
+        {
+            Ok(self.0.clone())
+        }
+        fn cached(&self, _environment_id: i32) -> Option<EnvironmentAddress> {
+            Some(self.0.clone())
+        }
+        async fn deployment_completed(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Option<temps_core::environment_address::ReachabilityWarning> {
+            None
+        }
+    }
+
+    fn settled(
+        primary: Option<(&str, AddressKind)>,
+        no_address: Option<&str>,
+    ) -> EnvironmentAddress {
+        EnvironmentAddress {
+            environment_id: 1,
+            primary: primary.map(|(address, kind)| {
+                temps_core::environment_address::PrimaryAddress {
+                    address: address.into(),
+                    kind,
+                    way_in: None,
+                }
+            }),
+            no_address_reason: no_address.map(str::to_string),
+            warning: None,
+        }
+    }
+
+    #[test]
+    fn the_probe_follows_the_primary_address() {
+        // A custom domain or tunnel host is dialled on https.
+        assert_eq!(
+            primary_probe_url(Some(&settled(
+                Some(("app.example.com", AddressKind::CustomDomain)),
+                None
+            )))
+            .as_deref(),
+            Some("https://app.example.com")
+        );
+        assert_eq!(
+            primary_probe_url(Some(&settled(
+                Some(("app-production.example.org", AddressKind::TunnelHost)),
+                None
+            )))
+            .as_deref(),
+            Some("https://app-production.example.org")
+        );
+        // The generated host and private addresses keep today's URL and
+        // routing, as does no answer at all.
+        for kind in [AddressKind::Generated, AddressKind::Private] {
+            assert_eq!(
+                primary_probe_url(Some(&settled(Some(("x.example.dev", kind)), None))),
+                None
+            );
+        }
+        assert_eq!(primary_probe_url(None), None);
+        assert!(report_check_outcome(
+            &KeyedFailureLatch::default(),
+            1,
+            NO_ADDRESS_STATUS,
+            Some(NO_ADDRESS_MESSAGE)
+        )
+        .is_none());
+    }
+
+    struct ExpectStatus(&'static str);
+    #[async_trait::async_trait]
+    impl JobQueue for ExpectStatus {
+        async fn send(&self, job: Job) -> Result<(), QueueError> {
+            match job {
+                Job::StatusCheckCompleted(job) => assert_eq!(job.status, self.0, "{job:?}"),
+                _ => panic!("only the check is emitted"),
+            }
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn JobReceiver> {
+            panic!("not used")
+        }
+    }
+
+    fn settings_row(settings: temps_core::AppSettings) -> temps_entities::settings::Model {
+        let now = Utc::now();
+        temps_entities::settings::Model {
+            id: 1,
+            data: settings.to_json(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The rows `persist_check_if_current` reads and writes for `status`.
+    fn persisted_check(
+        db: sea_orm::MockDatabase,
+        monitor: &status_monitors::Model,
+        status: &str,
+    ) -> sea_orm::MockDatabase {
+        let now = Utc::now();
+        db.append_query_results([vec![monitor.clone()]])
+            .append_query_results([vec![make_env(1, false)]])
+            .append_query_results([vec![health_probe_deployment()]])
+            .append_query_results([vec![monitor.clone()]])
+            .append_query_results([vec![status_checks::Model {
+                id: 1,
+                monitor_id: monitor.id,
+                status: status.into(),
+                checked_at: now,
+                created_at: now,
+                response_time_ms: None,
+                error_message: None,
+            }]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+    }
+
+    #[tokio::test]
+    async fn a_managed_monitor_without_a_public_address_probes_through_the_local_proxy() {
+        probe_on_a_local_install(true).await;
+    }
+
+    #[tokio::test]
+    async fn a_monitor_created_by_hand_without_a_public_address_probes_through_the_local_proxy() {
+        // Not managed, so the probe dials the public name first. It resolves
+        // to this computer, which is not public, so the probe falls back to
+        // the local proxy as before ADR 068 -- never to `no_address`.
+        if tokio::net::lookup_host("proj-env-1.localho.st:80")
+            .await
+            .is_err()
+        {
+            println!("proj-env-1.localho.st does not resolve here, skipping");
+            return;
+        }
+        probe_on_a_local_install(false).await;
+    }
+
+    /// A plain local install: the preview domain is `localho.st`, so nobody
+    /// else can reach the app, but Temps' own proxy serves it. The monitor
+    /// probes there and reports the app's health, as it did before ADR 068.
+    async fn probe_on_a_local_install(is_managed: bool) {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local proxy listener");
+        let proxy_address = listener.local_addr().expect("read proxy address");
+        let proxy = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept the probe");
+            let mut request = [0_u8; 2048];
+            let size = stream.read(&mut request).await.expect("read the probe");
+            let request = String::from_utf8_lossy(&request[..size]).to_string();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .expect("answer the probe");
+            request
+        });
+        let mut monitor = make_monitor(1, Some(1));
+        monitor.is_managed = is_managed;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![make_env(1, false)]])
+            .append_query_results([vec![health_probe_deployment()]])
+            .append_query_results([vec![health_probe_counts(1, 1)]])
+            .append_query_results([vec![settings_row(temps_core::AppSettings {
+                preview_domain: "localho.st".into(),
+                external_url: None,
+                ..temps_core::AppSettings::default()
+            })]]);
+        let db = Arc::new(persisted_check(db, &monitor, "operational").into_connection());
+        let config = temps_config::ServerConfig::new(
+            proxy_address.to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .expect("build test ServerConfig");
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ));
+        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
+            None,
+            Some("proj-env-1.localho.st only resolves to this computer"),
+        )));
+        HealthCheckService::check_monitor_with(
+            db.clone(),
+            config_service,
+            monitor,
+            Arc::new(ExpectStatus("operational")),
+            Some(addresses),
+        )
+        .await
+        .expect("the check is recorded");
+        let request = proxy.await.expect("the local proxy was probed");
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("host: proj-env-1.localho.st"),
+            "{request}"
+        );
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("one owner")
+                .into_transaction_log()
+        );
+        assert!(log.contains("operational"), "{log}");
+        assert!(!log.contains(NO_ADDRESS_STATUS), "{log}");
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_name_with_nothing_set_up_records_no_address() {
+        // The probe goes where it always went: out over the public internet
+        // for a monitor created by hand, or for a managed one behind an
+        // external URL. The name does not resolve (`.invalid` never does,
+        // RFC 6761) and the environment was never given an address, so the
+        // failure is `no_address` rather than an outage.
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (is_managed, external_url) in [
+            (false, None),
+            (true, Some("https://temps.example.invalid".to_string())),
+        ] {
+            let mut monitor = make_monitor(1, Some(1));
+            monitor.is_managed = is_managed;
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 1)]])
+                .append_query_results([vec![settings_row(temps_core::AppSettings {
+                    preview_domain: "apps.example.invalid".into(),
+                    external_url,
+                    ..temps_core::AppSettings::default()
+                })]]);
+            let db = Arc::new(persisted_check(db, &monitor, NO_ADDRESS_STATUS).into_connection());
+            let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(
+                None,
+                Some("proj-env-1.apps.example.invalid does not resolve"),
+            )));
+            HealthCheckService::check_monitor_with(
+                db.clone(),
+                test_config_service(&db, "postgres://localhost/test"),
+                monitor,
+                Arc::new(ExpectStatus(NO_ADDRESS_STATUS)),
+                Some(addresses),
+            )
+            .await
+            .expect("no_address is recorded");
+            let log = format!(
+                "{:?}",
+                Arc::try_unwrap(db)
+                    .expect("one owner")
+                    .into_transaction_log()
+            );
+            assert!(log.contains("no_address"), "managed={is_managed}: {log}");
+        }
+    }
+
+    #[tokio::test]
+    async fn health_probe_of_a_broken_way_in_records_an_outage_not_no_address() {
+        // ADR 068 D4: the primary was a tunnel host and the tunnel is now in
+        // error. Reachability gives no primary and no `no_address` reason --
+        // a way in was set up and broke -- so the monitor probes the
+        // generated URL as before and records the outage.
+        use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+        struct ExpectOutage;
+        #[async_trait::async_trait]
+        impl JobQueue for ExpectOutage {
+            async fn send(&self, job: Job) -> Result<(), QueueError> {
+                match job {
+                    Job::StatusCheckCompleted(job) => {
+                        assert_eq!(job.status, "major_outage");
+                        assert_ne!(job.error_message.as_deref(), Some(NO_ADDRESS_MESSAGE));
+                    }
+                    _ => panic!("only the outage check is emitted"),
+                }
+                Ok(())
+            }
+            fn subscribe(&self) -> Box<dyn JobReceiver> {
+                panic!("not used")
+            }
+        }
+        let monitor = make_monitor(1, Some(1));
+        let now = Utc::now();
+        // `.invalid` never resolves (RFC 6761), so the probe fails without
+        // reaching any network.
+        let settings = temps_entities::settings::Model {
+            id: 1,
+            data: temps_core::AppSettings {
+                preview_domain: "apps.example.invalid".into(),
+                ..temps_core::AppSettings::default()
+            }
+            .to_json(),
+            created_at: now,
+            updated_at: now,
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![health_probe_counts(1, 1)]])
+                .append_query_results([vec![settings]])
+                // persist_check_if_current
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![make_env(1, false)]])
+                .append_query_results([vec![health_probe_deployment()]])
+                .append_query_results([vec![monitor.clone()]])
+                .append_query_results([vec![status_checks::Model {
+                    id: 1,
+                    monitor_id: 1,
+                    status: "major_outage".into(),
+                    checked_at: now,
+                    created_at: now,
+                    response_time_ms: None,
+                    error_message: Some("DNS resolution failed".into()),
+                }]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let addresses: Arc<dyn EnvironmentAddresses> = Arc::new(FixedAddress(settled(None, None)));
+        HealthCheckService::check_monitor_with(
+            db.clone(),
+            test_config_service(&db, "postgres://localhost/test"),
+            monitor,
+            Arc::new(ExpectOutage),
+            Some(addresses),
+        )
+        .await
+        .expect("the outage is recorded");
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("one owner")
+                .into_transaction_log()
+        );
+        assert!(log.contains("major_outage"), "{log}");
+        assert!(!log.contains(NO_ADDRESS_STATUS), "{log}");
     }
 
     struct RejectHealthProbeJobs;

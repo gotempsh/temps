@@ -253,6 +253,8 @@ export interface PlatformSettings extends AppSettingsResponse {
   rate_limiting: RateLimitSettings
   /** Database-backed proxy forwarded-IP trust opt-in. */
   trust_loopback_forwarded_ip: boolean
+  /** Header a trusted loopback proxy sends the visitor's JA4 in; null = none. */
+  loopback_ja4_header?: string | null
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
@@ -373,6 +375,7 @@ export function buildPlatformSettingsUpdateBody(
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
     trust_loopback_forwarded_ip: updated.trust_loopback_forwarded_ip,
+    loopback_ja4_header: updated.loopback_ja4_header ?? null,
     // Edited on the Security page; the server also preserves an omitted
     // value, but the page's own save must carry it to take effect.
     trusted_private_networks: updated.trusted_private_networks,

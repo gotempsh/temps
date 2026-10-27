@@ -188,6 +188,17 @@ describe('projectHealthIndicator', () => {
     expect(indicator.detail).not.toContain('failing')
   })
 
+  test('a monitor with nothing to check is grey, never down', () => {
+    const indicator = projectHealthIndicator({
+      health: summary({ status: 'unknown', total_requests: 0 }),
+      monitor: { status: 'no_address' },
+    })
+    expect(indicator).toMatchObject({ tone: 'idle', label: 'Nothing to check' })
+    expect(indicator.detail).toContain(
+      'nobody can reach this environment yet'
+    )
+  })
+
   test('falls back to traffic when the project has no monitors', () => {
     expect(
       projectHealthIndicator({

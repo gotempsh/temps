@@ -14,12 +14,141 @@ use temps_query::{
 };
 use tracing::{debug, error, warn};
 
+/// Every user database, by name.
+const DATABASE_NAMES_QUERY: &str = r#"
+    SELECT SCHEMA_NAME
+    FROM information_schema.SCHEMATA
+    WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+    ORDER BY SCHEMA_NAME
+"#;
+
+/// Table count and on-disk size (data + indexes) of every user database that
+/// has tables.
+///
+/// Read separately from [`DATABASE_NAMES_QUERY`] and merged, not as one
+/// `SCHEMATA LEFT JOIN TABLES`: that join opens every table of every schema
+/// once per schema, which costs ~120 temporary tables and ~75 commits on a
+/// small server and grows with the schema count.
+const DATABASE_SIZES_QUERY: &str = r#"
+    SELECT TABLE_SCHEMA,
+           COUNT(*) AS table_count,
+           CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
+    FROM information_schema.TABLES
+    WHERE TABLE_TYPE = 'BASE TABLE'
+      AND TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+    GROUP BY TABLE_SCHEMA
+"#;
+
+/// On-disk size and table count of one database.
+const DATABASE_SIZE_QUERY: &str = r#"
+    SELECT COUNT(TABLE_NAME) AS table_count,
+           CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
+    FROM information_schema.TABLES
+    WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
+"#;
+
+/// Container metadata for a database's size, under the keys the data browser
+/// renders (`size_bytes`, `entity_count`) — the same ones Postgres reports.
+fn database_size_metadata(
+    size_bytes: Option<u64>,
+    table_count: Option<i64>,
+) -> HashMap<String, serde_json::Value> {
+    let mut metadata = HashMap::new();
+    if let Some(size) = size_bytes {
+        metadata.insert("size_bytes".to_string(), serde_json::json!(size));
+    }
+    if let Some(count) = table_count {
+        metadata.insert("entity_count".to_string(), serde_json::json!(count));
+    }
+    metadata
+}
+
+/// Ceiling on the optional size read, enforced by the server and, as a
+/// backstop, by a client-side deadline slightly past it.
+const DATABASE_SIZES_TIMEOUT_MS: u64 = 5_000;
+
+/// Table count and size of `name` from the grouped size read.
+///
+/// `sizes` is `None` when that read failed, so the numbers are unknown. When
+/// it succeeded, a database with no row has no tables: it is empty, not
+/// unknown, and shows as 0 tables / 0 bytes.
+fn database_size(
+    sizes: Option<&HashMap<String, (i64, u64)>>,
+    name: &str,
+) -> (Option<i64>, Option<u64>) {
+    match sizes {
+        None => (None, None),
+        Some(sizes) => match sizes.get(name) {
+            Some((tables, size)) => (Some(*tables), Some(*size)),
+            None => (Some(0), Some(0)),
+        },
+    }
+}
+
 pub struct MariaDbSource {
     pool: MySqlPool,
     database_name: String,
 }
 
 impl MariaDbSource {
+    /// Table count and size per database, or `None` when they cannot be read
+    /// within [`DATABASE_SIZES_TIMEOUT_MS`].
+    ///
+    /// The read scans every visible base table, so it must not delay or fail
+    /// the database list it decorates: it runs only once a server-side
+    /// ceiling is in place on the same connection, and any failure just means
+    /// the list is returned without sizes.
+    async fn read_database_sizes(&self) -> Option<HashMap<String, (i64, u64)>> {
+        let mut conn = match self.pool.acquire().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                warn!(
+                    database = %self.database_name,
+                    "Failed to acquire a MariaDB connection for database sizes: {}", e
+                );
+                return None;
+            }
+        };
+        if !apply_statement_timeout(&mut conn, DATABASE_SIZES_TIMEOUT_MS, &self.database_name).await
+        {
+            return None;
+        }
+        let deadline = std::time::Duration::from_millis(DATABASE_SIZES_TIMEOUT_MS + 1_000);
+        let rows = match tokio::time::timeout(
+            deadline,
+            sqlx::query(DATABASE_SIZES_QUERY).fetch_all(&mut *conn),
+        )
+        .await
+        {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(e)) => {
+                warn!(
+                    database = %self.database_name,
+                    "Failed to read MariaDB database sizes: {}", e
+                );
+                return None;
+            }
+            Err(_) => {
+                warn!(
+                    database = %self.database_name,
+                    "Reading MariaDB database sizes exceeded {} ms; listing databases without sizes",
+                    deadline.as_millis()
+                );
+                return None;
+            }
+        };
+        Some(
+            rows.iter()
+                .filter_map(|row| {
+                    let schema = row.try_get::<String, _>("TABLE_SCHEMA").ok()?;
+                    let tables = row.try_get::<i64, _>("table_count").ok()?;
+                    let size = row.try_get::<u64, _>("size_bytes").ok()?;
+                    Some((schema, (tables, size)))
+                })
+                .collect(),
+        )
+    }
+
     /// Above this many estimated rows, report `information_schema.TABLE_ROWS`
     /// rather than running an exact `COUNT(*)`.
     ///
@@ -189,32 +318,34 @@ impl DataSource for MariaDbSource {
     async fn list_containers(&self, path: &ContainerPath) -> Result<Vec<ContainerInfo>> {
         match path.depth() {
             0 => {
-                let rows = sqlx::query(
-                    r#"
-                    SELECT SCHEMA_NAME
-                    FROM information_schema.SCHEMATA
-                    WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-                    ORDER BY SCHEMA_NAME
-                    "#,
-                )
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| DataError::QueryFailed(format!("Failed to list databases: {}", e)))?;
+                let names = sqlx::query(DATABASE_NAMES_QUERY)
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        DataError::QueryFailed(format!("Failed to list databases: {}", e))
+                    })?;
 
-                Ok(rows
+                // Sizes make the database list show which database is the
+                // heavy one, but listing must not fail without them.
+                let sizes = self.read_database_sizes().await;
+
+                Ok(names
                     .iter()
-                    .filter_map(|row| row.try_get::<String, _>("SCHEMA_NAME").ok())
-                    .map(|name| ContainerInfo {
-                        name,
-                        container_type: ContainerType::Database,
-                        capabilities: ContainerCapabilities {
-                            can_contain_containers: false,
-                            can_contain_entities: true,
-                            child_container_type: None,
-                            entity_type_label: Some("table".to_string()),
-                            entity_count_hint: Some(EntityCountHint::Small),
-                        },
-                        metadata: HashMap::new(),
+                    .filter_map(|row| {
+                        let name = row.try_get::<String, _>("SCHEMA_NAME").ok()?;
+                        let (table_count, size_bytes) = database_size(sizes.as_ref(), &name);
+                        Some(ContainerInfo {
+                            name,
+                            container_type: ContainerType::Database,
+                            capabilities: ContainerCapabilities {
+                                can_contain_containers: false,
+                                can_contain_entities: true,
+                                child_container_type: None,
+                                entity_type_label: Some("table".to_string()),
+                                entity_count_hint: Some(EntityCountHint::Small),
+                            },
+                            metadata: database_size_metadata(size_bytes, table_count),
+                        })
                     })
                     .collect())
             }
@@ -257,8 +388,30 @@ impl DataSource for MariaDbSource {
         let charset: Option<String> = row.try_get("DEFAULT_CHARACTER_SET_NAME").ok();
         let collation: Option<String> = row.try_get("DEFAULT_COLLATION_NAME").ok();
 
-        let mut metadata = HashMap::new();
+        // Best effort: a database whose sizes cannot be read still opens.
+        let (size_bytes, table_count) = match sqlx::query(DATABASE_SIZE_QUERY)
+            .bind(database_name)
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(row) => (
+                row.try_get::<u64, _>("size_bytes").ok(),
+                row.try_get::<i64, _>("table_count").ok(),
+            ),
+            Err(e) => {
+                warn!(
+                    "Failed to read size of MariaDB database '{}': {}",
+                    database_name, e
+                );
+                (None, None)
+            }
+        };
+
+        let mut metadata = database_size_metadata(size_bytes, table_count);
         if let Some(value) = charset {
+            // `encoding` is the key the data browser shows; `charset` is kept
+            // for existing API consumers.
+            metadata.insert("encoding".to_string(), serde_json::json!(value));
             metadata.insert("charset".to_string(), serde_json::json!(value));
         }
         if let Some(value) = collation {
@@ -1247,11 +1400,13 @@ const COUNT_TIMEOUT_MS: u64 = 10_000;
 /// Best-effort by design: failing to set a ceiling should not fail the query,
 /// but it must be visible, because it means only the control-plane deadline is
 /// in play and the server will keep working after the client gives up.
+/// Returns whether a ceiling was applied, for callers that would rather skip
+/// an optional query than run it unbounded.
 async fn apply_statement_timeout(
     conn: &mut sqlx::pool::PoolConnection<sqlx::MySql>,
     timeout_ms: u64,
     database_name: &str,
-) {
+) -> bool {
     let mysql_set = sqlx::query(&format!("SET SESSION max_execution_time = {timeout_ms}"))
         .execute(&mut **conn)
         .await
@@ -1271,6 +1426,7 @@ async fn apply_statement_timeout(
              data browser statements are bounded only by the control-plane deadline"
         );
     }
+    mysql_set || mariadb_set
 }
 
 #[cfg(test)]
@@ -1550,6 +1706,26 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_size_reports_measured_empty_and_unknown_databases() {
+        let mut measured = HashMap::new();
+        measured.insert("app".to_string(), (3_i64, 4096_u64));
+
+        assert_eq!(database_size(Some(&measured), "app"), (Some(3), Some(4096)));
+        // No row in the grouped read means no tables, not "unknown".
+        assert_eq!(
+            database_size(Some(&measured), "scratch"),
+            (Some(0), Some(0))
+        );
+        // The same lookup when the size read failed: nothing is known.
+        assert_eq!(database_size(None, "app"), (None, None));
+        // A server with no tables anywhere is a successful, empty read.
+        assert_eq!(
+            database_size(Some(&HashMap::new()), "app"),
+            (Some(0), Some(0))
+        );
+    }
+
     use super::*;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
@@ -1775,7 +1951,42 @@ mod tests {
             .is_some_and(|encoded| !encoded.is_empty()));
         assert_eq!(compatible.rows[0]["flags"], serde_json::json!(10));
 
+        // The database list and the database detail both report the
+        // database's on-disk size and table count.
+        let databases = source.list_containers(&ContainerPath::root()).await?;
+        let app = databases
+            .iter()
+            .find(|db| db.name == "app")
+            .expect("the app database is listed");
+        assert_eq!(
+            app.metadata.get("entity_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert!(app
+            .metadata
+            .get("size_bytes")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|size| size > 0));
+        let detail = source.get_container_info(&path).await?;
+        assert_eq!(
+            detail.metadata.get("entity_count"),
+            Some(&serde_json::json!(2))
+        );
+        assert_eq!(
+            detail.metadata.get("size_bytes"),
+            app.metadata.get("size_bytes")
+        );
+        assert!(detail.metadata.contains_key("encoding"));
+
         Ok(())
+    }
+
+    #[test]
+    fn database_size_metadata_uses_the_data_browser_keys() {
+        let metadata = database_size_metadata(Some(32_768), Some(3));
+        assert_eq!(metadata.get("size_bytes"), Some(&serde_json::json!(32_768)));
+        assert_eq!(metadata.get("entity_count"), Some(&serde_json::json!(3)));
+        assert!(database_size_metadata(None, None).is_empty());
     }
 
     fn assert_where_rejected(clause: &str) {

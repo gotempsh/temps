@@ -79,6 +79,24 @@ pub enum FieldKind {
         #[serde(default)]
         allow_subdomain: bool,
     },
+    /// Teams of this instance, answered as a list of team ids.
+    Teams,
+    /// Users of this instance, answered as a list of user ids.
+    Users,
+    /// One of `choices`, answered as its `value`.
+    Choice {
+        choices: Vec<FieldChoice>,
+    },
+    /// A list of text values, answered as an array of strings.
+    TextList,
+}
+
+/// One answer a [`FieldKind::Choice`] field offers.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, ToSchema)]
+pub struct FieldChoice {
+    pub value: String,
+    pub label: String,
+    pub help: Option<String>,
 }
 
 /// A create request's answers, checked against the fields and resolved.

@@ -21,6 +21,14 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
+        &["sign_everyone_out_of_address"],
+    ),
+    (
+        "ends the caller's own app sessions; tied to their browser session, not an assistant action",
+        &["sign_out_of_apps"],
+    ),
+    (
         "irreversible data loss or an availability risk; the console shows the user the plan first",
         &[
             "ExternalServiceEnablePgStatStatements",
@@ -38,6 +46,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "cancel_pg_upgrade",
             "cancel_restore_run",
             "cleanup_expired_backups",
+            "delete_access_provider",
             "delete_backup",
             "delete_connection",
             "delete_delivery_profile",
@@ -70,6 +79,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "retry_pg_upgrade",
             "rollback_pg_upgrade",
             "rotate_status_page_url",
+            // Makes every environment publicly reachable under a tunnel's zone
+            // and publishes DNS records; a user decision behind step-up.
+            "set_connector_environment_hosts",
             "set_ingress_connector_nodes",
             "set_project_hosting",
             "start_data_import",
@@ -461,7 +473,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
+            "check_access_provider",
             "createHttpCheck",
+            "create_access_provider",
             "create_agent",
             "create_bitbucket_provider",
             "create_delivery_profile",

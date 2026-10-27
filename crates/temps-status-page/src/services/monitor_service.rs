@@ -178,16 +178,22 @@ impl UptimeCoverage {
 ///   (major_outage, or no check within a day); a monitor merely returning a
 ///   soft client error (degraded/partial_outage) does not paint the project
 ///   red -- see health_check_service.rs for the per-monitor statuses.
+/// - `no_address`: every deployed monitor's environment has no address
+///   anyone can reach (ADR 068 D4), so there is nothing to probe. Neutral,
+///   never `down`; such monitors are left out of the other tallies.
 /// - `degraded`: anything in between.
 fn project_monitor_status(
     monitor_count: i64,
     undeployed_count: i64,
     operational_count: i64,
     major_outage_count: i64,
+    no_address_count: i64,
 ) -> &'static str {
-    let checked = monitor_count - undeployed_count;
+    let checked = monitor_count - undeployed_count - no_address_count;
     if monitor_count == 0 {
         "no_monitors"
+    } else if checked <= 0 && no_address_count > 0 {
+        "no_address"
     } else if checked <= 0 {
         "not_deployed"
     } else if operational_count == checked {
@@ -757,6 +763,7 @@ impl MonitorService {
             undeployed_count: i64,
             operational_count: i64,
             major_outage_count: i64,
+            no_address_count: i64,
         }
 
         // Single query: for each project, get latest check status of production monitors.
@@ -789,7 +796,10 @@ impl MonitorService {
                 COUNT(*) FILTER (
                     WHERE e.current_deployment_id IS NOT NULL
                       AND (lc.status = 'major_outage' OR lc.status IS NULL)
-                ) as major_outage_count
+                ) as major_outage_count,
+                COUNT(lc.status) FILTER (
+                    WHERE e.current_deployment_id IS NOT NULL AND lc.status = 'no_address'
+                ) as no_address_count
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
                 AND e.name = 'production'
@@ -828,6 +838,7 @@ impl MonitorService {
                 r.undeployed_count,
                 r.operational_count,
                 r.major_outage_count,
+                r.no_address_count,
             );
 
             health_map.insert(
@@ -1079,6 +1090,9 @@ impl MonitorService {
                   AND checked_at >= $2 - make_interval(secs => $4)
                   AND checked_at < $3
                   AND status != 'unknown'
+                  -- ADR 068: nobody could reach the environment, so nothing
+                  -- was monitored; neither up nor down.
+                  AND status != 'no_address'
             ),
             spans AS (
                 SELECT
@@ -1284,6 +1298,7 @@ impl MonitorService {
                   -- excludes create_monitor's synthetic bootstrap row -- see
                   -- uptime_coverage's identical comment.
                   AND status != 'unknown'
+                  AND status != 'no_address'
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
@@ -2820,34 +2835,44 @@ mod tests {
     fn never_deployed_project_is_not_deployed_rather_than_down() {
         // One managed production monitor, environment never deployed: the
         // checker skips it, so there is no check row at all.
-        assert_eq!(project_monitor_status(1, 1, 0, 0), "not_deployed");
+        assert_eq!(project_monitor_status(1, 1, 0, 0, 0), "not_deployed");
     }
 
     #[test]
     fn project_without_monitors_is_no_monitors() {
-        assert_eq!(project_monitor_status(0, 0, 0, 0), "no_monitors");
+        assert_eq!(project_monitor_status(0, 0, 0, 0, 0), "no_monitors");
     }
 
     #[test]
     fn deployed_project_with_all_checks_passing_is_operational() {
-        assert_eq!(project_monitor_status(1, 0, 1, 0), "operational");
+        assert_eq!(project_monitor_status(1, 0, 1, 0, 0), "operational");
     }
 
     #[test]
     fn deployed_project_with_all_checks_failing_is_down() {
-        assert_eq!(project_monitor_status(2, 0, 0, 2), "down");
+        assert_eq!(project_monitor_status(2, 0, 0, 2, 0), "down");
     }
 
     /// An undeployed monitor alongside a healthy deployed one must not drag
     /// the project to "degraded".
     #[test]
     fn undeployed_monitors_do_not_count_against_deployed_ones() {
-        assert_eq!(project_monitor_status(2, 1, 1, 0), "operational");
-        assert_eq!(project_monitor_status(2, 1, 0, 1), "down");
+        assert_eq!(project_monitor_status(2, 1, 1, 0, 0), "operational");
+        assert_eq!(project_monitor_status(2, 1, 0, 1, 0), "down");
     }
 
     #[test]
     fn mixed_results_are_degraded() {
-        assert_eq!(project_monitor_status(3, 0, 1, 1), "degraded");
+        assert_eq!(project_monitor_status(3, 0, 1, 1, 0), "degraded");
+    }
+
+    /// ADR 068 D4: a monitor with nothing to probe is grey, never down, and
+    /// never drags a checked one down.
+    #[test]
+    fn no_address_is_neutral() {
+        assert_eq!(project_monitor_status(1, 0, 0, 0, 1), "no_address");
+        assert_eq!(project_monitor_status(2, 1, 0, 0, 1), "no_address");
+        assert_eq!(project_monitor_status(2, 0, 1, 0, 1), "operational");
+        assert_eq!(project_monitor_status(2, 0, 0, 1, 1), "down");
     }
 }

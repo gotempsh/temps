@@ -337,6 +337,69 @@ impl fmt::Debug for Ja4 {
     }
 }
 
+/// Where a request's JA4 came from (D4). It follows the client-address
+/// trust chain: a proxy that ends TLS in front of temps gives its own
+/// ClientHello, so only that proxy's header can carry the visitor's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ja4Source {
+    /// Computed by this ingress from the connection's ClientHello.
+    Direct,
+    /// `cf-ja4` from a Cloudflare address.
+    Cloudflare,
+    /// `CDN-JA4` from a Bunny address.
+    Bunny,
+    /// A trusted proxy on loopback.
+    Local,
+    /// A registered temps edge.
+    Edge,
+}
+
+impl Ja4Source {
+    /// The inverse of [`Self::as_str`].
+    pub fn parse(value: &str) -> Option<Self> {
+        [
+            Self::Direct,
+            Self::Cloudflare,
+            Self::Bunny,
+            Self::Local,
+            Self::Edge,
+        ]
+        .into_iter()
+        .find(|source| source.as_str() == value)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Cloudflare => "cloudflare",
+            Self::Bunny => "bunny",
+            Self::Local => "local",
+            Self::Edge => "edge",
+        }
+    }
+}
+
+/// The headers proxies in front of temps carry a visitor's JA4 in (D4):
+/// Cloudflare's, Bunny's, CloudFront's and the temps edge's. Each is read
+/// only from the peers that set it, and every ingress removes them all
+/// before a request goes upstream, so an app never sees one a visitor
+/// could have written.
+pub const FORWARDED_JA4_HEADERS: [&str; 4] = [
+    "cf-ja4",
+    "cdn-ja4",
+    "cloudfront-viewer-ja4-fingerprint",
+    "x-temps-edge-client",
+];
+
+/// A request's client fingerprint. `ja4` is `None` when the source gives
+/// none: plain HTTP, Cloudflare without Bot Management, most local proxies.
+/// Having none is not suspicious.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientFingerprint {
+    pub ja4: Option<Ja4>,
+    pub source: Ja4Source,
+}
+
 pub fn ja4(hello: &ClientHello, transport: Transport) -> Ja4 {
     let mut out = [b'0'; 36];
     out[..10].copy_from_slice(&prefix(hello, transport));
@@ -457,9 +520,53 @@ fn truncated_hash(input: &str) -> [u8; 12] {
     out
 }
 
+/// Read until `buf` holds the whole ClientHello, never past the record that
+/// ends it. Everything read is in `buf`, whatever the outcome, so the
+/// caller can hand every byte to the TLS library; a read cancelled by a
+/// timeout loses nothing, since bytes join `buf` only once a read has
+/// returned them. `None` for anything that is not a ClientHello, a read
+/// error or the end of the stream.
+#[cfg(feature = "tokio")]
+pub async fn read_client_hello<S>(stream: &mut S, buf: &mut Vec<u8>) -> Option<ClientHello>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut chunk = [0u8; 4096];
+    loop {
+        match needed(buf) {
+            Ok(Need::Done(_)) => return parse(buf).ok(),
+            Ok(Need::More(n)) => {
+                let want = n.min(chunk.len());
+                let got = stream.read(&mut chunk[..want]).await.ok()?;
+                if got == 0 {
+                    return None;
+                }
+                buf.extend_from_slice(&chunk[..got]);
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sources_round_trip_through_their_names() {
+        for source in [
+            Ja4Source::Direct,
+            Ja4Source::Cloudflare,
+            Ja4Source::Bunny,
+            Ja4Source::Local,
+            Ja4Source::Edge,
+        ] {
+            assert_eq!(Ja4Source::parse(source.as_str()), Some(source));
+        }
+        assert_eq!(Ja4Source::parse("Cloudflare"), None);
+    }
 
     /// A ClientHello with the given parts, as one handshake message.
     struct Hello {

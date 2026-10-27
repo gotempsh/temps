@@ -62,6 +62,11 @@ impl TempsPlugin for ProjectsPlugin {
                 environment_service,
                 encryption_service,
             ));
+            if let Some(slot) =
+                context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
+            {
+                project_service.set_environment_addresses(slot);
+            }
             context.register_service(project_service);
 
             // The list other plugins add their project deletion hooks to;

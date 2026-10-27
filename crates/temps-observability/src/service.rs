@@ -693,6 +693,8 @@ mod tests {
             error_group_id: Some(99),
             shield_verdict: None,
             shield_reasons: None,
+            ja4: None,
+            ja4_source: None,
         }
     }
 

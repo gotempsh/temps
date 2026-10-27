@@ -17,7 +17,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
 };
 use serde_json::Value;
 use temps_config::ConfigService;
@@ -44,35 +45,41 @@ use temps_entities::{
     deployment_containers, dns_managed_record_states, domains, environment_domains, environments,
     ingress_connectors, node_public_ingress, nodes, project_custom_domains,
     project_ip_access_rules, projects, reachability_plans, reachability_runs,
-    tailnet_serve_entries,
+    tailnet_serve_entries, teams, users,
 };
 use temps_projects::CustomDomainService;
 use thiserror::Error;
 use tracing::{info, warn};
 
+use super::access::{self as access_api, AccessApp, AccessPolicyAnswer, ACCESS_TUNNEL_ONLY};
+use super::access_service::AccessProviderService;
 use super::compute::{
     address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
     AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
     ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
 use super::model::{
-    AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience, DecideRequest,
-    DnsRecordState, EnvironmentReachability, Intent, JournalEntry, PlanOptionKind, PlanRequest,
-    PlannedRecord, PreviousChoice, ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep,
-    RunStepStatus, RunView, StepKind,
+    AccessBinding, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
+    DecideRequest, DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent,
+    JournalEntry, PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityPlan,
+    ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView, StepKind,
 };
 use super::plan::{
-    address_for_audience, fingerprint, guess_zone, http01_direct, plan, planned_record,
-    private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
-    tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
-    PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
-    ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_TOKEN,
+    access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
+};
+use super::plan::{
+    address_for_audience, environment_hosts_tunnel, fingerprint, gate_allow_answer, guess_zone,
+    http01_direct, plan, planned_record, private_worker, record_type_of, records_to_read,
+    service_of, service_tag, service_worker, tunnel_domain_for, tunnel_route, unique_tunnel_name,
+    zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact, ServiceSeen,
+    TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
+    FIELD_TOKEN,
 };
 use super::run::{
-    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, NewTunnel,
-    RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget,
-    ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus,
-    WriteError, ZoneState,
+    created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
+    AccessRun, NewTunnel, RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus,
+    ServeRelease, ServeTarget, ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop,
+    Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
 use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
@@ -169,10 +176,12 @@ pub struct ReachabilityDeps {
     pub custom_domains: Arc<CustomDomainService>,
     pub domains: Arc<DomainService>,
     pub config: Arc<ConfigService>,
+    /// Saved Cloudflare Access tokens and their apps (ADR 065 D9).
+    pub access: Arc<AccessProviderService>,
 }
 
 pub struct ReachabilityService {
-    deps: Arc<ReachabilityDeps>,
+    pub(super) deps: Arc<ReachabilityDeps>,
     http: reqwest::Client,
     /// Tailscale's API, its access tokens in memory only (ADR 065 D2).
     tailnet: Arc<dyn TailnetApi>,
@@ -214,16 +223,23 @@ async fn load_tailscale_credential(
 }
 
 /// The environment and project a request is about.
-struct Scope {
-    project: projects::Model,
-    environment: environments::Model,
+pub(super) struct Scope {
+    pub(super) project: projects::Model,
+    pub(super) environment: environments::Model,
 }
 
 /// What the service knows about an environment's addresses.
-struct Gathered {
-    addresses: Vec<AddressInput>,
-    running_on: Vec<String>,
-    deployed: bool,
+pub(super) struct Gathered {
+    pub(super) addresses: Vec<AddressInput>,
+    /// Public hostnames that reach one Compose service of the environment:
+    /// its generated `<service>--<env>` names and service custom domains.
+    /// Not addresses Make it reachable manages, but they open the same app.
+    pub(super) service_addresses: Vec<String>,
+    pub(super) running_on: Vec<String>,
+    /// Every container of the current deployment runs on a worker, which is
+    /// what a tunnel can carry (ADR 058).
+    pub(super) on_workers: bool,
+    pub(super) deployed: bool,
 }
 
 impl ReachabilityService {
@@ -472,7 +488,7 @@ impl ReachabilityService {
 
     // ----- scope and facts ----------------------------------------------
 
-    async fn scope(
+    pub(super) async fn scope(
         &self,
         project_id: i32,
         environment_id: i32,
@@ -500,7 +516,7 @@ impl ReachabilityService {
         })
     }
 
-    async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
+    pub(super) async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
         self.deps
             .config
             .get_settings()
@@ -511,20 +527,16 @@ impl ReachabilityService {
     /// Every address attached to the environment: the generated hostname,
     /// environment domains and custom domains (redirects and wildcards left
     /// out: nobody lands on those to use the app).
-    async fn gather(
+    pub(super) async fn gather(
         &self,
+        project: &projects::Model,
         environment: &environments::Model,
         preview_domain: &str,
     ) -> Result<Gathered, ReachabilityError> {
+        let mut service_addresses = BTreeSet::new();
         let mut seen = BTreeSet::new();
         let mut addresses = Vec::new();
-        let expand = |domain: &str| {
-            if domain.contains('.') {
-                domain.trim_end_matches('.').to_ascii_lowercase()
-            } else {
-                PublicHostnameStrategy::Standard.environment_hostname(preview_domain, domain)
-            }
-        };
+        let expand = |domain: &str| expand_environment_domain(domain, preview_domain);
         let mut push = |address: String,
                         audience: Audience,
                         source,
@@ -546,6 +558,13 @@ impl ReachabilityService {
             .all(self.deps.db.as_ref())
             .await?;
         for custom in customs {
+            if custom.service_name.is_some()
+                && custom.redirect_to.is_none()
+                && Audience::parse(&custom.audience) == Audience::Public
+                && !custom.domain.starts_with("*.")
+            {
+                service_addresses.insert(custom.domain.trim_end_matches('.').to_ascii_lowercase());
+            }
             if custom.redirect_to.is_some() || custom.service_name.is_some() {
                 continue;
             }
@@ -572,10 +591,20 @@ impl ReachabilityService {
             .await?;
         for domain in env_domains {
             let audience = Audience::parse(&domain.audience);
+            // A label (no dot) is served under the preview domain: it is a
+            // generated host, not one the user chose (ADR 068 D4). A tunnel
+            // generated the others carrying a connector (D3).
+            let source = if domain.generated_by_connector_id.is_some() {
+                AddressSource::TunnelHost
+            } else if domain.domain.contains('.') {
+                AddressSource::EnvironmentDomain
+            } else {
+                AddressSource::Generated
+            };
             push(
                 expand(&domain.domain),
                 audience,
-                AddressSource::EnvironmentDomain,
+                source,
                 None,
                 audience.is_private().then(|| PrivateBinding {
                     address_id: private_address_id(false, domain.id),
@@ -596,9 +625,39 @@ impl ReachabilityService {
                 None,
                 None,
             );
+            if let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) =
+                project.preset_config.as_ref()
+            {
+                // The route table names each public Compose service the same
+                // way, with the managed domain's hostname layout.
+                let modes: HashMap<String, PublicHostnameStrategy> =
+                    temps_entities::dns_managed_domains::Entity::find()
+                        .all(self.deps.db.as_ref())
+                        .await?
+                        .into_iter()
+                        .map(|d| {
+                            (
+                                d.domain.to_ascii_lowercase(),
+                                PublicHostnameStrategy::from_db_str(&d.generated_hostname_mode),
+                            )
+                        })
+                        .collect();
+                let strategy =
+                    temps_core::public_hostname_resolver::match_strategy(&modes, preview_domain);
+                for label in
+                    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+                {
+                    service_addresses.insert(strategy.service_hostname(
+                        preview_domain,
+                        &environment.subdomain,
+                        &label,
+                    ));
+                }
+            }
         }
 
         let mut running_on = Vec::new();
+        let mut on_workers = false;
         if let Some(deployment_id) = environment.current_deployment_id {
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
@@ -624,17 +683,20 @@ impl ReachabilityService {
                 });
             }
             running_on = place.into_iter().collect();
+            on_workers = !containers.is_empty() && containers.iter().all(|c| c.node_id.is_some());
         }
         Ok(Gathered {
             addresses,
+            service_addresses: service_addresses.into_iter().collect(),
             running_on,
+            on_workers,
             deployed: environment.current_deployment_id.is_some(),
         })
     }
 
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
-    async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
+    pub(super) async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
         let mut directs = Vec::new();
         let server = self.deps.config.get_server_config();
         let takes_port_80 = server
@@ -972,15 +1034,7 @@ impl ReachabilityService {
                 }
             }
         };
-        let approved = entries
-            .iter()
-            .find(|e| e.node_id == node_id && e.address_id == address_id)
-            .and_then(|mine| {
-                hosts
-                    .iter()
-                    .find(|h| h.is(mine.tailscale_node_id.as_deref(), mine.dns_name.as_deref()))
-            })
-            .map(|host| host.approved.unwrap_or(false));
+        let approved = worker_approval(&hosts, &entries, node_id, address_id);
         ServiceHostsState {
             name: service.to_string(),
             tag,
@@ -989,7 +1043,7 @@ impl ReachabilityService {
         }
     }
 
-    async fn judge(
+    pub(super) async fn judge(
         &self,
         addresses: &[AddressInput],
         directs: &[DirectIngress],
@@ -1025,7 +1079,105 @@ impl ReachabilityService {
                 environment_name,
             ));
         }
+        // ADR 065 D10: a signed-in address is reachable only when what
+        // answers there is its gate.
+        let gates = self.signed_in_gates(&hosts).await;
+        for verdict in &mut verdicts {
+            let Some((gate, team_domain)) = gates.get(&verdict.address) else {
+                continue;
+            };
+            if verdict.audience == Audience::SignedIn
+                && verdict.state == super::model::ReachState::Reachable
+            {
+                let probe =
+                    super::gate_check::probe(&verdict.address, *gate, team_domain.as_deref()).await;
+                *verdict = super::gate_check::judged(verdict.clone(), probe);
+            }
+        }
         verdicts
+    }
+
+    /// The gate of each of `hosts` that is a signed-in address, with the
+    /// team domain of the Access account an Access address is bound to.
+    async fn signed_in_gates(
+        &self,
+        hosts: &[String],
+    ) -> HashMap<String, (GateKind, Option<String>)> {
+        let db = self.deps.db.as_ref();
+        let mut gates = HashMap::new();
+        let mut bound: HashMap<String, i32> = HashMap::new();
+        // Environment domains may be stored as the label under the preview
+        // domain; `gather` expands them, so look up both forms and key each
+        // gate by the address `judge` asks about.
+        let preview_domain = self
+            .settings()
+            .await
+            .map(|settings| settings.preview_domain)
+            .unwrap_or_default();
+        let environment_names = names_with_preview_labels(hosts, &preview_domain);
+        match project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(hosts.to_vec()))
+            .filter(
+                project_custom_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN),
+            )
+            .all(db)
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                    if let Some(provider_id) = row.gate_access_provider_id {
+                        bound.insert(row.domain.clone(), provider_id);
+                    }
+                    gates.insert(row.domain, (gate, None));
+                }
+            }
+            Err(error) => warn!(%error, "could not read the gates of signed-in custom domains"),
+        }
+        match environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.is_in(environment_names))
+            .filter(environment_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN))
+            .all(db)
+            .await
+        {
+            Ok(rows) => {
+                for row in rows {
+                    let host = expand_environment_domain(&row.domain, &preview_domain);
+                    let gate = row.gate.as_deref().map(GateKind::parse).unwrap_or_default();
+                    if let Some(provider_id) = row.gate_access_provider_id {
+                        bound.insert(host.clone(), provider_id);
+                    }
+                    gates.insert(host, (gate, None));
+                }
+            }
+            Err(error) => {
+                warn!(%error, "could not read the gates of signed-in environment domains")
+            }
+        }
+        if !bound.is_empty() {
+            let ids: BTreeSet<i32> = bound.values().copied().collect();
+            match temps_entities::cloudflare_access_providers::Entity::find()
+                .filter(temps_entities::cloudflare_access_providers::Column::Id.is_in(ids))
+                .all(db)
+                .await
+            {
+                Ok(providers) => {
+                    let teams: HashMap<i32, String> = providers
+                        .into_iter()
+                        .map(|p| (p.id, p.team_domain))
+                        .collect();
+                    for (host, provider_id) in bound {
+                        if let Some(entry) = gates.get_mut(&host) {
+                            entry.1 = teams.get(&provider_id).cloned();
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "could not read the Access accounts of signed-in addresses")
+                }
+            }
+        }
+        gates
     }
 
     // ----- D3 ----------------------------------------------------------
@@ -1038,7 +1190,7 @@ impl ReachabilityService {
         let scope = self.scope(project_id, environment_id).await?;
         let settings = self.settings().await?;
         let gathered = self
-            .gather(&scope.environment, &settings.preview_domain)
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
             .await?;
         let directs = self.directs(&settings).await;
         let addresses = self
@@ -1059,6 +1211,7 @@ impl ReachabilityService {
                     &gathered,
                     directs,
                     Audience::Public,
+                    GateKind::default(),
                     None,
                     Vec::new(),
                 )
@@ -1068,6 +1221,7 @@ impl ReachabilityService {
         Ok(EnvironmentReachability {
             project_id,
             environment_id,
+            primary_address: super::addresses::primary_address(&addresses),
             environment_name: scope.environment.name.clone(),
             deployed: gathered.deployed,
             summary: summary(
@@ -1085,12 +1239,16 @@ impl ReachabilityService {
 
     // ----- D4: plan -----------------------------------------------------
 
+    // The audience and its two refinements, the gate (signed_in) and the
+    // principals (tailnet_users), travel separately so each stays typed.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_facts(
         &self,
         scope: &Scope,
         gathered: &Gathered,
         directs: Vec<DirectIngress>,
         audience: Audience,
+        gate: GateKind,
         requested: Option<String>,
         principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<PlanFacts, ReachabilityError> {
@@ -1282,6 +1440,7 @@ impl ReachabilityService {
             choices: tunnel_facts.choices,
             private_rule,
             audiences,
+            service_addresses: gathered.service_addresses.clone(),
             worker_modes,
             audience,
             project_slug: scope.project.slug.clone(),
@@ -1302,6 +1461,9 @@ impl ReachabilityService {
             private_workers,
             suggested_private_worker,
             private_ranges,
+            password_protected: password_protected(&scope.project, &scope.environment),
+            gate,
+            access_providers: Vec::new(),
             tailnet_workers,
             serve_entries,
             tailscale_credential,
@@ -1314,8 +1476,10 @@ impl ReachabilityService {
             },
             principals_now: Vec::new(),
             identity_workers,
+            environment_host_label: Some(self.environment_host_label(scope).await?),
         };
         let mut dns_records = Vec::new();
+        let mut access_providers = Vec::new();
         let mut service_seen = None;
         let mut principals_now = Vec::new();
         // The suggested address is known only now; D9 decides it too.
@@ -1341,6 +1505,10 @@ impl ReachabilityService {
                     }
                 };
                 dns_records.push((host, record_type, seen));
+            }
+            // ADR 065 D9: the Access apps already protecting the address.
+            if audience == Audience::SignedIn && gate == GateKind::CloudflareAccess {
+                access_providers = self.access_facts(&address).await?;
             }
             if !intents.contains_key(&address) {
                 let more = self
@@ -1378,10 +1546,41 @@ impl ReachabilityService {
         Ok(PlanFacts {
             intents,
             dns_records,
+            access_providers,
             service_seen,
             principals_now,
             ..facts
         })
+    }
+
+    /// The label a tunnel's environment hosts give `scope`'s environment
+    /// (ADR 068 D3).
+    async fn environment_host_label(&self, scope: &Scope) -> Result<String, ReachabilityError> {
+        let settings = self.settings().await?;
+        Ok(super::environment_hosts::environment_host_label(
+            &scope.project.slug,
+            &scope.environment,
+            settings.production_hostname_template.as_deref(),
+        ))
+    }
+
+    /// Every saved Access token, with its apps covering `host`.
+    async fn access_facts(&self, host: &str) -> Result<Vec<AccessProviderFact>, ReachabilityError> {
+        let providers = self
+            .deps
+            .access
+            .names()
+            .await
+            .map_err(|e| ReachabilityError::Validation(e.to_string()))?;
+        let mut facts = Vec::with_capacity(providers.len());
+        for (id, name, _) in providers {
+            let covering = self.deps.access.covering_apps(id, host).await;
+            if let Err(error) = &covering {
+                warn!(provider_id = id, %host, %error, "could not read Access applications to plan with");
+            }
+            facts.push(AccessProviderFact { id, name, covering });
+        }
+        Ok(facts)
     }
 
     /// ADR 065 3b: the worker that will host `service` must be a device of
@@ -1438,16 +1637,19 @@ impl ReachabilityService {
         &self,
         scope: &Scope,
         audience: Audience,
+        gate: GateKind,
         requested: Option<String>,
         principals: Vec<temps_core::tailnet::TailnetPrincipal>,
     ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
-            .gather(&scope.environment, &settings.preview_domain)
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
             .await?;
         let directs = self.directs(&settings).await;
         let facts = self
-            .plan_facts(scope, &gathered, directs, audience, requested, principals)
+            .plan_facts(
+                scope, &gathered, directs, audience, gate, requested, principals,
+            )
             .await?;
         Ok((facts, settings))
     }
@@ -1495,6 +1697,14 @@ impl ReachabilityService {
         user_id: Option<i32>,
     ) -> Result<ReachabilityPlan, ReachabilityError> {
         let scope = self.scope(project_id, environment_id).await?;
+        let gate =
+            match request.gate.unwrap_or_default() {
+                GateKind::Unsupported => return Err(ReachabilityError::Validation(
+                    "That gate is not one this version of Temps can put in front of an address."
+                        .into(),
+                )),
+                gate => gate,
+            };
         // ADR 065 D6: who a `tailnet_users` address admits, checked and
         // lower-cased before anything is planned with it.
         let principals = if request.audience == Audience::TailnetUsers {
@@ -1504,7 +1714,7 @@ impl ReachabilityService {
             Vec::new()
         };
         let (facts, _) = self
-            .facts_for(&scope, request.audience, request.address, principals)
+            .facts_for(&scope, request.audience, gate, request.address, principals)
             .await?;
         self.store_plan(&scope, &facts, user_id).await
     }
@@ -1561,6 +1771,7 @@ impl ReachabilityService {
             .as_ref()
             .map(|p| Audience::parse(&p.audience))
             .unwrap_or_default();
+        let gate = stored.as_ref().map(planned_gate).unwrap_or_default();
         // ADR 065 D6: the list the plan was made for, and only that one.
         let principals = stored
             .as_ref()
@@ -1568,7 +1779,7 @@ impl ReachabilityService {
             .map(|p| p.principals)
             .unwrap_or_default();
         let (facts, settings) = self
-            .facts_for(&scope, audience, requested, principals)
+            .facts_for(&scope, audience, gate, requested, principals)
             .await?;
         let address = match address_for_audience(&facts) {
             Ok(Some(address)) => address,
@@ -1681,6 +1892,7 @@ impl ReachabilityService {
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
             audience: None,
+            access: None,
             serve: None,
             tailscale_service: None,
             tailscale_credential: None,
@@ -1787,6 +1999,7 @@ impl ReachabilityService {
                         private_via: None,
                         private_service: None,
                         principals: facts.principals.clone(),
+                        ..AddressAudience::default()
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1818,6 +2031,7 @@ impl ReachabilityService {
                         private_via: Some(via::TAILSCALE_SERVE.to_string()),
                         private_service: None,
                         principals: facts.principals.clone(),
+                        ..AddressAudience::default()
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1894,6 +2108,7 @@ impl ReachabilityService {
                         private_via: Some(via::TAILSCALE_SERVICE.to_string()),
                         private_service: Some(service),
                         principals: facts.principals.clone(),
+                        ..AddressAudience::default()
                     },
                     self.current_audience(&address).await?,
                 ));
@@ -1905,6 +2120,41 @@ impl ReachabilityService {
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
             }
+            PlanOptionKind::TunnelEnvironmentHosts => {
+                let tunnel = environment_hosts_tunnel(&facts, &address).ok_or_else(|| {
+                    ReachabilityError::Conflict(format!(
+                        "No tunnel can give {} the address {address} any more.",
+                        scope.environment.name
+                    ))
+                })?;
+                input.tunnel = Some(NamedId {
+                    id: tunnel.id,
+                    name: tunnel.name.clone(),
+                });
+            }
+        }
+
+        // ADR 065 D7: a signed-in plan sets the gate (and who may sign in)
+        // right after attaching, before anything publishes the address.
+        if audience == Audience::SignedIn && gate == GateKind::CloudflareAccess {
+            // ADR 065 D9: the app in front of it is used as found or
+            // created first, and only a tunnel carries it.
+            if !option.way_in.starts_with("tunnel") {
+                return Err(ReachabilityError::Validation(
+                    ACCESS_TUNNEL_ONLY.to_string(),
+                ));
+            }
+            input.access = Some(self.access_run(&facts, &address, &request.answers).await?);
+            input.audience = Some((
+                AddressAudience::signed_in(GateKind::CloudflareAccess, None),
+                self.current_audience(&address).await?,
+            ));
+        } else if audience == Audience::SignedIn {
+            let allow = self.gate_allow(&request.answers).await?;
+            input.audience = Some((
+                AddressAudience::signed_in(GateKind::Temps, allow),
+                self.current_audience(&address).await?,
+            ));
         }
 
         // B5: an option that turns a private address public says so in a
@@ -1996,6 +2246,113 @@ impl ReachabilityService {
         Ok(view)
     }
 
+    /// The Access app a Cloudflare Access apply puts in front of `address`:
+    /// the one covering it, used as found, else a new one in the account
+    /// answered (or the only one), letting in who the answers say.
+    async fn access_run(
+        &self,
+        facts: &PlanFacts,
+        address: &str,
+        answers: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<AccessRun, ReachabilityError> {
+        match access_choice(facts) {
+            AccessChoice::NoProvider => Err(ReachabilityError::Validation(
+                "No Cloudflare Access token is saved any more. Add one, then plan again.".into(),
+            )),
+            AccessChoice::Unreadable { provider, error } => {
+                Err(ReachabilityError::Validation(format!(
+                    "Temps could not read the Access applications of {}: {error}",
+                    provider.name
+                )))
+            }
+            AccessChoice::Existing { provider, app } => Ok(AccessRun {
+                provider_id: provider.id,
+                existing: Some(app.clone()),
+                name: app.name.clone(),
+                policy: AccessPolicyAnswer::default(),
+            }),
+            AccessChoice::Create(providers) => {
+                let chosen = answers
+                    .get(FIELD_ACCESS_PROVIDER)
+                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.trim().parse().ok()))
+                    .and_then(|id| i32::try_from(id).ok());
+                let provider_id = match (chosen, providers.as_slice()) {
+                    (Some(id), _) => providers
+                        .iter()
+                        .find(|p| p.id == id)
+                        .map(|p| p.id)
+                        .ok_or_else(|| {
+                            ReachabilityError::Validation(format!(
+                                "Cloudflare Access token {id} is not saved; pick one of the \
+                                 saved tokens."
+                            ))
+                        })?,
+                    (None, [only]) => only.id,
+                    (None, _) => {
+                        return Err(ReachabilityError::Validation(
+                            "Pick the Cloudflare Access account to create the app in.".into(),
+                        ))
+                    }
+                };
+                let policy =
+                    access_policy_answer(answers).map_err(ReachabilityError::Validation)?;
+                let install = self
+                    .deps
+                    .records
+                    .instance_id()
+                    .await
+                    .map_err(IngressError::from)?;
+                Ok(AccessRun {
+                    provider_id,
+                    existing: None,
+                    name: access_api::app_name(address, &install),
+                    policy,
+                })
+            }
+        }
+    }
+
+    /// The teams and users a signed-in apply was answered with, each one
+    /// checked to exist so a typo is refused rather than locking people out.
+    async fn gate_allow(
+        &self,
+        answers: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Option<GateAllowList>, ReachabilityError> {
+        let Some(list) = gate_allow_answer(answers).map_err(ReachabilityError::Validation)? else {
+            return Ok(None);
+        };
+        let db = self.deps.db.as_ref();
+        if !list.teams.is_empty() {
+            let found: HashSet<i32> = teams::Entity::find()
+                .filter(teams::Column::Id.is_in(list.teams.clone()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
+            if let Some(missing) = list.teams.iter().find(|id| !found.contains(id)) {
+                return Err(ReachabilityError::Validation(format!(
+                    "Team {missing} does not exist; pick the teams that may sign in again."
+                )));
+            }
+        }
+        if !list.users.is_empty() {
+            let found: HashSet<i32> = users::Entity::find()
+                .filter(users::Column::Id.is_in(list.users.clone()))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|u| u.id)
+                .collect();
+            if let Some(missing) = list.users.iter().find(|id| !found.contains(id)) {
+                return Err(ReachabilityError::Validation(format!(
+                    "User {missing} does not exist; pick the people who may sign in again."
+                )));
+            }
+        }
+        Ok(Some(list))
+    }
+
     /// Who `host` is for now, as stored: public when it is not attached.
     async fn current_audience(&self, host: &str) -> Result<AddressAudience, ReachabilityError> {
         let db = self.deps.db.as_ref();
@@ -2018,16 +2375,9 @@ impl ReachabilityService {
         environment_id: i32,
         plan_id: &str,
         option: PlanOptionKind,
-        answered_address: Option<&str>,
-    ) -> Result<
-        Option<(
-            String,
-            AddressAudience,
-            Audience,
-            Vec<temps_core::tailnet::TailnetPrincipal>,
-        )>,
-        ReachabilityError,
-    > {
+        answers: &std::collections::BTreeMap<String, Value>,
+    ) -> Result<Option<(String, AddressAudience, AddressAudience)>, ReachabilityError> {
+        let answered_address = answers.get(FIELD_ADDRESS).and_then(Value::as_str);
         let Some(stored) = reachability_plans::Entity::find_by_id(plan_id.to_string())
             .filter(reachability_plans::Column::ProjectId.eq(project_id))
             .filter(reachability_plans::Column::EnvironmentId.eq(environment_id))
@@ -2051,12 +2401,29 @@ impl ReachabilityService {
         match (changes, address) {
             (true, Some(address)) => {
                 let before = self.current_audience(&address).await?;
-                Ok(Some((
-                    address,
-                    before,
-                    Audience::parse(&stored.audience),
-                    planned.principals,
-                )))
+                let after = match Audience::parse(&stored.audience) {
+                    // ADR 065 D9: which app decides is known once the run
+                    // has it; the gate changing is what needs the step-up.
+                    Audience::SignedIn if planned.gate == Some(GateKind::CloudflareAccess) => {
+                        AddressAudience::signed_in(GateKind::CloudflareAccess, None)
+                    }
+                    // ADR 065 D7: who may sign in is part of who it is for.
+                    Audience::SignedIn => AddressAudience::signed_in(
+                        GateKind::Temps,
+                        gate_allow_answer(answers).map_err(ReachabilityError::Validation)?,
+                    ),
+                    // ADR 065 D6: who it admits is part of who it is for.
+                    Audience::TailnetUsers => AddressAudience {
+                        audience: Audience::TailnetUsers,
+                        principals: planned.principals.clone(),
+                        ..AddressAudience::default()
+                    },
+                    audience => AddressAudience {
+                        audience,
+                        ..AddressAudience::default()
+                    },
+                };
+                Ok(Some((address, before, after)))
             }
             _ => Ok(None),
         }
@@ -2575,6 +2942,19 @@ pub fn run_view(row: &reachability_runs::Model) -> RunView {
 
 /// The IP allow list governing an environment when it lets in only private
 /// ranges (ADR 064 D9): the environment's own policy, else the project's.
+/// Whether password protection is on for the environment or its project.
+fn password_protected(project: &projects::Model, environment: &environments::Model) -> bool {
+    [
+        project.deployment_config.as_ref(),
+        environment.deployment_config.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|config| config.security.as_ref())
+    .filter_map(|security| security.password_protection.as_ref())
+    .any(|password| password.enabled)
+}
+
 pub async fn private_rule(
     db: &DatabaseConnection,
     project_id: i32,
@@ -2608,7 +2988,7 @@ pub async fn private_rule(
 }
 
 /// Look up `host`. `Ok(empty)` when it has no address record.
-async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
+pub(super) async fn resolve(host: &str) -> Result<Vec<IpAddr>, String> {
     if let Some(ip) = parse_reported_ip(host) {
         return Ok(vec![ip]);
     }
@@ -2853,6 +3233,23 @@ impl RunOps for LiveOps {
                 .map(|_| RunResource::Certificate {
                     domain: domain.clone(),
                 }),
+            Intent::AccessApp {
+                provider_id,
+                name,
+                hostname,
+            } => self
+                .deps
+                .access
+                .app_named(*provider_id, name, hostname)
+                .await?
+                .map(|app| RunResource::AccessApp {
+                    provider_id: *provider_id,
+                    id: app.id,
+                    name: app.name,
+                    hostname: hostname.clone(),
+                    aud: app.aud,
+                    policies: app.policies,
+                }),
             Intent::TailscaleCredential { name } => ingress_connectors::Entity::find()
                 .filter(ingress_connectors::Column::Name.eq(name.clone()))
                 .filter(ingress_connectors::Column::Provider.eq(tailscale::KIND))
@@ -2867,6 +3264,13 @@ impl RunOps for LiveOps {
             Intent::TailscaleService { .. } => {
                 return Err("Tailscale Services are looked up by their marker.".to_string())
             }
+            Intent::EnvironmentHosts { connector_id, name } => self
+                .environment_hosts(*connector_id)
+                .await?
+                .then(|| RunResource::EnvironmentHosts {
+                    connector_id: *connector_id,
+                    name: name.clone(),
+                }),
         })
     }
 
@@ -3056,18 +3460,37 @@ impl RunOps for LiveOps {
         project_id: i32,
         environment_id: i32,
         host: &str,
+        initial: Option<&AddressAudience>,
     ) -> Result<i32, String> {
+        let Some(initial) = initial else {
+            return self
+                .deps
+                .custom_domains
+                .create_custom_domain(
+                    project_id,
+                    environment_id,
+                    host.to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map(|d| d.id)
+                .map_err(text);
+        };
+        refuse_signed_in_wildcard(host, initial)?;
+        // Tailnet principals live in their own table, keyed by the row's
+        // id: only an audience without them is written with the row.
+        if initial.audience == Audience::TailnetUsers {
+            return Err("A tailnet audience is set after attaching, not with it.".into());
+        }
+        let initial = initial.clone();
         self.deps
             .custom_domains
-            .create_custom_domain(
-                project_id,
-                environment_id,
-                host.to_string(),
-                None,
-                None,
-                None,
-                None,
-            )
+            .create_custom_domain_shaped(project_id, environment_id, host.to_string(), move |row| {
+                set_address_audience_on(row, &AddressAudience::public(), &initial)
+            })
             .await
             .map(|d| d.id)
             .map_err(text)
@@ -3334,6 +3757,7 @@ impl RunOps for LiveOps {
                 reason: "Not checked.".into(),
                 action: None,
                 network: None,
+                nothing_set_up: false,
             })
     }
 
@@ -3356,12 +3780,14 @@ impl RunOps for LiveOps {
             .own_address(host)
             .await?
             .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        refuse_signed_in_wildcard(&row.domain, audience)?;
+        let current = address_audience_of(&row);
         use sea_orm::TransactionTrait;
         // ADR 065 D6: the audience and who it admits change together.
         let address_id = private_address_id(true, row.id);
         let txn = self.deps.db.begin().await.map_err(text)?;
         let mut active: project_custom_domains::ActiveModel = row.into();
-        set_address_audience_on(&mut active, audience);
+        set_address_audience_on(&mut active, &current, audience);
         active.update(&txn).await.map_err(text)?;
         let list = if audience.audience == Audience::TailnetUsers {
             audience.principals.as_slice()
@@ -3372,7 +3798,68 @@ impl RunOps for LiveOps {
             .await
             .map_err(text)?;
         txn.commit().await.map_err(text)?;
+        if audience.audience != Audience::Public {
+            // ADR 068 D3: a restricted environment loses its public tunnel
+            // host now, not at the next reconcile a minute later.
+            let connectors = self.deps.connectors.clone();
+            tokio::spawn(async move { connectors.reconcile_all().await });
+        }
         Ok(())
+    }
+
+    async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+        Ok(ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?
+            .is_some_and(|c| c.environment_hosts))
+    }
+
+    async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+        let connector = ingress_connectors::Entity::find_by_id(connector_id)
+            .one(self.deps.db.as_ref())
+            .await
+            .map_err(text)?;
+        let Some(connector) = connector else {
+            // Gone: its generated hosts went with it.
+            return if on {
+                Err(format!("Tunnel {connector_id} no longer exists."))
+            } else {
+                Ok(())
+            };
+        };
+        super::environment_hosts::set_environment_hosts(self.deps.db.as_ref(), &connector, on)
+            .await
+            .map_err(text)?;
+        // The reconciler generates and publishes (or withdraws) the hosts.
+        let connectors = self.deps.connectors.clone();
+        tokio::spawn(async move { connectors.reconcile_all().await });
+        Ok(())
+    }
+
+    async fn access_app(&self, provider_id: i32, id: &str) -> Result<Option<AccessApp>, String> {
+        self.deps.access.app(provider_id, id).await
+    }
+
+    async fn create_access_app(
+        &self,
+        provider_id: i32,
+        name: &str,
+        host: &str,
+        policy: &AccessPolicyAnswer,
+    ) -> Result<AccessApp, WriteError> {
+        self.deps
+            .access
+            .create_app(provider_id, name, host, policy)
+            .await
+            .map_err(|error| WriteError {
+                message: error.message,
+                maybe_applied: error.maybe_applied,
+            })
+    }
+
+    async fn delete_access_app(&self, provider_id: i32, id: &str) -> Result<(), String> {
+        self.deps.access.delete_app(provider_id, id).await
     }
 
     async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String> {
@@ -3589,6 +4076,51 @@ impl RunOps for LiveOps {
     }
 }
 
+/// The gate a stored plan was made for (ADR 065 D7): the Temps sign-in
+/// for plans stored before plans recorded one.
+fn planned_gate(stored: &reachability_plans::Model) -> GateKind {
+    stored
+        .plan
+        .get("gate")
+        .cloned()
+        .and_then(|gate| serde_json::from_value::<Option<GateKind>>(gate).ok())
+        .flatten()
+        .unwrap_or_default()
+}
+
+/// The label `host` is stored under when it sits directly under the preview
+/// domain: environment domains and generated hostnames may be kept as the
+/// bare label, which [`expand_environment_domain`] turns back into `host`.
+fn preview_label(host: &str, preview_domain: &str) -> Option<String> {
+    if preview_domain.trim().is_empty() {
+        return None;
+    }
+    host.strip_suffix(&format!(".{}", preview_domain.trim_start_matches("*.")))
+        .filter(|label| !label.is_empty() && !label.contains('.'))
+        .map(str::to_string)
+}
+
+/// `hosts` and the label each is stored under, for looking up environment
+/// domain rows in either form.
+fn names_with_preview_labels(hosts: &[String], preview_domain: &str) -> Vec<String> {
+    let mut names = hosts.to_vec();
+    names.extend(
+        hosts
+            .iter()
+            .filter_map(|host| preview_label(host, preview_domain)),
+    );
+    names
+}
+
+/// The address an environment domain row stands for, as `gather` builds it.
+fn expand_environment_domain(domain: &str, preview_domain: &str) -> String {
+    if domain.contains('.') {
+        domain.trim_end_matches('.').to_ascii_lowercase()
+    } else {
+        PublicHostnameStrategy::Standard.environment_hostname(preview_domain, domain)
+    }
+}
+
 fn dns_record_type(record_type: &str) -> DnsRecordType {
     match record_type {
         "AAAA" => DnsRecordType::AAAA,
@@ -3600,11 +4132,33 @@ fn dns_record_type(record_type: &str) -> DnsRecordType {
 pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudience {
     let audience = Audience::parse(&row.audience);
     let private = audience.is_private();
+    let signed_in = audience == Audience::SignedIn;
     AddressAudience {
         audience,
         network_range: row.private_range.clone().filter(|_| private),
         private_node_id: row.private_node_id.filter(|_| private),
         private_listener: row.private_listener.clone().filter(|_| private),
+        gate: signed_in.then(|| row.gate.as_deref().map(GateKind::parse).unwrap_or_default()),
+        gate_allow: row
+            .gate_allow
+            .clone()
+            .filter(|_| signed_in)
+            .and_then(|value| serde_json::from_value::<GateAllowList>(value).ok())
+            .map(GateAllowList::normalized)
+            .filter(|list| !list.is_empty()),
+        gate_access: match (
+            signed_in,
+            row.gate_access_provider_id,
+            &row.gate_access_app_id,
+            &row.gate_access_aud,
+        ) {
+            (true, Some(provider_id), Some(app_id), Some(aud)) => Some(AccessBinding {
+                provider_id,
+                app_id: app_id.clone(),
+                aud: aud.clone(),
+            }),
+            _ => None,
+        },
         // `listener` is phase 2's way in, which journals record as `None`.
         private_via: row
             .private_via
@@ -3613,6 +4167,19 @@ pub fn address_audience_of(row: &project_custom_domains::Model) -> AddressAudien
         private_service: row.private_service.clone().filter(|_| private),
         principals: Vec::new(),
     }
+}
+
+/// ADR 065 D8: a signed-in address sends each visitor back to its own
+/// callback, so it must be one hostname; `*.example.com` has none.
+fn refuse_signed_in_wildcard(domain: &str, audience: &AddressAudience) -> Result<(), String> {
+    if audience.audience == Audience::SignedIn && domain.starts_with("*.") {
+        return Err(format!(
+            "{domain} is a wildcard, which can't be signed-in: sign-in returns each \
+             visitor to one hostname. Attach the hostnames you need and make those \
+             signed-in instead."
+        ));
+    }
+    Ok(())
 }
 
 /// `audience` with the list a `tailnet_users` row admits (ADR 065 D6).
@@ -3629,9 +4196,11 @@ async fn with_principals<C: sea_orm::ConnectionTrait>(
 }
 
 /// Write `audience` with what bounds it; a public one clears the private
-/// fields, so nothing stale routes it later.
+/// and gate fields, so nothing stale routes it later. When who may open it
+/// changes, every gate token issued before now stops working (ADR 065 D8).
 fn set_address_audience_on(
     active: &mut project_custom_domains::ActiveModel,
+    current: &AddressAudience,
     audience: &AddressAudience,
 ) {
     let private = audience.audience.is_private();
@@ -3639,6 +4208,21 @@ fn set_address_audience_on(
     active.private_range = Set(audience.network_range.clone().filter(|_| private));
     active.private_node_id = Set(audience.private_node_id.filter(|_| private));
     active.private_listener = Set(audience.private_listener.clone().filter(|_| private));
+    let (_, gate, allow, ..) = audience.who();
+    active.gate = Set(gate.map(|g| g.as_str().to_string()));
+    active.gate_allow = Set(allow.and_then(|list| serde_json::to_value(list).ok()));
+    // ADR 065 D9: only an Access address names an app.
+    let access = audience
+        .gate_access
+        .clone()
+        .filter(|_| gate == Some(GateKind::CloudflareAccess));
+    active.gate_access_provider_id = Set(access.as_ref().map(|a| a.provider_id));
+    active.gate_access_app_id = Set(access.as_ref().map(|a| a.app_id.clone()));
+    active.gate_access_aud = Set(access.map(|a| a.aud));
+    let gated = |a: &AddressAudience| a.audience == Audience::SignedIn;
+    if (gated(current) || gated(audience)) && current.who() != audience.who() {
+        active.gate_not_before = Set(Some(Utc::now()));
+    }
     // ADR 065 D11: a private row always says how it is served.
     active.private_via = Set(private.then(|| {
         audience
@@ -3871,13 +4455,7 @@ impl EnvironmentWaysIn for WaysIn {
             .map_err(|e| failed(e.to_string()))?;
         let env_ids: Vec<i32> = envs.iter().map(|e| e.id).collect();
         let mut pairs: Vec<(i32, String)> = Vec::new();
-        let expand = |domain: &str| {
-            if domain.contains('.') {
-                domain.trim_end_matches('.').to_ascii_lowercase()
-            } else {
-                PublicHostnameStrategy::Standard.environment_hostname(&preview_domain, domain)
-            }
-        };
+        let expand = |domain: &str| expand_environment_domain(domain, &preview_domain);
         for env in &envs {
             if !preview_domain.trim().is_empty() && !env.subdomain.is_empty() {
                 pairs.push((env.id, expand(&env.subdomain)));
@@ -3989,9 +4567,48 @@ impl WaysIn {
 }
 
 /// ADR 064 D9 on the tunnel side: a hostname is not moved onto a tunnel
-/// while an IP allow list of only private ranges governs its environment.
+/// while an IP allow list of only private ranges governs its environment;
+/// and (ADR 065 D9) a Cloudflare Access address is never taken off one.
 #[async_trait]
 impl TunnelMoveGuard for WaysIn {
+    async fn check_move_off(&self, host: &str) -> Result<(), String> {
+        let db = self.db.as_ref();
+        let unreadable =
+            |e: sea_orm::DbErr| format!("Temps could not check who {host} is for: {e}");
+        let access = temps_entities::audience::GATE_CLOUDFLARE_ACCESS;
+        let custom = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .filter(
+                project_custom_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN),
+            )
+            .filter(project_custom_domains::Column::Gate.eq(access))
+            .count(db)
+            .await
+            .map_err(unreadable)?;
+        let preview_domain = self
+            .config
+            .get_settings()
+            .await
+            .map(|s| s.preview_domain)
+            .unwrap_or_default();
+        let environment = environment_domains::Entity::find()
+            .filter(
+                environment_domains::Column::Domain.is_in(names_with_preview_labels(
+                    &[host.to_string()],
+                    &preview_domain,
+                )),
+            )
+            .filter(environment_domains::Column::Audience.eq(temps_entities::audience::SIGNED_IN))
+            .filter(environment_domains::Column::Gate.eq(access))
+            .count(db)
+            .await
+            .map_err(unreadable)?;
+        if custom + environment > 0 {
+            return Err(ACCESS_TUNNEL_ONLY.to_string());
+        }
+        Ok(())
+    }
+
     async fn check_move(&self, host: &str, tunnel: &str) -> Result<(), String> {
         let db = self.db.as_ref();
         let unreadable = |e: sea_orm::DbErr| {
@@ -4014,10 +4631,7 @@ impl TunnelMoveGuard for WaysIn {
             .map(|s| s.preview_domain)
             .unwrap_or_default();
         let mut names = vec![host.to_string()];
-        let label = host
-            .strip_suffix(&format!(".{}", preview_domain.trim_start_matches("*.")))
-            .filter(|label| !preview_domain.trim().is_empty() && !label.contains('.'))
-            .map(str::to_string);
+        let label = preview_label(host, &preview_domain);
         names.extend(label.clone());
         let mut env_ids: Vec<i32> = environment_domains::Entity::find()
             .filter(environment_domains::Column::Domain.is_in(names))
@@ -4063,5 +4677,150 @@ impl TunnelMoveGuard for WaysIn {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_wildcard_is_never_made_signed_in() {
+        let signed_in = AddressAudience::signed_in(GateKind::Temps, None);
+        let error = refuse_signed_in_wildcard("*.example.com", &signed_in)
+            .expect_err("a wildcard has no single callback host");
+        assert!(error.contains("*.example.com is a wildcard"), "{error}");
+        assert!(refuse_signed_in_wildcard("app.example.com", &signed_in).is_ok());
+        // Public and private wildcards are unchanged.
+        assert!(refuse_signed_in_wildcard("*.example.com", &AddressAudience::public()).is_ok());
+    }
+
+    /// An environment domain stored as the bare label under the preview
+    /// domain is the same address `gather` expands it to, so lookups by
+    /// address have to try the label too.
+    #[test]
+    fn preview_labels_round_trip_with_their_expansion() {
+        let preview = "apps.example.test";
+        let host = expand_environment_domain("shop", preview);
+        assert_eq!(preview_label(&host, preview).as_deref(), Some("shop"));
+        assert_eq!(
+            names_with_preview_labels(&[host.clone(), "other.example.com".into()], preview),
+            vec![host, "other.example.com".to_string(), "shop".to_string()]
+        );
+        // Deeper names, other domains and an unset preview domain have no
+        // label form.
+        assert_eq!(preview_label("a.shop.apps.example.test", preview), None);
+        assert_eq!(preview_label("shop.example.com", preview), None);
+        assert_eq!(preview_label("shop.apps.example.test", ""), None);
+        assert_eq!(
+            expand_environment_domain("Shop.Example.COM.", preview),
+            "shop.example.com"
+        );
+    }
+
+    /// ADR 065 D9: a Cloudflare Access address stays on its tunnel even
+    /// when its environment domain row holds only the label.
+    #[tokio::test]
+    async fn an_access_address_stored_as_a_label_is_not_moved_off_its_tunnel() {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            eprintln!("Docker/Postgres unavailable; skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let preview = "apps.example.test";
+        let server = temps_config::ServerConfig::new(
+            "127.0.0.1:0".to_string(),
+            test_db.database_url.clone(),
+            None,
+            None,
+        )
+        .expect("server config");
+        let config = Arc::new(ConfigService::new(Arc::new(server), db.clone()));
+        let mut settings = config.get_settings().await.expect("settings");
+        settings.preview_domain = preview.to_string();
+        config
+            .update_settings(settings)
+            .await
+            .expect("save settings");
+
+        let now = Utc::now();
+        let project = projects::ActiveModel {
+            name: Set("Access label".into()),
+            repo_name: Set("access-label".into()),
+            repo_owner: Set("owner".into()),
+            slug: Set("access-label".into()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/".into()),
+            main_branch: Set("main".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".into()),
+            slug: Set("production".into()),
+            subdomain: Set("access-label-production".into()),
+            host: Set(String::new()),
+            upstreams: Set(Default::default()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("environment");
+        environment_domains::ActiveModel {
+            environment_id: Set(environment.id),
+            domain: Set("shop".into()),
+            audience: Set(temps_entities::audience::SIGNED_IN.into()),
+            gate: Set(Some(
+                temps_entities::audience::GATE_CLOUDFLARE_ACCESS.into(),
+            )),
+            created_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("label-form environment domain");
+
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"),
+        );
+        let providers = Arc::new(temps_dns::DnsProviderService::new(
+            db.clone(),
+            encryption.clone(),
+        ));
+        let records = Arc::new(temps_dns::ManagedDnsRecordService::new(
+            db.clone(),
+            providers.clone(),
+            encryption.clone(),
+        ));
+        let ways_in = WaysIn {
+            db: db.clone(),
+            connectors: Arc::new(IngressConnectorService::new(
+                db.clone(),
+                encryption,
+                providers,
+                records,
+                Arc::new(temps_routes::CachedPeerTable::new(db.clone())),
+            )),
+            config,
+        };
+
+        let host = expand_environment_domain("shop", preview);
+        assert_eq!(
+            ways_in.check_move_off(&host).await,
+            Err(ACCESS_TUNNEL_ONLY.to_string())
+        );
+        assert_eq!(
+            ways_in.check_move_off("unrelated.example.com").await,
+            Ok(())
+        );
     }
 }

@@ -25,7 +25,7 @@ use crate::provider::{
     DnsIntent, TunnelContext, TunnelHandle, TunnelHealth, TunnelLink, TunnelProvider,
 };
 use crate::wire::{
-    Artifact, ContainerSpec, DriverChoice, NodeConnectorSpec, ProcessSpec, Readiness,
+    Artifact, ContainerSpec, DriverChoice, ForwardedJa4, NodeConnectorSpec, ProcessSpec, Readiness,
 };
 
 pub const KIND: &str = "cloudflare_tunnel";
@@ -294,7 +294,7 @@ impl CloudflareTunnelProvider {
         // One catch-all rule: the node's listener routes by Host.
         let body = json!({
             "config": {
-                "ingress": [ { "service": format!("http://127.0.0.1:{edge_port}") } ]
+                "ingress": tunnel_ingress_rules(edge_port, &[])
             }
         });
         self.call::<Value>(
@@ -450,6 +450,11 @@ impl TunnelProvider for CloudflareTunnelProvider {
             revision: String::new(),
             edge_port,
             client_address_header: Some("CF-Connecting-IP".into()),
+            // Cloudflare sends it with Bot Management's request headers.
+            client_ja4: Some(ForwardedJa4 {
+                header: "cf-ja4".into(),
+                source: "cloudflare".into(),
+            }),
             drivers,
             secrets,
         };
@@ -584,6 +589,56 @@ impl TunnelProvider for CloudflareTunnelProvider {
             .await?;
         Ok(())
     }
+}
+
+/// Whether Temps adds cloudflared's own Access check
+/// (`originRequest.access`) for Cloudflare Access addresses (ADR 065 D9).
+///
+/// Off: whether remotely managed tunnels accept `originRequest.access` in
+/// the configuration API could not be confirmed when this was built, and
+/// the listener verifies the Access JWT on every request either way, so
+/// nothing depends on it. Turning it on also needs the tunnel to be
+/// reconfigured when an address's Access app changes; today it is
+/// configured once, when it is created.
+pub const CLOUDFLARED_ORIGIN_ACCESS: bool = false;
+
+/// A hostname cloudflared should check Access for itself: the team name
+/// (`<team>` of `<team>.cloudflareaccess.com`) and the app's AUD tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginAccess {
+    pub hostname: String,
+    pub team_name: String,
+    pub aud: String,
+}
+
+/// The tunnel's ingress rules: with [`CLOUDFLARED_ORIGIN_ACCESS`] on, one
+/// rule per Access hostname with `originRequest.access`, so cloudflared
+/// refuses a request without a valid Access JWT before it reaches the
+/// node; then the catch-all, since the node's listener routes by Host.
+fn tunnel_ingress_rules(edge_port: u16, access: &[OriginAccess]) -> Vec<Value> {
+    let service = format!("http://127.0.0.1:{edge_port}");
+    let mut rules: Vec<Value> = if CLOUDFLARED_ORIGIN_ACCESS {
+        access
+            .iter()
+            .map(|a| {
+                json!({
+                    "hostname": a.hostname,
+                    "service": service,
+                    "originRequest": {
+                        "access": {
+                            "required": true,
+                            "teamName": a.team_name,
+                            "audTag": [a.aud],
+                        }
+                    }
+                })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    rules.push(json!({ "service": service }));
+    rules
 }
 
 /// `temps-<name>-<install>`: the install part keeps two installs that share
@@ -725,6 +780,28 @@ impl crate::registry::ProviderFactory for CloudflareTunnelFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_access_rules_are_off_and_the_catch_all_stays_last() {
+        let access = [OriginAccess {
+            hostname: "app.example.com".into(),
+            team_name: "team".into(),
+            aud: "aud-1".into(),
+        }];
+        let rules = tunnel_ingress_rules(8080, &access);
+        let last = rules.last().expect("a catch-all");
+        assert_eq!(last["service"], "http://127.0.0.1:8080");
+        assert!(last.get("hostname").is_none());
+        if CLOUDFLARED_ORIGIN_ACCESS {
+            assert_eq!(rules.len(), 2);
+            assert_eq!(rules[0]["hostname"], "app.example.com");
+            assert_eq!(rules[0]["originRequest"]["access"]["required"], true);
+            assert_eq!(rules[0]["originRequest"]["access"]["teamName"], "team");
+            assert_eq!(rules[0]["originRequest"]["access"]["audTag"][0], "aud-1");
+        } else {
+            assert_eq!(rules.len(), 1);
+        }
+    }
 
     #[test]
     fn tunnel_names_carry_the_install() {

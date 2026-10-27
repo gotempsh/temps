@@ -56,6 +56,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0005_shield_verdict",
         sql: include_str!("../../migrations/clickhouse/0005_shield_verdict.sql"),
     },
+    Migration {
+        name: "0006_ja4",
+        sql: include_str!("../../migrations/clickhouse/0006_ja4.sql"),
+    },
 ];
 
 /// SQL for the migration tracking table. Created on first run.

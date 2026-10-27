@@ -75,6 +75,14 @@ function renderPage(role: string) {
   )
 }
 
+// Only the provider list counts: the page also loads the Cloudflare Access
+// tokens card, which a provider delete does not refresh.
+function listFetches(api: ReturnType<typeof mockApi>) {
+  return api.calls.filter(
+    (c) => c.method === 'GET' && c.path === '/dns-providers'
+  ).length
+}
+
 async function openRowMenu(view: ReturnType<typeof render>) {
   const trigger = await view.findByLabelText('Open menu')
   await act(async () => {
@@ -137,7 +145,7 @@ test('a refused delete keeps the confirmation open and the list unrefreshed', as
   await waitFor(() =>
     expect(view.getByText('Delete DNS provider Example DNS?')).toBeTruthy()
   )
-  expect(api.calls.filter((c) => c.method === 'GET').length).toBe(1)
+  expect(listFetches(api)).toBe(1)
 
   // The failure is reported with the server's own reason, never as a success.
   expect(await view.findByText('Failed to delete DNS provider')).toBeTruthy()
@@ -170,9 +178,7 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   await waitFor(() =>
     expect(view.queryByText('Delete DNS provider Example DNS?')).toBeNull()
   )
-  await waitFor(() =>
-    expect(api.calls.filter((c) => c.method === 'GET').length).toBe(2)
-  )
+  await waitFor(() => expect(listFetches(api)).toBe(2))
   expect(
     await view.findByText('DNS provider deleted successfully')
   ).toBeTruthy()

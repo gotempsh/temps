@@ -105,6 +105,7 @@ import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { ReachableAfterDeploy } from '@/components/reachability/ReachableAfterDeploy'
+import { ReachabilityWarningBanner } from '@/components/reachability/ReachabilityWarningBanner'
 
 type BadgeVariant =
   'default' | 'secondary' | 'destructive' | 'success' | 'warning' | 'outline'
@@ -1571,11 +1572,18 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
 
         <DeployFailureReport project={project} deployment={deployment} />
 
+        <ReachabilityWarningBanner
+          warning={deployment.reachability_warning}
+          projectId={deployment.project_id}
+        />
+
         <ReachableAfterDeploy
           enabled={
             deployment.status === 'completed' &&
             project.hosting !== 'external' &&
-            project.source_type !== 'external'
+            project.source_type !== 'external' &&
+            // ADR 068 D5 already says it, with its fixes.
+            !deployment.reachability_warning
           }
           projectId={deployment.project_id}
           environmentId={deployment.environment_id}

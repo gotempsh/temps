@@ -603,6 +603,9 @@ fn strip_proxy_owned_response_headers(response: &mut ResponseHeader) {
     // used by managed monitors to decide whether a local TLS follow-up is safe.
     response.remove_header("X-Temps-Proxy-Https-Redirect");
     response.remove_header("X-Temps-Proxy-Probe-Capable");
+    // Monitors read `x-temps-gate` as the gate's own answer (ADR 065 D10),
+    // so no app, gated or not, may send it.
+    response.remove_header(temps_core::gate::GATE_HEADER);
 }
 
 fn deployment_asset_scope(
@@ -1110,9 +1113,18 @@ pub struct ProxyContext {
     /// The function the request is for, so a failed connect can tell the
     /// activator its instance is gone (the next request wakes it again).
     pub function_key: Option<temps_workload_activator::ActivationKey>,
+    /// The host is a signed-in address (ADR 065 D8): the app's response may
+    /// not set the gate's cookies or pass for the gate.
+    pub gated_host: bool,
+    /// Who the gate admitted, for a signed-in address.
+    pub gate_identity: Option<temps_core::gate::GateClaims>,
     /// What the Shield reputation lists say about the client (ADR 066 D1),
     /// when one holds it. Phase 2 only records it with the request log.
     pub shield: Option<temps_shield::Verdict>,
+    /// The client's JA4 and where it came from (ADR 066 D4), resolved with
+    /// the client address. Recorded with the request log; nothing acts on
+    /// it yet.
+    pub client_fingerprint: Option<temps_shield::ja4::ClientFingerprint>,
 }
 
 impl ProxyContext {
@@ -1121,6 +1133,18 @@ impl ProxyContext {
         self.shield
             .as_ref()
             .map(|verdict| verdict.action.as_str().to_string())
+    }
+
+    /// The JA4 as the request log stores it.
+    fn ja4(&self) -> Option<String> {
+        self.client_fingerprint
+            .and_then(|fingerprint| fingerprint.ja4)
+            .map(|ja4| ja4.to_string())
+    }
+
+    fn ja4_source(&self) -> Option<String> {
+        self.client_fingerprint
+            .map(|fingerprint| fingerprint.source.as_str().to_string())
     }
 
     fn shield_reasons(&self) -> Vec<String> {
@@ -1164,6 +1188,9 @@ pub struct LoadBalancer {
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     trust_loopback_forwarded_ip: Arc<AtomicBool>,
+    /// The header a trusted loopback proxy sends the visitor's JA4 in
+    /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
+    loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// Wakes scale-to-zero functions on their first request (ADR-055
     /// phase 10). `None`, or no function routed: one `ArcSwap` load per
@@ -1234,6 +1261,9 @@ pub struct LoadBalancer {
     /// `crate::console_unavailable`. `None` in split topology (`temps proxy`),
     /// where the console is another process this one cannot observe.
     console_unavailable: Option<Arc<crate::console_unavailable::ConsoleUnavailableResponder>>,
+    /// The signed-in gate (ADR 065 D8). `None` only in test harnesses that
+    /// never serve a signed-in address; `setup_proxy_server` always sets it.
+    gate: Option<Arc<crate::handler::gate::ProxyGate>>,
 }
 
 /// Status recorded in proxy logs when the client disconnected before a
@@ -1404,6 +1434,7 @@ impl LoadBalancer {
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
+            loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
             on_demand_manager: None,
             activator: None,
             on_demand_cert_manager: None,
@@ -1417,6 +1448,90 @@ impl LoadBalancer {
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
             upstream_failures: Default::default(),
             console_unavailable: None,
+            gate: None,
+        }
+    }
+
+    /// Enforce the signed-in gate (ADR 065 D8) for hosts the route table
+    /// marks `signed_in`. Hosts without a gate are not affected.
+    pub fn with_gate(mut self, gate: Arc<crate::handler::gate::ProxyGate>) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    /// Run the signed-in gate for this request. `Some(true)` when the gate
+    /// answered it; `None` when the host has no gate or the visitor is
+    /// admitted (identity headers set, gate cookies removed).
+    async fn enforce_gate(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<Option<bool>> {
+        let Some(gate) = self.gate.as_ref() else {
+            return Ok(None);
+        };
+        let hostname = crate::handler::gate::gate_hostname(&ctx.host);
+        let Some(policy) = gate.policy_for(&hostname) else {
+            return Ok(None);
+        };
+        ctx.gated_host = true;
+        // ACME HTTP-01 first, as on the agent: a signed-in address must still
+        // get and renew its certificate, and Let's Encrypt never signs in.
+        // Only a challenge stored for this host is answered; any other path
+        // under the prefix meets the gate, so the prefix is no way past it.
+        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            if let Some(key_authorization) = self
+                .handle_acme_http_challenge(&ctx.host, &ctx.path)
+                .await?
+            {
+                let body = Bytes::from(key_authorization);
+                let mut resp = ResponseHeader::build(200, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Cache-Control", "no-cache")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(body), true).await?;
+                ctx.routing_status = "acme_challenge".to_string();
+                return Ok(Some(true));
+            }
+        }
+        // An operator who turned the HTTPS redirect off terminates TLS in
+        // front of this listener; sending the visitor to HTTPS again would
+        // loop. Either way the gate runs: this only picks the redirect.
+        let secure = self.is_https_request(session) || self.disable_https_redirect;
+        let outcome = {
+            let header = session.req_header();
+            let request = temps_core::gate::GateRequest {
+                hostname: &hostname,
+                method: &header.method,
+                path: header.uri.path(),
+                query: header.uri.query(),
+                headers: &header.headers,
+                secure,
+                // Tunnels end at a worker's tunnel origin, never here.
+                via_tunnel: false,
+            };
+            gate.evaluate(&policy, &request, temps_core::gate::unix_now())
+                .await
+        };
+        match outcome {
+            crate::handler::gate::GateOutcome::Admit(claims) => {
+                crate::handler::gate::admit(session.req_header_mut(), &claims)?;
+                ctx.gate_identity = Some(claims);
+                Ok(None)
+            }
+            crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
+                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), body.is_none())
+                    .await?;
+                if let Some(body) = body {
+                    session.write_response_body(Some(body), true).await?;
+                }
+                ctx.routing_status = routing_status.to_string();
+                Ok(Some(true))
+            }
         }
     }
 
@@ -1478,6 +1593,15 @@ impl LoadBalancer {
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
     pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.trust_loopback_forwarded_ip = enabled;
+        self
+    }
+
+    /// The header a trusted loopback proxy sends the visitor's JA4 in.
+    pub fn with_loopback_ja4_header(
+        mut self,
+        header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
+    ) -> Self {
+        self.loopback_ja4_header = header;
         self
     }
 
@@ -1782,6 +1906,8 @@ impl LoadBalancer {
                 error_group_id: None,
                 shield_verdict: ctx.shield_verdict(),
                 shield_reasons: ctx.shield_reasons(),
+                ja4: ctx.ja4(),
+                ja4_source: ctx.ja4_source(),
             };
 
             // Non-blocking enqueue; shed with rate-limited accounting when full.
@@ -1843,6 +1969,8 @@ impl LoadBalancer {
     /// clearance to it together with the client's /24 or /64 and the
     /// User-Agent (ADR 066, D3), so it must not contain the full address.
     fn extract_tls_info(&self, session: &PingoraSession, ctx: &mut ProxyContext) {
+        // The JA4 this ingress computed for the connection, if it ended TLS.
+        let mut direct_ja4 = None;
         // Access SSL digest from the downstream session's digest
         // digest() returns Option<&Digest>, and Digest contains ssl_digest: Option<Arc<SslDigest>>
         if let Some(digest) = session.downstream_session.digest() {
@@ -1873,6 +2001,7 @@ impl LoadBalancer {
                         "SNI hostname from TLS extension: {} for request_id={}",
                         ext_data.sni_hostname, ctx.request_id
                     );
+                    direct_ja4 = ext_data.ja4;
                 }
 
                 let version: &str = ssl_digest.version.as_ref();
@@ -1893,6 +2022,17 @@ impl LoadBalancer {
                 ctx.request_id
             );
         }
+
+        ctx.client_fingerprint = Some(resolve_client_fingerprint(
+            session
+                .client_addr()
+                .and_then(|address| address.as_inet())
+                .map(|address| address.ip()),
+            &session.req_header().headers,
+            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
+            self.loopback_ja4_header.load().as_deref(),
+            direct_ja4,
+        ));
     }
 
     /// Resolve visitor and session identifiers from cookies — entirely in-process,
@@ -2558,7 +2698,7 @@ impl LoadBalancer {
         header.remove_header("cookie");
         header.remove_header("authorization");
         header.remove_header("x-forwarded-host");
-        strip_untrusted_client_ip_headers(header);
+        strip_untrusted_client_ip_headers(header, self.loopback_ja4_header.load().as_deref());
         if let Some(ip) = ctx.ip_address.as_deref() {
             header.insert_header("X-Forwarded-For", ip)?;
         } else {
@@ -2915,6 +3055,8 @@ impl LoadBalancer {
                 error_group_id: None,
                 shield_verdict: ctx.shield_verdict(),
                 shield_reasons: ctx.shield_reasons(),
+                ja4: ctx.ja4(),
+                ja4_source: ctx.ja4_source(),
             };
 
             // Stash rather than send: the `logging` hook fires after the
@@ -3040,6 +3182,8 @@ impl LoadBalancer {
             error_group_id: None,
             shield_verdict: ctx.shield_verdict(),
             shield_reasons: ctx.shield_reasons(),
+            ja4: ctx.ja4(),
+            ja4_source: ctx.ja4_source(),
         };
 
         // Non-blocking enqueue; shed with rate-limited accounting when full.
@@ -4170,6 +4314,58 @@ fn resolve_session_client_ip(
 
     // --- Direct connection: use peer address ---
     Some(peer.to_string())
+}
+
+const CF_JA4: axum::http::HeaderName = axum::http::HeaderName::from_static("cf-ja4");
+const CDN_JA4: axum::http::HeaderName = axum::http::HeaderName::from_static("cdn-ja4");
+
+/// The client's JA4 by the same trust chain as its address (ADR 066 D4).
+///
+/// A proxy that ends TLS in front of temps shows temps its own ClientHello,
+/// so behind one the JA4 can only come from that proxy's header, and a
+/// missing header means none: a proxy's JA4 is never taken for the
+/// visitor's. Headers are honoured only from the peers that set them, and
+/// only in the exact JA4 format; [`strip_untrusted_client_ip_headers`]
+/// removes them before the request goes upstream.
+///
+/// A trusted local proxy's header is the one the platform settings name
+/// (`loopback_ja4_header`); with none set, a local proxy gives no JA4.
+/// Temps edges and the PROXY protocol come in later steps of phase 3.
+fn resolve_client_fingerprint(
+    peer: Option<std::net::IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trust_loopback_forwarded_ip: bool,
+    loopback_ja4_header: Option<&axum::http::HeaderName>,
+    direct: Option<temps_shield::ja4::Ja4>,
+) -> temps_shield::ja4::ClientFingerprint {
+    use temps_shield::ja4::{ClientFingerprint, Ja4, Ja4Source};
+
+    let forwarded = |name: &axum::http::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(Ja4::parse_forwarded)
+    };
+    let (ja4, source) = match peer {
+        Some(peer)
+            if crate::client_ip::resolve_loopback_client_ip(
+                peer,
+                headers,
+                trust_loopback_forwarded_ip,
+            )
+            .is_some() =>
+        {
+            (loopback_ja4_header.and_then(forwarded), Ja4Source::Local)
+        }
+        Some(peer) if crate::cloudflare_ips::CLOUDFLARE_TRUST.is_cloudflare(peer) => {
+            (forwarded(&CF_JA4), Ja4Source::Cloudflare)
+        }
+        Some(peer) if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) => {
+            (forwarded(&CDN_JA4), Ja4Source::Bunny)
+        }
+        Some(_) | None => (direct, Ja4Source::Direct),
+    };
+    ClientFingerprint { ja4, source }
 }
 
 /// Selects the upstream read/write/idle timeout for a proxied request.
@@ -5418,7 +5614,10 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
 /// an app, so an app that reads `Tailscale-User-Login` cannot be fed one
 /// through a public way in. Collecting the names allocates only when the
 /// request carries one.
-fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
+fn strip_untrusted_client_ip_headers(
+    request: &mut RequestHeader,
+    loopback_ja4_header: Option<&axum::http::HeaderName>,
+) {
     request.remove_header("forwarded");
     request.remove_header("x-real-ip");
     request.remove_header("cf-connecting-ip");
@@ -5430,6 +5629,15 @@ fn strip_untrusted_client_ip_headers(request: &mut RequestHeader) {
         .collect();
     for name in identity {
         request.remove_header(&name);
+    }
+    // The JA4 headers of D4 (ADR 066): the CDNs', the temps edge's and the
+    // one a trusted local proxy is configured to send. An app never sees a
+    // JA4 header a visitor could have written.
+    for name in temps_shield::ja4::FORWARDED_JA4_HEADERS {
+        request.remove_header(name);
+    }
+    if let Some(name) = loopback_ja4_header {
+        request.remove_header(name);
     }
 }
 
@@ -6086,6 +6294,26 @@ mod https_redirect_tests {
             .is_none());
     }
 
+    /// ADR 065 D10: a monitor takes `x-temps-gate` for the gate's own
+    /// answer, so an app on any host, gated or not, cannot send it.
+    #[test]
+    fn application_cannot_pass_for_the_gate() {
+        let mut response = ResponseHeader::build(500, None).expect("build application response");
+        response
+            .insert_header(
+                temps_core::gate::GATE_HEADER,
+                temps_core::gate::GATE_SIGN_IN,
+            )
+            .expect("insert spoofed gate answer");
+
+        strip_proxy_owned_response_headers(&mut response);
+
+        assert!(response
+            .headers
+            .get(temps_core::gate::GATE_HEADER)
+            .is_none());
+    }
+
     #[test]
     fn default_behaviour_follows_certificate_presence() {
         // No per-environment override → the pre-existing heuristic is unchanged:
@@ -6294,7 +6522,10 @@ impl ProxyHttp for LoadBalancer {
             preview_route: None,
             preview_on_worker: false,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
+            client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -6532,6 +6763,10 @@ impl ProxyHttp for LoadBalancer {
         // honored by downstream auth middleware.
         let _ = session.req_header_mut().remove_header("X-Temps-Demo-Mode");
 
+        // SECURITY: only the signed-in gate tells an app who is signed in
+        // (ADR 065 D8); a client's own identity headers never get through.
+        crate::handler::gate::strip_client_identity(session.req_header_mut());
+
         // SECURITY: only the status-host branch below may tag a request with
         // the custom hostname it was served for (#1412).
         let _ = session
@@ -6595,6 +6830,12 @@ impl ProxyHttp for LoadBalancer {
                     return Ok(true);
                 }
             }
+        }
+
+        // Signed-in addresses (ADR 065 D8): the gate answers before anything
+        // can reach the app, including waking a sleeping environment.
+        if let Some(handled) = self.enforce_gate(session, ctx).await? {
+            return Ok(handled);
         }
 
         // On-demand: check if this host maps to a sleeping environment.
@@ -8053,7 +8294,10 @@ impl ProxyHttp for LoadBalancer {
         // complete trusted X-Forwarded-* set below from the already-
         // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
         // possibly-spoofed client-supplied header instead.
-        strip_untrusted_client_ip_headers(session.req_header_mut());
+        strip_untrusted_client_ip_headers(
+            session.req_header_mut(),
+            self.loopback_ja4_header.load().as_deref(),
+        );
 
         // Browsers split cookies across several fields over HTTP/2; the
         // upstream must receive them as one `Cookie` header or it keeps only
@@ -8490,6 +8734,9 @@ impl ProxyHttp for LoadBalancer {
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
         strip_proxy_owned_response_headers(upstream_response);
+        if ctx.gated_host {
+            crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
+        }
         upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
 
         // First upstream header = backend latency (connect + upstream time).
@@ -8757,6 +9004,10 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        // ADR 065 D8: no app receives the gate's cookies, admitted or not,
+        // gated host or not. A cookie left from before an address stopped
+        // being signed-in is still a token.
+        crate::handler::gate::strip_gate_cookies(upstream_request)?;
         // A stripping path route forwards `/api/users` as `/users` and tells
         // the target where it is mounted, for apps that build absolute URLs.
         // Only the platform sets that header on routed requests: a client
@@ -9755,7 +10006,10 @@ mod markdown_tests {
             preview_route: None,
             preview_on_worker: false,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
+            client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -10296,7 +10550,10 @@ mod markdown_pipeline_tests {
             preview_route: None,
             preview_on_worker: false,
             path_route: None,
+            gated_host: false,
+            gate_identity: None,
             shield: None,
+            client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
             streaming_session: false,
@@ -11622,7 +11879,7 @@ mod forwarded_authority_tests {
             .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
             .expect("unrelated test header must be valid");
 
-        strip_untrusted_client_ip_headers(&mut request);
+        strip_untrusted_client_ip_headers(&mut request, None);
 
         assert!(!request.headers.contains_key("forwarded"));
         assert_eq!(
@@ -11649,7 +11906,7 @@ mod forwarded_authority_tests {
             .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
             .expect("unrelated test header must be valid");
 
-        strip_untrusted_client_ip_headers(&mut request);
+        strip_untrusted_client_ip_headers(&mut request, None);
 
         assert!(!request.headers.contains_key("x-real-ip"));
         assert!(!request.headers.contains_key("cf-connecting-ip"));
@@ -11680,9 +11937,55 @@ mod forwarded_authority_tests {
             .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
             .expect("unrelated test header must be valid");
 
-        strip_untrusted_client_ip_headers(&mut request);
+        strip_untrusted_client_ip_headers(&mut request, None);
 
         assert_eq!(request.headers.len(), 1, "{:?}", request.headers);
+        assert_eq!(
+            request.headers.get("x-unrelated"),
+            Some(&HeaderValue::from_static("preserved"))
+        );
+    }
+
+    /// The CDN, edge and configured local JA4 headers are only read from the
+    /// peers that set them, and an app never sees one a visitor could have
+    /// written.
+    #[test]
+    fn removes_client_supplied_ja4_headers() {
+        let names = [
+            "cf-ja4",
+            "cdn-ja4",
+            "cloudfront-viewer-ja4-fingerprint",
+            "x-temps-edge-client",
+            "x-ja4",
+        ];
+        assert!(temps_shield::ja4::FORWARDED_JA4_HEADERS
+            .iter()
+            .all(|name| names.contains(name)));
+        let mut request =
+            RequestHeader::build("GET", b"/", Some(2)).expect("test request header must be valid");
+        for name in names {
+            request
+                .insert_header(
+                    name,
+                    HeaderValue::from_static("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+                )
+                .expect("JA4 test header must be valid");
+        }
+        request
+            .insert_header("x-unrelated", HeaderValue::from_static("preserved"))
+            .expect("unrelated test header must be valid");
+
+        strip_untrusted_client_ip_headers(
+            &mut request,
+            Some(&axum::http::HeaderName::from_static("x-ja4")),
+        );
+
+        for name in names {
+            assert!(
+                !request.headers.contains_key(name),
+                "{name} must be removed"
+            );
+        }
         assert_eq!(
             request.headers.get("x-unrelated"),
             Some(&HeaderValue::from_static("preserved"))
@@ -12641,6 +12944,105 @@ mod status_page_host_tests {
         Ok(())
     }
 
+    /// A signed-in address served by this proxy still gets and renews its
+    /// certificate (ADR 065 D8): Let's Encrypt never signs in, so a stored
+    /// HTTP-01 challenge is answered before the gate. Any other path under
+    /// the prefix still meets the gate.
+    #[tokio::test]
+    async fn a_signed_in_host_still_answers_its_acme_challenge_over_http() -> Result<()> {
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_core::gate::{GateKind, GatePolicy, TempsGate};
+
+        const GATED: &str = "app.example.com";
+        let Some(mut h) = harness(None, false).await? else {
+            return Ok(());
+        };
+        let db = h._db.connection_arc().clone();
+        let now = chrono::Utc::now();
+        temps_entities::domains::ActiveModel {
+            domain: Set(GATED.to_string()),
+            status: Set("pending".to_string()),
+            http_challenge_token: Set(Some("challenge-token".to_string())),
+            http_challenge_key_authorization: Set(Some("challenge-token.thumbprint".to_string())),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        h.route_table.insert_route_for_test(
+            GATED,
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::Upstream {
+                    backends: vec![temps_routes::BackendEntry {
+                        address: "127.0.0.1:2".to_string(),
+                        container_id: None,
+                        container_name: None,
+                    }],
+                    round_robin_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: None,
+                environment: None,
+                deployment: None,
+                cert_eligible: true,
+            },
+        );
+        let key = temps_core::gate::generate_signing_key()?;
+        h.route_table.insert_gate_policy_for_test(
+            GATED,
+            GatePolicy {
+                address_id: "custom:7".into(),
+                gate: GateKind::Temps,
+                temps: Some(TempsGate {
+                    public_key: temps_core::gate::encode_public_key(&key.verifying_key()),
+                    authorize_url: "https://console.example.com/_temps/gate/authorize".into(),
+                    not_before: 0,
+                    revoked: vec![],
+                }),
+                access: None,
+            },
+        );
+        let service = Arc::new(temps_routes::gate::GateService::new(
+            db,
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "gate-test",
+            )),
+        ));
+        h.lb =
+            h.lb.with_gate(Arc::new(crate::handler::gate::ProxyGate::new(
+                h.route_table.clone(),
+                service,
+            )));
+
+        match send(
+            &h,
+            &get("/.well-known/acme-challenge/challenge-token", GATED),
+        )
+        .await?
+        {
+            Outcome::Answered { head, body } => {
+                assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+                assert_eq!(body, "challenge-token.thumbprint");
+            }
+            Outcome::Forwarded { path, .. } => panic!("the challenge must be answered: {path}"),
+        }
+        // No stored challenge: the gate answers, never the app.
+        for path in ["/.well-known/acme-challenge/other-token", "/"] {
+            match send(&h, &get(path, GATED)).await? {
+                Outcome::Answered { head, body } => {
+                    assert!(!head.starts_with("HTTP/1.1 200"), "{path}: {head}");
+                    assert!(!body.contains("thumbprint"), "{path}: {body}");
+                }
+                Outcome::Forwarded { path, .. } => panic!("{path} must meet the gate"),
+            }
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn without_an_ingress_listener_the_host_fails_closed() -> Result<()> {
         let Some(h) = harness(None, true).await? else {
@@ -13223,5 +13625,137 @@ mod static_path_route_redirect_tests {
         assert_eq!(outcome, StaticFileServeOutcome::Redirected, "{head}");
         assert_eq!(location, "/docs/other");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod client_fingerprint_tests {
+    use super::resolve_client_fingerprint;
+    use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use std::net::IpAddr;
+    use temps_shield::ja4::{Ja4, Ja4Source};
+
+    const SPEC_JA4: &str = "t13d1516h2_8daaf6152771_e5627efa2ab1";
+    const CURL_JA4: &str = "t13d3012h2_1d37bd780c83_882d495ac381";
+
+    fn ja4(text: &str) -> Ja4 {
+        Ja4::parse_forwarded(text).expect("test JA4 must be valid")
+    }
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().expect("test address must be valid")
+    }
+
+    fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_static(value));
+        }
+        map
+    }
+
+    fn resolve(
+        peer: &str,
+        pairs: &[(&'static str, &'static str)],
+        trust_loopback: bool,
+    ) -> (Option<String>, Ja4Source) {
+        let local = HeaderName::from_static("x-ja4");
+        let fingerprint = resolve_client_fingerprint(
+            Some(ip(peer)),
+            &headers(pairs),
+            trust_loopback,
+            Some(&local),
+            Some(ja4(CURL_JA4)),
+        );
+        (fingerprint.ja4.map(|j| j.to_string()), fingerprint.source)
+    }
+
+    /// Behind Cloudflare the TLS client is Cloudflare, so its `cf-ja4` is
+    /// the visitor's and the computed one is not; a malformed header gives
+    /// no JA4 rather than Cloudflare's own.
+    #[test]
+    fn cloudflare_peers_supply_the_ja4() {
+        assert_eq!(
+            resolve("173.245.48.1", &[("cf-ja4", SPEC_JA4)], false),
+            (Some(SPEC_JA4.into()), Ja4Source::Cloudflare)
+        );
+        assert_eq!(
+            resolve("173.245.48.1", &[("cf-ja4", "not a ja4")], false),
+            (None, Ja4Source::Cloudflare)
+        );
+        assert_eq!(
+            resolve("173.245.48.1", &[], false),
+            (None, Ja4Source::Cloudflare)
+        );
+    }
+
+    #[test]
+    fn bunny_peers_supply_the_ja4() {
+        assert_eq!(
+            resolve("185.152.66.1", &[("cdn-ja4", SPEC_JA4)], false),
+            (Some(SPEC_JA4.into()), Ja4Source::Bunny)
+        );
+        // Bunny's peers are not trusted for Cloudflare's header.
+        assert_eq!(
+            resolve("185.152.66.1", &[("cf-ja4", SPEC_JA4)], false),
+            (None, Ja4Source::Bunny)
+        );
+    }
+
+    /// Anyone else is the TLS client: the computed JA4 counts, and the
+    /// headers they wrote do not.
+    #[test]
+    fn direct_clients_get_the_computed_ja4() {
+        assert_eq!(
+            resolve(
+                "8.8.8.8",
+                &[("cf-ja4", SPEC_JA4), ("cdn-ja4", SPEC_JA4)],
+                false
+            ),
+            (Some(CURL_JA4.into()), Ja4Source::Direct)
+        );
+        assert_eq!(
+            resolve_client_fingerprint(None, &HeaderMap::new(), false, None, None).source,
+            Ja4Source::Direct
+        );
+    }
+
+    /// A trusted local proxy terminated the visitor's TLS, so the computed
+    /// JA4 is the proxy's: only the configured header counts, and without
+    /// it none is known. Untrusted loopback is direct.
+    #[test]
+    fn trusted_loopback_peers_supply_the_configured_header() {
+        assert_eq!(
+            resolve(
+                "127.0.0.1",
+                &[("x-forwarded-for", "8.8.8.8"), ("x-ja4", SPEC_JA4)],
+                true
+            ),
+            (Some(SPEC_JA4.into()), Ja4Source::Local)
+        );
+        assert_eq!(
+            resolve("127.0.0.1", &[("x-forwarded-for", "8.8.8.8")], true),
+            (None, Ja4Source::Local)
+        );
+        // Another proxy's header is not the configured one.
+        assert_eq!(
+            resolve("127.0.0.1", &[("cf-ja4", SPEC_JA4)], true),
+            (None, Ja4Source::Local)
+        );
+        let unconfigured = resolve_client_fingerprint(
+            Some(ip("127.0.0.1")),
+            &headers(&[("x-ja4", SPEC_JA4)]),
+            true,
+            None,
+            Some(ja4(CURL_JA4)),
+        );
+        assert_eq!(
+            (unconfigured.ja4, unconfigured.source),
+            (None, Ja4Source::Local)
+        );
+        assert_eq!(
+            resolve("127.0.0.1", &[("x-ja4", SPEC_JA4)], false),
+            (Some(CURL_JA4.into()), Ja4Source::Direct)
+        );
     }
 }

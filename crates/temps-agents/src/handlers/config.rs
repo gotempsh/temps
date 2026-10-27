@@ -67,6 +67,13 @@ impl From<AgentError> for Problem {
             AgentError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
+            // 400 like every other rejected request-body field, and like the
+            // sibling error-group checks in the trigger and workflow
+            // handlers. Its message never says whether the group exists in
+            // another project.
+            AgentError::InvalidErrorGroup { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Error Group")
+                .with_detail(error.to_string()),
             AgentError::ImmutableSandboxImageRebuild { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Immutable Sandbox Image")

@@ -39,6 +39,29 @@ pub struct Model {
     /// For a `private` address: the listener address DNS points at.
     #[serde(default)]
     pub private_listener: Option<String>,
+    /// For a `signed_in` address (ADR 065 D7): `temps` or
+    /// `cloudflare_access`. Null on every other address.
+    #[serde(default)]
+    pub gate: Option<String>,
+    /// For a `signed_in` address with the Temps gate: the teams and users
+    /// that may sign in, `{"teams": [..], "users": [..]}`. Null means every
+    /// user with access to the project.
+    #[serde(default)]
+    pub gate_allow: Option<Json>,
+    /// Gate tokens issued before this time are refused (ADR 065 D8).
+    #[serde(default)]
+    pub gate_not_before: Option<DBDateTime>,
+    /// For a `cloudflare_access` gate (ADR 065 D9): the Access token
+    /// provider whose app stands in front of the address.
+    #[serde(default)]
+    pub gate_access_provider_id: Option<i32>,
+    /// That Access app's id at Cloudflare.
+    #[serde(default)]
+    pub gate_access_app_id: Option<String>,
+    /// That Access app's AUD tag: what a listener checks a JWT's `aud`
+    /// against.
+    #[serde(default)]
+    pub gate_access_aud: Option<String>,
     /// How a `private` address is served (ADR 065 D1): `listener`,
     /// `tailscale_serve` or `tailscale_service` ([`crate::audience::via`]).
     /// Set exactly when the audience is private; a check enforces it.

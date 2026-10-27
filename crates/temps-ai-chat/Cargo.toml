@@ -56,8 +56,10 @@ zip = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 # Text layer of uploaded PDFs; the parse is isolated (blocking pool, timeout,
-# panic guard) because the input is untrusted.
-pdf-extract = "0.12"
+# panic guard) because the input is untrusted. Used directly rather than via
+# pdf-extract, which pins lopdf 0.42 and with it the unmaintained ttf-parser
+# (RUSTSEC-2026-0192). Default features (clock, rayon) are not needed to read.
+lopdf = { version = "0.46", default-features = false }
 unicode-normalization = "0.1"
 unicode-casefold = "0.2"
 url = { workspace = true }

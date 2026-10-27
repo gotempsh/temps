@@ -28,7 +28,11 @@ import {
   type PlatformSettings,
 } from '@/hooks/useSettings'
 import { client } from '@/api/client/client.gen'
-import { getPublicIngressStatusQueryKey } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getPreviewDomainStatusQueryKey,
+  getPublicIngressStatusQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { PreviewDomainStatus } from '@/components/settings/PreviewDomainStatus'
 import {
   AlertTriangle,
   Loader2,
@@ -227,6 +231,9 @@ export function Settings() {
       await queryClient.invalidateQueries({
         queryKey: getPublicIngressStatusQueryKey(),
       })
+      await queryClient.invalidateQueries({
+        queryKey: getPreviewDomainStatusQueryKey(),
+      })
       toast.success('Settings saved successfully')
     } catch {
       // useUpdateSettings already toasts this failure, with the server's reason.
@@ -344,6 +351,7 @@ export function Settings() {
                 Deployments will be accessible at subdomain.
                 {settings?.preview_domain || 'localho.st'}
               </p>
+              <PreviewDomainStatus />
             </div>
             <SettingsSection
               title="Advanced networking"

@@ -27,9 +27,13 @@ pub mod ai_user_preferences;
 pub mod alarms;
 pub mod analytics_ingest_keys;
 pub mod audience;
+// Signed-in addresses (ADR 065 D8).
 pub mod autofix_incident_events;
 pub mod autofix_incidents;
 pub mod cross_project_trace_refs;
+pub mod gate_codes;
+pub mod gate_keys;
+pub mod gate_sessions;
 // Agent entities (renamed from autopilot)
 pub mod agent_run_logs;
 pub mod agent_runs;
@@ -60,6 +64,7 @@ pub mod cloud_telemetry_bulk_jobs;
 pub mod cloud_telemetry_fidelity;
 pub mod cloud_telemetry_outbox;
 pub mod cloud_telemetry_write_mode;
+pub mod cloudflare_access_providers;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;

@@ -42,6 +42,10 @@ import {
   CloudflareTokenGuide,
 } from '@/components/domains/CloudflareTokenGuide'
 import { TunnelHostnames } from '@/components/domains/TunnelHostnames'
+import {
+  TunnelEnvironmentHosts,
+  WithdrawnEnvironmentHosts,
+} from '@/components/domains/TunnelEnvironmentHosts'
 import { TunnelLinks } from '@/components/nodes/TunnelLinks'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -267,6 +271,7 @@ export function WorkerTunnels({
               </>
             )}
             <TunnelHostnames connector={connector} />
+            <TunnelEnvironmentHosts connector={connector} />
           </div>
         )
       })}
@@ -371,8 +376,14 @@ export function WorkerTunnels({
         resourceType="tunnel"
         resourceName={deleting?.name ?? ''}
         consequences={
-          deleting &&
-          `Apps under ${deleting.domain} stop being reachable through it, on every worker that runs it. Temps removes the tunnel and its DNS records at ${providerName(deleting.provider)}.`
+          deleting && (
+            <div className="space-y-2">
+              <p>
+                {`Apps under ${deleting.domain} stop being reachable through it, on every worker that runs it. Temps removes the tunnel and its DNS records at ${providerName(deleting.provider)}.`}
+              </p>
+              <WithdrawnEnvironmentHosts connector={deleting} />
+            </div>
+          )
         }
         onConfirm={() =>
           deleting && remove.mutate({ path: { id: deleting.id } })

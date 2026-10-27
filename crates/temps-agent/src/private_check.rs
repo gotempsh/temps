@@ -295,6 +295,7 @@ mod tests {
                 deployment_id: None,
                 project_id: None,
                 environment_id: None,
+                gate: None,
             },
             address_id: "custom:7".into(),
             range: "127.0.0.0/8".into(),

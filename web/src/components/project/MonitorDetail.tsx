@@ -429,9 +429,16 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
               <div className="text-2xl font-bold capitalize">
                 {currentStatus === 'major_outage'
                   ? 'Major Outage'
-                  : currentStatus}
+                  : currentStatus === 'no_address'
+                    ? 'Nothing to check'
+                    : currentStatus}
               </div>
             </div>
+            {currentStatus === 'no_address' && (
+              <p className="text-xs text-muted-foreground mt-1">
+                Nothing to check: nobody can reach this environment yet.
+              </p>
+            )}
             <p className="text-xs text-muted-foreground mt-1">
               Last checked{' '}
               {new Date(

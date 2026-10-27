@@ -3308,6 +3308,36 @@ impl ExternalServiceManager {
     // Remote-node helpers
     // -----------------------------------------------------------------------
 
+    /// The address the control plane dials to reach a standalone service on
+    /// a worker node: the node's data address, where the worker's agent
+    /// publishes the service's host port (see `nodes::Model::data_address`).
+    ///
+    /// `None` for a service on the control plane (no node, or node 0). A
+    /// worker that has no node record is an error rather than `None`, because
+    /// falling back to the stored loopback host would reach the control plane,
+    /// and possibly an unrelated service there on the same port.
+    pub async fn worker_data_address(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<Option<String>, ExternalServiceError> {
+        let Some(node_id) = service
+            .node_id
+            .filter(|id| *id != Self::CONTROL_PLANE_NODE_ID)
+        else {
+            return Ok(None);
+        };
+        let node = nodes::Entity::find_by_id(node_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Service {} ({}) is placed on node {}, which has no node record",
+                    service.id, service.name, node_id
+                ),
+            })?;
+        Ok(Some(node.data_address().to_string()))
+    }
+
     /// Look up a node by ID and return a `RemoteServiceClient` ready to call
     /// the agent's service endpoints.
     async fn get_remote_client(
@@ -7742,45 +7772,6 @@ echo "[restore] Pre-seed complete"
                 ),
             })?;
         Ok(result.exit_code)
-    }
-
-    /// The address the control plane dials to reach a standalone service that
-    /// runs on a worker node.
-    ///
-    /// A worker publishes a managed service's port on its own data address
-    /// (never on all interfaces), while the stored connection parameters keep
-    /// the host the service was created with, `localhost`. From the control
-    /// plane that loopback address is its own host, where nothing listens.
-    /// Returns `None` for services on the control plane (no node, or node 0)
-    /// and for clusters, whose members carry their own endpoints.
-    pub async fn worker_data_address(
-        &self,
-        service_id: i32,
-    ) -> Result<Option<String>, ExternalServiceError> {
-        let service = self.get_service(service_id).await?;
-        // Node 0 is the control plane itself, like no node at all.
-        let Some(node_id) = service
-            .node_id
-            .filter(|node_id| *node_id != 0 && service.topology != "cluster")
-        else {
-            return Ok(None);
-        };
-        let node = nodes::Entity::find_by_id(node_id)
-            .one(self.db.as_ref())
-            .await
-            .map_err(|error| ExternalServiceError::DatabaseError {
-                reason: format!(
-                    "Failed to resolve node {} hosting service {} '{}': {}",
-                    node_id, service_id, service.name, error
-                ),
-            })?
-            .ok_or_else(|| ExternalServiceError::InternalError {
-                reason: format!(
-                    "Service {} '{}' is placed on node {}, which was not found",
-                    service_id, service.name, node_id
-                ),
-            })?;
-        Ok(Some(node.data_address().to_string()))
     }
 
     /// Get the primary data node's connection address for a cluster service.

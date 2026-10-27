@@ -6,6 +6,7 @@ import type { DeploymentResponse } from '@/api/client'
 import {
   displayUrl,
   resolvePrimaryUrl,
+  resolveStableLink,
   resolveStableUrl,
 } from './deployment-url'
 
@@ -254,6 +255,55 @@ describe('resolveStableUrl', () => {
         })
       )
     ).toBeNull()
+  })
+})
+
+describe('resolveStableLink', () => {
+  test('follows the primary address the backend names', () => {
+    expect(
+      resolveStableLink(
+        deployment({
+          environment: {
+            domains: [
+              'https://shop.example.com',
+              'http://app-production.127-0-0-1.sslip.io',
+            ],
+            primary_url: 'https://shop.example.com',
+          },
+        })
+      )
+    ).toEqual({ url: 'https://shop.example.com', unavailableReason: null })
+  })
+
+  test('has no link and says why when nobody can reach the environment', () => {
+    expect(
+      resolveStableLink(
+        deployment({
+          environment: {
+            domains: ['http://app-production.localho.st'],
+            no_address_reason:
+              'app-production.localho.st only resolves on this machine',
+          },
+        })
+      )
+    ).toEqual({
+      url: null,
+      unavailableReason:
+        'app-production.localho.st only resolves on this machine',
+    })
+  })
+
+  test('without an answer from the backend, domains[0] stays the link', () => {
+    expect(
+      resolveStableLink(
+        deployment({
+          environment: { domains: ['http://app.127-0-0-1.sslip.io'] },
+        })
+      )
+    ).toEqual({
+      url: 'http://app.127-0-0-1.sslip.io',
+      unavailableReason: null,
+    })
   })
 })
 

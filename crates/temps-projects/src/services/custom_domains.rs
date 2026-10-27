@@ -9,7 +9,8 @@ use std::sync::Arc;
 use temps_core::url_validation;
 use temps_core::AppSettings;
 use temps_entities::{
-    domain_delivery_bindings, domains, environments, project_custom_domains, settings,
+    domain_delivery_bindings, domains, environment_domains, environments, project_custom_domains,
+    settings,
 };
 use thiserror::Error;
 use tracing::{debug, info};
@@ -159,6 +160,41 @@ impl CustomDomainService {
         }
 
         Ok(())
+    }
+
+    /// Rejects a hostname that is already an environment's address, in any
+    /// project. The route table serves a custom domain in place of the
+    /// environment address with the same name, so without this a user of
+    /// one project could take over another project's environment host --
+    /// including a tunnel environment host (ADR 068 D3), whose names are
+    /// predictable and published before anyone asks for them.
+    async fn ensure_not_environment_address<C: ConnectionTrait>(
+        conn: &C,
+        domain: &str,
+    ) -> Result<(), CustomDomainError> {
+        let host = domain.trim_end_matches('.').to_ascii_lowercase();
+        let Some(row) = environment_domains::Entity::find()
+            .filter(
+                sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                    sea_orm::sea_query::Expr::col(environment_domains::Column::Domain),
+                ))
+                .eq(host.as_str()),
+            )
+            .one(conn)
+            .await?
+        else {
+            return Ok(());
+        };
+        Err(CustomDomainError::DuplicateDomain(
+            if row.generated_by_connector_id.is_some() {
+                format!(
+                    "'{domain}' is published by a tunnel as an environment's address; choose \
+                     another name"
+                )
+            } else {
+                format!("'{domain}' is already an environment's address; remove it there first")
+            },
+        ))
     }
 
     /// Rejects an `environment_id` that does not belong to `project_id`.
@@ -391,6 +427,55 @@ impl CustomDomainService {
         branch: Option<String>,
         service_name: Option<String>,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            redirect_to,
+            status_code,
+            branch,
+            service_name,
+            |_| {},
+        )
+        .await
+    }
+
+    /// [`Self::create_custom_domain`] for a plain domain whose row `shape`
+    /// completes before it is inserted, in the same transaction. A caller
+    /// that attaches an address with its gate already set (ADR 065) then
+    /// never has it served open, not even between two writes.
+    pub async fn create_custom_domain_shaped(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
+        self.create_custom_domain_with(
+            project_id,
+            environment_id,
+            domain,
+            None,
+            None,
+            None,
+            None,
+            shape,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_custom_domain_with(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        domain: String,
+        redirect_to: Option<String>,
+        status_code: Option<i32>,
+        branch: Option<String>,
+        service_name: Option<String>,
+        shape: impl FnOnce(&mut project_custom_domains::ActiveModel) + Send,
+    ) -> Result<project_custom_domains::Model, CustomDomainError> {
         info!(
             "Creating custom domain: {} for project: {}",
             domain, project_id
@@ -433,7 +518,7 @@ impl CustomDomainService {
             None
         };
 
-        let new_custom_domain = project_custom_domains::ActiveModel {
+        let mut new_custom_domain = project_custom_domains::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             domain: Set(domain.clone()),
@@ -446,6 +531,7 @@ impl CustomDomainService {
             service_name: Set(service_name),
             ..Default::default()
         };
+        shape(&mut new_custom_domain);
 
         // Claim under the shared hostname lock so a status page cannot attach
         // the same name between the checks above and this insert (#1412).
@@ -460,6 +546,9 @@ impl CustomDomainService {
                     domain
                 )));
             }
+            // Under the hostname lock tunnel environment hosts are generated
+            // under too, so neither side can claim the name in between.
+            Self::ensure_not_environment_address(&txn, &domain).await?;
             Ok(new_custom_domain.insert(&txn).await?)
         }
         .await;
@@ -887,6 +976,31 @@ impl CustomDomainService {
                         });
                     }
 
+                    // A new name is claimed under the hostname lock, as on
+                    // create, so a tunnel environment host or a status page
+                    // cannot take it between this check and the update.
+                    if let Some(new_domain) = requested_domain
+                        .as_deref()
+                        .filter(|new_domain| !new_domain.eq_ignore_ascii_case(&locked.domain))
+                    {
+                        temps_entities::status_page_domains::lock_hostname_claim(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?;
+                        if temps_entities::status_page_domains::attached_hostname_conflict(
+                            transaction,
+                            new_domain,
+                        )
+                        .await?
+                        {
+                            return Err(CustomDomainError::DuplicateDomain(format!(
+                                "'{new_domain}' is attached to a status page; remove it there first"
+                            )));
+                        }
+                        Self::ensure_not_environment_address(transaction, new_domain).await?;
+                    }
+
                     let renames = requested_domain
                         .as_deref()
                         .is_some_and(|new_domain| new_domain != locked.domain);
@@ -1266,6 +1380,135 @@ mod tests {
         assert!(
             matches!(result, Err(CustomDomainError::InvalidDomain(_))),
             "a cross-project environment_id must be refused, got {result:?}"
+        );
+    }
+
+    fn environment_domain_row(generated: Option<i32>) -> environment_domains::Model {
+        environment_domains::Model {
+            id: 7,
+            environment_id: 3,
+            domain: "shop-staging.tunnel.example.com".to_string(),
+            created_at: chrono::Utc::now(),
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            generated_by_connector_id: generated,
+            private_via: None,
+            private_service: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+        }
+    }
+
+    /// ADR 068 D3: a custom domain served in place of an environment's
+    /// address would hand that address to another project. A tunnel
+    /// environment host is refused and named as one.
+    #[tokio::test]
+    async fn an_environment_address_cannot_become_a_custom_domain() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (generated, says) in [
+            (Some(2), "published by a tunnel"),
+            (None, "remove it there"),
+        ] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![environment_domain_row(generated)]])
+                .into_connection();
+            let result = CustomDomainService::ensure_not_environment_address(
+                &db,
+                "Shop-Staging.tunnel.example.com",
+            )
+            .await;
+            match result {
+                Err(CustomDomainError::DuplicateDomain(message)) => {
+                    assert!(message.contains(says), "{message}")
+                }
+                other => panic!("expected a duplicate, got {other:?}"),
+            }
+            // Compared case-insensitively.
+            let log = format!("{:?}", db.into_transaction_log());
+            assert!(log.contains("LOWER"), "{log}");
+            assert!(log.contains("shop-staging.tunnel.example.com"), "{log}");
+        }
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<environment_domains::Model>::new()])
+            .into_connection();
+        assert!(
+            CustomDomainService::ensure_not_environment_address(&db, "free.example.com")
+                .await
+                .is_ok()
+        );
+    }
+
+    /// The same, end to end across two projects, on create and on rename.
+    #[tokio::test]
+    async fn another_projects_environment_address_is_refused_as_a_custom_domain() {
+        let Some(test_db) = test_database().await else {
+            return;
+        };
+        let service = CustomDomainService::new(test_db.db.clone());
+        let (_, victim_env) = insert_project_environment(&test_db.db, "Victim Shop").await;
+        let (attacker, attacker_env) =
+            insert_project_environment(&test_db.db, "Attacker Shop").await;
+        environment_domains::ActiveModel {
+            environment_id: Set(victim_env.id),
+            domain: Set("shop-staging.tunnel.example.com".to_string()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .unwrap();
+
+        let created = service
+            .create_custom_domain(
+                attacker.id,
+                attacker_env.id,
+                "shop-staging.tunnel.example.com".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(created, Err(CustomDomainError::DuplicateDomain(_))),
+            "got {created:?}"
+        );
+
+        let own = service
+            .create_custom_domain(
+                attacker.id,
+                attacker_env.id,
+                "attacker.example.org".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let renamed = service
+            .update_custom_domain(
+                own.id,
+                Some("SHOP-STAGING.tunnel.example.com".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(renamed, Err(CustomDomainError::DuplicateDomain(_))),
+            "got {renamed:?}"
         );
     }
 

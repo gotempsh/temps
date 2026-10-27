@@ -61,6 +61,11 @@ pub struct RouteSyncAppState {
     pub peer_table: Arc<CachedPeerTable>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub request_policy_gate: Arc<temps_core::RequestPolicyGateSlot>,
+    /// Redeems sign-in codes and logs out for agents (ADR 065 D8).
+    pub gate: Arc<crate::gate::GateService>,
+    /// Fetches Cloudflare Access keys again when an agent meets an unknown
+    /// one (ADR 065 D9).
+    pub access_keys: Arc<crate::access_keys::AccessKeyService>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,6 +98,10 @@ pub struct RouteEntryDto {
     pub deployment_id: Option<i32>,
     pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
+    /// The gate of a signed-in address (ADR 065 D7). Set only on routes in
+    /// `gated_routes`, which an agent that predates the gate never reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<temps_core::gate::GatePolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +130,13 @@ pub struct PublicIngressSnapshot {
     /// private mode ignore the field and serve none of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_routes: Vec<PrivateRouteEntryDto>,
+    /// Signed-in addresses (ADR 065 D7), each with its gate. Never in
+    /// `routes`: an agent that predates the gate ignores this field, so it
+    /// serves none of them, from a snapshot or from the `routes.json` it
+    /// loads after a rollback. Sent only when the snapshot request itself
+    /// declared `gate.v1`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gated_routes: Vec<RouteEntryDto>,
     /// What this worker serves through tailscaled (ADR 065 D4): its
     /// `tailnet_serve_entries` rows, being removed or not. Never in `routes`
     /// or `private_routes`; agents that predate it ignore the field and
@@ -348,15 +364,12 @@ pub async fn get_routes_snapshot(
     Query(q): Query<RouteSnapshotQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
-    // ADR 065 D6: what this request's agent enforces, from this request
+    // ADR 065 D6, D7: what this request's agent enforces, from this request
     // only. A capability reported earlier says nothing about the binary
     // asking now (it may have been rolled back).
-    let tailnet_identity = temps_core::tailnet::header_names_capability(
-        headers
-            .get(temps_core::tailnet::AGENT_CAPABILITIES_HEADER)
-            .and_then(|value| value.to_str().ok()),
-        temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
-    );
+    let enforces_gate = request_declares(&headers, temps_core::gate::GATE_CAPABILITY);
+    let tailnet_identity =
+        request_declares(&headers, temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY);
 
     // Arm the notifier BEFORE checking the generation. `Notify::notified()`
     // captures the current notify epoch at construction time, so a reload
@@ -383,7 +396,7 @@ pub async fn get_routes_snapshot(
     let mut current = app_state.peer_table.current_generation();
     if current != q.since {
         return Ok(Json(
-            build_snapshot(&app_state, &node, current, tailnet_identity)
+            build_snapshot(&app_state, &node, current, enforces_gate, tailnet_identity)
                 .await
                 .map_err(snapshot_error_response)?,
         ));
@@ -419,7 +432,7 @@ pub async fn get_routes_snapshot(
     // also drops a token revoked while the request was parked.
     let node = authenticate_node(&app_state.db, &headers, node_id).await?;
     Ok(Json(
-        build_snapshot(&app_state, &node, current, tailnet_identity)
+        build_snapshot(&app_state, &node, current, enforces_gate, tailnet_identity)
             .await
             .map_err(snapshot_error_response)?,
     ))
@@ -569,6 +582,18 @@ pub fn configure_routes() -> axum::Router<Arc<RouteSyncAppState>> {
             "/internal/nodes/{node_id}/public-ingress/report",
             post(crate::public_ingress_sync::post_listener_report),
         )
+        .route(
+            "/internal/nodes/{node_id}/gate/redeem",
+            post(crate::gate_sync::post_gate_redeem),
+        )
+        .route(
+            "/internal/nodes/{node_id}/gate/logout",
+            post(crate::gate_sync::post_gate_logout),
+        )
+        .route(
+            "/internal/nodes/{node_id}/gate/access-keys",
+            post(crate::gate_sync::post_gate_access_keys),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +709,12 @@ pub async fn worker_public_routes(
             route.backends.iter().all(|backend| {
                 public_backend_is_registered_worker(&backend.address, &registered_worker_addresses)
             })
+        })
+        .map(|mut route| {
+            route.gate = peer_table
+                .gate_for_host(&route.host)
+                .map(|policy| policy.as_ref().clone());
+            route
         })
         .collect();
     let mut unsupported_reasons = blocking_policies.clone();
@@ -933,6 +964,7 @@ async fn build_snapshot(
     state: &RouteSyncAppState,
     node: &nodes::Model,
     generation: u64,
+    enforces_gate: bool,
     tailnet_identity: bool,
 ) -> Result<RouteSnapshot, SnapshotBuildError> {
     let raw = state.peer_table.snapshot_internal_routes();
@@ -1041,6 +1073,7 @@ async fn build_snapshot(
                 certificates: encrypt_public_certificates(state, node, hosts).await?,
                 listen: None,
                 private_routes,
+                gated_routes: Vec::new(),
                 serve_entries: Vec::new(),
                 identity_private_routes,
                 identity_serve_routes: Vec::new(),
@@ -1062,16 +1095,20 @@ async fn build_snapshot(
                 operation,
                 source,
             })?;
-            // A node gets keys only for what it terminates itself: its public
-            // routes when it listens publicly, and its private routes. A
-            // connector-only node terminates none of the public ones.
-            let allowed_certificate_hosts: std::collections::HashSet<String> = public_routes
-                .iter()
-                .filter(|_| node.public_ingress_enabled)
-                .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
-                .chain(private_hosts.iter().cloned())
-                .collect();
+            // ADR 065 D7: a signed-in address goes only to an agent that
+            // declared it enforces the gate, and only in `gated_routes`. An
+            // older agent would serve it open.
+            let (public_routes, gated_routes, gate_held_back) =
+                split_gated(public_routes, enforces_gate, &node.name);
+            let allowed_certificate_hosts = certificate_hosts(
+                &public_routes,
+                &gated_routes,
+                node.public_ingress_enabled,
+                &private_hosts,
+            );
+            let unsupported_route_count = unsupported_route_count + gate_held_back.len();
             let mut unsupported_reasons = unsupported_reasons;
+            unsupported_reasons.extend(gate_held_back);
             unsupported_reasons.extend(private_held_back.iter().cloned());
             PublicIngressSnapshot {
                 enabled: true,
@@ -1092,6 +1129,7 @@ async fn build_snapshot(
                     None
                 },
                 private_routes,
+                gated_routes,
                 serve_entries: Vec::new(),
                 identity_private_routes,
                 identity_serve_routes: Vec::new(),
@@ -1113,6 +1151,75 @@ async fn build_snapshot(
         routes,
         public_ingress,
     })
+}
+
+/// Whether this request's agent declared `capability` on the request
+/// itself (ADR 065 D6, D7). An earlier report is never trusted: the binary
+/// that made it may have been rolled back since. Every value of the header
+/// is read.
+pub fn request_declares(headers: &HeaderMap, capability: &str) -> bool {
+    temps_core::gate::declares_capability(
+        headers
+            .get_all(temps_core::tailnet::AGENT_CAPABILITIES_HEADER)
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        capability,
+    )
+}
+
+/// Whether this request's agent declared that it enforces the signed-in
+/// gate (ADR 065 D7).
+pub fn request_declares_gate(headers: &HeaderMap) -> bool {
+    request_declares(headers, temps_core::gate::GATE_CAPABILITY)
+}
+
+/// ADR 065 D7: take every signed-in route out of `routes`, the field every
+/// agent reads. Returns the open routes, the signed-in ones to send in
+/// `gated_routes` (only when the requesting agent declared `gate.v1`;
+/// otherwise none), and why each signed-in route was held back.
+pub fn split_gated(
+    routes: Vec<RouteEntryDto>,
+    enforces_gate: bool,
+    node_name: &str,
+) -> (Vec<RouteEntryDto>, Vec<RouteEntryDto>, Vec<String>) {
+    let (gated, open): (Vec<_>, Vec<_>) =
+        routes.into_iter().partition(|route| route.gate.is_some());
+    if enforces_gate {
+        return (open, gated, Vec::new());
+    }
+    let held_back = gated
+        .iter()
+        .map(|route| {
+            format!(
+                "{}: it is for people who sign in, and the agent on {node_name} does not \
+                 enforce sign-in yet; update the agent on {node_name}",
+                route.host
+            )
+        })
+        .collect();
+    (open, Vec::new(), held_back)
+}
+
+/// The hosts a node gets certificate keys for: only what it terminates
+/// itself. That is its public and signed-in routes when it listens publicly,
+/// and its private routes. A connector-only node terminates none of the
+/// public ones. Takes the routes after [`split_gated`], so a signed-in host
+/// held back from an agent that does not enforce the gate gets no key
+/// either: that agent cannot serve it, and the key would let it impersonate
+/// the host (ADR 065 D7).
+pub fn certificate_hosts(
+    public_routes: &[RouteEntryDto],
+    gated_routes: &[RouteEntryDto],
+    public_ingress_enabled: bool,
+    private_hosts: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    public_routes
+        .iter()
+        .chain(gated_routes)
+        .filter(|_| public_ingress_enabled)
+        .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
+        .chain(private_hosts.iter().cloned())
+        .collect()
 }
 
 async fn public_listen(
@@ -1285,6 +1392,7 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         deployment_id: info.deployment.as_ref().map(|d| d.id),
         project_id: info.project.as_ref().map(|p| p.id),
         environment_id: info.environment.as_ref().map(|e| e.id),
+        gate: None,
     })
 }
 
@@ -1433,6 +1541,7 @@ pub(crate) mod tests {
             deployment_id: None,
             project_id: None,
             environment_id: None,
+            gate: None,
         }
     }
 
@@ -1735,9 +1844,17 @@ pub(crate) mod tests {
                 peer_table: Arc::clone(&peer_table),
                 encryption_service: Arc::clone(&encryption_service),
                 request_policy_gate: open_gate,
+                gate: Arc::new(crate::gate::GateService::new(
+                    test_db.db.clone(),
+                    Arc::clone(&encryption_service),
+                )),
+                access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                    test_db.db.clone(),
+                )),
             },
             &node,
             1,
+            true,
             false,
         )
         .await?;
@@ -1766,9 +1883,17 @@ pub(crate) mod tests {
                     peer_table: Arc::clone(&peer_table),
                     encryption_service: Arc::clone(&encryption_service),
                     request_policy_gate,
+                    gate: Arc::new(crate::gate::GateService::new(
+                        test_db.db.clone(),
+                        Arc::clone(&encryption_service),
+                    )),
+                    access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                        test_db.db.clone(),
+                    )),
                 },
                 &node,
                 1,
+                true,
                 false,
             )
             .await?;
@@ -1815,9 +1940,17 @@ pub(crate) mod tests {
                 peer_table: Arc::clone(&peer_table),
                 encryption_service: Arc::clone(&encryption_service),
                 request_policy_gate: open_gate,
+                gate: Arc::new(crate::gate::GateService::new(
+                    test_db.db.clone(),
+                    Arc::clone(&encryption_service),
+                )),
+                access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                    test_db.db.clone(),
+                )),
             },
             &node,
             1,
+            true,
             false,
         )
         .await?;
@@ -1859,9 +1992,17 @@ pub(crate) mod tests {
                     peer_table: Arc::clone(&peer_table),
                     encryption_service: Arc::clone(&encryption_service),
                     request_policy_gate: open_gate,
+                    gate: Arc::new(crate::gate::GateService::new(
+                        test_db.db.clone(),
+                        Arc::clone(&encryption_service),
+                    )),
+                    access_keys: Arc::new(crate::access_keys::AccessKeyService::new(
+                        test_db.db.clone(),
+                    )),
                 },
                 &node,
                 1,
+                true,
                 false,
             )
             .await
@@ -2084,5 +2225,150 @@ pub(crate) mod tests {
             &certificate,
             "app.example.test"
         ));
+    }
+}
+
+#[cfg(test)]
+mod gate_hold_back_tests {
+    use super::*;
+
+    fn route(host: &str, gated: bool) -> RouteEntryDto {
+        RouteEntryDto {
+            host: host.to_string(),
+            backends: vec![],
+            deployment_id: None,
+            project_id: None,
+            environment_id: None,
+            gate: gated.then(|| temps_core::gate::GatePolicy {
+                address_id: "custom:1".into(),
+                gate: temps_core::gate::GateKind::Temps,
+                temps: None,
+                access: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn a_signed_in_route_never_travels_in_routes() {
+        let routes = vec![
+            route("open.example.test", false),
+            route("team.example.test", true),
+        ];
+        let (open, gated, held) = split_gated(routes.clone(), false, "worker-1");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].host, "open.example.test");
+        assert!(gated.is_empty());
+        assert_eq!(held.len(), 1);
+        assert!(
+            held[0].contains("update the agent on worker-1"),
+            "{}",
+            held[0]
+        );
+        let (open, gated, held) = split_gated(routes, true, "worker-1");
+        assert_eq!(open.len(), 1);
+        assert_eq!(open[0].host, "open.example.test");
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].host, "team.example.test");
+        assert!(held.is_empty());
+    }
+
+    /// A signed-in host withheld from an agent that does not enforce the
+    /// gate gets no certificate key on that node either.
+    #[test]
+    fn a_withheld_signed_in_host_gets_no_certificate_key() {
+        let routes = vec![
+            route("open.example.test", false),
+            route("Team.example.test.", true),
+        ];
+        let private = std::collections::HashSet::from(["lan.example.test".to_string()]);
+
+        let (open, gated, _) = split_gated(routes.clone(), false, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, true, &private);
+        assert!(!hosts.contains("team.example.test"), "{hosts:?}");
+        assert!(hosts.contains("open.example.test"));
+        assert!(hosts.contains("lan.example.test"));
+
+        let (open, gated, _) = split_gated(routes.clone(), true, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, true, &private);
+        assert!(hosts.contains("team.example.test"), "{hosts:?}");
+
+        // A connector-only node terminates no public host, gated or not.
+        let (open, gated, _) = split_gated(routes, true, "worker-1");
+        let hosts = certificate_hosts(&open, &gated, false, &private);
+        assert_eq!(
+            hosts,
+            std::collections::HashSet::from(["lan.example.test".to_string()])
+        );
+    }
+
+    #[test]
+    fn only_the_request_itself_declares_the_gate() {
+        let mut headers = HeaderMap::new();
+        assert!(!request_declares_gate(&headers));
+        headers.append(
+            temps_core::tailnet::AGENT_CAPABILITIES_HEADER,
+            axum::http::HeaderValue::from_static("tailnet_identity.v1"),
+        );
+        assert!(!request_declares_gate(&headers));
+        // A second header line is read too, not only the first.
+        headers.append(
+            temps_core::tailnet::AGENT_CAPABILITIES_HEADER,
+            axum::http::HeaderValue::from_static("gate.v1"),
+        );
+        assert!(request_declares_gate(&headers));
+    }
+
+    /// A worker rolled back to an agent that predates the gate reads the
+    /// snapshot with its own types: it must find no signed-in host in it.
+    #[test]
+    fn an_agent_that_predates_the_gate_finds_no_signed_in_host() {
+        #[derive(serde::Deserialize)]
+        struct OldSnapshot {
+            public_ingress: OldPublicIngress,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPublicIngress {
+            routes: Vec<OldEntry>,
+            #[serde(default)]
+            private_routes: Vec<OldPrivate>,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldEntry {
+            host: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct OldPrivate {
+            #[serde(flatten)]
+            route: OldEntry,
+        }
+        let (open, gated, _) = split_gated(
+            vec![
+                route("open.example.test", false),
+                route("team.example.test", true),
+            ],
+            true,
+            "worker-1",
+        );
+        let snapshot = RouteSnapshot {
+            generation: 1,
+            routes: Vec::new(),
+            public_ingress: PublicIngressSnapshot {
+                enabled: true,
+                routes: open,
+                gated_routes: gated,
+                ..PublicIngressSnapshot::default()
+            },
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(json.contains("team.example.test"), "{json}");
+        let old: OldSnapshot = serde_json::from_str(&json).unwrap();
+        let hosts: Vec<&str> = old
+            .public_ingress
+            .routes
+            .iter()
+            .chain(old.public_ingress.private_routes.iter().map(|p| &p.route))
+            .map(|r| r.host.as_str())
+            .collect();
+        assert_eq!(hosts, vec!["open.example.test"]);
     }
 }

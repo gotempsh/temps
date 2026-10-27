@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod access_keys;
+pub mod gate;
+pub mod gate_sync;
 pub mod ingress;
 pub mod project_change_listener;
 pub mod public_ingress_store;

@@ -813,6 +813,10 @@ pub struct ProjectService {
     /// tests exercise the claim rule against an explicit grant without
     /// mutating process-global environment state.
     docker_socket_grant: temps_core::docker_socket_grant::DockerSocketGrant,
+    /// ADR 068 D5: the reachability warning on the project response
+    /// (late-bound, optional: empty without the ingress plugin).
+    environment_addresses:
+        std::sync::OnceLock<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
 }
 
 fn initial_deployment_config(
@@ -1116,6 +1120,57 @@ impl ProjectService {
             environment_service,
             encryption_service,
             docker_socket_grant: temps_core::docker_socket_grant::process_grant().clone(),
+            environment_addresses: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Wire the ADR 068 D5 reachability warning.
+    pub fn set_environment_addresses(
+        &self,
+        slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
+    ) {
+        let _ = self.environment_addresses.set(slot);
+    }
+
+    /// ADR 068 D5: the warning for the project's production environment
+    /// (the one the project header shows), or `None`. Never an error: a
+    /// reachability failure is logged and reads as no warning.
+    pub async fn reachability_warning(
+        &self,
+        project_id: i32,
+    ) -> Option<temps_core::environment_address::ReachabilityWarning> {
+        use temps_entities::environments;
+        let addresses = self.environment_addresses.get()?.get()?;
+        let candidates = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::DeletedAt.is_null())
+            .filter(environments::Column::IsPreview.eq(false))
+            .filter(environments::Column::CurrentDeploymentId.is_not_null())
+            .order_by_asc(environments::Column::Id)
+            .all(self.db.as_ref())
+            .await;
+        let candidates = match candidates {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(project_id, %error, "could not read environments for the reachability warning");
+                return None;
+            }
+        };
+        let environment = candidates
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("production"))
+            .or_else(|| candidates.first())?;
+        match addresses.address(project_id, environment.id).await {
+            Ok(address) => address.warning,
+            Err(error) => {
+                warn!(
+                    project_id,
+                    environment_id = environment.id,
+                    %error,
+                    "could not tell whether the project's environment is reachable"
+                );
+                None
+            }
         }
     }
 

@@ -45,6 +45,7 @@ use temps_config::ConfigService;
 use temps_core::EncryptionService;
 use temps_entities::{external_services, nodes};
 
+use crate::collector::mariadb::MariaDbCollector;
 use crate::collector::mongodb::MongoCollector;
 use crate::collector::postgres::PostgresCollector;
 use crate::collector::redis::RedisCollector;
@@ -193,37 +194,6 @@ impl MetricsScraper {
         }
     }
 
-    /// The data address of every node hosting one of `services` standalone,
-    /// keyed by node id. A failed lookup is logged and yields no entries, so
-    /// those services are scraped at their stored host as before.
-    async fn worker_hosts(&self, services: &[external_services::Model]) -> HashMap<i32, String> {
-        let node_ids: HashSet<i32> = services
-            .iter()
-            .filter(|service| service.topology != "cluster")
-            .filter_map(|service| service.node_id)
-            .collect();
-        if node_ids.is_empty() {
-            return HashMap::new();
-        }
-        match nodes::Entity::find()
-            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
-            .all(self.db.as_ref())
-            .await
-        {
-            Ok(rows) => rows
-                .into_iter()
-                .map(|node| (node.id, node.data_address().to_string()))
-                .collect(),
-            Err(e) => {
-                warn!(
-                    node_ids = ?node_ids,
-                    "MetricsScraper: failed to resolve the nodes hosting scraped services: {e}"
-                );
-                HashMap::new()
-            }
-        }
-    }
-
     /// Run one complete scrape cycle over all enabled services.
     async fn run_cycle(&self) -> Result<(), String> {
         // Query external_services with metrics_enabled = true and status = 'running'
@@ -249,13 +219,15 @@ impl MetricsScraper {
 
         debug!("MetricsScraper: scraping {} service(s)", services.len());
 
-        // Worker-hosted standalone services publish their port on the
-        // worker's data address, not on this host: one lookup per cycle for
-        // every node that hosts one.
-        let worker_hosts = self.worker_hosts(&services).await;
-
         // Collect the active service ID set for stale-entry pruning after the cycle.
         let active_ids: HashSet<i32> = services.iter().map(|s| s.id).collect();
+
+        // Where each worker node publishes its services, loaded once for the
+        // whole cycle rather than once per service.
+        let (worker_addresses, node_lookup_error) =
+            self.load_worker_data_addresses(&services).await;
+        let worker_addresses = Arc::new(worker_addresses);
+        let node_lookup_error = Arc::new(node_lookup_error);
 
         // Semaphore caps concurrent collector tasks to avoid thundering-herd on
         // the DB pool and TimescaleDB chunk locks.
@@ -280,9 +252,8 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
-            let worker_host = service
-                .node_id
-                .and_then(|node_id| worker_hosts.get(&node_id).cloned());
+            let worker_addresses = Arc::clone(&worker_addresses);
+            let node_lookup_error = Arc::clone(&node_lookup_error);
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
@@ -341,15 +312,46 @@ impl MetricsScraper {
                     }
 
                     // Build a connection string from the encrypted service config.
-                    let connection_string =
-                        build_connection_string(&service, &encryption, worker_host.as_deref())
-                            .map_err(|e| {
-                                warn!(
+                    let mut params =
+                        decrypt_service_params(&service, &encryption).map_err(|e| {
+                            warn!(
+                                service_id,
+                                service_type, "MetricsScraper: cannot read service config: {e}"
+                            );
+                        })?;
+                    match worker_data_address(service.node_id, &worker_addresses) {
+                        Ok(Some(data_address)) => use_worker_host(&mut params, data_address),
+                        Ok(None) => {}
+                        Err(node_id) => {
+                            // Dialling the stored loopback host would reach
+                            // the control plane, and possibly an unrelated
+                            // service there on the same port.
+                            match node_lookup_error.as_deref() {
+                                Some(lookup_error) => warn!(
                                     service_id,
                                     service_type,
-                                    "MetricsScraper: cannot build connection string: {e}"
-                                );
-                            })?;
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id} but \
+                                     the node lookup failed ({lookup_error}); skipping scrape"
+                                ),
+                                None => warn!(
+                                    service_id,
+                                    service_type,
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id}, \
+                                     which has no node record; skipping scrape"
+                                ),
+                            }
+                            return Err(());
+                        }
+                    }
+                    let connection_string =
+                        build_connection_string(&service, &params).map_err(|e| {
+                            warn!(
+                                service_id,
+                                service_type, "MetricsScraper: cannot build connection string: {e}"
+                            );
+                        })?;
 
                     let config =
                         CollectorConfig::new(service_id, SourceKind::Database, connection_string)
@@ -361,6 +363,13 @@ impl MetricsScraper {
                         "postgres" => collect_with_timeout(PostgresCollector::new(), &config).await,
                         "redis" => collect_with_timeout(RedisCollector::new(), &config).await,
                         "mongodb" => collect_with_timeout(MongoCollector::new(), &config).await,
+                        "mariadb" => {
+                            let mut collector = MariaDbCollector::new();
+                            if let Some(app_user) = mariadb_app_user_connection_string(&params) {
+                                collector = collector.with_fallback_connection_string(app_user);
+                            }
+                            collect_with_timeout(collector, &config).await
+                        }
                         // RustFS is S3-compatible: reuse the same collector.
                         "s3" | "rustfs" => collect_with_timeout(S3Collector::new(), &config).await,
                         _ => {
@@ -418,23 +427,86 @@ impl MetricsScraper {
     }
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-/// Whether `host` names this machine: `localhost` or a loopback literal.
-fn is_loopback_host(host: &str) -> bool {
-    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost")
-        || bare
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
+impl MetricsScraper {
+    /// `data_address` of every worker node hosting one of `services`.
+    ///
+    /// A failed lookup is logged and returned alongside an empty map, so each
+    /// worker-placed service can report "lookup failed" rather than "no such
+    /// node"; those services skip this cycle while control-plane services are
+    /// still scraped.
+    async fn load_worker_data_addresses(
+        &self,
+        services: &[external_services::Model],
+    ) -> (HashMap<i32, String>, Option<String>) {
+        let node_ids: HashSet<i32> = services
+            .iter()
+            .filter_map(|s| s.node_id)
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        if node_ids.is_empty() {
+            return (HashMap::new(), None);
+        }
+        match nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|node| (node.id, node.data_address().to_string()))
+                    .collect(),
+                None,
+            ),
+            Err(e) => {
+                warn!(
+                    node_ids = ?node_ids,
+                    "MetricsScraper: failed to load worker node addresses; services on \
+                     worker nodes are skipped this cycle: {e}"
+                );
+                (HashMap::new(), Some(e.to_string()))
+            }
+        }
+    }
 }
 
-/// `host` as a URL authority needs it: IPv6 literals bracketed.
-fn url_host(host: &str) -> String {
-    match host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(v6)) => format!("[{v6}]"),
-        _ => host.to_string(),
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Node id the control plane uses for itself. A service placed there runs
+/// beside the scraper, like one with no node at all.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// The address to dial for a service on a worker node: `Ok(None)` for a
+/// service on the control plane, `Err(node_id)` when its worker is unknown.
+fn worker_data_address(
+    node_id: Option<i32>,
+    worker_addresses: &HashMap<i32, String>,
+) -> Result<Option<&str>, i32> {
+    match node_id {
+        None | Some(CONTROL_PLANE_NODE_ID) => Ok(None),
+        Some(id) => worker_addresses
+            .get(&id)
+            .map(|address| Some(address.as_str()))
+            .ok_or(id),
     }
+}
+
+/// Point a worker-placed service's connection at its node.
+///
+/// A managed service on a worker is stored with a loopback `host`, which means
+/// "this machine" to the worker and the wrong machine to the control plane.
+/// The worker's agent publishes the service's host `port` on the node's data
+/// address (its private address, or its WireGuard mesh address when it joined
+/// with a public one — `nodes::Model::data_address`), so that is where the
+/// scraper must dial. A host the operator set explicitly is kept.
+fn use_worker_host(params: &mut ServiceParams, data_address: &str) {
+    if !temps_core::node_address::is_local_service_host(&param_str(params, "host")) {
+        return;
+    }
+    // Every connection string embeds the host in a URL authority.
+    params.insert(
+        "host".to_string(),
+        serde_json::Value::String(temps_core::node_address::url_host(data_address)),
+    );
 }
 
 /// Scrape an HA (cluster-topology) service at its current primary.
@@ -622,17 +694,14 @@ async fn apply_delta(
     out
 }
 
-/// Build a connection string for the given external service using its
-/// encrypted config blob.
-///
-/// Parses the decrypted JSON parameters and produces an appropriate URI or
-/// DSN for the service type.  Returns an error if the config cannot be
-/// decrypted or does not contain the required parameters.
-fn build_connection_string(
+/// Decrypted service parameters, as stored in `external_services.config`.
+type ServiceParams = HashMap<String, serde_json::Value>;
+
+/// Decrypt and parse the given external service's config blob.
+fn decrypt_service_params(
     service: &external_services::Model,
     encryption: &EncryptionService,
-    worker_host: Option<&str>,
-) -> Result<String, String> {
+) -> Result<ServiceParams, String> {
     let encrypted_config = service
         .config
         .as_deref()
@@ -642,16 +711,66 @@ fn build_connection_string(
         .decrypt_string(encrypted_config)
         .map_err(|e| format!("Failed to decrypt config for service {}: {e}", service.id))?;
 
-    let params: HashMap<String, serde_json::Value> = serde_json::from_str(&config_json)
-        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))?;
+    serde_json::from_str(&config_json)
+        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))
+}
 
-    let get_str = |key: &str| -> String {
-        params
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+/// A string parameter, or `""` when it is missing or not a string.
+fn param_str(params: &ServiceParams, key: &str) -> String {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Host and port of a MariaDB service, with the provider's defaults.
+fn mariadb_host_port(params: &ServiceParams) -> (String, String) {
+    let host = param_str(params, "host");
+    let port = param_str(params, "port");
+    (
+        if host.is_empty() {
+            "localhost".to_string()
+        } else {
+            host
+        },
+        if port.is_empty() {
+            "3306".to_string()
+        } else {
+            port
+        },
+    )
+}
+
+/// Connection string for a MariaDB service's application user — the
+/// collector's fallback when the root login is rejected. `None` when the
+/// service has no application credentials.
+fn mariadb_app_user_connection_string(params: &ServiceParams) -> Option<String> {
+    let username = param_str(params, "username");
+    let password = param_str(params, "password");
+    if username.is_empty() || password.is_empty() {
+        return None;
+    }
+    let (host, port) = mariadb_host_port(params);
+    Some(format!(
+        "mysql://{}:{}@{}:{}/",
+        urlencoded(&username),
+        urlencoded(&password),
+        host,
+        port
+    ))
+}
+
+/// Build a connection string for the given external service from its
+/// decrypted parameters.
+///
+/// Produces an appropriate URI or DSN for the service type. Returns an error
+/// if the parameters required for the service type are missing.
+fn build_connection_string(
+    service: &external_services::Model,
+    params: &ServiceParams,
+) -> Result<String, String> {
+    let get_str = |key: &str| -> String { param_str(params, key) };
 
     let host = {
         let h = get_str("host");
@@ -660,12 +779,6 @@ fn build_connection_string(
         } else {
             h
         }
-    };
-    // A managed service on a worker keeps `localhost` in its parameters,
-    // which from here is this host; dial the worker it runs on instead.
-    let host = match worker_host {
-        Some(worker) if is_loopback_host(&host) => url_host(worker),
-        _ => host,
     };
 
     match service.service_type.to_lowercase().as_str() {
@@ -765,6 +878,29 @@ fn build_connection_string(
                 ))
             }
         }
+        // MariaDB: log in as root, the account Temps provisions with, so the
+        // scrape sees every schema (project databases have their own users)
+        // and the replication status. The collector falls back to the
+        // application user — see `mariadb_app_user_connection_string`.
+        "mariadb" => {
+            let root_password = get_str("root_password");
+            if root_password.is_empty() {
+                return mariadb_app_user_connection_string(params).ok_or_else(|| {
+                    format!(
+                        "Service {}: MariaDB config has neither root_password nor \
+                         username/password",
+                        service.id
+                    )
+                });
+            }
+            let (host, port) = mariadb_host_port(params);
+            Ok(format!(
+                "mysql://root:{}@{}:{}/",
+                urlencoded(&root_password),
+                host,
+                port
+            ))
+        }
         // S3 (MinIO) and RustFS both use S3-compatible APIs.
         // The S3Collector expects: region|access_key|secret_key[|endpoint_url]
         // For locally-hosted services the endpoint is http://host:port.
@@ -813,7 +949,7 @@ fn build_connection_string(
 /// Encodes all characters that are either reserved in the URI user-info
 /// position or could break URI parsing if left bare.  Crucially, `%` itself
 /// is encoded first so that subsequent passes do not double-encode it.
-fn urlencoded(s: &str) -> String {
+pub(crate) fn urlencoded(s: &str) -> String {
     // Each byte is encoded independently so multi-byte UTF-8 sequences are
     // handled correctly (each byte gets its own %XX escape).
     let mut out = String::with_capacity(s.len() * 3);
@@ -853,61 +989,6 @@ impl CollectorConfigExt for CollectorConfig {
 mod tests {
     use super::*;
 
-    // ── worker-hosted standalone services ──────────────────────────────────
-
-    fn standalone_postgres(
-        encryption: &EncryptionService,
-        host: &str,
-        node_id: Option<i32>,
-    ) -> external_services::Model {
-        let params = serde_json::json!({
-            "host": host,
-            "port": "5432",
-            "username": "postgres",
-            "password": "pw",
-            "database": "postgres",
-        });
-        let mut service = cluster_service(3, "postgres");
-        service.topology = "standalone".to_string();
-        service.node_id = node_id;
-        service.config = Some(encryption.encrypt_string(&params.to_string()).unwrap());
-        service
-    }
-
-    #[test]
-    fn a_worker_hosted_service_is_scraped_at_its_worker_address() {
-        let encryption = EncryptionService::new_from_password("scraper-test");
-        let service = standalone_postgres(&encryption, "localhost", Some(1));
-        let dsn = build_connection_string(&service, &encryption, Some("10.42.0.22")).unwrap();
-        assert_eq!(dsn, "postgresql://postgres:pw@10.42.0.22:5432/postgres");
-
-        let dsn = build_connection_string(&service, &encryption, Some("fd00::22")).unwrap();
-        assert_eq!(dsn, "postgresql://postgres:pw@[fd00::22]:5432/postgres");
-    }
-
-    #[test]
-    fn the_worker_address_never_replaces_a_host_the_user_chose() {
-        let encryption = EncryptionService::new_from_password("scraper-test");
-        let service = standalone_postgres(&encryption, "db.example.com", Some(1));
-        let dsn = build_connection_string(&service, &encryption, Some("10.42.0.22")).unwrap();
-        assert_eq!(dsn, "postgresql://postgres:pw@db.example.com:5432/postgres");
-
-        // A service on this host keeps dialling loopback.
-        let local = standalone_postgres(&encryption, "localhost", None);
-        let dsn = build_connection_string(&local, &encryption, None).unwrap();
-        assert_eq!(dsn, "postgresql://postgres:pw@localhost:5432/postgres");
-    }
-
-    #[test]
-    fn loopback_hosts_are_recognised() {
-        for host in ["localhost", "LOCALHOST", "127.0.0.1", "::1", "[::1]"] {
-            assert!(is_loopback_host(host), "{host}");
-        }
-        for host in ["10.42.0.22", "db.example.com", ""] {
-            assert!(!is_loopback_host(host), "{host}");
-        }
-    }
-
     // ── scrape_cluster ─────────────────────────────────────────────────────
 
     fn cluster_service(id: i32, service_type: &str) -> external_services::Model {
@@ -923,6 +1004,7 @@ mod tests {
             config: None,
             node_id: None,
             topology: "cluster".to_string(),
+            workload_mode: Default::default(),
             error_message: None,
             health_status: None,
             last_health_check_at: None,
@@ -935,7 +1017,6 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
-            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }
@@ -1138,13 +1219,188 @@ mod tests {
 
     // ── build_connection_string ────────────────────────────────────────────
 
-    // We can't test build_connection_string directly with a real EncryptionService
-    // in unit tests because it requires a real encryption key. Instead, we test
-    // the urlencoded helper and apply_delta logic directly.
-
     #[test]
     fn urlencoded_slash() {
         assert_eq!(urlencoded("a/b"), "a%2Fb");
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> ServiceParams {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    /// Regression: a MariaDB service had no connection string builder, so
+    /// metrics for it could never be collected.
+    #[test]
+    fn mariadb_connects_as_root_with_the_app_user_as_fallback() {
+        let service = cluster_service(5, "mariadb");
+        let p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("database", "appdb"),
+            ("username", "app"),
+            ("password", "app:p@ss"),
+            ("root_password", "r00t/pw#"),
+        ]);
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:r00t%2Fpw%23@localhost:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app%3Ap%40ss@localhost:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn mariadb_without_root_password_connects_as_the_app_user() {
+        let service = cluster_service(6, "MariaDB");
+        let p = params(&[("username", "app"), ("password", "secret12")]);
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://app:secret12@localhost:3306/".to_string())
+        );
+
+        let err = build_connection_string(&service, &params(&[]))
+            .expect_err("no credentials at all cannot be scraped");
+        assert!(err.contains("Service 6"), "error names the service: {err}");
+    }
+
+    /// Regression: a service placed on a worker node is stored with host
+    /// `localhost`, so the scraper dialled the control plane and never
+    /// reached it. It must dial the worker's data address, where the agent
+    /// publishes the service's host port.
+    #[test]
+    fn worker_placed_mariadb_is_dialled_at_its_node_data_address() {
+        let mut service = cluster_service(12, "mariadb");
+        service.node_id = Some(4);
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        let mut p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("username", "app"),
+            ("password", "app-secret"),
+            ("root_password", "rootpw12"),
+        ]);
+
+        let address = worker_data_address(service.node_id, &workers).expect("node 4 is known");
+        use_worker_host(&mut p, address.expect("node 4 is a worker"));
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:rootpw12@10.100.0.7:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app-secret@10.100.0.7:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn worker_host_applies_to_every_engine() {
+        let mut service = cluster_service(13, "postgres");
+        service.node_id = Some(4);
+        let mut p = params(&[
+            ("host", "127.0.0.1"),
+            ("port", "25432"),
+            ("username", "postgres"),
+            ("password", "pw"),
+            ("database", "app"),
+        ]);
+        use_worker_host(&mut p, "10.100.0.7");
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("postgresql://postgres:pw@10.100.0.7:25432/app".to_string())
+        );
+    }
+
+    #[test]
+    fn control_plane_services_keep_their_stored_host() {
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        assert_eq!(worker_data_address(None, &workers), Ok(None));
+        assert_eq!(
+            worker_data_address(Some(CONTROL_PLANE_NODE_ID), &workers),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn unknown_worker_node_is_reported_not_dialled_locally() {
+        assert_eq!(worker_data_address(Some(9), &HashMap::new()), Err(9));
+    }
+
+    #[test]
+    fn worker_host_keeps_an_explicit_host_and_brackets_ipv6() {
+        let mut explicit = params(&[("host", "db.internal")]);
+        use_worker_host(&mut explicit, "10.100.0.7");
+        assert_eq!(param_str(&explicit, "host"), "db.internal");
+
+        for loopback in ["", "localhost", "127.0.0.1", "::1", "0.0.0.0"] {
+            let mut p = params(&[("host", loopback)]);
+            use_worker_host(&mut p, "fd00::7");
+            assert_eq!(
+                param_str(&p, "host"),
+                "[fd00::7]",
+                "stored host {loopback:?}"
+            );
+        }
+    }
+
+    /// The MariaDB collector reports raw cumulative status counters; the
+    /// scraper must turn them into per-interval deltas (queries per interval,
+    /// not queries since the server started).
+    #[tokio::test]
+    async fn mariadb_status_counters_become_per_interval_deltas() {
+        use crate::collector::mariadb::{build_points, parse_name_value_rows, MariaDbSnapshot};
+
+        let config = CollectorConfig::new(11, SourceKind::Database, "unused");
+        let snapshot = |questions: &str, connected: &str| MariaDbSnapshot {
+            status: parse_name_value_rows([
+                ("Questions".to_string(), questions.to_string()),
+                ("Threads_connected".to_string(), connected.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1000", "4"), &config),
+        )
+        .await;
+        assert!(
+            first.iter().all(|p| p.name != "mariadb.queries_total"),
+            "the first scrape only records the counter baseline"
+        );
+        assert!(first.iter().any(|p| p.name == "mariadb.connections"));
+
+        let second = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1250", "5"), &config),
+        )
+        .await;
+        let value = |name: &str| second.iter().find(|p| p.name == name).map(|p| p.value);
+        assert_eq!(value("mariadb.queries_total"), Some(250.0));
+        assert_eq!(
+            value("mariadb.connections"),
+            Some(5.0),
+            "gauges pass through"
+        );
+
+        // Server restart: counters start over.
+        let third = apply_delta(&baselines, 11, build_points(&snapshot("30", "1"), &config)).await;
+        assert_eq!(
+            third
+                .iter()
+                .find(|p| p.name == "mariadb.queries_total")
+                .map(|p| p.value),
+            Some(30.0)
+        );
     }
 
     #[tokio::test]

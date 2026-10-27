@@ -86,6 +86,8 @@ interface ProjectDetailHeaderProps {
   repositoryProviderType?: string | null
   lastDeployment?: DeploymentResponse
   lastDeploymentUrl?: string | null
+  /** Why there is no URL to visit: nobody can reach the environment yet. */
+  lastDeploymentUnavailableReason?: string | null
   /** Environment served by lastDeploymentUrl, independently of healthEnvironment. */
   lastDeploymentEnvironmentId?: number
   isLoadingLastDeployment?: boolean
@@ -113,6 +115,7 @@ export function ProjectDetailHeader({
   repositoryProviderType,
   lastDeployment,
   lastDeploymentUrl,
+  lastDeploymentUnavailableReason,
   lastDeploymentEnvironmentId,
   isLoadingLastDeployment = false,
   onDeploy,
@@ -419,6 +422,27 @@ export function ProjectDetailHeader({
               </a>
             </Button>
           )}
+          {!lastDeploymentUrl &&
+            lastDeploymentUnavailableReason &&
+            !isLoadingLastDeployment &&
+            !siteIsWorker && (
+              // ADR 068 D4: nothing to open, so the button stays and says
+              // why. The span carries the tooltip, which a disabled button
+              // would not show.
+              <span
+                title={`Nothing to visit yet: ${lastDeploymentUnavailableReason}`}
+              >
+                <Button
+                  variant="outline"
+                  size="icon"
+                  className="size-9"
+                  disabled
+                  aria-label={`Visit deployed site: unavailable, ${lastDeploymentUnavailableReason}`}
+                >
+                  <ExternalLink className="size-4" />
+                </Button>
+              </span>
+            )}
           {!isExternal && (
             <Button size="sm" onClick={onDeploy}>
               <Rocket className="size-4" />

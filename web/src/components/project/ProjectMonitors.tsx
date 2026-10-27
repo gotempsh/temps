@@ -263,7 +263,10 @@ function MonitorCard({
                         : currentMonitorStatus?.current_status ===
                             'major_outage'
                           ? 'Major Outage'
-                          : 'Unknown'}
+                          : currentMonitorStatus?.current_status ===
+                              'no_address'
+                            ? 'Nothing to check'
+                            : 'Unknown'}
                   </div>
                 </div>
                 {/* Mini Status Timeline */}

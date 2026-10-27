@@ -3681,6 +3681,14 @@
               }
             ]
           },
+          "loopback_ja4_header": {
+            "default": null,
+            "description": "The header a trusted loopback proxy puts the visitor's JA4 TLS\nfingerprint in (ADR 066, D4), e.g. `x-ja4`. Read only from a peer\n`trust_loopback_forwarded_ip` trusts, and removed from every request\nbefore it goes upstream. `None` records no JA4 behind such a proxy.\nSet through [`normalize_loopback_ja4_header`].",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mcp_server": {
             "default": {
               "enabled": false
@@ -3995,6 +4003,14 @@
           },
           "letsencrypt": {
             "$ref": "#/components/schemas/LetsEncryptSettings"
+          },
+          "loopback_ja4_header": {
+            "description": "The header a trusted loopback proxy sends the visitor's JA4 in.\n`None` records no JA4 behind such a proxy.",
+            "example": "x-ja4",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mcp_server": {
             "$ref": "#/components/schemas/McpServerSettings",
@@ -37592,6 +37608,22 @@
           },
           "is_system_request": {
             "type": "boolean"
+          },
+          "ja4": {
+            "description": "The client's JA4 TLS fingerprint, when its source gives one.",
+            "example": "t13d1516h2_8daaf6152771_e5627efa2ab1",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4_source": {
+            "description": "Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or\n`edge`.",
+            "example": "direct",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "method": {
             "type": "string"

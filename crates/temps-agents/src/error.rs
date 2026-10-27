@@ -55,6 +55,19 @@ pub enum AgentError {
     #[error("Validation error: {message}")]
     Validation { message: String },
 
+    /// An `error_group_id` that does not resolve inside the project the
+    /// request names: either no such group exists, or it belongs to another
+    /// project. The two cases are deliberately indistinguishable, in the
+    /// variant and in its message alike — error group ids are sequential, so
+    /// a distinguishable "it exists, elsewhere" answer would let a caller
+    /// with ProjectsWrite on any one project enumerate another project's
+    /// error groups.
+    #[error("Error group {error_group_id} not found in project {project_id}")]
+    InvalidErrorGroup {
+        error_group_id: i32,
+        project_id: i32,
+    },
+
     #[error("Cannot locally rebuild immutable sandbox image '{image}'; choose a mutable tag before rebuilding")]
     ImmutableSandboxImageRebuild { image: String },
 
