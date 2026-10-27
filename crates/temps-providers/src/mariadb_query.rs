@@ -14,17 +14,29 @@ use temps_query::{
 };
 use tracing::{debug, error, warn};
 
-/// Every user database with its on-disk size (data + indexes) and table count.
-const DATABASES_WITH_SIZES_QUERY: &str = r#"
-    SELECT s.SCHEMA_NAME,
-           COUNT(t.TABLE_NAME) AS table_count,
-           CAST(COALESCE(SUM(t.DATA_LENGTH + t.INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
-    FROM information_schema.SCHEMATA s
-    LEFT JOIN information_schema.TABLES t
-           ON t.TABLE_SCHEMA = s.SCHEMA_NAME AND t.TABLE_TYPE = 'BASE TABLE'
-    WHERE s.SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-    GROUP BY s.SCHEMA_NAME
-    ORDER BY s.SCHEMA_NAME
+/// Every user database, by name.
+const DATABASE_NAMES_QUERY: &str = r#"
+    SELECT SCHEMA_NAME
+    FROM information_schema.SCHEMATA
+    WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+    ORDER BY SCHEMA_NAME
+"#;
+
+/// Table count and on-disk size (data + indexes) of every user database that
+/// has tables.
+///
+/// Read separately from [`DATABASE_NAMES_QUERY`] and merged, not as one
+/// `SCHEMATA LEFT JOIN TABLES`: that join opens every table of every schema
+/// once per schema, which costs ~120 temporary tables and ~75 commits on a
+/// small server and grows with the schema count.
+const DATABASE_SIZES_QUERY: &str = r#"
+    SELECT TABLE_SCHEMA,
+           COUNT(*) AS table_count,
+           CAST(COALESCE(SUM(DATA_LENGTH + INDEX_LENGTH), 0) AS UNSIGNED) AS size_bytes
+    FROM information_schema.TABLES
+    WHERE TABLE_TYPE = 'BASE TABLE'
+      AND TABLE_SCHEMA NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+    GROUP BY TABLE_SCHEMA
 "#;
 
 /// On-disk size and table count of one database.
@@ -49,6 +61,24 @@ fn database_size_metadata(
         metadata.insert("entity_count".to_string(), serde_json::json!(count));
     }
     metadata
+}
+
+/// Table count and size of `name` from the grouped size read.
+///
+/// `sizes` is `None` when that read failed, so the numbers are unknown. When
+/// it succeeded, a database with no row has no tables: it is empty, not
+/// unknown, and shows as 0 tables / 0 bytes.
+fn database_size(
+    sizes: Option<&HashMap<String, (i64, u64)>>,
+    name: &str,
+) -> (Option<i64>, Option<u64>) {
+    match sizes {
+        None => (None, None),
+        Some(sizes) => match sizes.get(name) {
+            Some((tables, size)) => (Some(*tables), Some(*size)),
+            None => (Some(0), Some(0)),
+        },
+    }
 }
 
 pub struct MariaDbSource {
@@ -226,22 +256,41 @@ impl DataSource for MariaDbSource {
     async fn list_containers(&self, path: &ContainerPath) -> Result<Vec<ContainerInfo>> {
         match path.depth() {
             0 => {
-                // Size and table count come from the same catalog read as the
-                // names (one grouped query, not one per database), so the
-                // database list can show which database is the heavy one.
-                let rows = sqlx::query(DATABASES_WITH_SIZES_QUERY)
+                let names = sqlx::query(DATABASE_NAMES_QUERY)
                     .fetch_all(&self.pool)
                     .await
                     .map_err(|e| {
                         DataError::QueryFailed(format!("Failed to list databases: {}", e))
                     })?;
 
-                Ok(rows
+                // Sizes make the database list show which database is the
+                // heavy one, but listing must not fail without them.
+                let sizes: Option<HashMap<String, (i64, u64)>> =
+                    match sqlx::query(DATABASE_SIZES_QUERY)
+                        .fetch_all(&self.pool)
+                        .await
+                    {
+                        Ok(rows) => Some(
+                            rows.iter()
+                                .filter_map(|row| {
+                                    let schema = row.try_get::<String, _>("TABLE_SCHEMA").ok()?;
+                                    let tables = row.try_get::<i64, _>("table_count").ok()?;
+                                    let size = row.try_get::<u64, _>("size_bytes").ok()?;
+                                    Some((schema, (tables, size)))
+                                })
+                                .collect(),
+                        ),
+                        Err(e) => {
+                            warn!("Failed to read MariaDB database sizes: {}", e);
+                            None
+                        }
+                    };
+
+                Ok(names
                     .iter()
                     .filter_map(|row| {
                         let name = row.try_get::<String, _>("SCHEMA_NAME").ok()?;
-                        let size_bytes = row.try_get::<u64, _>("size_bytes").ok();
-                        let table_count = row.try_get::<i64, _>("table_count").ok();
+                        let (table_count, size_bytes) = database_size(sizes.as_ref(), &name);
                         Some(ContainerInfo {
                             name,
                             container_type: ContainerType::Database,
@@ -1611,6 +1660,26 @@ pub(crate) fn is_mariadb_compatible_image(image: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_size_reports_measured_empty_and_unknown_databases() {
+        let mut measured = HashMap::new();
+        measured.insert("app".to_string(), (3_i64, 4096_u64));
+
+        assert_eq!(database_size(Some(&measured), "app"), (Some(3), Some(4096)));
+        // No row in the grouped read means no tables, not "unknown".
+        assert_eq!(
+            database_size(Some(&measured), "scratch"),
+            (Some(0), Some(0))
+        );
+        // The same lookup when the size read failed: nothing is known.
+        assert_eq!(database_size(None, "app"), (None, None));
+        // A server with no tables anywhere is a successful, empty read.
+        assert_eq!(
+            database_size(Some(&HashMap::new()), "app"),
+            (Some(0), Some(0))
+        );
+    }
+
     use super::*;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
