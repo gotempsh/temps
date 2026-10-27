@@ -325,6 +325,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "list_agent_runs",
             "list_all_runs",
             "list_data_imports",
+            "list_shield_events",
             "observability_full_event",
             "observability_list_events",
             "revenue_global_events",
