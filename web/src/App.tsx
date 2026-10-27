@@ -942,6 +942,10 @@ const FullAppRoutes = () => {
                             path="nodes/:nodeId"
                             element={<NodeDetailPage />}
                           />
+                          <Route
+                            path="nodes/:nodeId/:section"
+                            element={<NodeDetailPage />}
+                          />
                           <Route path="plugins" element={<PluginsPage />} />
                           <Route
                             path="plugins/install"

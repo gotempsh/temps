@@ -10,7 +10,7 @@ import { BuilderLimitsPanel } from './BuilderLimitsPanel'
 
 afterEach(cleanup)
 
-test('saves per-node limits and retains edits when the server rejects them', async () => {
+test('shows the form at once, saves per-node limits and retains edits when the server rejects them', async () => {
   let submitted: unknown
   mockApi({
     'PUT /internal/nodes/7/build-limits': async (request) => {
@@ -34,7 +34,6 @@ test('saves per-node limits and retains edits when the server rejects them', asy
       <BuilderLimitsPanel node={node} />
     </QueryClientProvider>
   )
-  fireEvent.click(view.getByRole('button', { name: 'Change' }))
   const concurrency = view.getByLabelText(
     'Concurrent builds'
   ) as HTMLInputElement
@@ -53,5 +52,16 @@ test('saves per-node limits and retains edits when the server rejects them', asy
     build_timeout_seconds: 1800,
   })
   expect(concurrency.value).toBe('3')
+
+  fireEvent.click(view.getByRole('button', { name: 'Reset' }))
+  await waitFor(() => expect(concurrency.value).toBe('1'))
+  expect(view.queryByRole('alert')).toBeNull()
+  expect(
+    (
+      view.getByRole('button', {
+        name: 'Save builder limits',
+      }) as HTMLButtonElement
+    ).disabled
+  ).toBe(true)
   client.clear()
 })

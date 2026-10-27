@@ -52,12 +52,22 @@ import {
   Zap,
 } from 'lucide-react'
 
-import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  adminGetNodeOptions,
+  getProjectBySlugOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
+import {
+  nodeRouteOf,
+  nodeSections,
+  nodeSectionUrl,
+  resolveNodeSection,
+} from '@/lib/node-detail'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   isSettingsSidebarRoute,
   primaryPlatformGroups,
@@ -67,7 +77,7 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { ChevronRight, type LucideIcon } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useLocation } from 'react-router'
+import { Link, useLocation, useNavigate } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
   DropdownMenu,
@@ -286,6 +296,7 @@ export default function AppSidebar() {
   // Route-driven sidebar swap.
   //   /settings/*       → settings nav (back → default)
   //   /projects/:slug/* → project nav  (back → default)
+  //   /settings/nodes/:id/* → node nav (back → the node list)
   //   anything else     → default workspace nav
   // /projects (the list) and /projects/new keep the default nav.
   // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
@@ -293,6 +304,7 @@ export default function AppSidebar() {
   // hide the entry that is currently active and highlight nothing, so the
   // route is explicitly excluded from the settings swap.
   const settingsMode = isSettingsSidebarRoute(location.pathname)
+  const nodeRoute = nodeRouteOf(location.pathname)
   const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
   const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
   const projectSlug =
@@ -313,7 +325,8 @@ export default function AppSidebar() {
 
   const compact = isMinimal && !isMobile
 
-  const showDefault = forceDefault || (!settingsMode && !aiMode && !projectSlug)
+  const showDefault =
+    forceDefault || (!settingsMode && !aiMode && !projectSlug && !nodeRoute)
 
   return (
     <Sidebar>
@@ -374,6 +387,8 @@ export default function AppSidebar() {
             slug={projectSlug}
             onBack={() => setForceDefaultKey(location.key)}
           />
+        ) : nodeRoute ? (
+          <NodeNav nodeId={nodeRoute.nodeId} segment={nodeRoute.segment} />
         ) : null}
       </SidebarContent>
       <SidebarFooter>
@@ -1016,6 +1031,61 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
               >
                 <Link
                   to={`/projects/${slug}/${item.url}`}
+                  aria-current={active === item.section ? 'page' : undefined}
+                  onClick={() => isMobile && setOpenMobile(false)}
+                >
+                  <item.icon />
+                  {!compact && <span>{item.title}</span>}
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
+      </SidebarGroup>
+    </>
+  )
+}
+
+/**
+ * A node's sections, like a project's. Back leads to the node list: unlike a
+ * project, a node is reached from there, not from the main menu.
+ */
+function NodeNav({
+  nodeId,
+  segment,
+}: {
+  nodeId: number
+  segment: string | undefined
+}) {
+  const { data: node } = useQuery(
+    adminGetNodeOptions({ path: { node_id: nodeId } })
+  )
+  const navigate = useNavigate()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const active = resolveNodeSection(segment, node?.role)
+  return (
+    <>
+      <SwapHeader
+        title={node?.name ?? 'Loading…'}
+        onBack={() => navigate(WORKER_NODES_URL)}
+        backLabel="Back to worker nodes"
+      />
+      <SidebarGroup className="py-2">
+        <SidebarMenu aria-label="Node navigation">
+          {nodeSections(node?.role).map((item) => (
+            <SidebarMenuItem key={item.section}>
+              <SidebarMenuButton
+                asChild
+                tooltip={compact ? item.title : undefined}
+                className={cn(
+                  compact ? 'justify-center' : 'justify-start',
+                  active === item.section &&
+                    'bg-sidebar-accent text-sidebar-accent-foreground'
+                )}
+              >
+                <Link
+                  to={nodeSectionUrl(nodeId, item.section)}
                   aria-current={active === item.section ? 'page' : undefined}
                   onClick={() => isMobile && setOpenMobile(false)}
                 >

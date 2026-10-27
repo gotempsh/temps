@@ -279,6 +279,7 @@ function NodeResourcesSection({
       title={RESOURCES_TITLE}
       description={RESOURCES_DESCRIPTION}
       icon={Gauge}
+      defaultOpen
     >
       {query.isPending ? (
         <SectionSkeleton />
@@ -375,6 +376,7 @@ function NetworkPolicyModeSection({
       title={NETWORK_TITLE}
       description={NETWORK_DESCRIPTION}
       icon={Network}
+      defaultOpen
     >
       {query.isPending ? (
         <SectionSkeleton />
@@ -468,7 +470,17 @@ function NetworkPolicyModeSection({
  * policy mode, and the desired-state stream it reads. `nodeId` 0 is the
  * control plane.
  */
-export function NodeWorkloadSettings({
+/**
+ * How much of this node the scheduler may fill (ADR-055). Shown open: it is
+ * the subject of the node's Scheduling page.
+ */
+export function NodeSchedulingResources({ nodeId }: { nodeId: number }) {
+  const canEdit = useIsInstanceAdmin()
+  return <NodeResourcesSection nodeId={nodeId} canEdit={canEdit} />
+}
+
+/** Whether this node applies network policy (ADR-055), on its Networking page. */
+export function NodeNetworkPolicySettings({
   nodeId,
   nodeName,
 }: {
@@ -477,20 +489,23 @@ export function NodeWorkloadSettings({
 }) {
   const canEdit = useIsInstanceAdmin()
   return (
-    <div className="space-y-4">
-      <NodeStateStreamStatus
-        context={
-          nodeId === CONTROL_PLANE_NODE_ID
-            ? 'Desired-state stream'
-            : 'Desired-state stream to workers'
-        }
-      />
-      <NodeResourcesSection nodeId={nodeId} canEdit={canEdit} />
-      <NetworkPolicyModeSection
-        nodeId={nodeId}
-        nodeName={nodeName}
-        canEdit={canEdit}
-      />
-    </div>
+    <NetworkPolicyModeSection
+      nodeId={nodeId}
+      nodeName={nodeName}
+      canEdit={canEdit}
+    />
+  )
+}
+
+/** The desired-state stream to this node (ADR-055 §7). */
+export function NodeDesiredStateStream({ nodeId }: { nodeId: number }) {
+  return (
+    <NodeStateStreamStatus
+      context={
+        nodeId === CONTROL_PLANE_NODE_ID
+          ? 'Desired-state stream'
+          : 'Desired-state stream to workers'
+      }
+    />
   )
 }
