@@ -1029,6 +1029,22 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     if contains_any(r, &["worker builds cannot", "worker builds do not support"]) {
         return make(S::Configuration, C::InvalidConfiguration);
     }
+    // A Compose stack's placement refused the deployment before anything
+    // ran: its home node is offline (stacks never fail over, their volumes
+    // live there), no node can take its first deployment, it links
+    // services a worker cannot reach, or it was moved while this deployment
+    // ran. The remedy is in the message.
+    if contains_any(
+        r,
+        &[
+            "will not start the stack anywhere else",
+            "no node can take the first deployment of compose environment",
+            "compose stacks on worker nodes cannot reach linked services",
+            "was moved while deployment",
+        ],
+    ) {
+        return make(S::Configuration, C::InvalidConfiguration);
+    }
 
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
@@ -1056,7 +1072,15 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Configuration, C::ComposePolicyRejected);
     }
-    if r.contains("docker compose v2 is unavailable") {
+    // The node cannot run Compose stacks (yet): no Compose plugin, or a
+    // worker still publishing on its public address before its mesh is up.
+    if contains_any(
+        r,
+        &[
+            "docker compose v2 is unavailable",
+            "a compose stack publishes its ports only on a private address",
+        ],
+    ) {
         return make(S::Platform, C::ComposeUnavailable);
     }
     if contains_any(
@@ -2025,6 +2049,41 @@ mod tests {
         assert_class(&untouched, S::Image, C::ImageMissing);
     }
 
+    /// Compose placement refusals carry their remedy in the message and are
+    /// configuration outcomes. Built from the real errors, so rewording one
+    /// cannot silently change how its deployment failure is recorded.
+    #[test]
+    fn compose_placement_refusals_are_configuration_failures() {
+        use crate::services::compose_placement::ComposePlacementError as E;
+        let refusals = [
+            E::HomeNodeUnavailable {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                node_id: 3,
+                node_name: "worker-a".to_string(),
+                state: "offline".to_string(),
+            },
+            E::NoPlacement {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                reason: "no active node matches".to_string(),
+            },
+            E::MovedConcurrently {
+                environment_id: 2,
+                deployment_id: 9,
+                expected: "worker node #3 (moving from the control plane)".to_string(),
+                current: "worker node #4 (moving from the control plane)".to_string(),
+            },
+        ];
+        for refusal in refusals {
+            assert_class(
+                &wrapped("deploy_compose", &refusal.to_string()),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+        }
+    }
+
     #[test]
     fn build_plan_failures_are_classified_before_building() {
         let missing = wrapped(
@@ -2182,6 +2241,14 @@ mod tests {
             "Compose prepare/pull failed: Docker Compose v2 is unavailable: failed to run `docker compose version`: No such file or directory. Install the Docker Compose CLI plugin",
         );
         assert_class(&unavailable, S::Platform, C::ComposeUnavailable);
+
+        // The worker agent's refusal while it still publishes on its public
+        // address (`AgentComposeError::PublicBindAddress`).
+        let off_mesh = wrapped(
+            "deploy_compose",
+            "Compose prepare/pull failed: worker node 'worker-a': This node publishes container ports on 203.0.113.10, a public address: it joined the cluster with a public address and is not on its WireGuard mesh yet. A Compose stack publishes its ports only on a private address, as the control plane keeps them on loopback, so project 'temps-1-2' was not prepared. Deploy again once the node is on the mesh (its mesh status is shown in the node list)",
+        );
+        assert_class(&off_mesh, S::Platform, C::ComposeUnavailable);
 
         let generic = wrapped(
             "deploy_compose",

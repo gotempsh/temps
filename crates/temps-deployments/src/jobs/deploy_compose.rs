@@ -26,6 +26,8 @@ use temps_deployer::compose::{
 };
 use temps_entities::{deployment_containers, deployments, preset::ComposePublicPort};
 use temps_logs::{LogLevel, LogService};
+
+use super::compose_host::ComposeStackHost;
 use tracing::debug;
 
 fn route_binding_for_service<'a>(
@@ -232,6 +234,16 @@ pub struct DeployComposeJob {
     /// Unique to this in-memory job construction, including a replay of the
     /// same durable deployment/workflow identifiers.
     secret_generation: String,
+    /// Where the stack runs: its pinned home (see `services::compose_placement`).
+    host: ComposeStackHost,
+    /// The host a requested move leaves: the stack is stopped there (volumes
+    /// kept) before it starts on `host`.
+    vacate_host: Option<ComposeStackHost>,
+    /// Pin `host` as the stack's home when this deployment reaches
+    /// `docker compose up`, the first moment it can hold data there.
+    pin_home: bool,
+    /// Target Nodes / Label Selectors no longer describe the home.
+    placement_drift: Option<String>,
 }
 
 pub struct DeployComposeJobBuilder {
@@ -257,6 +269,10 @@ pub struct DeployComposeJobBuilder {
     download_job_id: Option<String>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
+    host: ComposeStackHost,
+    vacate_host: Option<ComposeStackHost>,
+    pin_home: bool,
+    placement_drift: Option<String>,
 }
 
 impl Default for DeployComposeJobBuilder {
@@ -290,7 +306,34 @@ impl DeployComposeJobBuilder {
             download_job_id: None,
             log_id: None,
             log_service: None,
+            host: ComposeStackHost::ControlPlane,
+            vacate_host: None,
+            pin_home: false,
+            placement_drift: None,
         }
+    }
+
+    /// Where the stack runs. Defaults to the control plane.
+    pub fn host(mut self, host: ComposeStackHost) -> Self {
+        self.host = host;
+        self
+    }
+
+    /// Stop the stack on `host` first: a requested move leaves it.
+    pub fn vacate_host(mut self, host: Option<ComposeStackHost>) -> Self {
+        self.vacate_host = host;
+        self
+    }
+
+    /// Pin the host as the stack's home once it reaches `docker compose up`.
+    pub fn pin_home(mut self, pin: bool) -> Self {
+        self.pin_home = pin;
+        self
+    }
+
+    pub fn placement_drift(mut self, drift: Option<String>) -> Self {
+        self.placement_drift = drift;
+        self
     }
 
     pub fn job_id(mut self, id: String) -> Self {
@@ -434,6 +477,10 @@ impl DeployComposeJobBuilder {
                 deployment_id,
                 &uuid::Uuid::new_v4().simple().to_string(),
             ),
+            host: self.host,
+            vacate_host: self.vacate_host,
+            pin_home: self.pin_home,
+            placement_drift: self.placement_drift,
         })
     }
 }
@@ -634,7 +681,7 @@ impl DeployComposeJob {
                 deployed_at: Set(now),
                 ready_at: Set(None),
                 deleted_at: Set(None),
-                node_id: Set(None),
+                node_id: Set(self.host.node_id()),
                 ..Default::default()
             };
 
@@ -678,19 +725,21 @@ impl DeployComposeJob {
         let direct_error = if containers.is_empty() {
             None
         } else {
-            self.compose_executor
-                .remove_verified_containers(containers, expected_labels)
+            self.host
+                .remove_verified_containers(&self.compose_executor, containers, expected_labels)
                 .await
                 .err()
         };
         let compose_error = self
-            .compose_executor
-            .teardown_at(
+            .host
+            .teardown(
+                &self.compose_executor,
                 project_name,
                 repo_path,
                 Some(compose_file_name),
                 &self.environment_vars,
                 true,
+                None,
             )
             .await
             .err();
@@ -712,6 +761,118 @@ impl DeployComposeJob {
         }
     }
 
+    /// Pin the stack's home (first start only) and, when a move is pending,
+    /// stop the stack on the host it leaves.
+    ///
+    /// Runs after the candidate is prepared and before the previous stack is
+    /// touched. Pinning here — not when the deployment was planned — means a
+    /// first deployment that fails to build leaves nothing pinned, while one
+    /// that reaches `docker compose up` (and may create volumes) always does.
+    /// The old host's `docker compose down` never removes volumes: that data
+    /// stays where it is, which is what the operator acknowledged by moving.
+    ///
+    /// A pinned stack is only started while its placement is still the one
+    /// this deployment planned against; a move requested since then fails
+    /// the deployment rather than start the stack where nothing would ever
+    /// stop it.
+    async fn pin_and_vacate(
+        &self,
+        project_name: &str,
+        compose_file_name: &str,
+    ) -> Result<(), WorkflowError> {
+        let placement =
+            crate::services::compose_placement::ComposePlacementService::new(self.db.clone());
+        let placement_error = |error: crate::services::compose_placement::ComposePlacementError| {
+            WorkflowError::JobExecutionFailed(error.to_string())
+        };
+        if !self.pin_home {
+            placement
+                .expect_placement(
+                    self.environment_id,
+                    self.deployment_id,
+                    self.host.node_id(),
+                    self.vacate_host.as_ref().map(ComposeStackHost::node_id),
+                )
+                .await
+                .map_err(placement_error)?;
+        }
+        if self.pin_home {
+            placement
+                .pin(self.environment_id, self.host.node_id())
+                .await
+                .map_err(placement_error)?;
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Pinned this Compose stack to {}: later deployments return there \
+                             because its volumes live there",
+                            self.host.describe()
+                        ),
+                    )
+                    .await;
+            }
+        }
+        let Some(vacate_host) = self.vacate_host.as_ref() else {
+            return Ok(());
+        };
+        if let Some(ref log_id) = self.log_id {
+            let _ = self
+                .log_service
+                .log_warning(
+                    log_id,
+                    &format!(
+                        "Moving this Compose stack from {} to {}: stopping it on {} first. Its \
+                         volumes there are kept, but the stack starts on {} without them",
+                        vacate_host.describe(),
+                        self.host.describe(),
+                        vacate_host.describe(),
+                        self.host.describe()
+                    ),
+                )
+                .await;
+        }
+        vacate_host
+            .teardown(
+                &self.compose_executor,
+                project_name,
+                None,
+                Some(compose_file_name),
+                &self.environment_vars,
+                true,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to stop Compose stack {project_name} on {} while moving it to {} for \
+                     deployment {}: {error}. The stack keeps running on {}; retry the deployment \
+                     once that host is reachable",
+                    vacate_host.describe(),
+                    self.host.describe(),
+                    self.deployment_id,
+                    vacate_host.describe()
+                ))
+            })?;
+        // Conditional on the placement still being this move: a move requested
+        // while the old host was stopping keeps its own pending vacate, and
+        // this deployment fails (its candidate is discarded) instead of
+        // starting the stack where the placement no longer points. The old
+        // host is already stopped either way; a repeated `docker compose down`
+        // there is idempotent.
+        placement
+            .complete_vacate(
+                self.environment_id,
+                self.deployment_id,
+                self.host.node_id(),
+                vacate_host.node_id(),
+            )
+            .await
+            .map_err(placement_error)
+    }
+
     async fn compensate_if_cancelled(
         &self,
         project_name: &str,
@@ -722,17 +883,20 @@ impl DeployComposeJob {
         if !self.cancellation_requested.load(Ordering::Acquire) {
             return Ok(());
         }
-        self.compose_executor
-            .teardown_at(
+        self.host
+            .teardown(
+                &self.compose_executor,
                 project_name,
                 repo_path,
                 Some(compose_file_name),
                 &self.environment_vars,
                 true,
+                None,
             )
             .await
             .map_err(|error| WorkflowError::JobExecutionFailed(format!(
-                "Compose deployment was cancelled {phase}, but compensation failed for {project_name}: {error}"
+                "Compose deployment was cancelled {phase}, but compensation failed for {project_name} on {}: {error}",
+                self.host.describe()
             )))?;
         Err(WorkflowError::WorkflowCancelled)
     }
@@ -868,9 +1032,10 @@ impl DeployComposeJob {
         // `prepare_and_pull` instead of a job failure naming the actual
         // remedy up front. Mirrors `BuildImageJob::execute`'s
         // `local_workloads_enabled` guard.
-        if !self.compose_executor.docker_available() {
-            let message = "This control plane runs no local Compose deployments; run the \
-                full profile on a node with Docker"
+        if self.host.is_control_plane() && !self.compose_executor.docker_available() {
+            let message = "This control plane runs no local Compose deployments; pin the \
+                environment to a worker node in its Node scheduling settings, or run the full \
+                profile on a node with Docker"
                 .to_string();
             if let Some(ref log_id) = self.log_id {
                 let _ = self
@@ -887,9 +1052,16 @@ impl DeployComposeJob {
                 .log_service
                 .log_info(
                     log_id,
-                    &format!("Deploying Docker Compose stack (project: {})", project_name),
+                    &format!(
+                        "Deploying Docker Compose stack (project: {}) on {}",
+                        project_name,
+                        self.host.describe()
+                    ),
                 )
                 .await;
+            if let Some(drift) = self.placement_drift.as_deref() {
+                let _ = self.log_service.log_warning(log_id, drift).await;
+            }
         }
 
         // Build Temps labels for container discovery
@@ -1038,7 +1210,9 @@ impl DeployComposeJob {
                 environment: &self.environment_vars,
                 repository_env: None,
                 filesystem_checks: repo_path.is_some(),
-                allow_cli: true,
+                // A worker resolves anything the control plane cannot
+                // without a Docker CLI when it prepares the stack.
+                allow_cli: self.host.is_control_plane() || self.compose_executor.docker_available(),
                 defer_unknown_required: false,
             })
             .await
@@ -1323,8 +1497,8 @@ impl DeployComposeJob {
         }
         let secret_generation = self.secret_generation.clone();
         let prepared = match self
-            .compose_executor
-            .prepare_and_pull_for_generation(&request, &secret_generation)
+            .host
+            .prepare(&self.compose_executor, &request, &secret_generation)
             .await
         {
             Ok(p) => p,
@@ -1345,13 +1519,26 @@ impl DeployComposeJob {
         // Images are already local at this point, so the actual downtime window
         // is now only: old-container-stop → new-container-healthy (no pull).
         if self.cancellation_requested.load(Ordering::Acquire) {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|error| WorkflowError::JobExecutionFailed(format!(
                     "Compose deployment was cancelled before teardown, but candidate secret cleanup failed for {project_name}: {error}"
                 )))?;
             return Err(WorkflowError::WorkflowCancelled);
+        }
+        if let Err(error) = self.pin_and_vacate(&project_name, compose_file_name).await {
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
+                .await
+                .map_err(|cleanup_error| {
+                    WorkflowError::JobExecutionFailed(format!(
+                        "{error}; additionally failed to clean candidate generation '{}' on {}: {cleanup_error}",
+                        secret_generation,
+                        self.host.describe()
+                    ))
+                })?;
+            return Err(error);
         }
         if let Some(ref log_id) = self.log_id {
             let _ = self
@@ -1363,8 +1550,9 @@ impl DeployComposeJob {
                 .await;
         }
         if let Err(error) = self
-            .compose_executor
-            .teardown_at(
+            .host
+            .teardown(
+                &self.compose_executor,
                 &project_name,
                 repo_path.as_deref(),
                 Some(compose_file_name),
@@ -1374,6 +1562,7 @@ impl DeployComposeJob {
                 // them into the new containers. Deleting them now would cause
                 // the new containers to start with missing or empty secrets.
                 false,
+                Some(&secret_generation),
             )
             .await
         {
@@ -1381,8 +1570,8 @@ impl DeployComposeJob {
             // not prune older generations unless teardown succeeded: a
             // partially-running previous stack can still have those files
             // bind-mounted and must keep them intact.
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1406,12 +1595,16 @@ impl DeployComposeJob {
         let candidate_secret_generation =
             (!request.secrets.is_empty()).then_some(secret_generation.as_str());
         if let Err(error) = self
-            .compose_executor
-            .prune_secret_generations(&project_name, candidate_secret_generation)
+            .host
+            .prune_secret_generations(
+                &self.compose_executor,
+                &project_name,
+                candidate_secret_generation,
+            )
             .await
         {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1432,8 +1625,8 @@ impl DeployComposeJob {
         // teardown above (or `up --force-recreate` below) replaces any prior
         // candidate, including a retained failed stack from the last attempt.
         if let Err(error) = self.retire_previous_compose_container_records().await {
-            self.compose_executor
-                .cleanup_secret_generation(&project_name, &secret_generation)
+            self.host
+                .discard_generation(&self.compose_executor, &project_name, &secret_generation)
                 .await
                 .map_err(|cleanup_error| {
                     WorkflowError::JobExecutionFailed(format!(
@@ -1455,8 +1648,13 @@ impl DeployComposeJob {
         // Deploy (network + up + wait + discover + label). Images are already
         // local from prepare_and_pull so this is the live downtime window.
         let services = match self
-            .compose_executor
-            .deploy_prepared(prepared, &request)
+            .host
+            .deploy(
+                &self.compose_executor,
+                prepared,
+                &request,
+                &secret_generation,
+            )
             .await
         {
             Ok(s) => s,
@@ -1550,8 +1748,14 @@ impl DeployComposeJob {
                     false
                 } else {
                     match self
-                        .compose_executor
-                        .stop_at(&project_name, repo_path.as_deref(), Some(compose_file_name))
+                        .host
+                        .stop(
+                            &self.compose_executor,
+                            &project_name,
+                            repo_path.as_deref(),
+                            Some(compose_file_name),
+                            Some(&secret_generation),
+                        )
                         .await
                     {
                         Err(stop_error) => {
@@ -1645,8 +1849,9 @@ impl DeployComposeJob {
 
         if services.is_empty() {
             let _ = self
-                .compose_executor
-                .teardown_at(
+                .host
+                .teardown(
+                    &self.compose_executor,
                     &project_name,
                     repo_path.as_deref(),
                     Some(compose_file_name),
@@ -1655,6 +1860,7 @@ impl DeployComposeJob {
                     // credentials are not left on disk for a stack that
                     // is no longer running.
                     true,
+                    None,
                 )
                 .await;
             let error_msg = "No containers found after docker compose up".to_string();
@@ -1731,7 +1937,7 @@ impl DeployComposeJob {
         context.set_output(
             "deploy_container",
             "node_ids",
-            vec![None::<i32>; services.len()],
+            vec![self.host.node_id(); services.len()],
         )?;
 
         // Compose-specific outputs for MarkDeploymentCompleteJob
@@ -1904,8 +2110,9 @@ impl WorkflowTask for DeployComposeJob {
                 .await;
         }
 
-        self.compose_executor
-            .teardown_at(
+        self.host
+            .teardown(
+                &self.compose_executor,
                 &project_name,
                 cleanup_repo_path.as_deref(),
                 Some(compose_file_name),
@@ -1913,11 +2120,13 @@ impl WorkflowTask for DeployComposeJob {
                 // The workflow has failed and no subsequent deploy will consume
                 // the materialized secret files.
                 true,
+                None,
             )
             .await
             .map_err(|error| {
                 WorkflowError::JobExecutionFailed(format!(
-                    "Failed to clean up compose stack {project_name} after job failure: {error}"
+                    "Failed to clean up compose stack {project_name} on {} after job failure: {error}",
+                    self.host.describe()
                 ))
             })
     }

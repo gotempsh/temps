@@ -318,6 +318,20 @@ pub enum NodeError {
         count: usize,
     },
 
+    #[error(
+        "Node '{node_name}' (id {node_id}) holds {count} Docker Compose stack(s) (environment \
+         ids: {environment_ids}): each is either at home on it, with its volumes there, or \
+         moving away and still running there until its next deployment. Move each stack off \
+         the node from its environment's Node scheduling settings and redeploy it before \
+         removing the node"
+    )]
+    HostsComposeStacks {
+        node_id: i32,
+        node_name: String,
+        count: usize,
+        environment_ids: String,
+    },
+
     #[error("Invalid node configuration: {message}")]
     Validation { message: String },
 
@@ -594,6 +608,15 @@ pub fn node_is_unreachable(node: &nodes::Model, now: chrono::DateTime<chrono::Ut
         Some(heartbeat) => now - heartbeat > chrono::Duration::seconds(NODE_HEARTBEAT_STALE_SECS),
         None => true,
     }
+}
+
+/// How [`NodeRemoval::lost_environments`] names a Compose stack whose
+/// volumes were on a node removed as lost.
+fn compose_stack_lost_note(environment_name: &str, environment_id: i32) -> String {
+    format!(
+        "Docker Compose stack of environment '{environment_name}' (id {environment_id}): \
+         its volumes were on the removed node, so its next deployment starts it without them"
+    )
 }
 
 /// Request to register a new worker node.
@@ -2434,6 +2457,49 @@ impl NodeService {
                 count: serving,
             });
         };
+        let mut lost_environments = lost_environments;
+        // A Compose stack's data stays on its home node even when nothing is
+        // running there. `compose_placements.node_id` is ON DELETE RESTRICT;
+        // this names the stacks instead of failing on the foreign key. A
+        // stack moving away still runs here until its next deployment stops
+        // it, and `vacate_node_id` has no foreign key, so that is checked too.
+        // A deleted environment's stack was stopped when it was deleted, so
+        // its placement is released rather than pinning the node forever.
+        let compose_stacks =
+            crate::services::compose_placement::placements_on_node(&txn, node_id).await?;
+        let mut released = compose_stacks.deleted_environment_ids;
+        if !compose_stacks.live.is_empty() {
+            if serving_containers == ServingContainers::RecordLost
+                && node_is_unreachable(&locked, chrono::Utc::now())
+            {
+                // The operator says the host is gone, and the stacks' volumes
+                // with it. Holding the placement would leave a move off the
+                // node unable to finish (its teardown can never reach the
+                // node) and the node impossible to remove. Released, each
+                // stack's next deployment starts it without those volumes.
+                for (placement, environment_name) in &compose_stacks.live {
+                    lost_environments.push(compose_stack_lost_note(
+                        environment_name,
+                        placement.environment_id,
+                    ));
+                    released.push(placement.environment_id);
+                }
+            } else {
+                return Err(NodeError::HostsComposeStacks {
+                    node_id,
+                    node_name: locked.name,
+                    count: compose_stacks.live.len(),
+                    environment_ids: compose_stacks
+                        .live
+                        .iter()
+                        .map(|(placement, _)| placement.environment_id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                });
+            }
+        }
+        crate::services::compose_placement::release_placements_on_node(&txn, node_id, &released)
+            .await?;
 
         // Read and rewritten under the placement lock taken above: a settings
         // save that names this node either committed first and is rewritten
@@ -3147,6 +3213,35 @@ impl NodeService {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
+        // A Compose stack is pinned to its home: its volumes are on this node,
+        // so redeploying it elsewhere would start it empty. It waits for the
+        // node to return, or for the operator to move it.
+        let pinned_compose: std::collections::HashSet<i32> =
+            temps_entities::compose_placements::Entity::find()
+                .filter(temps_entities::compose_placements::Column::NodeId.eq(node_id))
+                .filter(
+                    temps_entities::compose_placements::Column::EnvironmentId
+                        .is_in(environment_ids.clone()),
+                )
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|placement| placement.environment_id)
+                .collect();
+        for environment_id in &pinned_compose {
+            tracing::warn!(
+                node_id,
+                environment_id,
+                "Not failing over a Compose stack pinned to this node; it waits for the node \
+                 to come back or for an operator to move it"
+            );
+        }
+        let deploys: Vec<_> = deploys
+            .into_iter()
+            .filter(|deployment| !pinned_compose.contains(&deployment.environment_id))
+            .collect();
+        let deployment_ids: Vec<i32> = deploys.iter().map(|deployment| deployment.id).collect();
+
         let affected_environments = environments::Entity::find()
             .filter(environments::Column::Id.is_in(environment_ids))
             .all(self.db.as_ref())
@@ -3800,6 +3895,8 @@ mod tests {
             )])]])
             // nothing serving on the node under the lock
             .append_query_results(vec![vec![count_row(0)]])
+            // no Compose stack lives on the node
+            .append_query_results(vec![Vec::<temps_entities::compose_placements::Model>::new()])
             // no environment or project targets the node
             .append_query_results(vec![Vec::<environments::Model>::new()])
             .append_query_results(vec![Vec::<projects::Model>::new()])
@@ -3822,6 +3919,85 @@ mod tests {
 
         let removal = service.remove(1).await.unwrap();
         assert!(removal.placements_updated.is_empty());
+    }
+
+    /// A node that is still a Compose stack's home is never removed: the
+    /// stack's volumes are there, and the refusal names its environment.
+    #[tokio::test]
+    async fn test_remove_refuses_a_node_that_is_a_compose_stack_home() {
+        let now = chrono::Utc::now();
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
+            .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(0)),
+            )])]])
+            .append_query_results(vec![vec![count_row(0)]])
+            // The placement joined with its live environment.
+            .append_query_results(vec![vec![(
+                temps_entities::compose_placements::Model {
+                    environment_id: 42,
+                    node_id: Some(1),
+                    pinned_at: now,
+                    vacate_pending: false,
+                    vacate_node_id: None,
+                    updated_at: now,
+                },
+                sample_environment(42, 7, None),
+            )]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let err = service.remove(1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::HostsComposeStacks { node_id: 1, count: 1, ref environment_ids, .. }
+                    if environment_ids == "42"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Move each stack"), "{err}");
+    }
+
+    /// A stack whose move away from the node has not been deployed yet still
+    /// runs there; removing the node would leave it running with nothing to
+    /// stop it.
+    #[tokio::test]
+    async fn test_remove_refuses_a_node_a_compose_stack_is_moving_away_from() {
+        let now = chrono::Utc::now();
+        let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
+            .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
+            .append_query_results(vec![vec![std::collections::BTreeMap::from([(
+                "num_items".to_string(),
+                sea_orm::Value::BigInt(Some(0)),
+            )])]])
+            .append_query_results(vec![vec![count_row(0)]])
+            // The placement joined with its live environment.
+            .append_query_results(vec![vec![(
+                temps_entities::compose_placements::Model {
+                    environment_id: 43,
+                    node_id: None,
+                    pinned_at: now,
+                    vacate_pending: true,
+                    vacate_node_id: Some(1),
+                    updated_at: now,
+                },
+                sample_environment(43, 7, None),
+            )]])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let err = service.remove(1).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                NodeError::HostsComposeStacks { node_id: 1, count: 1, ref environment_ids, .. }
+                    if environment_ids == "43"
+            ),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("moving away"), "{err}");
     }
 
     /// A deployment that placed a container on the node after the caller
@@ -3952,6 +4128,186 @@ mod tests {
         .await
         .unwrap();
         (project, environment)
+    }
+
+    /// A deleted environment's Compose stack was stopped when it was
+    /// deleted; its placement is kept for a restore, and must not keep the
+    /// node from ever being removed. A live one still refuses.
+    #[tokio::test]
+    async fn test_remove_releases_compose_placements_of_deleted_environments() {
+        use sea_orm::ActiveModelTrait;
+        use temps_entities::compose_placements;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        let (_, home_here) = seed_placement(db.as_ref(), "home-here", None, None).await;
+        let (_, leaving_here) = seed_placement(db.as_ref(), "leaving-here", None, None).await;
+        let (_, live) = seed_placement(db.as_ref(), "live", None, None).await;
+        let placement = |environment_id, node_id, vacate_node_id: Option<i32>| {
+            compose_placements::ActiveModel {
+                environment_id: Set(environment_id),
+                node_id: Set(node_id),
+                pinned_at: Set(chrono::Utc::now()),
+                vacate_pending: Set(vacate_node_id.is_some()),
+                vacate_node_id: Set(vacate_node_id),
+                updated_at: Set(chrono::Utc::now()),
+            }
+        };
+        placement(home_here.id, Some(node.id), None)
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        placement(leaving_here.id, None, Some(node.id))
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        placement(live.id, Some(node.id), None)
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        for environment in [&home_here, &leaving_here] {
+            let mut deleted: environments::ActiveModel = environment.clone().into();
+            deleted.deleted_at = Set(Some(chrono::Utc::now()));
+            deleted.update(db.as_ref()).await.unwrap();
+        }
+
+        // The live stack still holds the node.
+        let error = service.remove(node.id).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NodeError::HostsComposeStacks { count: 1, ref environment_ids, .. }
+                    if *environment_ids == live.id.to_string()
+            ),
+            "{error:?}"
+        );
+
+        // Once it has moved off, the deleted environments do not.
+        compose_placements::Entity::delete_by_id(live.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        service.remove(node.id).await.unwrap();
+        assert!(compose_placements::Entity::find_by_id(home_here.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let leaving = compose_placements::Entity::find_by_id(leaving_here.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(leaving.pending_vacate(), None);
+        assert_eq!(leaving.node_id, None);
+    }
+
+    /// A node recorded as lost does not hold its Compose stacks hostage:
+    /// their volumes went with it, a move off it could never tear the stack
+    /// down there, and refusing would leave the node unremovable. Both a
+    /// stack at home there and one moving away are released and reported.
+    /// While the node still heartbeats, the refusal stands.
+    #[tokio::test]
+    async fn test_remove_as_lost_releases_live_compose_placements_of_an_unreachable_node() {
+        use sea_orm::ActiveModelTrait;
+        use temps_entities::compose_placements;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req(
+                "worker-gone",
+                "hash",
+                "https://10.100.0.2:3100",
+            ))
+            .await
+            .unwrap();
+        let (_, at_home) = seed_placement(db.as_ref(), "at-home", None, None).await;
+        let (_, moving_away) = seed_placement(db.as_ref(), "moving-away", None, None).await;
+        for (environment_id, node_id, vacate_node_id) in [
+            (at_home.id, Some(node.id), None),
+            (moving_away.id, None, Some(node.id)),
+        ] {
+            compose_placements::ActiveModel {
+                environment_id: Set(environment_id),
+                node_id: Set(node_id),
+                pinned_at: Set(chrono::Utc::now()),
+                vacate_pending: Set(vacate_node_id.is_some()),
+                vacate_node_id: Set(vacate_node_id),
+                updated_at: Set(chrono::Utc::now()),
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+        let heartbeat = |seconds_ago: i64| {
+            let mut row: nodes::ActiveModel = node.clone().into();
+            row.last_heartbeat = Set(Some(
+                chrono::Utc::now() - chrono::Duration::seconds(seconds_ago),
+            ));
+            row
+        };
+
+        // Still heartbeating: forcing does not discard the stacks' data.
+        heartbeat(5).update(db.as_ref()).await.unwrap();
+        let error = service
+            .remove_with(node.id, ServingContainers::RecordLost)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, NodeError::HostsComposeStacks { count: 2, .. }),
+            "{error:?}"
+        );
+
+        // Silent past the threshold, without the operator's say-so: refused.
+        heartbeat(NODE_HEARTBEAT_STALE_SECS + 30)
+            .update(db.as_ref())
+            .await
+            .unwrap();
+        let error = service.remove(node.id).await.unwrap_err();
+        assert!(
+            matches!(error, NodeError::HostsComposeStacks { count: 2, .. }),
+            "{error:?}"
+        );
+
+        // Recorded as lost: removed, and both stacks released and named.
+        let removal = service
+            .remove_with(node.id, ServingContainers::RecordLost)
+            .await
+            .unwrap();
+        let mut lost = removal.lost_environments;
+        lost.sort();
+        let mut expected = vec![
+            compose_stack_lost_note(&at_home.name, at_home.id),
+            compose_stack_lost_note(&moving_away.name, moving_away.id),
+        ];
+        expected.sort();
+        assert_eq!(lost, expected);
+        assert!(nodes::Entity::find_by_id(node.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(compose_placements::Entity::find_by_id(at_home.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+        let moving = compose_placements::Entity::find_by_id(moving_away.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(moving.pending_vacate(), None);
+        assert_eq!(moving.node_id, None);
     }
 
     fn stored_targets(environment: &environments::Model) -> Option<Vec<i32>> {
@@ -5645,6 +6001,32 @@ mod tests {
 
     // ── affected_deployments integration tests ─────────────────────
 
+    /// A Compose stack pinned to the failed node is never failed over: its
+    /// volumes are there, so it waits for the node or for an explicit move.
+    #[tokio::test]
+    async fn test_affected_deployments_skips_compose_stacks_pinned_to_the_node() {
+        let now = chrono::Utc::now();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![sample_container(1, 10, 5)]])
+            .append_query_results(vec![vec![sample_deployment(10, 100, 200)]])
+            .append_query_results(vec![vec![temps_entities::compose_placements::Model {
+                environment_id: 200,
+                node_id: Some(5),
+                pinned_at: now,
+                vacate_pending: false,
+                vacate_node_id: None,
+                updated_at: now,
+            }]])
+            .append_query_results(vec![vec![sample_environment(200, 100, Some(10))]])
+            .append_query_results(vec![Vec::<deployment_containers::Model>::new()])
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let affected = service.affected_deployments(5).await.unwrap();
+
+        assert!(affected.is_empty(), "{affected:?}");
+    }
+
     #[tokio::test]
     async fn test_affected_deployments_classifies_current_and_historical_with_counts() {
         // Arrange: deployment 10 is current and has a healthy replica elsewhere.
@@ -5665,6 +6047,8 @@ mod tests {
             ]])
             // deployments query
             .append_query_results(vec![vec![current, historical]])
+            // no Compose stack is pinned to the node
+            .append_query_results(vec![Vec::<temps_entities::compose_placements::Model>::new()])
             // environments query determines which deployment is canonical
             .append_query_results(vec![vec![environment]])
             // all active containers for these deployment IDs

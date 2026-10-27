@@ -23,6 +23,8 @@ use crate::build_protocol::{
 use crate::image_scan::{
     ImageScanReport, ImageScanRequest, MAX_SCAN_FINDINGS, MAX_SCAN_REPORT_BYTES,
 };
+mod compose_client;
+
 use crate::{
     BuildRequest, BuildRequestWithCallback, BuildResult, BuilderError, ContainerDeployer,
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,

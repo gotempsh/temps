@@ -11914,6 +11914,79 @@
         ],
         "type": "string"
       },
+      "ComposePlacementResponse": {
+        "description": "Where a Compose environment's stack lives, for the console.",
+        "properties": {
+          "drift": {
+            "description": "Why the environment's Target Nodes / Label Selectors no longer\ndescribe the home, when they do not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "home_node_id": {
+            "description": "The home node: `0` is the control plane. `None` when not pinned.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "home_node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "home_node_status": {
+            "description": "The home's state (`active`, `offline`, `draining`, ...). Deployments\nfail rather than move while the home is not active.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "moving_from_node_id": {
+            "description": "A move is pending: the node the next deployment stops the stack on\n(`0` is the control plane).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "moving_from_node_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pinned": {
+            "description": "Whether the stack has a home yet. `false` until its first deployment\nreaches `docker compose up` (or a move chose one).",
+            "type": "boolean"
+          },
+          "pinned_at": {
+            "description": "When the stack was pinned to its home, ISO 8601.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_id",
+          "pinned"
+        ],
+        "type": "object"
+      },
       "ComposePortMapping": {
         "description": "A Docker Compose service port mapping, reduced to the information the UI\nneeds to build a public route without confusing host and container ports.",
         "properties": {
@@ -41027,6 +41100,24 @@
           "retention_hourly_days",
           "retention_daily_years",
           "clickhouse_url_set"
+        ],
+        "type": "object"
+      },
+      "MoveComposeStackRequest": {
+        "description": "Move a Compose stack to another node.",
+        "properties": {
+          "acknowledge_data_loss": {
+            "description": "The stack starts on the new node with empty volumes; the data on its\ncurrent home is kept there but not copied. Must be `true` to move a\nstack that already has a home.",
+            "type": "boolean"
+          },
+          "node_id": {
+            "description": "The node to move the stack to; `0` is the control plane.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "node_id"
         ],
         "type": "object"
       },
@@ -133680,6 +133771,222 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/compose-placement": {
+      "get": {
+        "operationId": "get_compose_placement",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePlacementResponse"
+                }
+              }
+            },
+            "description": "The stack's placement"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a Docker Compose project"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Where this environment's Compose stack lives: its home node, a pending\nmove, and whether the environment's Target Nodes / Label Selectors still\ndescribe that home.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/compose-placement/move": {
+      "post": {
+        "operationId": "move_compose_stack",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveComposeStackRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposePlacementResponse"
+                }
+              }
+            },
+            "description": "The new placement; redeploy to complete the move"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Not a Docker Compose project, or data loss not acknowledged"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment or node not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The node cannot take the stack, or it already lives there"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Move this environment's Compose stack to another node. Nothing runs yet:\nthe next deployment stops the stack on its current home (`docker compose\ndown`, volumes kept there) and starts it on the new node with empty\nvolumes. Redeploy to complete the move.",
+        "tags": [
+          "Compose"
+        ]
+      }
+    },
     "/projects/{project_id}/environments/{environment_id}/container-history": {
       "get": {
         "operationId": "list_container_history",
@@ -157939,6 +158246,10 @@
     {
       "description": "Cron jobs management API",
       "name": "Crons"
+    },
+    {
+      "description": "Docker Compose configuration diagnostics",
+      "name": "Compose"
     },
     {
       "description": "Docker Compose configuration diagnostics",

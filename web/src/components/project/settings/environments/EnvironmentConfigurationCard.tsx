@@ -19,6 +19,7 @@ import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
+import { ComposePlacementPanel } from './ComposePlacementPanel'
 import { projectHasGitRepo } from '@/lib/project-git'
 import { nodeSchedulingRole, targetNodesHint } from '@/lib/node-role'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
@@ -383,6 +384,7 @@ export function EnvironmentConfigurationCard({
   }
 
   const hasGitRepo = projectHasGitRepo(project)
+  const isComposeProject = project.preset === 'docker-compose'
 
   return (
     <form onSubmit={handleSubmit}>
@@ -916,8 +918,19 @@ export function EnvironmentConfigurationCard({
               <div>
                 <Label className="text-sm font-medium">Target Nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
-                  {targetNodesHint(activeNodes)}
+                  {isComposeProject
+                    ? 'Choose where this Compose stack first runs. After its first deployment it stays on that node, because its volumes live there.'
+                    : targetNodesHint(activeNodes)}
                 </p>
+                {isComposeProject && (
+                  <div className="mb-2">
+                    <ComposePlacementPanel
+                      projectId={project.id}
+                      environmentId={environment.id}
+                      nodes={activeNodes}
+                    />
+                  </div>
+                )}
                 <div className="space-y-2">
                   {activeNodes.map((node) => {
                     const isSelected = formData.target_nodes.includes(node.id)

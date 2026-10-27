@@ -5857,6 +5857,44 @@ export type ComposeHostStatusResponse = {
 export type ComposeOverrideRedundancy = 'identical' | 'superset';
 
 /**
+ * Where a Compose environment's stack lives, for the console.
+ */
+export type ComposePlacementResponse = {
+    /**
+     * Why the environment's Target Nodes / Label Selectors no longer
+     * describe the home, when they do not.
+     */
+    drift?: string | null;
+    environment_id: number;
+    /**
+     * The home node: `0` is the control plane. `None` when not pinned.
+     */
+    home_node_id?: number | null;
+    home_node_name?: string | null;
+    /**
+     * The home's state (`active`, `offline`, `draining`, ...). Deployments
+     * fail rather than move while the home is not active.
+     */
+    home_node_status?: string | null;
+    /**
+     * A move is pending: the node the next deployment stops the stack on
+     * (`0` is the control plane).
+     */
+    moving_from_node_id?: number | null;
+    moving_from_node_name?: string | null;
+    /**
+     * Whether the stack has a home yet. `false` until its first deployment
+     * reaches `docker compose up` (or a move chose one).
+     */
+    pinned: boolean;
+    /**
+     * When the stack was pinned to its home, ISO 8601.
+     */
+    pinned_at?: string | null;
+    project_id: number;
+};
+
+/**
  * A Docker Compose service port mapping, reduced to the information the UI
  * needs to build a public route without confusing host and container ports.
  */
@@ -19035,6 +19073,22 @@ export type MonitoringSettingsMasked = {
     retention_raw_days: number;
     scrape_interval_secs: number;
     store: MetricsStoreKind;
+};
+
+/**
+ * Move a Compose stack to another node.
+ */
+export type MoveComposeStackRequest = {
+    /**
+     * The stack starts on the new node with empty volumes; the data on its
+     * current home is kept there but not copied. Must be `true` to move a
+     * stack that already has a home.
+     */
+    acknowledge_data_loss?: boolean;
+    /**
+     * The node to move the stack to; `0` is the control plane.
+     */
+    node_id: number;
 };
 
 export type MrrBucketResponse = {
@@ -70326,6 +70380,110 @@ export type WakeEnvironmentResponses = {
 };
 
 export type WakeEnvironmentResponse = WakeEnvironmentResponses[keyof WakeEnvironmentResponses];
+
+export type GetComposePlacementData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/compose-placement';
+};
+
+export type GetComposePlacementErrors = {
+    /**
+     * Not a Docker Compose project
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetComposePlacementError = GetComposePlacementErrors[keyof GetComposePlacementErrors];
+
+export type GetComposePlacementResponses = {
+    /**
+     * The stack's placement
+     */
+    200: ComposePlacementResponse;
+};
+
+export type GetComposePlacementResponse = GetComposePlacementResponses[keyof GetComposePlacementResponses];
+
+export type MoveComposeStackData = {
+    body: MoveComposeStackRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/compose-placement/move';
+};
+
+export type MoveComposeStackErrors = {
+    /**
+     * Not a Docker Compose project, or data loss not acknowledged
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment or node not found
+     */
+    404: ProblemDetails;
+    /**
+     * The node cannot take the stack, or it already lives there
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type MoveComposeStackError = MoveComposeStackErrors[keyof MoveComposeStackErrors];
+
+export type MoveComposeStackResponses = {
+    /**
+     * The new placement; redeploy to complete the move
+     */
+    200: ComposePlacementResponse;
+};
+
+export type MoveComposeStackResponse = MoveComposeStackResponses[keyof MoveComposeStackResponses];
 
 export type ListContainerHistoryData = {
     body?: never;

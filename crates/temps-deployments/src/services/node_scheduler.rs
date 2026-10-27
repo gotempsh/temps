@@ -571,6 +571,17 @@ impl NodeScheduler {
     }
 
     /// Get a reference to the underlying node service.
+    /// The worker node `node_id` when it is active and has heartbeated within
+    /// the scheduler's threshold, i.e. when a deployment may be sent to it.
+    pub async fn active_node(&self, node_id: i32) -> Result<Option<nodes::Model>, NodeError> {
+        Ok(self
+            .node_service
+            .list_active(self.heartbeat_threshold_secs)
+            .await?
+            .into_iter()
+            .find(|node| node.id == node_id))
+    }
+
     pub fn node_service(&self) -> &NodeService {
         &self.node_service
     }

@@ -31,6 +31,7 @@ pub mod build_timings;
 pub mod build_verification;
 pub mod compose;
 pub mod compose_interpolation;
+pub mod compose_protocol;
 mod compose_remote;
 pub mod runner_protocol;
 

@@ -2970,6 +2970,12 @@ impl WorkflowExecutionService {
                 // stayed `pending` forever, with no per-job reason anywhere in
                 // the UI. Constructing unconditionally keeps the refusal on
                 // the job's own execution path, where the tracker records it.
+                // Where the stack lives: its pinned home, or (first
+                // deployment) the node its Target Nodes / Label Selectors
+                // choose. See `services::compose_placement`.
+                let (placement_plan, compose_host, compose_vacate_host) = self
+                    .plan_compose_stack(project, environment, deployment, &compose_policy)
+                    .await?;
                 let compose_executor = Arc::new(
                     temps_deployer::compose::ComposeExecutor::new_with_handle(
                         self.docker_handle.clone(),
@@ -3017,6 +3023,10 @@ impl WorkflowExecutionService {
                     .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
+                    .host(compose_host)
+                    .vacate_host(compose_vacate_host)
+                    .pin_home(!placement_plan.pinned)
+                    .placement_drift(placement_plan.drift)
                     .build()?;
 
                 Ok(Arc::new(job))
@@ -3884,6 +3894,25 @@ impl WorkflowExecutionService {
         let Some(node_id) = node_id else {
             return Ok(self.container_deployer.clone());
         };
+        let (_, deployer) = self
+            .remote_deployer_for_node(node_id, "removing a retained container")
+            .await?;
+        Ok(Arc::new(deployer))
+    }
+
+    /// The agent client for worker node `node_id`, for `purpose` (named in
+    /// every error).
+    async fn remote_deployer_for_node(
+        &self,
+        node_id: i32,
+        purpose: &str,
+    ) -> Result<
+        (
+            temps_entities::nodes::Model,
+            temps_deployer::remote::RemoteNodeDeployer,
+        ),
+        WorkflowExecutionError,
+    > {
         use temps_entities::nodes;
 
         let node = nodes::Entity::find_by_id(node_id)
@@ -3891,29 +3920,29 @@ impl WorkflowExecutionService {
             .await?
             .ok_or_else(|| {
                 WorkflowExecutionError::JobCreationFailed(format!(
-                    "Cannot remove container from missing worker node {node_id}"
+                    "Worker node {node_id} is not registered (while {purpose})"
                 ))
             })?;
         let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Worker node {node_id} has no agent token; retained containers cannot be removed safely"
+                "Worker node {node_id} has no agent token, so Temps cannot reach it safely (while {purpose})"
             ))
         })?;
         let encryption_service = self.encryption_service.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Encryption service is unavailable; retained containers on worker node {node_id} cannot be removed safely"
+                "Encryption service is unavailable, so worker node {node_id} cannot be reached (while {purpose})"
             ))
         })?;
         let token_bytes = encryption_service
             .decrypt(encrypted_token)
             .map_err(|error| {
                 WorkflowExecutionError::JobCreationFailed(format!(
-                    "Failed to decrypt the agent token for worker node {node_id}: {error}"
+                    "Failed to decrypt the agent token for worker node {node_id} (while {purpose}): {error}"
                 ))
             })?;
         let token = String::from_utf8(token_bytes).map_err(|error| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Agent token for worker node {node_id} is not valid UTF-8: {error}"
+                "Agent token for worker node {node_id} is not valid UTF-8 (while {purpose}): {error}"
             ))
         })?;
         let deployer = crate::cluster_ca::build_node_deployer(
@@ -3925,10 +3954,120 @@ impl WorkflowExecutionService {
         .await
         .map_err(|error| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Failed to connect to worker node {node_id} while removing a retained container: {error}"
+                "Failed to connect to worker node {node_id} (while {purpose}): {error}"
             ))
         })?;
-        Ok(Arc::new(deployer))
+        Ok((node, deployer))
+    }
+
+    /// Where this deployment of a Compose environment runs, which host a
+    /// pending move leaves, and whether the home still has to be pinned.
+    async fn plan_compose_stack(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+    ) -> Result<
+        (
+            crate::services::compose_placement::ComposePlacementPlan,
+            crate::jobs::ComposeStackHost,
+            Option<crate::jobs::ComposeStackHost>,
+        ),
+        WorkflowExecutionError,
+    > {
+        let (target_nodes, target_labels) = resolve_placement_constraints(
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        );
+        let plan =
+            crate::services::compose_placement::ComposePlacementService::new(self.db.clone())
+                .plan(
+                    self.node_scheduler.get().map(Arc::as_ref),
+                    project,
+                    environment,
+                    target_nodes.as_deref(),
+                    target_labels.as_ref(),
+                )
+                .await
+                .map_err(|source| WorkflowExecutionError::ComposePlacement {
+                    deployment_id: deployment.id,
+                    source,
+                })?;
+        let host = self
+            .compose_stack_host(plan.home, policy, "deploying a Compose stack")
+            .await?;
+        if !host.is_control_plane() {
+            self.refuse_linked_services_on_worker(project, deployment, &host)
+                .await?;
+        }
+        let vacate_host = match plan.vacate {
+            Some(old) => Some(
+                self.compose_stack_host(old, policy, "moving a Compose stack off it")
+                    .await?,
+            ),
+            None => None,
+        };
+        info!(
+            deployment_id = deployment.id,
+            environment_id = environment.id,
+            home = %host.describe(),
+            pinned = plan.pinned,
+            moving_from = ?vacate_host.as_ref().map(crate::jobs::ComposeStackHost::describe),
+            "Planned Compose stack placement"
+        );
+        Ok((plan, host, vacate_host))
+    }
+
+    async fn compose_stack_host(
+        &self,
+        node_id: Option<i32>,
+        policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+        purpose: &str,
+    ) -> Result<crate::jobs::ComposeStackHost, WorkflowExecutionError> {
+        let Some(node_id) = node_id else {
+            return Ok(crate::jobs::ComposeStackHost::ControlPlane);
+        };
+        let (node, deployer) = self.remote_deployer_for_node(node_id, purpose).await?;
+        Ok(crate::jobs::ComposeStackHost::Worker {
+            node_id,
+            node_name: node.name,
+            deployer: Arc::new(deployer),
+            policy: policy.clone(),
+        })
+    }
+
+    /// Linked Temps-managed services are reached by container name on the
+    /// control plane's Docker network. A stack on a worker has no route to
+    /// them, so it would start with connection strings that never connect.
+    async fn refuse_linked_services_on_worker(
+        &self,
+        project: &projects::Model,
+        deployment: &deployments::Model,
+        host: &crate::jobs::ComposeStackHost,
+    ) -> Result<(), WorkflowExecutionError> {
+        use temps_entities::{external_services, project_services};
+        let linked = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project.id))
+            .find_also_related(external_services::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        if linked.is_empty() {
+            return Ok(());
+        }
+        let services = linked
+            .iter()
+            .map(|(link, service)| match service {
+                Some(service) => format!("'{}'", service.name),
+                None => format!("service {}", link.service_id),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(WorkflowExecutionError::ComposeLinkedServicesOnWorker {
+            deployment_id: deployment.id,
+            host: host.describe(),
+            services,
+        })
     }
 
     async fn teardown_registered_container(
@@ -4509,6 +4648,30 @@ pub enum WorkflowExecutionError {
         platform: String,
         reason: String,
     },
+
+    /// Where a Compose stack lives could not be decided, or its home cannot
+    /// take this deployment (see `services::compose_placement`).
+    #[error("Deployment {deployment_id}: {source}")]
+    ComposePlacement {
+        deployment_id: i32,
+        #[source]
+        source: crate::services::compose_placement::ComposePlacementError,
+    },
+
+    /// A Compose stack whose home is a worker links Temps-managed services,
+    /// which its containers there cannot reach.
+    #[error(
+        "Deployment {deployment_id} would run this Docker Compose stack on {host}, but the \
+         project is linked to Temps-managed services ({services}) whose connection details \
+         only resolve on the control plane. Compose stacks on worker nodes cannot reach linked \
+         services yet: unlink them and run the database inside the stack, or move the stack to \
+         the control plane in the environment's Node scheduling settings"
+    )]
+    ComposeLinkedServicesOnWorker {
+        deployment_id: i32,
+        host: String,
+        services: String,
+    },
 }
 
 impl WorkflowExecutionError {
@@ -4531,7 +4694,16 @@ impl WorkflowExecutionError {
             | Self::DedicatedNodesNotPinned { .. }
             // The cluster's state: a target architecture has no reachable
             // worker. Recorded on the deployment with the fix.
-            | Self::NoBuilderForArchitecture { .. } => true,
+            | Self::NoBuilderForArchitecture { .. }
+            // A Compose stack whose home links services it cannot reach.
+            | Self::ComposeLinkedServicesOnWorker { .. } => true,
+            // The stack's home is offline, nothing can take its first
+            // deployment, or a concurrent deployment pinned it elsewhere.
+            // Recorded on the deployment with the fix.
+            Self::ComposePlacement { source, .. } => !matches!(
+                source,
+                crate::services::compose_placement::ComposePlacementError::Database { .. }
+            ),
             Self::DatabaseError(_)
             | Self::NoJobsFound(_)
             | Self::MissingJobConfig(_)
@@ -7067,6 +7239,126 @@ mod tests {
             Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
         ));
 
+        Ok(())
+    }
+
+    /// Compose placement failures the operator acts on are recorded as
+    /// deployment outcomes; a database failure is Temps' own fault.
+    #[test]
+    fn compose_placement_failures_are_outcomes_except_database_errors() {
+        use crate::services::compose_placement::ComposePlacementError;
+        let offline = WorkflowExecutionError::ComposePlacement {
+            deployment_id: 12,
+            source: ComposePlacementError::HomeNodeUnavailable {
+                environment_id: 3,
+                environment_name: "production".to_string(),
+                node_id: 7,
+                node_name: "worker-a".to_string(),
+                state: "offline".to_string(),
+            },
+        };
+        let message = offline.to_string();
+        assert!(message.starts_with("Deployment 12: "), "{message}");
+        assert!(message.contains("'worker-a' (id 7)"), "{message}");
+        assert!(offline.is_workload_outcome());
+        assert_eq!(
+            crate::services::failure_classifier::classify_failure_reason(Some(&message)).code,
+            crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
+        );
+
+        let database = WorkflowExecutionError::ComposePlacement {
+            deployment_id: 12,
+            source: ComposePlacementError::Database {
+                environment_id: 3,
+                operation: "reading the Compose placement",
+                source: sea_orm::DbErr::Custom("connection reset".to_string()),
+            },
+        };
+        assert!(!database.is_workload_outcome());
+
+        let linked = WorkflowExecutionError::ComposeLinkedServicesOnWorker {
+            deployment_id: 12,
+            host: "worker node 'worker-a' (id 7)".to_string(),
+            services: "'orders-db'".to_string(),
+        };
+        let message = linked.to_string();
+        assert!(message.contains("'orders-db'"), "{message}");
+        assert!(linked.is_workload_outcome());
+        assert_eq!(
+            crate::services::failure_classifier::classify_failure_reason(Some(&message)).code,
+            crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
+        );
+    }
+
+    /// A first Compose deployment pinned to a worker goes to that worker; an
+    /// unconstrained one stays on the control plane; a pinned home that went
+    /// offline is never replaced.
+    #[tokio::test]
+    async fn compose_stacks_go_to_their_home_and_never_fail_over(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
+        service.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(node_service).with_local_workloads_enabled(true),
+        ));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        let worker = insert_node(
+            db.as_ref(),
+            "worker-a",
+            "http://127.0.0.1:9",
+            "linux/amd64",
+            serde_json::json!({}),
+        )
+        .await?;
+        let policy = temps_entities::compose_security::ComposeSecurityPolicy::default();
+
+        // Unconstrained: the control plane, as Compose always ran.
+        let (plan, host, vacate) = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await?;
+        assert!(host.is_control_plane(), "{host:?}");
+        assert!(!plan.pinned);
+        assert!(vacate.is_none());
+
+        // Target Nodes naming the worker: the worker.
+        environment.deployment_config = with_placement(Some(vec![worker.id]), None);
+        let (plan, host, _) = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await?;
+        assert_eq!(host.node_id(), Some(worker.id), "{host:?}");
+        assert!(!plan.pinned);
+
+        // Pinned there, then the worker goes offline: refused, never moved.
+        crate::services::compose_placement::ComposePlacementService::new(db.clone())
+            .pin(environment.id, Some(worker.id))
+            .await?;
+        let mut offline: temps_entities::nodes::ActiveModel = worker.clone().into();
+        offline.status = Set("offline".to_string());
+        offline.update(db.as_ref()).await?;
+        environment.deployment_config = None;
+        let error = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkflowExecutionError::ComposePlacement {
+                    source: crate::services::compose_placement::ComposePlacementError::HomeNodeUnavailable { node_id, .. },
+                    ..
+                } if node_id == worker.id
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 
