@@ -14,7 +14,9 @@ extend-exclude = ["README.*.md", "**/__fixtures__/**", "crates/temps-credential-
 [default]
 # This exact upstream Gitleaks rule ID has a historical spelling.
 # Correcting it silently disables Airtable automatic verification.
-extend-ignore-re = ['"airtable-personnal-access-token"']
+extend-ignore-re = ['"airtable-personnal-access-token"', '"loca\.lt"']
+# `loca.lt` above is localtunnel's public domain, which the sandbox
+# exposure filter matches; "correcting" it to `local.lt` stops the match.
 
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,

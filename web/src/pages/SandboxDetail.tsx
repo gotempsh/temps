@@ -507,6 +507,9 @@ export default function SandboxDetail() {
     { tone: StatusTone; label: string }
   > = {
     running: { tone: 'ok', label: 'Running' },
+    // The create is still running: the first sandbox on a node builds its
+    // image, which can take minutes. The page refetches until it is up.
+    starting: { tone: 'idle', label: 'Starting' },
     stopped: { tone: 'warn', label: workspace ? 'Sleeping' : 'Stopped' },
     destroyed: { tone: 'error', label: 'Destroyed' },
   }

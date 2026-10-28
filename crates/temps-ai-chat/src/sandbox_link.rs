@@ -1080,6 +1080,41 @@ impl SandboxLinkService {
         Ok(())
     }
 
+    /// [`Self::merge_metadata_key`] for the link, applied only where the
+    /// stored link still names `expected` (`None`: no link). Returns whether
+    /// it was written.
+    async fn merge_link_if_unchanged(
+        &self,
+        conversation: &ai_conversations::Model,
+        value: &Value,
+        expected: Option<&str>,
+    ) -> Result<bool, SandboxLinkError> {
+        let result = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE ai_conversations \
+                     SET metadata = (CASE WHEN jsonb_typeof(metadata) = 'object' THEN metadata ELSE '{{}}'::jsonb END) \
+                         || jsonb_build_object($1::text, $2::jsonb) \
+                     WHERE {} \
+                       AND (CASE WHEN jsonb_typeof(metadata) = 'object' \
+                                 THEN metadata -> $1::text ->> 'sandbox_id' END) \
+                           IS NOT DISTINCT FROM $4",
+                    metadata_scope("$3", is_workspace_shared_key(SANDBOX_LINK_KEY))
+                ),
+                [
+                    SANDBOX_LINK_KEY.into(),
+                    value.clone().into(),
+                    conversation.id.into(),
+                    expected.map(str::to_string).into(),
+                ],
+            ))
+            .await
+            .map_err(|source| Self::db_err(conversation, source))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn remove_metadata_key(
         &self,
         conversation: &ai_conversations::Model,
@@ -1162,16 +1197,51 @@ impl SandboxLinkService {
         };
         let service = self.clone();
         let target = conversation.clone();
+        // The link the chat has now. A slow create must not replace a sandbox
+        // the user links by hand while it runs.
+        let linked_before =
+            link_from_metadata(conversation.metadata.as_ref()).map(|l| l.sandbox_id);
         let task = tokio::spawn(async move {
-            let row = service
-                .sandboxes
-                .create_sandbox(user_id, request)
-                .await
-                .map_err(|error| SandboxLinkError::Sandbox {
+            let row = match service.sandboxes.create_sandbox(user_id, request).await {
+                Ok(row) => row,
+                Err(error) => {
+                    // The chat may have stopped waiting already; this log is
+                    // then the only record of why no sandbox was linked.
+                    warn!(
+                        conversation_id = %target.public_id,
+                        user_id,
+                        error = %error,
+                        "creating a sandbox for the chat failed; nothing was linked"
+                    );
+                    return Err(SandboxLinkError::Sandbox {
+                        conversation_id: target.public_id.clone(),
+                        reason: format!("could not create a sandbox: {error}"),
+                    });
+                }
+            };
+            let Some(link) = service
+                .store_link_if_unchanged(
+                    &target,
+                    row.public_id.clone(),
+                    row.name,
+                    linked_before.as_deref(),
+                )
+                .await?
+            else {
+                info!(
+                    conversation_id = %target.public_id,
+                    sandbox_id = %row.public_id,
+                    "the chat was linked to another sandbox while this one was created; leaving it unlinked"
+                );
+                return Err(SandboxLinkError::Sandbox {
                     conversation_id: target.public_id.clone(),
-                    reason: format!("could not create a sandbox: {error}"),
-                })?;
-            let link = service.store_link(&target, row.public_id, row.name).await?;
+                    reason: format!(
+                        "sandbox {} was created, but the chat was linked to another sandbox in \
+                         the meantime, so it was left unlinked",
+                        row.public_id
+                    ),
+                });
+            };
             if let Some(reason) = assistant_reason {
                 service
                     .audit_created(&target, user_id, &link.sandbox_id, &reason)
@@ -1203,6 +1273,35 @@ impl SandboxLinkService {
         sandbox_id: String,
         name: String,
     ) -> Result<SandboxLink, SandboxLinkError> {
+        let sandbox = sandbox_id.clone();
+        self.write_link(conversation, sandbox_id, name, None)
+            .await?
+            .ok_or_else(|| SandboxLinkError::Validation {
+                conversation_id: conversation.public_id.clone(),
+                message: format!("the link to sandbox {sandbox} was not stored"),
+            })
+    }
+
+    /// Store the link only while the chat is still linked to `expected`
+    /// (`None`: not linked). `Ok(None)` when the link changed in between.
+    async fn store_link_if_unchanged(
+        &self,
+        conversation: &ai_conversations::Model,
+        sandbox_id: String,
+        name: String,
+        expected: Option<&str>,
+    ) -> Result<Option<SandboxLink>, SandboxLinkError> {
+        self.write_link(conversation, sandbox_id, name, Some(expected))
+            .await
+    }
+
+    async fn write_link(
+        &self,
+        conversation: &ai_conversations::Model,
+        sandbox_id: String,
+        name: String,
+        expected: Option<Option<&str>>,
+    ) -> Result<Option<SandboxLink>, SandboxLinkError> {
         let link = SandboxLink {
             sandbox_id,
             name,
@@ -1212,8 +1311,20 @@ impl SandboxLinkService {
             conversation_id: conversation.public_id.clone(),
             message: format!("could not encode the link: {error}"),
         })?;
-        self.merge_metadata_key(conversation, SANDBOX_LINK_KEY, &value)
-            .await?;
+        match expected {
+            None => {
+                self.merge_metadata_key(conversation, SANDBOX_LINK_KEY, &value)
+                    .await?
+            }
+            Some(expected) => {
+                if !self
+                    .merge_link_if_unchanged(conversation, &value, expected)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
         // A port confirmed on the previous sandbox says nothing about this one,
         // and neither do the services that sandbox was connected to.
         self.remove_metadata_key(conversation, SANDBOX_PREVIEW_KEY)
@@ -1227,7 +1338,7 @@ impl SandboxLinkService {
             sandbox_id = %link.sandbox_id,
             "sandbox linked to chat"
         );
-        Ok(link)
+        Ok(Some(link))
     }
 
     /// Remove the link. The sandbox itself is left running and untouched.

@@ -1334,6 +1334,11 @@ pub struct SandboxService {
     /// Worker nodes whose sandboxes are being evicted right now. They take
     /// no new sandboxes, and a second eviction of the same node is refused.
     evicting_nodes: Arc<EvictingNodes>,
+    /// Sandboxes whose create is still running in this process. Their rows
+    /// already say `running`, but no container exists yet: reads report them
+    /// as `starting`, and exec/filesystem calls are refused instead of
+    /// trying to wake a container that was never made.
+    creates_in_progress: Arc<CreatesInProgress>,
     /// This server is a control plane that runs no workloads (ADR 063):
     /// placement never picks it, and anything that needs its own host is
     /// refused with a typed error. `false` on every install that runs
@@ -1370,6 +1375,46 @@ impl EvictingNodes {
 
     fn contains(&self, node_id: i32) -> bool {
         self.set().contains(&node_id)
+    }
+}
+
+/// Public ids of the sandboxes this process is creating right now. Bounded by
+/// the number of concurrent creates.
+#[derive(Default)]
+struct CreatesInProgress(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl CreatesInProgress {
+    fn set(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        // Plain ids only; a poisoned lock is still consistent.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark `public_id` as being created until the guard drops, however the
+    /// create ends.
+    fn begin(self: &Arc<Self>, public_id: &str) -> CreateInProgress {
+        self.set().insert(public_id.to_string());
+        CreateInProgress {
+            creates: self.clone(),
+            public_id: public_id.to_string(),
+        }
+    }
+
+    fn contains(&self, public_id: &str) -> bool {
+        self.set().contains(public_id)
+    }
+}
+
+/// Holds a sandbox's create mark; see [`CreatesInProgress::begin`].
+struct CreateInProgress {
+    creates: Arc<CreatesInProgress>,
+    public_id: String,
+}
+
+impl Drop for CreateInProgress {
+    fn drop(&mut self) {
+        self.creates.set().remove(&self.public_id);
     }
 }
 
@@ -1411,6 +1456,7 @@ impl SandboxService {
             runtime_credentials: None,
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
+            creates_in_progress: Arc::new(CreatesInProgress::default()),
             control_plane_runs_no_workloads: false,
         }
     }
@@ -2166,6 +2212,7 @@ impl SandboxService {
     /// Replace the `node-<id>` placeholders from `From<&Model>` with real
     /// node names (one query for the whole batch).
     pub async fn fill_node_names(&self, summaries: &mut [SandboxSummary]) {
+        self.mark_creates_in_progress(summaries);
         let ids: std::collections::HashSet<i32> =
             summaries.iter().filter_map(|s| s.node_id).collect();
         if ids.is_empty() {
@@ -2187,6 +2234,17 @@ impl SandboxService {
     /// the internal ID the provider indexes by), then asks the provider
     /// to create the container. On provider failure the DB row is marked
     /// "destroyed" so list doesn't show zombie entries.
+    /// Report sandboxes this process is still creating as `starting`: their
+    /// rows say `running` from the insert on, before any container exists.
+    pub fn mark_creates_in_progress(&self, summaries: &mut [SandboxSummary]) {
+        for summary in summaries.iter_mut() {
+            if summary.status == "running" && self.creates_in_progress.contains(&summary.public_id)
+            {
+                summary.status = "starting".to_string();
+            }
+        }
+    }
+
     /// [`Self::create_sandbox`] in a task of its own, so it always reaches its
     /// success or cleanup path, even when the caller stops waiting.
     ///
@@ -2505,6 +2563,7 @@ impl SandboxService {
                 e.into()
             }
         })?;
+        let _create_in_progress = self.creates_in_progress.begin(&public_id_value);
 
         // Allocate host-side working directory. A worker node derives and
         // creates its own work directory, so nothing is made here for it.
@@ -5963,6 +6022,16 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(sandboxes::Model, i32), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if self.creates_in_progress.contains(public_id_value) {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: "starting".to_string(),
+                operation: "run exec or filesystem operations until its create finishes \
+                            (the first sandbox on a node builds its image, which can take \
+                            several minutes); retry when its status is running"
+                    .to_string(),
+            });
+        }
         let lifecycle = SandboxLifecycle::from_row(&row);
         if row.status == "stopped" {
             // Workspaces (ADR-036) are places a human comes back to, so a
@@ -11031,6 +11100,86 @@ mod storage_cleanup_tests {
             "a create nobody waited for must still clean up; found {:?}",
             leftovers
         );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// While a create runs, the row already says `running`. Reads must say
+    /// `starting` instead, and the mark must go away when the create ends.
+    #[tokio::test]
+    async fn a_create_in_progress_reads_as_starting_until_it_ends() {
+        let data_root = unique_data_root("create-starting");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_create = true;
+        provider.create_delay = Some(Duration::from_millis(300));
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (held, hold) = tokio::sync::oneshot::channel::<()>();
+        let _waiting = service.spawn_create(1, CreateSandboxRequest::default(), held);
+        let creating = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Some(id) = service.creates_in_progress.set().iter().next().cloned() {
+                    found = Some(id);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            found.expect("the create should be marked in progress")
+        };
+        let mut summaries = [
+            SandboxSummary::from(&row(&creating, None)),
+            SandboxSummary::from(&row(PUBLIC_ID, None)),
+        ];
+        service.mark_creates_in_progress(&mut summaries);
+        assert_eq!(summaries[0].status, "starting");
+        assert_eq!(
+            summaries[1].status, "running",
+            "other sandboxes keep their status"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), hold)
+            .await
+            .expect("the create must finish")
+            .expect_err("the held value is dropped, never sent");
+        assert!(
+            !service.creates_in_progress.contains(&creating),
+            "the mark must be cleared when the create ends, even when it fails"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// Exec and filesystem calls on a sandbox still being created get a
+    /// clear 409 instead of a wake attempt on a container that does not exist.
+    #[tokio::test]
+    async fn resolve_id_refuses_a_sandbox_whose_create_is_still_running() {
+        let data_root = unique_data_root("resolve-starting");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let _mark = service.creates_in_progress.begin(PUBLIC_ID);
+
+        let error = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect_err("a sandbox being created cannot run commands yet");
+        match error {
+            SandboxError::InvalidState {
+                sandbox_id, state, ..
+            } => {
+                assert_eq!(sandbox_id, PUBLIC_ID);
+                assert_eq!(state, "starting");
+            }
+            other => panic!("expected InvalidState(starting), got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&data_root);
     }
 

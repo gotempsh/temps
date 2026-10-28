@@ -94,6 +94,7 @@ function statusVariant(
     case 'sleeping':
       return 'warning'
     case 'recovering':
+    case 'starting':
       return 'secondary'
     case 'failed':
     case 'destroyed':
