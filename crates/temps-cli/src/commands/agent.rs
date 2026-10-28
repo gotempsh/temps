@@ -355,6 +355,7 @@ impl AgentCommand {
                         config.token.clone(),
                         docker.clone(),
                         dns_policy.clone(),
+                        &agent_data_dir(),
                     ) {
                         tracing::warn!(error = %e, "network policy enforcer could not start");
                     }

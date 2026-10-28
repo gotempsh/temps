@@ -910,10 +910,16 @@ impl NetworkPolicyService {
             .map_err(NetworkPolicyError::db(
                 "list workload addresses on other nodes",
             ))?;
+        // Every other node's host addresses. Trusted as sources, since the
+        // proxies and health checks dial from them, and therefore closed to
+        // this node's workloads on published ports: a workload connecting
+        // through one would be masqueraded to this node's address and pass
+        // the receiver as a system source.
+        let node_hosts = self.other_node_addresses(node_id).await?;
         let system_ingress = if node_id == CONTROL_PLANE_NODE_ID {
             Vec::new()
         } else {
-            let mut sources = self.other_node_addresses(node_id).await?;
+            let mut sources = node_hosts.clone();
             sources.extend(self.control_plane_sources_toward(node_id).await?);
             sources.sort();
             sources.dedup();
@@ -949,6 +955,7 @@ impl NetworkPolicyService {
                 protocol: L4Protocol::Tcp,
             }],
             system_ingress,
+            node_hosts,
             ..Default::default()
         })
     }
@@ -1797,6 +1804,16 @@ mod tests {
             remote,
             vec!["172.20.5.42".to_string(), "172.20.5.44".to_string()],
             "the running member's overlay IP and its name record; never the stopped member"
+        );
+        // Node 0's workloads may not open the worker's published ports
+        // through its host address: it is in `node_hosts`.
+        assert!(
+            snapshot
+                .node_hosts
+                .iter()
+                .any(|cidr| cidr.to_string() == "10.201.0.9/32"),
+            "{:?}",
+            snapshot.node_hosts
         );
         assert!(snapshot
             .policies

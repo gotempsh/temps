@@ -16,6 +16,7 @@ pub mod gate;
 pub mod handlers;
 pub mod internal_proxy;
 pub mod mesh_listener;
+pub mod netpol_guard;
 pub mod network_policy;
 pub mod network_sync;
 pub mod node_runtime;

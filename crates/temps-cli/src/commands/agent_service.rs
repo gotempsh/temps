@@ -13,6 +13,11 @@ use clap::{Args, Subcommand};
 const SERVICE_NAME: &str = "temps-agent.service";
 const UNIT_PATH: &str = "/etc/systemd/system/temps-agent.service";
 const MANAGED_MARKER: &str = "# Managed by Temps. Do not edit by hand.";
+/// Loads the network policy boot guard before Docker restarts workloads.
+const GUARD_SERVICE_NAME: &str = "temps-netpol-guard.service";
+const GUARD_UNIT_PATH: &str = "/etc/systemd/system/temps-netpol-guard.service";
+/// Where `nft` usually lives; the guard unit names it by absolute path.
+const NFT_CANDIDATES: [&str; 3] = ["/usr/sbin/nft", "/sbin/nft", "/usr/bin/nft"];
 
 /// Run the agent as a systemd service
 #[derive(Subcommand, Debug, Clone)]
@@ -94,8 +99,33 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
         )
     })?;
     let unit = render_unit(&binary, &data_dir)?;
+    let nft = NFT_CANDIDATES
+        .iter()
+        .map(Path::new)
+        .find(|candidate| candidate.is_file());
+    let guard_unit = match nft {
+        Some(nft) => match render_guard_unit(nft, &data_dir) {
+            Ok(unit) => Some(unit),
+            Err(error) => {
+                eprintln!("Warning: the network policy boot guard is not installed: {error}");
+                None
+            }
+        },
+        None => {
+            eprintln!(
+                "Warning: nft was not found, so the network policy boot guard is not \
+                 installed. Without it, a node in `enforce` leaves restricted workloads \
+                 unguarded between a reboot and the agent's first policy pass. Install \
+                 nftables and run this again."
+            );
+            None
+        }
+    };
     if args.dry_run {
         print!("{unit}");
+        if let Some(guard_unit) = &guard_unit {
+            print!("\n{guard_unit}");
+        }
         return Ok(());
     }
 
@@ -108,7 +138,18 @@ fn install(args: &InstallArgs) -> anyhow::Result<()> {
     std::fs::write(&temporary, unit)?;
     set_mode(&temporary, 0o644)?;
     std::fs::rename(&temporary, UNIT_PATH)?;
+    if let Some(guard_unit) = guard_unit {
+        refuse_foreign_unit(Path::new(GUARD_UNIT_PATH))?;
+        let temporary = Path::new(GUARD_UNIT_PATH).with_extension("service.tmp");
+        std::fs::write(&temporary, guard_unit)?;
+        set_mode(&temporary, 0o644)?;
+        std::fs::rename(&temporary, GUARD_UNIT_PATH)?;
+    }
     systemctl(&["daemon-reload"])?;
+    if Path::new(GUARD_UNIT_PATH).exists() {
+        // Enabled, not started: it only matters at boot, before Docker.
+        systemctl(&["enable", GUARD_SERVICE_NAME])?;
+    }
     systemctl(&["enable", SERVICE_NAME])?;
     systemctl(&["restart", SERVICE_NAME])?;
     println!("Installed and started {SERVICE_NAME}.");
@@ -163,6 +204,14 @@ fn uninstall() -> anyhow::Result<()> {
         .args(["disable", "--now", SERVICE_NAME])
         .status();
     std::fs::remove_file(unit)?;
+    let guard = Path::new(GUARD_UNIT_PATH);
+    if guard.exists() {
+        refuse_foreign_unit(guard)?;
+        let _ = Command::new("systemctl")
+            .args(["disable", GUARD_SERVICE_NAME])
+            .status();
+        std::fs::remove_file(guard)?;
+    }
     systemctl(&["daemon-reload"])?;
     println!("Removed {SERVICE_NAME}.");
     Ok(())
@@ -198,6 +247,44 @@ UMask=0077
 
 [Install]
 WantedBy=multi-user.target
+"
+    ))
+}
+
+/// The unit that loads the network policy boot guard the agent keeps in
+/// `data_dir` (see `temps_agent::netpol_guard`), before Docker restarts any
+/// container. Nothing happens when the file is absent: the node does not
+/// enforce. A failure to load it does not hold Docker back.
+fn render_guard_unit(nft: &Path, data_dir: &Path) -> anyhow::Result<String> {
+    let nft = systemd_program(nft)?;
+    let guard = data_dir.join(temps_agent::netpol_guard::GUARD_FILE);
+    let quoted = systemd_quoted(&guard)?;
+    // `ConditionPathExists=` takes the path unquoted.
+    if quoted != guard.to_string_lossy() || quoted.contains(char::is_whitespace) {
+        anyhow::bail!(
+            "{} needs quoting, which ConditionPathExists= cannot express; use a data directory \
+             without spaces, quotes, backslashes or '%'",
+            guard.display()
+        );
+    }
+    Ok(format!(
+        "{MANAGED_MARKER}
+[Unit]
+Description=Temps network policy boot guard
+Documentation=https://temps.sh/docs/multi-node
+DefaultDependencies=no
+After=local-fs.target
+Before=docker.service network-pre.target
+Wants=network-pre.target
+ConditionPathExists={quoted}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=\"{nft}\" -f \"{quoted}\"
+
+[Install]
+WantedBy=multi-user.target docker.service
 "
     ))
 }
@@ -456,6 +543,24 @@ mod tests {
     }
 
     /// A restart of the agent must not kill the sandbox VMs it started.
+    #[test]
+    fn the_guard_unit_loads_the_guard_before_docker_only_when_present() {
+        let unit =
+            render_guard_unit(Path::new("/usr/sbin/nft"), Path::new("/root/.temps")).unwrap();
+        assert!(unit.lines().any(|line| line == MANAGED_MARKER));
+        assert!(unit.contains("Before=docker.service"));
+        assert!(unit.contains("WantedBy=multi-user.target docker.service"));
+        assert!(unit.contains("ConditionPathExists=/root/.temps/netpol-boot-guard.nft"));
+        assert!(
+            unit.contains("ExecStart=\"/usr/sbin/nft\" -f \"/root/.temps/netpol-boot-guard.nft\"")
+        );
+        assert!(unit.contains("DefaultDependencies=no"));
+        assert!(
+            render_guard_unit(Path::new("/usr/sbin/nft"), Path::new("/srv/my data")).is_err(),
+            "a path ConditionPathExists= cannot spell is refused"
+        );
+    }
+
     #[test]
     fn the_unit_stops_only_the_agent_so_sandbox_vms_survive_a_restart() {
         let unit =

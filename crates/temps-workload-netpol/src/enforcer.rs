@@ -50,7 +50,9 @@ use crate::ebpf::{
 use crate::egress::{EgressPolicy, EgressTable};
 use crate::executor::{NftError, NftExecutor};
 use crate::identity::IdentityMap;
-use crate::nft::{compile, CompileError, TableName};
+use crate::nft::{
+    compile, host_port_ruleset, host_port_table, removal_ruleset, CompileError, TableName,
+};
 use crate::ports::{PortQuery, PortResolver};
 use crate::rule::{
     Action, Cidr, Direction, L4Protocol, Origin, Peer, PortRange, Profile, Rule, WorkloadPolicy,
@@ -223,6 +225,11 @@ pub struct PolicySnapshot {
     /// proxies and health checkers of other nodes. The node's own addresses
     /// are added by the node.
     pub system_ingress: Vec<Cidr>,
+    /// Host addresses of every other node (private, underlay, mesh). This
+    /// node's workloads may not open their published ports through them;
+    /// see [`crate::nft::host_port_ruleset`]. Empty from an older control
+    /// plane.
+    pub node_hosts: Vec<Cidr>,
 }
 
 /// A node's mode and, outside `legacy`, its snapshot: the answer to
@@ -258,6 +265,8 @@ pub trait PolicySource: Send + Sync {
     /// merged in: what other nodes need to know about this one. Called on
     /// every pass outside `legacy`.
     fn observed(&self, _local: &IdentityMap) {}
+    /// A pass succeeded with `outcome`: whatever it decided is in force.
+    async fn applied(&self, _outcome: &PassOutcome) {}
 }
 
 /// The workload a container is an instance of.
@@ -326,6 +335,8 @@ pub struct NodePlan {
     pub bindings: Vec<PortBinding>,
     pub warnings: Vec<String>,
     pub local: BTreeSet<WorkloadRef>,
+    /// Addresses of this node's own workloads.
+    pub local_addresses: BTreeSet<IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -352,6 +363,9 @@ pub struct NodeEnforcer {
     /// restarts, so a hit is always current.
     port_cache: HashMap<String, String>,
     installed: Installed,
+    /// Digest of the host-port ruleset in the kernel; `None` in a fresh
+    /// process, which may have inherited one.
+    host_ports: Option<u64>,
     datapath: Option<DatapathSlot>,
     wake: Option<Arc<tokio::sync::Notify>>,
 }
@@ -376,6 +390,9 @@ struct DatapathSlot {
 /// What a pass observed on this node, before any backend compiles it.
 struct Observed {
     containers: Vec<ObservedContainer>,
+    /// Addresses of this node's own identified workloads, before remote
+    /// peers are merged in.
+    local_addresses: BTreeSet<IpAddr>,
     identities: IdentityMap,
     local: BTreeSet<WorkloadRef>,
     /// Indexes into `containers` of identified ones, with their workload.
@@ -406,6 +423,7 @@ impl NodeEnforcer {
             egress,
             port_cache: HashMap::new(),
             installed: Installed::Unknown,
+            host_ports: None,
             datapath: None,
             wake: None,
         }
@@ -459,6 +477,7 @@ impl NodeEnforcer {
             return self.reconcile_datapath(mode).await;
         }
         if mode == NodeMode::Legacy {
+            self.sync_host_ports(None).await?;
             match self.installed {
                 Installed::Enforced(_) => {
                     self.remove(mode).await?;
@@ -482,6 +501,7 @@ impl NodeEnforcer {
         match mode {
             NodeMode::Legacy => Ok(PassOutcome::Legacy),
             NodeMode::Shadow => {
+                self.sync_host_ports(None).await?;
                 match self.installed {
                     Installed::Enforced(_) => self.remove(mode).await?,
                     Installed::Unknown => self.clear_leftovers(mode).await?,
@@ -521,6 +541,12 @@ impl NodeEnforcer {
                 // the snapshots are refreshed every pass; storing an Arc
                 // is all it costs.
                 self.publish(&plan, &snapshot);
+                self.sync_host_ports(Some(host_port_ruleset(
+                    &self.table,
+                    &plan.local_addresses,
+                    &snapshot.node_hosts,
+                )))
+                .await?;
                 if self.installed == Installed::Enforced(plan.digest) {
                     return Ok(PassOutcome::Unchanged {
                         mode,
@@ -564,6 +590,7 @@ impl NodeEnforcer {
             source,
         };
         if mode == NodeMode::Legacy {
+            self.sync_host_ports(None).await?;
             let Some(slot) = self.datapath.as_mut() else {
                 return Ok(PassOutcome::Legacy);
             };
@@ -578,6 +605,8 @@ impl NodeEnforcer {
             datapath.set_mode(NodeMode::Legacy).map_err(dp_err)?;
             info!(node = %self.node, "network policy datapath switched to legacy: nothing is filtered");
             slot.applied = Some((NodeMode::Legacy, 0));
+            // A previous process enforced: drop its host-port rules too.
+            self.clear_host_port_leftovers().await;
             self.dns.store(Arc::new(DnsPolicy::open()));
             self.egress.store(Arc::new(EgressTable::default()));
             return Ok(PassOutcome::Removed { mode });
@@ -636,6 +665,12 @@ impl NodeEnforcer {
         };
         let identities = observed.identities.clone();
         if mode == NodeMode::Enforce {
+            self.sync_host_ports(Some(host_port_ruleset(
+                &self.table,
+                &observed.local_addresses,
+                &snapshot.node_hosts,
+            )))
+            .await?;
             let local_egress: Vec<EgressPolicy> = snapshot
                 .egress
                 .iter()
@@ -651,6 +686,7 @@ impl NodeEnforcer {
             self.egress
                 .store(Arc::new(EgressTable::build(&local_egress, &identities)));
         } else {
+            self.sync_host_ports(None).await?;
             self.dns.store(Arc::new(DnsPolicy::open()));
             self.egress.store(Arc::new(EgressTable::default()));
         }
@@ -708,6 +744,7 @@ impl NodeEnforcer {
         if let Err(e) = self.executor.clear_leftover_tables(&self.table).await {
             debug!(node = %self.node, error = %e, "no nftables network policy tables to clear");
         }
+        self.clear_host_port_leftovers().await;
     }
 
     /// The cgroup of every identified container. A cgroup claimed by two
@@ -817,6 +854,65 @@ impl NodeEnforcer {
         )));
     }
 
+    /// Keep the host-port table (see [`host_port_ruleset`]) at `ruleset`,
+    /// or removed when `None`. Applied only when it changed; a fresh
+    /// process applies once, since it may have inherited one.
+    async fn sync_host_ports(&mut self, ruleset: Option<String>) -> Result<(), EnforcerError> {
+        let ruleset = match ruleset {
+            Some(ruleset) => ruleset,
+            // Nothing this process applied: a table a previous one left is
+            // cleared with the other leftovers.
+            None if self.host_ports.is_none() => return Ok(()),
+            None => removal_ruleset(&host_port_table(&self.table)),
+        };
+        let removing = ruleset == removal_ruleset(&host_port_table(&self.table));
+        let mut hasher = DefaultHasher::new();
+        ruleset.hash(&mut hasher);
+        let digest = hasher.finish();
+        if self.host_ports == Some(digest) {
+            return Ok(());
+        }
+        match self.executor.apply(&ruleset).await {
+            Ok(()) => {
+                debug!(node = %self.node, table = %host_port_table(&self.table), "network policy host-port rules applied");
+            }
+            // The eBPF datapath runs without nft. The policy still applies;
+            // only reaching published ports through a node address stays
+            // possible, which an operator must hear about.
+            Err(NftError::Spawn { reason, .. })
+                if reason.contains("No such file") || reason.contains("not found") =>
+            {
+                if !removing {
+                    warn!(
+                        node = %self.node,
+                        %reason,
+                        "nft is not installed: workloads on this node can still reach other \
+                         workloads' published ports through a node address, past their ingress \
+                         rules. Install nftables on the node."
+                    );
+                }
+            }
+            Err(source) => {
+                return Err(EnforcerError::Apply {
+                    node: self.node.clone(),
+                    source,
+                })
+            }
+        }
+        self.host_ports = (!removing).then_some(digest);
+        Ok(())
+    }
+
+    /// Clear a host-port table a previous process may have left. Tolerates
+    /// a host without nft, where none can exist.
+    async fn clear_host_port_leftovers(&mut self) {
+        let table = host_port_table(&self.table);
+        if let Err(error) = self.executor.clear_leftover_tables(&table).await {
+            debug!(node = %self.node, %table, %error, "no network policy host-port table to clear");
+        }
+        self.host_ports = None;
+    }
+
     async fn remove(&mut self, mode: NodeMode) -> Result<(), EnforcerError> {
         self.executor
             .apply(&node_removal_ruleset(&self.table))
@@ -825,6 +921,7 @@ impl NodeEnforcer {
                 node: self.node.clone(),
                 source,
             })?;
+        self.clear_host_port_leftovers().await;
         self.dns.store(Arc::new(DnsPolicy::open()));
         self.egress.store(Arc::new(EgressTable::default()));
         info!(node = %self.node, table = %self.table, %mode, "network policy removed from the node");
@@ -843,6 +940,7 @@ impl NodeEnforcer {
                 node: self.node.clone(),
                 source,
             })?;
+        self.clear_host_port_leftovers().await;
         self.dns.store(Arc::new(DnsPolicy::open()));
         self.egress.store(Arc::new(EgressTable::default()));
         info!(node = %self.node, table = %self.table, %mode, "cleared any network policy tables left by a previous process");
@@ -882,6 +980,10 @@ impl NodeEnforcer {
             owned.push((workload, index));
         }
         self.policies.observed(&identities);
+        let local_addresses: BTreeSet<IpAddr> = local
+            .iter()
+            .flat_map(|workload| identities.addresses(workload).collect::<Vec<_>>())
+            .collect();
         merge_remote(
             &self.node,
             &mut identities,
@@ -908,6 +1010,7 @@ impl NodeEnforcer {
         }
         Ok(Observed {
             containers,
+            local_addresses,
             identities,
             local,
             owned,
@@ -919,6 +1022,7 @@ impl NodeEnforcer {
     pub async fn plan(&mut self, snapshot: &PolicySnapshot) -> Result<NodePlan, EnforcerError> {
         let Observed {
             containers,
+            local_addresses,
             identities,
             local,
             owned,
@@ -975,6 +1079,7 @@ impl NodeEnforcer {
             bindings,
             warnings: compiled.warnings,
             local,
+            local_addresses,
         })
     }
 
@@ -1079,8 +1184,12 @@ impl NodeEnforcer {
                 }
             }
             match self.reconcile().await {
-                Ok(PassOutcome::Legacy) | Ok(PassOutcome::Unchanged { .. }) => {}
-                Ok(outcome) => debug!(node = %self.node, ?outcome, "network policy pass"),
+                Ok(outcome) => {
+                    if !matches!(outcome, PassOutcome::Legacy | PassOutcome::Unchanged { .. }) {
+                        debug!(node = %self.node, ?outcome, "network policy pass");
+                    }
+                    self.policies.applied(&outcome).await;
+                }
                 Err(e) => warn!(node = %self.node, error = %e, "network policy pass failed"),
             }
         }
@@ -1395,6 +1504,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingExecutor {
         applied: Mutex<Vec<String>>,
+        /// Host-port rulesets, kept apart so `applied` stays the policy's.
+        host_ports: Mutex<Vec<String>>,
         /// Makes the next apply fail once, as a missing helper would.
         fail_next: std::sync::atomic::AtomicBool,
     }
@@ -1408,7 +1519,11 @@ mod tests {
                     timeout_secs: 1,
                 });
             }
-            self.applied.lock().await.push(ruleset.to_string());
+            if ruleset.contains("inet temps_netpol_t_hp") {
+                self.host_ports.lock().await.push(ruleset.to_string());
+            } else {
+                self.applied.lock().await.push(ruleset.to_string());
+            }
             Ok(())
         }
         async fn remove(&self, _table: &TableName) -> Result<(), NftError> {
@@ -1847,6 +1962,49 @@ mod tests {
         ));
         assert_eq!(h.executor.applied.lock().await.len(), 2);
         assert_eq!(h.ports.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// In `enforce`, this node's workloads are kept from other nodes'
+    /// published ports through host addresses; leaving `enforce` drops the
+    /// rule, and an unchanged pass does not re-apply it.
+    #[tokio::test]
+    async fn enforce_closes_node_addresses_to_local_workloads_and_leaving_reopens_them() {
+        let mut h = harness(NodeMode::Enforce);
+        h.policies.set_snapshot(PolicySnapshot {
+            node_hosts: vec!["10.20.1.4/32".parse().unwrap()],
+            ..harness_snapshot()
+        });
+        h.enforcer.reconcile().await.unwrap();
+        {
+            let host_ports = h.executor.host_ports.lock().await;
+            let applied = host_ports.last().expect("host-port rules applied");
+            assert!(
+                applied.contains("table inet temps_netpol_t_hp {"),
+                "{applied}"
+            );
+            assert!(applied.contains("elements = { 10.20.1.4/32 }"), "{applied}");
+            assert!(
+                applied.contains("10.237.1.2"),
+                "local workloads are the sources: {applied}"
+            );
+            assert!(applied.contains("ct status dnat"), "{applied}");
+        }
+        let count = h.executor.host_ports.lock().await.len();
+        h.enforcer.reconcile().await.unwrap();
+        assert_eq!(
+            h.executor.host_ports.lock().await.len(),
+            count,
+            "an unchanged pass leaves the rules alone"
+        );
+
+        h.policies.set_mode(NodeMode::Legacy);
+        h.enforcer.reconcile().await.unwrap();
+        let host_ports = h.executor.host_ports.lock().await;
+        let last = host_ports.last().map(String::as_str).unwrap_or_default();
+        assert!(
+            last.contains("delete table inet temps_netpol_t_hp") && !last.contains("{"),
+            "leaving enforce removes the host-port table: {last}"
+        );
     }
 
     #[tokio::test]

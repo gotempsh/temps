@@ -44,13 +44,13 @@ pub use egress::{
 };
 pub use enforcer::{
     identify, spawn_container_wake, with_best_datapath, DockerInstanceSource, EnforcerError,
-    InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome,
+    InstanceSource, NodeEnforcer, NodeMode, NodePolicy, NodePolicyReport, PassOutcome, PassSummary,
     PolicySnapshot, PolicySource, StaticPolicySource, SystemContainer, SystemPeer,
 };
 pub use executor::{choose_executor, DockerVmNft, HostNft, NftError, NftExecutor};
 pub use identity::{IdentityEntry, IdentityMap};
 pub use microsandbox::{to_sdk_policy, SdkNetworkPolicy, Translated};
-pub use nft::{compile, removal_ruleset, CompileError, Compiled, TableName};
+pub use nft::{compile, removal_ruleset, CompileError, Compiled, TableName, HOOK_PRIORITY};
 pub use ports::{choose_port_resolver, PortQuery, PortResolver};
 pub use rule::{
     Action, Cidr, Direction, InvalidCidr, L4Protocol, Origin, Peer, PortRange, Profile, Rule,
