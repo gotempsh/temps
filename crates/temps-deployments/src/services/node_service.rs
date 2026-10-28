@@ -2475,13 +2475,18 @@ impl NodeService {
                 // The operator says the host is gone, and the stacks' volumes
                 // with it. Holding the placement would leave a move off the
                 // node unable to finish (its teardown can never reach the
-                // node) and the node impossible to remove. Released, each
-                // stack's next deployment starts it without those volumes.
+                // node) and the node impossible to remove. Placements whose
+                // data lived there are released; unfinished moves to this
+                // node return to their source, retaining its data.
                 for (placement, environment_name) in &compose_stacks.live {
-                    lost_environments.push(compose_stack_lost_note(
-                        environment_name,
-                        placement.environment_id,
-                    ));
+                    // A pending destination never held this stack's data:
+                    // release_placements_on_node restores its source home.
+                    if placement.node_id != Some(node_id) || !placement.vacate_pending {
+                        lost_environments.push(compose_stack_lost_note(
+                            environment_name,
+                            placement.environment_id,
+                        ));
+                    }
                     released.push(placement.environment_id);
                 }
             } else {
@@ -4232,15 +4237,23 @@ mod tests {
             .unwrap();
         let (_, at_home) = seed_placement(db.as_ref(), "at-home", None, None).await;
         let (_, moving_away) = seed_placement(db.as_ref(), "moving-away", None, None).await;
-        for (environment_id, node_id, vacate_node_id) in [
-            (at_home.id, Some(node.id), None),
-            (moving_away.id, None, Some(node.id)),
+        let mut source_request =
+            register_req("worker-source", "source-hash", "https://10.100.0.3:3100");
+        source_request.private_address = "10.100.0.3".to_string();
+        let source = service.register(source_request).await.unwrap();
+        let (_, from_worker) = seed_placement(db.as_ref(), "from-worker", None, None).await;
+        let (_, from_local) = seed_placement(db.as_ref(), "from-local", None, None).await;
+        for (environment_id, node_id, vacate_pending, vacate_node_id) in [
+            (at_home.id, Some(node.id), false, None),
+            (moving_away.id, None, true, Some(node.id)),
+            (from_worker.id, Some(node.id), true, Some(source.id)),
+            (from_local.id, Some(node.id), true, None),
         ] {
             compose_placements::ActiveModel {
                 environment_id: Set(environment_id),
                 node_id: Set(node_id),
                 pinned_at: Set(chrono::Utc::now()),
-                vacate_pending: Set(vacate_node_id.is_some()),
+                vacate_pending: Set(vacate_pending),
                 vacate_node_id: Set(vacate_node_id),
                 updated_at: Set(chrono::Utc::now()),
             }
@@ -4263,7 +4276,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            matches!(error, NodeError::HostsComposeStacks { count: 2, .. }),
+            matches!(error, NodeError::HostsComposeStacks { count: 4, .. }),
             "{error:?}"
         );
 
@@ -4274,11 +4287,11 @@ mod tests {
             .unwrap();
         let error = service.remove(node.id).await.unwrap_err();
         assert!(
-            matches!(error, NodeError::HostsComposeStacks { count: 2, .. }),
+            matches!(error, NodeError::HostsComposeStacks { count: 4, .. }),
             "{error:?}"
         );
 
-        // Recorded as lost: removed, and both stacks released and named.
+        // Recorded as lost: only stacks that held data there are reported lost.
         let removal = service
             .remove_with(node.id, ServingContainers::RecordLost)
             .await
@@ -4308,6 +4321,19 @@ mod tests {
             .unwrap();
         assert_eq!(moving.pending_vacate(), None);
         assert_eq!(moving.node_id, None);
+        // Removing the pending destination preserves both worker and local
+        // source homes, so the next deploy cannot start an untracked copy.
+        for (environment_id, expected_home) in
+            [(from_worker.id, Some(source.id)), (from_local.id, None)]
+        {
+            let restored = compose_placements::Entity::find_by_id(environment_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(restored.node_id, expected_home);
+            assert_eq!(restored.pending_vacate(), None);
+        }
     }
 
     fn stored_targets(environment: &environments::Model) -> Option<Vec<i32>> {

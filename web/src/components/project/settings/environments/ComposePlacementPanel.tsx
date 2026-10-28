@@ -142,10 +142,9 @@ export function ComposePlacementPanel({
           <AlertTriangle className="h-4 w-4" aria-hidden="true" />
           <AlertTitle>Move pending: redeploy to complete it</AlertTitle>
           <AlertDescription>
-            The next deployment stops the stack on{' '}
-            {placement.moving_from_node_name} and starts it on{' '}
-            {placement.home_node_name} with empty volumes. The data on{' '}
-            {placement.moving_from_node_name} stays there.
+            {composeMoveSourceActive(placement)
+              ? `The next deployment stops the stack on ${placement.moving_from_node_name} and starts it on ${placement.home_node_name} with empty volumes. The data on ${placement.moving_from_node_name} stays there.`
+              : `${placement.moving_from_node_name} is ${placement.moving_from_node_status ?? 'unavailable'}, so the stack's running state there is unknown. The move must stop any remaining stack there before starting on ${placement.home_node_name} with empty volumes. The data on ${placement.moving_from_node_name} stays there.`}
           </AlertDescription>
         </Alert>
       )}

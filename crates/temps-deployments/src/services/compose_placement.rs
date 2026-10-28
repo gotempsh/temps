@@ -915,7 +915,8 @@ pub async fn placements_on_node<C: sea_orm::ConnectionTrait>(
 }
 
 /// Detach the placements of `environment_ids` from `node_id`, which is being
-/// removed: a home there is forgotten (its data goes with the node, and
+/// removed: an unfinished move to it is cancelled, restoring the source home.
+/// Otherwise a home there is forgotten (its data goes with the node, and
 /// `node_id` is ON DELETE RESTRICT) and a pending vacate of it is dropped.
 /// Called for deleted environments, and for live ones only when the node is
 /// recorded as lost.
@@ -928,6 +929,31 @@ pub async fn release_placements_on_node<C: sea_orm::ConnectionTrait>(
         return Ok(());
     }
     let of_these = compose_placements::Column::EnvironmentId.is_in(environment_ids.to_vec());
+    // Removing a move's destination does not lose the original host or its
+    // volumes. Restore that home before deleting placements on the lost node.
+    // A NULL vacate_node_id represents the control plane.
+    compose_placements::Entity::update_many()
+        .col_expr(
+            compose_placements::Column::NodeId,
+            sea_orm::sea_query::Expr::col(compose_placements::Column::VacateNodeId).into(),
+        )
+        .col_expr(
+            compose_placements::Column::VacatePending,
+            sea_orm::sea_query::Expr::value(false),
+        )
+        .col_expr(
+            compose_placements::Column::VacateNodeId,
+            sea_orm::sea_query::Expr::value(Option::<i32>::None),
+        )
+        .col_expr(
+            compose_placements::Column::UpdatedAt,
+            sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+        )
+        .filter(of_these.clone())
+        .filter(compose_placements::Column::NodeId.eq(node_id))
+        .filter(compose_placements::Column::VacatePending.eq(true))
+        .exec(db)
+        .await?;
     compose_placements::Entity::delete_many()
         .filter(of_these.clone())
         .filter(compose_placements::Column::NodeId.eq(node_id))

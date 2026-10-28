@@ -495,15 +495,6 @@ impl AgentConfig {
         Ok(work_root)
     }
 
-    /// Root for the work directories of sandboxes hosted on this node
-    /// (ADR-048): `<agent data dir>/sandboxes`, always absolute.
-    ///
-    /// `temps agent` calls [`AgentConfig::resolve_paths`] at startup, which
-    /// fails fast on a data dir that cannot be resolved, so the error branch
-    /// here is unreachable for a running agent. It is still handled without
-    /// producing a relative path: a config that skipped `resolve_paths` gets
-    /// `/var/lib/temps/sandboxes` and an error log naming the cause, never a
-    /// relative bind-mount source.
     /// The agent data directory (the parent of `dns_data_dir`), where Compose
     /// stacks, their persistent bind directories and secrets live. Always
     /// absolute; falls back to `/var/lib/temps` with an error log for a config
@@ -529,6 +520,15 @@ impl AgentConfig {
         }
     }
 
+    /// Root for the work directories of sandboxes hosted on this node
+    /// (ADR-048): `<agent data dir>/sandboxes`, always absolute.
+    ///
+    /// `temps agent` calls [`AgentConfig::resolve_paths`] at startup, which
+    /// fails fast on a data dir that cannot be resolved, so the error branch
+    /// here is unreachable for a running agent. It is still handled without
+    /// producing a relative path: a config that skipped `resolve_paths` gets
+    /// `/var/lib/temps/sandboxes` and an error log naming the cause, never a
+    /// relative bind-mount source.
     pub fn sandbox_work_root(&self) -> std::path::PathBuf {
         match sandbox_work_root_for(&self.dns_data_dir) {
             Ok(work_root) => work_root,
