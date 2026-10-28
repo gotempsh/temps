@@ -633,7 +633,7 @@ export function DomainDetail() {
     domain.status === 'pending_dns' ||
     domain.status === 'pending_http' ||
     domain.status === 'pending' ||
-    !!activeOrder
+    (isServingCert(domain.status) && !!activeOrder)
 
   // The user can (re)create an order when the domain is awaiting issuance and either
   // no order exists or the existing order is in a terminal state.

@@ -87,9 +87,13 @@ fn certificate_policy_due(
     alert_days: i32,
     alerts_enabled: bool,
 ) -> (bool, bool) {
+    // Instance preferences can contain any i32. Compare durations instead of
+    // adding an unchecked window to a DateTime, which can overflow and stop
+    // the entire renewal scheduler.
+    let remaining = expires_at.signed_duration_since(now);
     (
-        expires_at <= now + chrono::Duration::days(i64::from(renewal_days)),
-        alerts_enabled && expires_at <= now + chrono::Duration::days(i64::from(alert_days)),
+        remaining <= chrono::Duration::days(i64::from(renewal_days)),
+        alerts_enabled && remaining <= chrono::Duration::days(i64::from(alert_days)),
     )
 }
 
@@ -1746,6 +1750,22 @@ mod tests {
             super::certificate_policy_due(now + chrono::Duration::days(20), now, 15, 30, true),
             (false, true)
         );
+    }
+
+    #[test]
+    fn regression_certificate_policy_handles_extreme_thresholds() {
+        let now = chrono::Utc::now();
+        let expires = now + chrono::Duration::days(10);
+        for (days, due) in [(i32::MIN, false), (-1, false), (90, true), (i32::MAX, true)] {
+            assert_eq!(
+                super::certificate_policy_due(expires, now, days, days, true),
+                (due, due)
+            );
+            assert_eq!(
+                super::certificate_policy_due(expires, now, 30, days, false),
+                (true, false)
+            );
+        }
     }
 
     use super::*;

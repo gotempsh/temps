@@ -352,15 +352,25 @@ test('failed domain without any order starts a new order', () => {
   client.clear()
 })
 
-test('failed domain whose order is still open can verify again', () => {
-  const client = createClient()
-  client.setQueryData(domainKey, failedDomain)
-  client.setQueryData(orderKey, orderWithStatus('pending'))
-  const html = render(client)
-  expect(html).toContain('Retry verification')
-  expect(html).not.toContain('Start new order')
-  client.clear()
-})
+for (const method of ['dns-01', 'http-01']) {
+  test(`failed ${method} domain with an open order has one set of verification controls`, () => {
+    const client = createClient()
+    client.setQueryData(domainKey, {
+      ...failedDomain,
+      verification_method: method,
+    })
+    const pending = orderWithStatus('pending')
+    pending.order.authorizations.challenge_type = method
+    client.setQueryData(orderKey, pending)
+    const html = render(client)
+    expect(html).toContain('Retry verification')
+    expect(html).not.toContain('Start new order')
+    expect(html).not.toContain('DNS challenge required')
+    expect(html).not.toContain('HTTP-01 challenge')
+    expect(html.match(/Cancel order<\/button>/g)?.length).toBe(1)
+    client.clear()
+  })
+}
 
 test('active certificate still exposes a DNS renewal order after switching from HTTP', () => {
   const client = createClient()

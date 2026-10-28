@@ -1838,8 +1838,15 @@ impl DomainService {
     ) -> Result<(), DomainServiceError> {
         // Step 1: create + persist a fresh ACME order. This sets the HTTP-01
         // token on the domains row, which the proxy serves.
+        // On-demand issuance only serves HTTP challenges; DNS policy remains
+        // available for explicit orders and scheduled renewal.
         let challenge = self
-            .request_challenge(hostname, email)
+            .request_challenge_with(
+                DomainLookup::Name(hostname),
+                email,
+                true,
+                Some(ChallengeType::Http01),
+            )
             .await
             .map_err(|e| Self::map_acme_error(hostname, e))?;
 
@@ -2859,6 +2866,41 @@ mod tests {
         // Return the TestDatabase guard so the caller keeps it alive for the whole
         // test; its Drop reaps the dedicated schema afterwards.
         Some((service, db, test_db))
+    }
+
+    #[tokio::test]
+    async fn regression_on_demand_ignores_dns_policy() {
+        let Some((service, _, db, _guard)) =
+            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
+        else {
+            return;
+        };
+        let hostname = "on-demand.example.test";
+        let domain = service.create_domain(hostname, "dns-01").await.unwrap();
+        assert!(domain.certificate.is_none());
+        let policy = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            renewal_days: 20,
+            alert_days: Some(7),
+            alerts_enabled: Some(true),
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        service
+            .provision_on_demand(hostname, "ops@example.test")
+            .await
+            .unwrap();
+        let issued = domain_row(db.as_ref(), hostname).await;
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.verification_method, "http-01");
+        assert!(issued.certificate.is_some());
+        // The on-demand override must not rewrite the operator's future-order policy.
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
     }
 
     #[tokio::test]
