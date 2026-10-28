@@ -10,14 +10,17 @@
 //! database's request is now [`data_container_create_body`] of its admitted
 //! spec, whichever node runs it.
 //!
-//! `Data` is today's control-plane database host config: `no-new-privileges`
-//! and the engine's PID cap (512 to start with; it counts threads, and
-//! MongoDB and MariaDB use one per connection), a fixed restart policy and
-//! the engine's healthcheck. It deliberately does **not** drop every
-//! capability or add an init process the way `Trusted` does: the official
-//! database entrypoints start as root and need `CHOWN`, `SETUID` and
-//! `SETGID` to fix the data directory's ownership and step down to their
-//! service user, and no database container has ever run with them dropped.
+//! `Data` is today's control-plane database host config: `no-new-privileges`,
+//! the engine's PID cap (512 to start with; it counts threads, and MongoDB
+//! and MariaDB use one per connection), an init process, a fixed restart
+//! policy and the engine's healthcheck. The init process reaps children the
+//! engine did not fork (a timed-out healthcheck, an orphaned `docker exec`),
+//! which PostgreSQL would otherwise treat as a crashed backend. It
+//! deliberately does **not** drop every capability the way `Trusted` does:
+//! the official database entrypoints start as root and need `CHOWN`,
+//! `SETUID` and `SETGID` to fix the data directory's ownership and step down
+//! to their service user, and no database container has ever run with them
+//! dropped.
 
 use bollard::models::{ContainerCreateBody, HealthConfig, HostConfig};
 use temps_workload::{Attachments, InstanceSpec, Probe, ProbeKind, Probes};
@@ -42,6 +45,7 @@ pub fn data_host_config(binds: Vec<String>) -> HostConfig {
     HostConfig {
         security_opt: Some(vec!["no-new-privileges:true".to_string()]),
         pids_limit: Some(DATA_DEFAULT_PIDS_LIMIT),
+        init: Some(true),
         binds: (!binds.is_empty()).then_some(binds),
         ..Default::default()
     }
@@ -202,7 +206,7 @@ mod tests {
             host.cap_drop, None,
             "database entrypoints need their capabilities"
         );
-        assert_eq!(host.init, None);
+        assert_eq!(host.init, Some(true));
         assert_eq!(
             host.restart_policy.as_ref().and_then(|p| p.name),
             Some(bollard::models::RestartPolicyNameEnum::ALWAYS)
