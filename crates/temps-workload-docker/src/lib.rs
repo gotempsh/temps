@@ -358,6 +358,17 @@ impl DockerDriver {
         spec: &InstanceSpec,
         mut body: ContainerCreateBody,
     ) -> Result<InstanceHandle, DriverError> {
+        // Docker only inherits image CMD when no ENTRYPOINT override is sent.
+        // Resolve it here for both custom and cleared entrypoints, keeping the
+        // two overrides independent as promised by the workload contract.
+        if spec.entrypoint.is_some() && spec.command.is_none() {
+            let image = self
+                .docker
+                .inspect_image(&spec.image)
+                .await
+                .map_err(runtime("inspect image command", &spec.name))?;
+            body.cmd = image.config.and_then(|config| config.cmd);
+        }
         // Each workload's containers share a slice, so network policy can
         // identify them by cgroup from their first instruction (network
         // access plan, §4.15).
@@ -741,6 +752,76 @@ fn docker_entrypoint_override(entrypoint: Option<&[String]>) -> Option<Vec<Strin
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn entrypoint_override_inherits_image_command() {
+        use serde_json::json;
+        use temps_docker_capture::{FakeDocker, Method};
+
+        for entrypoint in [vec![], vec!["/custom-entrypoint".into()]] {
+            for command in [None, Some(vec!["explicit-command".into()])] {
+                let fake = FakeDocker::start().await.unwrap();
+                fake.allow_create("shop-production-31");
+                fake.respond(
+                    Method::GET,
+                    "/images/",
+                    200,
+                    json!({"Config": {"Cmd": ["image-command", "argument with spaces"]}}),
+                );
+                let mut s = spec();
+                s.entrypoint = Some(entrypoint.clone());
+                s.command = command.clone();
+                DockerDriver::new(fake.docker())
+                    .create(&s, &attach())
+                    .await
+                    .unwrap();
+                let creates = fake.creates();
+                assert_eq!(creates[0].body["Image"], s.image);
+                assert_eq!(
+                    creates[0].body["Cmd"],
+                    command.map_or(
+                        json!(["image-command", "argument with spaces"]),
+                        |cmd| json!(cmd)
+                    )
+                );
+                assert_eq!(
+                    fake.calls()
+                        .iter()
+                        .filter(|c| c.path.starts_with("/images/"))
+                        .count(),
+                    usize::from(s.command.is_none()),
+                    "only inspect when inheriting CMD with an entrypoint override"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn entrypoint_override_stops_before_create_if_image_inspection_fails() {
+        let fake = temps_docker_capture::FakeDocker::start().await.unwrap();
+        fake.allow_create("shop-production-31");
+        let root = tempfile::tempdir().unwrap();
+        let mut s = spec();
+        s.entrypoint = Some(vec![]);
+        s.secret_files.push(temps_workload::SecretFile {
+            name: "API_TOKEN".into(),
+            value: "seeded-token-value".into(),
+        });
+        let error = DockerDriver::new(fake.docker())
+            .with_secrets_root(root.path())
+            .create(&s, &attach())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("inspect"), "{error}");
+        assert!(
+            !root.path().join(&s.name).exists(),
+            "failed inspection must clean up secrets"
+        );
+        assert!(
+            fake.creates().is_empty(),
+            "do not start with a silently missing command"
+        );
+    }
+
     #[test]
     fn dockerfile_entrypoint_inheritance_override_and_reset() {
         for (entrypoint, expected) in [

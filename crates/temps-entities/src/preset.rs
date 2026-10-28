@@ -883,10 +883,14 @@ pub struct DockerfileConfig {
 /// shell parsing; use an explicit shell entrypoint when shell syntax is needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 pub struct ContainerRuntimeOverrides {
-    /// Override image CMD. Omitted/null uses the image default.
+    /// Override image CMD. On creation, omitted/null uses the image default.
+    /// On partial project updates, omission preserves the stored override;
+    /// send null to restore the image default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Vec<String>>,
-    /// Override image ENTRYPOINT. Omitted/null inherits; [] clears it.
+    /// Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.
+    /// On partial project updates, omission preserves the stored override;
+    /// send null to restore the image default, or [] to clear the entrypoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entrypoint: Option<Vec<String>>,
 }

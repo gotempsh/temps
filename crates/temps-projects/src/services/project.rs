@@ -479,6 +479,30 @@ fn merge_preset_config(
     }
 }
 
+/// Resolve a settings patch against the caller's current project row. Writers
+/// must call this under the row lock; a preflight result must never be saved.
+fn resolve_preset_patch(
+    current_preset: temps_entities::preset::Preset,
+    current_config: Option<&temps_entities::preset::PresetConfig>,
+    requested_preset: Option<&str>,
+    config_value: Option<&serde_json::Value>,
+) -> Result<Option<temps_presets::StoredPreset>, ProjectError> {
+    if let Some(slug) = requested_preset {
+        return resolve_preset_selection(slug, config_value, current_config).map(Some);
+    }
+    let Some(value) = config_value else {
+        return Ok(None);
+    };
+    let parsed = temps_entities::preset::PresetConfig::parse_for_preset(&current_preset, value)
+        .map_err(|error| ProjectError::InvalidInput(format!("Invalid preset config: {error}")))?;
+    let merged = merge_preset_config(current_config, parsed, value, true);
+    let config = validate_preset_config(current_preset, merged, Some(value))?;
+    Ok(Some(temps_presets::StoredPreset {
+        preset: current_preset,
+        config: Some(config),
+    }))
+}
+
 fn validate_preset_config(
     preset: temps_entities::preset::Preset,
     config: temps_entities::preset::PresetConfig,
@@ -4253,7 +4277,6 @@ impl ProjectService {
         // Capture the current preset/config before converting to ActiveModel
         let project_preset = project.preset;
         let existing_preset_config = project.preset_config.clone();
-        let previous_public_ports = compose_public_ports(existing_preset_config.as_ref());
         let existing_pull_only_root_directory = project.pull_only_root_directory;
 
         // Update the project
@@ -4273,33 +4296,14 @@ impl ProjectService {
         // reverse conversion goes through `set_source_type`).
         active_project.source_type = Set(temps_entities::source_type::SourceType::Git);
 
-        if let Some(preset_value) = preset {
-            let resolved = resolve_preset_selection(
-                preset_value.as_str(),
-                preset_config.as_ref(),
-                existing_preset_config.as_ref(),
-            )?;
-            apply_resolved_preset(&mut active_project, resolved)?;
-        } else if let Some(config_value) = preset_config.as_ref() {
-            let parsed = temps_entities::preset::PresetConfig::parse_for_preset(
-                &project_preset,
-                config_value,
-            )
-            .map_err(|error| {
-                ProjectError::InvalidInput(format!("Invalid preset config: {}", error))
-            })?;
-            let merged =
-                merge_preset_config(existing_preset_config.as_ref(), parsed, config_value, true);
-            let merged = validate_preset_config(project_preset, merged, Some(config_value))?;
-            let resolved = temps_presets::StoredPreset {
-                preset: project_preset,
-                config: Some(merged.clone()),
-            };
-            if active_project.project_type.as_ref() != &ProjectType::Service {
-                active_project.project_type = Set(project_type_for_resolved_preset(&resolved)?);
-            }
-            active_project.preset_config = Set(Some(merged));
-        }
+        // Reject invalid settings before any provider-side webhook changes.
+        // Re-resolve under the row lock below; this snapshot can become stale.
+        resolve_preset_patch(
+            project_preset,
+            existing_preset_config.as_ref(),
+            preset.as_deref(),
+            preset_config.as_ref(),
+        )?;
 
         // Determine the effective new connection id and whether we need to handle
         // webhook lifecycle.  Three cases:
@@ -4622,6 +4626,21 @@ impl ProjectService {
             .await?
             .ok_or_else(|| ProjectError::NotFound(format!("Project {project_id} not found")))?;
         self.guard_granted_project_write(&locked_project.slug, "the source repository", caller)?;
+        let previous_public_ports = compose_public_ports(locked_project.preset_config.as_ref());
+        if locked_project.project_type == ProjectType::Service {
+            return Err(ProjectError::InvalidInput(
+                "A service project cannot be converted to a Git source; update its applied template or runtime instead"
+                    .to_string(),
+            ));
+        }
+        if let Some(resolved) = resolve_preset_patch(
+            locked_project.preset,
+            locked_project.preset_config.as_ref(),
+            preset.as_deref(),
+            preset_config.as_ref(),
+        )? {
+            apply_resolved_preset(&mut active_project, resolved)?;
+        }
         let enable_hosting =
             locked_project.source_type == temps_entities::source_type::SourceType::External;
         let updated_project = active_project.update(&txn).await?;
@@ -13017,6 +13036,111 @@ templates:
                 ));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn git_settings_merge_startup_overrides_from_locked_row() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use temps_entities::preset::{ContainerRuntimeOverrides, DockerfileConfig, PresetConfig};
+        for preset in [None, Some("dockerfile".to_string())] {
+            let mut stale = project_for_hosting_lock_test("startup-test");
+            stale.source_type = temps_entities::source_type::SourceType::Git;
+            stale.directory = ".".into();
+            stale.preset = Preset::Dockerfile;
+            stale.preset_config = Some(PresetConfig::Dockerfile(DockerfileConfig::default()));
+            let mut current = stale.clone();
+            current.preset_config = Some(PresetConfig::Dockerfile(DockerfileConfig {
+                runtime: ContainerRuntimeOverrides {
+                    command: Some(vec!["concurrent-command".into()]),
+                    entrypoint: Some(vec!["concurrent-entrypoint".into()]),
+                },
+                ..Default::default()
+            }));
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![stale], vec![current.clone()], vec![current]])
+                    .into_connection(),
+            );
+            let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+            service
+                .update_git_settings(
+                    10,
+                    None,
+                    "main".into(),
+                    "owner".into(),
+                    "repo".into(),
+                    preset,
+                    ".".into(),
+                    Some(serde_json::json!({"target": "production"})),
+                    None,
+                    None,
+                    None,
+                    DeployCaller::Platform,
+                )
+                .await
+                .unwrap();
+            drop(service);
+            let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+            let writes = transactions
+                .iter()
+                .map(|txn| format!("{txn:?}"))
+                .filter(|txn| txn.contains("UPDATE"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                writes.contains("concurrent-command"),
+                "stale command overwrote locked value: {writes}"
+            );
+            assert!(
+                writes.contains("concurrent-entrypoint"),
+                "stale entrypoint overwrote locked value: {writes}"
+            );
+            assert!(
+                writes.contains("production"),
+                "incoming patch was not applied: {writes}"
+            );
+            assert!(
+                writes.contains("FOR UPDATE"),
+                "merge and write must hold the row lock: {writes}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn git_settings_reject_concurrent_conversion_to_service() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        let mut stale = project_for_hosting_lock_test("startup-test");
+        stale.source_type = temps_entities::source_type::SourceType::Git;
+        stale.directory = ".".into();
+        let mut current = stale.clone();
+        current.project_type = ProjectType::Service;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![stale], vec![current]])
+                .into_connection(),
+        );
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let error = service
+            .update_git_settings(
+                10,
+                None,
+                "main".into(),
+                "owner".into(),
+                "repo".into(),
+                Some("dockerfile".into()),
+                ".".into(),
+                None,
+                None,
+                None,
+                None,
+                DeployCaller::Platform,
+            )
+            .await
+            .err()
+            .expect("a concurrent service conversion must prevent the Git write");
+        assert!(
+            matches!(error, ProjectError::InvalidInput(message) if message.contains("service project"))
+        );
     }
 
     #[tokio::test]

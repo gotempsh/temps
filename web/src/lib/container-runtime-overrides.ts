@@ -57,3 +57,16 @@ export const containerRuntimeSchema = z.object({
   command: runtimeArgumentsSchema(false),
   entrypoint: runtimeArgumentsSchema(true),
 })
+
+/** Creation includes startup overrides before the automatic first deployment. */
+export function dockerfileCreationConfig(values: {
+  dockerfilePath?: string
+  command?: string
+  entrypoint?: string
+}) {
+  return {
+    dockerfilePath: values.dockerfilePath || 'Dockerfile',
+    command: parseRuntimeArguments(values.command ?? ''),
+    entrypoint: parseRuntimeArguments(values.entrypoint ?? ''),
+  }
+}

@@ -6780,11 +6780,15 @@ export type ContainerRuntimeInfo = {
  */
 export type ContainerRuntimeOverrides = {
     /**
-     * Override image CMD. Omitted/null uses the image default.
+     * Override image CMD. On creation, omitted/null uses the image default.
+     * On partial project updates, omission preserves the stored override;
+     * send null to restore the image default.
      */
     command?: Array<string> | null;
     /**
-     * Override image ENTRYPOINT. Omitted/null inherits; [] clears it.
+     * Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.
+     * On partial project updates, omission preserves the stored override;
+     * send null to restore the image default, or [] to clear the entrypoint.
      */
     entrypoint?: Array<string> | null;
 };

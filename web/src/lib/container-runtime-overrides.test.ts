@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import {
   containerRuntimeSchema,
+  dockerfileCreationConfig,
   parseRuntimeArguments,
 } from './container-runtime-overrides'
 
@@ -46,5 +47,29 @@ describe('container startup overrides', () => {
         containerRuntimeSchema.safeParse({ command, entrypoint: '' }).success
       ).toBe(false)
     }
+  })
+})
+
+test('creation payload inherits blank fields and preserves explicit argument boundaries', () => {
+  expect(dockerfileCreationConfig({})).toEqual({
+    dockerfilePath: 'Dockerfile',
+    command: null,
+    entrypoint: null,
+  })
+  expect(
+    dockerfileCreationConfig({
+      dockerfilePath: 'docker/worker.Dockerfile',
+      command: '["worker", "argument with spaces", ""]',
+      entrypoint: '[]',
+    })
+  ).toEqual({
+    dockerfilePath: 'docker/worker.Dockerfile',
+    command: ['worker', 'argument with spaces', ''],
+    entrypoint: [],
+  })
+  expect(dockerfileCreationConfig({ entrypoint: '["/app/start"]' })).toEqual({
+    dockerfilePath: 'Dockerfile',
+    command: null,
+    entrypoint: ['/app/start'],
   })
 })

@@ -115,6 +115,10 @@ pub fn build_router(
         // Container management routes
         .route("/agent/containers/deploy", post(handlers::deploy_container))
         .route(
+            "/agent/v2/containers/deploy",
+            post(handlers::deploy_container_v2),
+        )
+        .route(
             "/agent/containers/{id}/stop",
             post(handlers::stop_container),
         )
@@ -1705,6 +1709,43 @@ pub(crate) mod tests {
             request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
         request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn versioned_deploy_route_requires_auth_and_valid_request() {
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            remote.clone(),
+            remote,
+            None,
+            &test_agent_config(false),
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_dns_resolver::open_dns_policy_slot(),
+            },
+            Default::default(),
+        );
+        for route in ["/agent/containers/deploy", "/agent/v2/containers/deploy"] {
+            for (token, status) in [(None, 401), (Some("wrong"), 401), (Some("secret"), 422)] {
+                let response = app
+                    .clone()
+                    .oneshot(post_json(route, token, b"{}".to_vec()))
+                    .await
+                    .unwrap();
+                assert_eq!(response.status().as_u16(), status, "{route}");
+            }
+            assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
+        }
     }
 
     #[tokio::test]

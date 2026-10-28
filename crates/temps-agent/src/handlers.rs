@@ -403,6 +403,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
 #[openapi(
     paths(
         deploy_container,
+        deploy_container_v2,
         stop_container,
         start_container,
         remove_container,
@@ -576,6 +577,27 @@ impl utoipa::Modify for SecurityAddon {
             );
         }
     }
+}
+
+/// Deploy with container startup override support. Older workers do not expose
+/// this route, so a new control plane cannot silently lose an entrypoint override.
+#[utoipa::path(
+    tag = "Containers",
+    post,
+    path = "/agent/v2/containers/deploy",
+    request_body = DeployRequest,
+    responses(
+        (status = 200, description = "Container deployed with startup overrides", body = AgentResponse<temps_deployer::DeployResult>),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 500, description = "Deploy failed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn deploy_container_v2(
+    state: State<Arc<AgentState>>,
+    request: Json<DeployRequest>,
+) -> impl IntoResponse {
+    deploy_container(state, request).await
 }
 
 /// Deploy a new container on this worker node

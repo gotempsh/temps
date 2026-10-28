@@ -13885,7 +13885,7 @@
         "description": "Exec-form container startup overrides. Arguments are passed verbatim without\nshell parsing; use an explicit shell entrypoint when shell syntax is needed.",
         "properties": {
           "command": {
-            "description": "Override image CMD. Omitted/null uses the image default.",
+            "description": "Override image CMD. On creation, omitted/null uses the image default.\nOn partial project updates, omission preserves the stored override;\nsend null to restore the image default.",
             "items": {
               "type": "string"
             },
@@ -13895,7 +13895,7 @@
             ]
           },
           "entrypoint": {
-            "description": "Override image ENTRYPOINT. Omitted/null inherits; [] clears it.",
+            "description": "Override image ENTRYPOINT. On creation, omitted/null inherits; [] clears it.\nOn partial project updates, omission preserves the stored override;\nsend null to restore the image default, or [] to clear the entrypoint.",
             "items": {
               "type": "string"
             },

@@ -79,7 +79,7 @@ function DockerfileRuntimeForm({
         <Field
           label="Command (CMD)"
           optional
-          description='A JSON argument list, for example ["python", "-m", "worker"]. Leave blank to use the image command when inheriting its entrypoint.'
+          description='A JSON argument list, for example ["python", "-m", "worker"]. Leave blank to inherit the image command.'
           error={errors.Command}
         >
           {(props) => (
@@ -95,7 +95,7 @@ function DockerfileRuntimeForm({
         <Field
           label="Entrypoint (ENTRYPOINT)"
           optional
-          description='Leave blank to inherit the image entrypoint, or enter [] to remove it. An override replaces the image startup program; supply Command too if it needs arguments. For shell syntax, use ["/bin/sh", "-c"] with a single command string in Command.'
+          description='Leave blank to inherit the image entrypoint, or enter [] to remove it. An override replaces the image startup program; Command is inherited unless you override it too. For shell syntax, use ["/bin/sh", "-c"] with a single command string in Command.'
           error={errors.Entrypoint}
         >
           {(props) => (
