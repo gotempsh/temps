@@ -219,3 +219,47 @@ test('creating invalidates every cached page of the sandbox list', async () => {
   expect(client.getQueryState(pageTwo)?.isInvalidated).toBe(true)
   api.restore()
 })
+
+const PLACEMENT_WITH_BACKENDS = {
+  allowed_node_ids: null,
+  nodes: [
+    {
+      ...PLACEMENT.nodes[0],
+      backends: [
+        { backend: 'docker', available: true, reason: null },
+        { backend: 'firecracker', available: true, reason: null },
+        {
+          backend: 'microsandbox',
+          available: false,
+          reason: 'run `temps microsandbox setup` on the server host',
+        },
+      ],
+    },
+  ],
+}
+
+test('offers the backends the node runs and explains the missing ones', async () => {
+  let body: unknown
+  const api = mockApi({
+    'GET /v1/sandboxes/placement': () => jsonResponse(PLACEMENT_WITH_BACKENDS),
+    'POST /v1/sandboxes': async (request) => {
+      body = await request.json()
+      return jsonResponse(CREATED, 201)
+    },
+  })
+  const view = renderSheet()
+
+  // The unavailable backend stays visible, disabled, with the server's fix.
+  await view.findByText(/temps microsandbox setup/)
+  const microsandbox = view.baseElement.querySelector('#backend-microsandbox')
+  expect(microsandbox?.hasAttribute('disabled')).toBe(true)
+
+  const firecracker = view.baseElement.querySelector('#backend-firecracker')
+  expect(firecracker?.hasAttribute('disabled')).toBe(false)
+  fireEvent.click(firecracker as Element)
+  fireEvent.click(view.getByRole('button', { name: 'Create sandbox' }))
+
+  await view.findByText('detail page')
+  expect(body).toEqual({ lifecycle: 'ephemeral', backend: 'firecracker' })
+  api.restore()
+})

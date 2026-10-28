@@ -42545,6 +42545,29 @@
         ],
         "type": "string"
       },
+      "NodeBackend": {
+        "description": "Whether one node can run sandboxes on one backend.",
+        "properties": {
+          "available": {
+            "type": "boolean"
+          },
+          "backend": {
+            "$ref": "#/components/schemas/SandboxBackend"
+          },
+          "reason": {
+            "description": "Why the node cannot run it, and how to fix that when it can be fixed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "backend",
+          "available"
+        ],
+        "type": "object"
+      },
       "NodeCapabilityResponse": {
         "description": "Whether this installation can run a workload anywhere, and if not, why.",
         "properties": {
@@ -48190,6 +48213,13 @@
           "allowed": {
             "description": "Allowed by the operator's sandbox placement settings.",
             "type": "boolean"
+          },
+          "backends": {
+            "description": "Every backend a sandbox can ask for, and whether this node can run\nit. A node that cannot says why, so a client can show the choice and\nits fix rather than hide it.",
+            "items": {
+              "$ref": "#/components/schemas/NodeBackend"
+            },
+            "type": "array"
           },
           "dedicated": {
             "description": "Labelled `temps.sh/role=dedicated`: automatic placement never picks\nit, but a sandbox that requests it by id or name may still run there\nwhen it is `eligible`. Always `false` for the control plane.",
@@ -58431,6 +58461,16 @@
           "updated_at"
         ],
         "type": "object"
+      },
+      "SandboxBackend": {
+        "description": "Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker\ncontainers, Firecracker microVMs and microsandbox (libkrun) microVMs\ncoexist on the same host behind the same `SandboxProvider` seam;\n`routing::RoutingSandboxProvider` dispatches between them. `Local` is the\ndev-only fork-exec fallback.",
+        "enum": [
+          "docker",
+          "firecracker",
+          "microsandbox",
+          "local"
+        ],
+        "type": "string"
       },
       "SandboxChanges": {
         "description": "The Git changes of every repository found under the work directory.",

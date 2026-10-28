@@ -724,6 +724,7 @@ mod tests {
             reason: None,
             live_sandboxes: 1,
             dedicated: false,
+            backends: Vec::new(),
         }
     }
 

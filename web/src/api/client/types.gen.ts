@@ -19874,6 +19874,18 @@ export type NixpacksPresetConfig = {
 export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
 
 /**
+ * Whether one node can run sandboxes on one backend.
+ */
+export type NodeBackend = {
+    available: boolean;
+    backend: SandboxBackend;
+    /**
+     * Why the node cannot run it, and how to fix that when it can be fixed.
+     */
+    reason?: string | null;
+};
+
+/**
  * Whether this installation can run a workload anywhere, and if not, why.
  */
 export type NodeCapabilityResponse = {
@@ -22434,6 +22446,12 @@ export type PlacementNode = {
      * Allowed by the operator's sandbox placement settings.
      */
     allowed: boolean;
+    /**
+     * Every backend a sandbox can ask for, and whether this node can run
+     * it. A node that cannot says why, so a client can show the choice and
+     * its fix rather than hide it.
+     */
+    backends?: Array<NodeBackend>;
     /**
      * Labelled `temps.sh/role=dedicated`: automatic placement never picks
      * it, but a sandbox that requests it by id or name may still run there
@@ -27507,6 +27525,15 @@ export type S3SourceResponse = {
     region: string;
     updated_at: number;
 };
+
+/**
+ * Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
+ * containers, Firecracker microVMs and microsandbox (libkrun) microVMs
+ * coexist on the same host behind the same `SandboxProvider` seam;
+ * `routing::RoutingSandboxProvider` dispatches between them. `Local` is the
+ * dev-only fork-exec fallback.
+ */
+export type SandboxBackend = 'docker' | 'firecracker' | 'microsandbox' | 'local';
 
 /**
  * The Git changes of every repository found under the work directory.

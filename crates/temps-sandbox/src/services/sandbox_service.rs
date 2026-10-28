@@ -2007,7 +2007,30 @@ impl SandboxService {
         let policy = self.placement_policy().await?;
         let workers = self.placement_workers().await?;
         let live = placement::live_counts(self.db.as_ref()).await?;
-        Ok(placement::describe(&policy, &workers, &live))
+        let mut nodes = placement::describe(&policy, &workers, &live);
+        if let Some(control_plane) = nodes.iter_mut().find(|n| n.is_control_plane) {
+            control_plane.backends = self.control_plane_backends();
+        }
+        Ok(nodes)
+    }
+
+    /// What the control plane's own provider can run, with the setup step
+    /// for each backend it cannot. Registration is decided at startup, so
+    /// this is a read of in-memory state plus, for an unavailable
+    /// microsandbox, the host probe that names what is missing.
+    fn control_plane_backends(&self) -> Vec<placement::NodeBackend> {
+        let provider = self.registry.provider_arc();
+        temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+            .into_iter()
+            .map(|backend| {
+                let available = provider.supports_backend(backend);
+                placement::NodeBackend {
+                    backend,
+                    available,
+                    reason: (!available).then(|| backend_unavailable_message(backend)),
+                }
+            })
+            .collect()
     }
 
     /// Live sandboxes on one node, from every owner (the operator view on
@@ -2407,18 +2430,11 @@ impl SandboxService {
                         .to_string(),
                 });
             }
-            if backend == Some(temps_agents::sandbox::SandboxBackend::Firecracker) {
+            if let Some(b) =
+                backend.filter(|b| !temps_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
+            {
                 return Err(SandboxError::Validation {
-                    message: "the firecracker backend is not available on worker nodes yet; \
-                              use the docker backend or the control plane"
-                        .to_string(),
-                });
-            }
-            if backend == Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
-                return Err(SandboxError::Validation {
-                    message: "the microsandbox backend is not available on worker nodes \
-                              (ADR-050); use the docker backend or the control plane"
-                        .to_string(),
+                    message: placement::worker_backend_unavailable(b),
                 });
             }
         }
@@ -7855,6 +7871,8 @@ mod storage_cleanup_tests {
         fail_egress: bool,
         /// `create` takes this long, like a first image build.
         create_delay: Option<Duration>,
+        /// The backends this host registered; `None` claims every one.
+        backends: Option<Vec<SandboxBackend>>,
     }
 
     impl FakeProvider {
@@ -7876,6 +7894,7 @@ mod storage_cleanup_tests {
                 egress_calls: Arc::new(Mutex::new(Vec::new())),
                 fail_egress: false,
                 create_delay: None,
+                backends: None,
             }
         }
     }
@@ -7894,6 +7913,12 @@ mod storage_cleanup_tests {
 
     #[async_trait]
     impl SandboxProvider for FakeProvider {
+        fn supports_backend(&self, backend: SandboxBackend) -> bool {
+            self.backends
+                .as_ref()
+                .is_none_or(|backends| backends.contains(&backend))
+        }
+
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
             if let Some(delay) = self.create_delay {
                 tokio::time::sleep(delay).await;
@@ -11646,5 +11671,39 @@ mod storage_cleanup_tests {
             "got {error:?}"
         );
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The control plane offers every selectable backend, says which it can
+    /// run, and names the setup step for each one it cannot, so the console
+    /// can show the choice instead of hiding it.
+    #[test]
+    fn the_control_plane_lists_its_backends_with_the_fix_for_missing_ones() {
+        let mut provider = FakeProvider::new();
+        provider.backends = Some(vec![SandboxBackend::Docker]);
+        let (service, _) = build_service(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            provider,
+            unique_data_root("cp-backends"),
+        );
+
+        let backends = service.control_plane_backends();
+
+        let offered: Vec<_> = backends.iter().map(|b| b.backend).collect();
+        assert_eq!(
+            offered,
+            temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS.to_vec()
+        );
+        let docker = &backends[0];
+        assert!(docker.available && docker.reason.is_none(), "{docker:?}");
+        let firecracker = &backends[1];
+        assert!(!firecracker.available);
+        assert!(
+            firecracker
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("temps firecracker setup")),
+            "an unavailable backend says how to provision it: {firecracker:?}"
+        );
+        assert!(!backends[2].available && backends[2].reason.is_some());
     }
 }

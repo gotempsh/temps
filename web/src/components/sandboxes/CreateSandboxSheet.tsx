@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect } from 'react'
+import { useEffect, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -46,12 +46,17 @@ import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 import {
   AUTO_NODE,
+  DEFAULT_BACKEND,
   PREVIEW_PASSWORD_MIN_LEN,
+  backendChoices,
   createSandboxFormDefaults,
   createSandboxFormSchema,
+  nodeRunsBackend,
+  targetNode,
   toCreateSandboxBody,
   type CreateSandboxFormValues,
 } from './sandbox-create'
+import { SandboxBackendLogo } from './SandboxBackendLogo'
 
 const LIFECYCLES = [
   {
@@ -67,6 +72,23 @@ const LIFECYCLES = [
       'A long-lived place to work. It sleeps when idle and wakes on the next use; nothing deletes it automatically.',
   },
 ] as const
+
+const BACKEND_DESCRIPTIONS: Record<string, { title: string; description: string }> = {
+  docker: {
+    title: 'Docker',
+    description: 'A namespaced container. Starts fastest and runs on every node.',
+  },
+  firecracker: {
+    title: 'Firecracker',
+    description:
+      'A hardware-virtualized microVM (KVM). The strongest isolation, for untrusted code.',
+  },
+  microsandbox: {
+    title: 'microsandbox',
+    description:
+      'A libkrun microVM (experimental). For trusted and agent workloads.',
+  },
+}
 
 interface CreateSandboxSheetProps {
   open: boolean
@@ -121,7 +143,12 @@ export function CreateSandboxSheet({
     enabled: open && available,
     retry: false,
   })
-  const nodes = (placement.data?.nodes ?? []).filter((node) => node.eligible)
+  const allNodes = placement.data?.nodes ?? []
+  const nodes = allNodes.filter((node) => node.eligible)
+  const selectedNode = form.watch('node')
+  const selectedBackend = form.watch('backend')
+  const backends = backendChoices(allNodes, selectedNode)
+  const target = targetNode(allNodes, selectedNode)
 
   const submit = (values: CreateSandboxFormValues) =>
     create.mutate({ body: toCreateSandboxBody(values) })
@@ -337,7 +364,20 @@ export function CreateSandboxSheet({
                 render={({ field }) => (
                   <FormItem>
                     <FormLabel>Node</FormLabel>
-                    <Select value={field.value} onValueChange={field.onChange}>
+                    <Select
+                      value={field.value}
+                      onValueChange={(value) => {
+                        field.onChange(value)
+                        // A backend the new node cannot run goes back to the
+                        // default rather than failing the create.
+                        const still = backendChoices(allNodes, value).find(
+                          (choice) => choice.backend === form.getValues('backend')
+                        )
+                        if (still && !still.available) {
+                          form.setValue('backend', DEFAULT_BACKEND)
+                        }
+                      }}
+                    >
                       <FormControl>
                         <SelectTrigger>
                           <SelectValue />
@@ -347,11 +387,19 @@ export function CreateSandboxSheet({
                         <SelectItem value={AUTO_NODE}>
                           Automatic placement
                         </SelectItem>
-                        {nodes.map((node) => (
-                          <SelectItem key={node.id} value={node.name}>
-                            {node.name} ({node.live_sandboxes} running)
-                          </SelectItem>
-                        ))}
+                        {nodes.map((node) => {
+                          const runs = nodeRunsBackend(node, selectedBackend)
+                          return (
+                            <SelectItem
+                              key={node.id}
+                              value={node.name}
+                              disabled={!runs}
+                            >
+                              {node.name} ({node.live_sandboxes} running)
+                              {!runs && ` · no ${selectedBackend}`}
+                            </SelectItem>
+                          )
+                        })}
                       </SelectContent>
                     </Select>
                     <FormMessage />
@@ -359,6 +407,54 @@ export function CreateSandboxSheet({
                 )}
               />
             </div>
+
+            <FormField
+              control={form.control}
+              name="backend"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Backend</FormLabel>
+                  <FormControl>
+                    <RadioGroup
+                      value={field.value}
+                      onValueChange={field.onChange}
+                      className="grid gap-2"
+                    >
+                      <BackendCard
+                        value={DEFAULT_BACKEND}
+                        selected={field.value === DEFAULT_BACKEND}
+                        title="Platform default"
+                        description={
+                          target
+                            ? `Whatever ${target.name} runs by default.`
+                            : 'Whatever the node runs by default.'
+                        }
+                      />
+                      {backends.map((choice) => {
+                        const text = BACKEND_DESCRIPTIONS[choice.backend]
+                        return (
+                          <BackendCard
+                            key={choice.backend}
+                            value={choice.backend}
+                            selected={field.value === choice.backend}
+                            disabled={!choice.available}
+                            title={text?.title ?? choice.backend}
+                            description={text?.description ?? ''}
+                            reason={choice.available ? null : choice.reason}
+                            logo={<SandboxBackendLogo backend={choice.backend} />}
+                          />
+                        )
+                      })}
+                    </RadioGroup>
+                  </FormControl>
+                  <FormDescription>
+                    Which backends you can pick depends on the node: worker
+                    nodes run Docker sandboxes only.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
 
             <FormField
               control={form.control}
@@ -425,5 +521,60 @@ export function CreateSandboxSheet({
         </Form>
       </SheetContent>
     </Sheet>
+  )
+}
+
+/** One choice in the backend picker. An unavailable one stays visible and says why. */
+function BackendCard({
+  value,
+  selected,
+  disabled = false,
+  title,
+  description,
+  reason,
+  logo,
+}: {
+  value: string
+  selected: boolean
+  disabled?: boolean
+  title: string
+  description: string
+  reason?: string | null
+  logo?: ReactNode
+}) {
+  const id = `backend-${value}`
+  return (
+    <Label
+      htmlFor={id}
+      className={cn(
+        'flex items-start gap-3 rounded-lg border p-3 font-normal',
+        disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer',
+        selected && 'border-primary bg-primary/5'
+      )}
+    >
+      <RadioGroupItem
+        id={id}
+        value={value}
+        disabled={disabled}
+        className="mt-0.5"
+      />
+      <span className="min-w-0 space-y-1">
+        <span className="flex items-center gap-1.5 text-sm font-medium">
+          {logo}
+          {title}
+        </span>
+        <span className="block text-xs text-muted-foreground">
+          {description}
+        </span>
+        {reason && (
+          <span className="block break-words text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">
+              Not available here:
+            </span>{' '}
+            {reason}
+          </span>
+        )}
+      </span>
+    </Label>
   )
 }

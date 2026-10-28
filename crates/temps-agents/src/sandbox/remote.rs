@@ -1889,7 +1889,7 @@ impl SandboxProvider for RemoteSandboxProvider {
     }
 
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
-        backend == SandboxBackend::Docker
+        super::WORKER_SANDBOX_BACKENDS.contains(&backend)
     }
 
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {

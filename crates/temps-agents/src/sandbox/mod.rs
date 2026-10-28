@@ -117,6 +117,19 @@ pub enum SandboxBackend {
     Local,
 }
 
+/// The backends a caller may ask for, in the order they are offered. `Local`
+/// is a dev-only fallback, never a choice.
+pub const SELECTABLE_SANDBOX_BACKENDS: [SandboxBackend; 3] = [
+    SandboxBackend::Docker,
+    SandboxBackend::Firecracker,
+    SandboxBackend::Microsandbox,
+];
+
+/// The backends a worker node runs sandboxes on (ADR-048): its agent creates
+/// Docker containers only. [`remote::RemoteSandboxProvider`] answers from
+/// this, and so does every surface that says what a worker can run.
+pub const WORKER_SANDBOX_BACKENDS: [SandboxBackend; 1] = [SandboxBackend::Docker];
+
 impl std::str::FromStr for SandboxBackend {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {

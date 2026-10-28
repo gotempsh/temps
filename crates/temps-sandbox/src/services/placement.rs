@@ -129,6 +129,44 @@ pub struct PlacementNode {
     /// when it is `eligible`. Always `false` for the control plane.
     #[serde(default)]
     pub dedicated: bool,
+    /// Every backend a sandbox can ask for, and whether this node can run
+    /// it. A node that cannot says why, so a client can show the choice and
+    /// its fix rather than hide it.
+    #[serde(default)]
+    pub backends: Vec<NodeBackend>,
+}
+
+/// Whether one node can run sandboxes on one backend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct NodeBackend {
+    pub backend: temps_agents::sandbox::SandboxBackend,
+    pub available: bool,
+    /// Why the node cannot run it, and how to fix that when it can be fixed.
+    pub reason: Option<String>,
+}
+
+/// Why a worker node cannot run `backend`: its agent creates Docker
+/// containers only (ADR-048).
+pub fn worker_backend_unavailable(backend: temps_agents::sandbox::SandboxBackend) -> String {
+    format!(
+        "the {backend} backend is not available on worker nodes, which run docker \
+         sandboxes only; use the docker backend or the control plane"
+    )
+}
+
+/// What a worker node can run, for [`PlacementNode::backends`].
+pub fn worker_backends() -> Vec<NodeBackend> {
+    temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+        .into_iter()
+        .map(|backend| {
+            let available = temps_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(&backend);
+            NodeBackend {
+                backend,
+                available,
+                reason: (!available).then(|| worker_backend_unavailable(backend)),
+            }
+        })
+        .collect()
 }
 
 /// Why an otherwise active worker cannot take new sandboxes.
@@ -553,6 +591,9 @@ pub fn describe(
         reason: cp_reason,
         live_sandboxes: live.get(&CONTROL_PLANE_NODE_ID).copied().unwrap_or(0),
         dedicated: false,
+        // Known only to the control plane's own provider; the service fills
+        // it in.
+        backends: Vec::new(),
     }];
     for w in workers {
         let allowed = policy.allows(w.id);
@@ -573,6 +614,7 @@ pub fn describe(
             reason,
             live_sandboxes: live.get(&w.id).copied().unwrap_or(0),
             dedicated: w.dedicated,
+            backends: worker_backends(),
         });
     }
     out
@@ -1491,5 +1533,32 @@ pub(crate) mod tests {
         };
         let reason = probe.check(4).await.unwrap_err();
         assert!(reason.contains("did not answer"), "{reason}");
+    }
+
+    /// A worker runs Docker sandboxes only (ADR-048): the placement listing
+    /// says so per backend, with the alternative, rather than leaving the
+    /// console to discover it from a failed create.
+    #[test]
+    fn a_worker_offers_docker_and_explains_the_other_backends() {
+        use temps_agents::sandbox::SandboxBackend;
+        let rows = describe(&all(), &workers(), &HashMap::new());
+
+        // The control plane's backends come from its provider, not from here.
+        assert!(rows[0].is_control_plane && rows[0].backends.is_empty());
+        let worker = &rows[1];
+        let available: Vec<_> = worker
+            .backends
+            .iter()
+            .filter(|b| b.available)
+            .map(|b| b.backend)
+            .collect();
+        assert_eq!(available, vec![SandboxBackend::Docker]);
+        for backend in worker.backends.iter().filter(|b| !b.available) {
+            let reason = backend.reason.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains(&backend.backend.to_string()) && reason.contains("control plane"),
+                "{backend:?}"
+            );
+        }
     }
 }
