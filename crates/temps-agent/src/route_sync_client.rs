@@ -79,6 +79,14 @@ struct SnapshotPublicIngress {
     /// ADR 065 D6: the routes of `tailnet_users` Serve entries.
     #[serde(default)]
     identity_serve_routes: Vec<SnapshotIdentityServeRoute>,
+    /// ADR 066 D10: routes whose environment acts on verdicts, sent only
+    /// because this agent declared it runs Shield.
+    #[serde(default)]
+    shield_routes: Vec<SnapshotRoute>,
+    /// The current Shield snapshot revision; absent from a control plane
+    /// that predates Shield on workers.
+    #[serde(default)]
+    shield: Option<temps_core::worker_shield::ShieldRef>,
 }
 
 /// Where a `tailnet_users` Serve socket sends requests (ADR 065 D6).
@@ -147,6 +155,8 @@ struct SnapshotRoute {
     environment_id: Option<i32>,
     #[serde(default)]
     gate: Option<temps_core::gate::GatePolicy>,
+    #[serde(default)]
+    shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,13 +173,15 @@ struct AckRequest {
     applied_generation: u64,
 }
 
-/// What this agent enforces (ADR 065 D6, D7), declared on every request
-/// it makes to the control plane. The control plane sends `tailnet_users`
-/// and signed-in routes only to a request that names the capability, so a
-/// binary rolled back to one without it stops getting them at once.
-pub const DECLARED_CAPABILITIES: [&str; 2] = [
+/// What this agent enforces (ADR 065 D6, D7; ADR 066 D10), declared on
+/// every request it makes to the control plane. The control plane sends
+/// `tailnet_users`, signed-in and Shield routes only to a request that names
+/// the capability, so a binary rolled back to one without it stops getting
+/// them at once.
+pub const DECLARED_CAPABILITIES: [&str; 3] = [
     temps_core::gate::GATE_CAPABILITY,
     temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+    temps_core::worker_shield::SHIELD_CAPABILITY,
 ];
 
 /// [`DECLARED_CAPABILITIES`] as the header value: one comma-separated list.
@@ -433,6 +445,13 @@ impl RouteSyncClient {
                     principals: identity.principals,
                 })
                 .collect(),
+            shield_routes: body
+                .public_ingress
+                .shield_routes
+                .into_iter()
+                .map(snapshot_route_into_entry)
+                .collect(),
+            shield: body.public_ingress.shield,
             serve_entries: body
                 .public_ingress
                 .serve_entries
@@ -548,6 +567,7 @@ fn snapshot_route_into_entry(route: SnapshotRoute) -> RouteEntry {
         project_id: route.project_id,
         environment_id: route.environment_id,
         gate: route.gate,
+        shield: route.shield,
     }
 }
 
@@ -622,6 +642,7 @@ mod tests {
             project_id: Some(2),
             environment_id: Some(3),
             gate: None,
+            shield: None,
         }
     }
 
@@ -663,6 +684,8 @@ mod tests {
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
+            shield_routes: Vec::new(),
+            shield: None,
         }
     }
 
@@ -789,6 +812,8 @@ mod tests {
             serve_entries: Vec::new(),
             identity_private_routes: Vec::new(),
             identity_serve_routes: Vec::new(),
+            shield_routes: Vec::new(),
+            shield: None,
         });
 
         crate::public_ingress::update_snapshot_health(&store);
@@ -962,13 +987,14 @@ mod tests {
         .expect("create route sync client");
 
         let _ = client.tick_once().await;
-        // One header naming both capabilities.
+        // One header naming every capability.
         assert_eq!(
             *seen.lock().expect("fixture lock"),
             vec![Some(format!(
-                "{},{}",
+                "{},{},{}",
                 temps_core::gate::GATE_CAPABILITY,
-                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY
+                temps_core::tailnet::CAPABILITY_TAILNET_IDENTITY,
+                temps_core::worker_shield::SHIELD_CAPABILITY
             ))]
         );
         let private = store.lookup_private("users.example.test").expect("served");

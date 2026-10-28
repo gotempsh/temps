@@ -78,6 +78,7 @@ test('environment sidebar preserves the selected page when switching environment
   await expect(nav.getByRole('button')).toHaveText([
     'Containers',
     'Metrics',
+    'Shield',
     'Settings',
   ])
   await expect(

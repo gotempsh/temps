@@ -136,6 +136,9 @@ pub struct ComposePlacementResponse {
     /// (`0` is the control plane).
     pub moving_from_node_id: Option<i32>,
     pub moving_from_node_name: Option<String>,
+    /// That node's state. The stack's volumes are there, but it only runs
+    /// there while the node is `active`.
+    pub moving_from_node_status: Option<String>,
     /// Why the environment's Target Nodes / Label Selectors no longer
     /// describe the home, when they do not.
     pub drift: Option<String>,
@@ -764,6 +767,7 @@ impl ComposePlacementService {
             pinned_at: None,
             moving_from_node_id: None,
             moving_from_node_name: None,
+            moving_from_node_status: None,
             drift: None,
         };
         let Some(placement) = self.get(environment_id).await? else {
@@ -792,9 +796,10 @@ impl ComposePlacementService {
             target_labels.as_ref(),
         );
         if let Some(old) = placement.pending_vacate() {
-            let (old_id, old_name, _, _) = self.describe_node(environment_id, old).await?;
+            let (old_id, old_name, old_status, _) = self.describe_node(environment_id, old).await?;
             response.moving_from_node_id = Some(old_id);
             response.moving_from_node_name = Some(old_name);
+            response.moving_from_node_status = Some(old_status);
         }
         response.pinned = true;
         response.home_node_id = Some(home_id);
@@ -1506,6 +1511,7 @@ mod tests {
         assert_eq!(status.home_node_id, Some(node.id));
         assert_eq!(status.home_node_name.as_deref(), Some("worker-a"));
         assert_eq!(status.moving_from_node_id, Some(CONTROL_PLANE_NODE_ID));
+        assert_eq!(status.moving_from_node_status.as_deref(), Some("active"));
         assert_eq!(status.drift, None);
 
         // Another project's environment is not found through this one.

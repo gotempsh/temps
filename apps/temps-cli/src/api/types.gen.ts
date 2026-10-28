@@ -2203,6 +2203,10 @@ export type AppSettings = {
      */
     setup_complete?: boolean;
     /**
+     * ADR 066: platform-wide Shield settings.
+     */
+    shield?: ShieldSettings;
+    /**
      * Ceilings the operator places on what a *tenant* may configure for
      * their own project/environment. Entirely unenforced by default, so an
      * upgrade never changes what an existing config means.
@@ -5883,6 +5887,11 @@ export type ComposePlacementResponse = {
     moving_from_node_id?: number | null;
     moving_from_node_name?: string | null;
     /**
+     * That node's state. The stack's volumes are there, but it only runs
+     * there while the node is `active`.
+     */
+    moving_from_node_status?: string | null;
+    /**
      * Whether the stack has a home yet. `false` until its first deployment
      * reaches `docker compose up` (or a move chose one).
      */
@@ -8514,6 +8523,34 @@ export type CreateSandboxBody = {
     timeout_secs?: number | null;
 };
 
+export type CreateShieldEntryRequest = {
+    /**
+     * When the entry stops applying; omit for never.
+     */
+    expires_at?: string | null;
+    /**
+     * A JA4 fingerprint; exactly one of `network` and `ja4`.
+     */
+    ja4?: string | null;
+    /**
+     * An address or CIDR range; exactly one of `network` and `ja4`.
+     */
+    network?: string | null;
+    note?: string | null;
+    verdict: ShieldEntryVerdict;
+};
+
+export type CreateShieldTokenRequest = {
+    /**
+     * What uses it: `uptime monitor`, `CI`.
+     */
+    name: string;
+    /**
+     * Valid for every environment of the project, not only this one.
+     */
+    project_wide?: boolean;
+};
+
 export type CreateSkillRequest = {
     content: string;
     description?: string | null;
@@ -8630,6 +8667,16 @@ export type CreatedResource = {
      * Resource type (project, environment, deployment, service, domain, etc.)
      */
     resource_type: string;
+};
+
+/**
+ * A new bypass token. `secret` is shown this once and never again.
+ */
+export type CreatedShieldTokenResponse = ShieldTokenResponse & {
+    /**
+     * Send it in `X-Temps-Shield-Token`.
+     */
+    secret: string;
 };
 
 export type CronExecutionInfo = {
@@ -12154,6 +12201,13 @@ export type EnvironmentResponse = {
      * Deployments must be promoted from another environment.
      */
     protected: boolean;
+    /**
+     * Paths Shield never challenges in this environment (ADR 066 D7):
+     * `/api*` exempts everything under `/api/`, any other entry one exact
+     * path.
+     */
+    shield_exempt_paths: Array<string>;
+    shield_mode: ShieldMode | null;
     /**
      * When true, the environment's containers are currently stopped due to
      * inactivity (on-demand mode) and will start on the next request.
@@ -22904,6 +22958,9 @@ export type ProjectResponse = {
     allow_alternate_sources?: boolean | null;
     /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
+     *
+     * Kept for one release for consoles that predate Shield modes; it is
+     * true exactly when `shield_mode` is `attack`.
      */
     attack_mode: boolean;
     created_at: number;
@@ -23037,6 +23094,11 @@ export type ProjectResponse = {
      * Exact service-template version currently applied to the project.
      */
     service_template_version?: string | null;
+    /**
+     * How Shield acts on verdicts in the project's environments (ADR 066
+     * D1); an environment can set its own.
+     */
+    shield_mode: ShieldMode;
     slug: string;
     /**
      * Source type for deployments (git, docker_image, or static_files)
@@ -28802,6 +28864,298 @@ export type SetupMfaRequest = {
 };
 
 /**
+ * Challenges in the window.
+ */
+export type ShieldChallengeCounts = {
+    failed: number;
+    issued: number;
+    solved: number;
+};
+
+export type ShieldEntryResponse = {
+    created_at: string;
+    created_by?: number | null;
+    /**
+     * After this the entry no longer applies; `null` for never.
+     */
+    expires_at?: string | null;
+    id: number;
+    /**
+     * The fingerprint, when the entry names one.
+     */
+    ja4?: string | null;
+    /**
+     * The address range, when the entry names one.
+     */
+    network?: string | null;
+    note?: string | null;
+    project_id?: number | null;
+    scope: ShieldEntryScope;
+    verdict: ShieldEntryVerdict;
+};
+
+/**
+ * Whose entries: the platform's, or one project's.
+ */
+export type ShieldEntryScope = 'platform' | 'project';
+
+/**
+ * The verdict an operator entry gives what it matches.
+ */
+export type ShieldEntryVerdict = 'allow' | 'log' | 'challenge' | 'block';
+
+export type ShieldEventResponse = {
+    difficulty?: number | null;
+    host: string;
+    ip: string;
+    ja4?: string | null;
+    /**
+     * `verdict`, `challenge_issued`, `challenge_solved` or
+     * `challenge_failed`.
+     */
+    kind: string;
+    mode: string;
+    /**
+     * The worker that saw it; `null` on the control plane.
+     */
+    node_id?: number | null;
+    path: string;
+    reasons: Array<string>;
+    request_id: string;
+    signature?: string | null;
+    solve_ms?: number | null;
+    timestamp: string;
+    user_agent: string;
+    verdict: string;
+};
+
+export type ShieldEventsResponse = {
+    events: Array<ShieldEventResponse>;
+    /**
+     * Pass as `before` for the next page; `null` when this one is the last.
+     */
+    next_before?: string | null;
+};
+
+export type ShieldLookupResponse = {
+    /**
+     * `pass`, `log`, `challenge` or `block`: what the lists say.
+     */
+    action: string;
+    /**
+     * An operator allow rule matched: the client passes whatever else it
+     * matches.
+     */
+    allowed: boolean;
+    /**
+     * Whether this environment acts on the action rather than recording it.
+     */
+    enforced: boolean;
+    ip?: string | null;
+    ja4?: string | null;
+    /**
+     * The environment's mode, which decides whether the action is taken.
+     */
+    mode: ShieldMode;
+    /**
+     * Why, one line per match: `spamhaus_drop (185.93.89.0/24)`.
+     */
+    reasons: Array<string>;
+    /**
+     * The snapshot looked up; `null` when none is stored yet and only the
+     * built-in lists apply.
+     */
+    snapshot_revision?: number | null;
+};
+
+/**
+ * How an environment acts on verdicts (D1).
+ */
+export type ShieldMode = 'off' | 'log' | 'selective' | 'attack';
+
+/**
+ * Where an environment's mode is set.
+ */
+export type ShieldModeSource = 'environment' | 'project';
+
+/**
+ * What a proposal names.
+ */
+export type ShieldProposalKind = 'ip' | 'ja4';
+
+/**
+ * One page of proposals, newest evidence first.
+ */
+export type ShieldProposalPage = {
+    items: Array<ShieldProposalResponse>;
+    page: number;
+    page_size: number;
+    /**
+     * Proposals that match, on every page.
+     */
+    total: number;
+};
+
+/**
+ * An address or fingerprint fleet learning proposes to challenge or block.
+ */
+export type ShieldProposalResponse = {
+    decided_at?: string | null;
+    decided_by?: number | null;
+    /**
+     * After this the proposal, and an approval of it, no longer apply.
+     */
+    expires_at: string;
+    first_seen: string;
+    /**
+     * Events behind it in the last learning window.
+     */
+    hits: number;
+    id: number;
+    kind: ShieldProposalKind;
+    last_seen: string;
+    /**
+     * The evidence, as learning summarised it.
+     */
+    reason: string;
+    status: ShieldProposalStatus;
+    /**
+     * The address or the fingerprint.
+     */
+    subject: string;
+    /**
+     * `challenge` or `block`.
+     */
+    verdict: ShieldEntryVerdict;
+};
+
+/**
+ * Where a learned proposal stands. Only `approved` ones apply.
+ */
+export type ShieldProposalStatus = 'pending' | 'approved' | 'rejected';
+
+/**
+ * Platform-wide Shield settings (ADR 066, I10).
+ */
+export type ShieldSettings = {
+    /**
+     * Whether what one environment's visitors did counts for every
+     * environment (D9): addresses and fingerprints learned from events are
+     * proposed, and an approved proposal applies fleet-wide. Nothing
+     * applies without an approval. Off, nothing is proposed or applied.
+     */
+    share_observations?: boolean;
+};
+
+/**
+ * How long visitors took to solve a challenge (D6).
+ */
+export type ShieldSolveTimes = {
+    median_ms?: number | null;
+    p90_ms?: number | null;
+    samples: number;
+};
+
+/**
+ * Requests one source matched.
+ */
+export type ShieldSourceCount = {
+    requests: number;
+    /**
+     * The list, rule or signature: `spamhaus_drop`, `operator`,
+     * `CVE-2021-41773`.
+     */
+    source: string;
+};
+
+export type ShieldSummaryResponse = {
+    challenges: ShieldChallengeCounts;
+    end: string;
+    environment_id: number;
+    /**
+     * The mode the environment runs in.
+     */
+    mode: ShieldMode;
+    mode_source: ShieldModeSource;
+    project_id: number;
+    /**
+     * The project's mode, which an inheriting environment runs in.
+     */
+    project_mode: ShieldMode;
+    solve_times: ShieldSolveTimes;
+    /**
+     * The sources behind those verdicts, most first (at most 20).
+     */
+    sources: Array<ShieldSourceCount>;
+    start: string;
+    /**
+     * `clickhouse` or `postgres`: where the counts come from.
+     */
+    storage: string;
+    /**
+     * Requests in the window with a verdict, from the request log.
+     */
+    verdicts: ShieldVerdictCounts;
+    window: ShieldWindow;
+    /**
+     * Block and challenge verdicts Shield recorded without acting on them:
+     * what switching to `selective` would have stopped. The request log's
+     * counts less the verdicts events show were acted on, so a window that
+     * was partly in `selective` does not count those twice.
+     */
+    would_have: ShieldWouldHave;
+};
+
+/**
+ * A bypass token, without its secret.
+ */
+export type ShieldTokenResponse = {
+    created_at: string;
+    created_by?: number | null;
+    /**
+     * The environment it is limited to; `null` for a project-wide token.
+     */
+    environment_id?: number | null;
+    id: number;
+    last_used_at?: string | null;
+    name: string;
+    scope: ShieldTokenScope;
+};
+
+/**
+ * Which environments a bypass token is valid for.
+ */
+export type ShieldTokenScope = 'environment' | 'project';
+
+/**
+ * Requests by verdict.
+ */
+export type ShieldVerdictCounts = {
+    block: number;
+    challenge: number;
+    log: number;
+};
+
+/**
+ * The window a summary covers.
+ */
+export type ShieldWindow = '1h' | '24h' | '7d';
+
+/**
+ * What would have happened in `selective`.
+ */
+export type ShieldWouldHave = {
+    /**
+     * Requests with a block verdict that Shield only recorded.
+     */
+    blocked: number;
+    /**
+     * Requests with a challenge verdict that Shield only recorded.
+     */
+    challenged: number;
+};
+
+/**
  * A sibling project that shares the same `trace_id` and has opted in to
  * cross-project trace sharing (`cross_project_trace_sharing = TRUE`).
  *
@@ -32449,6 +32803,10 @@ export type UpdateEnvironmentSettingsRequest = {
      * - absent → leave the current override unchanged
      * - JSON `null` → clear the override (inherit the project-level setting)
      * - `true`/`false` → override the project setting for this environment
+     *
+     * Kept for consoles that predate Shield modes: `true` sets the Shield
+     * mode to `attack`, `false` leaves attack, `null` inherits both. When
+     * `shield_mode` is also sent, `shield_mode` wins.
      */
     attack_mode?: boolean | null;
     /**
@@ -32550,6 +32908,13 @@ export type UpdateEnvironmentSettingsRequest = {
      * Enable/disable session recording
      */
     session_recording_enabled?: boolean | null;
+    /**
+     * Paths Shield never challenges here (ADR 066 D7), replacing the stored
+     * list: `/api*` exempts everything under `/api/`, anything else one
+     * exact path; at most 64. Omit to leave them unchanged.
+     */
+    shield_exempt_paths?: Array<string> | null;
+    shield_mode?: ShieldMode | null;
     /**
      * Override the proxy's idle timeout for Server-Sent Events streams to
      * this environment, in seconds (0 = no timeout, or 1-86400). Always clamped to the
@@ -32935,6 +33300,10 @@ export type UpdateProjectSettingsRequest = {
     ai_api_traffic_summary_enabled?: boolean | null;
     /**
      * Enable/disable attack mode (CAPTCHA protection) for all project environments
+     *
+     * Kept for consoles that predate Shield modes: `true` sets the Shield
+     * mode to `attack`, `false` turns attack back to `log`. When
+     * `shield_mode` is also sent, `shield_mode` wins.
      */
     attack_mode?: boolean | null;
     /**
@@ -33011,6 +33380,7 @@ export type UpdateProjectSettingsRequest = {
      * project's traffic. Omit to leave unchanged.
      */
     serves_own_temps_api?: boolean | null;
+    shield_mode?: ShieldMode | null;
     slug?: string | null;
     /**
      * Opt in to Trivy vulnerability scanning of this project's deployed Docker
@@ -33184,6 +33554,15 @@ export type UpdateSessionDurationRequest = {
 
 export type UpdateSessionDurationResponse = {
     message: string;
+};
+
+/**
+ * Replaces an entry's verdict, note and expiry; what it matches stays.
+ */
+export type UpdateShieldEntryRequest = {
+    expires_at?: string | null;
+    note?: string | null;
+    verdict: ShieldEntryVerdict;
 };
 
 export type UpdateSkillRequest = {
@@ -34525,6 +34904,13 @@ export type WireguardMeshState = 'disabled' | 'starting' | 'ready';
  */
 export type WireguardMeshStatusResponse = {
     /**
+     * Whether the cluster CA must be rotated before the mesh can be turned
+     * on: it predates certificate address history, so no pool can be
+     * proven free of its worker certificates. Always `false` once the mesh
+     * is on.
+     */
+    ca_rotation_required: boolean;
+    /**
      * Whether `POST /nodes/wireguard` can turn the mesh on here.
      */
     can_enable: boolean;
@@ -34562,6 +34948,11 @@ export type WireguardMeshStatusResponse = {
      */
     listen_port: number;
     nodes: Array<WireguardMeshNodeStatus>;
+    /**
+     * The pool the mesh uses, or would use if turned on now: nodes get
+     * their mesh addresses from it. Unrelated to the compute pool.
+     */
+    pool_cidr: string;
     /**
      * Why the mesh is not ready, when it is not. Rendered verbatim.
      */
@@ -71554,6 +71945,335 @@ export type UpdateRuntimeHealthResponses = {
 
 export type UpdateRuntimeHealthResponse = UpdateRuntimeHealthResponses[keyof UpdateRuntimeHealthResponses];
 
+export type ListShieldEventsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * Events to return, 1 to 100; 20 by default.
+         */
+        limit?: number;
+        /**
+         * Only this kind: `verdict`, `challenge_issued`, `challenge_solved` or
+         * `challenge_failed`.
+         */
+        kind?: string;
+        /**
+         * Only this verdict: `block`, `challenge` or `log`.
+         */
+        verdict?: string;
+        /**
+         * Only this client address, IPv4 or IPv6.
+         */
+        ip?: string;
+        /**
+         * Only events before this instant (the `next_before` of the previous
+         * page).
+         */
+        before?: string;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/shield/events';
+};
+
+export type ListShieldEventsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListShieldEventsError = ListShieldEventsErrors[keyof ListShieldEventsErrors];
+
+export type ListShieldEventsResponses = {
+    /**
+     * Recent events
+     */
+    200: ShieldEventsResponse;
+};
+
+export type ListShieldEventsResponse = ListShieldEventsResponses[keyof ListShieldEventsResponses];
+
+export type LookupShieldClientData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * A client address.
+         */
+        ip?: string;
+        /**
+         * A JA4 TLS fingerprint.
+         */
+        ja4?: string;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/shield/lookup';
+};
+
+export type LookupShieldClientErrors = {
+    /**
+     * Invalid address or fingerprint
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type LookupShieldClientError = LookupShieldClientErrors[keyof LookupShieldClientErrors];
+
+export type LookupShieldClientResponses = {
+    /**
+     * Verdict and reasons
+     */
+    200: ShieldLookupResponse;
+};
+
+export type LookupShieldClientResponse = LookupShieldClientResponses[keyof LookupShieldClientResponses];
+
+export type GetShieldSummaryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * `1h`, `24h` (the default) or `7d`.
+         */
+        window?: ShieldWindow;
+    };
+    url: '/projects/{project_id}/environments/{environment_id}/shield/summary';
+};
+
+export type GetShieldSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetShieldSummaryError = GetShieldSummaryErrors[keyof GetShieldSummaryErrors];
+
+export type GetShieldSummaryResponses = {
+    /**
+     * Shield summary
+     */
+    200: ShieldSummaryResponse;
+};
+
+export type GetShieldSummaryResponse = GetShieldSummaryResponses[keyof GetShieldSummaryResponses];
+
+export type ListShieldTokensData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/shield/tokens';
+};
+
+export type ListShieldTokensErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListShieldTokensError = ListShieldTokensErrors[keyof ListShieldTokensErrors];
+
+export type ListShieldTokensResponses = {
+    /**
+     * Active bypass tokens
+     */
+    200: Array<ShieldTokenResponse>;
+};
+
+export type ListShieldTokensResponse = ListShieldTokensResponses[keyof ListShieldTokensResponses];
+
+export type CreateShieldTokenData = {
+    body: CreateShieldTokenRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/shield/tokens';
+};
+
+export type CreateShieldTokenErrors = {
+    /**
+     * Invalid name
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project or environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * The project has the most tokens it may hold
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateShieldTokenError = CreateShieldTokenErrors[keyof CreateShieldTokenErrors];
+
+export type CreateShieldTokenResponses = {
+    /**
+     * Token created; `secret` is shown only now
+     */
+    201: CreatedShieldTokenResponse;
+};
+
+export type CreateShieldTokenResponse = CreateShieldTokenResponses[keyof CreateShieldTokenResponses];
+
+export type RevokeShieldTokenData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Bypass token ID
+         */
+        token_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/shield/tokens/{token_id}';
+};
+
+export type RevokeShieldTokenErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project, environment or token not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RevokeShieldTokenError = RevokeShieldTokenErrors[keyof RevokeShieldTokenErrors];
+
+export type RevokeShieldTokenResponses = {
+    /**
+     * Token revoked
+     */
+    200: ShieldTokenResponse;
+};
+
+export type RevokeShieldTokenResponse = RevokeShieldTokenResponses[keyof RevokeShieldTokenResponses];
+
 export type ListAlertRulesData = {
     body?: never;
     path: {
@@ -75847,6 +76567,194 @@ export type UpdateProjectSettingsResponses = {
 };
 
 export type UpdateProjectSettingsResponse = UpdateProjectSettingsResponses[keyof UpdateProjectSettingsResponses];
+
+export type ListProjectShieldEntriesData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/shield/entries';
+};
+
+export type ListProjectShieldEntriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListProjectShieldEntriesError = ListProjectShieldEntriesErrors[keyof ListProjectShieldEntriesErrors];
+
+export type ListProjectShieldEntriesResponses = {
+    /**
+     * The project's entries, newest first
+     */
+    200: Array<ShieldEntryResponse>;
+};
+
+export type ListProjectShieldEntriesResponse = ListProjectShieldEntriesResponses[keyof ListProjectShieldEntriesResponses];
+
+export type CreateProjectShieldEntryData = {
+    body: CreateShieldEntryRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/shield/entries';
+};
+
+export type CreateProjectShieldEntryErrors = {
+    /**
+     * Invalid network, fingerprint, note or expiry
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * The project has the most entries it may hold
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateProjectShieldEntryError = CreateProjectShieldEntryErrors[keyof CreateProjectShieldEntryErrors];
+
+export type CreateProjectShieldEntryResponses = {
+    /**
+     * Entry added
+     */
+    201: ShieldEntryResponse;
+};
+
+export type CreateProjectShieldEntryResponse = CreateProjectShieldEntryResponses[keyof CreateProjectShieldEntryResponses];
+
+export type DeleteProjectShieldEntryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/shield/entries/{entry_id}';
+};
+
+export type DeleteProjectShieldEntryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found in this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteProjectShieldEntryError = DeleteProjectShieldEntryErrors[keyof DeleteProjectShieldEntryErrors];
+
+export type DeleteProjectShieldEntryResponses = {
+    /**
+     * Entry removed
+     */
+    204: void;
+};
+
+export type DeleteProjectShieldEntryResponse = DeleteProjectShieldEntryResponses[keyof DeleteProjectShieldEntryResponses];
+
+export type UpdateProjectShieldEntryData = {
+    body: UpdateShieldEntryRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/shield/entries/{entry_id}';
+};
+
+export type UpdateProjectShieldEntryErrors = {
+    /**
+     * Invalid note or expiry
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found in this project
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectShieldEntryError = UpdateProjectShieldEntryErrors[keyof UpdateProjectShieldEntryErrors];
+
+export type UpdateProjectShieldEntryResponses = {
+    /**
+     * Entry changed
+     */
+    200: ShieldEntryResponse;
+};
+
+export type UpdateProjectShieldEntryResponse = UpdateProjectShieldEntryResponses[keyof UpdateProjectShieldEntryResponses];
 
 export type ListSkillsData = {
     body?: never;
@@ -80549,6 +81457,373 @@ export type DeleteSecretResponses = {
 };
 
 export type DeleteSecretResponse = DeleteSecretResponses[keyof DeleteSecretResponses];
+
+export type GetShieldSettingsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/shield';
+};
+
+export type GetShieldSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetShieldSettingsError = GetShieldSettingsErrors[keyof GetShieldSettingsErrors];
+
+export type GetShieldSettingsResponses = {
+    /**
+     * Platform Shield settings
+     */
+    200: ShieldSettings;
+};
+
+export type GetShieldSettingsResponse = GetShieldSettingsResponses[keyof GetShieldSettingsResponses];
+
+export type UpdateShieldSettingsData = {
+    body: ShieldSettings;
+    path?: never;
+    query?: never;
+    url: '/settings/shield';
+};
+
+export type UpdateShieldSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateShieldSettingsError = UpdateShieldSettingsErrors[keyof UpdateShieldSettingsErrors];
+
+export type UpdateShieldSettingsResponses = {
+    /**
+     * Settings saved
+     */
+    200: ShieldSettings;
+};
+
+export type UpdateShieldSettingsResponse = UpdateShieldSettingsResponses[keyof UpdateShieldSettingsResponses];
+
+export type ListPlatformShieldEntriesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/settings/shield/entries';
+};
+
+export type ListPlatformShieldEntriesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListPlatformShieldEntriesError = ListPlatformShieldEntriesErrors[keyof ListPlatformShieldEntriesErrors];
+
+export type ListPlatformShieldEntriesResponses = {
+    /**
+     * Platform entries, newest first
+     */
+    200: Array<ShieldEntryResponse>;
+};
+
+export type ListPlatformShieldEntriesResponse = ListPlatformShieldEntriesResponses[keyof ListPlatformShieldEntriesResponses];
+
+export type CreatePlatformShieldEntryData = {
+    body: CreateShieldEntryRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/shield/entries';
+};
+
+export type CreatePlatformShieldEntryErrors = {
+    /**
+     * Invalid network, fingerprint, note or expiry
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * The platform has the most entries it may hold
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreatePlatformShieldEntryError = CreatePlatformShieldEntryErrors[keyof CreatePlatformShieldEntryErrors];
+
+export type CreatePlatformShieldEntryResponses = {
+    /**
+     * Entry added
+     */
+    201: ShieldEntryResponse;
+};
+
+export type CreatePlatformShieldEntryResponse = CreatePlatformShieldEntryResponses[keyof CreatePlatformShieldEntryResponses];
+
+export type DeletePlatformShieldEntryData = {
+    body?: never;
+    path: {
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/entries/{entry_id}';
+};
+
+export type DeletePlatformShieldEntryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeletePlatformShieldEntryError = DeletePlatformShieldEntryErrors[keyof DeletePlatformShieldEntryErrors];
+
+export type DeletePlatformShieldEntryResponses = {
+    /**
+     * Entry removed
+     */
+    204: void;
+};
+
+export type DeletePlatformShieldEntryResponse = DeletePlatformShieldEntryResponses[keyof DeletePlatformShieldEntryResponses];
+
+export type UpdatePlatformShieldEntryData = {
+    body: UpdateShieldEntryRequest;
+    path: {
+        /**
+         * Entry ID
+         */
+        entry_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/entries/{entry_id}';
+};
+
+export type UpdatePlatformShieldEntryErrors = {
+    /**
+     * Invalid note or expiry
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Entry not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdatePlatformShieldEntryError = UpdatePlatformShieldEntryErrors[keyof UpdatePlatformShieldEntryErrors];
+
+export type UpdatePlatformShieldEntryResponses = {
+    /**
+     * Entry changed
+     */
+    200: ShieldEntryResponse;
+};
+
+export type UpdatePlatformShieldEntryResponse = UpdatePlatformShieldEntryResponses[keyof UpdatePlatformShieldEntryResponses];
+
+export type ListShieldProposalsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Only proposals in this state; all of them when omitted.
+         */
+        status?: ShieldProposalStatus;
+        /**
+         * Only proposals whose address or fingerprint contains this text,
+         * ignoring case.
+         */
+        q?: string;
+        /**
+         * Page number, from 1 (the default).
+         */
+        page?: number;
+        /**
+         * Proposals per page: 25 by default, at most 100.
+         */
+        page_size?: number;
+    };
+    url: '/settings/shield/proposals';
+};
+
+export type ListShieldProposalsErrors = {
+    /**
+     * Search too long
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListShieldProposalsError = ListShieldProposalsErrors[keyof ListShieldProposalsErrors];
+
+export type ListShieldProposalsResponses = {
+    /**
+     * A page of proposals that have not expired, newest evidence first
+     */
+    200: ShieldProposalPage;
+};
+
+export type ListShieldProposalsResponse = ListShieldProposalsResponses[keyof ListShieldProposalsResponses];
+
+export type ApproveShieldProposalData = {
+    body?: never;
+    path: {
+        /**
+         * Proposal ID
+         */
+        proposal_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/proposals/{proposal_id}/approve';
+};
+
+export type ApproveShieldProposalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Proposal not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ApproveShieldProposalError = ApproveShieldProposalErrors[keyof ApproveShieldProposalErrors];
+
+export type ApproveShieldProposalResponses = {
+    /**
+     * Proposal approved
+     */
+    200: ShieldProposalResponse;
+};
+
+export type ApproveShieldProposalResponse = ApproveShieldProposalResponses[keyof ApproveShieldProposalResponses];
+
+export type RejectShieldProposalData = {
+    body?: never;
+    path: {
+        /**
+         * Proposal ID
+         */
+        proposal_id: number;
+    };
+    query?: never;
+    url: '/settings/shield/proposals/{proposal_id}/reject';
+};
+
+export type RejectShieldProposalErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Proposal not found or expired
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type RejectShieldProposalError = RejectShieldProposalErrors[keyof RejectShieldProposalErrors];
+
+export type RejectShieldProposalResponses = {
+    /**
+     * Proposal rejected
+     */
+    200: ShieldProposalResponse;
+};
+
+export type RejectShieldProposalResponse = RejectShieldProposalResponses[keyof RejectShieldProposalResponses];
 
 export type ListGlobalSkillsData = {
     body?: never;

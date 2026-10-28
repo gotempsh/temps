@@ -3325,6 +3325,7 @@ impl ProjectService {
             preset,
             directory,
             attack_mode,
+            shield_mode,
             enable_preview_environments,
             preview_envs_on_demand,
             preview_envs_idle_timeout_seconds,
@@ -3694,8 +3695,9 @@ impl ProjectService {
             txn.commit().await?;
         }
 
-        // Update attack_mode if provided
-        if let Some(attack_mode_value) = attack_mode {
+        // ADR 066: the Shield mode and the attack-mode column it replaces
+        // are written together for one release (`project_shield_write`).
+        if shield_mode.is_some() || attack_mode.is_some() {
             // Reload project to ensure we have the latest state
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -3704,10 +3706,20 @@ impl ProjectService {
                     "Project {} not found",
                     project_id
                 )))?;
-
-            let mut active_project: projects::ActiveModel = project.into();
-            active_project.attack_mode = Set(attack_mode_value);
-            active_project.update(self.db.as_ref()).await?;
+            let current = temps_shield::ShieldMode::effective(
+                None,
+                &project.shield_mode,
+                None,
+                project.attack_mode,
+            );
+            if let Some((mode, attack)) =
+                temps_environments::project_shield_write(shield_mode, attack_mode, current)
+            {
+                let mut active_project: projects::ActiveModel = project.into();
+                active_project.shield_mode = Set(mode.as_str().to_string());
+                active_project.attack_mode = Set(attack);
+                active_project.update(self.db.as_ref()).await?;
+            }
         }
 
         // Update AI feature toggles if provided (ADR-021 / ADR-023). These are
@@ -7036,6 +7048,7 @@ impl ProjectService {
             is_on_demand: false, // Deprecated field, default to false
             deployment_config: deployment_config.clone(),
             attack_mode: db_project.attack_mode,
+            shield_mode: db_project.shield_mode,
             ai_alert_summaries_enabled: db_project.ai_alert_summaries_enabled,
             ai_api_traffic_summary_enabled: db_project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: db_project.error_source_context_enabled,
@@ -9893,6 +9906,86 @@ mod tests {
                 assert_eq!(job.project_name, "Updated Test Project");
             }
             _ => panic!("Expected ProjectUpdated job"),
+        }
+    }
+
+    /// ADR 066 I10: a Shield mode is stored with the attack-mode column the
+    /// older consoles read, and a legacy attack-mode write maps onto a mode.
+    #[tokio::test]
+    async fn shield_mode_and_legacy_attack_mode_are_written_together() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Shield".to_string()),
+            slug: Set("shield-modes".to_string()),
+            repo_name: Set("shield-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("shield-dir".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::Nixpacks),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let stored = |id| {
+            let db = db.clone();
+            async move {
+                let row = projects::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                (row.shield_mode, row.attack_mode)
+            }
+        };
+        assert_eq!(stored(project.id).await, ("log".to_string(), false));
+
+        for (params, expected) in [
+            (
+                UpdateProjectSettingsParams {
+                    shield_mode: Some(temps_shield::ShieldMode::Attack),
+                    ..Default::default()
+                },
+                ("attack", true),
+            ),
+            (
+                UpdateProjectSettingsParams {
+                    shield_mode: Some(temps_shield::ShieldMode::Selective),
+                    ..Default::default()
+                },
+                ("selective", false),
+            ),
+            (
+                UpdateProjectSettingsParams {
+                    attack_mode: Some(true),
+                    ..Default::default()
+                },
+                ("attack", true),
+            ),
+            (
+                UpdateProjectSettingsParams {
+                    attack_mode: Some(false),
+                    ..Default::default()
+                },
+                ("log", false),
+            ),
+        ] {
+            let update = project_service
+                .update_project_settings(project.id, params)
+                .await
+                .expect("settings update succeeds");
+            assert_eq!(update.project.shield_mode, expected.0);
+            assert_eq!(update.project.attack_mode, expected.1);
+            assert_eq!(
+                stored(project.id).await,
+                (expected.0.to_string(), expected.1)
+            );
         }
     }
 
@@ -12799,7 +12892,7 @@ templates:
             "repo_name": "repo", "repo_owner": "owner", "directory": "/",
             "main_branch": "main", "preset": "nixpacks", "pull_only_root_directory": false,
             "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
-            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "ai_write_actions_enabled": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log", "ai_write_actions_enabled": false,
             "error_source_context_enabled": false, "vulnerability_scanning_enabled": false,
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,

@@ -20,14 +20,29 @@ describe('composeHomeSummary', () => {
     expect(summary.detail).toContain('control plane or any worker')
   })
 
-  test('a stack with a pending move names the node still running it', () => {
+  test('a pending move away from an unavailable node does not claim it runs there', () => {
     const summary = composeHomeSummary({
       pinned: true,
       home_node_name: 'worker-b',
       moving_from_node_id: 3,
       moving_from_node_name: 'worker-a',
+      moving_from_node_status: 'offline',
     })
-    expect(summary.title).toBe('Runs on worker-a, moving to worker-b')
+    expect(summary.title).toBe('Moving from worker-a (offline) to worker-b')
+    expect(summary.detail).toContain('running state is unknown')
+    expect(summary.detail).toContain('volumes are on worker-a')
+    expect(summary.detail).not.toContain('keeps running')
+  })
+
+  test('a pending move names its active source and its destination', () => {
+    const summary = composeHomeSummary({
+      pinned: true,
+      home_node_name: 'worker-b',
+      moving_from_node_id: 3,
+      moving_from_node_name: 'worker-a',
+      moving_from_node_status: 'active',
+    })
+    expect(summary.title).toBe('Moving from worker-a to worker-b')
     expect(summary.detail).toContain('next deployment starts it on worker-b')
     expect(summary.detail).toContain('data on worker-a stays there')
   })

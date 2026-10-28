@@ -459,6 +459,7 @@ export function SecuritySettings({
       </SettingsSection>
 
       <SettingsSection
+        id="ip-access"
         title="IP access control"
         description="Allow or block access by IP address and network range"
         icon={ListFilter}

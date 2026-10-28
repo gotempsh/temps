@@ -27,6 +27,7 @@ import {
   composeHomeSummary,
   composeMoveCandidates,
   composeMoveLosesData,
+  composeMoveSourceActive,
   composeRunningNodeId,
 } from '@/lib/compose-placement'
 import { cn } from '@/lib/utils'
@@ -44,6 +45,8 @@ interface ComposePlacementPanelProps {
   nodesLoaded: boolean
   /** Why the node list could not be loaded, if it could not. */
   nodesError?: Error | null
+  /** Load the node list again after it failed. */
+  onRetryNodes: () => void
 }
 
 /**
@@ -57,6 +60,7 @@ export function ComposePlacementPanel({
   nodes,
   nodesLoaded,
   nodesError,
+  onRetryNodes,
 }: ComposePlacementPanelProps) {
   const queryClient = useQueryClient()
   const [moveOpen, setMoveOpen] = useState(false)
@@ -117,8 +121,19 @@ export function ComposePlacementPanel({
           <AlertTriangle className="h-4 w-4" aria-hidden="true" />
           <AlertTitle>Could not load the cluster&apos;s nodes</AlertTitle>
           <AlertDescription>
-            The stack&apos;s placement is shown, but it cannot be moved until
-            the node list loads: {nodesError.toString()}
+            <p>
+              The stack&apos;s placement is shown, but it cannot be moved until
+              the node list loads: {nodesError.toString()}
+            </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-2"
+              onClick={onRetryNodes}
+            >
+              Try again
+            </Button>
           </AlertDescription>
         </Alert>
       )}
@@ -180,8 +195,11 @@ function homeOfflineExplanation(
   placement: ComposePlacementResponse,
   movePending: boolean
 ): string {
+  if (movePending && composeMoveSourceActive(placement)) {
+    return `The next deployment cannot start the stack there, and its volumes remain on ${placement.moving_from_node_name}. Bring ${placement.home_node_name} back online, or move the stack back to ${placement.moving_from_node_name} to cancel the move and keep its data.`
+  }
   if (movePending) {
-    return `The next deployment cannot start the stack there, so it keeps running on ${placement.moving_from_node_name} with its volumes. Bring ${placement.home_node_name} back online, or move the stack back to ${placement.moving_from_node_name} to cancel the move and keep its data.`
+    return `The next deployment cannot start the stack there, and its volumes are on ${placement.moving_from_node_name}, which is ${placement.moving_from_node_status ?? 'unavailable'}, so its running state is unknown. Bring either node back online: ${placement.moving_from_node_name} to cancel the move and keep its data, or ${placement.home_node_name} to complete it with empty volumes.`
   }
   return 'Deployments of this stack fail until it is back, because its volumes are on it. Temps never moves a Compose stack on its own; bring the node back online, or move the stack (its data stays behind).'
 }
@@ -327,8 +345,14 @@ function composeMoveDescription(
   if (!placement.pinned) {
     return 'It has not run yet. Choose where its first deployment goes.'
   }
+  if (
+    placement.moving_from_node_id != null &&
+    composeMoveSourceActive(placement)
+  ) {
+    return `Its volumes remain on ${runningNodeName}. The next deployment starts it on ${placement.home_node_name} with empty volumes. Choose ${runningNodeName} to cancel the move and keep its data, or another node to start it there with empty volumes.`
+  }
   if (placement.moving_from_node_id != null) {
-    return `It still runs on ${runningNodeName}, with its volumes, until the next deployment moves it to ${placement.home_node_name}. Choose ${runningNodeName} to cancel the move and keep its data, or another node to start it there with empty volumes.`
+    return `Its volumes are on ${runningNodeName}, which is ${placement.moving_from_node_status ?? 'unavailable'}, so the move cannot be cancelled until that node is back. The next deployment starts it on ${placement.home_node_name} with empty volumes; choose another node to start it there instead.`
   }
   return `It runs on ${placement.home_node_name} and keeps its volumes there. On the next deployment Temps stops it there and starts it on the node you choose with empty volumes.`
 }

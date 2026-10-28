@@ -30,6 +30,7 @@ mod runtime_health;
 pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
+pub mod shield;
 pub mod tailnet_identity;
 pub mod tailscale_api;
 pub mod tailscale_serve;

@@ -79,6 +79,12 @@ impl ShieldLists {
         self.index.load().revision()
     }
 
+    /// The loaded index, for [`temps_shield::ShieldEngine::decide`].
+    /// Lock-free.
+    pub fn index(&self) -> arc_swap::Guard<Arc<Index>> {
+        self.index.load()
+    }
+
     /// Start polling `shield_snapshots` on `handle`'s runtime.
     pub fn spawn_loader(
         self: &Arc<Self>,
@@ -198,6 +204,7 @@ mod tests {
                 Some(3600),
                 network,
             )],
+            ..ShieldSnapshot::default()
         }
     }
 

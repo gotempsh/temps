@@ -116,6 +116,8 @@ function makeMeshNode(overrides: Partial<WireguardMeshNodeStatus> = {}): Wiregua
 function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): WireguardMeshStatusResponse {
   return {
     state: 'disabled',
+    ca_rotation_required: false,
+    pool_cidr: '10.201.0.0/16',
     reason: null,
     cidr: null,
     listen_port: 51820,

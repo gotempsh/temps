@@ -15,12 +15,24 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { Textarea } from '@/components/ui/textarea'
 import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
 import { ComposePlacementPanel } from './ComposePlacementPanel'
 import { projectHasGitRepo } from '@/lib/project-git'
+import {
+  environmentShieldModeToPayload,
+  environmentShieldModeToSelect,
+  exemptPathsToText,
+  parseExemptPathsText,
+  SHIELD_MODES,
+  shieldModeDescription,
+  shieldModeLabel,
+  validateExemptPaths,
+  type EnvironmentShieldModeSelect,
+} from '@/lib/shield'
 import { nodeSchedulingRole, targetNodesHint } from '@/lib/node-role'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
 import {
@@ -78,35 +90,6 @@ interface SecurityConfig {
   }
 }
 
-/** Select value for the tri-state environment attack-mode override. */
-type AttackModeSelect = 'inherit' | 'on' | 'off'
-
-/**
- * Map the environment's nullable `attack_mode` to the select value.
- * `null`/`undefined` → "inherit" (use the project setting); `true` → "on";
- * `false` → "off". Keeping these distinct is what lets an environment opt out
- * of (or into) attack mode independently of the project default.
- */
-function attackModeToSelect(
-  value: boolean | null | undefined
-): AttackModeSelect {
-  if (value === true) return 'on'
-  if (value === false) return 'off'
-  return 'inherit'
-}
-
-/**
- * Map the select value back to the API payload. "inherit" sends `null` so the
- * column is cleared and the project setting applies; "on"/"off" send the
- * explicit override. Sending `false` for "off" is intentional — it forces
- * attack mode off even when the project has it on.
- */
-function attackModeToPayload(value: AttackModeSelect): boolean | null {
-  if (value === 'on') return true
-  if (value === 'off') return false
-  return null
-}
-
 /** Select value for the tri-state environment HTTP→HTTPS redirect override. */
 type ForceHttpsSelect = 'inherit' | 'always' | 'never'
 
@@ -157,10 +140,10 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.memoryRequest?.toString() ?? '',
     memory_limit: environment.deployment_config?.memoryLimit?.toString() ?? '',
     replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-    // Tri-state attack mode: 'inherit' (null → use the project setting),
-    // 'on' (true → force on) or 'off' (false → force off). Map the nullable
-    // boolean from the API to the select value.
-    attack_mode: attackModeToSelect(environment.attack_mode),
+    // Shield mode: 'inherit' (null → the project's mode) or a mode of its
+    // own. The API still writes the legacy attack_mode column to match.
+    shield_mode: environmentShieldModeToSelect(environment.shield_mode),
+    shield_exempt_paths: exemptPathsToText(environment.shield_exempt_paths),
     force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
@@ -233,7 +216,8 @@ export function EnvironmentConfigurationCard({
       memory_limit:
         environment.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-      attack_mode: attackModeToSelect(environment.attack_mode),
+      shield_mode: environmentShieldModeToSelect(environment.shield_mode),
+      shield_exempt_paths: exemptPathsToText(environment.shield_exempt_paths),
       force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
@@ -305,8 +289,15 @@ export function EnvironmentConfigurationCard({
     },
   })
 
+  const [exemptPathsError, setExemptPathsError] = useState<string | null>(null)
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+
+    const exemptPaths = parseExemptPathsText(formData.shield_exempt_paths)
+    const exemptProblem = validateExemptPaths(exemptPaths)
+    setExemptPathsError(exemptProblem)
+    if (exemptProblem) return
 
     updateEnvironmentSettings.mutateAsync({
       path: {
@@ -333,8 +324,9 @@ export function EnvironmentConfigurationCard({
         // the rest of this form never clobbers that override.
         protected: formData.protected,
         automatic_deploy: formData.automatic_deploy,
-        // Tri-state: null clears the override (inherit project), true/false force it.
-        attack_mode: attackModeToPayload(formData.attack_mode),
+        // null clears the override so the environment follows the project.
+        shield_mode: environmentShieldModeToPayload(formData.shield_mode),
+        shield_exempt_paths: exemptPaths,
         // Tri-state: null clears the override (inherit the proxy's
         // certificate-driven default), true/false force it.
         force_https: forceHttpsToPayload(formData.force_https),
@@ -392,6 +384,7 @@ export function EnvironmentConfigurationCard({
       nodes={activeNodes}
       nodesLoaded={nodesQuery.isSuccess}
       nodesError={nodesQuery.error}
+      onRetryNodes={() => void nodesQuery.refetch()}
     />
   )
 
@@ -1099,35 +1092,83 @@ export function EnvironmentConfigurationCard({
         {/* Security Configuration */}
         <SettingsSection title="Security" icon={Shield}>
           <div className="space-y-4">
-            <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
-              <div className="flex-1 min-w-0">
-                <Label className="text-sm font-medium">Attack Mode</Label>
-                <p className="text-xs text-muted-foreground">
-                  Require a CAPTCHA challenge for visitors. Inherit uses the
-                  service default (currently{' '}
-                  {project.attack_mode ? 'on' : 'off'}).
+            <div className="space-y-3 p-3 border rounded-lg">
+              <div className="flex items-start sm:items-center gap-3">
+                <div className="flex-1 min-w-0">
+                  <Label
+                    htmlFor="env-shield-mode"
+                    className="text-sm font-medium"
+                  >
+                    Shield mode
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    {formData.shield_mode === 'inherit'
+                      ? `Follows the service, currently ${shieldModeLabel(project.shield_mode).toLowerCase()}: ${shieldModeDescription(project.shield_mode)}`
+                      : shieldModeDescription(formData.shield_mode)}
+                  </p>
+                </div>
+                <Select
+                  value={formData.shield_mode}
+                  onValueChange={(value) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      shield_mode: value as EnvironmentShieldModeSelect,
+                    }))
+                  }
+                >
+                  <SelectTrigger
+                    id="env-shield-mode"
+                    className="w-full sm:w-[180px]"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="inherit">
+                      Inherit ({shieldModeLabel(project.shield_mode)})
+                    </SelectItem>
+                    {SHIELD_MODES.map((mode) => (
+                      <SelectItem key={mode.value} value={mode.value}>
+                        {mode.label}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label
+                  htmlFor="env-shield-exempt-paths"
+                  className="text-sm font-medium"
+                >
+                  Paths never challenged
+                </Label>
+                <Textarea
+                  id="env-shield-exempt-paths"
+                  value={formData.shield_exempt_paths}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      shield_exempt_paths: e.target.value,
+                    }))
+                  }
+                  rows={3}
+                  spellCheck={false}
+                  className="font-mono text-xs"
+                  placeholder={'/api/*\n/webhooks/incoming'}
+                  aria-invalid={exemptPathsError ? 'true' : undefined}
+                  aria-describedby="env-shield-exempt-paths-help"
+                />
+                <p
+                  id="env-shield-exempt-paths-help"
+                  className={
+                    exemptPathsError
+                      ? 'text-xs text-destructive'
+                      : 'text-xs text-muted-foreground'
+                  }
+                >
+                  {exemptPathsError ??
+                    'One path per line; a trailing /* covers everything below it. Requests to these paths are never challenged.'}
                 </p>
               </div>
-              <Select
-                value={formData.attack_mode}
-                onValueChange={(value) =>
-                  setFormData((prev) => ({
-                    ...prev,
-                    attack_mode: value as AttackModeSelect,
-                  }))
-                }
-              >
-                <SelectTrigger className="w-full sm:w-[180px]">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="inherit">
-                    Inherit ({project.attack_mode ? 'on' : 'off'})
-                  </SelectItem>
-                  <SelectItem value="on">On</SelectItem>
-                  <SelectItem value="off">Off</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
 
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">

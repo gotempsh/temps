@@ -9,4 +9,5 @@ pub mod password_wall;
 pub mod preview_wall;
 pub mod project_ip_access;
 pub mod proxy_logs;
+pub mod shield;
 pub mod types;

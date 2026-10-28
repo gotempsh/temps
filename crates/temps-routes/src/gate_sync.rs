@@ -70,6 +70,7 @@ async fn node_serves_address(
         state.db.as_ref(),
         &state.peer_table,
         !state.request_policy_gate.supports_worker_ingress(),
+        crate::route_sync::request_declares(headers, temps_core::worker_shield::SHIELD_CAPABILITY),
     )
     .await
     .map_err(|(operation, source)| internal(operation, source))?;

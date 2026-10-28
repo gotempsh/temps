@@ -6,8 +6,9 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Whether published container ports may bind to `address`: loopback, or a
-/// private address (see [`is_private_node_address`]). No public interface
-/// answers on either, so ports bound there never bypass the Temps proxy.
+/// private address (see [`is_private_node_address`]). This prevents binding to
+/// a public interface; it is not an access-control check. Private-underlay
+/// deployments rely on the operator restricting access to that network.
 pub fn is_private_publish_address(address: IpAddr) -> bool {
     address.is_loopback()
         || match address {

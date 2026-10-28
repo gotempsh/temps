@@ -14,10 +14,19 @@ import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useOpenSectionFromHash } from '@/hooks/useOpenSectionFromHash'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, LockKeyhole, Loader2, Network, Save } from 'lucide-react'
+import {
+  AlertCircle,
+  LockKeyhole,
+  Loader2,
+  Network,
+  Save,
+  Shield,
+} from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -43,10 +52,13 @@ function parseNetworkLines(text: string): string[] {
     .filter((entry) => entry.length > 0)
 }
 
+const LINKED_SECTIONS = ['shield'] as const
+
 export function SecurityPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
+  useOpenSectionFromHash(LINKED_SECTIONS, !isLoading && !error)
 
   const {
     register,
@@ -180,6 +192,15 @@ export function SecurityPage() {
         icon={LockKeyhole}
       >
         <AdminGateCard />
+      </SettingsSection>
+      {/* Outside the form below: Shield settings save as they change. */}
+      <SettingsSection
+        id="shield"
+        title="Shield"
+        description="Blocklists, exploit probes and learned attackers, for every service"
+        icon={Shield}
+      >
+        <ShieldPlatformSettings />
       </SettingsSection>
       <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
         <SettingsSection

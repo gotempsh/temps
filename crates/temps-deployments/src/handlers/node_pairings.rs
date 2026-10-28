@@ -147,6 +147,7 @@ pub(crate) fn problem(error: MeshError) -> Problem {
         MeshError::Corrupt { .. }
         | MeshError::Database(_)
         | MeshError::InvalidCidr { .. }
+        | MeshError::CaPredatesCertificateHistory { .. }
         | MeshError::OverlapsComputePool { .. }
         | MeshError::InvalidPort(_)
         | MeshError::PortClashesWithVxlan(_)

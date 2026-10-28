@@ -18370,6 +18370,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
         }
@@ -22724,6 +22726,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,

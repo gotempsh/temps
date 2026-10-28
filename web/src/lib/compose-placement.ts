@@ -7,6 +7,18 @@ export interface ComposeHomeFields {
   home_node_name?: string | null
   moving_from_node_id?: number | null
   moving_from_node_name?: string | null
+  moving_from_node_status?: string | null
+}
+
+/**
+ * Whether the source node is active and can be selected to cancel a move.
+ * Volumes stay there regardless of status, but an inactive node cannot be
+ * selected as a move target.
+ */
+export function composeMoveSourceActive(placement: {
+  moving_from_node_status?: string | null
+}): boolean {
+  return placement.moving_from_node_status === 'active'
 }
 
 /** The fields of `ComposePlacementResponse` a move reads. */
@@ -84,11 +96,18 @@ export function composeHomeSummary(placement: ComposeHomeFields): {
     }
   }
   if (placement.moving_from_node_id != null) {
-    const running = placement.moving_from_node_name ?? 'an unknown node'
+    const source = placement.moving_from_node_name ?? 'an unknown node'
     const destination = placement.home_node_name ?? 'an unknown node'
+    if (!composeMoveSourceActive(placement)) {
+      const state = placement.moving_from_node_status ?? 'unavailable'
+      return {
+        title: `Moving from ${source} (${state}) to ${destination}`,
+        detail: `Its volumes are on ${source}, which is ${state}, so its running state is unknown. The next deployment starts it on ${destination} with empty volumes; the data on ${source} stays there.`,
+      }
+    }
     return {
-      title: `Runs on ${running}, moving to ${destination}`,
-      detail: `It keeps running on ${running}, with its volumes, until the next deployment starts it on ${destination} with empty volumes. The data on ${running} stays there.`,
+      title: `Moving from ${source} to ${destination}`,
+      detail: `Its volumes are on ${source}. The next deployment starts it on ${destination} with empty volumes. The data on ${source} stays there.`,
     }
   }
   return {

@@ -13,6 +13,7 @@ import { EnvironmentSettingsContent } from '@/components/environments/Environmen
 import { EnvironmentNavigation } from '@/components/environments/EnvironmentNavigation'
 import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
 import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
+import { EnvironmentShieldView } from '@/components/environments/shield/EnvironmentShieldView'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
@@ -119,6 +120,12 @@ export function EnvironmentDashboard({
               project={project}
               environmentId={environmentId.toString()}
               onDelete={onDelete}
+            />
+          ) : activeView === 'shield' ? (
+            <EnvironmentShieldView
+              project={project}
+              environment={environment}
+              onOpenSettings={() => handleViewChange('settings')}
             />
           ) : isStatic ? (
             <div className="flex flex-col items-center justify-center h-72 rounded-lg border border-neutral-950/10 bg-neutral-50 p-6 text-center dark:border-white/10 dark:bg-white/5">

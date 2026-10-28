@@ -86,6 +86,10 @@ fn mesh_problem(error: WireguardMeshError) -> Problem {
         MeshError::InUse { .. } => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Settings In Use")
             .with_detail(error.to_string()),
+        // Not the request's fault: the stored CA must be rotated first.
+        MeshError::CaPredatesCertificateHistory { .. } => problemdetails::new(StatusCode::CONFLICT)
+            .with_title("Rotate The Cluster CA First")
+            .with_detail(error.to_string()),
         MeshError::Disabled => problemdetails::new(StatusCode::CONFLICT)
             .with_title("WireGuard Mesh Off")
             .with_detail("Turn the WireGuard mesh on before choosing a hub."),
@@ -608,6 +612,12 @@ mod tests {
     fn set_hub_errors_map_to_conflict_or_not_found() {
         assert_eq!(problem_status(MeshError::Disabled), StatusCode::CONFLICT);
         assert_eq!(
+            problem_status(MeshError::CaPredatesCertificateHistory {
+                pool: "10.201.0.0/16".parse().unwrap(),
+            }),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
             problem_status(MeshError::NotOnMesh("worker-1".into())),
             StatusCode::CONFLICT
         );
@@ -775,10 +785,14 @@ mod tests {
     #[tokio::test]
     async fn status_onboards_while_the_mesh_is_off() {
         let db = mock_db()
-            // load_settings, published_control_plane, configured_port
+            // load_settings, published_control_plane, configured_port,
+            // configured_pool
             .append_query_results(vec![vec![network_config(false, false)]])
             .append_query_results(vec![vec![network_config(false, false)]])
             .append_query_results(vec![vec![network_config(false, false)]])
+            .append_query_results(vec![vec![network_config(false, false)]])
+            // no cluster CA yet, so nothing to rotate
+            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
             // the nodes
             .append_query_results(vec![vec![worker()]])
             .into_connection();
@@ -797,6 +811,11 @@ mod tests {
         assert_eq!(body["join_url"], "https://cp.example.com");
         assert_eq!(body["enable_command"], ENABLE_MESH_COMMAND);
         assert_eq!(body["can_enable"], cfg!(target_os = "linux"));
+        assert_eq!(
+            body["pool_cidr"],
+            network_config(false, false).wireguard_cidr
+        );
+        assert_eq!(body["ca_rotation_required"], false);
         assert!(body["reason"]
             .as_str()
             .unwrap()
@@ -806,6 +825,40 @@ mod tests {
         assert_eq!(body["nodes"][0]["checks"], serde_json::json!([]));
         assert_eq!(body["links"], serde_json::json!([]));
         assert!(body["hub"].is_null());
+    }
+
+    /// A CA older than certificate address history blocks every pool, so the
+    /// status says so up front instead of letting the enable call fail.
+    #[tokio::test]
+    async fn status_asks_for_a_ca_rotation_when_the_ca_predates_history() {
+        let ca = temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({"multi_node": {"cluster_ca_cert_pem": "old-ca"}}),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = mock_db()
+            .append_query_results(vec![vec![network_config(false, false)]])
+            .append_query_results(vec![vec![network_config(false, false)]])
+            .append_query_results(vec![vec![network_config(false, false)]])
+            .append_query_results(vec![vec![network_config(false, false)]])
+            .append_query_results(vec![vec![ca]])
+            // no cluster_certificate_history row for it
+            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results(vec![vec![worker()]])
+            .into_connection();
+        let app = app(db, allow(), Arc::new(RecordingAuditLogger::default()));
+        let (status, _, body) = send(
+            app,
+            "GET",
+            "/nodes/wireguard",
+            None,
+            Some(settings_reader()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ca_rotation_required"], true);
+        assert_eq!(body["can_enable"], false);
     }
 
     #[tokio::test]

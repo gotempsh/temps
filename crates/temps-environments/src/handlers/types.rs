@@ -8,6 +8,7 @@ use temps_core::{
     AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
 };
 use temps_entities::deployment_config::DeploymentConfig;
+use temps_shield::ShieldMode;
 use utoipa::ToSchema;
 
 use crate::services::env_var_service::EnvVarService;
@@ -175,6 +176,14 @@ pub struct EnvironmentResponse {
     /// explicitly enable/disable the challenge for this environment. Always
     /// serialized (NOT skipped) so the UI can distinguish `null` from `false`.
     pub attack_mode: Option<bool>,
+    /// This environment's Shield mode (ADR 066 D1). `null` inherits the
+    /// project's. Always serialized so the UI can tell `null` from a value.
+    #[schema(required = true, nullable = true)]
+    pub shield_mode: Option<ShieldMode>,
+    /// Paths Shield never challenges in this environment (ADR 066 D7):
+    /// `/api/*` exempts everything under `/api/`, any other entry one exact
+    /// path.
+    pub shield_exempt_paths: Vec<String>,
     /// Per-environment HTTP→HTTPS redirect override.
     /// `null` means inherit the proxy default (redirect only when the host has
     /// an active TLS certificate); `true` always redirects plain HTTP for this
@@ -226,6 +235,8 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             protected: env.protected,
             sleeping: env.sleeping,
             attack_mode: env.attack_mode,
+            shield_mode: stored_shield_mode(env.shield_mode.as_deref()),
+            shield_exempt_paths: env.shield_exempt_paths.0,
             force_https: env.force_https,
             last_activity_at,
             estimated_sleep_at,
@@ -377,6 +388,24 @@ where
     }
 }
 
+fn deserialize_optional_optional_shield_mode<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<ShieldMode>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Same present-`null` contract as the helpers above: `null` makes the
+    // environment inherit the project's mode.
+    Option::<ShieldMode>::deserialize(deserializer).map(Some)
+}
+
+/// The mode an environment row stores, `None` when it inherits. The column
+/// has a CHECK constraint, so an unknown value only means a newer binary
+/// wrote it; it reads as inherit rather than failing the response.
+pub fn stored_shield_mode(value: Option<&str>) -> Option<ShieldMode> {
+    value.and_then(ShieldMode::parse)
+}
+
 fn deserialize_optional_optional_health<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<temps_core::repo_config::HealthCheckConfig>>, D::Error>
@@ -477,8 +506,31 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// - absent → leave the current override unchanged
     /// - JSON `null` → clear the override (inherit the project-level setting)
     /// - `true`/`false` → override the project setting for this environment
+    ///
+    /// Kept for consoles that predate Shield modes: `true` sets the Shield
+    /// mode to `attack`, `false` leaves attack, `null` inherits both. When
+    /// `shield_mode` is also sent, `shield_mode` wins.
     #[serde(default, deserialize_with = "deserialize_optional_optional_bool")]
     pub attack_mode: Option<Option<bool>>,
+    /// This environment's Shield mode (ADR 066 D1), tri-state:
+    /// - absent → leave it unchanged
+    /// - JSON `null` → inherit the project's mode (and its attack mode)
+    /// - `off`, `log`, `selective` or `attack` → use this mode here
+    ///
+    /// `attack_mode` is written to match for one release, so older consoles
+    /// keep reading the right value.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_shield_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[schema(value_type = Option<ShieldMode>)]
+    pub shield_mode: Option<Option<ShieldMode>>,
+    /// Paths Shield never challenges here (ADR 066 D7), replacing the stored
+    /// list: `/api/*` exempts everything under `/api/`, anything else one
+    /// exact path; at most 64. Omit to leave them unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shield_exempt_paths: Option<Vec<String>>,
     /// Per-environment HTTP→HTTPS redirect override (tri-state):
     /// - absent → leave the current override unchanged
     /// - JSON `null` → clear the override (inherit the proxy default, which
@@ -703,6 +755,30 @@ mod tests {
     /// can leave it unchanged (absent), clear it to inherit the project setting
     /// (JSON `null`), or override it (true/false). Each JSON state must map to a
     /// distinct value, mirroring the resource fields above.
+    /// `shield_mode` has the same tri-state shape: absent leaves it, `null`
+    /// inherits the project's, a name sets it, anything else is refused.
+    #[test]
+    fn shield_mode_distinguishes_absent_null_and_value() {
+        let absent: UpdateEnvironmentSettingsRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.shield_mode, None);
+        assert_eq!(absent.shield_exempt_paths, None);
+        let inherit: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"shield_mode":null}"#).unwrap();
+        assert_eq!(inherit.shield_mode, Some(None));
+        let selective: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"shield_mode":"selective","shield_exempt_paths":["/api/*"]}"#)
+                .unwrap();
+        assert_eq!(selective.shield_mode, Some(Some(ShieldMode::Selective)));
+        assert_eq!(
+            selective.shield_exempt_paths,
+            Some(vec!["/api/*".to_string()])
+        );
+        assert!(serde_json::from_str::<UpdateEnvironmentSettingsRequest>(
+            r#"{"shield_mode":"loud"}"#
+        )
+        .is_err());
+    }
+
     #[test]
     fn attack_mode_distinguishes_absent_null_and_value() {
         // Field absent → None (leave unchanged)

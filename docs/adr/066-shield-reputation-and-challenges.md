@@ -7,7 +7,9 @@ Phase 2 (reputation lists in `log` mode) shipped on 2026-10-26, with a
 correction to what D2 said about the lists' terms. Phase 3 (JA4) is being
 implemented in the order its entry in Phases gives: the parser, the
 control plane for direct, Cloudflare and Bunny clients, the local proxy
-header and workers are done; the later phases are proposed. File and line references are to
+header and workers are done. Phases 4 to 8 are being implemented together;
+the questions they settle are recorded under "Settled while implementing
+phases 4 to 8". File and line references are to
 `main` at 41dcd5c, before phase 1, and to pingora-core 0.9.0 and the vendored
 OpenSSL 3.6.2 it builds with.
 
@@ -436,17 +438,27 @@ when the address is also listed. Request bodies are not read in this ADR.
 ### D9. The fleet learns from every ingress
 
 Every decision other than `pass` is an event (D11). Every 30 seconds the
-control plane promotes:
+control plane proposes:
 
-| Evidence in the last hour | Promoted | For |
+| Evidence in the last hour | Proposed | For |
 |---|---|---|
 | 1 or more exploit hits from an address | address → `block` | 7 days |
 | 3 or more failed or abandoned challenges from an address | address → `challenge` | 24 hours |
 | One JA4 with exploit hits from 20 or more addresses, not on the browser list | fingerprint → `challenge` | 24 hours |
 
-An address that probes `/.env` on one ingress is blocked on all of them
-within about a minute. Only addresses, fingerprints and reasons cross
-tenants; paths and hosts stay with the environment that saw them.
+A proposal applies only once an instance admin approves it (Settings →
+Shield proposals, or `POST /settings/shield/proposals/{id}/approve`);
+nothing learned blocks anyone by default. Once approved, an address that
+probed `/.env` on one ingress is blocked on all of them within about a
+minute, until the proposal expires. A rejection is kept until then too, so
+the same evidence does not propose it again; new evidence on a pending
+proposal can raise `challenge` to `block`, never the other way, and a
+decided one keeps its verdict and reason. An expired row starts over as
+pending. Only addresses, fingerprints and reasons cross tenants; paths and
+hosts stay with the environment that saw them.
+
+Applying proposals automatically, for the rules that earn the trust, is
+left for later: the review data is what that decision needs.
 
 ### D10. Workers run Shield too
 
@@ -546,7 +558,9 @@ Migration `mYYYYMMDD_000001_create_shield.rs`:
 - `shield_operator_entries (id, scope, project_id NULL, network CIDR or
   ja4 TEXT, verdict, note, created_by, created_at, expires_at NULL)`.
 - `shield_observed (subject TEXT, kind ip|ja4, verdict, reason,
-  first_seen, last_seen, hits, expires_at)`, unique on `(kind, subject)`.
+  first_seen, last_seen, hits, expires_at, status pending|approved|rejected,
+  decided_at, decided_by)`, unique on `(kind, subject)`. Only `approved`
+  rows reach the snapshot.
 - `shield_snapshots (revision BIGSERIAL, created_at, sha256, body BYTEA,
   sources_updated_at)`, zstd-compressed, keep the last 10 (phase 2).
   `sources_updated_at` is the newest source change a revision was built
@@ -872,7 +886,7 @@ which every control plane registers:
 | Task | Every | Does |
 |---|---|---|
 | fetch sources | 1 h | Download feeds with ETag; CrowdSec if enrolled. Each source is claimed by the `UPDATE` that stamps `last_attempt_at`, so no lock is held across a download. A document that is mostly not networks, or a network broader than /8 (IPv6 /16) on a list that acts, is refused and the last good copy kept |
-| promote | 30 s | Query the last hour of `shield_events`, upsert `shield_observed`, expire old rows |
+| promote | 30 s | Query the last hour of `shield_events`, upsert `shield_observed` as proposals, expire old rows |
 | compile | on change, and daily | Build and store a new snapshot revision when a source changed since the newest one; daily so lists dated by their fetch stay fresh. Bump the route generation (phase 5) |
 | prune | hourly | Expired observed rows, old snapshots; `challenge_sessions` until it is dropped |
 
@@ -1032,6 +1046,43 @@ which every control plane registers:
 7. **Fleet learning** (D9) for addresses, then fingerprints.
 8. **netwatch exchange** (D12).
 
+### Settled while implementing phases 4 to 8
+
+- **Default mode.** New projects default to `log`. `selective` is a choice
+  the Shield card offers with the "would have" counts beside it.
+- **Plain HTTP.** A `challenge` outcome over plain HTTP answers `426` with
+  `Upgrade: TLS/1.2, HTTP/1.1` instead of a page: the clearance cookie is
+  `__Host-` and needs TLS, so a page served over HTTP could never clear
+  the visitor. A `block` answers `403` over either.
+- **IPv6 binding.** The identity binds to the /64.
+- **Budget.** 3,000 requests per hour per clearance on each ingress,
+  counting every request, as in phase 1.
+- **What each exemption skips.** A bypass token skips blocks and
+  challenges; an exempt path, a clearance and a verified crawler skip only
+  challenges. A `block` verdict is never cleared by solving.
+- **Sharing.** `AppSettings.shield.share_observations` (on by default)
+  turns proposals, and approved ones applying, off for the whole plane. Receiving others' observations is
+  not separable from sharing within one plane, so there is no second switch.
+- **Workers' policy.** Per-environment policy (mode, exempt paths, bypass
+  token hashes) rides in the route data workers already receive, not in the
+  snapshot as I3's sketch had it: it changes with the routes, and the
+  snapshot stays the same for every environment.
+- **Identity.** Clearances bind to JA4 when one is known, so a visitor
+  cleared before phase 4 is challenged once more after the upgrade.
+- **Response header.** `X-Temps-Shield` is sent only on a response Shield
+  wrote: `block` on a `403`, `challenge` on a challenge page, a `429` or a
+  `426`, and `error` on a `503` when no challenge could be issued. A
+  request Shield let through carries no header, whatever its verdict.
+- **netwatch.** Each node turns the exchange on for itself with
+  `TEMPS_NETWATCH=1` (`TEMPS_NETWATCH_URL`, `TEMPS_NETWATCH_TOKEN` and
+  `TEMPS_NETWATCH_SOCKET` override the defaults), not with a platform
+  setting, since netwatch runs per host. The bans load as the node's local
+  list; request lines go to netwatch's Unix datagram socket, one versioned
+  JSON object each, for requests to environments whose mode is not `off`.
+- **Signatures.** The table lives in the `temps-signatures` crate, with no
+  dependencies, so netwatch can depend on it too. Recon and secret probes
+  log unless the address is also listed at `challenge` or above, as D8 says.
+
 ## Later
 
 Left out of this ADR on purpose, to be proposed separately once Shield is in
@@ -1051,15 +1102,6 @@ use:
   the source in a reason (`spamhaus_drop (…)`) in the console and in Shield
   lookups within that, or should temps ask Spamhaus? A redistribution
   licence would also let workers and air-gapped installs carry DROP.
-- Should new projects default to `log` or `selective`?
-- Can `selective` challenge plain HTTP, now that identity no longer needs
-  TLS, or should it redirect to HTTPS first?
-- IPv6 binding: /64 or /56?
-- May an operator opt out of sharing observations with the fleet, or of
-  receiving others'?
-- Default request budget per clearance: 3,000 per hour on each ingress in
-  phase 1, counting every request; per-environment from its traffic, or
-  counting only page loads once D7 lands?
 - Do we want JA4H later, under a FoxIO licence?
 - Trust CloudFront like Cloudflare and Bunny: its address ranges,
   `CloudFront-Viewer-Address` for the client address, and its JA4 header?

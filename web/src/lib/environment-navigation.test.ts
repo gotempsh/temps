@@ -19,6 +19,7 @@ describe('environment navigation', () => {
 
   test('only accepts known environment views', () => {
     expect(resolveEnvironmentView('settings')).toBe('settings')
+    expect(resolveEnvironmentView('shield')).toBe('shield')
     expect(resolveEnvironmentView('containers')).toBe('containers')
     expect(resolveEnvironmentView('unknown')).toBe('containers')
   })
@@ -50,5 +51,26 @@ describe('environment navigation', () => {
     const next = updateEnvironmentSearchParams(current, { environmentId: 9 })
 
     expect(next.toString()).toBe('environment=9&view=settings')
+  })
+
+  test('keeps the Shield view in the URL', () => {
+    const next = updateEnvironmentSearchParams(new URLSearchParams(), {
+      view: 'shield',
+    })
+
+    expect(next.toString()).toBe('view=shield')
+  })
+
+  test('leaving the Shield tab or its environment closes the events list', () => {
+    const current = new URLSearchParams(
+      'environment=7&view=shield&shield=events&kind=verdict&verdict=block&ip=203.0.113.7'
+    )
+
+    expect(
+      updateEnvironmentSearchParams(current, { environmentId: 9 }).toString()
+    ).toBe('environment=9&view=shield')
+    expect(
+      updateEnvironmentSearchParams(current, { view: 'metrics' }).toString()
+    ).toBe('environment=7&view=metrics')
   })
 })

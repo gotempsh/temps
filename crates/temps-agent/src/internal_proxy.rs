@@ -84,7 +84,7 @@ pub(crate) struct PublicPeer(pub SocketAddr);
 
 /// The visitor's TLS fingerprint (ADR 066, D4): computed by the public
 /// HTTPS listener, or taken from a tunnel connector's header over
-/// loopback. Logged at `debug` until Shield runs on workers (phase 5).
+/// loopback. Shield reads it for the visitor identity and its JA4 lists.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PublicClientFingerprint(pub temps_shield::ja4::ClientFingerprint);
 
@@ -725,14 +725,36 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
         if let Some(recorder) = req.extensions().get::<RequestRecorder>() {
             recorder.mark_project();
         }
-        if let Some(PublicClientFingerprint(fingerprint)) = req.extensions().get() {
-            debug!(
-                host = %host,
-                ja4 = fingerprint.ja4.as_ref().map(|ja4| ja4.as_str()),
-                ja4_source = fingerprint.source.as_str(),
-                "public request"
-            );
-        }
+        // Shield (ADR 066, D10, I5): before the sign-in gate and anything
+        // else, with the visitor the listener resolved. A host without
+        // Shield settings goes on as before.
+        let shield = state.store.shield();
+        let visitor = crate::shield::Visitor {
+            ip: req
+                .extensions()
+                .get::<PublicPeer>()
+                .map(|peer| peer.0.ip())
+                .or_else(|| {
+                    // The tunnel origin's peer is the connector, never the
+                    // visitor.
+                    (!state.tunnel_origin)
+                        .then(|| req.extensions().get::<ConnectInfo<SocketAddr>>())
+                        .flatten()
+                        .map(|peer| peer.0.ip())
+                }),
+            fingerprint: req
+                .extensions()
+                .get::<PublicClientFingerprint>()
+                .map(|fingerprint| fingerprint.0),
+            tls: state.forwarded_proto == "https",
+        };
+        let shielded = match crate::shield::guard(shield, &host, req, visitor).await {
+            Ok((request, applied)) => {
+                req = request;
+                applied
+            }
+            Err(response) => return response,
+        };
         // Signed-in addresses (ADR 065 D8): the gate answers before anything
         // reaches the app. Routes without a gate are not affected.
         if let Some(policy) = entry.gate.as_ref() {
@@ -763,6 +785,9 @@ async fn handle(State(state): State<Arc<ProxyState>>, mut req: Request) -> Respo
         } else {
             proxy_with_retries(&state, &entry, req).await
         };
+        if let Some(applied) = shielded {
+            applied.record_status(response.status());
+        }
         if entry.gate.is_some() {
             // The app may neither pass for the gate nor touch its cookies.
             temps_core::gate::strip_gate_response_headers(response.headers_mut());
@@ -2224,6 +2249,7 @@ mod tests {
             project_id: Some(project_id),
             environment_id: Some(project_id * 100),
             gate: None,
+            shield: None,
         }
     }
 
@@ -2469,6 +2495,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(1),
                 gate: None,
+                shield: None,
             };
             let service = hyper::service::service_fn(move |mut request| {
                 request

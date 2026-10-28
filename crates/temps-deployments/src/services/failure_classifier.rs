@@ -1033,17 +1033,21 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     // ran: its home node is offline (stacks never fail over, their volumes
     // live there), no node can take its first deployment, it links
     // services a worker cannot reach, or it was moved or pinned elsewhere
-    // while this deployment ran. The remedy is in the message.
-    if contains_any(
-        r,
-        &[
-            "will not start the stack anywhere else",
-            "no node can take the first deployment of compose environment",
-            "compose stacks on worker nodes cannot reach linked services",
-            "was moved while deployment",
-            "by another deployment while this one was starting",
-        ],
-    ) {
+    // while this deployment ran. The remedy is in the message. These come
+    // from planning (no job yet) or the Compose job, never from build or
+    // container output, whose free text could otherwise contain a phrase.
+    if matches!(phase, None | Some(JobPhase::Compose))
+        && contains_any(
+            r,
+            &[
+                "will not start the stack anywhere else",
+                "no node can take the first deployment of compose environment",
+                "compose stacks on worker nodes cannot reach linked services",
+                "was moved while deployment",
+                "by another deployment while this one was starting",
+            ],
+        )
+    {
         return make(S::Configuration, C::InvalidConfiguration);
     }
 
@@ -2087,7 +2091,30 @@ mod tests {
                 S::Configuration,
                 C::InvalidConfiguration,
             );
+            // Raised while planning, before any job ran.
+            assert_class(
+                &format!("Compose placement refused deployment 9: {refusal}"),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
         }
+    }
+
+    /// A build whose own output happens to contain a placement refusal's
+    /// wording is still a build failure, not a placement refusal.
+    #[test]
+    fn placement_wording_in_build_output_is_not_a_placement_refusal() {
+        let reason = wrapped(
+            "build_image",
+            "Build failed: step 4/9 RUN ./check.sh: lock was taken by another deployment while \
+             this one was starting; exit code 1",
+        );
+        let got = classify_failure_reason(Some(&reason));
+        assert_ne!(
+            (got.stage, got.code),
+            (S::Configuration, C::InvalidConfiguration),
+            "{reason}"
+        );
     }
 
     #[test]

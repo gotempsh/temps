@@ -8764,6 +8764,7 @@ mod storage_cleanup_tests {
             git_url: git_url.map(str::to_string),
             git_provider_connection_id: Some(3),
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,

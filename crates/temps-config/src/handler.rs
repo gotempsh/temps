@@ -1596,18 +1596,12 @@ async fn require_cluster_ca_rotation_authorization(
             .build());
     }
 
-    let mfa_enabled = auth.user.as_ref().is_some_and(|user| user.mfa_enabled);
-    if !mfa_enabled {
-        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
-            .title("MFA Enrollment Required")
-            .detail(
-                "Enroll an MFA method in account security settings before rotating the cluster CA.",
-            )
-            .value("error_code", "CLUSTER_CA_ROTATION_MFA_REQUIRED")
-            .value("setup_path", "/settings/security")
-            .build());
-    }
-
+    // Step-up re-verifies an enrolled factor; an admin without MFA passes,
+    // as for every other sensitive action (see
+    // `DefaultSensitiveActionAuthorizer`). Rotation hands out no key material,
+    // so the most a stolen unenrolled session can do is disconnect workers,
+    // which the typed confirmation, the fingerprint compare-and-swap and the
+    // audit record already bound.
     temps_auth::require_sensitive_action(
         authorizer,
         auth,
@@ -5398,21 +5392,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cluster_ca_rotation_requires_mfa_enrollment() {
+    async fn cluster_ca_rotation_lets_an_admin_without_mfa_through() {
         let auth = temps_auth::AuthContext::new_persisted_session(
             rotation_test_user(false),
             temps_auth::Role::Admin,
             23,
         );
 
-        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+        require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
             .await
-            .expect_err("an admin without MFA must not rotate the cluster CA");
-        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
-        assert_eq!(
-            error.body.get("error_code"),
-            Some(&serde_json::json!("CLUSTER_CA_ROTATION_MFA_REQUIRED"))
-        );
+            .expect("an admin with no factor to re-verify is not asked to enroll one");
     }
 
     /// An operator's decision to forbid console updates must survive a save

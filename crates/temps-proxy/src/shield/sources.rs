@@ -12,15 +12,24 @@
 //!    run. A fetch sends the stored `ETag`s; a list that parses badly, or is
 //!    mostly not networks, is refused and the last good copy kept.
 //! 2. **Compiles** a new `shield_snapshots` revision from every enabled
-//!    source when a list changed since the newest revision, or once a day
-//!    so undated lists stay fresh. It runs under a transaction-scoped
-//!    advisory lock, so two planes never compile at once, and keeps the
-//!    last [`KEEP_SNAPSHOTS`].
+//!    source, the operator's rules (`shield_operator_entries`) and what the
+//!    fleet learned (`shield_observed`, D9) when a list or an entry changed
+//!    since the newest revision, or once a day so undated lists stay fresh.
+//!    It runs under a transaction-scoped advisory lock, so two planes never
+//!    compile at once, and keeps the last [`KEEP_SNAPSHOTS`].
 //!
 //! Every ingress then loads the new revision (see [`super::lists`]).
+//!
+//! Operator and observed entries go in as lists named [`OPERATOR_SOURCE`]
+//! and [`OBSERVED_SOURCE`], one per verdict: platform-wide rules and every
+//! observed address in `lists`, a project's rules in `scoped`, fingerprints
+//! in `ja4`. Whether they changed is decided by comparing what they compile
+//! to with what the newest revision holds, so an entry that expires, or a
+//! rule the console edits or deletes, is a change too, while an observed row
+//! whose expiry only moved later is not (see [`EXPIRY_GRACE_SECS`]).
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -31,7 +40,9 @@ use sea_orm::{
 use sha2::{Digest, Sha256};
 use temps_entities::{shield_snapshots, shield_sources};
 use temps_shield::feeds::{self, Feed, FeedError};
-use temps_shield::{ShieldSnapshot, SnapshotError, SourceList};
+use temps_shield::{
+    Ja4Entry, ListVerdict, Network, ScopedList, ShieldSnapshot, SnapshotError, SourceList,
+};
 use tracing::{debug, info, warn};
 
 pub const TICK: Duration = Duration::from_secs(5 * 60);
@@ -43,6 +54,22 @@ pub const KEEP_SNAPSHOTS: i64 = 10;
 /// The full IPv6 bogon list, the largest, is 2.6 MB.
 const MAX_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const COMPILE_LOCK: &str = "temps_shield_compile";
+/// The source operator rules are compiled under (D2).
+pub const OPERATOR_SOURCE: &str = "operator";
+/// The source what the fleet learned is compiled under (D9).
+pub const OBSERVED_SOURCE: &str = "observed";
+/// How long after a compile an entry with an expiry may still act, at the
+/// least. A live control plane recompiles when an entry expires and at
+/// least daily, so it always replaces the revision first; an ingress cut
+/// off from it stops acting on expiring entries a day later rather than
+/// never. Observed rows are extended on every promotion, so tying the
+/// snapshot to their exact expiry would recompile every 30 seconds while an
+/// attack lasts.
+pub const EXPIRY_GRACE_SECS: i64 = RECOMPILE_INTERVAL.as_secs() as i64 + 60 * 60;
+/// Most observed rows a revision carries, the most recently seen first.
+const MAX_OBSERVED: i64 = 100_000;
+/// Most operator rules a revision carries.
+const MAX_OPERATOR: i64 = 100_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
@@ -72,6 +99,8 @@ pub enum SourceError {
     },
     #[error("snapshot: {0}")]
     Snapshot(#[from] SnapshotError),
+    #[error("could not read the platform Shield settings: {0}")]
+    Settings(String),
 }
 
 /// What one fetch found.
@@ -91,6 +120,12 @@ pub struct ShieldSources {
     db: Arc<DatabaseConnection>,
     http: reqwest::Client,
     feeds: &'static [Feed],
+    /// Where `shield.share_observations` is read; without it observed
+    /// entries are compiled in, as the setting defaults to.
+    config: Option<Arc<temps_config::ConfigService>>,
+    /// The entries key of the newest revision, by revision and checksum, so
+    /// a body is decoded once rather than on every compile check.
+    stored_key: Mutex<Option<(i64, String, [u8; 32])>>,
 }
 
 impl ShieldSources {
@@ -107,7 +142,20 @@ impl ShieldSources {
             .connect_timeout(Duration::from_secs(15))
             .timeout(Duration::from_secs(60))
             .build()?;
-        Ok(Self { db, http, feeds })
+        Ok(Self {
+            db,
+            http,
+            feeds,
+            config: None,
+            stored_key: Mutex::new(None),
+        })
+    }
+
+    /// Read `shield.share_observations` from `config`: off, observed
+    /// entries are left out of every revision.
+    pub fn with_config(mut self, config: Arc<temps_config::ConfigService>) -> Self {
+        self.config = Some(config);
+        self
     }
 
     /// Run the jobs every [`TICK`] on the current runtime, the first time a
@@ -394,6 +442,24 @@ impl ShieldSources {
     /// Store a new snapshot revision if one is needed and no other plane is
     /// compiling. Returns the new revision.
     pub async fn compile(&self) -> Result<Option<i64>, SourceError> {
+        let include_observed = match &self.config {
+            Some(config) => {
+                config
+                    .get_settings()
+                    .await
+                    .map_err(|e| SourceError::Settings(e.to_string()))?
+                    .shield
+                    .share_observations
+            }
+            None => true,
+        };
+        self.compile_with(include_observed).await
+    }
+
+    pub(crate) async fn compile_with(
+        &self,
+        include_observed: bool,
+    ) -> Result<Option<i64>, SourceError> {
         let txn = self.db.begin().await?;
         let locked = txn
             .query_one(Statement::from_sql_and_values(
@@ -417,13 +483,18 @@ impl ShieldSources {
             .order_by_desc(shield_snapshots::Column::Revision)
             .one(&txn)
             .await?;
-        let recompile_after = Utc::now()
+        let now = Utc::now();
+        let (operator, observed) = load_entries(&txn, include_observed).await?;
+        let entries = Entries::compile(&operator, &observed, now.timestamp());
+        let key = entries.key();
+        let recompile_after = now
             - chrono::Duration::from_std(RECOMPILE_INTERVAL).unwrap_or(chrono::Duration::days(1));
         let due = match &latest {
             None => true,
             Some(latest) => {
                 latest.created_at < recompile_after
                     || sources_updated_at > latest.sources_updated_at
+                    || self.stored_key(latest).await != Some(key)
             }
         };
         if !due {
@@ -464,10 +535,14 @@ impl ShieldSources {
             .map(|row| row.try_get::<i64>("", "revision"))
             .transpose()?
             .ok_or_else(|| DbErr::RecordNotFound("shield_snapshots revision".into()))?;
+        lists.extend(entries.lists);
+        lists.sort_by(|a, b| a.source.cmp(&b.source));
         let snapshot = ShieldSnapshot {
             revision: u64::try_from(revision).unwrap_or(0),
-            generated_at: Utc::now().timestamp(),
+            generated_at: now.timestamp(),
             lists,
+            scoped: entries.scoped,
+            ja4: entries.ja4,
         };
         let body = snapshot.encode()?;
         let sha256 = hex::encode(Sha256::digest(&body));
@@ -477,7 +552,7 @@ impl ShieldSources {
              VALUES ($1, $2, $3, $4)",
             [
                 revision.into(),
-                sha256.into(),
+                sha256.clone().into(),
                 body.into(),
                 sources_updated_at.into(),
             ],
@@ -491,7 +566,302 @@ impl ShieldSources {
         ))
         .await?;
         txn.commit().await?;
+        if let Ok(mut stored) = self.stored_key.lock() {
+            *stored = Some((revision, sha256, key));
+        }
         Ok(Some(revision))
+    }
+
+    /// The entries key of a stored revision, or `None` when its body does
+    /// not decode (which makes it due for replacing).
+    async fn stored_key(&self, latest: &shield_snapshots::Model) -> Option<[u8; 32]> {
+        if let Ok(stored) = self.stored_key.lock() {
+            if let Some((revision, sha256, key)) = stored.as_ref() {
+                if *revision == latest.revision && *sha256 == latest.sha256 {
+                    return Some(*key);
+                }
+            }
+        }
+        let body = latest.body.clone();
+        let decoded = tokio::task::spawn_blocking(move || {
+            ShieldSnapshot::decode(&body).map(|snapshot| Entries::of_snapshot(&snapshot).key())
+        })
+        .await;
+        match decoded {
+            Ok(Ok(key)) => {
+                if let Ok(mut stored) = self.stored_key.lock() {
+                    *stored = Some((latest.revision, latest.sha256.clone(), key));
+                }
+                Some(key)
+            }
+            Ok(Err(error)) => {
+                debug!(revision = latest.revision, error = %error, "The newest Shield snapshot does not decode; compiling a new one");
+                None
+            }
+            Err(error) => {
+                debug!(revision = latest.revision, error = %error, "Could not read the newest Shield snapshot's entries");
+                None
+            }
+        }
+    }
+}
+
+/// An operator rule as the compiler reads it: unexpired, with `network`
+/// as CIDR text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OperatorEntry {
+    /// `None` for a platform-wide rule.
+    pub project_id: Option<i32>,
+    pub network: Option<String>,
+    pub ja4: Option<String>,
+    pub verdict: String,
+    /// Unix seconds.
+    pub expires_at: Option<i64>,
+}
+
+/// An unexpired, approved `shield_observed` row: learning only proposes,
+/// so a row applies once an instance admin approves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObservedEntry {
+    /// `ip` or `ja4`.
+    pub kind: String,
+    pub subject: String,
+    pub verdict: String,
+    /// Unix seconds.
+    pub expires_at: i64,
+}
+
+async fn load_entries<C: ConnectionTrait>(
+    conn: &C,
+    include_observed: bool,
+) -> Result<(Vec<OperatorEntry>, Vec<ObservedEntry>), DbErr> {
+    let rows = conn
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT project_id, network::text AS network, ja4, verdict, \
+             extract(epoch FROM expires_at)::bigint AS expires_at \
+             FROM shield_operator_entries \
+             WHERE expires_at IS NULL OR expires_at > now() ORDER BY id LIMIT $1",
+            [MAX_OPERATOR.into()],
+        ))
+        .await?;
+    let operator = rows
+        .iter()
+        .map(|row| {
+            Ok(OperatorEntry {
+                project_id: row.try_get("", "project_id")?,
+                network: row.try_get("", "network")?,
+                ja4: row.try_get("", "ja4")?,
+                verdict: row.try_get("", "verdict")?,
+                expires_at: row.try_get("", "expires_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, DbErr>>()?;
+    if !include_observed {
+        return Ok((operator, Vec::new()));
+    }
+    let rows = conn
+        .query_all(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT kind, subject, verdict, extract(epoch FROM expires_at)::bigint AS expires_at \
+             FROM shield_observed WHERE expires_at > now() AND status = 'approved' \
+             ORDER BY last_seen DESC LIMIT $1",
+            [MAX_OBSERVED.into()],
+        ))
+        .await?;
+    let observed = rows
+        .iter()
+        .map(|row| {
+            Ok(ObservedEntry {
+                kind: row.try_get("", "kind")?,
+                subject: row.try_get("", "subject")?,
+                verdict: row.try_get("", "verdict")?,
+                expires_at: row.try_get("", "expires_at")?,
+            })
+        })
+        .collect::<Result<Vec<_>, DbErr>>()?;
+    Ok((operator, observed))
+}
+
+/// What the operator's rules and the fleet's observations add to a
+/// snapshot.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Entries {
+    pub lists: Vec<SourceList>,
+    pub scoped: Vec<ScopedList>,
+    pub ja4: Vec<Ja4Entry>,
+}
+
+/// One list to build: scope, source, verdict and whether its entries
+/// expire.
+type Group = (Option<i32>, &'static str, ListVerdict, bool);
+
+impl Entries {
+    /// Group the entries into one list per scope, source, verdict and
+    /// whether they expire, and one fingerprint entry each. Entries that do
+    /// not parse are skipped with a warning; expired ones are not passed in.
+    pub(crate) fn compile(
+        operator: &[OperatorEntry],
+        observed: &[ObservedEntry],
+        now: i64,
+    ) -> Self {
+        // Networks and the latest expiry per list.
+        let mut groups: BTreeMap<Group, (Vec<Network>, i64)> = BTreeMap::new();
+        let mut ja4: BTreeMap<(String, &'static str, Option<i32>, ListVerdict), Option<i64>> =
+            BTreeMap::new();
+        let mut add_network = |group: Group, network: Network, expires_at: Option<i64>| {
+            let entry = groups.entry(group).or_insert_with(|| (Vec::new(), 0));
+            entry.0.push(network);
+            entry.1 = entry.1.max(expires_at.unwrap_or(0));
+        };
+        let mut add_ja4 = |key: (String, &'static str, Option<i32>, ListVerdict),
+                           expires_at: Option<i64>| {
+            ja4.entry(key)
+                .and_modify(|at: &mut Option<i64>| {
+                    // No expiry outlasts any.
+                    *at = match (*at, expires_at) {
+                        (Some(a), Some(b)) => Some(a.max(b)),
+                        _ => None,
+                    }
+                })
+                .or_insert(expires_at);
+        };
+        for entry in operator {
+            let Some(verdict) = ListVerdict::parse(&entry.verdict) else {
+                warn!(verdict = %entry.verdict, "Skipping a Shield operator rule with an unknown verdict");
+                continue;
+            };
+            match (&entry.network, &entry.ja4) {
+                (Some(network), _) => match Network::parse(network) {
+                    Some(network) => add_network(
+                        (
+                            entry.project_id,
+                            OPERATOR_SOURCE,
+                            verdict,
+                            entry.expires_at.is_some(),
+                        ),
+                        network,
+                        entry.expires_at,
+                    ),
+                    None => {
+                        warn!(network = %network, "Skipping a Shield operator rule whose network does not parse")
+                    }
+                },
+                (None, Some(fingerprint)) => add_ja4(
+                    (
+                        fingerprint.clone(),
+                        OPERATOR_SOURCE,
+                        entry.project_id,
+                        verdict,
+                    ),
+                    entry.expires_at,
+                ),
+                (None, None) => {}
+            }
+        }
+        for entry in observed {
+            // Only these two are ever promoted (D9).
+            let verdict = match entry.verdict.as_str() {
+                "block" => ListVerdict::Block,
+                "challenge" => ListVerdict::Challenge,
+                other => {
+                    warn!(verdict = %other, "Skipping an observed Shield entry with an unknown verdict");
+                    continue;
+                }
+            };
+            match entry.kind.as_str() {
+                "ip" => match Network::parse(&entry.subject) {
+                    Some(network) => add_network(
+                        (None, OBSERVED_SOURCE, verdict, true),
+                        network,
+                        Some(entry.expires_at),
+                    ),
+                    None => {
+                        warn!(subject = %entry.subject, "Skipping an observed Shield address that does not parse")
+                    }
+                },
+                "ja4" => add_ja4(
+                    (entry.subject.clone(), OBSERVED_SOURCE, None, verdict),
+                    Some(entry.expires_at),
+                ),
+                other => {
+                    warn!(kind = %other, "Skipping an observed Shield entry of an unknown kind")
+                }
+            }
+        }
+
+        let grace = now.saturating_add(EXPIRY_GRACE_SECS);
+        let mut entries = Entries::default();
+        for ((project_id, source, verdict, expiring), (networks, latest)) in groups {
+            let max_age_secs =
+                expiring.then(|| u64::try_from(latest.max(grace) - now).unwrap_or(0));
+            let list = SourceList::new(source, verdict, now, max_age_secs, networks);
+            match project_id {
+                Some(project_id) => entries.scoped.push(ScopedList { project_id, list }),
+                None => entries.lists.push(list),
+            }
+        }
+        entries.ja4 = ja4
+            .into_iter()
+            .map(
+                |((fingerprint, source, project_id, verdict), expires_at)| Ja4Entry {
+                    fingerprint,
+                    source: source.to_string(),
+                    verdict,
+                    project_id,
+                    expires_at: expires_at.map(|at| at.max(grace)),
+                },
+            )
+            .collect();
+        entries
+    }
+
+    /// The operator and observed parts of a stored snapshot.
+    fn of_snapshot(snapshot: &ShieldSnapshot) -> Self {
+        Self {
+            lists: snapshot
+                .lists
+                .iter()
+                .filter(|list| list.source == OPERATOR_SOURCE || list.source == OBSERVED_SOURCE)
+                .cloned()
+                .collect(),
+            scoped: snapshot.scoped.clone(),
+            ja4: snapshot.ja4.clone(),
+        }
+    }
+
+    /// A digest of what the entries do, leaving out the dates each compile
+    /// moves (publication time, maximum age, the expiry past the grace), so
+    /// two compiles of the same rules compare equal.
+    fn key(&self) -> [u8; 32] {
+        let describe = |scope: Option<i32>, list: &SourceList| {
+            let networks: Vec<String> = list.networks().map(|n| n.to_string()).collect();
+            format!(
+                "list {scope:?} {} {} {} {}",
+                list.source,
+                list.verdict.as_str(),
+                list.max_age_secs.is_some(),
+                networks.join(",")
+            )
+        };
+        let mut lines: Vec<String> = self.lists.iter().map(|list| describe(None, list)).collect();
+        lines.extend(
+            self.scoped
+                .iter()
+                .map(|scoped| describe(Some(scoped.project_id), &scoped.list)),
+        );
+        lines.extend(self.ja4.iter().map(|entry| {
+            format!(
+                "ja4 {:?} {} {} {} {}",
+                entry.project_id,
+                entry.source,
+                entry.fingerprint,
+                entry.verdict.as_str(),
+                entry.expires_at.is_some()
+            )
+        }));
+        lines.sort();
+        Sha256::digest(lines.join("\n").as_bytes()).into()
     }
 }
 
@@ -512,8 +882,199 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_shield::feeds::Format;
-    use temps_shield::{Action, ListVerdict};
+    use temps_shield::{Action, Index, ListVerdict};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const NOW: i64 = 1_800_000_000;
+    const DAY: i64 = 24 * 60 * 60;
+    const TOOL_JA4: &str = "t13d3012h2_1d37bd780c83_882d495ac381";
+    const SCANNER_JA4: &str = "t13d1311h2_f57a46bbacb6_ab7e3b40a677";
+
+    fn rule(
+        project_id: Option<i32>,
+        network: Option<&str>,
+        ja4: Option<&str>,
+        verdict: &str,
+        expires_at: Option<i64>,
+    ) -> OperatorEntry {
+        OperatorEntry {
+            project_id,
+            network: network.map(str::to_string),
+            ja4: ja4.map(str::to_string),
+            verdict: verdict.to_string(),
+            expires_at,
+        }
+    }
+
+    fn observed(kind: &str, subject: &str, verdict: &str, expires_at: i64) -> ObservedEntry {
+        ObservedEntry {
+            kind: kind.to_string(),
+            subject: subject.to_string(),
+            verdict: verdict.to_string(),
+            expires_at,
+        }
+    }
+
+    fn rules() -> Vec<OperatorEntry> {
+        vec![
+            rule(None, Some("185.93.89.0/24"), None, "block", None),
+            rule(Some(7), Some("93.184.216.9/32"), None, "allow", None),
+            rule(
+                Some(7),
+                Some("45.33.32.0/24"),
+                None,
+                "challenge",
+                Some(NOW + 3600),
+            ),
+            rule(None, None, Some(TOOL_JA4), "block", None),
+            rule(Some(7), None, Some(SCANNER_JA4), "log", None),
+        ]
+    }
+
+    fn observations() -> Vec<ObservedEntry> {
+        vec![
+            observed("ip", "93.184.216.9", "block", NOW + 7 * DAY),
+            observed("ip", "2a01:4f8::9", "challenge", NOW + DAY),
+            observed("ja4", SCANNER_JA4, "challenge", NOW + DAY),
+        ]
+    }
+
+    fn snapshot_of(entries: Entries) -> ShieldSnapshot {
+        ShieldSnapshot {
+            revision: 1,
+            generated_at: NOW,
+            lists: entries.lists,
+            scoped: entries.scoped,
+            ja4: entries.ja4,
+        }
+    }
+
+    /// Operator rules and observations land in the scope they were written
+    /// for, with their verdict, and an operator allow wins.
+    #[test]
+    fn operator_and_observed_entries_apply_where_they_are_scoped() {
+        let index = Index::new(&snapshot_of(Entries::compile(
+            &rules(),
+            &observations(),
+            NOW,
+        )));
+        let at = |ip: &str, ja4: Option<&str>, project: i32| {
+            index.evaluate_client(None, Some(ip.parse().unwrap()), ja4, project, NOW)
+        };
+
+        let observed = at("93.184.216.9", None, 8);
+        assert_eq!(observed.verdict.action, Action::Block);
+        assert_eq!(
+            observed.verdict.reason_strings(),
+            ["observed (93.184.216.9/32)"]
+        );
+        // Project 7 allows the address it blocks everywhere else.
+        let allowed = at("93.184.216.9", None, 7);
+        assert!(allowed.allowed);
+        assert_eq!(allowed.verdict, temps_shield::Verdict::PASS);
+
+        let platform = at("185.93.89.1", None, 8).verdict;
+        assert_eq!(platform.action, Action::Block);
+        assert_eq!(platform.reason_strings(), ["operator (185.93.89.0/24)"]);
+        assert_eq!(at("45.33.32.9", None, 7).verdict.action, Action::Challenge);
+        assert_eq!(
+            at("45.33.32.9", None, 8).verdict,
+            temps_shield::Verdict::PASS
+        );
+        assert_eq!(
+            at("2a01:4f8::9", None, 8).verdict.reason_strings(),
+            ["observed (2a01:4f8::9/128)"]
+        );
+
+        let tool = at("8.8.4.4", Some(TOOL_JA4), 8).verdict;
+        assert_eq!(tool.action, Action::Block);
+        assert_eq!(
+            tool.reason_strings(),
+            [format!("operator (ja4 {TOOL_JA4})")]
+        );
+        // Observed everywhere; project 7 also logs it.
+        let scanner = at("8.8.4.4", Some(SCANNER_JA4), 7).verdict;
+        assert_eq!(scanner.action, Action::Challenge);
+        assert_eq!(
+            scanner.reason_strings(),
+            [
+                format!("observed (ja4 {SCANNER_JA4})"),
+                format!("operator (ja4 {SCANNER_JA4})")
+            ]
+        );
+        assert_eq!(
+            at("8.8.4.4", Some(SCANNER_JA4), 8).verdict.reason_strings(),
+            [format!("observed (ja4 {SCANNER_JA4})")]
+        );
+    }
+
+    /// An ingress that never hears of a newer revision stops acting on
+    /// expiring entries a day after the last one ends, not never; one that
+    /// does hear gets a revision without them first.
+    #[test]
+    fn expiring_entries_only_log_once_the_snapshot_outlives_them() {
+        let index = Index::new(&snapshot_of(Entries::compile(&[], &observations(), NOW)));
+        let at = |now| {
+            index
+                .evaluate_client(None, Some("93.184.216.9".parse().unwrap()), None, 8, now)
+                .verdict
+                .action
+        };
+        assert_eq!(at(NOW + EXPIRY_GRACE_SECS), Action::Block);
+        assert_eq!(at(NOW + 7 * DAY), Action::Block);
+        assert_eq!(at(NOW + 7 * DAY + 1), Action::Log);
+        let ja4 = index.evaluate_client(None, None, Some(SCANNER_JA4), 8, NOW + EXPIRY_GRACE_SECS);
+        assert_eq!(ja4.verdict, temps_shield::Verdict::PASS);
+    }
+
+    /// Only what the entries do counts as a change, not when they were
+    /// compiled or how far a promotion moved an expiry.
+    #[test]
+    fn the_entries_key_ignores_what_a_recompile_moves() {
+        let key = Entries::compile(&rules(), &observations(), NOW).key();
+        let later = Entries::compile(&rules(), &observations(), NOW + 600);
+        assert_eq!(later.key(), key);
+        let mut extended = observations();
+        extended[0].expires_at += DAY;
+        extended[2].expires_at += DAY;
+        assert_eq!(Entries::compile(&rules(), &extended, NOW).key(), key);
+        // What the stored revision holds compares equal to what made it.
+        let snapshot = snapshot_of(Entries::compile(&rules(), &observations(), NOW));
+        assert_eq!(Entries::of_snapshot(&snapshot).key(), key);
+
+        let mut fewer = observations();
+        fewer.remove(1);
+        assert_ne!(Entries::compile(&rules(), &fewer, NOW).key(), key);
+        let mut upgraded = observations();
+        upgraded[1].verdict = "block".into();
+        assert_ne!(Entries::compile(&rules(), &upgraded, NOW).key(), key);
+        let mut edited = rules();
+        edited[0].verdict = "challenge".into();
+        assert_ne!(Entries::compile(&edited, &observations(), NOW).key(), key);
+        let mut permanent = rules();
+        permanent[2].expires_at = None;
+        assert_ne!(
+            Entries::compile(&permanent, &observations(), NOW).key(),
+            key
+        );
+    }
+
+    #[test]
+    fn entries_that_do_not_parse_are_left_out() {
+        let entries = Entries::compile(
+            &[
+                rule(None, Some("not a network"), None, "block", None),
+                rule(None, Some("10.0.0.0/8"), None, "maybe", None),
+            ],
+            &[
+                observed("ip", "nowhere", "block", NOW + DAY),
+                observed("ip", "198.51.100.7", "allow", NOW + DAY),
+                observed("asn", "64496", "block", NOW + DAY),
+            ],
+            NOW,
+        );
+        assert_eq!(entries, Entries::default());
+    }
 
     /// A one-route HTTP server: answers `body` with `ETag: "v1"`, or 304
     /// when the request carries that tag. Counts the requests it answers.
