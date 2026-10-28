@@ -1032,8 +1032,8 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     // A Compose stack's placement refused the deployment before anything
     // ran: its home node is offline (stacks never fail over, their volumes
     // live there), no node can take its first deployment, it links
-    // services a worker cannot reach, or it was moved while this deployment
-    // ran. The remedy is in the message.
+    // services a worker cannot reach, or it was moved or pinned elsewhere
+    // while this deployment ran. The remedy is in the message.
     if contains_any(
         r,
         &[
@@ -1041,6 +1041,7 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "no node can take the first deployment of compose environment",
             "compose stacks on worker nodes cannot reach linked services",
             "was moved while deployment",
+            "by another deployment while this one was starting",
         ],
     ) {
         return make(S::Configuration, C::InvalidConfiguration);
@@ -2067,6 +2068,11 @@ mod tests {
                 environment_id: 2,
                 environment_name: "production".to_string(),
                 reason: "no active node matches".to_string(),
+            },
+            E::PinnedConcurrently {
+                environment_id: 2,
+                pinned: "worker node #4".to_string(),
+                expected: "worker node #3".to_string(),
             },
             E::MovedConcurrently {
                 environment_id: 2,

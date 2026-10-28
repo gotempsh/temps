@@ -242,8 +242,9 @@ pub fn configure_routes() -> Router<Arc<ComposePlacementAppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(get_compose_placement, move_compose_stack),
-    components(schemas(ComposePlacementResponse, MoveComposeStackRequest)),
-    tags((name = "Compose", description = "Docker Compose configuration diagnostics"))
+    // The "Compose" tag is declared once, by `ComposeCheckApiDoc`; declaring
+    // it here too would list it twice in the merged document.
+    components(schemas(ComposePlacementResponse, MoveComposeStackRequest))
 )]
 pub struct ComposePlacementApiDoc;
 

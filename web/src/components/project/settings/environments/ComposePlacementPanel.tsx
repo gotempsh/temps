@@ -40,6 +40,10 @@ interface ComposePlacementPanelProps {
   environmentId: number
   /** Nodes a stack can move to (active nodes, including the control plane). */
   nodes: NodeInfoResponse[]
+  /** Whether `nodes` has loaded; moving waits for it. */
+  nodesLoaded: boolean
+  /** Why the node list could not be loaded, if it could not. */
+  nodesError?: Error | null
 }
 
 /**
@@ -51,6 +55,8 @@ export function ComposePlacementPanel({
   projectId,
   environmentId,
   nodes,
+  nodesLoaded,
+  nodesError,
 }: ComposePlacementPanelProps) {
   const queryClient = useQueryClient()
   const [moveOpen, setMoveOpen] = useState(false)
@@ -79,6 +85,7 @@ export function ComposePlacementPanel({
     placement.pinned &&
     placement.home_node_status != null &&
     placement.home_node_status !== 'active'
+  const movePending = placement.moving_from_node_id != null
 
   return (
     <div className="space-y-2 rounded-lg border p-3">
@@ -97,6 +104,7 @@ export function ComposePlacementPanel({
           type="button"
           variant="outline"
           size="sm"
+          disabled={!nodesLoaded}
           onClick={() => setMoveOpen(true)}
         >
           <MoveRight className="h-4 w-4" aria-hidden="true" />
@@ -104,7 +112,17 @@ export function ComposePlacementPanel({
         </Button>
       </div>
 
-      {placement.moving_from_node_id != null && (
+      {nodesError && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" aria-hidden="true" />
+          <AlertTitle>Could not load the cluster&apos;s nodes</AlertTitle>
+          <AlertDescription>
+            The stack&apos;s placement is shown, but it cannot be moved until
+            the node list loads: {nodesError.toString()}
+          </AlertDescription>
+        </Alert>
+      )}
+      {movePending && (
         <Alert variant="warning">
           <AlertTriangle className="h-4 w-4" aria-hidden="true" />
           <AlertTitle>Move pending: redeploy to complete it</AlertTitle>
@@ -123,9 +141,7 @@ export function ComposePlacementPanel({
             {placement.home_node_name} is {placement.home_node_status}
           </AlertTitle>
           <AlertDescription>
-            Deployments of this stack fail until it is back, because its volumes
-            are on it. Temps never moves a Compose stack on its own; bring the
-            node back online, or move the stack (its data stays behind).
+            {homeOfflineExplanation(placement, movePending)}
           </AlertDescription>
         </Alert>
       )}
@@ -153,6 +169,21 @@ export function ComposePlacementPanel({
       />
     </div>
   )
+}
+
+/**
+ * Why an unavailable home blocks deployments. During a pending move the home
+ * is the destination, which holds no data yet; the volumes are still on the
+ * node the move is leaving.
+ */
+function homeOfflineExplanation(
+  placement: ComposePlacementResponse,
+  movePending: boolean
+): string {
+  if (movePending) {
+    return `The next deployment cannot start the stack there, so it keeps running on ${placement.moving_from_node_name} with its volumes. Bring ${placement.home_node_name} back online, or move the stack back to ${placement.moving_from_node_name} to cancel the move and keep its data.`
+  }
+  return 'Deployments of this stack fail until it is back, because its volumes are on it. Temps never moves a Compose stack on its own; bring the node back online, or move the stack (its data stays behind).'
 }
 
 interface MoveComposeStackDialogProps {

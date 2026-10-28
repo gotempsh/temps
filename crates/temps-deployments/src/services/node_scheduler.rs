@@ -1839,6 +1839,21 @@ fn builder_nodes_for(nodes: Vec<nodes::Model>, platform: Option<&str>) -> Vec<no
 ///
 /// Example selector: `{"region": ["us", "asia"], "gpu": "true"}`
 /// Matches a node with `{"region": "us", "gpu": "true"}` (region=us OR region=asia, AND gpu=true)
+/// Whether one node label value satisfies one selector value: an array
+/// selector matches any of its elements, a single value matches exactly
+/// (see [`values_match`] for how non-string values compare).
+pub(crate) fn label_value_matches(
+    node_value: &serde_json::Value,
+    required_value: &serde_json::Value,
+) -> bool {
+    match required_value.as_array() {
+        Some(required_values) => required_values
+            .iter()
+            .any(|required| values_match(node_value, required)),
+        None => values_match(node_value, required_value),
+    }
+}
+
 fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::Value) -> bool {
     let selector_map = match selector.as_object() {
         Some(m) => m,
@@ -1857,17 +1872,7 @@ fn node_matches_labels(node_labels: &serde_json::Value, selector: &serde_json::V
             None => return false, // Node doesn't have this label key → no match
         };
 
-        let key_matches = if let Some(required_values) = required_value.as_array() {
-            // Array → OR: node value must match any element
-            required_values
-                .iter()
-                .any(|rv| values_match(node_value, rv))
-        } else {
-            // Single value → exact match
-            values_match(node_value, required_value)
-        };
-
-        if !key_matches {
+        if !label_value_matches(node_value, required_value) {
             return false;
         }
     }

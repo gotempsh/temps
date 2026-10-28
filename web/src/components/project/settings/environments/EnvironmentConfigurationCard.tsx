@@ -385,6 +385,15 @@ export function EnvironmentConfigurationCard({
 
   const hasGitRepo = projectHasGitRepo(project)
   const isComposeProject = project.preset === 'docker-compose'
+  const composePlacementPanel = (
+    <ComposePlacementPanel
+      projectId={project.id}
+      environmentId={environment.id}
+      nodes={activeNodes}
+      nodesLoaded={nodesQuery.isSuccess}
+      nodesError={nodesQuery.error}
+    />
+  )
 
   return (
     <form onSubmit={handleSubmit}>
@@ -833,7 +842,10 @@ export function EnvironmentConfigurationCard({
               take a build, it runs on the control plane when local builds are
               enabled, and the build log says why. CI uses the configured GitHub
               Actions runner and never falls back locally.{' '}
-              <Link to="/settings/build-limits#ci-builder" className="underline">
+              <Link
+                to="/settings/build-limits#ci-builder"
+                className="underline"
+              >
                 Configure CI builder
               </Link>
               .
@@ -857,6 +869,15 @@ export function EnvironmentConfigurationCard({
               )}
           </div>
         </SettingsSection>
+
+        {/* A Compose stack's placement stays visible when no worker is
+            active, or the node list failed to load: the stack still lives
+            somewhere, possibly on a node that just went offline. */}
+        {isComposeProject && activeNodes.length === 0 && (
+          <SettingsSection title="Compose stack placement" icon={Network}>
+            {composePlacementPanel}
+          </SettingsSection>
+        )}
 
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
@@ -923,13 +944,7 @@ export function EnvironmentConfigurationCard({
                     : targetNodesHint(activeNodes)}
                 </p>
                 {isComposeProject && (
-                  <div className="mb-2">
-                    <ComposePlacementPanel
-                      projectId={project.id}
-                      environmentId={environment.id}
-                      nodes={activeNodes}
-                    />
-                  </div>
+                  <div className="mb-2">{composePlacementPanel}</div>
                 )}
                 <div className="space-y-2">
                   {activeNodes.map((node) => {

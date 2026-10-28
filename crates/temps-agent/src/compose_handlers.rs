@@ -50,10 +50,13 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::RequireAgentAuth;
 use crate::handlers::{AgentResourceLimits, AgentResponse};
 
-/// Longest a prepare (upload, build, pull) may run once admitted.
-const PREPARE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Longest a prepare (build, pull) may run once admitted. Shared with the
+/// control plane, whose request timeout outlasts it.
+const PREPARE_DEADLINE: std::time::Duration =
+    temps_deployer::compose_protocol::COMPOSE_PREPARE_DEADLINE;
 /// Longest a prepare waits for an image-operation slot.
-const PREPARE_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+const PREPARE_QUEUE_TIMEOUT: std::time::Duration =
+    temps_deployer::compose_protocol::COMPOSE_PREPARE_QUEUE_TIMEOUT;
 /// A prepared generation nobody started is forgotten after this long.
 const PREPARED_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
@@ -216,7 +219,13 @@ impl ComposeHostState {
             )
         })?;
         let executor = ComposeExecutor::new(docker, self.data_dir.clone());
-        match self.published_host_ip() {
+        // Lifecycle commands publish nothing, so a public bind address (a
+        // node not on its mesh yet) leaves them on the loopback default;
+        // prepare refuses that address before it gets here.
+        match self
+            .published_host_ip()
+            .filter(|address| is_private_bind_address(*address))
+        {
             Some(address) => executor
                 .with_published_host_ip(address)
                 .map_err(|error| AgentComposeError::Invalid(error.to_string())),
@@ -332,26 +341,37 @@ impl ComposeHostState {
         self.take_prepared(project, generation).await
     }
 
-    /// Forget prepared generations nobody started, and their files.
+    /// Forget prepared generations nobody started, and their files: the
+    /// checkout and the decrypted secrets prepare materialized for them.
     async fn evict_stale(&self) {
-        let stale: Vec<(String, String)> = {
+        let stale: Vec<((String, String), PreparedGeneration)> = {
             let mut prepared = self.prepared.lock().await;
             let keys: Vec<_> = prepared
                 .iter()
                 .filter(|(_, entry)| entry.prepared_at.elapsed() > PREPARED_TTL)
                 .map(|(key, _)| key.clone())
                 .collect();
-            for key in &keys {
-                prepared.remove(key);
-            }
-            keys
+            keys.into_iter()
+                .filter_map(|key| prepared.remove(&key).map(|entry| (key, entry)))
+                .collect()
         };
-        for (project, generation) in stale {
+        for ((project, generation), entry) in stale {
             tracing::warn!(
                 project = %project,
                 generation = %generation,
                 "Discarding a prepared Compose generation that was never started"
             );
+            if let Err(error) = entry
+                .executor
+                .cleanup_secret_generation(&project, &generation)
+                .await
+            {
+                tracing::warn!(
+                    project = %project,
+                    generation = %generation,
+                    "Could not remove the secrets of a discarded Compose generation: {error}"
+                );
+            }
             self.remove_unused_generation(&project, &generation).await;
         }
     }
@@ -417,8 +437,9 @@ impl ComposeHostState {
 
 /// Loopback (an agent registered without a private address) or a private
 /// (RFC 1918 / unique-local) address: one no public interface answers on.
+/// The same rule `ComposeExecutor::with_published_host_ip` enforces.
 fn is_private_bind_address(address: std::net::IpAddr) -> bool {
-    address.is_loopback() || temps_core::node_address::is_private_node_address(&address.to_string())
+    temps_core::node_address::is_private_publish_address(address)
 }
 
 fn event_bytes(event: &ComposeHostEvent) -> bytes::Bytes {
@@ -1129,12 +1150,21 @@ mod tests {
     /// A prepared generation for `project`, built by an executor that
     /// publishes on `address`.
     fn prepared_generation(project: &str, generation: &str, address: &str) -> PreparedGeneration {
+        prepared_generation_in(&std::env::temp_dir(), project, generation, address)
+    }
+
+    fn prepared_generation_in(
+        data_dir: &Path,
+        project: &str,
+        generation: &str,
+        address: &str,
+    ) -> PreparedGeneration {
         let executor = ComposeExecutor::new_with_handle(
             Arc::new(temps_core::DockerHandle::disabled(
                 "test",
                 "no Docker in tests",
             )),
-            std::env::temp_dir(),
+            data_dir.to_path_buf(),
         )
         .with_published_host_ip(address.parse().unwrap())
         .unwrap();
@@ -1187,7 +1217,7 @@ mod tests {
         std::fs::create_dir_all(stale_dir.join("source")).unwrap();
         state.prepared.lock().await.insert(
             ("temps-1-2".to_string(), "deployment-1-a".to_string()),
-            prepared_generation("temps-1-2", "deployment-1-a", "203.0.113.7"),
+            prepared_generation("temps-1-2", "deployment-1-a", "10.30.0.7"),
         );
         state.prepared.lock().await.insert(
             ("temps-1-2".to_string(), "deployment-2-b".to_string()),
@@ -1205,7 +1235,7 @@ mod tests {
             "{error}"
         );
         let message = error.to_string();
-        assert!(message.contains("203.0.113.7"), "{message}");
+        assert!(message.contains("10.30.0.7"), "{message}");
         assert!(message.contains("10.20.0.5"), "{message}");
         assert_eq!(Problem::from(error).status_code, StatusCode::CONFLICT);
         assert!(!stale_dir.exists());
@@ -1223,6 +1253,55 @@ mod tests {
             current.executor.published_host_ip().to_string(),
             "10.20.0.5"
         );
+    }
+
+    /// A generation nobody started is forgotten after its TTL together with
+    /// its checkout and the decrypted secrets prepare wrote for it; a fresh
+    /// one is kept.
+    #[tokio::test]
+    async fn an_expired_prepared_generation_takes_its_secrets_with_it() {
+        let data = tempfile::tempdir().unwrap();
+        let state = state(data.path());
+        let secrets = |generation: &str| {
+            data.path()
+                .join("compose-secrets")
+                .join("temps-1-2")
+                .join(generation)
+        };
+        for generation in ["deployment-1-a", "deployment-2-b"] {
+            std::fs::create_dir_all(secrets(generation)).unwrap();
+            std::fs::write(secrets(generation).join("db_password"), "s3cret").unwrap();
+            std::fs::create_dir_all(state.generation_dir("temps-1-2", generation).join("source"))
+                .unwrap();
+        }
+        let Some(expired_at) =
+            std::time::Instant::now().checked_sub(PREPARED_TTL + std::time::Duration::from_secs(1))
+        else {
+            println!("monotonic clock too young to backdate a prepare, skipping");
+            return;
+        };
+        let mut expired =
+            prepared_generation_in(data.path(), "temps-1-2", "deployment-1-a", "10.20.0.5");
+        expired.prepared_at = expired_at;
+        state.prepared.lock().await.insert(
+            ("temps-1-2".to_string(), "deployment-1-a".to_string()),
+            expired,
+        );
+        state.prepared.lock().await.insert(
+            ("temps-1-2".to_string(), "deployment-2-b".to_string()),
+            prepared_generation_in(data.path(), "temps-1-2", "deployment-2-b", "10.20.0.5"),
+        );
+
+        state.evict_stale().await;
+
+        assert!(!secrets("deployment-1-a").exists());
+        assert!(!state.generation_dir("temps-1-2", "deployment-1-a").exists());
+        assert!(secrets("deployment-2-b").join("db_password").exists());
+        assert!(state
+            .prepared
+            .lock()
+            .await
+            .contains_key(&("temps-1-2".to_string(), "deployment-2-b".to_string())));
     }
 
     /// A stack that started on the address its generation was prepared with

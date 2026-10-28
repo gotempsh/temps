@@ -15,14 +15,18 @@ use crate::compose::{ComposeDeployFailure, ComposeError, ComposeOutputSink, Comp
 use crate::compose_protocol::{
     pack_compose_stack, ComposeAck, ComposeGenerationRequest, ComposeHostEvent, ComposePrepareSpec,
     ComposePruneRequest, ComposeRemoveVerifiedRequest, ComposeStackRequest,
-    MAX_COMPOSE_EVENT_BYTES, MAX_COMPOSE_SPEC_BYTES,
+    COMPOSE_PREPARE_DEADLINE, COMPOSE_PREPARE_QUEUE_TIMEOUT, MAX_COMPOSE_EVENT_BYTES,
+    MAX_COMPOSE_SPEC_BYTES,
 };
 use temps_presets::compose_check::ComposeCheckErrorClass;
 
-/// Prepare builds and pulls on the worker: as long as an image build may take
-/// there (30 minutes once admitted), plus the upload, plus a margin so the
-/// worker's own timeout answer arrives first.
-const COMPOSE_PREPARE_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
+/// Prepare waits for an image-operation slot on the worker and then builds
+/// and pulls there, each bounded by the worker. This outlasts both together,
+/// with a margin for the upload and for waiting on the project's lifecycle
+/// lock, so the worker's own timeout answer arrives before this one fires.
+const COMPOSE_PREPARE_REQUEST_TIMEOUT: Duration = Duration::from_secs(
+    COMPOSE_PREPARE_QUEUE_TIMEOUT.as_secs() + COMPOSE_PREPARE_DEADLINE.as_secs() + 15 * 60,
+);
 /// Starting a stack waits for its services to become ready, bounded by the
 /// project's startup timeout; this outlasts any value the setting allows.
 const COMPOSE_DEPLOY_REQUEST_TIMEOUT: Duration = Duration::from_secs(61 * 60);
@@ -344,5 +348,21 @@ fn upgrade_hint(status: reqwest::StatusCode) -> &'static str {
          worker"
     } else {
         ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The control plane must not give up on a prepare the worker may still
+    /// legitimately be running: a slow queue followed by a long build would
+    /// otherwise fail as a transport timeout instead of the worker's answer.
+    #[test]
+    fn a_prepare_request_outlasts_the_worker_queue_and_deadline() {
+        assert!(
+            COMPOSE_PREPARE_REQUEST_TIMEOUT
+                > COMPOSE_PREPARE_QUEUE_TIMEOUT + COMPOSE_PREPARE_DEADLINE
+        );
     }
 }

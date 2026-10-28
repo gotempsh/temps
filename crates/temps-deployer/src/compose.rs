@@ -1581,7 +1581,7 @@ pub struct ComposeExecutor {
 impl ComposeExecutor {
     /// Bind the stack's published ports to `address` instead of loopback.
     ///
-    /// Only private, non-wildcard addresses are accepted: the point of the
+    /// Only loopback and private addresses are accepted: the point of the
     /// loopback rule is that published ports never bypass the Temps proxy,
     /// and a worker's private address is reachable only from the cluster.
     pub fn with_published_host_ip(
@@ -1593,6 +1593,14 @@ impl ComposeExecutor {
                 address: address.to_string(),
                 reason: "a wildcard or multicast address would publish the stack's ports on \
                          every interface"
+                    .to_string(),
+            });
+        }
+        if !temps_core::node_address::is_private_publish_address(address) {
+            return Err(ComposeError::InvalidPublishedHostAddress {
+                address: address.to_string(),
+                reason: "it is neither loopback nor a private address, so the stack's ports \
+                         would be reachable from outside the cluster without the Temps proxy"
                     .to_string(),
             });
         }
@@ -10443,7 +10451,7 @@ mod tests {
 
     /// A worker can never ask to publish on every interface.
     #[test]
-    fn published_host_ip_rejects_wildcard_addresses() {
+    fn published_host_ip_accepts_only_loopback_and_private_addresses() {
         let executor = || {
             ComposeExecutor::new_with_handle(
                 Arc::new(DockerHandle::disabled(
@@ -10453,19 +10461,27 @@ mod tests {
                 std::env::temp_dir(),
             )
         };
-        for wildcard in ["0.0.0.0", "::", "239.0.0.1"] {
+        for refused in ["0.0.0.0", "::", "239.0.0.1", "203.0.113.10", "2001:db8::10"] {
             let error = executor()
-                .with_published_host_ip(wildcard.parse().unwrap())
+                .with_published_host_ip(refused.parse().unwrap())
                 .unwrap_err();
             assert!(
                 matches!(error, ComposeError::InvalidPublishedHostAddress { .. }),
-                "{error}"
+                "{refused}: {error}"
             );
         }
-        let executor = executor()
-            .with_published_host_ip("10.20.0.5".parse().unwrap())
-            .unwrap();
-        assert_eq!(executor.published_host_ip().to_string(), "10.20.0.5");
+        for accepted in [
+            "10.20.0.5",
+            "192.168.1.9",
+            "fd00::7",
+            "127.0.0.1",
+            "127.0.0.53",
+        ] {
+            let executor = executor()
+                .with_published_host_ip(accepted.parse().unwrap())
+                .unwrap();
+            assert_eq!(executor.published_host_ip().to_string(), accepted);
+        }
     }
 
     #[test]

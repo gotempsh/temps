@@ -194,7 +194,13 @@ pub fn placement_drift(
         let labels = home_labels.and_then(serde_json::Value::as_object);
         let unmatched: Vec<String> = selectors
             .iter()
-            .filter(|(key, value)| labels.and_then(|labels| labels.get(*key)) != Some(*value))
+            // The scheduler's rule, so drift never disagrees with where a
+            // first deployment would have been placed.
+            .filter(|(key, value)| {
+                !labels
+                    .and_then(|labels| labels.get(*key))
+                    .is_some_and(|label| super::node_scheduler::label_value_matches(label, value))
+            })
             .map(|(key, value)| match value.as_str() {
                 Some(text) => format!("{key}={text}"),
                 None => format!("{key}={value}"),
@@ -830,6 +836,16 @@ impl ComposePlacementService {
                     ),
                 });
             }
+            if super::node_scheduler::is_build_only_node(&node) {
+                return Err(ComposePlacementError::InvalidMove {
+                    environment_id,
+                    reason: format!(
+                        "worker node '{}' (id {node_id}) is a build-only node \
+                         (temps.sh/role=builder), which never hosts workloads",
+                        node.name
+                    ),
+                });
+            }
         }
         let (_, previous) = self
             .request_move(environment_id, target, acknowledge_data_loss)
@@ -1014,6 +1030,34 @@ mod tests {
             placement_drift(Some(3), "w", Some(&labels), None, Some(&selector)),
             None
         );
+    }
+
+    /// Drift reads Label Selectors with the scheduler's rules: an array
+    /// matches any of its values, and a non-string value compares with a
+    /// string label. A home the scheduler would pick is never drift.
+    #[test]
+    fn label_selectors_are_matched_as_the_scheduler_matches_them() {
+        let labels = serde_json::json!({ "region": "eu", "tier": "2" });
+        for selector in [
+            serde_json::json!({ "region": ["us", "eu"] }),
+            serde_json::json!({ "tier": 2 }),
+            serde_json::json!({ "region": ["eu"], "tier": ["1", "2"] }),
+        ] {
+            assert_eq!(
+                placement_drift(Some(3), "w", Some(&labels), None, Some(&selector)),
+                None,
+                "{selector}"
+            );
+        }
+        let drift = placement_drift(
+            Some(3),
+            "w",
+            Some(&labels),
+            None,
+            Some(&serde_json::json!({ "region": ["us", "ap"] })),
+        )
+        .unwrap();
+        assert!(drift.contains("region="), "{drift}");
     }
 
     /// A reported situation: a stack that has always run on the control
@@ -1490,6 +1534,28 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("is offline"), "{error}");
+
+        // A build-only node never hosts workloads, so it takes no stack.
+        let mut builder: nodes::ActiveModel = node.clone().into();
+        builder.status = Set("active".to_string());
+        builder.labels = Set(serde_json::json!({ "temps.sh/role": "builder" }));
+        builder.update(db.as_ref()).await?;
+        let error = service
+            .move_stack(project.id, environment.id, node.id, true)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ComposePlacementError::InvalidMove { .. }),
+            "{error}"
+        );
+        assert!(error.to_string().contains("build-only"), "{error}");
+        assert_eq!(
+            service
+                .status(project.id, environment.id)
+                .await?
+                .home_node_id,
+            Some(CONTROL_PLANE_NODE_ID)
+        );
         Ok(())
     }
 }

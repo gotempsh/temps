@@ -54,6 +54,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_email_provider",
             "delete_environment",
             "delete_environment_ip_access",
+            // Starts a Compose stack on another node with empty volumes; the
+            // user acknowledges the data loss in the console's Move dialog.
+            "move_compose_stack",
             "delete_git_provider",
             "delete_ingress_connector",
             "delete_project",

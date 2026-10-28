@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use temps_entities::compose_security::ComposeSecurityPolicy;
@@ -41,6 +42,13 @@ use crate::compose::{
 /// Bumped whenever a request or event changes shape incompatibly. A worker
 /// refuses a version it does not know rather than guessing.
 pub const COMPOSE_PROTOCOL_VERSION: u32 = 1;
+
+/// Longest a worker's prepare waits for one of the node's image-operation
+/// slots before refusing.
+pub const COMPOSE_PREPARE_QUEUE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Longest a worker's prepare (build and pull) may run once admitted.
+pub const COMPOSE_PREPARE_DEADLINE: Duration = Duration::from_secs(60 * 60);
 
 /// Largest prepare spec a worker accepts. Holds the resolved Compose file,
 /// its override, the repository `.env`, every variable and every secret

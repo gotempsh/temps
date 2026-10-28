@@ -14,7 +14,7 @@
 
 use sea_orm::{DatabaseBackend, MockDatabase};
 use std::sync::Arc;
-use temps_entities::{deployment_containers, deployments, environments, nodes};
+use temps_entities::{compose_placements, deployment_containers, deployments, environments, nodes};
 
 use temps_deployments::services::node_scheduler::{NodeAssignment, NodeScheduler};
 use temps_deployments::services::node_service::{HeartbeatRequest, NodeService};
@@ -519,6 +519,8 @@ async fn test_affected_deployments_identifies_needs_redeploy() {
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results(vec![vec![c1.clone(), c2.clone(), c3.clone()]])
         .append_query_results(vec![vec![d1, d2]])
+        // No Compose stack is pinned to node 5, so both may fail over.
+        .append_query_results(vec![Vec::<compose_placements::Model>::new()])
         .append_query_results(vec![vec![e1, e2]])
         .append_query_results(vec![vec![c1, c2, c3, c4, c5]])
         .into_connection();

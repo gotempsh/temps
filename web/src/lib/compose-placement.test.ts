@@ -15,7 +15,21 @@ describe('composeHomeSummary', () => {
     const summary = composeHomeSummary({ pinned: false })
     expect(summary.title).toBe('Not deployed yet')
     expect(summary.detail).toContain('Target Nodes')
-    expect(summary.detail).toContain('control plane')
+    // Empty constraints do not promise the control plane: the scheduler
+    // may pick a worker.
+    expect(summary.detail).toContain('control plane or any worker')
+  })
+
+  test('a stack with a pending move names the node still running it', () => {
+    const summary = composeHomeSummary({
+      pinned: true,
+      home_node_name: 'worker-b',
+      moving_from_node_id: 3,
+      moving_from_node_name: 'worker-a',
+    })
+    expect(summary.title).toBe('Runs on worker-a, moving to worker-b')
+    expect(summary.detail).toContain('next deployment starts it on worker-b')
+    expect(summary.detail).toContain('data on worker-a stays there')
   })
 
   test('a pinned stack names its home and why it stays', () => {
@@ -56,5 +70,18 @@ describe('moving a Compose stack', () => {
     expect(composeMoveCandidates(placement, nodes).map((n) => n.id)).toEqual([
       0, 4,
     ])
+  })
+
+  test('a build-only node is never offered as a target', () => {
+    const placement = { pinned: true, home_node_id: 0 }
+    const withBuilder = [
+      { id: 0, labels: {} },
+      { id: 3, labels: { 'temps.sh/role': 'builder' } },
+      { id: 4, labels: { 'temps.sh/role': 'dedicated' } },
+      { id: 5, labels: null },
+    ]
+    expect(
+      composeMoveCandidates(placement, withBuilder).map((n) => n.id)
+    ).toEqual([4, 5])
   })
 })

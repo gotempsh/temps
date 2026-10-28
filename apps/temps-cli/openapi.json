@@ -158252,10 +158252,6 @@
       "name": "Compose"
     },
     {
-      "description": "Docker Compose configuration diagnostics",
-      "name": "Compose"
-    },
-    {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
       "name": "Sandboxes"
     },

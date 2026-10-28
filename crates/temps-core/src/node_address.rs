@@ -5,6 +5,17 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+/// Whether published container ports may bind to `address`: loopback, or a
+/// private address (see [`is_private_node_address`]). No public interface
+/// answers on either, so ports bound there never bypass the Temps proxy.
+pub fn is_private_publish_address(address: IpAddr) -> bool {
+    address.is_loopback()
+        || match address {
+            IpAddr::V4(v4) => v4.is_private(),
+            IpAddr::V6(v6) => v6.is_unique_local(),
+        }
+}
+
 /// Whether a node's registered address (`ip` or `ip:port`) is private: RFC
 /// 1918 or IPv6 unique-local. Only such an address may carry published
 /// workload ports; a node that joined with anything else (a public IP, a
