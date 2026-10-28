@@ -1058,6 +1058,7 @@ mod tests {
                 project_id: Some(1),
                 environment_id: Some(1),
                 gate: None,
+                shield: None,
             }),
             addrs: Vec::new(),
             principals: None,

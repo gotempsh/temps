@@ -2445,7 +2445,10 @@ mod tests {
                                 client_ip,
                             ),
                             rate_limit,
-                            attack_mode: environment.attack_mode.unwrap_or(project.attack_mode),
+                            // As the proxy decides: attack mode is a Shield
+                            // mode (ADR 066), applied after this decision and
+                            // compiled into no endpoint.
+                            attack_mode: false,
                             captcha_path,
                             has_tls_fingerprint: request.tls,
                             password,
@@ -2509,8 +2512,6 @@ mod tests {
                 "ip_forbidden",
                 "rate_limit_blacklisted",
                 "too_many_requests",
-                "https_required",
-                "captcha_challenge",
                 "password_wall",
             ] {
                 assert!(

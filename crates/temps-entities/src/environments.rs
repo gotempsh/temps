@@ -49,6 +49,13 @@ pub struct Model {
     /// this environment, taking precedence over the project default.
     /// (A nullable boolean column maps to `Option<bool>` automatically.)
     pub attack_mode: Option<bool>,
+    /// ADR 066 D1: this environment's Shield mode; `None` inherits the
+    /// project's.
+    pub shield_mode: Option<String>,
+    /// ADR 066 D7: paths Shield never challenges here (`/api/*`, `/healthz`).
+    #[sea_orm(column_type = "JsonBinary")]
+    #[serde(default)]
+    pub shield_exempt_paths: ShieldExemptPaths,
     /// Per-environment override for the proxy's HTTP→HTTPS redirect.
     /// `None` (NULL) means inherit the proxy default, which redirects only when
     /// the requested host has an active TLS certificate. `Some(true)` always
@@ -148,6 +155,12 @@ impl Model {
         global_config.merge(&project_security).merge(&env_security)
     }
 }
+
+/// The exempt path patterns an environment stores (ADR 066, D7).
+#[derive(
+    Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, sea_orm::FromJsonQueryResult,
+)]
+pub struct ShieldExemptPaths(pub Vec<String>);
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {

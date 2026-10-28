@@ -78,6 +78,7 @@ pub mod update_status;
 pub mod ways_in;
 pub mod websocket_origin;
 pub mod worker_ingress;
+pub mod worker_shield;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
@@ -197,7 +198,7 @@ pub use app_settings::{
     ObservabilityCompressionSettings, ObservabilityRetentionSettings, OnDemandTlsSettings,
     ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
+    ShieldSettings, TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
     DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
     DEFAULT_GEO_REFRESH_INTERVAL_HOURS, DEFAULT_GEO_STALE_LOOKUP_DAYS,
     DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,

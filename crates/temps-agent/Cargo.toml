@@ -54,7 +54,8 @@ temps-workload-node = { path = "../temps-workload-node" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
 temps-metrics = { path = "../temps-metrics" }
-temps-shield = { path = "../temps-shield", features = ["tokio"] }
+temps-shield = { path = "../temps-shield", features = ["tokio", "crawlers", "netwatch"] }
+flate2 = { workspace = true }
 ipnet = "2.10"
 hickory-resolver = "0.26"
 parking_lot = "0.12"

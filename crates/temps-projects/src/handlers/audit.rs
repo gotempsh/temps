@@ -221,6 +221,10 @@ pub struct ProjectSettingsUpdatedFields {
     /// because it moves `/api/_temps` and `/api/otel` traffic on the
     /// project's domains away from this instance's analytics and OTLP ingest.
     pub serves_own_temps_api: Option<bool>,
+    /// The Shield mode stored after an update that changed it (ADR 066),
+    /// including one made through the legacy `attack_mode` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shield_mode: Option<temps_shield::ShieldMode>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {
@@ -377,6 +381,7 @@ mod tests {
                 log_ingest_lines_per_sec: None,
                 log_ingest_kib_per_sec: None,
                 serves_own_temps_api: None,
+                shield_mode: None,
             },
         };
 
@@ -408,6 +413,7 @@ mod tests {
             log_ingest_lines_per_sec: Some(None),
             log_ingest_kib_per_sec: Some(Some(0)),
             serves_own_temps_api: None,
+            shield_mode: None,
         };
         let json = serde_json::to_string(&fields).expect("fields serialize");
         assert!(json.contains("\"log_ingest_lines_per_sec\":null"), "{json}");

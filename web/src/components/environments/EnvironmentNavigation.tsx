@@ -21,11 +21,13 @@ import {
   LineChart,
   Plus,
   Settings2,
+  Shield,
 } from 'lucide-react'
 
 const views = [
   { value: 'containers', label: 'Containers', icon: Boxes },
   { value: 'metrics', label: 'Metrics', icon: LineChart },
+  { value: 'shield', label: 'Shield', icon: Shield },
   { value: 'settings', label: 'Settings', icon: Settings2 },
 ] as const
 

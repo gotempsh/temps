@@ -776,6 +776,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             last_activity_at: None,
             force_https: None,
             ingress_mode: Default::default(),

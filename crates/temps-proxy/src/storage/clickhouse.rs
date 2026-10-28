@@ -2428,7 +2428,7 @@ fn status_class_range(class: &str) -> Option<(i16, i16)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::traffic_aggregation::TrafficOrderBy;
 
@@ -2436,7 +2436,7 @@ mod tests {
     /// is optional for local/unit-test environments, so startup failures skip
     /// gracefully; once the server starts, migration/query failures are real
     /// test failures.
-    async fn setup_clickhouse_store(
+    pub(crate) async fn setup_clickhouse_store(
     ) -> Option<(ClickHouseProxyLogStore, Box<dyn std::any::Any + Send>)> {
         use testcontainers::{
             core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},

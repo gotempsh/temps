@@ -21,6 +21,7 @@ import {
   Server,
   Settings2,
   Shield,
+  ShieldCheck,
   Users,
   UsersRound,
   Waypoints,
@@ -124,6 +125,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
     label: 'Security',
     items: [
       { title: 'Security', url: '/settings/security', icon: Shield },
+      {
+        title: 'Shield proposals',
+        url: '/settings/shield-proposals',
+        icon: ShieldCheck,
+        keywords: ['learning', 'attackers', 'approve', 'block', 'review'],
+      },
       {
         title: 'On-demand TLS',
         url: '/settings/on-demand-tls',

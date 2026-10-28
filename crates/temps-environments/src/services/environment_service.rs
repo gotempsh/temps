@@ -988,6 +988,15 @@ impl EnvironmentService {
         } else {
             None
         };
+        // ADR 066 D7: refuse a pattern the proxy would not read the way it
+        // is written, with the parser's own explanation.
+        if let Some(paths) = &settings.shield_exempt_paths {
+            temps_shield::ExemptPaths::parse(paths).map_err(|e| {
+                EnvironmentError::InvalidInput(format!(
+                    "Invalid shield_exempt_paths for environment {env_id}: {e}"
+                ))
+            })?;
+        }
         let password_hash = match settings.password.as_ref().map(SecretString::expose) {
             Some(password) if !password.is_empty() => {
                 use argon2::{Argon2, PasswordHasher};
@@ -1168,8 +1177,43 @@ impl EnvironmentService {
         // deployment_config). `Some(inner)` applies the change: inner `None`
         // clears the override (NULL → inherit project), inner `Some(b)` sets it.
         // Outer `None` leaves the column unchanged.
-        if let Some(attack_mode) = settings.attack_mode {
+        //
+        // ADR 066: `shield_mode` replaces it, and both are written together
+        // for one release (see `shield_mode::environment_shield_write`).
+        let project_mode = if settings.shield_mode.is_none()
+            && settings.attack_mode == Some(Some(false))
+            && environment.shield_mode.is_none()
+        {
+            // Only a legacy "attack off" on an inheriting environment needs
+            // to know whether the project is in attack mode.
+            let project = projects::Entity::find_by_id(project_id_param)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| {
+                    EnvironmentError::NotFound(format!("Project {project_id_param} not found"))
+                })?;
+            temps_shield::ShieldMode::effective(
+                None,
+                &project.shield_mode,
+                None,
+                project.attack_mode,
+            )
+        } else {
+            temps_shield::ShieldMode::default()
+        };
+        if let Some((shield_mode, attack_mode)) = super::shield_mode::environment_shield_write(
+            settings.shield_mode,
+            settings.attack_mode,
+            crate::handlers::stored_shield_mode(environment.shield_mode.as_deref()),
+            || project_mode,
+        ) {
+            active_model.shield_mode = Set(shield_mode.map(|mode| mode.as_str().to_string()));
             active_model.attack_mode = Set(attack_mode);
+        }
+        if let Some(paths) = &settings.shield_exempt_paths {
+            let paths = paths.iter().map(|path| path.trim().to_string()).collect();
+            active_model.shield_exempt_paths =
+                Set(temps_entities::environments::ShieldExemptPaths(paths));
         }
         // force_https follows the same tri-state contract as attack_mode.
         if let Some(force_https) = settings.force_https {
@@ -1204,7 +1248,9 @@ impl EnvironmentService {
             || settings.idle_timeout_seconds.is_some()
             || settings.wake_timeout_seconds.is_some()
             || settings.force_https.is_some()
-            || settings.attack_mode.is_some();
+            || settings.attack_mode.is_some()
+            || settings.shield_mode.is_some()
+            || settings.shield_exempt_paths.is_some();
         if routing_relevant_changed {
             // "NOTIFY route_table_changes" is a fully hardcoded string — no
             // user-controlled data is interpolated. Statement::from_string is
@@ -1903,6 +1949,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
@@ -2025,6 +2073,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
@@ -2077,6 +2127,8 @@ mod tests {
                     build_location: None,
                     protected: None,
                     attack_mode: None,
+                    shield_mode: None,
+                    shield_exempt_paths: None,
                     force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
@@ -2128,6 +2180,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
@@ -2188,6 +2242,8 @@ mod tests {
                     build_location: None,
                     protected: None,
                     attack_mode: None,
+                    shield_mode: None,
+                    shield_exempt_paths: None,
                     force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
@@ -2247,6 +2303,8 @@ mod tests {
             build_location: None,
             protected: None,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: None,
             force_https: None,
             on_demand: None,
             idle_timeout_seconds: None,
@@ -2328,6 +2386,140 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// ADR 066 I10: a Shield mode is stored with the attack-mode column the
+    /// older consoles read, and the exempt paths as sent.
+    #[tokio::test]
+    async fn a_shield_mode_is_written_with_attack_mode_and_exempt_paths() {
+        let current = env_for_ceiling_test();
+        let updated = environments::Model {
+            shield_mode: Some("attack".into()),
+            attack_mode: Some(true),
+            shield_exempt_paths: temps_entities::environments::ShieldExemptPaths(vec![
+                "/api/*".into()
+            ]),
+            ..current.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![current]])
+                .append_query_results([vec![updated]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db.clone(), Default::default());
+        let result = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    shield_mode: Some(Some(temps_shield::ShieldMode::Attack)),
+                    shield_exempt_paths: Some(vec![" /api/* ".into()]),
+                    ..empty_settings_request()
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.shield_mode.as_deref(), Some("attack"));
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        // The UPDATE carries the mode, attack mode and the trimmed paths,
+        // and the proxy is told to reload.
+        assert!(log.contains(r#"String(Some("attack"))"#), "{log}");
+        assert!(log.contains("Bool(Some(true))"), "{log}");
+        assert!(log.contains(r#"String("/api/*")"#), "{log}");
+        assert!(log.contains("NOTIFY route_table_changes"), "{log}");
+    }
+
+    /// An older console that turns attack mode off on an environment that
+    /// inherits a project in attack mode must take it out of attack, so the
+    /// environment stops inheriting and runs in `log`.
+    #[tokio::test]
+    async fn a_legacy_attack_mode_off_takes_an_inheriting_environment_out_of_attack() {
+        let current = env_for_ceiling_test();
+        let mut project = hosting_project(temps_entities::source_type::SourceType::Git);
+        project.shield_mode = "attack".into();
+        project.attack_mode = true;
+        let updated = environments::Model {
+            shield_mode: Some("log".into()),
+            attack_mode: Some(false),
+            ..current.clone()
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![current]])
+                .append_query_results([vec![project]])
+                .append_query_results([vec![updated]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = service_with_ceilings(db.clone(), Default::default());
+        service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    attack_mode: Some(Some(false)),
+                    ..empty_settings_request()
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap();
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(log.contains(r#"FROM \"projects\""#), "{log}");
+        assert!(log.contains(r#"String(Some("log"))"#), "{log}");
+        assert!(log.contains("Bool(Some(false))"), "{log}");
+    }
+
+    /// A pattern the proxy would read differently from how it is written is
+    /// refused with the parser's explanation, before anything is read or
+    /// written.
+    #[tokio::test]
+    async fn invalid_exempt_paths_are_refused_before_any_write() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = service_with_ceilings(db.clone(), Default::default());
+        let error = service
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    shield_exempt_paths: Some(vec!["/ok/*".into(), "api/*".into()]),
+                    ..empty_settings_request()
+                },
+                temps_core::CeilingEnforcement::Bypass,
+            )
+            .await
+            .unwrap_err();
+        match error {
+            EnvironmentError::InvalidInput(message) => {
+                assert!(message.contains("environment 1"), "{message}");
+                assert!(message.contains("`api/*` is not a path"), "{message}");
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        drop(service);
+        assert!(Arc::try_unwrap(db)
+            .unwrap()
+            .into_transaction_log()
+            .is_empty());
     }
 
     fn service_with_ceilings(
@@ -2439,6 +2631,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
@@ -2563,6 +2757,8 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: Default::default(),
@@ -2710,7 +2906,7 @@ mod tests {
             "repo_name": "", "repo_owner": "", "directory": "/",
             "main_branch": "main", "preset": "nixpacks", "pull_only_root_directory": false,
             "created_at": chrono::Utc::now(), "updated_at": chrono::Utc::now(),
-            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "ai_write_actions_enabled": false,
+            "is_deleted": false, "is_public_repo": false, "attack_mode": false, "shield_mode": "log", "ai_write_actions_enabled": false,
             "error_source_context_enabled": false, "vulnerability_scanning_enabled": false,
             "enable_preview_environments": false, "preview_envs_on_demand": false,
             "preview_envs_idle_timeout_seconds": 300, "preview_envs_wake_timeout_seconds": 30,
@@ -3081,6 +3277,8 @@ mod tests {
             build_location: None,
             protected: None,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: None,
             force_https: None,
             on_demand: None,
             idle_timeout_seconds: None,

@@ -4478,6 +4478,13 @@
             "description": "Set to `true` by `temps setup` (all modes) once initial configuration\nhas been applied. The web onboarding wizard reads this from the server\nand skips itself when true, preventing the \"Configure Base Domain\" wall\nfrom appearing on installs that were already configured via the CLI.",
             "type": "boolean"
           },
+          "shield": {
+            "$ref": "#/components/schemas/ShieldSettings",
+            "default": {
+              "share_observations": true
+            },
+            "description": "ADR 066: platform-wide Shield settings."
+          },
           "tenant_resource_ceilings": {
             "$ref": "#/components/schemas/TenantResourceCeilings",
             "default": {
@@ -15965,68 +15972,6 @@
         ],
         "type": "object"
       },
-      "CreateFunctionRequest": {
-        "description": "Exactly one of `wasm_base64` and `image`.",
-        "properties": {
-          "idle_timeout_seconds": {
-            "description": "Seconds without a request before it is stopped. 10..=86400, default 300.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "image": {
-            "description": "An OCI image reference that serves HTTP on `port`.",
-            "example": "registry.example.com/team/fn:1",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "memory_limit_mb": {
-            "description": "Memory limit in MiB. 1..=4096.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "name": {
-            "description": "Lowercase letters, digits and single inner hyphens; unique in the\nproject. Part of the hostname.",
-            "example": "resize-image",
-            "type": "string"
-          },
-          "port": {
-            "description": "Port the function serves on. Default 8080.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "wake_timeout_seconds": {
-            "description": "Seconds the first request waits for it to start. 1..=300, default 30.",
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "wasm_base64": {
-            "description": "A WASI preview 1 core module (`wasm32-wasip1`), base64. It serves\nHTTP CGI-style: the request body on stdin, the response on stdout.",
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "name"
-        ],
-        "type": "object"
-      },
       "CreateFunnelRequest": {
         "properties": {
           "description": {
@@ -17756,6 +17701,61 @@
         ],
         "type": "object"
       },
+      "CreateShieldEntryRequest": {
+        "properties": {
+          "expires_at": {
+            "description": "When the entry stops applying; omit for never.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4": {
+            "description": "A JA4 fingerprint; exactly one of `network` and `ja4`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network": {
+            "description": "An address or CIDR range; exactly one of `network` and `ja4`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ShieldEntryVerdict"
+          }
+        },
+        "required": [
+          "verdict"
+        ],
+        "type": "object"
+      },
+      "CreateShieldTokenRequest": {
+        "properties": {
+          "name": {
+            "description": "What uses it: `uptime monitor`, `CI`.",
+            "type": "string"
+          },
+          "project_wide": {
+            "description": "Valid for every environment of the project, not only this one.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "CreateSkillRequest": {
         "properties": {
           "content": {
@@ -18059,6 +18059,27 @@
           "resource_name"
         ],
         "type": "object"
+      },
+      "CreatedShieldTokenResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ShieldTokenResponse"
+          },
+          {
+            "properties": {
+              "secret": {
+                "description": "Send it in `X-Temps-Shield-Token`.",
+                "example": "tst_12_…",
+                "type": "string"
+              }
+            },
+            "required": [
+              "secret"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "A new bypass token. `secret` is shown this once and never again."
       },
       "CronExecutionInfo": {
         "properties": {
@@ -25996,6 +26017,24 @@
             "description": "When true, git pushes do NOT auto-deploy to this environment.\nDeployments must be promoted from another environment.",
             "type": "boolean"
           },
+          "shield_exempt_paths": {
+            "description": "Paths Shield never challenges in this environment (ADR 066 D7):\n`/api/*` exempts everything under `/api/`, any other entry one exact\npath.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "shield_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ShieldMode",
+                "description": "This environment's Shield mode (ADR 066 D1). `null` inherits the\nproject's. Always serialized so the UI can tell `null` from a value."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "sleeping": {
             "description": "When true, the environment's containers are currently stopped due to\ninactivity (on-demand mode) and will start on the next request.",
             "type": "boolean"
@@ -26023,7 +26062,9 @@
           "updated_at",
           "is_preview",
           "protected",
-          "sleeping"
+          "sleeping",
+          "shield_mode",
+          "shield_exempt_paths"
         ],
         "type": "object"
       },
@@ -29898,183 +29939,6 @@
           "host",
           "path",
           "status"
-        ],
-        "type": "object"
-      },
-      "FunctionListResponse": {
-        "properties": {
-          "functions": {
-            "items": {
-              "$ref": "#/components/schemas/FunctionResponse"
-            },
-            "type": "array"
-          },
-          "page": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "page_size": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "total_pages": {
-            "format": "int64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "functions",
-          "total",
-          "page",
-          "page_size",
-          "total_pages"
-        ],
-        "type": "object"
-      },
-      "FunctionResponse": {
-        "properties": {
-          "artifact_kind": {
-            "description": "`wasm` or `oci`.",
-            "type": "string"
-          },
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "hostname": {
-            "description": "Requests to this hostname reach the function.",
-            "type": "string"
-          },
-          "id": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "idle_timeout_seconds": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "image_reference": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "memory_limit_mb": {
-            "format": "int32",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "name": {
-            "type": "string"
-          },
-          "port": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "project_id": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "ready_message": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "ready_reason": {
-            "description": "Why it is not serving (the plane's `Ready` reason), on the detail view.",
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "state": {
-            "description": "`asleep`, `waking`, `awake`, `sleeping`, or `unregistered`.",
-            "type": "string"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "wake_timeout_seconds": {
-            "format": "int32",
-            "type": "integer"
-          },
-          "wasm_digest": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "wasm_size_bytes": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
-          "workload_id": {
-            "format": "int64",
-            "type": [
-              "integer",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "id",
-          "project_id",
-          "name",
-          "artifact_kind",
-          "port",
-          "idle_timeout_seconds",
-          "wake_timeout_seconds",
-          "hostname",
-          "state",
-          "created_at",
-          "updated_at"
-        ],
-        "type": "object"
-      },
-      "FunctionsCapabilityResponse": {
-        "description": "Whether functions can be created here, and what is missing if not.",
-        "properties": {
-          "configured": {
-            "type": "boolean"
-          },
-          "oci": {
-            "$ref": "#/components/schemas/RuntimeAvailabilityResponse"
-          },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "setup_path": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "wasm": {
-            "$ref": "#/components/schemas/RuntimeAvailabilityResponse"
-          }
-        },
-        "required": [
-          "configured",
-          "wasm",
-          "oci"
         ],
         "type": "object"
       },
@@ -34160,6 +34024,16 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "overlay_addresses": {
+            "description": "The overlay address of each running Temps container on the node, sent\nwhen the set changes. Absent from older agents.",
+            "items": {
+              "$ref": "#/components/schemas/OverlayAddressReport"
+            },
+            "type": [
+              "array",
+              "null"
             ]
           },
           "public_ingress": {
@@ -45620,6 +45494,22 @@
         ],
         "type": "object"
       },
+      "OverlayAddressReport": {
+        "description": "One running container's overlay address, from a heartbeat.",
+        "properties": {
+          "container_name": {
+            "type": "string"
+          },
+          "ip": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "container_name",
+          "ip"
+        ],
+        "type": "object"
+      },
       "OverlayHeartbeat": {
         "description": "Cross-node overlay state reported by the agent (ADR 056).",
         "properties": {
@@ -50569,7 +50459,7 @@
             ]
           },
           "attack_mode": {
-            "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments",
+            "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments\n\nKept for one release for consoles that predate Shield modes; it is\ntrue exactly when `shield_mode` is `attack`.",
             "type": "boolean"
           },
           "created_at": {
@@ -50782,6 +50672,10 @@
               "null"
             ]
           },
+          "shield_mode": {
+            "$ref": "#/components/schemas/ShieldMode",
+            "description": "How Shield acts on verdicts in the project's environments (ADR 066\nD1); an environment can set its own."
+          },
           "slug": {
             "type": "string"
           },
@@ -50818,6 +50712,7 @@
           "is_public_repo",
           "deployment_config",
           "attack_mode",
+          "shield_mode",
           "error_source_context_enabled",
           "vulnerability_scanning_enabled",
           "enable_preview_environments",
@@ -58108,23 +58003,6 @@
         ],
         "type": "object"
       },
-      "RuntimeAvailabilityResponse": {
-        "properties": {
-          "available": {
-            "type": "boolean"
-          },
-          "reason": {
-            "type": [
-              "string",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "available"
-        ],
-        "type": "object"
-      },
       "RuntimeCoverage": {
         "properties": {
           "availability_percent": {
@@ -63647,6 +63525,671 @@
         },
         "type": "object"
       },
+      "ShieldChallengeCounts": {
+        "description": "Challenges in the window.",
+        "properties": {
+          "failed": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "issued": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "solved": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "issued",
+          "solved",
+          "failed"
+        ],
+        "type": "object"
+      },
+      "ShieldEntryResponse": {
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "description": "After this the entry no longer applies; `null` for never.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ja4": {
+            "description": "The fingerprint, when the entry names one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "network": {
+            "description": "The address range, when the entry names one.",
+            "example": "185.93.89.0/24",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ShieldEntryScope"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ShieldEntryVerdict"
+          }
+        },
+        "required": [
+          "id",
+          "scope",
+          "verdict",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ShieldEntryScope": {
+        "description": "Whose entries: the platform's, or one project's.",
+        "enum": [
+          "platform",
+          "project"
+        ],
+        "type": "string"
+      },
+      "ShieldEntryVerdict": {
+        "description": "The verdict an operator entry gives what it matches.",
+        "enum": [
+          "allow",
+          "log",
+          "challenge",
+          "block"
+        ],
+        "type": "string"
+      },
+      "ShieldEventResponse": {
+        "properties": {
+          "difficulty": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "ip": {
+            "type": "string"
+          },
+          "ja4": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`verdict`, `challenge_issued`, `challenge_solved` or\n`challenge_failed`.",
+            "type": "string"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "node_id": {
+            "description": "The worker that saw it; `null` on the control plane.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "path": {
+            "type": "string"
+          },
+          "reasons": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "signature": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "solve_ms": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "user_agent": {
+            "type": "string"
+          },
+          "verdict": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "timestamp",
+          "kind",
+          "ip",
+          "verdict",
+          "mode",
+          "reasons",
+          "host",
+          "path",
+          "user_agent",
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "ShieldEventsResponse": {
+        "properties": {
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ShieldEventResponse"
+            },
+            "type": "array"
+          },
+          "next_before": {
+            "description": "Pass as `before` for the next page; `null` when this one is the last.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "type": "object"
+      },
+      "ShieldLookupResponse": {
+        "properties": {
+          "action": {
+            "description": "`pass`, `log`, `challenge` or `block`: what the lists say.",
+            "type": "string"
+          },
+          "allowed": {
+            "description": "An operator allow rule matched: the client passes whatever else it\nmatches.",
+            "type": "boolean"
+          },
+          "enforced": {
+            "description": "Whether this environment acts on the action rather than recording it.",
+            "type": "boolean"
+          },
+          "ip": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ja4": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ShieldMode",
+            "description": "The environment's mode, which decides whether the action is taken."
+          },
+          "reasons": {
+            "description": "Why, one line per match: `spamhaus_drop (185.93.89.0/24)`.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "snapshot_revision": {
+            "description": "The snapshot looked up; `null` when none is stored yet and only the\nbuilt-in lists apply.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "action",
+          "allowed",
+          "reasons",
+          "mode",
+          "enforced"
+        ],
+        "type": "object"
+      },
+      "ShieldMode": {
+        "description": "How an environment acts on verdicts (D1).",
+        "enum": [
+          "off",
+          "log",
+          "selective",
+          "attack"
+        ],
+        "type": "string"
+      },
+      "ShieldModeSource": {
+        "description": "Where an environment's mode is set.",
+        "enum": [
+          "environment",
+          "project"
+        ],
+        "type": "string"
+      },
+      "ShieldProposalKind": {
+        "description": "What a proposal names.",
+        "enum": [
+          "ip",
+          "ja4"
+        ],
+        "type": "string"
+      },
+      "ShieldProposalPage": {
+        "description": "One page of proposals, newest evidence first.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ShieldProposalResponse"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "Proposals that match, on every page.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "page",
+          "page_size",
+          "total"
+        ],
+        "type": "object"
+      },
+      "ShieldProposalResponse": {
+        "description": "An address or fingerprint fleet learning proposes to challenge or block.",
+        "properties": {
+          "decided_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "decided_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "expires_at": {
+            "description": "After this the proposal, and an approval of it, no longer apply.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "first_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "hits": {
+            "description": "Events behind it in the last learning window.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ShieldProposalKind"
+          },
+          "last_seen": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "reason": {
+            "description": "The evidence, as learning summarised it.",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ShieldProposalStatus"
+          },
+          "subject": {
+            "description": "The address or the fingerprint.",
+            "example": "203.0.113.7",
+            "type": "string"
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ShieldEntryVerdict",
+            "description": "`challenge` or `block`."
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "subject",
+          "verdict",
+          "reason",
+          "hits",
+          "first_seen",
+          "last_seen",
+          "expires_at",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ShieldProposalStatus": {
+        "description": "Where a learned proposal stands. Only `approved` ones apply.",
+        "enum": [
+          "pending",
+          "approved",
+          "rejected"
+        ],
+        "type": "string"
+      },
+      "ShieldSettings": {
+        "description": "Platform-wide Shield settings (ADR 066, I10).",
+        "properties": {
+          "share_observations": {
+            "default": true,
+            "description": "Whether what one environment's visitors did counts for every\nenvironment (D9): addresses and fingerprints learned from events are\nproposed, and an approved proposal applies fleet-wide. Nothing\napplies without an approval. Off, nothing is proposed or applied.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "ShieldSolveTimes": {
+        "description": "How long visitors took to solve a challenge (D6).",
+        "properties": {
+          "median_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "p90_ms": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "samples": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "samples"
+        ],
+        "type": "object"
+      },
+      "ShieldSourceCount": {
+        "description": "Requests one source matched.",
+        "properties": {
+          "requests": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source": {
+            "description": "The list, rule or signature: `spamhaus_drop`, `operator`,\n`CVE-2021-41773`.",
+            "example": "spamhaus_drop",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "requests"
+        ],
+        "type": "object"
+      },
+      "ShieldSummaryResponse": {
+        "properties": {
+          "challenges": {
+            "$ref": "#/components/schemas/ShieldChallengeCounts"
+          },
+          "end": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "environment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/ShieldMode",
+            "description": "The mode the environment runs in."
+          },
+          "mode_source": {
+            "$ref": "#/components/schemas/ShieldModeSource"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "project_mode": {
+            "$ref": "#/components/schemas/ShieldMode",
+            "description": "The project's mode, which an inheriting environment runs in."
+          },
+          "solve_times": {
+            "$ref": "#/components/schemas/ShieldSolveTimes"
+          },
+          "sources": {
+            "description": "The sources behind those verdicts, most first (at most 20).",
+            "items": {
+              "$ref": "#/components/schemas/ShieldSourceCount"
+            },
+            "type": "array"
+          },
+          "start": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "storage": {
+            "description": "`clickhouse` or `postgres`: where the counts come from.",
+            "type": "string"
+          },
+          "verdicts": {
+            "$ref": "#/components/schemas/ShieldVerdictCounts",
+            "description": "Requests in the window with a verdict, from the request log."
+          },
+          "window": {
+            "$ref": "#/components/schemas/ShieldWindow"
+          },
+          "would_have": {
+            "$ref": "#/components/schemas/ShieldWouldHave",
+            "description": "Block and challenge verdicts Shield recorded without acting on them:\nwhat switching to `selective` would have stopped. The request log's\ncounts less the verdicts events show were acted on, so a window that\nwas partly in `selective` does not count those twice."
+          }
+        },
+        "required": [
+          "project_id",
+          "environment_id",
+          "window",
+          "start",
+          "end",
+          "mode",
+          "mode_source",
+          "project_mode",
+          "verdicts",
+          "sources",
+          "would_have",
+          "challenges",
+          "solve_times",
+          "storage"
+        ],
+        "type": "object"
+      },
+      "ShieldTokenResponse": {
+        "description": "A bypass token, without its secret.",
+        "properties": {
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "The environment it is limited to; `null` for a project-wide token.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_used_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/ShieldTokenScope"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "scope",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "ShieldTokenScope": {
+        "description": "Which environments a bypass token is valid for.",
+        "enum": [
+          "environment",
+          "project"
+        ],
+        "type": "string"
+      },
+      "ShieldVerdictCounts": {
+        "description": "Requests by verdict.",
+        "properties": {
+          "block": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "challenge": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "log": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "block",
+          "challenge",
+          "log"
+        ],
+        "type": "object"
+      },
+      "ShieldWindow": {
+        "description": "The window a summary covers.",
+        "enum": [
+          "1h",
+          "24h",
+          "7d"
+        ],
+        "type": "string"
+      },
+      "ShieldWouldHave": {
+        "description": "What would have happened in `selective`.",
+        "properties": {
+          "blocked": {
+            "description": "Requests with a block verdict that Shield only recorded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "challenged": {
+            "description": "Requests with a challenge verdict that Shield only recorded.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "blocked",
+          "challenged"
+        ],
+        "type": "object"
+      },
       "SiblingRef": {
         "description": "A sibling project that shares the same `trace_id` and has opted in to\ncross-project trace sharing (`cross_project_trace_sharing = TRUE`).\n\nReturned by `CrossProjectTraceService::find_sibling_projects` and exposed\nby the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.",
         "properties": {
@@ -63837,22 +64380,6 @@
         },
         "required": [
           "webhook_url"
-        ],
-        "type": "object"
-      },
-      "SleepFunctionResponse": {
-        "properties": {
-          "function": {
-            "$ref": "#/components/schemas/FunctionResponse"
-          },
-          "slept": {
-            "description": "Whether it was running and is now stopped.",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "function",
-          "slept"
         ],
         "type": "object"
       },
@@ -71442,7 +71969,7 @@
             ]
           },
           "attack_mode": {
-            "description": "Per-environment CAPTCHA attack-mode override (tri-state):\n- absent → leave the current override unchanged\n- JSON `null` → clear the override (inherit the project-level setting)\n- `true`/`false` → override the project setting for this environment",
+            "description": "Per-environment CAPTCHA attack-mode override (tri-state):\n- absent → leave the current override unchanged\n- JSON `null` → clear the override (inherit the project-level setting)\n- `true`/`false` → override the project setting for this environment\n\nKept for consoles that predate Shield modes: `true` sets the Shield\nmode to `attack`, `false` leaves attack, `null` inherits both. When\n`shield_mode` is also sent, `shield_mode` wins.",
             "type": [
               "boolean",
               "null"
@@ -71624,6 +72151,27 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "shield_exempt_paths": {
+            "description": "Paths Shield never challenges here (ADR 066 D7), replacing the stored\nlist: `/api/*` exempts everything under `/api/`, anything else one\nexact path; at most 64. Omit to leave them unchanged.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "shield_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ShieldMode",
+                "description": "This environment's Shield mode (ADR 066 D1), tri-state:\n- absent → leave it unchanged\n- JSON `null` → inherit the project's mode (and its attack mode)\n- `off`, `log`, `selective` or `attack` → use this mode here\n\n`attack_mode` is written to match for one release, so older consoles\nkeep reading the right value."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "sse_idle_timeout_seconds": {
@@ -72517,7 +73065,7 @@
             ]
           },
           "attack_mode": {
-            "description": "Enable/disable attack mode (CAPTCHA protection) for all project environments",
+            "description": "Enable/disable attack mode (CAPTCHA protection) for all project environments\n\nKept for consoles that predate Shield modes: `true` sets the Shield\nmode to `attack`, `false` turns attack back to `log`. When\n`shield_mode` is also sent, `shield_mode` wins.",
             "type": [
               "boolean",
               "null"
@@ -72658,6 +73206,17 @@
             "type": [
               "boolean",
               "null"
+            ]
+          },
+          "shield_mode": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ShieldMode",
+                "description": "How Shield acts on verdicts in the project's environments (ADR 066\nD1): `off`, `log`, `selective` or `attack`. `attack_mode` is written\nto match for one release. Omit to leave it unchanged."
+              },
+              {
+                "type": "null"
+              }
             ]
           },
           "slug": {
@@ -73120,6 +73679,31 @@
         },
         "required": [
           "message"
+        ],
+        "type": "object"
+      },
+      "UpdateShieldEntryRequest": {
+        "description": "Replaces an entry's verdict, note and expiry; what it matches stays.",
+        "properties": {
+          "expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verdict": {
+            "$ref": "#/components/schemas/ShieldEntryVerdict"
+          }
+        },
+        "required": [
+          "verdict"
         ],
         "type": "object"
       },
@@ -106781,37 +107365,6 @@
         "summary": "Every flag for the caller's environment, collapsed to what the evaluator\nneeds.",
         "tags": [
           "Feature Flags"
-        ]
-      }
-    },
-    "/functions/capability": {
-      "get": {
-        "operationId": "get_capability",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FunctionsCapabilityResponse"
-                }
-              }
-            },
-            "description": "Whether functions can run here"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
         ]
       }
     },
@@ -141147,6 +141700,666 @@
         ]
       }
     },
+    "/projects/{project_id}/environments/{environment_id}/shield/events": {
+      "get": {
+        "description": "Newest first. Pass `next_before` back as `before` for older ones.",
+        "operationId": "list_shield_events",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Events to return, 1 to 100; 20 by default.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only this kind: `verdict`, `challenge_issued`, `challenge_solved` or\n`challenge_failed`.",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this verdict: `block`, `challenge` or `log`.",
+            "in": "query",
+            "name": "verdict",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only this client address, IPv4 or IPv6.",
+            "in": "query",
+            "name": "ip",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Only events before this instant (the `next_before` of the previous\npage).",
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "format": "date-time",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEventsResponse"
+                }
+              }
+            },
+            "description": "Recent events"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Recent Shield events for an environment",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/shield/lookup": {
+      "get": {
+        "description": "Evaluates an address, a JA4 fingerprint or both against the newest stored\nsnapshot for this project, and says why (\"spamhaus_drop (185.93.89.0/24)\").",
+        "operationId": "lookup_shield_client",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "A client address.",
+            "in": "query",
+            "name": "ip",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A JA4 TLS fingerprint.",
+            "in": "query",
+            "name": "ja4",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldLookupResponse"
+                }
+              }
+            },
+            "description": "Verdict and reasons"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid address or fingerprint"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Look up what Shield says about a client",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/shield/summary": {
+      "get": {
+        "description": "The mode the environment runs in and where it is set, requests by verdict\nand by source, what `selective` would have blocked or challenged, and\nchallenge solve times, over the last hour, day or week.",
+        "operationId": "get_shield_summary",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "`1h`, `24h` (the default) or `7d`.",
+            "in": "query",
+            "name": "window",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ShieldWindow"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldSummaryResponse"
+                }
+              }
+            },
+            "description": "Shield summary"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Shield summary for an environment",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/shield/tokens": {
+      "get": {
+        "description": "The active tokens valid here: the environment's own and the project-wide\nones. Secrets are never returned.",
+        "operationId": "list_shield_tokens",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ShieldTokenResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Active bypass tokens"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List bypass tokens for an environment",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "post": {
+        "description": "Monitors, CI and API clients that send it in `X-Temps-Shield-Token` are\nnever challenged or blocked. The token is returned this once; only its\nhash is stored.",
+        "operationId": "create_shield_token",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateShieldTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedShieldTokenResponse"
+                }
+              }
+            },
+            "description": "Token created; `secret` is shown only now"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid name"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project or environment not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project has the most tokens it may hold"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Create a bypass token",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/shield/tokens/{token_id}": {
+      "delete": {
+        "description": "It stops working on every ingress once they reload their routes, which\nthis triggers.",
+        "operationId": "revoke_shield_token",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Bypass token ID",
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldTokenResponse"
+                }
+              }
+            },
+            "description": "Token revoked"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project, environment or token not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke a bypass token",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
     "/projects/{project_id}/error-alert-rules": {
       "get": {
         "operationId": "list_alert_rules",
@@ -143614,379 +144827,6 @@
         "summary": "Bring an archived flag back.",
         "tags": [
           "Feature Flags"
-        ]
-      }
-    },
-    "/projects/{project_id}/functions": {
-      "get": {
-        "operationId": "list_functions",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "1-based page. Default 1.",
-            "in": "query",
-            "name": "page",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            }
-          },
-          {
-            "description": "Default 20, max 100.",
-            "in": "query",
-            "name": "page_size",
-            "required": false,
-            "schema": {
-              "format": "int64",
-              "minimum": 0,
-              "type": [
-                "integer",
-                "null"
-              ]
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FunctionListResponse"
-                }
-              }
-            },
-            "description": "Functions, newest first"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
-        ]
-      },
-      "post": {
-        "operationId": "create_function",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CreateFunctionRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FunctionResponse"
-                }
-              }
-            },
-            "description": "Function created; it starts on its first request"
-          },
-          "400": {
-            "description": "Validation error"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Project not found"
-          },
-          "409": {
-            "description": "Name taken, or no runtime runs this artifact"
-          },
-          "500": {
-            "description": "Internal server error"
-          },
-          "503": {
-            "description": "The workload plane is not running"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
-        ]
-      }
-    },
-    "/projects/{project_id}/functions/{function_id}": {
-      "delete": {
-        "operationId": "delete_function",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Function ID",
-            "in": "path",
-            "name": "function_id",
-            "required": true,
-            "schema": {
-              "format": "int64",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Function deleted; its instance is removed"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Function not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          },
-          "503": {
-            "description": "The workload plane is not running"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
-        ]
-      },
-      "get": {
-        "operationId": "get_function",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Function ID",
-            "in": "path",
-            "name": "function_id",
-            "required": true,
-            "schema": {
-              "format": "int64",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FunctionResponse"
-                }
-              }
-            },
-            "description": "The function and its state"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Function not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
-        ]
-      }
-    },
-    "/projects/{project_id}/functions/{function_id}/sleep": {
-      "post": {
-        "operationId": "sleep_function",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Function ID",
-            "in": "path",
-            "name": "function_id",
-            "required": true,
-            "schema": {
-              "format": "int64",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SleepFunctionResponse"
-                }
-              }
-            },
-            "description": "The function is stopped"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Function not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
-        ]
-      }
-    },
-    "/projects/{project_id}/functions/{function_id}/wake": {
-      "post": {
-        "operationId": "wake_function",
-        "parameters": [
-          {
-            "description": "Project ID",
-            "in": "path",
-            "name": "project_id",
-            "required": true,
-            "schema": {
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          {
-            "description": "Function ID",
-            "in": "path",
-            "name": "function_id",
-            "required": true,
-            "schema": {
-              "format": "int64",
-              "type": "integer"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/FunctionResponse"
-                }
-              }
-            },
-            "description": "The function is running"
-          },
-          "401": {
-            "description": "Unauthorized"
-          },
-          "403": {
-            "description": "Insufficient permissions"
-          },
-          "404": {
-            "description": "Function not found"
-          },
-          "500": {
-            "description": "Internal server error"
-          },
-          "503": {
-            "description": "It could not be started; the detail says why"
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ],
-        "tags": [
-          "Functions"
         ]
       }
     },
@@ -148437,6 +149277,382 @@
         "summary": "Update project settings",
         "tags": [
           "Projects"
+        ]
+      }
+    },
+    "/projects/{project_id}/shield/entries": {
+      "get": {
+        "description": "Address ranges and fingerprints this project allows, logs, challenges or\nblocks, whatever the lists say.",
+        "operationId": "list_project_shield_entries",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ShieldEntryResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "The project's entries, newest first"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's Shield entries",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "post": {
+        "description": "One address, CIDR range or JA4 fingerprint, with the verdict it gets. It\napplies from the next snapshot, within minutes.",
+        "operationId": "create_project_shield_entry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateShieldEntryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "Entry added"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid network, fingerprint, note or expiry"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project has the most entries it may hold"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add a Shield entry to a project",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/projects/{project_id}/shield/entries/{entry_id}": {
+      "delete": {
+        "operationId": "delete_project_shield_entry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Entry removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found in this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a project's Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "put": {
+        "operationId": "update_project_shield_entry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateShieldEntryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "Entry changed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid note or expiry"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found in this project"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a project's Shield entry",
+        "tags": [
+          "Shield"
         ]
       }
     },
@@ -156090,6 +157306,707 @@
         ]
       }
     },
+    "/settings/shield": {
+      "get": {
+        "operationId": "get_shield_settings",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldSettings"
+                }
+              }
+            },
+            "description": "Platform Shield settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the platform Shield settings",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "put": {
+        "description": "Instance admins only; audit-logged as `SHIELD_SETTINGS_UPDATED`.",
+        "operationId": "update_shield_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShieldSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldSettings"
+                }
+              }
+            },
+            "description": "Settings saved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change the platform Shield settings",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/entries": {
+      "get": {
+        "description": "Entries that apply to every project.",
+        "operationId": "list_platform_shield_entries",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ShieldEntryResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Platform entries, newest first"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List platform Shield entries",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "post": {
+        "operationId": "create_platform_shield_entry",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateShieldEntryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "Entry added"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid network, fingerprint, note or expiry"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The platform has the most entries it may hold"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Add a platform Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/entries/{entry_id}": {
+      "delete": {
+        "operationId": "delete_platform_shield_entry",
+        "parameters": [
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Entry removed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove a platform Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      },
+      "put": {
+        "operationId": "update_platform_shield_entry",
+        "parameters": [
+          {
+            "description": "Entry ID",
+            "in": "path",
+            "name": "entry_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateShieldEntryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldEntryResponse"
+                }
+              }
+            },
+            "description": "Entry changed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid note or expiry"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Entry not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a platform Shield entry",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals": {
+      "get": {
+        "description": "Addresses and fingerprints learning proposes to challenge or block. None\napplies until an instance admin approves it.",
+        "operationId": "list_shield_proposals",
+        "parameters": [
+          {
+            "description": "Only proposals in this state; all of them when omitted.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ShieldProposalStatus"
+            }
+          },
+          {
+            "description": "Only proposals whose address or fingerprint contains this text,\nignoring case.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number, from 1 (the default).",
+            "example": 1,
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Proposals per page: 25 by default, at most 100.",
+            "example": 25,
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldProposalPage"
+                }
+              }
+            },
+            "description": "A page of proposals that have not expired, newest evidence first"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Search too long"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List fleet learning's proposals",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals/{proposal_id}/approve": {
+      "post": {
+        "description": "The address or fingerprint is challenged or blocked on every ingress\nuntil the proposal expires. Also changes an earlier rejection.",
+        "operationId": "approve_shield_proposal",
+        "parameters": [
+          {
+            "description": "Proposal ID",
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldProposalResponse"
+                }
+              }
+            },
+            "description": "Proposal approved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Proposal not found or expired"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Approve a proposal",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
+    "/settings/shield/proposals/{proposal_id}/reject": {
+      "post": {
+        "description": "Learning keeps the rejection until the proposal expires, so it is not\nproposed again meanwhile. Also withdraws an earlier approval.",
+        "operationId": "reject_shield_proposal",
+        "parameters": [
+          {
+            "description": "Proposal ID",
+            "in": "path",
+            "name": "proposal_id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShieldProposalResponse"
+                }
+              }
+            },
+            "description": "Proposal rejected"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Proposal not found or expired"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Reject a proposal",
+        "tags": [
+          "Shield"
+        ]
+      }
+    },
     "/settings/skills": {
       "get": {
         "operationId": "list_global_skills",
@@ -163565,10 +165482,6 @@
       "name": "Workload Volumes"
     },
     {
-      "description": "Upload a WASM module or an OCI image and serve it on its own hostname; it runs only while requests arrive",
-      "name": "Functions"
-    },
-    {
       "description": "Standalone sandbox API (`/v1/sandboxes/*`) for running isolated containers.",
       "name": "Sandboxes"
     },
@@ -163655,6 +165568,10 @@
     {
       "description": "Per-project and per-environment client IP allow/deny lists",
       "name": "Project IP Access"
+    },
+    {
+      "description": "Shield modes, events, lookups, bypass tokens and operator entries (ADR 066)",
+      "name": "Shield"
     },
     {
       "description": "Static file serving endpoints",

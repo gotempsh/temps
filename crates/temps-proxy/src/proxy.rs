@@ -1111,9 +1111,17 @@ pub struct ProxyContext {
     pub gated_host: bool,
     /// Who the gate admitted, for a signed-in address.
     pub gate_identity: Option<temps_core::gate::GateClaims>,
-    /// What the Shield reputation lists say about the client (ADR 066 D1),
-    /// when one holds it. Phase 2 only records it with the request log.
+    /// What Shield's lists and signals say about the request (ADR 066 D1),
+    /// when it is not `pass`. Recorded with the request log in every mode.
     pub shield: Option<temps_shield::Verdict>,
+    /// The `X-Temps-Shield` verdict, set only when Shield acted (D11).
+    pub shield_header: Option<&'static str>,
+    /// The environment Shield counted this request for, so its response
+    /// status feeds the same environment's adaptive difficulty (D6).
+    pub shield_env: Option<i32>,
+    /// The line netwatch gets for this request once its status is known
+    /// (ADR 066 D12); `None` without netwatch.
+    pub netwatch_line: Option<temps_shield::netwatch::RequestLine>,
     /// The client's JA4 and where it came from (ADR 066 D4), resolved with
     /// the client address. Recorded with the request log; nothing acts on
     /// it yet.
@@ -1169,12 +1177,10 @@ pub struct LoadBalancer {
     /// value always exists, whether or not a plugin claimed the slot.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
     request_policy_gate: Arc<dyn temps_core::RequestPolicyGate>,
-    /// Attack-mode challenges and clearances (ADR 066). Verifies without a
-    /// database; its only state is in memory.
-    challenge_gate: Arc<temps_shield::ChallengeGate>,
-    /// The Shield reputation lists (ADR 066 D2). The built-in baseline until
-    /// a loader swaps in a compiled snapshot; checked without locks or I/O.
-    shield_lists: Arc<crate::shield::ShieldLists>,
+    /// Shield (ADR 066): the decision engine, the reputation lists (the
+    /// built-in baseline until a loader swaps in a compiled snapshot), the
+    /// bypass tokens and the event sink. Decides without locks or I/O.
+    shield: crate::shield::ProxyShield,
     /// In-memory snapshot of domains that have a TLS certificate. Used by the
     /// HTTP→HTTPS redirect check instead of issuing 2 DB queries per request.
     /// Refreshed every 30 s by `CertHostCache::run_refresh_loop`. See WS3.
@@ -1333,6 +1339,48 @@ fn preview_next_from_query(query: Option<&str>) -> String {
     sanitize_next(&next)
 }
 
+/// When a request Shield would challenge but that cannot show the page (an
+/// API call, a POST) may retry (ADR 066, D7): by then the visitor may have
+/// loaded a page and earned a clearance.
+const SHIELD_RETRY_AFTER_SECS: u32 = 60;
+
+/// The problem body of that 429. It says what to do, never why.
+const SHIELD_CHALLENGE_PROBLEM: &str = r#"{"type":"about:blank","title":"Challenge required","status":429,"detail":"This site checks visitors before serving them. Open it in a browser to pass the check, then retry."}"#;
+
+/// A challenge over plain HTTP (426): the clearance cookie needs TLS.
+const SHIELD_HTTPS_REQUIRED_PAGE: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTPS required</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#0a0a0a;color:#e5e5e5}div{max-width:480px;padding:2rem;text-align:center}p{color:#a3a3a3}</style>
+</head>
+<body><div><h1>HTTPS required</h1><p>This site checks visitors over a secure connection. Open it with <strong>https://</strong> instead of http://.</p></div></body>
+</html>
+"#;
+
+/// Entity tags of the solver files, from their content.
+static SOLVER_JS_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(temps_shield::assets::SOLVER_JS.as_bytes()));
+static SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(temps_shield::assets::SOLVER_WASM));
+
+fn content_etag(content: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(content);
+    format!("\"{}\"", hex::encode(&digest[..12]))
+}
+
+/// How the client reached this ingress, which stands in for the JA4 in the
+/// visitor identity when there is none (ADR 066, D3).
+fn shield_source(ctx: &ProxyContext) -> &'static str {
+    ctx.client_fingerprint
+        .map(|fingerprint| fingerprint.source.as_str())
+        .unwrap_or(temps_shield::ja4::Ja4Source::Direct.as_str())
+}
+
+/// Project outages share a key; unscoped routes use their actual upstream.
 fn upstream_failure_key(
     project_id: Option<i32>,
     environment_id: Option<i32>,
@@ -1418,8 +1466,7 @@ impl LoadBalancer {
             ip_access_control_service,
             project_ip_gate,
             request_policy_gate: Arc::new(temps_core::OpenRequestPolicyGate),
-            challenge_gate,
-            shield_lists: Arc::new(crate::shield::ShieldLists::default()),
+            shield: crate::shield::ProxyShield::new(challenge_gate),
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
@@ -1542,7 +1589,46 @@ impl LoadBalancer {
     /// Check requests against `lists`, which a loader keeps current, instead
     /// of the built-in baseline alone.
     pub fn with_shield_lists(mut self, lists: Arc<crate::shield::ShieldLists>) -> Self {
-        self.shield_lists = lists;
+        self.shield.lists = lists;
+        self
+    }
+
+    /// Accept the bypass tokens `tokens` holds, which a loader keeps
+    /// current. Without it no token is accepted.
+    pub fn with_shield_bypass_tokens(mut self, tokens: Arc<crate::shield::BypassTokens>) -> Self {
+        self.shield.bypass = tokens;
+        self
+    }
+
+    /// Record Shield events in `events` instead of discarding them.
+    pub fn with_shield_events(mut self, events: Arc<dyn temps_shield::EventSink>) -> Self {
+        self.shield.events = events;
+        self
+    }
+
+    /// Talk to the node's netwatch (ADR 066 D12): its bans join the lists
+    /// as this node's own, and every request Shield sees is reported to it.
+    pub fn with_netwatch(mut self, netwatch: temps_shield::netwatch::Netwatch) -> Self {
+        self.shield.local = netwatch.local;
+        self.shield.netwatch = netwatch.sender;
+        self
+    }
+
+    /// What this node adds to the lists on its own (netwatch, ADR 066 D12).
+    pub fn with_shield_local_index(
+        mut self,
+        local: Arc<arc_swap::ArcSwapOption<temps_shield::Index>>,
+    ) -> Self {
+        self.shield.local = local;
+        self
+    }
+
+    /// Verify claimed crawlers with `verifier` instead of the system DNS.
+    pub fn with_crawler_verifier(
+        mut self,
+        verifier: Arc<temps_shield::crawler_check::CrawlerVerifier>,
+    ) -> Self {
+        self.shield.set_crawler_verifier(verifier);
         self
     }
 
@@ -1947,9 +2033,10 @@ impl LoadBalancer {
 
     /// Extract the TLS fingerprint, version and cipher of the connection.
     ///
-    /// The fingerprint describes only the TLS session. Attack mode binds a
-    /// clearance to it together with the client's /24 or /64 and the
-    /// User-Agent (ADR 066, D3), so it must not contain the full address.
+    /// The fingerprint describes only the TLS session, so it must not
+    /// contain the full address. Shield binds a clearance to the JA4
+    /// resolved here instead, with the client's /24 or /64 and the
+    /// User-Agent (ADR 066, D3).
     fn extract_tls_info(&self, session: &PingoraSession, ctx: &mut ProxyContext) {
         // The JA4 this ingress computed for the connection, if it ended TLS.
         let mut direct_ja4 = None;
@@ -2675,6 +2762,34 @@ impl LoadBalancer {
                 .await?;
         }
         ctx.routing_status = "status_page_host_not_found".to_string();
+        Ok(true)
+    }
+
+    /// Answers an ACME HTTP-01 request whose token is stored for this host,
+    /// and nothing else: `Ok(false)` for every other path.
+    async fn answer_stored_acme_challenge(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+    ) -> Result<bool> {
+        if !ctx.path.starts_with(ACME_HTTP01_PREFIX) {
+            return Ok(false);
+        }
+        let Some(key_authorization) = self
+            .handle_acme_http_challenge(&ctx.host, &ctx.path)
+            .await?
+        else {
+            return Ok(false);
+        };
+        let body = Bytes::from(key_authorization);
+        let mut resp = ResponseHeader::build(200, None)?;
+        resp.insert_header("Content-Type", "text/plain")?;
+        resp.insert_header("Cache-Control", "no-cache")?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        resp.insert_header("Content-Length", body.len().to_string())?;
+        session.write_response_header(Box::new(resp), false).await?;
+        session.write_response_body(Some(body), true).await?;
+        ctx.routing_status = "acme_challenge".to_string();
         Ok(true)
     }
 
@@ -3627,9 +3742,202 @@ impl LoadBalancer {
         Ok(outcome)
     }
 
+    /// Shield's decision for this request (ADR 066, D1, D6, D7, D11), and
+    /// its answer when it acts. `Ok(true)` when Shield answered the request.
+    ///
+    /// The pass path does no I/O and allocates nothing beyond the clearance
+    /// cookie's name in the modes that read it; a claimed crawler that would
+    /// be challenged waits at most [`crate::shield::CRAWLER_CHECK_TIMEOUT`]
+    /// for its DNS check.
+    async fn enforce_shield(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        project: &projects::Model,
+        environment: &environments::Model,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<bool> {
+        let policy = self.shield.policy(project, environment);
+        if policy.mode == temps_shield::ShieldMode::Off {
+            return Ok(false);
+        }
+        let now = temps_shield::unix_now();
+        // The clearance cookie is `__Host-` and `Secure`: only a TLS
+        // connection can receive one.
+        let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+        let (decision, netwatch_line) = {
+            let header = session.req_header();
+            let text = |name: &str| header.headers.get(name).and_then(|v| v.to_str().ok());
+            let mut matched = [("", ""); temps_shield::signatures::MATCHED_HEADERS.len()];
+            let mut count = 0;
+            for name in temps_shield::signatures::MATCHED_HEADERS {
+                if let Some(value) = text(name) {
+                    matched[count] = (name, value);
+                    count += 1;
+                }
+            }
+            // Only the modes that act read a clearance.
+            let clearance = if policy.mode.enforces() {
+                find_request_cookie(
+                    header,
+                    &temps_shield::clearance_cookie_name(environment.id),
+                    |value| Some(value.to_string()),
+                )
+            } else {
+                None
+            };
+            let ja4 = ctx
+                .client_fingerprint
+                .and_then(|fingerprint| fingerprint.ja4);
+            let request = temps_shield::Request {
+                ip: client_ip,
+                ja4: ja4.as_ref().map(|ja4| ja4.as_str()),
+                source: shield_source(ctx),
+                user_agent: &ctx.user_agent,
+                method: header.method.as_str(),
+                path: &ctx.path,
+                path_and_query: header
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or(&ctx.path),
+                accept: text("accept").unwrap_or_default(),
+                headers: &matched[..count],
+                clearance: clearance.as_deref(),
+                bypass_token: text(temps_shield::bypass::HEADER),
+                tls,
+            };
+            let decision = self.shield.decide(&policy, &request, now).await;
+            if decision.is_event() {
+                self.shield.submit(crate::shield::decision_event(
+                    &decision,
+                    &request,
+                    &crate::shield::EventContext {
+                        project_id: policy.project_id,
+                        environment_id: policy.environment_id,
+                        request_id: &ctx.request_id,
+                        host: &ctx.host,
+                    },
+                ));
+            }
+            let line = if self.shield.netwatch.is_enabled() {
+                temps_shield::netwatch::RequestLine::new(
+                    &request,
+                    &ctx.host,
+                    0,
+                    Some(&decision),
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            } else {
+                None
+            };
+            (decision, line)
+        };
+        ctx.shield_env = Some(environment.id);
+        ctx.netwatch_line = netwatch_line;
+        if let Some(temps_shield::Admitted::BypassToken(id)) = decision.admitted {
+            self.shield.bypass.record_use(id, now);
+        }
+        ctx.shield_header = decision.header_verdict();
+        let temps_shield::Decision {
+            verdict, outcome, ..
+        } = decision;
+        if verdict.action != temps_shield::Action::Pass {
+            ctx.shield = Some(verdict);
+        }
+        self.answer_shield(session, ctx, outcome).await
+    }
+
+    /// Writes Shield's answer for `outcome` (D1, D7). `Ok(false)` for a pass.
+    /// The response names the verdict in `X-Temps-Shield`, never the reason.
+    async fn answer_shield(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        outcome: temps_shield::Outcome,
+    ) -> Result<bool> {
+        use temps_shield::Outcome;
+        let (status, content_type, body, routing_status) = match outcome {
+            Outcome::Pass => return Ok(false),
+            Outcome::Block => (
+                StatusCode::FORBIDDEN,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"Forbidden\n"),
+                "shield_block",
+            ),
+            // The token is bound to this visitor, so no cache may keep or
+            // share the page.
+            Outcome::Challenge {
+                token, difficulty, ..
+            } => (
+                StatusCode::FORBIDDEN,
+                "text/html; charset=utf-8",
+                Bytes::from(crate::shield::challenge_page(
+                    &token,
+                    difficulty,
+                    ctx.ip_address.as_deref().unwrap_or("unknown"),
+                )),
+                "shield_challenge",
+            ),
+            Outcome::TooManyRequests => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "application/problem+json",
+                Bytes::from_static(SHIELD_CHALLENGE_PROBLEM.as_bytes()),
+                "shield_challenge",
+            ),
+            Outcome::HttpsRequired => (
+                StatusCode::UPGRADE_REQUIRED,
+                "text/html; charset=utf-8",
+                Bytes::from_static(SHIELD_HTTPS_REQUIRED_PAGE.as_bytes()),
+                "shield_https_required",
+            ),
+            Outcome::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/plain; charset=utf-8",
+                Bytes::from_static(b"Service unavailable\n"),
+                "shield_unavailable",
+            ),
+        };
+        let mut response = ResponseHeader::build(status, None)?;
+        response.insert_header("Content-Type", content_type)?;
+        response.insert_header("Content-Length", body.len().to_string())?;
+        response.insert_header("Cache-Control", "no-store")?;
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        if let Some(verdict) = ctx.shield_header {
+            response.insert_header(
+                temps_shield::RESPONSE_HEADER,
+                temps_shield::response_header_value(verdict, &ctx.request_id),
+            )?;
+        }
+        match status {
+            StatusCode::TOO_MANY_REQUESTS => {
+                response.insert_header("Retry-After", SHIELD_RETRY_AFTER_SECS.to_string())?;
+            }
+            StatusCode::UPGRADE_REQUIRED => {
+                response.insert_header("Upgrade", "TLS/1.2, HTTP/1.1")?;
+                response.insert_header("Connection", "Upgrade")?;
+            }
+            StatusCode::SERVICE_UNAVAILABLE => {
+                response.insert_header("Retry-After", "5")?;
+            }
+            _ => {}
+        }
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        let length = body.len() as i64;
+        session.write_response_body(Some(body), true).await?;
+        ctx.routing_status = routing_status.to_string();
+        // Requests the proxy answers itself never reach `log_request`; this
+        // one is recorded with its verdict (D11).
+        self.log_failed_request(ctx, status.as_u16(), Some(length));
+        Ok(true)
+    }
+
     /// Answers the challenge page's verify POST (ADR 066): reads the
-    /// solution, checks it against the visitor resolved for this connection,
-    /// and on success sets the clearance cookie for the environment the
+    /// solution, has the engine check it against the visitor resolved for
+    /// this connection (counting a failure towards a harder next challenge,
+    /// D6), and on success sets the clearance cookie for the environment the
     /// signed token names. That environment is not taken from how this
     /// request was routed: on a host with path routes (ADR 050) the verify
     /// path resolves to the host's own environment, not the routed one the
@@ -3638,6 +3946,9 @@ impl LoadBalancer {
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
+        project: &projects::Model,
+        environment: &environments::Model,
+        client_ip: Option<std::net::IpAddr>,
     ) -> Result<bool> {
         let mut body = Vec::new();
         let mut too_large = false;
@@ -3664,19 +3975,32 @@ impl LoadBalancer {
                 r#"{"ok":false,"error":"too_large"}"#.to_string(),
             )
         } else {
-            let identity = crate::shield::visitor_identity(
-                ctx.ip_address.as_deref(),
-                &ctx.user_agent,
-                ctx.tls_fingerprint.as_deref(),
-            );
-            match crate::shield::verify(
-                &self.challenge_gate,
-                &body,
-                &identity,
-                crate::shield::visitor_network(ctx.ip_address.as_deref()),
-                temps_shield::unix_now(),
-            ) {
-                crate::shield::VerifyOutcome::Cleared {
+            let ja4 = ctx
+                .client_fingerprint
+                .and_then(|fingerprint| fingerprint.ja4);
+            let request = temps_shield::Request {
+                ip: client_ip,
+                ja4: ja4.as_ref().map(|ja4| ja4.as_str()),
+                source: shield_source(ctx),
+                user_agent: &ctx.user_agent,
+                method: &ctx.method,
+                path: &ctx.path,
+                path_and_query: &ctx.path,
+                ..temps_shield::Request::default()
+            };
+            let mode = crate::shield::ProxyShield::mode(project, environment);
+            let context = crate::shield::EventContext {
+                project_id: project.id,
+                environment_id: environment.id,
+                request_id: &ctx.request_id,
+                host: &ctx.host,
+            };
+            match self
+                .shield
+                .engine
+                .verify(&body, &request, temps_shield::unix_now())
+            {
+                temps_shield::VerifyOutcome::Cleared {
                     env_id,
                     set_cookie,
                     solve_ms,
@@ -3684,20 +4008,39 @@ impl LoadBalancer {
                     debug!(
                         environment_id = env_id,
                         ?solve_ms,
-                        "Attack mode: challenge solved"
+                        "Shield: challenge solved"
                     );
+                    self.shield.submit(crate::shield::verify_event(
+                        Ok(solve_ms),
+                        mode,
+                        &request,
+                        &crate::shield::EventContext {
+                            environment_id: env_id,
+                            ..context
+                        },
+                    ));
                     (
                         StatusCode::OK,
                         Some(set_cookie),
                         r#"{"ok":true}"#.to_string(),
                     )
                 }
-                crate::shield::VerifyOutcome::Rejected(error) => {
-                    debug!(%error, "Attack mode: challenge rejected");
-                    let (status, code) = crate::shield::rejection_response(error);
-                    (status, None, format!(r#"{{"ok":false,"error":"{code}"}}"#))
+                temps_shield::VerifyOutcome::Rejected(error) => {
+                    debug!(%error, "Shield: challenge rejected");
+                    let (status, code) = temps_shield::rejection_response(error);
+                    self.shield.submit(crate::shield::verify_event(
+                        Err(code),
+                        mode,
+                        &request,
+                        &context,
+                    ));
+                    (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN),
+                        None,
+                        format!(r#"{{"ok":false,"error":"{code}"}}"#),
+                    )
                 }
-                crate::shield::VerifyOutcome::BadRequest => (
+                temps_shield::VerifyOutcome::BadRequest => (
                     StatusCode::BAD_REQUEST,
                     None,
                     r#"{"ok":false,"error":"bad_request"}"#.to_string(),
@@ -3731,48 +4074,58 @@ impl LoadBalancer {
         Ok(true)
     }
 
-    /// Serve embedded WASM files for CAPTCHA solver
-    /// Returns Ok(true) if file was served, Ok(false) if path doesn't match
-    async fn serve_wasm_file(
+    /// Serves the challenge page's solver (ADR 066, I1) from the copy built
+    /// into `temps-shield`. `Ok(false)` for any other path.
+    ///
+    /// The paths are not versioned, so the files are cached for an hour and
+    /// revalidated by their hash rather than kept for good: a new release
+    /// may ship a new solver under the same names.
+    async fn serve_solver_asset(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
     ) -> Result<bool> {
-        // Check if this is a WASM file request (use actual wasm-bindgen generated filenames)
-        if ctx.path == "/api/__temps/temps_captcha_wasm.js" {
-            let content = include_str!("../../temps-captcha-wasm/pkg/temps_captcha_wasm.js");
-            let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
-            resp.insert_header(
-                header::CONTENT_TYPE,
-                "application/javascript; charset=utf-8",
-            )?;
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
+        use temps_shield::assets;
+        let (content_type, content, etag): (_, &'static [u8], &str) =
+            if ctx.path == assets::SOLVER_JS_PATH {
+                (
+                    "application/javascript; charset=utf-8",
+                    assets::SOLVER_JS.as_bytes(),
+                    &SOLVER_JS_ETAG,
+                )
+            } else if ctx.path == assets::SOLVER_WASM_PATH {
+                ("application/wasm", assets::SOLVER_WASM, &SOLVER_WASM_ETAG)
+            } else {
+                return Ok(false);
+            };
+        let not_modified = session
+            .req_header()
+            .headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|tags| tags.split(',').any(|tag| tag.trim() == etag));
+        let status = if not_modified {
+            StatusCode::NOT_MODIFIED
+        } else {
+            StatusCode::OK
+        };
+        let mut resp = ResponseHeader::build(status, None)?;
+        resp.insert_header(header::CONTENT_TYPE, content_type)?;
+        resp.insert_header(header::CACHE_CONTROL, "public, max-age=3600")?;
+        resp.insert_header(header::ETAG, etag)?;
+        resp.insert_header("X-Content-Type-Options", "nosniff")?;
+        resp.insert_header("X-Request-ID", &ctx.request_id)?;
+        if not_modified {
+            session.write_response_header(Box::new(resp), true).await?;
+        } else {
+            resp.insert_header(header::CONTENT_LENGTH, content.len().to_string())?;
             session.write_response_header(Box::new(resp), false).await?;
             session
-                .write_response_body(Some(Bytes::from(content.as_bytes().to_vec())), true)
+                .write_response_body(Some(Bytes::from_static(content)), true)
                 .await?;
-
-            debug!("Served WASM JavaScript bindings: {}", ctx.path);
-            return Ok(true);
-        } else if ctx.path == "/api/__temps/temps_captcha_wasm_bg.wasm" {
-            let content = include_bytes!("../../temps-captcha-wasm/pkg/temps_captcha_wasm_bg.wasm");
-            let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
-            resp.insert_header(header::CONTENT_TYPE, "application/wasm")?;
-            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(Bytes::from(content.to_vec())), true)
-                .await?;
-
-            debug!("Served WASM binary module: {}", ctx.path);
-            return Ok(true);
         }
-
-        Ok(false) // Not a WASM file request
+        ctx.routing_status = "captcha_wasm".to_string();
+        Ok(true)
     }
 
     /// Infer content type from file extension
@@ -4319,31 +4672,6 @@ fn ip_restriction_denies(
 static IP_DENY_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
     crate::ip_access::DenyLogLimiter::new(10, 20);
 
-/// The 426 page attack mode answers a request with no TLS fingerprint.
-const HTTPS_REQUIRED_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HTTPS Required</title>
-    <style>
-        body { font-family: system-ui, -apple-system, sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
-        .container { background: white; border-radius: 16px; padding: 40px; max-width: 500px; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
-        h1 { color: #1a202c; margin-bottom: 16px; }
-        p { color: #4a5568; line-height: 1.6; }
-        .icon { font-size: 64px; margin-bottom: 16px; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="icon">🔒</div>
-        <h1>HTTPS Required</h1>
-        <p>This site requires a secure connection (HTTPS) for enhanced security and bot protection.</p>
-        <p>Please use <strong>https://</strong> instead of http://</p>
-    </div>
-</body>
-</html>"#;
-
 /// Caps "shadow evaluation disagrees" log lines at 20 per 10 seconds,
 /// process-wide. Every disagreement is counted in
 /// `proxy.ingress_shadow_mismatches`; only the log line is limited.
@@ -4363,11 +4691,6 @@ struct AccessRequest<'a> {
     host: &'a str,
     path: &'a str,
     tls_fingerprint: Option<&'a str>,
-    /// The client address as the proxy recorded it, and the user agent:
-    /// with the TLS fingerprint, the visitor identity an attack-mode
-    /// clearance is bound to (ADR 066).
-    ip_address: Option<&'a str>,
-    user_agent: &'a str,
     policy_decision: temps_core::RequestPolicyDecision,
     ip_restricted: bool,
     client_ip: Option<std::net::IpAddr>,
@@ -4376,32 +4699,6 @@ struct AccessRequest<'a> {
 }
 
 impl LoadBalancer {
-    /// Whether the request carries an attack-mode clearance signed for
-    /// this environment and for the visitor it presents (ADR 066, D3/D5).
-    /// Verifying the cookie is in memory; anything but `Admitted` (absent,
-    /// expired, signed for another visitor) shows the challenge again.
-    fn captcha_completed(&self, environment_id: i32, access: &AccessRequest<'_>) -> bool {
-        let identity = crate::shield::visitor_identity(
-            access.ip_address,
-            access.user_agent,
-            access.tls_fingerprint,
-        );
-        let now = temps_shield::unix_now();
-        find_request_cookie(
-            access.request,
-            &temps_shield::clearance_cookie_name(environment_id),
-            |value| match self
-                .challenge_gate
-                .admit(value, environment_id, &identity, now)
-            {
-                temps_shield::Admission::NotCleared => None,
-                admission => Some(admission),
-            },
-        )
-        .unwrap_or(temps_shield::Admission::NotCleared)
-            == temps_shield::Admission::Admitted
-    }
-
     /// The access decision for an environment request (ADR-055 §11).
     ///
     /// `legacy` runs the legacy chain. `enforce` runs the environment's
@@ -4497,22 +4794,15 @@ impl LoadBalancer {
                         now_secs,
                     },
                 };
+                // A captcha step is Shield's to answer (ADR 066), after this
+                // decision: resume past it.
                 return match enforce_step(endpoint, &request, &self.rate_limiter, false, 0) {
                     Step::Done(outcome) => outcome,
                     Step::NeedsCaptcha { resume_at } => {
-                        if !self.captcha_completed(environment_id, &access) {
-                            AccessOutcome::CaptchaChallenge
-                        } else {
-                            match enforce_step(
-                                endpoint,
-                                &request,
-                                &self.rate_limiter,
-                                true,
-                                resume_at,
-                            ) {
-                                Step::Done(outcome) => outcome,
-                                Step::NeedsCaptcha { .. } => AccessOutcome::CaptchaChallenge,
-                            }
+                        match enforce_step(endpoint, &request, &self.rate_limiter, true, resume_at)
+                        {
+                            Step::Done(outcome) => outcome,
+                            Step::NeedsCaptcha { .. } => AccessOutcome::CaptchaChallenge,
                         }
                     }
                 };
@@ -4523,9 +4813,8 @@ impl LoadBalancer {
             client_ip: access.client_ip,
             ip_restricted: access.ip_restricted,
             rate_limit: access.rate_limit,
-            attack_mode: environment
-                .attack_mode
-                .unwrap_or(project_ctx.project.attack_mode),
+            // Attack mode is a Shield mode (ADR 066), decided after this.
+            attack_mode: false,
             captcha_path,
             has_tls_fingerprint,
             password: access.password,
@@ -4533,10 +4822,7 @@ impl LoadBalancer {
         let mut facts = LegacyFacts::default();
         let outcome = match legacy_access(&legacy, &self.rate_limiter, now_secs, &mut facts) {
             Step::Done(outcome) => outcome,
-            Step::NeedsCaptcha { .. } => {
-                let completed = self.captcha_completed(environment_id, &access);
-                legacy_after_captcha(&legacy, completed, &mut facts)
-            }
+            Step::NeedsCaptcha { .. } => legacy_after_captcha(&legacy, true, &mut facts),
         };
 
         if mode == IngressMode::Shadow {
@@ -6427,6 +6713,9 @@ impl ProxyHttp for LoadBalancer {
             gated_host: false,
             gate_identity: None,
             shield: None,
+            shield_header: None,
+            shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
@@ -6462,8 +6751,9 @@ impl ProxyHttp for LoadBalancer {
         // Get the request path early to check if this is a CAPTCHA/WASM request
         let path = session.req_header().uri.path();
 
-        // WASM files must bypass IP access control since they're needed for challenge solving
-        let is_wasm_request = path.starts_with("/api/__temps/temps_captcha_wasm");
+        // The solver files bypass IP access control: the challenge page needs them.
+        let is_wasm_request = path == temps_shield::assets::SOLVER_JS_PATH
+            || path == temps_shield::assets::SOLVER_WASM_PATH;
 
         // Check if IP is blocked - this happens at infrastructure level before any processing
         // WASM routes bypass this check since they're needed for challenge solving
@@ -6650,7 +6940,7 @@ impl ProxyHttp for LoadBalancer {
             .map(|h| h.to_str().unwrap_or_default().to_string())
             .unwrap_or_default();
 
-        // Extract client IP address early (needed for attack mode checks)
+        // Extract client IP address early (needed for Shield)
         if let Some(client_ip) = resolve_session_client_ip(
             session,
             self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
@@ -7231,17 +7521,6 @@ impl ProxyHttp for LoadBalancer {
                 .as_deref()
                 .and_then(|s| s.parse::<std::net::IpAddr>().ok())
                 .map(normalize_client_ip);
-            // ADR 066 D1, phase 2: what the reputation lists would do with
-            // this client, recorded with the request log before any gate
-            // below answers it. Nothing acts on it yet.
-            if let Some(client_ip) = parsed_ip {
-                let verdict = self
-                    .shield_lists
-                    .evaluate(client_ip, temps_shield::unix_now() as i64);
-                if verdict.action != temps_shield::Action::Pass {
-                    ctx.shield = Some(verdict);
-                }
-            }
             let decision = evaluate_request_policy(
                 self.request_policy_gate.as_ref(),
                 session.req_header(),
@@ -7324,8 +7603,6 @@ impl ProxyHttp for LoadBalancer {
                         host: &ctx.host,
                         path: &ctx.path,
                         tls_fingerprint: ctx.tls_fingerprint.as_deref(),
-                        ip_address: ctx.ip_address.as_deref(),
-                        user_agent: &ctx.user_agent,
                         policy_decision: decision,
                         ip_restricted,
                         client_ip: parsed_ip,
@@ -7608,100 +7885,50 @@ impl ProxyHttp for LoadBalancer {
                     ctx.routing_status = "ingress_login_required".to_string();
                     return Ok(true);
                 }
-                crate::ingress::AccessOutcome::HttpsRequired => {
-                    // Attack mode REQUIRES HTTPS: the TLS fingerprint is part
-                    // of the visitor identity a clearance is bound to.
-                    debug!(
-                        "Attack mode: HTTPS required for environment {} (HTTP request from {})",
-                        project_ctx.environment.id,
-                        ctx.ip_address.as_deref().unwrap_or("unknown")
-                    );
-
-                    // Return 426 Upgrade Required
-                    let mut response = ResponseHeader::build(StatusCode::UPGRADE_REQUIRED, None)?;
-                    response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    response.insert_header("Upgrade", "TLS/1.2, TLS/1.3")?;
-                    response.insert_header("Connection", "Upgrade")?;
-
-                    session
-                        .write_response_header(Box::new(response), true)
-                        .await?;
-
-                    session
-                        .write_response_body(
-                            Some(Bytes::from_static(HTTPS_REQUIRED_HTML.as_bytes())),
-                            true,
-                        )
-                        .await?;
-
-                    return Err(Error::because(
-                        pingora::ErrorType::HTTPStatus(426),
-                        "HTTPS required in attack mode",
-                        pingora_core::Error::new(pingora::ErrorType::HTTPStatus(426)),
-                    ));
-                }
-                crate::ingress::AccessOutcome::CaptchaChallenge => {
-                    // The clearance must be signed for this environment and
-                    // for the visitor this connection presents (ADR 066,
-                    // D3/D5).
-                    let env_id = project_ctx.environment.id;
-                    let identity = crate::shield::visitor_identity(
-                        ctx.ip_address.as_deref(),
-                        &ctx.user_agent,
-                        ctx.tls_fingerprint.as_deref(),
-                    );
-                    let now = temps_shield::unix_now();
-                    debug!(environment_id = env_id, "Attack mode: challenge required");
-
-                    let token = self
-                        .challenge_gate
-                        .issue(env_id, &identity, crate::shield::CHALLENGE_DIFFICULTY, now)
-                        .map_err(|e| {
-                            Error::because(
-                                pingora::ErrorType::InternalError,
-                                "issuing an attack-mode challenge",
-                                e,
-                            )
-                        })?;
-
-                    // Return 403 with HTML challenge page. The token is bound
-                    // to this visitor, so no cache may keep or share the page.
-                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                    response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Challenge-Required", "true")?;
-
-                    session
-                        .write_response_header(Box::new(response), true)
-                        .await?;
-
-                    let html = crate::shield::challenge_page(
-                        &token,
-                        crate::shield::CHALLENGE_DIFFICULTY,
-                        ctx.ip_address.as_deref().unwrap_or("unknown"),
-                    );
-
-                    session
-                        .write_response_body(Some(Bytes::from(html)), true)
-                        .await?;
-
-                    // Return error to stop request processing
-                    return Err(Error::because(
-                        pingora::ErrorType::HTTPStatus(403),
-                        "Challenge required",
-                        pingora_core::Error::new(pingora::ErrorType::HTTPStatus(403)),
-                    ));
-                }
+                // Bot challenges are Shield's (ADR 066), which runs right
+                // after this decision; the access decision defers to it.
+                crate::ingress::AccessOutcome::HttpsRequired
+                | crate::ingress::AccessOutcome::CaptchaChallenge => {}
             }
 
-            // The attack-mode verify POST (ADR 066) is answered here, once the
-            // IP gate and rate limit have admitted the client and before the
-            // password wall: the clearance is for the environment in the
-            // signed token, so a page served just before attack mode was
-            // switched off can still finish. The access decision never
-            // challenges this path or the WASM solver the page loads.
+            // ADR 066 (I4): Shield, after the operator's IP gate and the
+            // rate limits, so an operator deny rule or a spent rate budget
+            // answers first and is not a Shield decision (D1). The verify
+            // POST and the solver the page loads are answered here, whichever
+            // environment this host or path resolved to: the clearance is for
+            // the environment in the signed token, and a page served just
+            // before Shield was turned off can still finish. Neither they nor
+            // ACME HTTP-01 are ever challenged (D7).
             if ctx.path == crate::shield::VERIFY_PATH {
-                return self.answer_challenge_verify(session, ctx).await;
+                return self
+                    .answer_challenge_verify(
+                        session,
+                        ctx,
+                        &project_ctx.project,
+                        &project_ctx.environment,
+                        parsed_ip,
+                    )
+                    .await;
+            }
+            if self.serve_solver_asset(session, ctx).await? {
+                return Ok(true);
+            }
+            // Only a challenge stored for this host skips Shield; any other
+            // path under the ACME prefix is decided like the rest.
+            if self.answer_stored_acme_challenge(session, ctx).await? {
+                return Ok(true);
+            }
+            if self
+                .enforce_shield(
+                    session,
+                    ctx,
+                    &project_ctx.project,
+                    &project_ctx.environment,
+                    parsed_ip,
+                )
+                .await?
+            {
+                return Ok(true);
             }
 
             // Password wall: the outcome says the wall decides this request
@@ -7941,10 +8168,10 @@ impl ProxyHttp for LoadBalancer {
             ctx.routing_status = "no_project".to_string();
         }
 
-        // Serve embedded WASM files for CAPTCHA solver (must come before general request handling)
-        if let Ok(true) = self.serve_wasm_file(session, ctx).await {
-            ctx.routing_status = "captcha_wasm".to_string();
-            return Ok(true); // Request handled
+        // The challenge solver, for hosts without a project (project hosts
+        // were answered with Shield above).
+        if self.serve_solver_asset(session, ctx).await? {
+            return Ok(true);
         }
 
         // Handle ACME HTTP-01 challenges BEFORE redirects
@@ -8751,6 +8978,16 @@ impl ProxyHttp for LoadBalancer {
             upstream_response.set_version(version);
         }
 
+        // `X-Temps-Shield` says what Shield did (ADR 066, D11): only Shield
+        // sets it, and only when it acted.
+        let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
+        if let Some(verdict) = ctx.shield_header {
+            upstream_response.insert_header(
+                temps_shield::RESPONSE_HEADER,
+                temps_shield::response_header_value(verdict, &ctx.request_id),
+            )?;
+        }
+
         // Capture upstream write pending time for upload diagnostics (Pingora 0.8.0)
         let pending_time = session.upstream_write_pending_time();
         if !pending_time.is_zero() {
@@ -9370,6 +9607,18 @@ impl ProxyHttp for LoadBalancer {
         // connection lifetime rather than a request latency.
         let is_streaming = status_code == 101 || ctx.streaming_session;
 
+        // Adaptive difficulty (ADR 066, D6) compares each environment's 5xx
+        // ratio with its last hour.
+        if let Some(env_id) = ctx.shield_env {
+            self.shield
+                .engine
+                .record_status(env_id, status_code, temps_shield::unix_now());
+        }
+        if let Some(mut line) = ctx.netwatch_line.take() {
+            line.status = status_code;
+            self.shield.netwatch.send(line);
+        }
+
         // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(
             status_code,
@@ -9878,6 +10127,9 @@ mod markdown_tests {
             gated_host: false,
             gate_identity: None,
             shield: None,
+            shield_header: None,
+            shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
@@ -10420,6 +10672,9 @@ mod markdown_pipeline_tests {
             gated_host: false,
             gate_identity: None,
             shield: None,
+            shield_header: None,
+            shield_env: None,
+            netwatch_line: None,
             client_fingerprint: None,
             public_surface_only: false,
             status_page_host: false,
@@ -12969,45 +13224,130 @@ mod status_page_host_tests {
     }
 }
 
-/// Attack mode end to end through `request_filter` (ADR 066, phase 1): the
-/// challenge page, the verify endpoint the proxy answers itself, and the
-/// clearance cookie.
+/// Shield end to end through `request_filter` (ADR 066, phases 1 and 4):
+/// each mode and verdict, the challenge page and the 429 and 426 that stand
+/// in for it, exemptions and bypass tokens, the verify endpoint the proxy
+/// answers itself, and the clearance cookie.
 #[cfg(test)]
-mod attack_mode_challenge_tests {
+mod shield_enforcement_tests {
     use super::status_page_host_tests::{harness, Harness};
+    use super::{LoadBalancer, ProxyContext};
     use anyhow::Result;
     use pingora_proxy::{ProxyHttp, Session};
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
     use sha2::{Digest, Sha256};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use temps_entities::{environments, projects, shield_bypass_tokens};
+    use temps_shield::{
+        bypass, EventKind, EventSink, ListVerdict, Network, ShieldEvent, ShieldSnapshot, SourceList,
+    };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const HOST: &str = "shielded.example.com";
     const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0";
     const FINGERPRINT: &str = "t13_0123456789abcdef01234567";
+    /// On the test lists: blocked, challenged, and on none.
+    const BLOCKED: &str = "185.93.89.7";
+    const CHALLENGED: &str = "45.33.32.9";
+    const CLEAN: &str = "8.8.8.8";
+
+    #[derive(Default)]
+    struct Collected(Mutex<Vec<ShieldEvent>>);
+
+    impl EventSink for Collected {
+        fn submit(&self, events: Vec<ShieldEvent>) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(events);
+        }
+    }
+
+    impl Collected {
+        fn take(&self) -> Vec<ShieldEvent> {
+            std::mem::take(
+                &mut *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+    }
+
+    struct Shielded {
+        h: Harness,
+        events: Arc<Collected>,
+        tokens: Arc<crate::shield::BypassTokens>,
+    }
+
+    /// The status-page harness's proxy, with the test lists, an event
+    /// collector, and bypass tokens loaded from its database.
+    async fn shielded_harness() -> Result<Option<Shielded>> {
+        let Some(h) = harness(None, true).await? else {
+            return Ok(None);
+        };
+        let Harness {
+            _db,
+            lb,
+            route_table,
+        } = h;
+        let now = temps_shield::unix_now() as i64;
+        let list = |source: &str, verdict, network: &str| {
+            SourceList::new(source, verdict, now, None, Network::parse(network))
+        };
+        let lists = crate::shield::ShieldLists::from_snapshot(&ShieldSnapshot {
+            revision: 1,
+            generated_at: now,
+            lists: vec![
+                list("spamhaus_drop", ListVerdict::Block, "185.93.89.0/24"),
+                list("dshield", ListVerdict::Challenge, "45.33.32.0/24"),
+            ],
+            ..ShieldSnapshot::default()
+        });
+        let events = Arc::new(Collected::default());
+        let tokens = Arc::new(crate::shield::BypassTokens::default());
+        let lb: LoadBalancer = lb
+            .with_shield_lists(Arc::new(lists))
+            .with_shield_events(events.clone())
+            .with_shield_bypass_tokens(tokens.clone());
+        Ok(Some(Shielded {
+            h: Harness {
+                _db,
+                lb,
+                route_table,
+            },
+            events,
+            tokens,
+        }))
+    }
 
     enum Outcome {
         Forwarded,
         Answered { head: String, body: String },
     }
 
-    /// Runs the request filters as a TLS connection with `FINGERPRINT`
-    /// would: the duplex stream has no handshake, so the fingerprint is set
-    /// where `early_request_filter` would have extracted it.
-    async fn send(h: &Harness, raw_request: String) -> Result<Outcome> {
+    struct Sent {
+        outcome: Outcome,
+        ctx: ProxyContext,
+    }
+
+    /// Runs the request filters for a client at `ip`, over TLS when `tls`:
+    /// the duplex stream has no handshake or peer address, so both are set
+    /// where `early_request_filter` would have found them.
+    async fn send(h: &Harness, raw_request: String, ip: &str, tls: bool) -> Result<Sent> {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         client.write_all(raw_request.as_bytes()).await?;
         let mut session = Session::new_h1(Box::new(server) as pingora_core::protocols::Stream);
         assert!(session.read_request().await?, "request must parse");
         let mut ctx = h.lb.new_ctx();
         h.lb.early_request_filter(&mut session, &mut ctx).await?;
-        ctx.tls_fingerprint = Some(FINGERPRINT.to_string());
-        // A challenge ends the request with an error after writing the page.
-        let answered =
-            h.lb.request_filter(&mut session, &mut ctx)
-                .await
-                .unwrap_or(true);
-        if !answered {
-            return Ok(Outcome::Forwarded);
+        ctx.ip_address = Some(ip.to_string());
+        ctx.tls_fingerprint = tls.then(|| FINGERPRINT.to_string());
+        if !h.lb.request_filter(&mut session, &mut ctx).await? {
+            return Ok(Sent {
+                outcome: Outcome::Forwarded,
+                ctx,
+            });
         }
         drop(session);
         let mut raw = Vec::new();
@@ -13021,70 +13361,96 @@ mod attack_mode_challenge_tests {
             .split_once("\r\n\r\n")
             .map(|(h, b)| (h.to_string(), b.to_string()))
             .unwrap_or((response.clone(), String::new()));
-        Ok(Outcome::Answered { head, body })
+        Ok(Sent {
+            outcome: Outcome::Answered { head, body },
+            ctx,
+        })
     }
 
-    fn get(user_agent: &str, cookie: Option<&str>) -> String {
-        get_path("/", user_agent, cookie)
+    fn request(method: &str, path: &str, accept: &str, extra: &str) -> String {
+        request_as(method, path, accept, UA, extra)
     }
 
-    fn get_path(path: &str, user_agent: &str, cookie: Option<&str>) -> String {
-        let cookie = cookie
-            .map(|c| format!("Cookie: {c}\r\n"))
-            .unwrap_or_default();
+    fn request_as(method: &str, path: &str, accept: &str, user_agent: &str, extra: &str) -> String {
         format!(
-            "GET {path} HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {user_agent}\r\nAccept: text/html\r\n{cookie}\r\n"
+            "{method} {path} HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {user_agent}\r\nAccept: {accept}\r\nContent-Length: 0\r\n{extra}\r\n"
         )
     }
 
-    /// The `name=value` pair of the `Set-Cookie` header in `head`.
-    fn set_cookie_pair(head: &str) -> String {
-        head.lines()
-            .find_map(|line| {
-                line.to_ascii_lowercase()
-                    .starts_with("set-cookie:")
-                    .then(|| line["set-cookie:".len()..].trim().to_string())
-            })
-            .and_then(|cookie| cookie.split(';').next().map(str::to_string))
-            .unwrap_or_default()
+    fn page(path: &str, cookie: Option<&str>) -> String {
+        let cookie = cookie
+            .map(|c| format!("Cookie: {c}\r\n"))
+            .unwrap_or_default();
+        request(
+            "GET",
+            path,
+            "text/html,application/xhtml+xml,*/*;q=0.8",
+            &cookie,
+        )
     }
 
-    fn post_verify(body: &str) -> String {
+    fn post_verify(user_agent: &str, body: &str) -> String {
         format!(
-            "POST {} HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {UA}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST {} HTTP/1.1\r\nHost: {HOST}\r\nUser-Agent: {user_agent}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             crate::shield::VERIFY_PATH,
             body.len()
         )
     }
 
-    fn answered(outcome: Outcome) -> (String, String) {
-        match outcome {
-            Outcome::Answered { head, body } => (head, body),
+    fn answered(sent: Sent) -> (String, String, ProxyContext) {
+        match sent.outcome {
+            Outcome::Answered { head, body } => (head, body, sent.ctx),
             Outcome::Forwarded => panic!("the proxy must answer, not forward"),
         }
     }
 
-    /// A host in attack mode, backed by real project rows.
-    async fn shielded(h: &Harness) -> Result<i32> {
-        let (route, env_id) = attack_mode_route(h, HOST).await?;
-        h.route_table.insert_route_for_test(HOST, route);
-        Ok(env_id)
+    fn forwarded(sent: Sent) -> ProxyContext {
+        match sent.outcome {
+            Outcome::Forwarded => sent.ctx,
+            Outcome::Answered { head, .. } => panic!("the request must be forwarded: {head}"),
+        }
     }
 
-    /// The route of a new project in attack mode, created with `domain`.
-    async fn attack_mode_route(
+    fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+    }
+
+    /// The `name=value` pair of the `Set-Cookie` header in `head`.
+    fn set_cookie_pair(head: &str) -> String {
+        header(head, "set-cookie")
+            .and_then(|cookie| cookie.split(';').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// `data-<name>` of the challenge page.
+    fn page_data(body: &str, name: &str) -> String {
+        body.split(&format!("data-{name}=\""))
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// The route of a new project created with `domain`, after `configure`
+    /// sets its Shield settings.
+    async fn route(
         h: &Harness,
         domain: &str,
-    ) -> Result<(temps_routes::RouteInfo, i32)> {
+        configure: impl FnOnce(&mut projects::Model, &mut environments::Model),
+    ) -> Result<(temps_routes::RouteInfo, i32, i32)> {
         let ops = crate::test_utils::TestDBMockOperations::new(h._db.connection_arc().clone())
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let (mut project, environment, deployment) = ops
+        let (mut project, mut environment, deployment) = ops
             .create_test_project_with_domain(domain)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-        project.attack_mode = true;
-        let env_id = environment.id;
+        configure(&mut project, &mut environment);
+        let (project_id, env_id) = (project.id, environment.id);
         Ok((
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
@@ -13103,53 +13469,309 @@ mod attack_mode_challenge_tests {
                 cert_eligible: false,
             },
             env_id,
+            project_id,
         ))
     }
 
-    /// A low-difficulty token for `env_id`, solved and posted as `user_agent`
-    /// would. Same keys as the proxy's gate.
-    fn solved_verify(env_id: i32, user_agent: &str) -> Result<String> {
-        let identity = crate::shield::visitor_identity(None, user_agent, Some(FINGERPRINT));
-        let token =
-            crate::shield::test_gate().issue(env_id, &identity, 4, temps_shield::unix_now())?;
-        Ok(format!(
-            r#"{{"token":"{token}","nonce":"{}"}}"#,
-            solve(&token, 4)
-        ))
+    /// `HOST` served by a new project in `mode`; returns its environment
+    /// and project ids.
+    async fn host_in(h: &Harness, mode: &str) -> Result<(i32, i32)> {
+        host_with(h, |project, _| project.shield_mode = mode.to_string()).await
+    }
+
+    async fn host_with(
+        h: &Harness,
+        configure: impl FnOnce(&mut projects::Model, &mut environments::Model),
+    ) -> Result<(i32, i32)> {
+        let (route, env_id, project_id) = route(h, HOST, configure).await?;
+        h.route_table.insert_route_for_test(HOST, route);
+        Ok((env_id, project_id))
     }
 
     fn solve(token: &str, difficulty: u8) -> String {
+        let prefix = Sha256::new_with_prefix(token.as_bytes());
         (0u64..)
             .map(|nonce| nonce.to_string())
             .find(|nonce| {
-                let hash = Sha256::digest(format!("{token}{nonce}").as_bytes());
-                temps_shield::has_leading_zero_bits(&hash, u32::from(difficulty))
+                let mut hash = prefix.clone();
+                hash.update(nonce.as_bytes());
+                temps_shield::has_leading_zero_bits(&hash.finalize(), u32::from(difficulty))
             })
             .unwrap_or_default()
     }
 
+    /// The verify body for the challenge page in `body`, solved.
+    fn solution(body: &str) -> String {
+        let token = page_data(body, "token");
+        let difficulty: u8 = page_data(body, "difficulty").parse().unwrap_or(0);
+        format!(
+            r#"{{"token":"{token}","nonce":"{}","solve_ms":700}}"#,
+            solve(&token, difficulty)
+        )
+    }
+
     #[tokio::test]
-    async fn only_a_solved_server_token_clears_a_visitor() -> Result<()> {
-        let Some(h) = harness(None, true).await? else {
+    async fn log_mode_records_the_verdict_and_serves_the_request() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
-        let env_id = shielded(&h).await?;
+        let (env_id, _) = host_in(&s.h, "log").await?;
 
-        // 1. No clearance: the challenge page, uncacheable, with a signed token.
-        let (head, body) = answered(send(&h, get(UA, None)).await?);
-        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        assert!(
-            head.to_ascii_lowercase()
-                .contains("cache-control: no-store"),
-            "{head}"
+        let ctx = forwarded(send(&s.h, page("/", None), BLOCKED, true).await?);
+        assert_eq!(ctx.shield_verdict().as_deref(), Some("block"));
+        assert_eq!(ctx.shield_reasons(), ["spamhaus_drop (185.93.89.0/24)"]);
+        assert_eq!(ctx.shield_header, None, "log mode never answers");
+        assert_eq!(ctx.shield_env, Some(env_id));
+        let events = s.events.take();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].kind, EventKind::Verdict);
+        assert_eq!(
+            (events[0].verdict.as_str(), events[0].mode.as_str()),
+            ("block", "log")
         );
-        let token = body
-            .split("data-token=\"")
-            .nth(1)
-            .and_then(|rest| rest.split('"').next())
-            .unwrap_or_default()
-            .to_string();
-        assert_eq!(token.len(), 80, "{body}");
+        assert_eq!(events[0].environment_id, env_id);
+        assert_eq!(events[0].ip, BLOCKED);
+        assert_eq!(events[0].request_id, ctx.request_id);
+
+        // A clean visitor is no event.
+        let ctx = forwarded(send(&s.h, page("/", None), CLEAN, true).await?);
+        assert_eq!(ctx.shield_verdict(), None);
+        assert!(s.events.take().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn off_mode_neither_acts_nor_records() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        host_in(&s.h, "off").await?;
+        let ctx = forwarded(send(&s.h, page("/", None), BLOCKED, true).await?);
+        assert_eq!(ctx.shield_verdict(), None);
+        assert_eq!(ctx.shield_env, None);
+        assert!(s.events.take().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selective_blocks_a_listed_address_without_saying_why() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        host_in(&s.h, "selective").await?;
+
+        let (head, body, ctx) = answered(send(&s.h, page("/", None), BLOCKED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(
+            header(&head, "x-temps-shield"),
+            Some(format!("block; ref={}", ctx.request_id).as_str())
+        );
+        assert_eq!(body, "Forbidden\n");
+        assert!(!head.contains("spamhaus") && !body.contains("spamhaus"));
+        assert_eq!(ctx.routing_status, "shield_block");
+        assert_eq!(ctx.shield_verdict().as_deref(), Some("block"));
+        let events = s.events.take();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].verdict.as_str(), events[0].mode.as_str()),
+            ("block", "selective")
+        );
+
+        // A clean visitor passes, with no header and no event.
+        let ctx = forwarded(send(&s.h, page("/", None), CLEAN, true).await?);
+        assert_eq!(ctx.shield_header, None);
+        assert!(s.events.take().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_challenge_is_a_page_for_page_loads_and_a_429_for_the_rest() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        host_in(&s.h, "selective").await?;
+
+        let (head, body, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(header(&head, "cache-control"), Some("no-store"));
+        assert_eq!(
+            header(&head, "x-temps-shield"),
+            Some(format!("challenge; ref={}", ctx.request_id).as_str())
+        );
+        assert_eq!(page_data(&body, "token").len(), 80, "{body}");
+        assert_eq!(page_data(&body, "difficulty"), "18");
+        assert!(!body.contains("dshield"));
+        let events = s.events.take();
+        assert_eq!(events[0].kind, EventKind::ChallengeIssued);
+        assert_eq!(events[0].difficulty, Some(18));
+
+        // An XHR and a form POST cannot show a page.
+        for raw in [
+            request("GET", "/data", "application/json", ""),
+            request("POST", "/form", "text/html", ""),
+        ] {
+            let (head, body, ctx) = answered(send(&s.h, raw, CHALLENGED, true).await?);
+            assert!(head.starts_with("HTTP/1.1 429"), "{head}");
+            assert_eq!(header(&head, "retry-after"), Some("60"));
+            assert_eq!(
+                header(&head, "content-type"),
+                Some("application/problem+json")
+            );
+            assert_eq!(
+                header(&head, "x-temps-shield"),
+                Some(format!("challenge; ref={}", ctx.request_id).as_str())
+            );
+            assert!(body.contains(r#""status":429"#), "{body}");
+            assert!(!body.contains("dshield"));
+        }
+        assert_eq!(s.events.take().len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_challenge_over_plain_http_asks_for_tls() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        host_in(&s.h, "selective").await?;
+        let (head, _, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, false).await?);
+        assert!(head.starts_with("HTTP/1.1 426"), "{head}");
+        assert_eq!(header(&head, "upgrade"), Some("TLS/1.2, HTTP/1.1"));
+        assert_eq!(
+            header(&head, "x-temps-shield"),
+            Some(format!("challenge; ref={}", ctx.request_id).as_str())
+        );
+        // Plain HTTP that Shield does not challenge is served.
+        forwarded(send(&s.h, page("/", None), CLEAN, false).await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_exempt_path_skips_a_challenge_but_not_a_block() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        host_with(&s.h, |project, environment| {
+            project.shield_mode = "selective".to_string();
+            environment.shield_exempt_paths =
+                environments::ShieldExemptPaths(vec!["/api/*".to_string()]);
+        })
+        .await?;
+
+        let ctx = forwarded(
+            send(
+                &s.h,
+                request("POST", "/api/users", "application/json", ""),
+                CHALLENGED,
+                true,
+            )
+            .await?,
+        );
+        // Still recorded with the request log.
+        assert_eq!(ctx.shield_verdict().as_deref(), Some("challenge"));
+        assert_eq!(ctx.shield_header, None);
+        let (head, _, _) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        let (head, body, _) = answered(
+            send(
+                &s.h,
+                request("GET", "/api/users", "application/json", ""),
+                BLOCKED,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(body, "Forbidden\n");
+        Ok(())
+    }
+
+    /// The token row's id, after storing the hash of a new token for it.
+    async fn create_token(
+        h: &Harness,
+        project_id: i32,
+        environment_id: Option<i32>,
+    ) -> Result<(i64, String)> {
+        let db = h._db.connection();
+        let row = shield_bypass_tokens::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(environment_id),
+            name: Set("uptime monitor".to_string()),
+            token_hash: Set(String::new()),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        let (token, hash) = bypass::generate(row.id);
+        let mut row: shield_bypass_tokens::ActiveModel = row.into();
+        row.token_hash = Set(bypass::to_hex(&hash));
+        let row = row.update(db).await?;
+        Ok((row.id, token))
+    }
+
+    #[tokio::test]
+    async fn a_bypass_token_passes_even_a_block_and_records_its_use() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        let (_, project_id) = host_in(&s.h, "attack").await?;
+        // A project-wide token applies to the environment.
+        let (id, token) = create_token(&s.h, project_id, None).await?;
+        s.tokens.spawn(
+            s.h._db.connection_arc().clone(),
+            &tokio::runtime::Handle::current(),
+        );
+        s.tokens.refresh(s.h._db.connection()).await?;
+
+        let with_token = |accept: &str, token: &str| {
+            request(
+                "GET",
+                "/",
+                accept,
+                &format!("X-Temps-Shield-Token: {token}\r\n"),
+            )
+        };
+        let ctx = forwarded(send(&s.h, with_token("text/html", &token), BLOCKED, true).await?);
+        assert_eq!(ctx.shield_verdict().as_deref(), Some("block"));
+        assert_eq!(ctx.shield_header, None);
+        // In attack mode a token also skips the challenge everyone gets.
+        forwarded(send(&s.h, with_token("application/json", &token), CLEAN, true).await?);
+
+        // Someone else's token, or a forged one, is just a header.
+        let (forged, _) = bypass::generate(id);
+        let (head, _, _) =
+            answered(send(&s.h, with_token("text/html", &forged), BLOCKED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+
+        // The use reaches the row, off the request path.
+        let mut last_used = None;
+        for _ in 0..50 {
+            last_used = shield_bypass_tokens::Entity::find_by_id(id)
+                .one(s.h._db.connection())
+                .await?
+                .and_then(|row| row.last_used_at);
+            if last_used.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(last_used.is_some(), "last_used_at was never recorded");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_solved_challenge_clears_the_visitor_who_solved_it() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        let (env_id, _) = host_in(&s.h, "selective").await?;
+
+        // 1. No clearance: the challenge page.
+        let (head, body, _) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        let solved = solution(&body);
+        s.events.take();
 
         // 2. Regression: the old body chose its own challenge, environment
         //    and identifier, and any solution of it cleared the visitor.
@@ -13157,40 +13779,33 @@ mod attack_mode_challenge_tests {
             r#"{{"challenge":"aa","nonce":"{}","environment_id":{env_id},"identifier":"x","identifier_type":"ja4"}}"#,
             solve("aa", 1)
         );
-        let (head, _) = answered(send(&h, post_verify(&forged)).await?);
+        let (head, _, _) = answered(send(&s.h, post_verify(UA, &forged), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 400"), "{head}");
         assert!(!head.contains("temps_clr"), "{head}");
 
-        // 3. The served token, unsolved, earns nothing.
+        // 3. The served token, unsolved, earns nothing, and is recorded.
+        let token = page_data(&body, "token");
         let unsolved = format!(r#"{{"token":"{token}","nonce":"x"}}"#);
-        let (head, body) = answered(send(&h, post_verify(&unsolved)).await?);
+        let (head, body_out, _) =
+            answered(send(&s.h, post_verify(UA, &unsolved), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        assert!(body.contains("unsolved"), "{body}");
+        assert!(body_out.contains("unsolved"), "{body_out}");
+        let failed = s.events.take();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].kind, EventKind::ChallengeFailed);
+        assert_eq!(failed[0].reasons, ["unsolved"]);
 
-        // 4. A token solved for another visitor (here another User-Agent)
-        //    clears no one: the proxy derives the visitor from the
-        //    connection, not from anything in the body. Tokens are issued at
-        //    a low difficulty with the same keys, to keep the test fast.
-        let gate = crate::shield::test_gate();
-        let other = crate::shield::visitor_identity(None, "curl/8.5.0", Some(FINGERPRINT));
-        let foreign = gate.issue(env_id, &other, 4, temps_shield::unix_now())?;
-        let foreign = format!(
-            r#"{{"token":"{foreign}","nonce":"{}"}}"#,
-            solve(&foreign, 4)
-        );
-        let (head, body) = answered(send(&h, post_verify(&foreign)).await?);
+        // 4. The solution, posted by another visitor (here another
+        //    User-Agent), clears no one: the visitor comes from the
+        //    connection, not from anything in the body.
+        let (head, body_out, _) =
+            answered(send(&s.h, post_verify("curl/8.5.0", &solved), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        assert!(body.contains("invalid"), "{body}");
-        assert!(!head.contains("temps_clr"), "{head}");
+        assert!(body_out.contains("invalid"), "{body_out}");
+        s.events.take();
 
-        // 5. A solved token for this visitor sets the clearance.
-        let identity = crate::shield::visitor_identity(None, UA, Some(FINGERPRINT));
-        let easy = gate.issue(env_id, &identity, 4, temps_shield::unix_now())?;
-        let solved = format!(
-            r#"{{"token":"{easy}","nonce":"{}","solve_ms":5}}"#,
-            solve(&easy, 4)
-        );
-        let (head, _) = answered(send(&h, post_verify(&solved)).await?);
+        // 5. Posted by the visitor it was served to, it sets the clearance.
+        let (head, _, _) = answered(send(&s.h, post_verify(UA, &solved), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         assert!(
             head.contains("Secure") && head.contains("HttpOnly"),
@@ -13201,34 +13816,111 @@ mod attack_mode_challenge_tests {
             pair.starts_with(&format!("__Host-temps_clr_{env_id}=")),
             "{head}"
         );
+        let solved_events = s.events.take();
+        assert_eq!(solved_events.len(), 1);
+        assert_eq!(solved_events[0].kind, EventKind::ChallengeSolved);
+        assert_eq!(solved_events[0].solve_ms, Some(700));
+        assert_eq!(solved_events[0].environment_id, env_id);
 
         // 6. The same token cannot be redeemed twice.
-        let (head, _) = answered(send(&h, post_verify(&solved)).await?);
+        let (head, _, _) = answered(send(&s.h, post_verify(UA, &solved), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
 
         // 7. The clearance admits this visitor, and only this visitor.
-        assert!(matches!(
-            send(&h, get(UA, Some(&pair))).await?,
-            Outcome::Forwarded
-        ));
-        let (head, _) = answered(send(&h, get("curl/8.5.0", Some(&pair))).await?);
+        let ctx = forwarded(send(&s.h, page("/", Some(&pair)), CHALLENGED, true).await?);
+        assert_eq!(ctx.shield_header, None);
+        let other = request_as(
+            "GET",
+            "/",
+            "text/html",
+            "curl/8.5.0",
+            &format!("Cookie: {pair}\r\n"),
+        );
+        let (head, _, _) = answered(send(&s.h, other, CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // A clearance never admits a block.
+        let (head, body_out, _) =
+            answered(send(&s.h, page("/", Some(&pair)), BLOCKED, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(body_out, "Forbidden\n");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn attack_mode_challenges_every_visitor() -> Result<()> {
+        let Some(s) = shielded_harness().await? else {
+            return Ok(());
+        };
+        // The legacy column still means attack.
+        host_with(&s.h, |project, _| project.attack_mode = true).await?;
+        let (head, body, _) = answered(send(&s.h, page("/", None), CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        assert_eq!(page_data(&body, "difficulty"), "20");
+        let events = s.events.take();
+        assert_eq!(events[0].kind, EventKind::ChallengeIssued);
+        assert_eq!(
+            (events[0].verdict.as_str(), events[0].mode.as_str()),
+            ("pass", "attack")
+        );
+        // The solver and ACME HTTP-01 are never challenged.
+        let (head, _, _) = answered(
+            send(
+                &s.h,
+                request("GET", temps_shield::assets::SOLVER_WASM_PATH, "*/*", ""),
+                CLEAN,
+                true,
+            )
+            .await?,
+        );
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(header(&head, "content-type"), Some("application/wasm"));
+        assert!(header(&head, "etag").is_some(), "{head}");
+        // A challenge stored for this host is answered over plain HTTP.
+        {
+            use sea_orm::{ActiveModelTrait, Set};
+            let now = chrono::Utc::now();
+            temps_entities::domains::ActiveModel {
+                domain: Set(HOST.to_string()),
+                status: Set("pending".to_string()),
+                http_challenge_token: Set(Some("stored-token".to_string())),
+                http_challenge_key_authorization: Set(Some("stored-token.thumbprint".to_string())),
+                is_wildcard: Set(false),
+                verification_method: Set("http-01".to_string()),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(s.h._db.connection_arc().as_ref())
+            .await?;
+        }
+        let acme = request("GET", "/.well-known/acme-challenge/stored-token", "*/*", "");
+        let (head, body, _) = answered(send(&s.h, acme, CLEAN, false).await?);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert_eq!(body, "stored-token.thumbprint");
+        assert!(header(&head, "x-temps-shield").is_none(), "{head}");
+        // Any other path under the prefix is no way past Shield.
+        let probe = request("GET", "/.well-known/acme-challenge/missing", "*/*", "");
+        let (head, _, _) = answered(send(&s.h, probe, CLEAN, true).await?);
+        assert!(head.starts_with("HTTP/1.1 429"), "{head}");
         Ok(())
     }
 
     /// Path routes (ADR 050): the host's environment at `/` and another at
-    /// `/docs`, both in attack mode. The page under `/docs` posts to the one
-    /// verify path, which resolves to the host's environment; the clearance
-    /// still goes to the environment the token was issued for, and each
-    /// environment keeps its own cookie.
+    /// `/docs`. The page under `/docs` posts to the one verify path, which
+    /// resolves to the host's environment; the clearance still goes to the
+    /// environment the token was issued for, and each environment keeps its
+    /// own cookie.
     #[tokio::test]
     async fn path_routed_environments_keep_their_own_clearance() -> Result<()> {
-        let Some(h) = harness(None, true).await? else {
+        let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
-        let host_env = shielded(&h).await?;
-        let (docs_route, docs_env) = attack_mode_route(&h, "docs-target.example.com").await?;
-        h.route_table.insert_path_routes_for_test(
+        let (host_env, _) = host_in(&s.h, "selective").await?;
+        let (docs_route, docs_env, _) = route(&s.h, "docs-target.example.com", |project, _| {
+            project.shield_mode = "selective".to_string()
+        })
+        .await?;
+        s.h.route_table.insert_path_routes_for_test(
             host_env,
             vec![temps_routes::PathRoute {
                 prefix: "/docs".to_string(),
@@ -13239,18 +13931,33 @@ mod attack_mode_challenge_tests {
             }],
         );
 
-        let (head, _) = answered(send(&h, get_path("/docs/", UA, None)).await?);
-        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        let (_, docs_page, _) = answered(send(&s.h, page("/docs/", None), CHALLENGED, true).await?);
+        let (_, host_page, _) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
 
-        let (head, _) = answered(send(&h, post_verify(&solved_verify(docs_env, UA)?)).await?);
+        let (head, _, _) = answered(
+            send(
+                &s.h,
+                post_verify(UA, &solution(&docs_page)),
+                CHALLENGED,
+                true,
+            )
+            .await?,
+        );
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let docs_pair = set_cookie_pair(&head);
         assert!(
             docs_pair.starts_with(&format!("__Host-temps_clr_{docs_env}=")),
             "{head}"
         );
-
-        let (head, _) = answered(send(&h, post_verify(&solved_verify(host_env, UA)?)).await?);
+        let (head, _, _) = answered(
+            send(
+                &s.h,
+                post_verify(UA, &solution(&host_page)),
+                CHALLENGED,
+                true,
+            )
+            .await?,
+        );
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");
         let host_pair = set_cookie_pair(&head);
         assert!(
@@ -13260,17 +13967,13 @@ mod attack_mode_challenge_tests {
 
         // Each cookie admits its own environment only; together, both.
         let both = format!("{host_pair}; {docs_pair}");
-        assert!(matches!(
-            send(&h, get_path("/docs/", UA, Some(&both))).await?,
-            Outcome::Forwarded
-        ));
-        assert!(matches!(
-            send(&h, get_path("/", UA, Some(&both))).await?,
-            Outcome::Forwarded
-        ));
-        let (head, _) = answered(send(&h, get_path("/docs/", UA, Some(&host_pair))).await?);
+        forwarded(send(&s.h, page("/docs/", Some(&both)), CHALLENGED, true).await?);
+        forwarded(send(&s.h, page("/", Some(&both)), CHALLENGED, true).await?);
+        let (head, _, _) =
+            answered(send(&s.h, page("/docs/", Some(&host_pair)), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
-        let (head, _) = answered(send(&h, get_path("/", UA, Some(&docs_pair))).await?);
+        let (head, _, _) =
+            answered(send(&s.h, page("/", Some(&docs_pair)), CHALLENGED, true).await?);
         assert!(head.starts_with("HTTP/1.1 403"), "{head}");
         Ok(())
     }

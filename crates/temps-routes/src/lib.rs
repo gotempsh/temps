@@ -11,6 +11,7 @@ pub mod public_ingress_sync;
 pub mod route_reload_subscriber;
 pub mod route_sync;
 pub mod route_table;
+pub mod shield_sync;
 pub mod wildcard_matcher;
 
 #[cfg(test)]

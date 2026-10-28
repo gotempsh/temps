@@ -366,6 +366,11 @@ const SecurityPage = lazy(() =>
     default: m.SecurityPage,
   }))
 )
+const ShieldProposalsPage = lazy(() =>
+  import('./pages/settings/ShieldProposalsPage').then((m) => ({
+    default: m.ShieldProposalsPage,
+  }))
+)
 const RateLimitingPage = lazy(() =>
   import('./pages/settings/RateLimitingPage').then((m) => ({
     default: m.RateLimitingPage,
@@ -899,6 +904,10 @@ const FullAppRoutes = () => {
                           {/* Security */}
                           <Route path="version" element={<VersionPage />} />
                           <Route path="security" element={<SecurityPage />} />
+                          <Route
+                            path="shield-proposals"
+                            element={<ShieldProposalsPage />}
+                          />
                           <Route
                             path="rate-limiting"
                             element={<RateLimitingPage />}

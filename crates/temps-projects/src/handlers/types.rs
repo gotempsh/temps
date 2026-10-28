@@ -426,7 +426,13 @@ pub struct ProjectResponse {
     /// Deployment configuration (resources, autoscaling, features)
     pub deployment_config: DeploymentConfig,
     /// Attack mode - when enabled, requires CAPTCHA verification for all project environments
+    ///
+    /// Kept for one release for consoles that predate Shield modes; it is
+    /// true exactly when `shield_mode` is `attack`.
     pub attack_mode: bool,
+    /// How Shield acts on verdicts in the project's environments (ADR 066
+    /// D1); an environment can set its own.
+    pub shield_mode: temps_shield::ShieldMode,
     /// Opt-in to AI summarization of metric alert notifications (NULL/false = off).
     pub ai_alert_summaries_enabled: Option<bool>,
     /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
@@ -564,6 +570,12 @@ impl ProjectResponse {
             is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
+            shield_mode: temps_shield::ShieldMode::effective(
+                None,
+                &project.shield_mode,
+                None,
+                project.attack_mode,
+            ),
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
             ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
             error_source_context_enabled: project.error_source_context_enabled,
@@ -987,7 +999,16 @@ pub struct UpdateProjectSettingsRequest {
     pub preset: Option<String>,
     pub directory: Option<String>,
     /// Enable/disable attack mode (CAPTCHA protection) for all project environments
+    ///
+    /// Kept for consoles that predate Shield modes: `true` sets the Shield
+    /// mode to `attack`, `false` turns attack back to `log`. When
+    /// `shield_mode` is also sent, `shield_mode` wins.
     pub attack_mode: Option<bool>,
+    /// How Shield acts on verdicts in the project's environments (ADR 066
+    /// D1): `off`, `log`, `selective` or `attack`. `attack_mode` is written
+    /// to match for one release. Omit to leave it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shield_mode: Option<temps_shield::ShieldMode>,
     /// Opt in to AI summarization of metric alert notifications (ADR-021).
     pub ai_alert_summaries_enabled: Option<bool>,
     /// Opt in to AI summarization of API traffic analytics.
@@ -1075,6 +1096,7 @@ impl From<UpdateProjectSettingsRequest> for crate::services::types::UpdateProjec
             preset: request.preset,
             directory: request.directory,
             attack_mode: request.attack_mode,
+            shield_mode: request.shield_mode,
             enable_preview_environments: request.enable_preview_environments,
             preview_envs_on_demand: request.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: request.preview_envs_idle_timeout_seconds,

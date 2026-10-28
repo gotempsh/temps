@@ -1811,10 +1811,14 @@ impl IngressConnectorService {
             .map(|choice| (choice.hostname, choice.connector_id))
             .collect();
         let gate = self.request_policy.get();
+        // A tunnel publishes a host for every node that runs it, whether or
+        // not that node's agent runs Shield (ADR 066, D10), so a host whose
+        // environment acts on verdicts stays on the control plane.
         let routes = temps_routes::route_sync::worker_public_routes(
             self.db.as_ref(),
             &self.peer_table,
             gate.is_none_or(|gate| !gate.supports_worker_ingress()),
+            false,
         )
         .await
         .map_err(|(_, error)| IngressError::Database(error))?;

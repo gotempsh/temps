@@ -108,21 +108,16 @@ pub fn sandbox_owner(sandbox_id: i32) -> ProductRef {
 /// 2. the rate-limit blacklists (instance and project), which only ever see
 ///    a resolved client;
 /// 3. the per-client rate limit, with its whitelist exempt;
-/// 4. attack mode, as a captcha;
-/// 5. the password wall, keyed by the environment id.
+/// 4. the password wall, keyed by the environment id.
+///
+/// Attack mode is not compiled into the endpoint: it is a Shield mode
+/// (ADR 066), which the proxy applies after the access decision.
 pub fn derived_policies(access: &EnvironmentAccess<'_>) -> Vec<AccessPolicy> {
     let mut policies = Vec::new();
     if let Some(policy) = project_ip_policy(access) {
         policies.push(policy);
     }
     rate_limit_policies(access, &mut policies);
-    let attack_mode = access
-        .environment
-        .attack_mode
-        .unwrap_or(access.project.attack_mode);
-    if attack_mode {
-        policies.push(AccessPolicy::Captcha);
-    }
     if password_hash(access.environment).is_some() {
         policies.push(AccessPolicy::Password {
             password_ref: i64::from(access.environment.id),
@@ -732,6 +727,8 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
             ingress_mode: IngressMode::Enforce,
@@ -790,6 +787,7 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
@@ -910,7 +908,8 @@ mod tests {
         let kinds: Vec<&str> = policies.iter().map(|p| p.name()).collect();
         assert_eq!(
             kinds,
-            ["ip_rules", "ip_rules", "rate_limit", "captcha", "password"]
+            // Attack mode is Shield's, not the endpoint's.
+            ["ip_rules", "ip_rules", "rate_limit", "password"]
         );
         assert_eq!(
             policies[1],
@@ -945,7 +944,7 @@ mod tests {
                 scope: RateLimitScope::Endpoint,
             }
         );
-        assert_eq!(policies[4], AccessPolicy::Password { password_ref: 7 });
+        assert_eq!(policies[3], AccessPolicy::Password { password_ref: 7 });
     }
 
     #[test]

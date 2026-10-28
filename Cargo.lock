@@ -569,7 +569,7 @@ checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -2199,7 +2199,7 @@ dependencies = [
  "heck 0.5.0",
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -3720,7 +3720,7 @@ checksum = "a65863d15a4ce2888bd2f0f543cc963d3879c3a022c8ee43f6141d479a3ac815"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -4257,7 +4257,7 @@ checksum = "9fb9654ba8355388abeb8dcb4fc62f511300867002afc858860463bdd9fe0c44"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -6627,7 +6627,7 @@ checksum = "241557b8286f30dbb8dab9d8b2f00634f5442c30fb855cbb6bef82ac76335f50"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -10493,7 +10493,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "serde_derive_internals 0.30.0",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -11090,7 +11090,7 @@ checksum = "f852137cce035d6a4df67ccce505ff6b3e9fd3a10e3e52b24dc71e650bb1a9bd"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -11260,7 +11260,7 @@ checksum = "a22144e767da4ddd8416dbf383700542ffd8a5dc493dfecedfe1fe3ad03c98ae"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -12252,9 +12252,9 @@ dependencies = [
 
 [[package]]
 name = "syn"
-version = "3.0.9"
+version = "3.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
+checksum = "53e9bae58849f64dfa4f5d5ae372c8341f7305f82a3868709269343628b659a3"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -12376,6 +12376,7 @@ dependencies = [
  "bollard",
  "bytes",
  "chrono",
+ "flate2",
  "futures",
  "hex",
  "hickory-resolver",
@@ -13869,6 +13870,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-shield",
  "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
@@ -14663,6 +14665,7 @@ dependencies = [
  "bollard",
  "sea-orm 1.1.20",
  "sea-orm-migration 1.1.20",
+ "sqlx 0.8.6",
  "temps-core",
  "temps-entities",
  "testcontainers",
@@ -15039,6 +15042,7 @@ dependencies = [
  "temps-presets",
  "temps-providers",
  "temps-queue",
+ "temps-shield",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -15368,7 +15372,9 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "axum",
+ "base64 0.23.1",
  "chrono",
+ "flate2",
  "hex",
  "http 1.5.0",
  "ipnetwork",
@@ -15385,6 +15391,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-shield",
  "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
@@ -15489,18 +15496,31 @@ dependencies = [
 name = "temps-shield"
 version = "0.1.0-beta.57"
 dependencies = [
+ "arc-swap",
+ "async-trait",
  "base64 0.23.1",
+ "hickory-resolver",
  "hmac 0.13.0",
+ "moka",
  "postcard",
  "rand 0.10.3",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "tempfile",
  "temps-shield",
+ "temps-signatures",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+ "utoipa",
  "zstd 0.14.3",
 ]
+
+[[package]]
+name = "temps-signatures"
+version = "0.1.0-beta.57"
 
 [[package]]
 name = "temps-static-files"
@@ -15929,7 +15949,7 @@ checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.9",
+ "syn 3.0.3",
 ]
 
 [[package]]
@@ -16923,15 +16943,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "syn 3.0.9",
+ "syn 3.0.3",
  "uuid",
 ]
 
 [[package]]
 name = "utoipa-swagger-ui"
-version = "10.0.1"
+version = "10.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f5ec9d7816e4ce8ccb7e0bd7276e090cad0fcb1def4f3540e5b0f7485d7583e"
+checksum = "4f1fd2f9615838885c6ff4115fde8a2b58825dc7b4617f78d29c167377a15c92"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -16941,7 +16961,7 @@ dependencies = [
  "serde_json",
  "utoipa",
  "utoipa-swagger-ui-vendored",
- "zip 8.6.0",
+ "zip 9.0.3",
 ]
 
 [[package]]

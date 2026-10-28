@@ -327,6 +327,10 @@ pub struct AppSettings {
     #[serde(default)]
     pub mcp_server: McpServerSettings,
 
+    /// ADR 066: platform-wide Shield settings.
+    #[serde(default)]
+    pub shield: ShieldSettings,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -2582,6 +2586,7 @@ impl Default for AppSettings {
             clickhouse: ClickHouseSettings::default(),
             geo: GeoSettings::default(),
             mcp_server: McpServerSettings::default(),
+            shield: ShieldSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             plugin_installation_reporting_enabled: false,
@@ -2819,10 +2824,20 @@ impl AppSettings {
                     serde_json::from_value::<OnDemandTlsSettings>(section.clone()).ok()
                 })
                 .unwrap_or_else(legacy_on_demand_tls_settings);
+            // Fleet sharing is an opt-out too: a malformed section reads as
+            // not sharing, never as the sharing default.
+            let shield = match value.get("shield") {
+                None | Some(serde_json::Value::Null) => ShieldSettings::default(),
+                Some(section) => serde_json::from_value::<ShieldSettings>(section.clone())
+                    .unwrap_or(ShieldSettings {
+                        share_observations: false,
+                    }),
+            };
             Self {
                 anonymous_telemetry_enabled,
                 clickhouse,
                 on_demand_tls,
+                shield,
                 ..Self::default()
             }
         })
@@ -4339,6 +4354,33 @@ mod tests {
 }
 
 #[cfg(test)]
+mod shield_settings_tests {
+    use super::{AppSettings, ShieldSettings};
+
+    #[test]
+    fn a_malformed_unrelated_section_keeps_the_shield_opt_out() {
+        // `geo` cannot parse, so the whole document takes the fallback.
+        let stored = serde_json::json!({
+            "geo": "not an object",
+            "shield": { "share_observations": false }
+        });
+        assert!(!AppSettings::from_json(stored).shield.share_observations);
+
+        let malformed = serde_json::json!({
+            "geo": "not an object",
+            "shield": { "share_observations": "maybe" }
+        });
+        assert!(!AppSettings::from_json(malformed).shield.share_observations);
+
+        let absent = serde_json::json!({ "geo": "not an object" });
+        assert_eq!(
+            AppSettings::from_json(absent).shield,
+            ShieldSettings::default()
+        );
+    }
+}
+
+#[cfg(test)]
 mod cloudflare_new_project_tests {
     use super::AppSettings;
 
@@ -4369,5 +4411,24 @@ mod cloudflare_new_project_tests {
         let restored = AppSettings::from_json(settings.to_json());
         assert!(restored.bunny_new_projects);
         assert!(!restored.cloudflare_new_projects);
+    }
+}
+
+/// Platform-wide Shield settings (ADR 066, I10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ShieldSettings {
+    /// Whether what one environment's visitors did counts for every
+    /// environment (D9): addresses and fingerprints learned from events are
+    /// proposed, and an approved proposal applies fleet-wide. Nothing
+    /// applies without an approval. Off, nothing is proposed or applied.
+    pub share_observations: bool,
+}
+
+impl Default for ShieldSettings {
+    fn default() -> Self {
+        Self {
+            share_observations: true,
+        }
     }
 }

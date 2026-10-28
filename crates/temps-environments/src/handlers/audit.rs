@@ -54,6 +54,13 @@ pub struct EnvironmentSettingsUpdatedFields {
     /// `None` = unchanged, `Some(None)` = cleared (inherit project),
     /// `Some(Some(b))` = overridden.
     pub attack_mode: Option<Option<bool>>,
+    /// The Shield mode stored after a write that changed it (ADR 066):
+    /// `None` = unchanged, `Some(None)` = inherits the project's,
+    /// `Some(Some(mode))` = set here. A legacy `attack_mode` write changes
+    /// it too.
+    pub shield_mode: Option<Option<temps_shield::ShieldMode>>,
+    /// The exempt paths written, when they changed.
+    pub shield_exempt_paths: Option<Vec<String>>,
     /// Per-environment HTTP→HTTPS redirect override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit the proxy default),
     /// `Some(Some(b))` = overridden.

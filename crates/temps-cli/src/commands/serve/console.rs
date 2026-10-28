@@ -2842,6 +2842,18 @@ fn ai_read_allowlist() -> Vec<String> {
         "check_ip_blocked",
         "get_ip_access_control",
         "list_ip_access_control",
+        // ── Shield (ADR 066) ──
+        // Verdict counts, lookups and operator entries; token rows carry
+        // id, scope, environment_id, created_by, name, and timestamps,
+        // never the token or its hash. The event list and learning's
+        // proposals stay out: they carry visitors' addresses, paths and user
+        // agents.
+        "get_shield_summary",
+        "lookup_shield_client",
+        "list_shield_tokens",
+        "list_project_shield_entries",
+        "list_platform_shield_entries",
+        "get_shield_settings",
         // Geolocation lookup for an IP — country/city, no PII beyond what the
         // caller already knows (the IP itself). Gated by AnalyticsRead.
         "get_ip_geolocation",
@@ -3150,7 +3162,6 @@ fn ai_read_allowlist() -> Vec<String> {
         "admin_get_environment_workload_mode",
         "admin_get_node_resources",
         "admin_list_environment_volumes",
-        "get_capability",
         "get_effective_policy",
         "get_ingress_settings",
         "get_rule",
@@ -5233,6 +5244,14 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         request_policy_gate: request_policy_gate_slot.clone(),
         gate: gate_service.clone(),
         access_keys: access_key_service.clone(),
+        // ADR 066, I8: workers' Shield events go to the sink the proxy's
+        // event store registers; looked up on first upload.
+        shield_events: {
+            let services = plugin_manager.service_context().create_plugin_context();
+            Arc::new(temps_routes::shield_sync::ShieldEventSinkSlot::new(
+                move || services.get_service::<dyn temps_routes::shield_sync::EventSink>(),
+            ))
+        },
     });
     let route_sync_routes =
         temps_routes::route_sync::configure_routes().with_state(route_sync_state);

@@ -94,6 +94,7 @@ import {
   Settings,
   Settings2,
   Shield,
+  ShieldCheck,
   Sparkles,
   SquareTerminal,
   SunMoon,
@@ -102,7 +103,6 @@ import {
   UsersRound,
   Wand2,
   Workflow,
-  Zap,
   type LucideIcon,
 } from 'lucide-react'
 import {
@@ -742,6 +742,12 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['security', 'headers', 'csp', 'cors', 'protection'],
   },
   {
+    title: 'Shield proposals',
+    url: '/settings/shield-proposals',
+    icon: ShieldCheck,
+    keywords: ['shield', 'learning', 'attackers', 'approve', 'block', 'review'],
+  },
+  {
     title: 'Rate Limiting',
     url: '/settings/rate-limiting',
     icon: Monitor,
@@ -1025,12 +1031,6 @@ export const projectNavItems: NavigationItem[] = [
     url: 'environment-variables',
     icon: Key,
     keywords: ['variables', 'env', 'config'],
-  },
-  {
-    title: 'Functions',
-    url: 'functions',
-    icon: Zap,
-    keywords: ['functions', 'wasm', 'serverless', 'scale to zero'],
   },
   {
     title: 'Secrets',

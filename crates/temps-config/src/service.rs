@@ -1797,6 +1797,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // from an older snapshot must not rename a running service's container.
         settings.kv = locked_settings.kv.clone();
         settings.blob = locked_settings.blob.clone();
+        // Shield's platform settings are owned by `update_shield_settings`
+        // (`PUT /settings/shield`), which audits each change.
+        settings.shield = locked_settings.shield.clone();
         preserve_provider_credential_proof(&mut settings, &locked_settings);
 
         // The handler checked that a new public ingress hostname was free, but
@@ -2197,6 +2200,20 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         })
         .await?;
         Ok(changed)
+    }
+
+    /// Replace the platform Shield settings (ADR 066, I10) under the
+    /// settings-row lock and return them as saved. Generic settings saves
+    /// restore this section from the locked row, so this is its only write
+    /// path and its audit entry is the record of every change.
+    pub async fn update_shield_settings(
+        &self,
+        shield: temps_core::ShieldSettings,
+    ) -> Result<temps_core::ShieldSettings, ConfigServiceError> {
+        self.update_settings_section("shield", move |current: &mut temps_core::ShieldSettings| {
+            *current = shield
+        })
+        .await
     }
 
     /// Read-modify-write one top-level section of the settings document under
@@ -4712,6 +4729,52 @@ mod tests {
             .await
             .expect("reset the KV container name");
         assert!(reset.container_name.is_empty());
+    }
+
+    /// ADR 066 I10: `PUT /settings/shield` is the only way the platform
+    /// Shield settings change, so its audit entry records every change.
+    #[tokio::test]
+    async fn shield_settings_change_only_through_their_own_write_path() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping Shield settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("Shield settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert!(stale_bulk_document.shield.share_observations);
+
+        let saved = service
+            .update_shield_settings(temps_core::ShieldSettings {
+                share_observations: false,
+            })
+            .await
+            .expect("save the Shield settings");
+        assert!(!saved.share_observations);
+
+        let mut rewrite = stale_bulk_document;
+        rewrite.shield.share_observations = true;
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the Shield section");
+        let stored = settings::Entity::find_by_id(1)
+            .one(database.db.as_ref())
+            .await
+            .expect("read settings")
+            .expect("settings row");
+        assert!(
+            !AppSettings::from_json(stored.data)
+                .shield
+                .share_observations
+        );
     }
 
     #[tokio::test]

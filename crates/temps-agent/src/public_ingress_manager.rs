@@ -746,6 +746,7 @@ mod tests {
                     project_id: None,
                     environment_id: None,
                     gate: None,
+                    shield: None,
                 },
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),

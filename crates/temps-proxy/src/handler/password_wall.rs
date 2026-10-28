@@ -554,7 +554,7 @@ mod tests {
                 "updated_at": "2026-09-28T00:00:00Z", "project_id": 2,
                 "current_deployment_id": null, "branch": null, "deleted_at": null,
                 "deployment_config": null, "is_preview": false, "protected": false,
-                "sleeping": false, "attack_mode": null, "force_https": null,
+                "sleeping": false, "attack_mode": null, "shield_exempt_paths": [], "force_https": null,
                 "last_activity_at": null
             }))
             .expect("environment fixture");
