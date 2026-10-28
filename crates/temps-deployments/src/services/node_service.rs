@@ -672,6 +672,10 @@ pub struct ArchitectureChange {
     pub to: String,
 }
 
+/// Most container overlay addresses one heartbeat may carry; matches the
+/// agent's own bound.
+pub const MAX_REPORTED_OVERLAY_ADDRESSES: usize = 4096;
+
 /// Request to update a node's heartbeat.
 #[derive(Debug, Clone)]
 pub struct HeartbeatRequest {
@@ -2148,6 +2152,29 @@ impl NodeService {
         let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
         let count = dns_registry.total_record_count().await?;
         Ok(count)
+    }
+
+    /// Move service members on `node_id` whose container now holds a
+    /// different overlay address than the one recorded, together with their
+    /// DNS records. `observed` comes from the node's heartbeat; entries that
+    /// are not addresses are dropped. Returns how many members moved.
+    pub async fn follow_member_addresses(
+        &self,
+        node_id: i32,
+        observed: Vec<(String, String)>,
+    ) -> Result<u64, NodeError> {
+        let observed: Vec<(String, std::net::IpAddr)> = observed
+            .into_iter()
+            .take(MAX_REPORTED_OVERLAY_ADDRESSES)
+            .filter_map(|(name, ip)| {
+                let ip = ip.trim().parse().ok()?;
+                (!name.is_empty()).then_some((name, ip))
+            })
+            .collect();
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        Ok(dns_registry
+            .follow_member_addresses(node_id, &observed)
+            .await?)
     }
 
     /// Internal DNS names refused because another owner holds them

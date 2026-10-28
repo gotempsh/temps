@@ -20,6 +20,7 @@ pub mod network_policy;
 pub mod network_sync;
 pub mod node_runtime;
 mod output_buffer;
+pub mod overlay_addresses;
 mod overlay_driver;
 mod plugin_build_handler;
 pub mod private_check;

@@ -366,6 +366,17 @@ pub struct HeartbeatApiRequest {
     /// which leaves the stored value untouched.
     #[serde(default)]
     pub deployments_without_resolver: Option<Vec<i64>>,
+    /// The overlay address of each running Temps container on the node, sent
+    /// when the set changes. Absent from older agents.
+    #[serde(default)]
+    pub overlay_addresses: Option<Vec<OverlayAddressReport>>,
+}
+
+/// One running container's overlay address, from a heartbeat.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OverlayAddressReport {
+    pub container_name: String,
+    pub ip: String,
 }
 
 /// Read `instances`, dropping entries this version cannot decode (a newer
@@ -858,6 +869,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::cluster_network::ClusterNetworkChangeResponse,
         crate::handlers::cluster_network::UpdateClusterNetworkRequest,
         OccupiedRangeReport,
+        OverlayAddressReport,
         OverlayHeartbeat,
         crate::handlers::node_pairings::CreateNodePairingRequest,
         crate::handlers::node_pairings::CreateNodePairingResponse,
@@ -2664,6 +2676,23 @@ async fn node_heartbeat(
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
+
+    // A Docker restart can hand the node's service containers new overlay
+    // addresses; move the records that still name the old ones. A failure is
+    // logged, not returned: the agent resends the addresses periodically.
+    if let Some(addresses) = request.overlay_addresses {
+        let observed = addresses
+            .into_iter()
+            .map(|a| (a.container_name, a.ip))
+            .collect();
+        if let Err(error) = app_state
+            .node_service
+            .follow_member_addresses(node_id, observed)
+            .await
+        {
+            warn!(node_id, %error, "could not follow the node's container overlay addresses");
+        }
+    }
 
     // Only an accepted heartbeat (valid token, known node) reaches the store.
     // Written in a background task so a slow metrics store can never delay the

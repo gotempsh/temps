@@ -386,6 +386,9 @@ fn spawn_sandbox_quarantine(
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
 const HEARTBEAT_MAX_RETRIES: u32 = 3;
+/// Beats (30s each) after which unchanged overlay addresses are sent again,
+/// in case the control plane could not apply them the last time.
+const OVERLAY_ADDRESSES_RESEND_BEATS: u32 = 20;
 /// The shortest gap between a heartbeat and an early one sent because an
 /// instance report changed (ADR-055 §7).
 const EARLY_BEAT_MIN_GAP: Duration = Duration::from_secs(2);
@@ -487,6 +490,11 @@ fn spawn_heartbeat_loop(
         // Occupied ranges the control plane acknowledged last (ADR 056):
         // they are sent only when they differ.
         let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
+        // Overlay addresses the control plane accepted last: sent when they
+        // change, and again every `OVERLAY_ADDRESSES_RESEND_BEATS` beats so a
+        // write the control plane failed to apply is retried.
+        let mut addresses_sent: Option<Vec<crate::overlay_addresses::OverlayAddress>> = None;
+        let mut beats_since_addresses_sent: u32 = 0;
         let mut capacity_sampler = CapacitySampler::new();
         let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
 
@@ -706,6 +714,28 @@ fn spawn_heartbeat_loop(
                 body["occupied_ranges"] = serde_json::json!(ranges);
             }
 
+            // Container overlay addresses, which a Docker restart can change
+            // under the records the control plane holds.
+            beats_since_addresses_sent = beats_since_addresses_sent.saturating_add(1);
+            let mut addresses_to_send = None;
+            if let Some(docker) = docker.as_ref() {
+                match crate::overlay_addresses::collect(docker).await {
+                    Ok(addresses) => {
+                        if addresses_sent.as_ref() != Some(&addresses)
+                            || beats_since_addresses_sent >= OVERLAY_ADDRESSES_RESEND_BEATS
+                        {
+                            body["overlay_addresses"] = serde_json::json!(addresses);
+                            addresses_to_send = Some(addresses);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        node_id,
+                        error = %e,
+                        "Could not list container overlay addresses for the heartbeat"
+                    ),
+                }
+            }
+
             // On the first heartbeat (agent startup/reconnect), include a full
             // container inventory so the control plane can reconcile stale state.
             if !inventory_sent {
@@ -797,6 +827,10 @@ fn spawn_heartbeat_loop(
                         }
                         if let Some(ranges) = occupied_to_send.clone() {
                             occupied_sent = Some(ranges);
+                        }
+                        if let Some(addresses) = addresses_to_send.clone() {
+                            addresses_sent = Some(addresses);
+                            beats_since_addresses_sent = 0;
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;

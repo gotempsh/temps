@@ -478,3 +478,177 @@ async fn list_stale_resolvers_returns_lagging_nodes() {
     // Validation: zero / negative thresholds rejected.
     assert!(registry.list_stale_resolvers(0).await.is_err());
 }
+
+async fn scalar_i64(db: &DatabaseConnection, sql: String) -> i64 {
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+    ))
+    .await
+    .expect("query")
+    .expect("row")
+    .try_get("", "v")
+    .expect("v column")
+}
+
+async fn text(db: &DatabaseConnection, sql: String) -> Option<String> {
+    db.query_one(Statement::from_string(
+        sea_orm::DatabaseBackend::Postgres,
+        sql,
+    ))
+    .await
+    .expect("query")
+    .expect("row")
+    .try_get("", "v")
+    .expect("v column")
+}
+
+async fn insert_member(
+    db: &DatabaseConnection,
+    service_id: i64,
+    node_id: i32,
+    name: &str,
+    compute_ip: Option<&str>,
+    ordinal: i32,
+) -> i64 {
+    let ip = compute_ip.map_or("NULL".to_string(), |ip| format!("'{ip}'"));
+    scalar_i64(
+        db,
+        format!(
+            "INSERT INTO service_members \
+             (service_id, role, container_name, status, ordinal, node_id, compute_ip, \
+              created_at, updated_at) \
+             VALUES ({service_id}, 'replica', '{name}', 'running', {ordinal}, {node_id}, {ip}, \
+                     now(), now()) RETURNING id::bigint AS v"
+        ),
+    )
+    .await
+}
+
+/// A Docker restart reshuffles dynamic overlay addresses. The node's report
+/// of what its containers hold now must move the members and their A
+/// records, swaps included, and touch nothing else.
+#[tokio::test]
+async fn follow_member_addresses_moves_drifted_members_and_their_records() {
+    let Some(db) = boot_db().await else { return };
+    let registry = DnsRegistry::new(db.clone());
+    let node = insert_node(db.as_ref(), "drift-node", "drift-hash").await;
+    let other_node = insert_node(db.as_ref(), "drift-other", "drift-other-hash").await;
+    let service = scalar_i64(
+        db.as_ref(),
+        "INSERT INTO external_services (name, service_type, status, topology, created_at, \
+         updated_at) VALUES ('drift-svc', 'postgres', 'running', 'cluster', now(), now()) \
+         RETURNING id::bigint AS v"
+            .to_string(),
+    )
+    .await;
+
+    let alpha = insert_member(db.as_ref(), service, node, "drift-a", Some("10.20.30.2"), 0).await;
+    let beta = insert_member(db.as_ref(), service, node, "drift-b", Some("10.20.30.3"), 1).await;
+    let steady = insert_member(db.as_ref(), service, node, "drift-c", Some("10.20.30.4"), 2).await;
+    let never = insert_member(db.as_ref(), service, node, "drift-d", None, 3).await;
+    // Same container name on another node: not this report's to move.
+    let elsewhere = insert_member(
+        db.as_ref(),
+        service,
+        other_node,
+        "drift-a",
+        Some("10.20.31.2"),
+        4,
+    )
+    .await;
+    for (member, ip, on) in [
+        (alpha, "10.20.30.2", node),
+        (beta, "10.20.30.3", node),
+        (steady, "10.20.30.4", node),
+        (elsewhere, "10.20.31.2", other_node),
+    ] {
+        let mut record = draft(&format!("m{member}.drift-svc.temps.local"), ip, member);
+        record.node_id = Some(on);
+        registry
+            .replace_endpoints_for_owner(OwnerKind::ServiceMember, member, &[record])
+            .await
+            .expect("publish member record");
+    }
+    let before = scalar_i64(
+        db.as_ref(),
+        "SELECT current AS v FROM dns_generation WHERE id = 1".to_string(),
+    )
+    .await;
+
+    // alpha and beta swapped addresses; steady kept its own; never has one
+    // now but never had one recorded.
+    let observed = [
+        ("drift-a".to_string(), "10.20.30.3".parse().unwrap()),
+        ("drift-b".to_string(), "10.20.30.2".parse().unwrap()),
+        ("drift-c".to_string(), "10.20.30.4".parse().unwrap()),
+        ("drift-d".to_string(), "10.20.30.9".parse().unwrap()),
+    ];
+    let moved = registry
+        .follow_member_addresses(node, &observed)
+        .await
+        .expect("follow addresses");
+    assert_eq!(moved, 2, "only the two swapped members moved");
+
+    let member_ip =
+        |id: i64| format!("SELECT compute_ip AS v FROM service_members WHERE id = {id}");
+    let record_ip = |id: i64| {
+        format!(
+            "SELECT target_ip AS v FROM service_endpoints \
+             WHERE owner_kind = 'service_member' AND owner_id = {id}"
+        )
+    };
+    assert_eq!(
+        text(db.as_ref(), member_ip(alpha)).await.as_deref(),
+        Some("10.20.30.3")
+    );
+    assert_eq!(
+        text(db.as_ref(), member_ip(beta)).await.as_deref(),
+        Some("10.20.30.2")
+    );
+    assert_eq!(
+        text(db.as_ref(), record_ip(alpha)).await.as_deref(),
+        Some("10.20.30.3")
+    );
+    assert_eq!(
+        text(db.as_ref(), record_ip(beta)).await.as_deref(),
+        Some("10.20.30.2")
+    );
+    assert_eq!(
+        text(db.as_ref(), member_ip(steady)).await.as_deref(),
+        Some("10.20.30.4")
+    );
+    assert_eq!(text(db.as_ref(), member_ip(never)).await, None);
+    assert_eq!(
+        text(db.as_ref(), member_ip(elsewhere)).await.as_deref(),
+        Some("10.20.31.2"),
+        "another node's member keeps its address"
+    );
+    assert_eq!(
+        text(db.as_ref(), record_ip(elsewhere)).await.as_deref(),
+        Some("10.20.31.2")
+    );
+    let after = scalar_i64(
+        db.as_ref(),
+        "SELECT current AS v FROM dns_generation WHERE id = 1".to_string(),
+    )
+    .await;
+    assert_eq!(
+        after,
+        before + 1,
+        "resolvers see the move as one generation"
+    );
+
+    // The same report again changes nothing and bumps nothing.
+    let again = registry
+        .follow_member_addresses(node, &observed)
+        .await
+        .expect("follow addresses again");
+    assert_eq!(again, 0);
+    let unchanged = scalar_i64(
+        db.as_ref(),
+        "SELECT current AS v FROM dns_generation WHERE id = 1".to_string(),
+    )
+    .await;
+    assert_eq!(unchanged, after);
+}

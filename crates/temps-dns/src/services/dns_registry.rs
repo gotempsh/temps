@@ -803,6 +803,104 @@ impl DnsRegistry {
         Ok(out)
     }
 
+    /// Follow service containers whose overlay address changed under them.
+    ///
+    /// `observed` is what node `node_id` reports its running containers hold
+    /// now (container name → address). A member of a service on that node
+    /// whose recorded `compute_ip` differs is moved to the observed address,
+    /// and so are the node's A/AAAA records that pointed at the old one, in
+    /// one transaction and one generation bump. Docker reassigns dynamic
+    /// addresses when its daemon restarts, so without this the records keep
+    /// naming an address that now belongs to a neighbour, or to nobody.
+    ///
+    /// Members that never had an overlay address are left alone: their
+    /// records were never built from one. Returns how many members moved.
+    pub async fn follow_member_addresses(
+        &self,
+        node_id: i32,
+        observed: &[(String, IpAddr)],
+    ) -> Result<u64, DnsRegistryError> {
+        if observed.is_empty() {
+            return Ok(0);
+        }
+        let names: Vec<String> = observed.iter().map(|(name, _)| name.clone()).collect();
+        let ips: Vec<String> = observed.iter().map(|(_, ip)| ip.to_string()).collect();
+        let names = serde_json::Value::from(names);
+        let ips = serde_json::Value::from(ips);
+        const OBSERVED: &str = "SELECT name, ip FROM jsonb_array_elements_text($2::jsonb) \
+                                WITH ORDINALITY AS n(name, i) \
+                                JOIN jsonb_array_elements_text($3::jsonb) \
+                                WITH ORDINALITY AS a(ip, j) ON i = j";
+
+        // Most heartbeats change nothing: find out before taking the lock.
+        let drifted = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "SELECT count(*) AS moved FROM service_members sm \
+                     JOIN ({OBSERVED}) o ON o.name = sm.container_name \
+                     WHERE sm.node_id = $1 AND sm.compute_ip IS NOT NULL \
+                       AND sm.compute_ip <> o.ip"
+                ),
+                [node_id.into(), names.clone().into(), ips.clone().into()],
+            ))
+            .await?
+            .map(|row| row.try_get::<i64>("", "moved"))
+            .transpose()?
+            .unwrap_or(0);
+        if drifted == 0 {
+            return Ok(0);
+        }
+
+        let txn = self.db.begin().await?;
+        // Lock order: the generation row before any endpoint row.
+        let generation = next_generation(&txn).await?;
+        let moved = txn
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                format!(
+                    "WITH moved AS ( \
+                         SELECT sm.id, sm.compute_ip AS old_ip, o.ip AS new_ip \
+                         FROM service_members sm \
+                         JOIN ({OBSERVED}) o ON o.name = sm.container_name \
+                         WHERE sm.node_id = $1 AND sm.compute_ip IS NOT NULL \
+                           AND sm.compute_ip <> o.ip \
+                         FOR UPDATE OF sm), \
+                     members AS ( \
+                         UPDATE service_members s SET compute_ip = m.new_ip, updated_at = now() \
+                         FROM moved m WHERE s.id = m.id RETURNING s.id), \
+                     records AS ( \
+                         UPDATE service_endpoints se \
+                         SET target_ip = m.new_ip, generation = $4, updated_at = now() \
+                         FROM moved m \
+                         WHERE se.node_id = $1 AND se.record_type IN ('A', 'AAAA') \
+                           AND se.target_ip = m.old_ip \
+                         RETURNING se.id) \
+                     SELECT (SELECT count(*) FROM members) AS members, \
+                            (SELECT count(*) FROM records) AS records"
+                ),
+                [node_id.into(), names.into(), ips.into(), generation.into()],
+            ))
+            .await?;
+        let (members, records) = match moved {
+            Some(row) => (
+                row.try_get::<i64>("", "members")?,
+                row.try_get::<i64>("", "records")?,
+            ),
+            None => (0, 0),
+        };
+        txn.commit().await?;
+        info!(
+            node_id,
+            members,
+            records,
+            generation,
+            "service containers changed overlay address; moved their records"
+        );
+        Ok(u64::try_from(members).unwrap_or(0))
+    }
+
     /// Return DNS changes since `since`.
     ///
     /// A changed generation is currently returned as an authoritative full
